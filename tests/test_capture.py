@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 
 from pkm_brain.automation import render_launch_agent, run_agent_log_ingest
-from pkm_brain.capture import AgentLogCapture
+from pkm_brain.capture import AgentLogCapture, redact_text
 from pkm_brain.db import connection
 from pkm_brain.paths import BrainPaths
 from pkm_brain.service import BrainService
@@ -191,3 +191,22 @@ def test_launch_agent_plist_render() -> None:
     assert decoded["Label"] == "com.pkm-brain.agent-log-ingest"
     assert decoded["StartInterval"] == 600
     assert "brain automation run-agent-log-ingest" in decoded["ProgramArguments"][-1]
+
+
+def test_redact_text_scrubs_embedded_secret_values() -> None:
+    text = """
+    GOOGLE_WORKSPACE_CLIENT_SECRET=GOCSPX-example-secret
+    "refresh_token": "1//example-refresh-token"
+    authorization: Bearer ya29.example-access-token
+    regular_key: keep-this
+    """
+
+    redacted = redact_text(text)
+
+    assert "GOCSPX-example-secret" not in redacted
+    assert "1//example-refresh-token" not in redacted
+    assert "ya29.example-access-token" not in redacted
+    assert "GOOGLE_WORKSPACE_CLIENT_SECRET=[redacted]" in redacted
+    assert '"refresh_token": "[redacted]"' in redacted
+    assert "authorization: Bearer [redacted]" in redacted
+    assert "regular_key: keep-this" in redacted

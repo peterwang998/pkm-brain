@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -17,7 +18,40 @@ MAX_ITEM_CHARS = 4000
 MAX_RAW_JSON_CHARS = 1200
 SKIPPED_TEXT_KEYS = {"data"}
 SKIPPED_CONTAINER_KEYS = {"snapshot", "pastedContents"}
-CAPTURE_FORMAT_VERSION = "agent-md-v2"
+CAPTURE_FORMAT_VERSION = "agent-md-v5"
+SENSITIVE_KEY_PATTERNS = (
+    "secret",
+    "token",
+    "api_key",
+    "apikey",
+    "password",
+    "credential",
+    "authorization",
+    "client_secret",
+    "refresh_token",
+    "access_token",
+)
+SENSITIVE_TEXT_VALUE_RE = re.compile(
+    r"""(?ix)
+    (
+      ["']?
+      \b[A-Z0-9_.-]*
+      (?:SECRET|PASSWORD|API[_-]?KEY|CREDENTIAL|ACCESS[_-]?TOKEN|REFRESH[_-]?TOKEN)
+      [A-Z0-9_.-]*
+      \b
+      ["']?
+      \s*[:=]\s*
+      ["']?
+    )
+    ([^"'\s,}\]]+)
+    """
+)
+AUTHORIZATION_VALUE_RE = re.compile(
+    r"(?i)(\bauthorization\s*[:=]\s*(?:bearer|basic)\s+)([A-Za-z0-9._~+/\-=]+)"
+)
+SECRET_SHAPE_RE = re.compile(
+    r"(?i)\b(?:GOCSPX-[A-Za-z0-9._/-]+|ya29\.[A-Za-z0-9._/-]+|1//[A-Za-z0-9._/-]+|AIza[A-Za-z0-9._/-]+|sk-[A-Za-z0-9._/-]+)"
+)
 
 
 @dataclass(frozen=True)
@@ -422,7 +456,9 @@ def extract_text(value: Any) -> str:
     def walk(item: Any) -> None:
         if isinstance(item, dict):
             for key, nested in item.items():
-                if key in SKIPPED_CONTAINER_KEYS:
+                if is_sensitive_key(key):
+                    found.append(f"{key}: [redacted]")
+                elif key in SKIPPED_CONTAINER_KEYS:
                     found.append(f"[omitted {key}]")
                 elif key in {"text", "content", "display"} and isinstance(nested, str):
                     found.append(redact_text(nested))
@@ -442,14 +478,19 @@ def redact_text(text: str) -> str:
     stripped = text.strip()
     if looks_like_base64(stripped):
         return f"[omitted base64 payload: {len(stripped)} chars]"
-    return stripped
+    redacted = AUTHORIZATION_VALUE_RE.sub(r"\1[redacted]", stripped)
+    redacted = SENSITIVE_TEXT_VALUE_RE.sub(r"\1[redacted]", redacted)
+    redacted = SECRET_SHAPE_RE.sub("[redacted]", redacted)
+    return redacted
 
 
 def redact_large_values(value: Any) -> Any:
     if isinstance(value, dict):
         output: dict[str, Any] = {}
         for key, nested in value.items():
-            if key in SKIPPED_CONTAINER_KEYS:
+            if is_sensitive_key(key):
+                output[key] = "[redacted]"
+            elif key in SKIPPED_CONTAINER_KEYS:
                 output[key] = f"[omitted {key}]"
             elif isinstance(nested, str):
                 output[key] = redact_text(truncate_text(nested, MAX_RAW_JSON_CHARS))
@@ -476,6 +517,11 @@ def looks_like_base64(text: str) -> bool:
     if any(ch not in allowed for ch in text):
         return False
     return len(set(text.replace("\n", "").replace("\r", ""))) > 20
+
+
+def is_sensitive_key(key: str) -> bool:
+    normalized = key.lower().replace("-", "_")
+    return any(pattern in normalized for pattern in SENSITIVE_KEY_PATTERNS)
 
 
 def dedupe_preserve_order(items: list[str]) -> list[str]:
