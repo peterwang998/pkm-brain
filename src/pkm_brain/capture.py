@@ -13,6 +13,12 @@ from .db import connection
 from .paths import BrainPaths
 from .util import file_sha256, now_iso, slugify, text_sha256
 
+MAX_ITEM_CHARS = 4000
+MAX_RAW_JSON_CHARS = 1200
+SKIPPED_TEXT_KEYS = {"data"}
+SKIPPED_CONTAINER_KEYS = {"snapshot", "pastedContents"}
+CAPTURE_FORMAT_VERSION = "agent-md-v2"
+
 
 @dataclass(frozen=True)
 class AgentSessionCapture:
@@ -97,12 +103,13 @@ class AgentLogCapture:
 
     def _is_unchanged(self, session: AgentSessionCapture) -> bool:
         capture_id = f"{session.agent}:{session.session_id}"
+        state_hash = capture_state_hash(session.source_hash)
         with connection(self.paths.sqlite_path) as conn:
             row = conn.execute(
                 "SELECT source_hash, status FROM capture_sources WHERE id = ?",
                 (capture_id,),
             ).fetchone()
-        return bool(row and row["source_hash"] == session.source_hash and row["status"] == "captured")
+        return bool(row and row["source_hash"] == state_hash and row["status"] == "captured")
 
     def _record_capture(
         self,
@@ -135,7 +142,7 @@ class AgentLogCapture:
                     session.agent,
                     session.session_id,
                     str(session.source_path),
-                    session.source_hash,
+                    capture_state_hash(session.source_hash),
                     session.source_mtime,
                     session.source_size,
                     str(output),
@@ -352,7 +359,7 @@ def render_markdown(metadata: dict[str, Any], events: list[dict[str, Any]]) -> s
         role = str(event.get("role") or event.get("type") or event.get("kind") or "").lower()
         text = extract_text(event)
         if not text:
-            text = json.dumps(event, ensure_ascii=False, sort_keys=True)[:2000]
+            text = truncate_text(json.dumps(redact_large_values(event), ensure_ascii=False, sort_keys=True), MAX_RAW_JSON_CHARS)
         if role == "user":
             user_messages.append(text)
         elif role == "assistant":
@@ -405,7 +412,7 @@ def markdown_items(items: list[str]) -> list[str]:
         return ["- Unknown"]
     rendered: list[str] = []
     for item in items:
-        rendered.append("- " + item.replace("\n", "\n  "))
+        rendered.append("- " + truncate_text(item, MAX_ITEM_CHARS).replace("\n", "\n  "))
     return rendered
 
 
@@ -415,11 +422,13 @@ def extract_text(value: Any) -> str:
     def walk(item: Any) -> None:
         if isinstance(item, dict):
             for key, nested in item.items():
-                if key in {"text", "content", "display"} and isinstance(nested, str):
-                    found.append(nested)
+                if key in SKIPPED_CONTAINER_KEYS:
+                    found.append(f"[omitted {key}]")
+                elif key in {"text", "content", "display"} and isinstance(nested, str):
+                    found.append(redact_text(nested))
                 elif key == "message":
                     walk(nested)
-                elif key not in {"snapshot"}:
+                elif key not in SKIPPED_TEXT_KEYS:
                     walk(nested)
         elif isinstance(item, list):
             for nested in item:
@@ -427,6 +436,46 @@ def extract_text(value: Any) -> str:
 
     walk(value)
     return "\n".join(dedupe_preserve_order(found)).strip()
+
+
+def redact_text(text: str) -> str:
+    stripped = text.strip()
+    if looks_like_base64(stripped):
+        return f"[omitted base64 payload: {len(stripped)} chars]"
+    return stripped
+
+
+def redact_large_values(value: Any) -> Any:
+    if isinstance(value, dict):
+        output: dict[str, Any] = {}
+        for key, nested in value.items():
+            if key in SKIPPED_CONTAINER_KEYS:
+                output[key] = f"[omitted {key}]"
+            elif isinstance(nested, str):
+                output[key] = redact_text(truncate_text(nested, MAX_RAW_JSON_CHARS))
+            else:
+                output[key] = redact_large_values(nested)
+        return output
+    if isinstance(value, list):
+        return [redact_large_values(item) for item in value[:20]]
+    if isinstance(value, str):
+        return redact_text(truncate_text(value, MAX_RAW_JSON_CHARS))
+    return value
+
+
+def truncate_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars]}... [truncated {len(text) - max_chars} chars]"
+
+
+def looks_like_base64(text: str) -> bool:
+    if len(text) < 800:
+        return False
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r")
+    if any(ch not in allowed for ch in text):
+        return False
+    return len(set(text.replace("\n", "").replace("\r", ""))) > 20
 
 
 def dedupe_preserve_order(items: list[str]) -> list[str]:
@@ -506,3 +555,7 @@ def find_provider(events: list[dict[str, Any]]) -> str:
 
 def hash_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def capture_state_hash(source_hash: str) -> str:
+    return f"{CAPTURE_FORMAT_VERSION}:{source_hash}"

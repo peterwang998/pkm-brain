@@ -24,7 +24,13 @@ def upsert_vectors(db_path: Path, rows: list[dict[str, Any]]) -> int:
             pass
         table.add(rows)
     else:
-        db.create_table(TABLE_NAME, rows)
+        try:
+            db.create_table(TABLE_NAME, rows)
+        except ValueError as exc:
+            if "already exists" not in str(exc):
+                raise
+            table = db.open_table(TABLE_NAME)
+            table.add(rows)
     return len(rows)
 
 
