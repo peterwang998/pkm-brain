@@ -136,6 +136,24 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
   unresolved_issues TEXT NOT NULL DEFAULT '[]',
   created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS capture_sources (
+  id TEXT PRIMARY KEY,
+  source_kind TEXT NOT NULL,
+  agent TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  source_path TEXT NOT NULL,
+  source_hash TEXT NOT NULL,
+  source_mtime REAL,
+  source_size INTEGER,
+  captured_path TEXT,
+  captured_at TEXT,
+  status TEXT NOT NULL,
+  error TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_capture_sources_agent_session
+ON capture_sources(agent, session_id);
 """
 
 

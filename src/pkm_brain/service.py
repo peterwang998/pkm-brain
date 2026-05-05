@@ -348,6 +348,8 @@ def detect_source_type(path: Path) -> str | None:
     suffix = path.suffix.lower()
     if suffix == ".md":
         text = path.read_text(encoding="utf-8", errors="replace")[:2000].lower()
+        if "source_type: agent_session_log" in text or "/agent_logs/" in str(path):
+            return "agent_session_log"
         return "agent_session_log" if "commands" in text and "outcome" in text else "markdown_note"
     if suffix == ".txt":
         return "meeting_transcript"

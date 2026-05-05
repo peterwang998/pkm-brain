@@ -57,6 +57,7 @@ V1 uses:
 - chunking with provenance
 - CLI commands for search, inspection, wiki linting, memory audit, and run inspection
 - MCP server tools for agent access
+- scheduled agent-log capture from Codex, Claude, and OpenCode via macOS LaunchAgent
 
 The runtime data flow is:
 
@@ -102,6 +103,65 @@ The MCP server exposes tools for:
 
 Agents should use these tools instead of reading SQLite or LanceDB directly.
 
+## Agent Log Automation
+
+PKM Brain can capture local agent session logs into the inbox, then ingest them through the normal pipeline.
+
+Supported local agent sources:
+
+- Codex: `~/.codex/state_5.sqlite` plus rollout JSONL files
+- Claude: `~/.claude/projects/**/*.jsonl`
+- OpenCode: `~/.local/share/opencode/opencode.db`
+
+Capture is intentionally routed through `~/brain/inbox`, not `~/brain/raw`:
+
+```text
+agent session stores
+  -> brain capture agents
+  -> ~/brain/inbox/agent_logs/<agent>/*.md
+  -> brain ingest
+  -> ~/brain/raw + SQLite + FTS5 + LanceDB
+```
+
+Preview capture without writing artifacts:
+
+```bash
+uv run brain capture agents --dry-run
+```
+
+Capture all supported agent logs:
+
+```bash
+uv run brain capture agents
+uv run brain ingest
+```
+
+Run the scheduled-ingestion command manually:
+
+```bash
+uv run brain automation run-agent-log-ingest
+```
+
+Install a user-level macOS LaunchAgent that polls every 10 minutes:
+
+```bash
+uv run brain launch-agent install --interval 600
+```
+
+Inspect or remove it:
+
+```bash
+uv run brain launch-agent status
+uv run brain launch-agent uninstall
+```
+
+LaunchAgent logs are written to:
+
+```text
+~/brain/logs/launchagent.out.log
+~/brain/logs/launchagent.err.log
+```
+
 ## Quickstart
 
 ```bash
@@ -131,6 +191,8 @@ Implemented:
 - wiki schema linting
 - memory proposal and audit commands
 - ingestion run logs
+- Codex, Claude, and OpenCode agent-log capture
+- macOS LaunchAgent scheduled polling
 - MCP server wrapper
 
 Not yet implemented:

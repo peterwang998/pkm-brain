@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -9,6 +10,15 @@ from rich.console import Console
 from rich.table import Table
 
 from .audit import audit_memories, provenance_check
+from .automation import (
+    as_jsonable,
+    install_launch_agent,
+    launch_agent_status,
+    render_launch_agent,
+    uninstall_launch_agent,
+    run_agent_log_ingest,
+)
+from .capture import AgentLogCapture
 from .db import connection, rows
 from .mcp_server import create_mcp
 from .paths import BrainPaths
@@ -22,12 +32,18 @@ wiki_app = typer.Typer(help="Wiki commands.")
 memory_app = typer.Typer(help="Typed memory commands.")
 runs_app = typer.Typer(help="Pipeline run commands.")
 provenance_app = typer.Typer(help="Provenance validation commands.")
+capture_app = typer.Typer(help="Capture external sources into the inbox.")
+automation_app = typer.Typer(help="Scheduled automation commands.")
+launch_agent_app = typer.Typer(help="macOS LaunchAgent commands.")
 app.add_typer(inspect_app, name="inspect")
 app.add_typer(index_app, name="index")
 app.add_typer(wiki_app, name="wiki")
 app.add_typer(memory_app, name="memory")
 app.add_typer(runs_app, name="runs")
 app.add_typer(provenance_app, name="provenance")
+app.add_typer(capture_app, name="capture")
+app.add_typer(automation_app, name="automation")
+app.add_typer(launch_agent_app, name="launch-agent")
 console = Console()
 
 
@@ -230,6 +246,68 @@ def runs_inspect(run_id: str, home: Optional[Path] = typer.Option(None)) -> None
 @app.command()
 def mcp(home: Optional[Path] = typer.Option(None)) -> None:
     create_mcp(str(home) if home else None).run()
+
+
+@capture_app.command("agents")
+def capture_agents(
+    agent: str = typer.Option("all", help="Agent to capture: all, codex, claude, or opencode."),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    svc = service(home)
+    svc.init_workspace()
+    result = AgentLogCapture(svc.paths).capture(agent=agent, dry_run=dry_run)
+    console.print_json(json.dumps(result.__dict__))
+
+
+@automation_app.command("run-agent-log-ingest")
+def automation_run_agent_log_ingest(
+    agent: str = typer.Option("all", help="Agent to capture: all, codex, claude, or opencode."),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    paths = BrainPaths.from_value(home)
+    result = run_agent_log_ingest(paths, agent=agent)
+    console.print_json(json.dumps(as_jsonable(result)))
+
+
+@launch_agent_app.command("install")
+def launch_agent_install(
+    interval: int = typer.Option(600, help="Polling interval in seconds."),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    paths = BrainPaths.from_value(home)
+    BrainService(paths).init_workspace()
+    uv = shutil.which("uv") or "/opt/homebrew/bin/uv"
+    result = install_launch_agent(
+        repo_path=Path.cwd(),
+        brain_home=paths.home,
+        uv_path=Path(uv),
+        interval=interval,
+        dry_run=dry_run,
+    )
+    console.print_json(json.dumps(result))
+
+
+@launch_agent_app.command("status")
+def launch_agent_status_command() -> None:
+    console.print_json(json.dumps(launch_agent_status()))
+
+
+@launch_agent_app.command("uninstall")
+def launch_agent_uninstall() -> None:
+    console.print_json(json.dumps(uninstall_launch_agent()))
+
+
+@launch_agent_app.command("render")
+def launch_agent_render(
+    interval: int = typer.Option(600),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    paths = BrainPaths.from_value(home)
+    uv = shutil.which("uv") or "/opt/homebrew/bin/uv"
+    plist = render_launch_agent(Path.cwd(), paths.home, Path(uv), interval=interval)
+    console.print_json(json.dumps(plist))
 
 
 def print_search_result(result: dict) -> None:
