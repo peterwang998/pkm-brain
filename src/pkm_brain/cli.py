@@ -1,0 +1,250 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Optional
+
+import typer
+from rich.console import Console
+from rich.table import Table
+
+from .audit import audit_memories, provenance_check
+from .db import connection, rows
+from .mcp_server import create_mcp
+from .paths import BrainPaths
+from .service import BrainService
+from .wiki import lint_wiki
+
+app = typer.Typer(help="Local personal knowledge management and agent memory tool.")
+inspect_app = typer.Typer(help="Inspect documents and chunks.")
+index_app = typer.Typer(help="Index health commands.")
+wiki_app = typer.Typer(help="Wiki commands.")
+memory_app = typer.Typer(help="Typed memory commands.")
+runs_app = typer.Typer(help="Pipeline run commands.")
+provenance_app = typer.Typer(help="Provenance validation commands.")
+app.add_typer(inspect_app, name="inspect")
+app.add_typer(index_app, name="index")
+app.add_typer(wiki_app, name="wiki")
+app.add_typer(memory_app, name="memory")
+app.add_typer(runs_app, name="runs")
+app.add_typer(provenance_app, name="provenance")
+console = Console()
+
+
+def service(home: Optional[Path] = None) -> BrainService:
+    return BrainService(BrainPaths.from_value(home))
+
+
+@app.command()
+def init(home: Optional[Path] = typer.Option(None, help="Brain home directory.")) -> None:
+    svc = service(home)
+    svc.init_workspace()
+    console.print(f"Initialized brain workspace at [bold]{svc.paths.home}[/bold]")
+
+
+@app.command()
+def doctor(home: Optional[Path] = typer.Option(None)) -> None:
+    status = service(home).doctor()
+    console.print_json(json.dumps(status))
+
+
+@app.command()
+def ingest(
+    path: Optional[Path] = typer.Argument(None, help="Path to ingest. Defaults to inbox."),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    result = service(home).ingest(path, dry_run=dry_run)
+    console.print_json(json.dumps(result.__dict__))
+
+
+@app.command()
+def search(
+    query: str,
+    limit: int = typer.Option(10),
+    debug: bool = typer.Option(False, "--debug"),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    result = service(home).search(query, limit=limit, debug=debug)
+    print_search_result(result)
+
+
+@app.command("retrieve-context")
+def retrieve_context(
+    task: str = typer.Option(...),
+    project: Optional[str] = typer.Option(None),
+    budget: int = typer.Option(8000),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    result = service(home).retrieve_context(task, project=project, budget=budget)
+    console.print_json(json.dumps(result))
+
+
+@inspect_app.command("document")
+def inspect_document(document_id: str, home: Optional[Path] = typer.Option(None)) -> None:
+    svc = service(home)
+    svc.init_workspace()
+    with connection(svc.paths.sqlite_path) as conn:
+        row = conn.execute("SELECT * FROM documents WHERE id = ?", (document_id,)).fetchone()
+    if not row:
+        console.print(f"Document not found: {document_id}")
+        raise typer.Exit(1)
+    console.print_json(json.dumps(dict(row)))
+
+
+@inspect_app.command("chunks")
+def inspect_chunks(document_id: str, home: Optional[Path] = typer.Option(None)) -> None:
+    svc = service(home)
+    svc.init_workspace()
+    with connection(svc.paths.sqlite_path) as conn:
+        found = rows(conn, "SELECT * FROM chunks WHERE document_id = ? ORDER BY chunk_index", (document_id,))
+    table = Table(title=f"Chunks for {document_id}")
+    for col in ["chunk_index", "id", "heading_path", "token_count", "preview"]:
+        table.add_column(col)
+    for row in found:
+        table.add_row(
+            str(row["chunk_index"]),
+            row["id"],
+            row["heading_path"] or "",
+            str(row["token_count"]),
+            row["text"][:120].replace("\n", " "),
+        )
+    console.print(table)
+
+
+@index_app.command("status")
+def index_status(home: Optional[Path] = typer.Option(None)) -> None:
+    svc = service(home)
+    svc.init_workspace()
+    with connection(svc.paths.sqlite_path) as conn:
+        docs = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+        chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        fts = conn.execute("SELECT COUNT(*) FROM chunk_fts").fetchone()[0]
+        runs = rows(conn, "SELECT * FROM ingestion_runs ORDER BY started_at DESC LIMIT 1")
+    lancedb_exists = svc.paths.lancedb_path.exists() and any(svc.paths.lancedb_path.iterdir())
+    console.print_json(
+        json.dumps(
+            {
+                "documents": docs,
+                "chunks": chunks,
+                "fts_rows": fts,
+                "lancedb_exists": lancedb_exists,
+                "embedding_provider": svc.embedding_provider.name,
+                "last_run": dict(runs[0]) if runs else None,
+            }
+        )
+    )
+
+
+@wiki_app.command("lint")
+def wiki_lint(home: Optional[Path] = typer.Option(None)) -> None:
+    svc = service(home)
+    svc.init_workspace()
+    result = lint_wiki(svc.paths)
+    console.print_json(json.dumps(result))
+    if result["errors"]:
+        raise typer.Exit(1)
+
+
+@memory_app.command("propose")
+def memory_propose(
+    memory_type: str,
+    scope: str,
+    content: str,
+    source: list[str] = typer.Option([], "--source"),
+    confidence: float = typer.Option(0.8),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    memory_id = service(home).propose_memory(memory_type, scope, content, source, confidence)
+    console.print_json(json.dumps({"memory_id": memory_id, "status": "proposed"}))
+
+
+@memory_app.command("list")
+def memory_list(status: Optional[str] = typer.Option(None), home: Optional[Path] = typer.Option(None)) -> None:
+    svc = service(home)
+    svc.init_workspace()
+    query = "SELECT * FROM memories"
+    params: list[str] = []
+    if status:
+        query += " WHERE status = ?"
+        params.append(status)
+    query += " ORDER BY created_at DESC"
+    with connection(svc.paths.sqlite_path) as conn:
+        found = [dict(row) for row in conn.execute(query, params)]
+    console.print_json(json.dumps(found))
+
+
+@memory_app.command("inspect")
+def memory_inspect(memory_id: str, home: Optional[Path] = typer.Option(None)) -> None:
+    svc = service(home)
+    svc.init_workspace()
+    with connection(svc.paths.sqlite_path) as conn:
+        row = conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+    if not row:
+        console.print(f"Memory not found: {memory_id}")
+        raise typer.Exit(1)
+    console.print_json(json.dumps(dict(row)))
+
+
+@memory_app.command("audit")
+def memory_audit(home: Optional[Path] = typer.Option(None)) -> None:
+    svc = service(home)
+    svc.init_workspace()
+    result = audit_memories(svc.paths)
+    console.print_json(json.dumps(result))
+    if result["errors"]:
+        raise typer.Exit(1)
+
+
+@provenance_app.command("check")
+def provenance_check_command(home: Optional[Path] = typer.Option(None)) -> None:
+    svc = service(home)
+    svc.init_workspace()
+    result = provenance_check(svc.paths)
+    console.print_json(json.dumps(result))
+    if result["errors"]:
+        raise typer.Exit(1)
+
+
+@runs_app.command("list")
+def runs_list(home: Optional[Path] = typer.Option(None)) -> None:
+    svc = service(home)
+    svc.init_workspace()
+    with connection(svc.paths.sqlite_path) as conn:
+        found = [dict(row) for row in rows(conn, "SELECT * FROM ingestion_runs ORDER BY started_at DESC LIMIT 20")]
+    console.print_json(json.dumps(found))
+
+
+@runs_app.command("inspect")
+def runs_inspect(run_id: str, home: Optional[Path] = typer.Option(None)) -> None:
+    svc = service(home)
+    svc.init_workspace()
+    with connection(svc.paths.sqlite_path) as conn:
+        row = conn.execute("SELECT * FROM ingestion_runs WHERE id = ?", (run_id,)).fetchone()
+    if not row:
+        console.print(f"Run not found: {run_id}")
+        raise typer.Exit(1)
+    console.print_json(json.dumps(dict(row)))
+
+
+@app.command()
+def mcp(home: Optional[Path] = typer.Option(None)) -> None:
+    create_mcp(str(home) if home else None).run()
+
+
+def print_search_result(result: dict) -> None:
+    table = Table(title=f"Search: {result['query']}")
+    for col in ["rank", "chunk_id", "title", "source", "preview"]:
+        table.add_column(col)
+    for index, row in enumerate(result["results"], start=1):
+        table.add_row(
+            str(index),
+            row["chunk_id"],
+            row["title"],
+            row["source_path"],
+            row["text"][:160].replace("\n", " "),
+        )
+    console.print(table)
+    console.print(f"retrieval_event_id: {result['event_id']}")
+    if result.get("debug"):
+        console.print_json(json.dumps(result["debug"]))
