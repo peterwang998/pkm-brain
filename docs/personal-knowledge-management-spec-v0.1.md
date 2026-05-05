@@ -366,6 +366,8 @@ omitted_due_to_budget
 
 The wiki is the human-readable, agent-maintained synthesis layer inspired by Karpathy's second brain pattern.
 
+The wiki is not the same thing as raw retrieval, source indexing, or one-page-per-document summarization. It is the compiled knowledge layer. Raw documents are evidence. Reference pages are provenance aids. The wiki's primary user-facing pages are durable topic pages that accumulate understanding across many sources.
+
 The wiki should contain:
 
 ```text
@@ -376,9 +378,81 @@ wiki/concepts/
 wiki/decisions/
 wiki/open_loops/
 wiki/timelines/
+wiki/references/
 ```
 
 Agents may update wiki pages only from cited sources.
+
+### 11.1 Wiki Layers
+
+The wiki has two generated layers:
+
+```text
+Compiled synthesis pages
+  Human-readable pages for projects, concepts, decisions, people, open loops, and timelines.
+  These pages merge evidence from many raw documents and should be pleasant to read directly.
+
+Reference pages
+  One-source provenance pages used for inspection and citation.
+  These are allowed to be mechanical and are not the main reading interface.
+```
+
+Generated reference pages must live under:
+
+```text
+wiki/references/<source_type>/
+```
+
+Generated compiled pages must live under their semantic folder:
+
+```text
+wiki/projects/
+wiki/concepts/
+wiki/decisions/
+wiki/open_loops/
+wiki/people/
+wiki/timelines/
+```
+
+The command `brain wiki synthesize` must do both:
+
+```text
+1. Maintain source-backed reference pages for provenance.
+2. Compile or update semantic wiki pages from the current corpus.
+3. Maintain wiki/index.md as the human and agent entrypoint.
+4. Insert links between related semantic pages using Obsidian-style wikilinks.
+5. Cite source document ids for every generated page.
+```
+
+The command must not silently overwrite hand-edited human pages. A generated page is safe to update only if it contains the generated marker. If a target page exists without the marker, the system must skip it and report the skip.
+
+### 11.2 Compiled Page Requirements
+
+Compiled pages should read like a small personal Wikipedia article, not like a copied source excerpt.
+
+Each compiled page should:
+
+```text
+Summarize the stable current understanding.
+Group related evidence across multiple sources.
+Use short bullets for key points.
+Link to related concepts, projects, decisions, and open loops.
+Keep raw excerpts short and only in Source Evidence or provenance sections.
+Represent uncertainty explicitly in Open Questions.
+Prefer durable concepts over session-specific details.
+```
+
+Compiled pages should not:
+
+```text
+Dump raw agent logs.
+Create one semantic page per source by default.
+Treat a source summary as a concept page.
+Invent facts not present in cited sources.
+Erase source provenance.
+```
+
+Reference pages may be noisy. Compiled pages must be human-readable.
 
 Each wiki page must follow a predictable Markdown schema so humans and agents can inspect, update, lint, and retrieve wiki content consistently.
 
@@ -500,6 +574,59 @@ ReferencePage
   ## Extracted Facts
   ## Source Evidence
 ```
+
+### 11.3 Links And Indexing
+
+Wiki body links should use Obsidian-compatible wikilinks:
+
+```text
+[[concepts/wiki-synthesis-layer]]
+[[projects/pkm-brain]]
+[[decisions/use-sqlite-for-canonical-metadata]]
+```
+
+Frontmatter `related` values should use the same path without brackets:
+
+```yaml
+related:
+  - concepts/wiki-synthesis-layer
+  - projects/pkm-brain
+```
+
+`wiki/index.md` is the required entrypoint. It must list generated project, concept, decision, open-loop, person, and timeline pages with one-line summaries and links.
+
+The index is content-oriented, not chronological. Chronological activity belongs in logs.
+
+### 11.4 Synthesis Workflow
+
+The wiki compiler should process sources in this order:
+
+```text
+1. Read latest ingested documents and chunks.
+2. Generate or update reference pages for each source.
+3. Extract candidate concepts, projects, decisions, people, and open loops.
+4. Merge candidates with existing generated semantic pages.
+5. Update semantic pages with source-backed summaries, links, and open questions.
+6. Update wiki/index.md.
+7. Run wiki lint.
+```
+
+The V1 compiler may use deterministic extraction rules and templates. Later versions may use an LLM to propose richer page updates, but the output must still follow the same schema and cite source ids.
+
+### 11.5 Retrieval Role
+
+Retrieval should use both the compiled wiki and raw chunks.
+
+At query time:
+
+```text
+Search compiled wiki pages first for stable synthesized context.
+Search raw chunks for supporting evidence and recent details.
+Return both in context packets when relevant.
+Do not force callers to choose between wiki and hybrid search.
+```
+
+The wiki answers "what do we currently understand?" Raw retrieval answers "where did that come from, and what exact source text supports it?"
 
 Example decision page:
 

@@ -127,6 +127,44 @@ def test_wiki_synthesis_creates_reference_pages_for_documents(tmp_path: Path) ->
     assert second["skipped"]
 
 
+def test_wiki_synthesis_compiles_semantic_pages(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "pkm-architecture.md"
+    note.write_text(
+        "# PKM Brain Architecture\n\n"
+        "PKM Brain is a personal knowledge management second brain.\n\n"
+        "SQLite is the canonical metadata store for documents and chunks.\n\n"
+        "The wiki synthesis layer should create human-readable compiled markdown pages.\n",
+        encoding="utf-8",
+    )
+    svc.ingest()
+
+    result = synthesize_wiki(svc.paths)
+
+    assert result["lint"]["errors"] == []
+    index = (svc.paths.wiki / "index.md").read_text(encoding="utf-8")
+    concept = (svc.paths.wiki / "concepts" / "wiki-synthesis-layer.md").read_text(encoding="utf-8")
+    decision = (svc.paths.wiki / "decisions" / "use-sqlite-for-canonical-metadata.md").read_text(encoding="utf-8")
+    project = (svc.paths.wiki / "projects" / "pkm-brain.md").read_text(encoding="utf-8")
+
+    assert "[[concepts/wiki-synthesis-layer]]" in index
+    assert "page_type: concept" in concept
+    assert "Reference page synthesized from" not in concept
+    assert "[[decisions/maintain-wiki-as-compiled-markdown]]" in concept
+    assert "document:" in concept
+    assert "page_type: decision" in decision
+    assert "Use SQLite as the canonical metadata store" in decision
+    assert "page_type: project" in project
+    assert "[[decisions/use-sqlite-for-canonical-metadata]]" in project
+
+    context = svc.retrieve_context("explain the wiki synthesis layer and sqlite metadata")
+    assert context["relevant_wiki_pages"]
+    assert context["supporting_chunks"]
+    assert any(page["relative_path"] == "concepts/wiki-synthesis-layer.md" for page in context["relevant_wiki_pages"])
+    assert any(str(citation).startswith("document:") for citation in context["citations"])
+
+
 def test_memory_audit_warns_on_missing_source(tmp_path: Path) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()

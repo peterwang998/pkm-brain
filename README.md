@@ -167,7 +167,12 @@ This is scheduled polling, not a general-purpose filesystem watcher.
 
 ## Wiki Synthesis
 
-PKM Brain can generate source-backed wiki reference pages for ingested documents.
+PKM Brain maintains two wiki layers:
+
+- compiled semantic pages under `~/brain/wiki/projects/`, `concepts/`, `decisions/`, and `open_loops/`
+- source-backed reference pages under `~/brain/wiki/references/<source_type>/`
+
+The compiled pages are the intended human-readable wiki. They group evidence across sources, cite document IDs, and link related concepts with Obsidian-style wikilinks. Reference pages are provenance aids for inspecting a single ingested source.
 
 Preview generated pages:
 
@@ -175,25 +180,35 @@ Preview generated pages:
 uv run brain wiki synthesize --dry-run
 ```
 
-Create generated reference pages:
+Create or update generated wiki pages:
 
 ```bash
 uv run brain wiki synthesize
 ```
 
-Generated pages are written under:
+Generated semantic pages are written under:
+
+```text
+~/brain/wiki/index.md
+~/brain/wiki/projects/
+~/brain/wiki/concepts/
+~/brain/wiki/decisions/
+~/brain/wiki/open_loops/
+```
+
+Generated reference pages are written under:
 
 ```text
 ~/brain/wiki/references/<source_type>/
 ```
 
-The first synthesis pass is conservative and mechanical:
+The V1 compiler is deterministic and conservative:
 
-- creates `reference` pages only
-- cites the source document id
-- includes source path, raw path, chunk count, and excerpts
-- does not infer concepts, decisions, or facts
-- does not overwrite existing generated pages unless `--overwrite-generated` is used
+- updates generated semantic pages only when source evidence matches known compiler patterns
+- cites source document IDs on generated semantic pages
+- uses `[[path/to/page]]` wikilinks for related pages
+- keeps noisy source excerpts in reference pages rather than concept pages
+- skips hand-edited pages that do not contain the generated marker
 
 ## Quickstart
 

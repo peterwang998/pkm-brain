@@ -233,19 +233,70 @@ class BrainService:
 
     def retrieve_context(self, task: str, project: str | None = None, budget: int = 8000) -> dict[str, Any]:
         query = f"{project or ''} {task}".strip()
+        wiki_pages = self.search_wiki_pages(query, limit=8)
         search_result = self.search(query, limit=8, caller="retrieve_context")
         memories = self.active_memories(project)
+        citations = dedupe_preserve_order(
+            [row["chunk_id"] for row in search_result["results"]]
+            + [source_id for page in wiki_pages for source_id in page.get("source_ids", [])]
+        )
         return {
             "task": task,
             "project": project,
             "budget": budget,
             "active_memories": memories,
-            "relevant_wiki_pages": [],
+            "relevant_wiki_pages": wiki_pages,
             "supporting_chunks": search_result["results"],
-            "citations": [row["chunk_id"] for row in search_result["results"]],
+            "citations": citations,
             "open_questions": [],
             "retrieval_event_id": search_result["event_id"],
         }
+
+    def search_wiki_pages(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        self.init_workspace()
+        terms = query_terms(query)
+        if not terms or not self.paths.wiki.exists():
+            return []
+        results: list[dict[str, Any]] = []
+        from .wiki import parse_frontmatter
+
+        for path in sorted(self.paths.wiki.rglob("*.md")):
+            text = path.read_text(encoding="utf-8", errors="replace")
+            frontmatter, body = parse_frontmatter(text)
+            if frontmatter is None:
+                continue
+            page_type = str(frontmatter.get("page_type") or "")
+            haystack = " ".join(
+                [
+                    str(frontmatter.get("title") or ""),
+                    page_type,
+                    " ".join(frontmatter.get("tags") or []),
+                    body,
+                ]
+            ).lower()
+            score = sum(1 for term in terms if term in haystack)
+            if score <= 0:
+                continue
+            if page_type not in {"index", "reference"}:
+                score += 3
+            elif page_type == "index":
+                score += 1
+            summary = first_section(body, "Summary")
+            source_ids = frontmatter.get("source_ids") or []
+            results.append(
+                {
+                    "title": frontmatter.get("title") or path.stem,
+                    "page_type": page_type,
+                    "path": str(path),
+                    "relative_path": str(path.relative_to(self.paths.wiki)),
+                    "source_ids": source_ids[:8],
+                    "source_count": len(source_ids),
+                    "summary": summary,
+                    "score": score,
+                }
+            )
+        results.sort(key=lambda page: (-page["score"], page["page_type"] == "reference", page["title"]))
+        return results[:limit]
 
     def active_memories(self, project: str | None = None) -> list[dict[str, Any]]:
         self.init_workspace()
@@ -369,3 +420,40 @@ def reciprocal_rank_fusion(*rankings: list[str], k: int = 60) -> list[str]:
 def build_fts_query(query: str) -> str:
     terms = re.findall(r"[A-Za-z0-9_]+", query)
     return " OR ".join(f'"{term}"' for term in terms)
+
+
+def query_terms(query: str) -> list[str]:
+    stopwords = {
+        "a",
+        "an",
+        "and",
+        "are",
+        "for",
+        "how",
+        "is",
+        "of",
+        "on",
+        "or",
+        "the",
+        "to",
+        "what",
+        "with",
+    }
+    return [term.lower() for term in re.findall(r"[A-Za-z0-9_]+", query) if term.lower() not in stopwords]
+
+
+def first_section(markdown: str, heading: str) -> str:
+    match = re.search(rf"^##\s+{re.escape(heading)}\s*\n+(.*?)(?=^##\s+|\Z)", markdown, flags=re.MULTILINE | re.DOTALL)
+    if not match:
+        return ""
+    return re.sub(r"\s+", " ", match.group(1)).strip()
+
+
+def dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    output: list[str] = []
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            output.append(value)
+    return output
