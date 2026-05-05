@@ -83,6 +83,7 @@ uv run brain ingest
 uv run brain search "sqlite metadata" --debug
 uv run brain inspect chunks <document_id>
 uv run brain wiki lint
+uv run brain wiki synthesize --dry-run
 uv run brain memory audit
 ```
 
@@ -162,6 +163,38 @@ LaunchAgent logs are written to:
 ~/brain/logs/launchagent.err.log
 ```
 
+This is scheduled polling, not a general-purpose filesystem watcher.
+
+## Wiki Synthesis
+
+PKM Brain can generate source-backed wiki reference pages for ingested documents.
+
+Preview generated pages:
+
+```bash
+uv run brain wiki synthesize --dry-run
+```
+
+Create generated reference pages:
+
+```bash
+uv run brain wiki synthesize
+```
+
+Generated pages are written under:
+
+```text
+~/brain/wiki/references/<source_type>/
+```
+
+The first synthesis pass is conservative and mechanical:
+
+- creates `reference` pages only
+- cites the source document id
+- includes source path, raw path, chunk count, and excerpts
+- does not infer concepts, decisions, or facts
+- does not overwrite existing generated pages unless `--overwrite-generated` is used
+
 ## Quickstart
 
 ```bash
@@ -189,6 +222,7 @@ Implemented:
 - reciprocal-rank fusion for hybrid retrieval
 - structured context retrieval
 - wiki schema linting
+- mechanical source-backed wiki reference synthesis
 - memory proposal and audit commands
 - ingestion run logs
 - Codex, Claude, and OpenCode agent-log capture
@@ -197,12 +231,11 @@ Implemented:
 
 Not yet implemented:
 
-- automatic wiki synthesis
 - autonomous memory activation
 - query expansion
 - local reranking
 - cloud embedding providers
-- background file watcher
+- general-purpose background filesystem watcher
 - HTTP API
 - GUI or Obsidian plugin
 

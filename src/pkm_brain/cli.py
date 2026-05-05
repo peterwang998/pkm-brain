@@ -23,7 +23,7 @@ from .db import connection, rows
 from .mcp_server import create_mcp
 from .paths import BrainPaths
 from .service import BrainService
-from .wiki import lint_wiki
+from .wiki import lint_wiki, synthesize_wiki
 
 app = typer.Typer(help="Local personal knowledge management and agent memory tool.")
 inspect_app = typer.Typer(help="Inspect documents and chunks.")
@@ -159,6 +159,21 @@ def wiki_lint(home: Optional[Path] = typer.Option(None)) -> None:
     result = lint_wiki(svc.paths)
     console.print_json(json.dumps(result))
     if result["errors"]:
+        raise typer.Exit(1)
+
+
+@wiki_app.command("synthesize")
+def wiki_synthesize(
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    overwrite_generated: bool = typer.Option(False, "--overwrite-generated"),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    svc = service(home)
+    svc.init_workspace()
+    result = synthesize_wiki(svc.paths, dry_run=dry_run, overwrite_generated=overwrite_generated)
+    console.print_json(json.dumps(result))
+    lint_result = result.get("lint")
+    if lint_result and lint_result["errors"]:
         raise typer.Exit(1)
 
 

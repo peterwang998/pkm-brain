@@ -6,7 +6,7 @@ from pkm_brain.audit import audit_memories
 from pkm_brain.db import connection
 from pkm_brain.paths import BrainPaths
 from pkm_brain.service import BrainService
-from pkm_brain.wiki import lint_wiki
+from pkm_brain.wiki import lint_wiki, synthesize_wiki
 
 
 def service_for(tmp_path: Path) -> BrainService:
@@ -97,6 +97,34 @@ def test_wiki_lint_accepts_valid_decision_page(tmp_path: Path) -> None:
 
     assert result["errors"] == []
     assert result["pages"] == 1
+
+
+def test_wiki_synthesis_creates_reference_pages_for_documents(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "sqlite-decision.md"
+    note.write_text(
+        "# SQLite Decision\n\nSQLite is the canonical metadata store.\n",
+        encoding="utf-8",
+    )
+    svc.ingest()
+
+    dry = synthesize_wiki(svc.paths, dry_run=True)
+    assert dry["created"]
+    assert not list(svc.paths.wiki.rglob("*.md"))
+
+    result = synthesize_wiki(svc.paths)
+    assert result["created"]
+    assert result["lint"]["errors"] == []
+    pages = list((svc.paths.wiki / "references").rglob("*.md"))
+    assert len(pages) == 1
+    text = pages[0].read_text(encoding="utf-8")
+    assert "page_type: reference" in text
+    assert "document:" in text
+
+    second = synthesize_wiki(svc.paths)
+    assert second["created"] == []
+    assert second["skipped"]
 
 
 def test_memory_audit_warns_on_missing_source(tmp_path: Path) -> None:

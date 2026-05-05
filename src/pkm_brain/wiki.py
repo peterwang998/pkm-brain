@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import re
+import hashlib
 from typing import Any
 
 import yaml
 
-from .db import connection
+from .db import connection, rows
 from .paths import BrainPaths
+from .util import now_iso, slugify
 
 
 ALLOWED_PAGE_TYPES = {
@@ -30,6 +32,7 @@ TYPE_SECTIONS = {
     "timeline": ["Events", "Current Status", "Source Evidence"],
     "reference": ["Notes", "Extracted Facts", "Source Evidence"],
 }
+GENERATED_MARKER = "<!-- generated-by: pkm-brain wiki-synthesis v1 -->"
 
 
 def lint_wiki(paths: BrainPaths) -> dict[str, Any]:
@@ -133,3 +136,170 @@ def sync_wiki_pages(paths: BrainPaths, pages: list[dict[str, Any]]) -> None:
                     str(page.get("updated_at") or ""),
                 ),
             )
+
+
+def synthesize_wiki(paths: BrainPaths, dry_run: bool = False, overwrite_generated: bool = False) -> dict[str, Any]:
+    paths.wiki.mkdir(parents=True, exist_ok=True)
+    existing_sources = existing_generated_sources(paths)
+    created: list[str] = []
+    skipped: list[str] = []
+    updated: list[str] = []
+    with connection(paths.sqlite_path) as conn:
+        documents = rows(
+            conn,
+            """
+            SELECT d.*,
+                   COUNT(c.id) AS chunk_count,
+                   GROUP_CONCAT(c.text, '\n\n---CHUNK---\n\n') AS chunk_texts
+            FROM documents d
+            LEFT JOIN chunks c ON c.document_id = d.id
+            WHERE d.ingested_at = (
+              SELECT MAX(d2.ingested_at)
+              FROM documents d2
+              WHERE d2.source_path = d.source_path
+            )
+            GROUP BY d.id
+            ORDER BY d.ingested_at DESC
+            """,
+        )
+    for document in documents:
+        source_id = f"document:{document['id']}"
+        path = reference_page_path(paths, dict(document))
+        source_path_key = f"source_path:{document['source_path']}"
+        exists_for_source = existing_sources.get(source_path_key) or existing_sources.get(source_id)
+        if exists_for_source and not overwrite_generated:
+            skipped.append(str(exists_for_source))
+            continue
+        markdown = render_reference_page(dict(document), source_id)
+        if dry_run:
+            if exists_for_source:
+                updated.append(str(exists_for_source))
+            else:
+                created.append(str(path))
+            continue
+        target = exists_for_source or path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(markdown, encoding="utf-8")
+        if exists_for_source:
+            updated.append(str(target))
+        else:
+            created.append(str(target))
+
+    lint_result = lint_wiki(paths) if not dry_run else None
+    return {
+        "documents": len(documents),
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+        "dry_run": dry_run,
+        "lint": lint_result,
+    }
+
+
+def existing_generated_sources(paths: BrainPaths) -> dict[str, Any]:
+    found: dict[str, Any] = {}
+    for path in paths.wiki.rglob("*.md"):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if GENERATED_MARKER not in text:
+            continue
+        frontmatter, _ = parse_frontmatter(text)
+        if not frontmatter:
+            continue
+        for source_id in frontmatter.get("source_ids") or []:
+            found[str(source_id)] = path
+        if frontmatter.get("source_path"):
+            found[f"source_path:{frontmatter['source_path']}"] = path
+    return found
+
+
+def reference_page_path(paths: BrainPaths, document: dict[str, Any]) -> Any:
+    title = document["title"] or document["id"]
+    stable_id = hashlib.sha256(str(document["source_path"]).encode("utf-8")).hexdigest()[:8]
+    filename = f"{slugify(title)}-{stable_id}.md"
+    return paths.wiki / "references" / document["source_type"] / filename
+
+
+def render_reference_page(document: dict[str, Any], source_id: str) -> str:
+    title = document["title"] or document["id"]
+    page_id = f"reference-{slugify(title)}-{str(document['id'])[-8:]}"
+    chunk_texts = split_chunk_texts(document.get("chunk_texts") or "")
+    excerpts = [clean_excerpt(text) for text in chunk_texts[:3] if clean_excerpt(text)]
+    timestamp = now_iso()[:10]
+    frontmatter = {
+        "title": title,
+        "page_type": "reference",
+        "id": page_id,
+        "status": "active",
+        "created_at": timestamp,
+        "updated_at": timestamp,
+        "source_ids": [source_id],
+        "source_path": document["source_path"],
+        "related": [],
+        "tags": [document["source_type"]],
+    }
+    lines = [
+        "---",
+        yaml.safe_dump(frontmatter, sort_keys=False).strip(),
+        "---",
+        "",
+        GENERATED_MARKER,
+        "",
+        f"# {title}",
+        "",
+        "## Summary",
+        "",
+        f"Reference page synthesized from `{document['source_type']}` source `{source_id}`.",
+        "",
+        "## Key Points",
+        "",
+        f"- Source type: `{document['source_type']}`",
+        f"- Source path: `{document['source_path']}`",
+        f"- Raw path: `{document['raw_path']}`",
+        f"- Chunk count: `{document['chunk_count']}`",
+        f"- Ingested at: `{document['ingested_at']}`",
+        "",
+        "## Source Evidence",
+        "",
+        f"- `{source_id}`",
+        "",
+        "## Related Pages",
+        "",
+        "- None yet.",
+        "",
+        "## Open Questions",
+        "",
+        "- None yet.",
+        "",
+        "## Notes",
+        "",
+    ]
+    if excerpts:
+        for excerpt in excerpts:
+            lines.append(f"- {excerpt}")
+    else:
+        lines.append("- No notes extracted yet.")
+    lines.extend(
+        [
+            "",
+            "## Extracted Facts",
+            "",
+            "- No extracted facts yet.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def split_chunk_texts(value: str) -> list[str]:
+    if not value:
+        return []
+    return value.split("\n\n---CHUNK---\n\n")
+
+
+def clean_excerpt(text: str, max_chars: int = 500) -> str:
+    text = re.sub(r"\A---\n.*?\n---\n", "", text, flags=re.DOTALL)
+    text = text.replace(GENERATED_MARKER, "")
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars]}... [truncated]"
