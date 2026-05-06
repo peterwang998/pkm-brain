@@ -116,6 +116,19 @@ CREATE TABLE IF NOT EXISTS ingestion_runs (
   warnings TEXT NOT NULL DEFAULT '[]'
 );
 
+CREATE TABLE IF NOT EXISTS automation_runs (
+  id TEXT PRIMARY KEY,
+  job_name TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  status TEXT NOT NULL,
+  summary TEXT NOT NULL DEFAULT '{}',
+  error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_automation_runs_job_status
+ON automation_runs(job_name, status, finished_at);
+
 CREATE TABLE IF NOT EXISTS retrieval_events (
   id TEXT PRIMARY KEY,
   query TEXT NOT NULL,

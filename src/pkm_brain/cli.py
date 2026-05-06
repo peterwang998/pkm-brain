@@ -13,10 +13,16 @@ from .audit import audit_memories, provenance_check
 from .automation import (
     as_jsonable,
     install_launch_agent,
+    install_nightly_launch_agent,
+    index_status as automation_index_status,
     launch_agent_status,
+    nightly_launch_agent_status,
     render_launch_agent,
+    render_nightly_launch_agent,
     uninstall_launch_agent,
+    uninstall_nightly_launch_agent,
     run_agent_log_ingest,
+    run_nightly_maintenance,
 )
 from .capture import AgentLogCapture
 from .db import connection, rows
@@ -132,24 +138,7 @@ def inspect_chunks(document_id: str, home: Optional[Path] = typer.Option(None)) 
 def index_status(home: Optional[Path] = typer.Option(None)) -> None:
     svc = service(home)
     svc.init_workspace()
-    with connection(svc.paths.sqlite_path) as conn:
-        docs = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
-        chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-        fts = conn.execute("SELECT COUNT(*) FROM chunk_fts").fetchone()[0]
-        runs = rows(conn, "SELECT * FROM ingestion_runs ORDER BY started_at DESC LIMIT 1")
-    lancedb_exists = svc.paths.lancedb_path.exists() and any(svc.paths.lancedb_path.iterdir())
-    console.print_json(
-        json.dumps(
-            {
-                "documents": docs,
-                "chunks": chunks,
-                "fts_rows": fts,
-                "lancedb_exists": lancedb_exists,
-                "embedding_provider": svc.embedding_provider.name,
-                "last_run": dict(runs[0]) if runs else None,
-            }
-        )
-    )
+    console.print_json(json.dumps(automation_index_status(svc.paths, svc)))
 
 
 @wiki_app.command("lint")
@@ -285,6 +274,20 @@ def automation_run_agent_log_ingest(
     console.print_json(json.dumps(as_jsonable(result)))
 
 
+@automation_app.command("nightly")
+def automation_nightly(
+    if_due: bool = typer.Option(False, "--if-due", help="Skip when the last successful nightly run is still recent."),
+    due_after_hours: int = typer.Option(20, help="Minimum hours between successful nightly runs when --if-due is set."),
+    agent: str = typer.Option("all", help="Agent to capture: all, codex, claude, or opencode."),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    paths = BrainPaths.from_value(home)
+    result = run_nightly_maintenance(paths, if_due=if_due, due_after_hours=due_after_hours, agent=agent)
+    console.print_json(json.dumps(as_jsonable(result)))
+    if result.status == "failed":
+        raise typer.Exit(1)
+
+
 @launch_agent_app.command("install")
 def launch_agent_install(
     interval: int = typer.Option(600, help="Polling interval in seconds."),
@@ -322,6 +325,55 @@ def launch_agent_render(
     paths = BrainPaths.from_value(home)
     uv = shutil.which("uv") or "/opt/homebrew/bin/uv"
     plist = render_launch_agent(Path.cwd(), paths.home, Path(uv), interval=interval)
+    console.print_json(json.dumps(plist))
+
+
+@launch_agent_app.command("install-nightly")
+def launch_agent_install_nightly(
+    interval: int = typer.Option(3600, help="Wake-check interval in seconds."),
+    due_after_hours: int = typer.Option(20, help="Minimum hours between successful nightly runs."),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    paths = BrainPaths.from_value(home)
+    BrainService(paths).init_workspace()
+    uv = shutil.which("uv") or "/opt/homebrew/bin/uv"
+    result = install_nightly_launch_agent(
+        repo_path=Path.cwd(),
+        brain_home=paths.home,
+        uv_path=Path(uv),
+        interval=interval,
+        due_after_hours=due_after_hours,
+        dry_run=dry_run,
+    )
+    console.print_json(json.dumps(result))
+
+
+@launch_agent_app.command("nightly-status")
+def launch_agent_nightly_status_command() -> None:
+    console.print_json(json.dumps(nightly_launch_agent_status()))
+
+
+@launch_agent_app.command("uninstall-nightly")
+def launch_agent_uninstall_nightly() -> None:
+    console.print_json(json.dumps(uninstall_nightly_launch_agent()))
+
+
+@launch_agent_app.command("render-nightly")
+def launch_agent_render_nightly(
+    interval: int = typer.Option(3600),
+    due_after_hours: int = typer.Option(20),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    paths = BrainPaths.from_value(home)
+    uv = shutil.which("uv") or "/opt/homebrew/bin/uv"
+    plist = render_nightly_launch_agent(
+        Path.cwd(),
+        paths.home,
+        Path(uv),
+        interval=interval,
+        due_after_hours=due_after_hours,
+    )
     console.print_json(json.dumps(plist))
 
 

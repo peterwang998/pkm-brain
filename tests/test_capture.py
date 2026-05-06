@@ -5,7 +5,7 @@ import plistlib
 import sqlite3
 from pathlib import Path
 
-from pkm_brain.automation import render_launch_agent, run_agent_log_ingest
+from pkm_brain.automation import render_launch_agent, render_nightly_launch_agent, run_agent_log_ingest, run_nightly_maintenance
 from pkm_brain.capture import AgentLogCapture, redact_text
 from pkm_brain.db import connection
 from pkm_brain.paths import BrainPaths
@@ -178,6 +178,46 @@ def test_automation_run_captures_and_ingests(tmp_path: Path) -> None:
     assert result.ingest is not None
 
 
+def test_nightly_maintenance_runs_self_healing_tasks(tmp_path: Path) -> None:
+    svc = make_service(tmp_path)
+    result = run_nightly_maintenance(
+        svc.paths,
+        codex_state=tmp_path / "missing-codex.sqlite",
+        claude_projects=tmp_path / "missing-claude",
+        opencode_db=tmp_path / "missing-opencode.sqlite",
+    )
+
+    assert result.status == "success"
+    assert result.summary["capture"]["discovered"] == 0
+    assert result.summary["ingest"] is not None
+    assert result.summary["index_status"]["documents"] == 0
+    assert result.summary["provenance_check"]["errors"] == []
+    assert result.summary["wiki_lint"]["errors"] == []
+    assert result.summary["memory_audit"]["errors"] == []
+    assert (svc.paths.wiki / "index.md").exists()
+    with connection(svc.paths.sqlite_path) as conn:
+        row = conn.execute("SELECT * FROM automation_runs WHERE job_name = ?", ("nightly-maintenance",)).fetchone()
+    assert row is not None
+    assert row["status"] == "success"
+
+
+def test_nightly_maintenance_skips_when_not_due(tmp_path: Path) -> None:
+    svc = make_service(tmp_path)
+    first = run_nightly_maintenance(
+        svc.paths,
+        codex_state=tmp_path / "missing-codex.sqlite",
+        claude_projects=tmp_path / "missing-claude",
+        opencode_db=tmp_path / "missing-opencode.sqlite",
+    )
+
+    second = run_nightly_maintenance(svc.paths, if_due=True, due_after_hours=20)
+
+    assert first.status == "success"
+    assert second.skipped is True
+    assert second.status == "skipped"
+    assert second.run_id is None
+
+
 def test_launch_agent_plist_render() -> None:
     plist = render_launch_agent(
         repo_path=Path("/Users/Peter/pkm-brain"),
@@ -191,6 +231,23 @@ def test_launch_agent_plist_render() -> None:
     assert decoded["Label"] == "com.pkm-brain.agent-log-ingest"
     assert decoded["StartInterval"] == 600
     assert "brain automation run-agent-log-ingest" in decoded["ProgramArguments"][-1]
+
+
+def test_nightly_launch_agent_plist_render() -> None:
+    plist = render_nightly_launch_agent(
+        repo_path=Path("/Users/Peter/pkm-brain"),
+        brain_home=Path("/Users/Peter/brain"),
+        uv_path=Path("/opt/homebrew/bin/uv"),
+        interval=3600,
+        due_after_hours=20,
+    )
+    encoded = plistlib.dumps(plist)
+    decoded = plistlib.loads(encoded)
+
+    assert decoded["Label"] == "com.pkm-brain.nightly-maintenance"
+    assert decoded["StartInterval"] == 3600
+    assert "brain automation nightly --if-due --due-after-hours 20" in decoded["ProgramArguments"][-1]
+    assert decoded["StandardOutPath"].endswith("nightly-maintenance.out.log")
 
 
 def test_redact_text_scrubs_embedded_secret_values() -> None:

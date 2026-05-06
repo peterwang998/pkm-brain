@@ -179,6 +179,7 @@ relations
 memories
 wiki_pages
 ingestion_runs
+automation_runs
 retrieval_events
 agent_sessions
 ```
@@ -245,6 +246,22 @@ rejected
 archived
 ```
 
+Minimum automation run schema:
+
+```sql
+automation_runs(
+  id TEXT PRIMARY KEY,
+  job_name TEXT,
+  started_at TEXT,
+  finished_at TEXT,
+  status TEXT,
+  summary TEXT,
+  error TEXT
+)
+```
+
+Automation run records should track scheduled jobs separately from ingestion runs. A nightly maintenance run may include capture, ingestion, wiki synthesis, audits, and status checks in one job summary.
+
 ## 8. Chunking Strategy
 
 Use source-specific chunking.
@@ -305,6 +322,53 @@ The nightly indexing job should run these stages:
 10. Propose wiki updates.
 11. Propose memory updates.
 12. Log ingestion run.
+```
+
+### 9.1 Nightly Maintenance Automation
+
+The nightly maintenance job is a self-healing wrapper around the local pipeline. It should be broader than the frequent agent-log polling job.
+
+Frequent job:
+
+```text
+com.pkm-brain.agent-log-ingest
+StartInterval = 600
+capture agents
+ingest inbox
+```
+
+Nightly job:
+
+```text
+com.pkm-brain.nightly-maintenance
+StartInterval = 3600
+brain automation nightly --if-due --due-after-hours 20
+```
+
+The nightly job should use an hourly due-check instead of only `StartCalendarInterval`. This makes it laptop-friendly: if the machine sleeps through the intended overnight window, the next hourly check after wake can run maintenance when the last successful run is older than the threshold.
+
+Nightly maintenance should run these local deterministic tasks:
+
+```text
+1. capture agents
+2. ingest inbox
+3. synthesize generated wiki pages with generated-page overwrite
+4. collect index status
+5. run provenance check
+6. run wiki lint
+7. run memory audit
+8. record automation run summary
+```
+
+These steps do not call an LLM by default. They are local Python pipeline operations. LLM-assisted enrichment can be added later as an explicit stage.
+
+Nightly maintenance status rules:
+
+```text
+If --if-due is set and the last successful run is younger than due_after_hours, exit successfully without running work.
+If another nightly run is active, exit successfully as skipped.
+If any check reports errors, record the automation run as failed.
+Warnings should be recorded but should not fail the job by default.
 ```
 
 LLM enrichment may extract:

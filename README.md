@@ -165,6 +165,56 @@ LaunchAgent logs are written to:
 
 This is scheduled polling, not a general-purpose filesystem watcher.
 
+## Nightly Maintenance
+
+PKM Brain also supports a separate nightly maintenance path for broader self-healing checks.
+
+Run it manually:
+
+```bash
+uv run brain automation nightly
+```
+
+The nightly job runs:
+
+- agent-log capture
+- inbox ingestion
+- generated wiki synthesis with generated-page overwrite
+- index status collection
+- provenance check
+- wiki lint
+- memory audit
+
+Install the nightly macOS LaunchAgent:
+
+```bash
+uv run brain launch-agent install-nightly
+```
+
+The nightly LaunchAgent uses an hourly wake-check by default:
+
+```text
+com.pkm-brain.nightly-maintenance
+StartInterval = 3600
+command = brain automation nightly --if-due --due-after-hours 20
+```
+
+This pattern is intentional for laptops. If the machine sleeps through a fixed overnight time, the next hourly check after wake can run maintenance if the last successful run is old enough.
+
+Inspect or remove the nightly job:
+
+```bash
+uv run brain launch-agent nightly-status
+uv run brain launch-agent uninstall-nightly
+```
+
+Nightly logs are written to:
+
+```text
+~/brain/logs/nightly-maintenance.out.log
+~/brain/logs/nightly-maintenance.err.log
+```
+
 ## Wiki Synthesis
 
 PKM Brain maintains two wiki layers:
@@ -242,6 +292,7 @@ Implemented:
 - ingestion run logs
 - Codex, Claude, and OpenCode agent-log capture
 - macOS LaunchAgent scheduled polling
+- hourly due-check nightly maintenance LaunchAgent
 - MCP server wrapper
 
 Not yet implemented:
