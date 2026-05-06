@@ -104,6 +104,195 @@ The MCP server exposes tools for:
 
 Agents should use these tools instead of reading SQLite or LanceDB directly.
 
+## Install On A New Mac
+
+These instructions install the source repo, initialize a local brain workspace, and schedule both background jobs.
+
+### 1. Install prerequisites
+
+Install Xcode command line tools if needed:
+
+```bash
+xcode-select --install
+```
+
+Install `uv`:
+
+```bash
+brew install uv
+```
+
+If Homebrew is not installed, install it first from <https://brew.sh/>.
+
+### 2. Clone the repo
+
+Clone the project into the expected source directory:
+
+```bash
+cd ~
+git clone https://github.com/peterwang998/pkm-brain.git
+cd ~/pkm-brain
+```
+
+For a private repository, authenticate GitHub first with your preferred method, for example `gh auth login`.
+
+### 3. Install Python dependencies
+
+```bash
+uv sync
+```
+
+Verify the CLI loads:
+
+```bash
+uv run brain doctor
+```
+
+### 4. Initialize the local brain workspace
+
+Fresh workspace:
+
+```bash
+uv run brain init --home ~/brain
+```
+
+If migrating an existing brain from another Mac, restore or copy the old `~/brain` directory before running scheduled jobs. The repo is source code; the private runtime data lives outside git in `~/brain`.
+
+Expected runtime layout:
+
+```text
+~/brain/
+  inbox/
+  raw/
+  wiki/
+  memory/
+  indexes/
+  db/
+  logs/
+  config/
+  evals/
+```
+
+### 5. Smoke test the pipeline
+
+Run a normal ingest:
+
+```bash
+uv run brain ingest --home ~/brain
+```
+
+Run core checks:
+
+```bash
+uv run brain index status --home ~/brain
+uv run brain provenance check --home ~/brain
+uv run brain wiki lint --home ~/brain
+uv run brain memory audit --home ~/brain
+```
+
+Optional: preview local agent-log capture if Codex, Claude, or OpenCode are installed on this Mac:
+
+```bash
+uv run brain capture agents --dry-run --home ~/brain
+```
+
+### 6. Install the 10-minute agent-log ingestion job
+
+This job captures local Codex, Claude, and OpenCode session logs, then ingests the inbox.
+
+```bash
+cd ~/pkm-brain
+uv run brain launch-agent install --interval 600 --home ~/brain
+```
+
+Verify it is loaded:
+
+```bash
+uv run brain launch-agent status
+```
+
+Expected status:
+
+```text
+loaded = true
+run interval = 600 seconds
+```
+
+Logs:
+
+```text
+~/brain/logs/launchagent.out.log
+~/brain/logs/launchagent.err.log
+```
+
+### 7. Install the nightly maintenance job
+
+This job performs the broader self-healing pass:
+
+```text
+capture agents
+ingest inbox
+wiki synthesize with generated overwrite
+index status
+provenance check
+wiki lint
+memory audit
+record automation run
+```
+
+Install it:
+
+```bash
+cd ~/pkm-brain
+uv run brain launch-agent install-nightly --home ~/brain
+```
+
+Verify it is loaded:
+
+```bash
+uv run brain launch-agent nightly-status
+```
+
+Expected status:
+
+```text
+loaded = true
+run interval = 3600 seconds
+```
+
+The nightly job wakes hourly and runs real work only when the last successful nightly run is more than 20 hours old:
+
+```text
+brain automation nightly --if-due --due-after-hours 20
+```
+
+This is better for laptops than a single fixed overnight time because the next hourly check after wake can catch up if the machine slept through the night.
+
+Logs:
+
+```text
+~/brain/logs/nightly-maintenance.out.log
+~/brain/logs/nightly-maintenance.err.log
+```
+
+### 8. Verify both scheduled jobs
+
+```bash
+uv run brain launch-agent status
+uv run brain launch-agent nightly-status
+tail -n 40 ~/brain/logs/launchagent.out.log
+tail -n 40 ~/brain/logs/nightly-maintenance.out.log
+```
+
+Both LaunchAgents are local deterministic Python jobs. They do not call GPT-5.5 or any other LLM unless a future pipeline stage explicitly adds an LLM API call.
+
+### 9. Uninstall scheduled jobs
+
+```bash
+uv run brain launch-agent uninstall
+uv run brain launch-agent uninstall-nightly
+```
+
 ## Agent Log Automation
 
 PKM Brain can capture local agent session logs into the inbox, then ingest them through the normal pipeline.
