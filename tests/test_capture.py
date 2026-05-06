@@ -8,6 +8,7 @@ from pathlib import Path
 from pkm_brain.automation import render_launch_agent, render_nightly_launch_agent, run_agent_log_ingest, run_nightly_maintenance
 from pkm_brain.capture import AgentLogCapture, redact_text
 from pkm_brain.db import connection
+from pkm_brain.llm import provider_status
 from pkm_brain.paths import BrainPaths
 from pkm_brain.service import BrainService
 
@@ -216,6 +217,42 @@ def test_nightly_maintenance_skips_when_not_due(tmp_path: Path) -> None:
     assert second.skipped is True
     assert second.status == "skipped"
     assert second.run_id is None
+
+
+def test_nightly_llm_proposals_fail_without_provider(tmp_path: Path, monkeypatch) -> None:
+    svc = make_service(tmp_path)
+    monkeypatch.delenv("PKM_BRAIN_LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("PKM_BRAIN_OLLAMA_MODEL", raising=False)
+
+    result = run_nightly_maintenance(
+        svc.paths,
+        with_llm_wiki_proposals=True,
+        codex_state=tmp_path / "missing-codex.sqlite",
+        claude_projects=tmp_path / "missing-claude",
+        opencode_db=tmp_path / "missing-opencode.sqlite",
+    )
+
+    assert result.status == "failed"
+    assert "PKM_BRAIN_LLM_PROVIDER" in str(result.error)
+
+    due_check = run_nightly_maintenance(svc.paths, if_due=True, with_llm_wiki_proposals=True)
+    assert due_check.status == "failed"
+    assert "PKM_BRAIN_LLM_PROVIDER" in str(due_check.error)
+
+
+def test_llm_provider_status_reports_missing_configuration(monkeypatch) -> None:
+    monkeypatch.delenv("PKM_BRAIN_LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    unset = provider_status()
+    openai = provider_status("openai")
+
+    assert unset["configured"] is False
+    assert "PKM_BRAIN_LLM_PROVIDER" in unset["missing"]
+    assert openai["configured"] is False
+    assert "OPENAI_API_KEY" in openai["missing"]
 
 
 def test_launch_agent_plist_render() -> None:

@@ -26,16 +26,28 @@ from .automation import (
 )
 from .capture import AgentLogCapture
 from .db import connection, rows
+from .llm import provider_status
 from .mcp_server import create_mcp
 from .paths import BrainPaths
 from .service import BrainService
 from .wiki import lint_wiki, synthesize_wiki
+from .wiki_proposals import (
+    apply_wiki_proposal,
+    generate_interview_questions,
+    inspect_wiki_proposal,
+    list_wiki_proposals,
+    propose_from_sources,
+    record_wiki_interview,
+    reject_wiki_proposal,
+)
 
 app = typer.Typer(help="Local personal knowledge management and agent memory tool.")
 inspect_app = typer.Typer(help="Inspect documents and chunks.")
 index_app = typer.Typer(help="Index health commands.")
 wiki_app = typer.Typer(help="Wiki commands.")
+wiki_proposals_app = typer.Typer(help="Wiki proposal review commands.")
 memory_app = typer.Typer(help="Typed memory commands.")
+llm_app = typer.Typer(help="LLM provider commands.")
 runs_app = typer.Typer(help="Pipeline run commands.")
 provenance_app = typer.Typer(help="Provenance validation commands.")
 capture_app = typer.Typer(help="Capture external sources into the inbox.")
@@ -44,7 +56,9 @@ launch_agent_app = typer.Typer(help="macOS LaunchAgent commands.")
 app.add_typer(inspect_app, name="inspect")
 app.add_typer(index_app, name="index")
 app.add_typer(wiki_app, name="wiki")
+wiki_app.add_typer(wiki_proposals_app, name="proposals")
 app.add_typer(memory_app, name="memory")
+app.add_typer(llm_app, name="llm")
 app.add_typer(runs_app, name="runs")
 app.add_typer(provenance_app, name="provenance")
 app.add_typer(capture_app, name="capture")
@@ -166,6 +180,87 @@ def wiki_synthesize(
         raise typer.Exit(1)
 
 
+@wiki_proposals_app.command("list")
+def wiki_proposals_list(
+    status: Optional[str] = typer.Option(None),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    svc = service(home)
+    svc.init_workspace()
+    console.print_json(json.dumps(list_wiki_proposals(svc.paths, status=status)))
+
+
+@wiki_proposals_app.command("inspect")
+def wiki_proposals_inspect(batch_id: str, home: Optional[Path] = typer.Option(None)) -> None:
+    svc = service(home)
+    svc.init_workspace()
+    console.print_json(json.dumps(inspect_wiki_proposal(svc.paths, batch_id)))
+
+
+@wiki_proposals_app.command("reject")
+def wiki_proposals_reject(
+    batch_id: str,
+    reason: Optional[str] = typer.Option(None),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    svc = service(home)
+    svc.init_workspace()
+    console.print_json(json.dumps(reject_wiki_proposal(svc.paths, batch_id, reason=reason)))
+
+
+@wiki_app.command("interview")
+def wiki_interview(
+    batch_id: str,
+    provider: Optional[str] = typer.Option(None),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    svc = service(home)
+    svc.init_workspace()
+    generated = generate_interview_questions(svc.paths, batch_id, provider_name=provider)
+    questions = generated["questions"]
+    answers: list[str] = []
+    for question in questions:
+        answers.append(typer.prompt(question, default=""))
+    disposition = typer.prompt("Disposition: approved, rejected, or needs_interview", default="needs_interview")
+    result = record_wiki_interview(
+        svc.paths,
+        batch_id,
+        questions,
+        answers,
+        disposition,
+        provider=generated.get("provider"),
+        model=generated.get("model"),
+    )
+    console.print_json(json.dumps(result))
+
+
+@wiki_app.command("apply")
+def wiki_apply(batch_id: str, home: Optional[Path] = typer.Option(None)) -> None:
+    svc = service(home)
+    svc.init_workspace()
+    result = apply_wiki_proposal(svc.paths, batch_id)
+    console.print_json(json.dumps(result))
+    if result["lint"]["errors"]:
+        raise typer.Exit(1)
+
+
+@wiki_app.command("propose-from-sources")
+def wiki_propose_from_sources(
+    provider: Optional[str] = typer.Option(None),
+    limit: int = typer.Option(8),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    svc = service(home)
+    svc.init_workspace()
+    result = propose_from_sources(svc.paths, provider_name=provider, limit=limit)
+    console.print_json(json.dumps(result))
+
+
+@llm_app.command("doctor")
+def llm_doctor(provider: Optional[str] = typer.Option(None)) -> None:
+    console.print_json(json.dumps(provider_status(provider)))
+
+
 @memory_app.command("propose")
 def memory_propose(
     memory_type: str,
@@ -279,10 +374,19 @@ def automation_nightly(
     if_due: bool = typer.Option(False, "--if-due", help="Skip when the last successful nightly run is still recent."),
     due_after_hours: int = typer.Option(20, help="Minimum hours between successful nightly runs when --if-due is set."),
     agent: str = typer.Option("all", help="Agent to capture: all, codex, claude, or opencode."),
+    with_llm_wiki_proposals: bool = typer.Option(False, "--with-llm-wiki-proposals"),
+    provider: Optional[str] = typer.Option(None),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
     paths = BrainPaths.from_value(home)
-    result = run_nightly_maintenance(paths, if_due=if_due, due_after_hours=due_after_hours, agent=agent)
+    result = run_nightly_maintenance(
+        paths,
+        if_due=if_due,
+        due_after_hours=due_after_hours,
+        agent=agent,
+        with_llm_wiki_proposals=with_llm_wiki_proposals,
+        provider=provider,
+    )
     console.print_json(json.dumps(as_jsonable(result)))
     if result.status == "failed":
         raise typer.Exit(1)

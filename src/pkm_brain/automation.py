@@ -12,10 +12,12 @@ from typing import Any
 from .audit import audit_memories, provenance_check
 from .capture import AgentLogCapture
 from .db import connection, dumps
+from .llm import get_provider
 from .paths import BrainPaths
 from .service import BrainService
 from .util import new_id, now_iso
 from .wiki import lint_wiki, synthesize_wiki
+from .wiki_proposals import propose_from_sources
 
 
 LAUNCH_AGENT_LABEL = "com.pkm-brain.agent-log-ingest"
@@ -83,6 +85,8 @@ def run_nightly_maintenance(
     codex_state: Path | None = None,
     claude_projects: Path | None = None,
     opencode_db: Path | None = None,
+    with_llm_wiki_proposals: bool = False,
+    provider: str | None = None,
 ) -> NightlyMaintenanceResult:
     service = BrainService(paths)
     service.init_workspace()
@@ -104,6 +108,22 @@ def run_nightly_maintenance(
                 reason="another nightly run is already active",
                 summary={},
             )
+
+        if with_llm_wiki_proposals:
+            try:
+                get_provider(provider)
+            except Exception as exc:
+                return NightlyMaintenanceResult(
+                    run_id=None,
+                    started_at=started_at,
+                    finished_at=now_iso(),
+                    status="failed",
+                    due=True,
+                    skipped=False,
+                    reason=None,
+                    summary={"with_llm_wiki_proposals": True},
+                    error=str(exc),
+                )
 
         if if_due and not nightly_due(paths, due_after_hours):
             return NightlyMaintenanceResult(
@@ -141,6 +161,8 @@ def run_nightly_maintenance(
             summary["provenance_check"] = provenance_check(paths)
             summary["wiki_lint"] = lint_wiki(paths)
             summary["memory_audit"] = audit_memories(paths)
+            if with_llm_wiki_proposals:
+                summary["wiki_proposals"] = propose_from_sources(paths, provider_name=provider)
 
             errors = (
                 summary["capture"].get("errors", [])

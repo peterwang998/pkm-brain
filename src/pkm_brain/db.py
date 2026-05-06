@@ -102,6 +102,54 @@ CREATE TABLE IF NOT EXISTS wiki_pages (
   updated_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS wiki_change_batches (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  rationale TEXT NOT NULL,
+  author TEXT NOT NULL,
+  source TEXT NOT NULL,
+  status TEXT NOT NULL,
+  confidence REAL NOT NULL,
+  source_ids TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL,
+  reviewed_at TEXT,
+  applied_at TEXT,
+  error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_wiki_change_batches_status
+ON wiki_change_batches(status, created_at);
+
+CREATE TABLE IF NOT EXISTS wiki_change_items (
+  id TEXT PRIMARY KEY,
+  batch_id TEXT NOT NULL REFERENCES wiki_change_batches(id) ON DELETE CASCADE,
+  order_index INTEGER NOT NULL,
+  target_path TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  section_name TEXT,
+  proposed_markdown TEXT NOT NULL,
+  rationale TEXT NOT NULL,
+  source_ids TEXT NOT NULL DEFAULT '[]',
+  confidence REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_wiki_change_items_batch_id
+ON wiki_change_items(batch_id);
+
+CREATE TABLE IF NOT EXISTS wiki_interviews (
+  id TEXT PRIMARY KEY,
+  batch_id TEXT NOT NULL REFERENCES wiki_change_batches(id) ON DELETE CASCADE,
+  questions TEXT NOT NULL DEFAULT '[]',
+  answers TEXT NOT NULL DEFAULT '[]',
+  disposition TEXT NOT NULL,
+  provider TEXT,
+  model TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_wiki_interviews_batch_id
+ON wiki_interviews(batch_id);
+
 CREATE TABLE IF NOT EXISTS ingestion_runs (
   id TEXT PRIMARY KEY,
   started_at TEXT NOT NULL,

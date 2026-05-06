@@ -449,6 +449,101 @@ The V1 compiler is deterministic and conservative:
 - keeps noisy source excerpts in reference pages rather than concept pages
 - skips hand-edited pages that do not contain the generated marker
 
+## Unapproved Wiki Proposals
+
+Agents and optional nightly LLM jobs can propose wiki changes without directly editing approved Markdown pages.
+
+Proposal state lives in SQLite:
+
+```text
+wiki_change_batches
+wiki_change_items
+wiki_interviews
+```
+
+The workflow is:
+
+```text
+agent or nightly LLM proposes a batch
+  -> status: proposed or needs_interview
+  -> human runs an interview/review
+  -> status: approved or rejected
+  -> approved batch patches wiki files section-by-section
+  -> status: applied
+```
+
+List and inspect proposals:
+
+```bash
+uv run brain wiki proposals list
+uv run brain wiki proposals inspect <batch_id>
+```
+
+Interview, reject, or apply:
+
+```bash
+uv run brain wiki interview <batch_id>
+uv run brain wiki proposals reject <batch_id>
+uv run brain wiki apply <batch_id>
+```
+
+Generate proposals from recent sources with an LLM provider:
+
+```bash
+uv run brain wiki propose-from-sources --provider openai
+uv run brain wiki propose-from-sources --provider anthropic
+uv run brain wiki propose-from-sources --provider ollama
+```
+
+Enable proposal generation during nightly maintenance:
+
+```bash
+uv run brain automation nightly --with-llm-wiki-proposals --provider openai
+```
+
+If `--with-llm-wiki-proposals` is set and the provider is not configured, the nightly run fails. Normal nightly maintenance without this flag remains deterministic local Python.
+
+Agents can also create proposals through MCP with `propose_wiki_update`.
+
+### LLM Provider Configuration
+
+Check provider configuration without printing secrets:
+
+```bash
+uv run brain llm doctor --provider openai
+uv run brain llm doctor --provider anthropic
+uv run brain llm doctor --provider ollama
+```
+
+OpenAI-compatible:
+
+```bash
+export PKM_BRAIN_LLM_PROVIDER=openai
+export OPENAI_API_KEY=...
+export PKM_BRAIN_OPENAI_MODEL=gpt-5.5
+# Optional:
+export PKM_BRAIN_OPENAI_BASE_URL=https://api.openai.com/v1
+```
+
+Anthropic:
+
+```bash
+export PKM_BRAIN_LLM_PROVIDER=anthropic
+export ANTHROPIC_API_KEY=...
+export PKM_BRAIN_ANTHROPIC_MODEL=claude-sonnet-4-5
+# Optional:
+export PKM_BRAIN_ANTHROPIC_BASE_URL=https://api.anthropic.com
+```
+
+Ollama:
+
+```bash
+export PKM_BRAIN_LLM_PROVIDER=ollama
+export PKM_BRAIN_OLLAMA_MODEL=llama3.1
+# Optional:
+export PKM_BRAIN_OLLAMA_BASE_URL=http://localhost:11434
+```
+
 ## Quickstart
 
 ```bash
@@ -477,6 +572,8 @@ Implemented:
 - structured context retrieval
 - wiki schema linting
 - mechanical source-backed wiki reference synthesis
+- unapproved wiki proposal batches with interview/apply workflow
+- OpenAI-compatible, Anthropic, and Ollama LLM provider adapters for wiki proposals
 - memory proposal and audit commands
 - ingestion run logs
 - Codex, Claude, and OpenCode agent-log capture

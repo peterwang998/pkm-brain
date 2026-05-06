@@ -7,6 +7,7 @@ from pkm_brain.db import connection
 from pkm_brain.paths import BrainPaths
 from pkm_brain.service import BrainService
 from pkm_brain.wiki import lint_wiki, synthesize_wiki
+from pkm_brain.wiki_proposals import apply_wiki_proposal, create_wiki_proposal, inspect_wiki_proposal, record_wiki_interview
 
 
 def service_for(tmp_path: Path) -> BrainService:
@@ -174,6 +175,76 @@ def test_memory_audit_warns_on_missing_source(tmp_path: Path) -> None:
 
     assert audit["errors"] == []
     assert any(memory_id in warning for warning in audit["warnings"])
+
+
+def test_wiki_proposal_interview_and_apply_patches_section(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    target = svc.paths.wiki / "concepts"
+    target.mkdir(parents=True)
+    (target / "test-concept.md").write_text(
+        "---\n"
+        "title: Test Concept\n"
+        "page_type: concept\n"
+        "id: concept-test\n"
+        "status: active\n"
+        "created_at: 2026-05-06\n"
+        "updated_at: 2026-05-06\n"
+        "source_ids:\n"
+        "  - document:test\n"
+        "related: []\n"
+        "tags: []\n"
+        "---\n\n"
+        "# Test Concept\n\n"
+        "## Summary\n\nOld summary.\n\n"
+        "## Key Points\n\n- Old point.\n\n"
+        "## Definition\n\nOld.\n\n"
+        "## Why It Matters\n\nOld.\n\n"
+        "## How It Works\n\nOld.\n\n"
+        "## Related Decisions\n\n- None.\n\n"
+        "## Source Evidence\n\n- document:test\n\n"
+        "## Related Pages\n\n- None.\n\n"
+        "## Open Questions\n\n- None.\n",
+        encoding="utf-8",
+    )
+    batch_id = create_wiki_proposal(
+        svc.paths,
+        title="Update test concept",
+        rationale="Better synthesis.",
+        source_ids=["document:test"],
+        changes=[
+            {
+                "target_path": "concepts/test-concept.md",
+                "operation": "replace_section",
+                "section_name": "Summary",
+                "proposed_markdown": "New source-backed summary.",
+                "rationale": "Improve summary.",
+                "source_ids": ["document:test"],
+                "confidence": 0.9,
+            }
+        ],
+        confidence=0.9,
+    )
+
+    proposal = inspect_wiki_proposal(svc.paths, batch_id)
+    assert proposal["status"] == "proposed"
+    assert proposal["items"][0]["target_path"] == "concepts/test-concept.md"
+
+    reviewed = record_wiki_interview(
+        svc.paths,
+        batch_id,
+        ["Approve?"],
+        ["Yes"],
+        "approved",
+    )
+    assert reviewed["status"] == "approved"
+
+    result = apply_wiki_proposal(svc.paths, batch_id)
+    assert result["lint"]["errors"] == []
+    text = (target / "test-concept.md").read_text(encoding="utf-8")
+    assert "New source-backed summary." in text
+    assert "Old summary." not in text
+    assert inspect_wiki_proposal(svc.paths, batch_id)["status"] == "applied"
 
 
 def test_agent_session_write(tmp_path: Path) -> None:

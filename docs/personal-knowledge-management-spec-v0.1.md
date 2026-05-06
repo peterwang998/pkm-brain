@@ -262,6 +262,61 @@ automation_runs(
 
 Automation run records should track scheduled jobs separately from ingestion runs. A nightly maintenance run may include capture, ingestion, wiki synthesis, audits, and status checks in one job summary.
 
+Minimum wiki proposal schema:
+
+```sql
+wiki_change_batches(
+  id TEXT PRIMARY KEY,
+  title TEXT,
+  rationale TEXT,
+  author TEXT,
+  source TEXT,
+  status TEXT,
+  confidence REAL,
+  source_ids TEXT,
+  created_at TEXT,
+  reviewed_at TEXT,
+  applied_at TEXT,
+  error TEXT
+)
+
+wiki_change_items(
+  id TEXT PRIMARY KEY,
+  batch_id TEXT,
+  order_index INTEGER,
+  target_path TEXT,
+  operation TEXT,
+  section_name TEXT,
+  proposed_markdown TEXT,
+  rationale TEXT,
+  source_ids TEXT,
+  confidence REAL
+)
+
+wiki_interviews(
+  id TEXT PRIMARY KEY,
+  batch_id TEXT,
+  questions TEXT,
+  answers TEXT,
+  disposition TEXT,
+  provider TEXT,
+  model TEXT,
+  created_at TEXT
+)
+```
+
+Wiki proposal statuses:
+
+```text
+proposed
+needs_interview
+approved
+rejected
+applied
+superseded
+failed
+```
+
 ## 8. Chunking Strategy
 
 Use source-specific chunking.
@@ -675,7 +730,41 @@ The wiki compiler should process sources in this order:
 7. Run wiki lint.
 ```
 
-The V1 compiler may use deterministic extraction rules and templates. Later versions may use an LLM to propose richer page updates, but the output must still follow the same schema and cite source ids.
+The V1 compiler may use deterministic extraction rules and templates.
+
+LLM-written wiki maintenance must use a two-state workflow:
+
+```text
+Unapproved state
+  Agents and optional nightly LLM jobs may create wiki proposal batches.
+  These proposals live in SQLite and do not mutate approved Markdown files.
+
+Approved state
+  A human review/interview approves a proposal batch.
+  Approved batches patch wiki Markdown files section-by-section.
+```
+
+Agents and nightly jobs may propose changes, but they must not directly write approved wiki pages. This keeps the workflow close to the LLM Wiki pattern while preserving reviewability and rollback.
+
+Required proposal entrypoints:
+
+```text
+MCP propose_wiki_update(...)
+brain wiki propose-from-sources --provider <openai|anthropic|ollama>
+brain automation nightly --with-llm-wiki-proposals --provider <provider>
+```
+
+Required review/apply entrypoints:
+
+```text
+brain wiki proposals list
+brain wiki proposals inspect <batch_id>
+brain wiki interview <batch_id>
+brain wiki proposals reject <batch_id>
+brain wiki apply <batch_id>
+```
+
+The system must support OpenAI-compatible, Anthropic, and Ollama provider adapters. Provider configuration must be inspectable with `brain llm doctor` without printing secrets. If nightly LLM proposals are explicitly enabled and provider configuration is missing, the nightly run must fail.
 
 ### 11.5 Retrieval Role
 

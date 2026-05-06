@@ -12,6 +12,7 @@ from .embeddings import get_embedding_provider
 from .indexes import search_vectors, upsert_vectors
 from .paths import BrainPaths
 from .util import file_sha256, new_id, now_iso, slugify
+from .wiki_proposals import create_wiki_proposal
 
 
 @dataclass
@@ -328,6 +329,28 @@ class BrainService:
                 (memory_id, memory_type, scope, content, confidence, dumps(sources), "proposed", timestamp, timestamp),
             )
         return memory_id
+
+    def propose_wiki_update(
+        self,
+        title: str,
+        rationale: str,
+        source_ids: list[str],
+        changes: list[dict[str, Any]],
+        confidence: float,
+        author: str = "agent",
+        source: str = "mcp",
+    ) -> str:
+        self.init_workspace()
+        return create_wiki_proposal(
+            self.paths,
+            title=title,
+            rationale=rationale,
+            source_ids=source_ids,
+            changes=changes,
+            confidence=confidence,
+            author=author,
+            source=source,
+        )
 
     def write_agent_session(
         self,
