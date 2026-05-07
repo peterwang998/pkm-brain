@@ -123,6 +123,48 @@ def make_opencode_fixture(tmp_path: Path) -> Path:
     return db
 
 
+def make_hyprnote_fixture(tmp_path: Path) -> Path:
+    root = tmp_path / "hyprnote"
+    session = root / "sessions" / "hyprnote-session-1"
+    session.mkdir(parents=True)
+    (session / "_meta.json").write_text(
+        json.dumps(
+            {
+                "id": "hyprnote-session-1",
+                "title": "Customer Meeting",
+                "created_at": "2026-05-07T15:00:00Z",
+                "event": {
+                    "title": "Customer Meeting",
+                    "started_at": "2026-05-07T15:00:00Z",
+                    "ended_at": "2026-05-07T16:00:00Z",
+                    "location": "Zoom",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (session / "_summary.md").write_text("# Summary\n\n- Discussed Ketch integration.", encoding="utf-8")
+    (session / "_memo.md").write_text("Follow up on deletion workflow.", encoding="utf-8")
+    (session / "transcript.json").write_text(
+        json.dumps(
+            {
+                "transcripts": [
+                    {
+                        "words": [
+                            {"text": " Hello"},
+                            {"text": " from"},
+                            {"text": " Hyprnote."},
+                        ]
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (session / "audio.mp3").write_bytes(b"audio should not be copied")
+    return root
+
+
 def test_capture_agents_writes_markdown_and_skips_unchanged(tmp_path: Path) -> None:
     svc = make_service(tmp_path)
     capture = AgentLogCapture(
@@ -130,6 +172,7 @@ def test_capture_agents_writes_markdown_and_skips_unchanged(tmp_path: Path) -> N
         codex_state=make_codex_fixture(tmp_path),
         claude_projects=make_claude_fixture(tmp_path),
         opencode_db=make_opencode_fixture(tmp_path),
+        hyprnote_root=tmp_path / "missing-hyprnote",
     )
 
     dry = capture.capture(dry_run=True)
@@ -155,6 +198,7 @@ def test_captured_agent_logs_ingest_as_agent_session_logs(tmp_path: Path) -> Non
         codex_state=make_codex_fixture(tmp_path),
         claude_projects=make_claude_fixture(tmp_path),
         opencode_db=make_opencode_fixture(tmp_path),
+        hyprnote_root=tmp_path / "missing-hyprnote",
     )
     capture.capture()
 
@@ -166,6 +210,54 @@ def test_captured_agent_logs_ingest_as_agent_session_logs(tmp_path: Path) -> Non
     assert source_types == ["agent_session_log", "agent_session_log", "agent_session_log"]
 
 
+def test_capture_hyprnote_writes_meeting_markdown_and_skips_unchanged(tmp_path: Path) -> None:
+    svc = make_service(tmp_path)
+    capture = AgentLogCapture(
+        svc.paths,
+        codex_state=tmp_path / "missing-codex.sqlite",
+        claude_projects=tmp_path / "missing-claude",
+        opencode_db=tmp_path / "missing-opencode.sqlite",
+        hyprnote_root=make_hyprnote_fixture(tmp_path),
+    )
+
+    first = capture.capture(agent="hyprnote")
+
+    assert first.discovered == 1
+    assert first.captured == 1
+    artifact = svc.paths.inbox / "documents" / "hyprnote" / "hyprnote-session-1.md"
+    text = artifact.read_text(encoding="utf-8")
+    assert 'source_type: "hyprnote_meeting"' in text
+    assert "# Meeting: Customer Meeting" in text
+    assert "Discussed Ketch integration." in text
+    assert "Follow up on deletion workflow." in text
+    assert "Hello from Hyprnote." in text
+    assert "audio should not be copied" not in text
+
+    second = capture.capture(agent="hyprnote")
+    assert second.skipped == 1
+    assert second.captured == 0
+
+
+def test_captured_hyprnote_ingests_as_meeting_document(tmp_path: Path) -> None:
+    svc = make_service(tmp_path)
+    capture = AgentLogCapture(
+        svc.paths,
+        codex_state=tmp_path / "missing-codex.sqlite",
+        claude_projects=tmp_path / "missing-claude",
+        opencode_db=tmp_path / "missing-opencode.sqlite",
+        hyprnote_root=make_hyprnote_fixture(tmp_path),
+    )
+    capture.capture(agent="hyprnote")
+
+    result = svc.ingest()
+
+    assert result.changed == 1
+    with connection(svc.paths.sqlite_path) as conn:
+        row = conn.execute("SELECT source_type, title FROM documents").fetchone()
+    assert row["source_type"] == "hyprnote_meeting"
+    assert row["title"] == "Customer Meeting"
+
+
 def test_automation_run_captures_and_ingests(tmp_path: Path) -> None:
     svc = make_service(tmp_path)
     result = run_agent_log_ingest(
@@ -173,6 +265,7 @@ def test_automation_run_captures_and_ingests(tmp_path: Path) -> None:
         codex_state=tmp_path / "missing-codex.sqlite",
         claude_projects=tmp_path / "missing-claude",
         opencode_db=tmp_path / "missing-opencode.sqlite",
+        hyprnote_root=tmp_path / "missing-hyprnote",
     )
 
     assert result.capture["discovered"] == 0
@@ -186,6 +279,7 @@ def test_nightly_maintenance_runs_self_healing_tasks(tmp_path: Path) -> None:
         codex_state=tmp_path / "missing-codex.sqlite",
         claude_projects=tmp_path / "missing-claude",
         opencode_db=tmp_path / "missing-opencode.sqlite",
+        hyprnote_root=tmp_path / "missing-hyprnote",
     )
 
     assert result.status == "success"

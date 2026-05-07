@@ -339,6 +339,16 @@ Meeting transcripts:
 - Generate meeting-level summary.
 ```
 
+Hyprnote meeting captures:
+
+```text
+- Source type: hyprnote_meeting.
+- Capture _summary.md, _memo.md, and transcript.json from each session directory.
+- Preserve calendar title, session id, source path, and meeting time range from _meta.json.
+- Do not copy audio files or local model artifacts in V1.
+- Hash text artifacts so unchanged sessions are skipped by scheduled polling.
+```
+
 Agent session logs:
 
 ```text

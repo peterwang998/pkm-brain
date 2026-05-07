@@ -64,6 +64,8 @@ class AgentSessionCapture:
     source_mtime: float | None
     source_size: int | None
     markdown: str
+    source_kind: str = "agent_session_log"
+    output_group: str = "agent_logs"
     warnings: list[str] = field(default_factory=list)
 
 
@@ -91,14 +93,16 @@ class AgentLogCapture:
         codex_state: Path | None = None,
         claude_projects: Path | None = None,
         opencode_db: Path | None = None,
+        hyprnote_root: Path | None = None,
     ) -> None:
         self.paths = paths
         self.codex_state = codex_state or Path("~/.codex/state_5.sqlite").expanduser()
         self.claude_projects = claude_projects or Path("~/.claude/projects").expanduser()
         self.opencode_db = opencode_db or Path("~/.local/share/opencode/opencode.db").expanduser()
+        self.hyprnote_root = hyprnote_root or Path("~/Library/Application Support/hyprnote").expanduser()
 
     def adapters(self, agent: str = "all") -> list[AgentLogAdapter]:
-        selected = {agent} if agent != "all" else {"codex", "claude", "opencode"}
+        selected = {agent} if agent != "all" else {"codex", "claude", "opencode", "hyprnote"}
         adapters: list[AgentLogAdapter] = []
         if "codex" in selected:
             adapters.append(CodexAdapter(self.codex_state))
@@ -106,6 +110,8 @@ class AgentLogCapture:
             adapters.append(ClaudeAdapter(self.claude_projects))
         if "opencode" in selected:
             adapters.append(OpenCodeAdapter(self.opencode_db))
+        if "hyprnote" in selected:
+            adapters.append(HyprnoteAdapter(self.hyprnote_root))
         return adapters
 
     def capture(self, agent: str = "all", dry_run: bool = False) -> CaptureResult:
@@ -120,7 +126,7 @@ class AgentLogCapture:
             result.discovered += len(sessions)
             for session in sessions:
                 result.warnings.extend(session.warnings)
-                output = self.paths.inbox / "agent_logs" / session.agent / f"{slugify(session.session_id)}.md"
+                output = self.paths.inbox / session.output_group / session.agent / f"{slugify(session.session_id)}.md"
                 if self._is_unchanged(session):
                     result.skipped += 1
                     continue
@@ -172,7 +178,7 @@ class AgentLogCapture:
                 """,
                 (
                     capture_id,
-                    "agent_session_log",
+                    session.source_kind,
                     session.agent,
                     session.session_id,
                     str(session.source_path),
@@ -367,6 +373,69 @@ class OpenCodeAdapter:
         return captures
 
 
+class HyprnoteAdapter:
+    agent = "hyprnote"
+
+    def __init__(self, root: Path) -> None:
+        self.root = root.expanduser()
+
+    def capture_sessions(self) -> list[AgentSessionCapture]:
+        sessions_dir = self.root / "sessions"
+        if not sessions_dir.exists():
+            return []
+        captures: list[AgentSessionCapture] = []
+        for session_dir in sorted((path for path in sessions_dir.iterdir() if path.is_dir()), key=session_modified_at, reverse=True):
+            capture = self.capture_session(session_dir)
+            if capture:
+                captures.append(capture)
+        return captures
+
+    def capture_session(self, session_dir: Path) -> AgentSessionCapture | None:
+        text_paths = [
+            session_dir / "_meta.json",
+            session_dir / "_memo.md",
+            session_dir / "_summary.md",
+            session_dir / "transcript.json",
+        ]
+        existing = [path for path in text_paths if path.exists()]
+        if not existing:
+            return None
+        meta = read_json_object(session_dir / "_meta.json")
+        session_id = str(meta.get("id") or session_dir.name)
+        event = meta.get("event") if isinstance(meta.get("event"), dict) else {}
+        title = str(meta.get("title") or event.get("title") or f"Hyprnote session {session_id}")
+        summary = read_text_if_exists(session_dir / "_summary.md")
+        memo = read_text_if_exists(session_dir / "_memo.md")
+        transcript = render_hyprnote_transcript(session_dir / "transcript.json")
+        stats = [path.stat() for path in existing]
+        metadata = {
+            "source_type": "hyprnote_meeting",
+            "agent": "hyprnote",
+            "session_id": session_id,
+            "source_path": str(session_dir),
+            "captured_at": now_iso(),
+            "source_updated_at": max(stat.st_mtime for stat in stats),
+            "title": title,
+            "created_at": meta.get("created_at") or "",
+            "event_started_at": event.get("started_at") or "",
+            "event_ended_at": event.get("ended_at") or "",
+            "location": event.get("location") or "",
+        }
+        source_hash = text_sha256("\n".join(path.read_text(encoding="utf-8", errors="replace") for path in existing))
+        return AgentSessionCapture(
+            agent="hyprnote",
+            session_id=session_id,
+            title=title,
+            source_path=session_dir,
+            source_hash=source_hash,
+            source_mtime=max(stat.st_mtime for stat in stats),
+            source_size=sum(stat.st_size for stat in stats),
+            markdown=render_hyprnote_markdown(metadata, summary=summary, memo=memo, transcript=transcript),
+            source_kind="hyprnote_meeting",
+            output_group="documents",
+        )
+
+
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     with path.open(encoding="utf-8", errors="replace") as fh:
@@ -433,12 +502,81 @@ def render_markdown(metadata: dict[str, Any], events: list[dict[str, Any]]) -> s
     return "\n".join(lines)
 
 
+def render_hyprnote_markdown(metadata: dict[str, Any], summary: str, memo: str, transcript: str) -> str:
+    title = metadata.get("title") or "Hyprnote meeting"
+    lines = [
+        "---",
+        *yaml_frontmatter_lines(metadata),
+        "---",
+        "",
+        f"# Meeting: {title}",
+        "",
+        "## Summary",
+        "",
+        summary.strip() or "No summary was captured.",
+        "",
+        "## Memo",
+        "",
+        memo.strip() or "No memo was captured.",
+        "",
+        "## Transcript",
+        "",
+        transcript.strip() or "No transcript was captured.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def yaml_frontmatter_lines(metadata: dict[str, Any]) -> list[str]:
     lines: list[str] = []
     for key, value in metadata.items():
         safe = str(value).replace("\n", " ").replace('"', '\\"')
         lines.append(f'{key}: "{safe}"')
     return lines
+
+
+def render_hyprnote_transcript(path: Path) -> str:
+    if not path.exists():
+        return ""
+    data = read_json_object(path)
+    transcripts = data.get("transcripts")
+    if not isinstance(transcripts, list):
+        return ""
+    rendered: list[str] = []
+    for transcript in transcripts:
+        if not isinstance(transcript, dict):
+            continue
+        words = transcript.get("words")
+        if not isinstance(words, list):
+            continue
+        text = "".join(str(word.get("text", "")) for word in words if isinstance(word, dict))
+        cleaned = re.sub(r"\s+", " ", text).strip()
+        if cleaned:
+            rendered.append(cleaned)
+    return "\n\n".join(rendered)
+
+
+def read_json_object(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def read_text_if_exists(path: Path) -> str:
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def session_modified_at(path: Path) -> float:
+    try:
+        return max((child.stat().st_mtime for child in path.iterdir() if child.is_file()), default=path.stat().st_mtime)
+    except OSError:
+        return 0.0
 
 
 def markdown_items(items: list[str]) -> list[str]:

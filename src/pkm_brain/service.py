@@ -80,17 +80,18 @@ class BrainService:
                         continue
                     content_hash = file_sha256(path)
                     existing = conn.execute(
-                        "SELECT id FROM documents WHERE content_hash = ?",
+                        "SELECT id, source_type, title FROM documents WHERE content_hash = ?",
                         (content_hash,),
                     ).fetchone()
+                    text = path.read_text(encoding="utf-8", errors="replace")
+                    title = markdown_frontmatter_value(text, "title") or path.stem.replace("-", " ").replace("_", " ").strip() or path.name
                     if existing:
+                        refresh_existing_document_metadata(conn, existing["id"], source_type, title, path)
                         skipped += 1
                         continue
-                    text = path.read_text(encoding="utf-8", errors="replace")
                     document_id = new_id("doc")
                     ingested_at = now_iso()
                     raw_path = self._copy_raw(path, source_type, ingested_at, content_hash)
-                    title = path.stem.replace("-", " ").replace("_", " ").strip() or path.name
                     conn.execute(
                         """
                         INSERT INTO documents(
@@ -422,6 +423,8 @@ def detect_source_type(path: Path) -> str | None:
     suffix = path.suffix.lower()
     if suffix == ".md":
         text = path.read_text(encoding="utf-8", errors="replace")[:2000].lower()
+        if "source_type: hyprnote_meeting" in text or "/documents/hyprnote/" in str(path):
+            return "hyprnote_meeting"
         if "source_type: agent_session_log" in text or "/agent_logs/" in str(path):
             return "agent_session_log"
         return "agent_session_log" if "commands" in text and "outcome" in text else "markdown_note"
@@ -430,6 +433,39 @@ def detect_source_type(path: Path) -> str | None:
     if suffix in {".json", ".jsonl"}:
         return "agent_session_log"
     return None
+
+
+def markdown_frontmatter_value(text: str, key: str) -> str | None:
+    if not text.startswith("---\n"):
+        return None
+    end = text.find("\n---", 4)
+    if end == -1:
+        return None
+    prefix = f"{key}:"
+    for line in text[4:end].splitlines():
+        if line.startswith(prefix):
+            value = line[len(prefix) :].strip()
+            return value.strip('"').strip("'").strip() or None
+    return None
+
+
+def refresh_existing_document_metadata(conn: Any, document_id: str, source_type: str, title: str, path: Path) -> None:
+    conn.execute(
+        """
+        UPDATE documents
+        SET source_type = ?, title = ?, source_path = ?
+        WHERE id = ?
+        """,
+        (source_type, title, str(path), document_id),
+    )
+    conn.execute(
+        """
+        UPDATE chunk_fts
+        SET title = ?
+        WHERE chunk_id IN (SELECT id FROM chunks WHERE document_id = ?)
+        """,
+        (title, document_id),
+    )
 
 
 def reciprocal_rank_fusion(*rankings: list[str], k: int = 60) -> list[str]:

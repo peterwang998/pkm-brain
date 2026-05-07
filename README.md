@@ -57,7 +57,7 @@ V1 uses:
 - chunking with provenance
 - CLI commands for search, inspection, wiki linting, memory audit, and run inspection
 - MCP server tools for agent access
-- scheduled agent-log capture from Codex, Claude, and OpenCode via macOS LaunchAgent
+- scheduled capture from Codex, Claude, OpenCode, and Hyprnote via macOS LaunchAgent
 
 The runtime data flow is:
 
@@ -190,7 +190,7 @@ uv run brain wiki lint --home ~/brain
 uv run brain memory audit --home ~/brain
 ```
 
-Optional: preview local agent-log capture if Codex, Claude, or OpenCode are installed on this Mac:
+Optional: preview local capture if Codex, Claude, OpenCode, or Hyprnote are installed on this Mac:
 
 ```bash
 uv run brain capture agents --dry-run --home ~/brain
@@ -198,7 +198,7 @@ uv run brain capture agents --dry-run --home ~/brain
 
 ### 6. Install the 10-minute agent-log ingestion job
 
-This job captures local Codex, Claude, and OpenCode session logs, then ingests the inbox.
+This job captures local Codex, Claude, OpenCode, and Hyprnote meeting notes, then ingests the inbox.
 
 ```bash
 cd ~/pkm-brain
@@ -304,13 +304,14 @@ uv run brain launch-agent uninstall-nightly
 
 ## Agent Log Automation
 
-PKM Brain can capture local agent session logs into the inbox, then ingest them through the normal pipeline.
+PKM Brain can capture local agent session logs and Hyprnote meeting documents into the inbox, then ingest them through the normal pipeline.
 
 Supported local agent sources:
 
 - Codex: `~/.codex/state_5.sqlite` plus rollout JSONL files
 - Claude: `~/.claude/projects/**/*.jsonl`
 - OpenCode: `~/.local/share/opencode/opencode.db`
+- Hyprnote: `~/Library/Application Support/hyprnote/sessions/*/{_summary.md,_memo.md,transcript.json}`
 
 Capture is intentionally routed through `~/brain/inbox`, not `~/brain/raw`:
 
@@ -318,6 +319,7 @@ Capture is intentionally routed through `~/brain/inbox`, not `~/brain/raw`:
 agent session stores
   -> brain capture agents
   -> ~/brain/inbox/agent_logs/<agent>/*.md
+  -> ~/brain/inbox/documents/hyprnote/*.md
   -> brain ingest
   -> ~/brain/raw + SQLite + FTS5 + LanceDB
 ```
@@ -601,7 +603,7 @@ Implemented:
 - Codex CLI, OpenAI-compatible, Anthropic, and Ollama LLM provider adapters for wiki proposals
 - memory proposal and audit commands
 - ingestion run logs
-- Codex, Claude, and OpenCode agent-log capture
+- Codex, Claude, OpenCode, and Hyprnote capture
 - macOS LaunchAgent scheduled polling
 - hourly due-check nightly maintenance LaunchAgent
 - MCP server wrapper

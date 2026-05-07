@@ -55,6 +55,7 @@ def run_agent_log_ingest(
     codex_state: Path | None = None,
     claude_projects: Path | None = None,
     opencode_db: Path | None = None,
+    hyprnote_root: Path | None = None,
 ) -> AutomationResult:
     service = BrainService(paths)
     service.init_workspace()
@@ -70,6 +71,7 @@ def run_agent_log_ingest(
             codex_state=codex_state,
             claude_projects=claude_projects,
             opencode_db=opencode_db,
+            hyprnote_root=hyprnote_root,
         ).capture(agent=agent)
         ingest_result = service.ingest()
         return AutomationResult(
@@ -87,6 +89,7 @@ def run_nightly_maintenance(
     codex_state: Path | None = None,
     claude_projects: Path | None = None,
     opencode_db: Path | None = None,
+    hyprnote_root: Path | None = None,
     with_llm_wiki_proposals: bool = False,
     provider: str | None = None,
 ) -> NightlyMaintenanceResult:
@@ -150,6 +153,7 @@ def run_nightly_maintenance(
                 codex_state=codex_state,
                 claude_projects=claude_projects,
                 opencode_db=opencode_db,
+                hyprnote_root=hyprnote_root,
             ).capture(agent=agent)
             summary["capture"] = capture_result.__dict__
 
