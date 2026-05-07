@@ -255,6 +255,14 @@ def test_llm_provider_status_reports_missing_configuration(monkeypatch) -> None:
     assert "OPENAI_API_KEY" in openai["missing"]
 
 
+def test_codex_provider_status_uses_local_cli() -> None:
+    status = provider_status("codex")
+
+    assert status["provider"] == "codex"
+    assert status["model"] == "gpt-5.5"
+    assert isinstance(status["configured"], bool)
+
+
 def test_launch_agent_plist_render() -> None:
     plist = render_launch_agent(
         repo_path=Path("/Users/Peter/pkm-brain"),
@@ -285,6 +293,51 @@ def test_nightly_launch_agent_plist_render() -> None:
     assert decoded["StartInterval"] == 3600
     assert "brain automation nightly --if-due --due-after-hours 20" in decoded["ProgramArguments"][-1]
     assert decoded["StandardOutPath"].endswith("nightly-maintenance.out.log")
+
+
+def test_nightly_launch_agent_plist_render_with_openai_wiki_proposals() -> None:
+    plist = render_nightly_launch_agent(
+        repo_path=Path("/Users/Peter/pkm-brain"),
+        brain_home=Path("/Users/Peter/brain"),
+        uv_path=Path("/opt/homebrew/bin/uv"),
+        interval=3600,
+        due_after_hours=20,
+        with_llm_wiki_proposals=True,
+        provider="openai",
+    )
+    encoded = plistlib.dumps(plist)
+    decoded = plistlib.loads(encoded)
+
+    command = decoded["ProgramArguments"][-1]
+    assert "--with-llm-wiki-proposals" in command
+    assert "--provider openai" in command
+    assert "OPENAI_API_KEY" not in command
+    assert decoded["EnvironmentVariables"]["PKM_BRAIN_LLM_PROVIDER"] == "openai"
+    assert decoded["EnvironmentVariables"]["PKM_BRAIN_OPENAI_MODEL"] == "gpt-5.5"
+
+
+def test_nightly_launch_agent_plist_render_with_codex_wiki_proposals(monkeypatch) -> None:
+    monkeypatch.setenv("PKM_BRAIN_CODEX_BIN", "/opt/homebrew/bin/codex")
+    plist = render_nightly_launch_agent(
+        repo_path=Path("/Users/Peter/pkm-brain"),
+        brain_home=Path("/Users/Peter/brain"),
+        uv_path=Path("/opt/homebrew/bin/uv"),
+        interval=3600,
+        due_after_hours=20,
+        with_llm_wiki_proposals=True,
+        provider="codex",
+    )
+    encoded = plistlib.dumps(plist)
+    decoded = plistlib.loads(encoded)
+
+    command = decoded["ProgramArguments"][-1]
+    assert "--with-llm-wiki-proposals" in command
+    assert "--provider codex" in command
+    assert "OPENAI_API_KEY" not in command
+    assert decoded["EnvironmentVariables"]["PKM_BRAIN_LLM_PROVIDER"] == "codex"
+    assert decoded["EnvironmentVariables"]["PKM_BRAIN_CODEX_MODEL"] == "gpt-5.5"
+    assert decoded["EnvironmentVariables"]["PKM_BRAIN_CODEX_BIN"] == "/opt/homebrew/bin/codex"
+    assert decoded["EnvironmentVariables"]["PKM_BRAIN_CODEX_CWD"] == "/Users/Peter/pkm-brain"
 
 
 def test_redact_text_scrubs_embedded_secret_values() -> None:

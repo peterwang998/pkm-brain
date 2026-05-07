@@ -247,6 +247,15 @@ cd ~/pkm-brain
 uv run brain launch-agent install-nightly --home ~/brain
 ```
 
+Install it with unapproved Codex wiki proposals enabled:
+
+```bash
+cd ~/pkm-brain
+uv run brain launch-agent install-nightly --home ~/brain --with-llm-wiki-proposals --provider codex
+```
+
+The LaunchAgent stores the provider/model choice and the absolute Codex CLI path. With `--provider codex`, no API key is stored by pkm-brain; Codex CLI uses its own local login.
+
 Verify it is loaded:
 
 ```bash
@@ -284,7 +293,7 @@ tail -n 40 ~/brain/logs/launchagent.out.log
 tail -n 40 ~/brain/logs/nightly-maintenance.out.log
 ```
 
-Both LaunchAgents are local deterministic Python jobs. They do not call GPT-5.5 or any other LLM unless a future pipeline stage explicitly adds an LLM API call.
+The capture LaunchAgent is a deterministic local Python job. The nightly LaunchAgent is also deterministic unless installed with `--with-llm-wiki-proposals`, in which case it calls the configured LLM provider to create unapproved wiki proposals.
 
 ### 9. Uninstall scheduled jobs
 
@@ -490,6 +499,7 @@ uv run brain wiki apply <batch_id>
 Generate proposals from recent sources with an LLM provider:
 
 ```bash
+uv run brain wiki propose-from-sources --provider codex
 uv run brain wiki propose-from-sources --provider openai
 uv run brain wiki propose-from-sources --provider anthropic
 uv run brain wiki propose-from-sources --provider ollama
@@ -498,7 +508,7 @@ uv run brain wiki propose-from-sources --provider ollama
 Enable proposal generation during nightly maintenance:
 
 ```bash
-uv run brain automation nightly --with-llm-wiki-proposals --provider openai
+uv run brain automation nightly --with-llm-wiki-proposals --provider codex
 ```
 
 If `--with-llm-wiki-proposals` is set and the provider is not configured, the nightly run fails. Normal nightly maintenance without this flag remains deterministic local Python.
@@ -510,10 +520,25 @@ Agents can also create proposals through MCP with `propose_wiki_update`.
 Check provider configuration without printing secrets:
 
 ```bash
+uv run brain llm doctor --provider codex
 uv run brain llm doctor --provider openai
 uv run brain llm doctor --provider anthropic
 uv run brain llm doctor --provider ollama
 ```
+
+Codex CLI:
+
+```bash
+codex login
+export PKM_BRAIN_LLM_PROVIDER=codex
+export PKM_BRAIN_CODEX_MODEL=gpt-5.5
+# Optional:
+export PKM_BRAIN_CODEX_BIN=/path/to/codex
+export PKM_BRAIN_CODEX_CWD=~/pkm-brain
+export PKM_BRAIN_CODEX_TIMEOUT_SECONDS=900
+```
+
+The Codex provider runs `codex exec` in read-only, non-interactive mode and captures the final message as JSON. It can create unapproved wiki proposal batches, but it cannot directly patch approved wiki Markdown.
 
 OpenAI-compatible:
 
@@ -573,7 +598,7 @@ Implemented:
 - wiki schema linting
 - mechanical source-backed wiki reference synthesis
 - unapproved wiki proposal batches with interview/apply workflow
-- OpenAI-compatible, Anthropic, and Ollama LLM provider adapters for wiki proposals
+- Codex CLI, OpenAI-compatible, Anthropic, and Ollama LLM provider adapters for wiki proposals
 - memory proposal and audit commands
 - ingestion run logs
 - Codex, Claude, and OpenCode agent-log capture

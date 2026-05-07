@@ -436,6 +436,8 @@ def launch_agent_render(
 def launch_agent_install_nightly(
     interval: int = typer.Option(3600, help="Wake-check interval in seconds."),
     due_after_hours: int = typer.Option(20, help="Minimum hours between successful nightly runs."),
+    with_llm_wiki_proposals: bool = typer.Option(False, "--with-llm-wiki-proposals"),
+    provider: Optional[str] = typer.Option(None, help="LLM provider for wiki proposals: codex, openai, anthropic, or ollama."),
     dry_run: bool = typer.Option(False, "--dry-run"),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
@@ -448,6 +450,8 @@ def launch_agent_install_nightly(
         uv_path=Path(uv),
         interval=interval,
         due_after_hours=due_after_hours,
+        with_llm_wiki_proposals=with_llm_wiki_proposals,
+        provider=provider,
         dry_run=dry_run,
     )
     console.print_json(json.dumps(result))
@@ -467,6 +471,8 @@ def launch_agent_uninstall_nightly() -> None:
 def launch_agent_render_nightly(
     interval: int = typer.Option(3600),
     due_after_hours: int = typer.Option(20),
+    with_llm_wiki_proposals: bool = typer.Option(False, "--with-llm-wiki-proposals"),
+    provider: Optional[str] = typer.Option(None, help="LLM provider for wiki proposals: codex, openai, anthropic, or ollama."),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
     paths = BrainPaths.from_value(home)
@@ -477,6 +483,8 @@ def launch_agent_render_nightly(
         Path(uv),
         interval=interval,
         due_after_hours=due_after_hours,
+        with_llm_wiki_proposals=with_llm_wiki_proposals,
+        provider=provider,
     )
     console.print_json(json.dumps(plist))
 

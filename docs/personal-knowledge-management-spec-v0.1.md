@@ -750,7 +750,7 @@ Required proposal entrypoints:
 
 ```text
 MCP propose_wiki_update(...)
-brain wiki propose-from-sources --provider <openai|anthropic|ollama>
+brain wiki propose-from-sources --provider <codex|openai|anthropic|ollama>
 brain automation nightly --with-llm-wiki-proposals --provider <provider>
 ```
 
@@ -764,7 +764,7 @@ brain wiki proposals reject <batch_id>
 brain wiki apply <batch_id>
 ```
 
-The system must support OpenAI-compatible, Anthropic, and Ollama provider adapters. Provider configuration must be inspectable with `brain llm doctor` without printing secrets. If nightly LLM proposals are explicitly enabled and provider configuration is missing, the nightly run must fail.
+The system must support Codex CLI, OpenAI-compatible, Anthropic, and Ollama provider adapters. The Codex adapter should use `codex exec` in read-only, non-interactive mode so pkm-brain can use the user's local Codex login instead of a separate API key. Provider configuration must be inspectable with `brain llm doctor` without printing secrets. If nightly LLM proposals are explicitly enabled and provider configuration is missing, the nightly run must fail.
 
 ### 11.5 Retrieval Role
 

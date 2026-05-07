@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import fcntl
 import json
+import os
 import plistlib
+import shutil
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -304,12 +306,19 @@ def render_nightly_launch_agent(
     uv_path: Path,
     interval: int = 3600,
     due_after_hours: int = 20,
+    with_llm_wiki_proposals: bool = False,
+    provider: str | None = None,
 ) -> dict[str, Any]:
+    llm_args = ""
+    if with_llm_wiki_proposals:
+        llm_args = " --with-llm-wiki-proposals"
+        if provider:
+            llm_args += f" --provider {provider}"
     command = (
         f"cd {repo_path} && "
-        f"{uv_path} run brain automation nightly --if-due --due-after-hours {due_after_hours} --home {brain_home}"
+        f"{uv_path} run brain automation nightly --if-due --due-after-hours {due_after_hours} --home {brain_home}{llm_args}"
     )
-    return {
+    plist = {
         "Label": NIGHTLY_LAUNCH_AGENT_LABEL,
         "ProgramArguments": ["/bin/zsh", "-lc", command],
         "StartInterval": interval,
@@ -318,6 +327,21 @@ def render_nightly_launch_agent(
         "StandardErrorPath": str(brain_home / "logs" / "nightly-maintenance.err.log"),
         "WorkingDirectory": str(repo_path),
     }
+    if with_llm_wiki_proposals:
+        environment = {}
+        if provider:
+            environment["PKM_BRAIN_LLM_PROVIDER"] = provider
+        if provider == "openai":
+            environment["PKM_BRAIN_OPENAI_MODEL"] = os.environ.get("PKM_BRAIN_OPENAI_MODEL", "gpt-5.5")
+        if provider == "codex":
+            environment["PKM_BRAIN_CODEX_MODEL"] = os.environ.get("PKM_BRAIN_CODEX_MODEL", "gpt-5.5")
+            codex_bin = os.environ.get("PKM_BRAIN_CODEX_BIN") or shutil.which("codex")
+            if codex_bin:
+                environment["PKM_BRAIN_CODEX_BIN"] = codex_bin
+            environment["PKM_BRAIN_CODEX_CWD"] = str(repo_path)
+        if environment:
+            plist["EnvironmentVariables"] = environment
+    return plist
 
 
 def install_launch_agent(
@@ -347,9 +371,19 @@ def install_nightly_launch_agent(
     uv_path: Path,
     interval: int = 3600,
     due_after_hours: int = 20,
+    with_llm_wiki_proposals: bool = False,
+    provider: str | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    plist = render_nightly_launch_agent(repo_path, brain_home, uv_path, interval, due_after_hours)
+    plist = render_nightly_launch_agent(
+        repo_path,
+        brain_home,
+        uv_path,
+        interval,
+        due_after_hours,
+        with_llm_wiki_proposals=with_llm_wiki_proposals,
+        provider=provider,
+    )
     path = nightly_launch_agent_path()
     if dry_run:
         return {"path": str(path), "plist": plist, "installed": False}
