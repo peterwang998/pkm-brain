@@ -343,6 +343,7 @@ Hyprnote meeting captures:
 
 ```text
 - Source type: hyprnote_meeting.
+- Opt-in only; default "all" capture must not scan Hyprnote.
 - Capture _summary.md, _memo.md, and transcript.json from each session directory.
 - Preserve calendar title, session id, source path, and meeting time range from _meta.json.
 - Do not copy audio files or local model artifacts in V1.

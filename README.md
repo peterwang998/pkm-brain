@@ -198,7 +198,7 @@ uv run brain capture agents --dry-run --home ~/brain
 
 ### 6. Install the 10-minute agent-log ingestion job
 
-This job captures local Codex, Claude, OpenCode, and Hyprnote meeting notes, then ingests the inbox.
+This job captures local Codex, Claude, and OpenCode session logs, then ingests the inbox. Hyprnote capture is optional and must be enabled explicitly.
 
 ```bash
 cd ~/pkm-brain
@@ -304,14 +304,14 @@ uv run brain launch-agent uninstall-nightly
 
 ## Agent Log Automation
 
-PKM Brain can capture local agent session logs and Hyprnote meeting documents into the inbox, then ingest them through the normal pipeline.
+PKM Brain can capture local agent session logs into the inbox, then ingest them through the normal pipeline. Hyprnote meeting capture is available as an opt-in source.
 
 Supported local agent sources:
 
 - Codex: `~/.codex/state_5.sqlite` plus rollout JSONL files
 - Claude: `~/.claude/projects/**/*.jsonl`
 - OpenCode: `~/.local/share/opencode/opencode.db`
-- Hyprnote: `~/Library/Application Support/hyprnote/sessions/*/{_summary.md,_memo.md,transcript.json}`
+- Hyprnote, opt-in only: `~/Library/Application Support/hyprnote/sessions/*/{_summary.md,_memo.md,transcript.json}`
 
 Capture is intentionally routed through `~/brain/inbox`, not `~/brain/raw`:
 
@@ -337,6 +337,13 @@ uv run brain capture agents
 uv run brain ingest
 ```
 
+Capture Hyprnote explicitly:
+
+```bash
+uv run brain capture agents --agent hyprnote
+uv run brain ingest
+```
+
 Run the scheduled-ingestion command manually:
 
 ```bash
@@ -347,6 +354,12 @@ Install a user-level macOS LaunchAgent that polls every 10 minutes:
 
 ```bash
 uv run brain launch-agent install --interval 600
+```
+
+Install it with Hyprnote included:
+
+```bash
+uv run brain launch-agent install --interval 600 --include-hyprnote
 ```
 
 Inspect or remove it:

@@ -350,24 +350,26 @@ def mcp(home: Optional[Path] = typer.Option(None)) -> None:
 @capture_app.command("agents")
 def capture_agents(
     agent: str = typer.Option("all", help="Source to capture: all, codex, claude, opencode, or hyprnote."),
+    include_hyprnote: bool = typer.Option(False, "--include-hyprnote", help="Include Hyprnote when --agent all is used."),
     hyprnote_root: Optional[Path] = typer.Option(None, help="Hyprnote root directory."),
     dry_run: bool = typer.Option(False, "--dry-run"),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
     svc = service(home)
     svc.init_workspace()
-    result = AgentLogCapture(svc.paths, hyprnote_root=hyprnote_root).capture(agent=agent, dry_run=dry_run)
+    result = AgentLogCapture(svc.paths, hyprnote_root=hyprnote_root, include_hyprnote=include_hyprnote).capture(agent=agent, dry_run=dry_run)
     console.print_json(json.dumps(result.__dict__))
 
 
 @automation_app.command("run-agent-log-ingest")
 def automation_run_agent_log_ingest(
     agent: str = typer.Option("all", help="Source to capture: all, codex, claude, opencode, or hyprnote."),
+    include_hyprnote: bool = typer.Option(False, "--include-hyprnote", help="Include Hyprnote when --agent all is used."),
     hyprnote_root: Optional[Path] = typer.Option(None, help="Hyprnote root directory."),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
     paths = BrainPaths.from_value(home)
-    result = run_agent_log_ingest(paths, agent=agent, hyprnote_root=hyprnote_root)
+    result = run_agent_log_ingest(paths, agent=agent, hyprnote_root=hyprnote_root, include_hyprnote=include_hyprnote)
     console.print_json(json.dumps(as_jsonable(result)))
 
 
@@ -376,6 +378,7 @@ def automation_nightly(
     if_due: bool = typer.Option(False, "--if-due", help="Skip when the last successful nightly run is still recent."),
     due_after_hours: int = typer.Option(20, help="Minimum hours between successful nightly runs when --if-due is set."),
     agent: str = typer.Option("all", help="Source to capture: all, codex, claude, opencode, or hyprnote."),
+    include_hyprnote: bool = typer.Option(False, "--include-hyprnote", help="Include Hyprnote when --agent all is used."),
     hyprnote_root: Optional[Path] = typer.Option(None, help="Hyprnote root directory."),
     with_llm_wiki_proposals: bool = typer.Option(False, "--with-llm-wiki-proposals"),
     provider: Optional[str] = typer.Option(None),
@@ -388,6 +391,7 @@ def automation_nightly(
         due_after_hours=due_after_hours,
         agent=agent,
         hyprnote_root=hyprnote_root,
+        include_hyprnote=include_hyprnote,
         with_llm_wiki_proposals=with_llm_wiki_proposals,
         provider=provider,
     )
@@ -399,6 +403,7 @@ def automation_nightly(
 @launch_agent_app.command("install")
 def launch_agent_install(
     interval: int = typer.Option(600, help="Polling interval in seconds."),
+    include_hyprnote: bool = typer.Option(False, "--include-hyprnote", help="Include Hyprnote in scheduled capture."),
     dry_run: bool = typer.Option(False, "--dry-run"),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
@@ -410,6 +415,7 @@ def launch_agent_install(
         brain_home=paths.home,
         uv_path=Path(uv),
         interval=interval,
+        include_hyprnote=include_hyprnote,
         dry_run=dry_run,
     )
     console.print_json(json.dumps(result))
@@ -428,11 +434,12 @@ def launch_agent_uninstall() -> None:
 @launch_agent_app.command("render")
 def launch_agent_render(
     interval: int = typer.Option(600),
+    include_hyprnote: bool = typer.Option(False, "--include-hyprnote"),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
     paths = BrainPaths.from_value(home)
     uv = shutil.which("uv") or "/opt/homebrew/bin/uv"
-    plist = render_launch_agent(Path.cwd(), paths.home, Path(uv), interval=interval)
+    plist = render_launch_agent(Path.cwd(), paths.home, Path(uv), interval=interval, include_hyprnote=include_hyprnote)
     console.print_json(json.dumps(plist))
 
 

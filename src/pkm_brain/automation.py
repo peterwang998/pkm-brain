@@ -56,6 +56,7 @@ def run_agent_log_ingest(
     claude_projects: Path | None = None,
     opencode_db: Path | None = None,
     hyprnote_root: Path | None = None,
+    include_hyprnote: bool = False,
 ) -> AutomationResult:
     service = BrainService(paths)
     service.init_workspace()
@@ -72,6 +73,7 @@ def run_agent_log_ingest(
             claude_projects=claude_projects,
             opencode_db=opencode_db,
             hyprnote_root=hyprnote_root,
+            include_hyprnote=include_hyprnote,
         ).capture(agent=agent)
         ingest_result = service.ingest()
         return AutomationResult(
@@ -90,6 +92,7 @@ def run_nightly_maintenance(
     claude_projects: Path | None = None,
     opencode_db: Path | None = None,
     hyprnote_root: Path | None = None,
+    include_hyprnote: bool = False,
     with_llm_wiki_proposals: bool = False,
     provider: str | None = None,
 ) -> NightlyMaintenanceResult:
@@ -154,6 +157,7 @@ def run_nightly_maintenance(
                 claude_projects=claude_projects,
                 opencode_db=opencode_db,
                 hyprnote_root=hyprnote_root,
+                include_hyprnote=include_hyprnote,
             ).capture(agent=agent)
             summary["capture"] = capture_result.__dict__
 
@@ -288,10 +292,12 @@ def render_launch_agent(
     brain_home: Path,
     uv_path: Path,
     interval: int = 600,
+    include_hyprnote: bool = False,
 ) -> dict[str, Any]:
+    hyprnote_arg = " --include-hyprnote" if include_hyprnote else ""
     command = (
         f"cd {repo_path} && "
-        f"{uv_path} run brain automation run-agent-log-ingest --home {brain_home}"
+        f"{uv_path} run brain automation run-agent-log-ingest --home {brain_home}{hyprnote_arg}"
     )
     return {
         "Label": LAUNCH_AGENT_LABEL,
@@ -353,9 +359,10 @@ def install_launch_agent(
     brain_home: Path,
     uv_path: Path,
     interval: int = 600,
+    include_hyprnote: bool = False,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    plist = render_launch_agent(repo_path, brain_home, uv_path, interval)
+    plist = render_launch_agent(repo_path, brain_home, uv_path, interval, include_hyprnote=include_hyprnote)
     path = launch_agent_path()
     if dry_run:
         return {"path": str(path), "plist": plist, "installed": False}

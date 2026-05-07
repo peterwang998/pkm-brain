@@ -238,6 +238,35 @@ def test_capture_hyprnote_writes_meeting_markdown_and_skips_unchanged(tmp_path: 
     assert second.captured == 0
 
 
+def test_capture_all_does_not_include_hyprnote_unless_opted_in(tmp_path: Path) -> None:
+    svc = make_service(tmp_path)
+    hyprnote_root = make_hyprnote_fixture(tmp_path)
+    capture = AgentLogCapture(
+        svc.paths,
+        codex_state=tmp_path / "missing-codex.sqlite",
+        claude_projects=tmp_path / "missing-claude",
+        opencode_db=tmp_path / "missing-opencode.sqlite",
+        hyprnote_root=hyprnote_root,
+    )
+
+    default = capture.capture()
+
+    assert default.discovered == 0
+    assert not (svc.paths.inbox / "documents" / "hyprnote").exists()
+
+    opted_in = AgentLogCapture(
+        svc.paths,
+        codex_state=tmp_path / "missing-codex.sqlite",
+        claude_projects=tmp_path / "missing-claude",
+        opencode_db=tmp_path / "missing-opencode.sqlite",
+        hyprnote_root=hyprnote_root,
+        include_hyprnote=True,
+    ).capture()
+
+    assert opted_in.discovered == 1
+    assert opted_in.captured == 1
+
+
 def test_captured_hyprnote_ingests_as_meeting_document(tmp_path: Path) -> None:
     svc = make_service(tmp_path)
     capture = AgentLogCapture(
@@ -370,6 +399,21 @@ def test_launch_agent_plist_render() -> None:
     assert decoded["Label"] == "com.pkm-brain.agent-log-ingest"
     assert decoded["StartInterval"] == 600
     assert "brain automation run-agent-log-ingest" in decoded["ProgramArguments"][-1]
+    assert "--include-hyprnote" not in decoded["ProgramArguments"][-1]
+
+
+def test_launch_agent_plist_render_with_hyprnote_opt_in() -> None:
+    plist = render_launch_agent(
+        repo_path=Path("/Users/Peter/pkm-brain"),
+        brain_home=Path("/Users/Peter/brain"),
+        uv_path=Path("/opt/homebrew/bin/uv"),
+        interval=600,
+        include_hyprnote=True,
+    )
+    encoded = plistlib.dumps(plist)
+    decoded = plistlib.loads(encoded)
+
+    assert "--include-hyprnote" in decoded["ProgramArguments"][-1]
 
 
 def test_nightly_launch_agent_plist_render() -> None:

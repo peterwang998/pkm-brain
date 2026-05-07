@@ -94,15 +94,19 @@ class AgentLogCapture:
         claude_projects: Path | None = None,
         opencode_db: Path | None = None,
         hyprnote_root: Path | None = None,
+        include_hyprnote: bool = False,
     ) -> None:
         self.paths = paths
         self.codex_state = codex_state or Path("~/.codex/state_5.sqlite").expanduser()
         self.claude_projects = claude_projects or Path("~/.claude/projects").expanduser()
         self.opencode_db = opencode_db or Path("~/.local/share/opencode/opencode.db").expanduser()
         self.hyprnote_root = hyprnote_root or Path("~/Library/Application Support/hyprnote").expanduser()
+        self.include_hyprnote = include_hyprnote
 
     def adapters(self, agent: str = "all") -> list[AgentLogAdapter]:
-        selected = {agent} if agent != "all" else {"codex", "claude", "opencode", "hyprnote"}
+        selected = {agent} if agent != "all" else {"codex", "claude", "opencode"}
+        if agent == "all" and self.include_hyprnote:
+            selected.add("hyprnote")
         adapters: list[AgentLogAdapter] = []
         if "codex" in selected:
             adapters.append(CodexAdapter(self.codex_state))
