@@ -4,7 +4,7 @@ Spec version: 0.1
 
 Status: Draft for human review
 
-Last updated: 2026-05-04
+Last updated: 2026-05-17
 
 ## 1. Purpose
 
@@ -182,6 +182,7 @@ ingestion_runs
 automation_runs
 retrieval_events
 agent_sessions
+forget_events
 ```
 
 Minimum document schema:
@@ -226,13 +227,16 @@ memories(
   id TEXT PRIMARY KEY,
   memory_type TEXT,
   scope TEXT,
+  sensitivity TEXT,
   content TEXT,
   confidence REAL,
   source_ids TEXT,
   status TEXT,
   created_at TEXT,
   updated_at TEXT,
-  last_seen_at TEXT
+  last_seen_at TEXT,
+  reviewed_at TEXT,
+  review_reason TEXT
 )
 ```
 
@@ -316,6 +320,35 @@ applied
 superseded
 failed
 ```
+
+Minimum forget event schema:
+
+```sql
+forget_events(
+  id TEXT PRIMARY KEY,
+  target_kind TEXT,
+  target_id TEXT,
+  content_hash TEXT,
+  reason TEXT,
+  requested_by TEXT,
+  requested_at TEXT,
+  applied_at TEXT,
+  affected_counts TEXT,
+  cloud_egress_followup TEXT
+)
+```
+
+Allowed forget target kinds:
+
+```text
+source
+session
+memory
+pattern
+range
+```
+
+`content_hash` is populated for source and session targets and is used as the re-ingestion tombstone key. `affected_counts` is a JSON object summarizing how many chunks, vectors, memories, wiki pages, and proposal batches were updated by the forget operation. `cloud_egress_followup` records the count of prior retrieval events and automation runs that previously sent the target to a cloud provider, so the user can follow up with provider-side deletion.
 
 ## 8. Chunking Strategy
 
@@ -426,7 +459,16 @@ Nightly maintenance should run these local deterministic tasks:
 8. record automation run summary
 ```
 
-These steps do not call an LLM by default. They are local Python pipeline operations. LLM-assisted enrichment can be added later as an explicit stage.
+These steps do not call an LLM by default. They are local Python pipeline operations. LLM-assisted enrichment must be enabled explicitly with proposal flags.
+
+Optional nightly LLM proposal stages:
+
+```text
+brain automation nightly --with-llm-wiki-proposals --provider <provider>
+brain automation nightly --with-llm-memory-proposals --provider <provider>
+```
+
+`--with-llm-memory-proposals` analyzes recent agent logs, structured `agent_sessions`, unresolved issues, failed or suspicious command history, retrieval events, and existing failure memories. It may create only `proposed` `AgentFailurePatternMemory` records and must deduplicate against existing proposed or active failure memories. It uses the existing `com.pkm-brain.nightly-maintenance` LaunchAgent; no separate memory proposal LaunchAgent should be created.
 
 Nightly maintenance status rules:
 
@@ -486,11 +528,14 @@ Context packet format:
 query
 selected_chunks
 source_citations
-related_memories
+active_memories
+candidate_memories
 related_wiki_pages
 confidence_notes
 omitted_due_to_budget
 ```
+
+`active_memories` are reviewed and trusted. `candidate_memories` are proposed, unreviewed hypotheses surfaced separately for awareness; agents must not treat them as authoritative operational instructions.
 
 ## 11. Wiki Synthesis Layer
 
@@ -763,6 +808,8 @@ Required proposal entrypoints:
 MCP propose_wiki_update(...)
 brain wiki propose-from-sources --provider <codex|openai|anthropic|ollama>
 brain automation nightly --with-llm-wiki-proposals --provider <provider>
+brain memory propose-from-sources --provider <codex|openai|anthropic|ollama>
+brain automation nightly --with-llm-memory-proposals --provider <provider>
 ```
 
 Required review/apply entrypoints:
@@ -895,6 +942,7 @@ BehaviorMemory
 RepoInstructionMemory
 OpenLoopMemory
 FactMemory
+AgentFailurePatternMemory
 ```
 
 Each memory must include:
@@ -919,7 +967,19 @@ agent
 topic
 ```
 
-Agents should propose important memories before activation unless explicitly configured otherwise.
+Reviewed memory lifecycle:
+
+```text
+proposed
+active
+rejected
+archived
+superseded
+```
+
+Agents and nightly jobs may create `proposed` memories. Only local human review through the CLI may activate, reject, or archive them. MCP must expose memory proposal but must not expose approval.
+
+`AgentFailurePatternMemory` is for operational lessons from agent failures: repeated bad assumptions, missed verification, tool misuse, or patterns that should change future agent behavior. It is authoritative only after status becomes `active`.
 
 Example:
 
@@ -932,7 +992,209 @@ sources: [agent_session_2026_05_04]
 status: proposed
 ```
 
-## 13. Agent Interface
+## 13. Sensitivity And Egress Controls
+
+Personal knowledge is mixed-sensitivity. The system must let the user mark sources and memories with a sensitivity tier and must enforce those tiers at retrieval, synthesis, and proposal time.
+
+Sensitivity tiers (stored on `documents.sensitivity` and `memories.sensitivity`):
+
+```text
+public      Shareable freely. Eligible for any retrieval, synthesis, or proposal target.
+normal      Default. Eligible for all local operations and for cloud-LLM-backed
+            enrichment.
+private     Local-only. Must not be sent to any cloud LLM provider for synthesis,
+            proposal, or retrieval-time prompting. May still be returned by local CLI
+            search and by local MCP retrieve_context.
+secret      Excluded from automatic retrieval. Must be opted in per call via an explicit
+            filter. Must never be sent to a cloud LLM provider. Must never be embedded
+            against a cloud embedding API.
+```
+
+Provider classification for egress purposes:
+
+```text
+local   ollama, local hash embedding, local SentenceTransformer
+cloud   anthropic, openai-compatible, codex, cloud embedding providers
+```
+
+The Codex provider is treated as cloud because requests flow through a remote model even though the CLI is local.
+
+Required egress rules:
+
+```text
+1. Any code path that calls a cloud provider for completion or embedding must filter
+   out documents, chunks, and memories with sensitivity in {private, secret} before
+   constructing the prompt or embedding payload.
+2. Nightly automation that uses a cloud provider must abort with a clear error if any
+   candidate source carries sensitivity=secret, unless --include-secret is passed
+   explicitly with a reason recorded on the automation run.
+3. Wiki and memory proposal generation must record the effective sensitivity filter
+   and the count of sources excluded by tier on every run.
+4. The local hash embedding provider and the local SentenceTransformer provider may
+   embed all tiers.
+```
+
+Default sensitivity inference at ingest:
+
+```text
+- agent_session_log captures default to normal unless the capture adapter detected
+  secret-shaped material during redaction; those documents must be marked private at
+  ingest time.
+- markdown_note and meeting_transcript default to normal.
+- hyprnote_meeting defaults to private. The user must promote a meeting explicitly to
+  send it to a cloud provider.
+- manual_entry defaults to normal.
+```
+
+Retrieval rules:
+
+```text
+- retrieve_context must include the effective sensitivity of each returned chunk,
+  wiki page, and memory so callers can decide whether to forward content to a cloud
+  LLM in their own pipeline.
+- search_knowledge must accept a max_sensitivity filter. The default is normal for
+  MCP callers and unrestricted for local CLI callers.
+- Retrieval events must record the effective sensitivity filter applied, the counts
+  excluded by tier, and the caller's transport.
+```
+
+Required commands:
+
+```text
+brain set-sensitivity document <document_id> <tier> [--reason <text>]
+brain set-sensitivity memory <memory_id> <tier> [--reason <text>]
+brain list documents --sensitivity <tier>
+brain list memories --sensitivity <tier>
+brain doctor                          # must report configured egress policy and
+                                       # provider classifications
+brain egress preview --provider <p>   # show counts of sources eligible vs excluded
+                                       # for a given provider, without sending data
+```
+
+Sensitivity is mutable and audited:
+
+```text
+- Every sensitivity change must be logged with old tier, new tier, reason, and actor.
+- Promoting a document from private or secret to normal or public must require an
+  explicit --confirm flag.
+- Demoting from public to a more restrictive tier may happen without confirmation.
+```
+
+## 14. Forgetting And Redaction
+
+The system captures personal material automatically and must provide a defined path to remove it. Rebuilding from raw is necessary but not sufficient when the goal is to delete the raw itself.
+
+Forget target kinds:
+
+```text
+source       A single ingested document, by id, content_hash, or source_path.
+session      A captured agent session, by agent and session id.
+memory       A specific memory id.
+pattern      All documents whose text matches a regex or substring filter.
+range        All documents ingested between two timestamps.
+```
+
+Propagation rules. When a target is forgotten, the system must, in order:
+
+```text
+1. Remove the raw artifact under ~/brain/raw/<source_type>/... .
+2. Remove any remaining copy in ~/brain/inbox.
+3. Delete the documents row, cascading to chunks via the existing ON DELETE CASCADE.
+4. Delete corresponding rows from chunk_fts.
+5. Delete corresponding vectors from the LanceDB chunks table.
+6. Update memories that cite only the forgotten source: set status='archived' with
+   review_reason='source forgotten <document_id>'. Memories that cite the forgotten
+   source plus other surviving sources must have the forgotten source_id removed and
+   must be flagged in the next memory audit.
+7. Update wiki pages that cite the forgotten source: remove the source_id from
+   frontmatter. If a reference page loses its last source_id, delete the page. If a
+   semantic page loses its last source_id, set status='stale' and surface in wiki
+   lint.
+8. Update wiki_change_batches and wiki_change_items: pending proposals that cite only
+   the forgotten source must be moved to status='superseded' with
+   error='source forgotten'.
+9. Update retrieval_events: redact selected and cited chunk ids that no longer
+   resolve, and append a tombstone marker to the event's debug payload.
+10. Update capture_sources: mark the corresponding capture as status='forgotten' so
+    the next polling pass does not re-import the same session.
+11. Insert a forget_events row recording the operation.
+```
+
+Tombstones and re-ingestion:
+
+```text
+- A forget_events row prevents re-ingestion of the same content_hash. The normal
+  ingest path must skip a candidate file whose content_hash matches a forget tombstone.
+- Re-ingesting a forgotten source must require an explicit --force-reingest flag and
+  must record a new forget_events row resolving the prior tombstone.
+```
+
+Required commands:
+
+```text
+brain forget source <document_id> [--reason <text>]
+brain forget source --content-hash <hash>
+brain forget session <agent>:<session_id>
+brain forget memory <memory_id>
+brain forget pattern <regex> [--dry-run|--commit]
+brain forget range --from <iso> --to <iso> [--dry-run|--commit]
+brain forget list                       # show recent forget_events
+brain forget inspect <forget_event_id>  # show propagation summary
+brain forget undo <forget_event_id>     # best-effort restore from raw if still on disk
+```
+
+Dry-run rules:
+
+```text
+- pattern and range forget operations must default to --dry-run. The committing form
+  requires --commit and must print a confirmation summary of affected counts before
+  executing.
+- Single-target forgets (source, session, memory) may run without --dry-run but must
+  print a confirmation summary before executing.
+```
+
+Scope rules:
+
+```text
+- Forgetting a source does not delete memories whose content is durable beyond the
+  source. Memories survive unless they cite only the forgotten source.
+- Forgetting a memory does not delete its source documents.
+- Forgetting a session removes only the agent_session_log document for that session
+  and the matching capture_sources row, not unrelated memories, wiki pages, or other
+  sessions from the same agent.
+```
+
+Audit:
+
+```text
+- brain provenance check must detect dangling source_ids in memories, wiki pages, and
+  retrieval_events. Each dangling reference must either point to a known forget_event
+  or be reported as an integrity error.
+- Every forget operation must be logged to ~/brain/logs/forget.log in addition to the
+  forget_events table.
+- brain memory audit must surface memories that lost source_ids due to a forget
+  operation and prompt for review.
+```
+
+Cloud propagation:
+
+```text
+- Forgetting a source does not retroactively recall content already sent to a cloud
+  LLM provider in a prior automation run or proposal. The user must request deletion
+  through that provider's own retention controls.
+- brain forget must surface the count of prior retrieval_events and automation_runs
+  that sent the forgotten content to a cloud provider, written to
+  forget_events.cloud_egress_followup, so the user knows where else to follow up.
+```
+
+Forget rule:
+
+```text
+The user must be able to remove personal material they captured, and removal must
+propagate predictably across every derived artifact.
+```
+
+## 15. Agent Interface
 
 Expose the system through MCP first.
 
@@ -941,11 +1203,13 @@ Required MCP tools:
 ```text
 search_knowledge(query, filters)
 retrieve_context(task, project, repo, budget)
-get_memories(scope, memory_type)
+get_memories(scope, memory_type, status)
 propose_memory(memory_type, scope, content, sources, confidence)
 write_agent_session(summary, files_touched, commands_run, outcome)
 get_project_context(project)
 ```
+
+`retrieve_context` must return `active_memories` and `candidate_memories` as separate fields. `get_memories` may support status filtering, but memory approval must remain a local CLI action.
 
 Optional HTTP endpoints:
 
@@ -960,7 +1224,7 @@ POST /session
 
 Agents should receive structured context, not raw search dumps.
 
-## 14. Feedback Loop
+## 16. Feedback Loop
 
 Log every retrieval event:
 
@@ -987,7 +1251,7 @@ memory refinement
 
 V1 only needs logging. Ranking feedback can come later.
 
-## 15. Execution Phases
+## 17. Execution Phases
 
 ### Phase 1: Local Archive And Search
 
@@ -1073,7 +1337,7 @@ Top results improve on manually tested queries.
 Context packets are concise and useful for agents.
 ```
 
-## 16. Key Engineering Rules
+## 18. Key Engineering Rules
 
 Agents implementing this system should follow these rules:
 
@@ -1088,7 +1352,7 @@ Use content hashes for caching.
 Log ingestion and retrieval events.
 ```
 
-## 17. Recommended First Implementation Task
+## 19. Recommended First Implementation Task
 
 Start with the smallest useful vertical slice:
 
@@ -1105,7 +1369,7 @@ Start with the smallest useful vertical slice:
 
 Do not start with the wiki or memory system until raw ingestion and retrieval are working end to end.
 
-## 18. Evaluation, Debugging, And Observability
+## 20. Evaluation, Debugging, And Observability
 
 The system must be debuggable at every layer: ingestion, chunking, indexing, retrieval, context assembly, wiki synthesis, and memory writing.
 
@@ -1343,6 +1607,9 @@ Commands:
 ```text
 brain memory list --status proposed
 brain memory inspect <memory_id>
+brain memory approve <memory_id>
+brain memory reject <memory_id> --reason <reason>
+brain memory archive <memory_id>
 brain memory audit
 ```
 
