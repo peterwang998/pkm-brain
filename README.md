@@ -73,6 +73,8 @@ inbox files
 
 SQLite is the system of record. LanceDB is a derived retrieval index and can be rebuilt from SQLite chunks.
 
+For a multi-device setup with a laptop as the canonical Brain and a LAN-only secondary machine as a mirror/outbox node, see [Primary / Secondary Brain Sync Spec](docs/primary-secondary-brain-sync-spec.md).
+
 ## Human And Agent Interfaces
 
 Humans interact through the CLI:
