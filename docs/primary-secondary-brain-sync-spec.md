@@ -332,7 +332,53 @@ brain sync init-secondary --node-id <secondary-node-id> --primary-node-id <prima
 brain sync add-peer --node-id <secondary-node-id> --host <secondary-host> --user <ssh-user> --brain-home <secondary-brain-home> --yes
 ```
 
-### 10.3 Capture Export
+### 10.3 Main Installer Integration
+
+The main Brain installation process must expose this topology directly instead of requiring users to discover `brain sync` separately.
+
+Add an interactive setup wizard:
+
+```bash
+brain setup
+```
+
+or an explicit wizard mode on init:
+
+```bash
+brain init --wizard
+```
+
+The wizard should perform normal single-machine Brain setup first, then ask whether to configure multi-device sync.
+
+Required wizard flow:
+
+```text
+1. Choose Brain home path.
+2. Initialize or validate the local Brain workspace.
+3. Ask: "Set up multi-device Primary/Secondary sync now?"
+4. If no, finish normal local setup.
+5. If yes, ask whether this machine is Primary or Secondary.
+6. If Primary:
+   - Prompt for Primary node ID.
+   - Ask whether to add a Secondary now.
+   - If yes, prompt for Secondary node ID, SSH host, SSH user, remote Brain home, and optional SSH identity file.
+   - Run `brain sync doctor`.
+   - Run `brain sync test-connection <secondary-node-id>`.
+   - Offer to install the Primary sync LaunchAgent only if validation passes.
+7. If Secondary:
+   - Prompt for Secondary node ID.
+   - Prompt for expected Primary node ID.
+   - Prompt for outbox path.
+   - Prompt for local capture sources to enable.
+   - Run `brain sync doctor`.
+   - Offer to install the Secondary capture LaunchAgent only if validation passes.
+```
+
+The wizard must support `--dry-run` and `--json` modes so users can preview the planned config without writing files. Non-interactive flags may exist for automation, but the default user path should be guided prompts.
+
+The wizard must not ask for or persist private key contents, tokens, passwords, or other secrets. It may store paths to SSH identity files and trusted host-key fingerprints.
+
+### 10.4 Capture Export
 
 Extend capture:
 
@@ -362,7 +408,7 @@ Manifest row shape:
 }
 ```
 
-### 10.4 Rsync Transport
+### 10.5 Rsync Transport
 
 Use `rsync` over SSH for V1.
 
@@ -406,7 +452,7 @@ indexes/
 logs/
 ```
 
-### 10.5 Remote Commands
+### 10.6 Remote Commands
 
 After push, the Primary may ask the Secondary to rebuild derived state:
 
@@ -416,7 +462,7 @@ ssh <ssh-user>@<secondary-host> 'cd <pkm-brain-repo> && uv run brain ingest --ho
 
 This command is LAN-only and initiated by the Primary.
 
-### 10.6 Scheduling
+### 10.7 Scheduling
 
 Primary LaunchAgent:
 
@@ -444,6 +490,8 @@ Failure behavior:
 ## 11. Install-Time Validation
 
 Installation must validate local role and peer connectivity before enabling scheduled sync.
+
+The preferred install path is the main setup wizard. The lower-level commands below are the underlying operations that the wizard calls and are also available for scripted setup.
 
 Primary install flow:
 
@@ -650,14 +698,15 @@ Manual acceptance test:
 
 ## 18. Implementation Order
 
-1. Add sync config model and `brain sync doctor`.
-2. Add role initialization commands.
-3. Add peer connection test over SSH.
-4. Add rsync command builder and dry-run mode.
-5. Add Secondary outbox export for captured agent logs.
-6. Add Primary pull into `inbox/external/<node_id>/`.
-7. Add Primary push of canonical source directories.
-8. Add remote Secondary ingest command.
-9. Add sync run logging and status.
-10. Add LaunchAgent installers for Primary sync and Secondary capture.
-11. Add docs to README install flow.
+1. Add the main `brain setup` or `brain init --wizard` installer flow.
+2. Add sync config model and `brain sync doctor`.
+3. Add role initialization commands.
+4. Add peer connection test over SSH.
+5. Add rsync command builder and dry-run mode.
+6. Add Secondary outbox export for captured agent logs.
+7. Add Primary pull into `inbox/external/<node_id>/`.
+8. Add Primary push of canonical source directories.
+9. Add remote Secondary ingest command.
+10. Add sync run logging and status.
+11. Add LaunchAgent installers for Primary sync and Secondary capture.
+12. Add docs to README install flow.

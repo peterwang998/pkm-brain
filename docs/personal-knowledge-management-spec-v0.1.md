@@ -87,6 +87,39 @@ Orchestration: cron or Makefile initially
 Human frontend: Obsidian / VSCode / filesystem
 ```
 
+### 4.1 Pending Installation Wizard
+
+The current V1 CLI initialization path is a direct workspace initializer, not a guided installation wizard. A publishable install flow should add an interactive wizard as a pending implementation item.
+
+Required command:
+
+```text
+brain setup
+```
+
+Acceptable alias:
+
+```text
+brain init --wizard
+```
+
+The wizard should prompt for:
+
+```text
+Brain home path
+workspace initialization or validation
+agent capture sources to enable
+MCP setup guidance for supported agents
+scheduled capture LaunchAgent installation
+nightly maintenance LaunchAgent installation
+optional LLM proposal provider configuration
+optional Primary / Secondary Brain sync setup
+```
+
+If the user chooses Primary / Secondary sync setup, the wizard must hand off to the sync configuration flow described in `docs/primary-secondary-brain-sync-spec.md`.
+
+The wizard must support `--dry-run`, `--json`, and non-interactive flags for scripted installs, but the default human path should be guided prompts.
+
 ## 5. Filesystem Layout
 
 Use a project directory such as:
