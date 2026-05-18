@@ -110,8 +110,8 @@ Brain home path
 workspace initialization or validation
 agent capture sources to enable
 MCP setup guidance for supported agents
-scheduled capture LaunchAgent installation
-nightly maintenance LaunchAgent installation
+scheduled capture job installation
+nightly maintenance job installation
 optional LLM proposal provider configuration
 optional Primary / Secondary Brain sync setup
 ```
@@ -119,6 +119,33 @@ optional Primary / Secondary Brain sync setup
 If the user chooses Primary / Secondary sync setup, the wizard must hand off to the sync configuration flow described in `docs/primary-secondary-brain-sync-spec.md`.
 
 The wizard must support `--dry-run`, `--json`, and non-interactive flags for scripted installs, but the default human path should be guided prompts.
+
+### 4.2 Pending Local Web UI
+
+Add an optional local Web UI as a human control plane for Brain status, setup, scheduled jobs, sync validation, and memory review.
+
+Default behavior:
+
+```text
+brain ui --host 127.0.0.1 --port 8765
+```
+
+The UI must bind to loopback by default, start on demand, avoid logging raw document contents, and require a local token or equivalent local authentication gate. LAN-visible mode must be explicit and authenticated.
+
+Required areas:
+
+```text
+status dashboard
+setup wizard
+capture and ingestion jobs
+Primary / Secondary sync status
+memory review and validation
+recent logs and errors
+```
+
+The Web UI must remain a thin layer over the same service operations as the CLI. It must not create a separate data model, memory store, sync engine, or approval path. Memory approval remains local and human-operated.
+
+For the detailed Primary / Secondary access model, SSH tunnel flow, scheduler abstraction, and Web UI sync requirements, see `docs/primary-secondary-brain-sync-spec.md`.
 
 ## 5. Filesystem Layout
 
@@ -1013,7 +1040,7 @@ archived
 superseded
 ```
 
-Agents and nightly jobs may create `proposed` memories. Only local human review through the CLI may activate, reject, or archive them. MCP must expose memory proposal but must not expose approval.
+Agents and nightly jobs may create `proposed` memories. Only local human review through the CLI or local Web UI may activate, reject, or archive them. MCP must expose memory proposal but must not expose approval.
 
 `AgentFailurePatternMemory` is for operational lessons from agent failures: repeated bad assumptions, missed verification, tool misuse, or patterns that should change future agent behavior. It is authoritative only after status becomes `active`.
 
@@ -1245,7 +1272,7 @@ write_agent_session(summary, files_touched, commands_run, outcome)
 get_project_context(project)
 ```
 
-`retrieve_context` must return `active_memories` and `candidate_memories` as separate fields. `get_memories` may support status filtering, but memory approval must remain a local CLI action.
+`retrieve_context` must return `active_memories` and `candidate_memories` as separate fields. `get_memories` may support status filtering, but memory approval must remain a local human action through the CLI or local Web UI.
 
 Optional HTTP endpoints:
 

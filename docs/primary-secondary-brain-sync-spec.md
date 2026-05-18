@@ -2,7 +2,7 @@
 
 Spec version: 0.1
 
-Status: Draft for implementation
+Status: Draft target design; current implementation status is tracked in Section 19
 
 Last updated: 2026-05-18
 
@@ -62,11 +62,13 @@ Derived state:
 - Keep sync deterministic and debuggable with plain files, SSH, and `rsync`.
 - Validate at install time whether a workspace is Primary or Secondary.
 - Validate that configured peer connectivity is live before enabling scheduled sync.
+- Provide an optional local-only control plane for status, setup, sync validation, job management, and memory review.
 - Avoid bidirectional writes to the same logical source path.
 
 ## 4. Non-Goals
 
 - No public Brain server in V1.
+- No public Web UI in V1.
 - No public inbound SSH to the Secondary.
 - No always-on cross-internet mesh requirement.
 - No direct syncing of live SQLite or LanceDB directories.
@@ -303,7 +305,7 @@ All setup commands must be interactive by default. Flags are optional for script
 - Brain home path, defaulting to `~/brain`.
 - Whether to add a Secondary peer now.
 - Optional shared config directory.
-- Whether to install the Primary sync LaunchAgent after validation.
+- Whether to install the Primary scheduled sync job after validation.
 
 `brain sync init-secondary` prompts for:
 
@@ -312,7 +314,7 @@ All setup commands must be interactive by default. Flags are optional for script
 - Expected Primary `node_id`.
 - Outbox path, defaulting to `~/brain/outbox/<node_id>`.
 - Which local capture sources to enable.
-- Whether to install the Secondary capture LaunchAgent after validation.
+- Whether to install the Secondary scheduled capture job after validation.
 
 `brain sync add-peer` prompts for:
 
@@ -364,14 +366,14 @@ Required wizard flow:
    - If yes, prompt for Secondary node ID, SSH host, SSH user, remote Brain home, and optional SSH identity file.
    - Run `brain sync doctor`.
    - Run `brain sync test-connection <secondary-node-id>`.
-   - Offer to install the Primary sync LaunchAgent only if validation passes.
+   - Offer to install the Primary scheduled sync job only if validation passes.
 7. If Secondary:
    - Prompt for Secondary node ID.
    - Prompt for expected Primary node ID.
    - Prompt for outbox path.
    - Prompt for local capture sources to enable.
    - Run `brain sync doctor`.
-   - Offer to install the Secondary capture LaunchAgent only if validation passes.
+   - Offer to install the Secondary scheduled capture job only if validation passes.
 ```
 
 The wizard must support `--dry-run` and `--json` modes so users can preview the planned config without writing files. Non-interactive flags may exist for automation, but the default user path should be guided prompts.
@@ -464,7 +466,7 @@ This command is LAN-only and initiated by the Primary.
 
 ### 10.7 Scheduling
 
-Primary LaunchAgent:
+Primary scheduled sync job:
 
 ```text
 com.pkm-brain.sync-primary
@@ -472,13 +474,27 @@ StartInterval = 1800
 command = brain sync run <secondary-node-id> --if-reachable
 ```
 
-Secondary LaunchAgent:
+Secondary scheduled capture job:
 
 ```text
 com.pkm-brain.capture-secondary
 StartInterval = 600
 command = brain capture agents --export-outbox
 ```
+
+The initial implementation may render these as macOS LaunchAgents. The scheduler interface should not assume launchd-only semantics because Linux support should map the same logical jobs to systemd user timers, and generic Unix support should be able to fall back to cron or on-demand commands.
+
+Add a logical scheduler command group:
+
+```bash
+brain scheduler install-sync --peer <secondary-node-id> --interval 1800
+brain scheduler install-secondary-capture --interval 600
+brain scheduler status
+brain scheduler uninstall-sync --peer <secondary-node-id>
+brain scheduler uninstall-secondary-capture
+```
+
+macOS-specific `brain launch-agent ...` commands may remain as lower-level adapter commands, but user-facing setup and Web UI flows should prefer the scheduler abstraction.
 
 Failure behavior:
 
@@ -500,7 +516,7 @@ brain sync init-primary
 brain sync add-peer
 brain sync doctor
 brain sync test-connection <secondary-node-id>
-brain launch-agent install-sync --peer <secondary-node-id> --interval 1800
+brain scheduler install-sync --peer <secondary-node-id> --interval 1800
 ```
 
 Secondary install flow:
@@ -508,8 +524,10 @@ Secondary install flow:
 ```bash
 brain sync init-secondary
 brain sync doctor
-brain launch-agent install-secondary-capture --interval 600
+brain scheduler install-secondary-capture --interval 600
 ```
+
+`brain scheduler` is the logical command group for scheduled Brain jobs. The macOS implementation may render LaunchAgents; Linux may render systemd user timers; generic Unix may render cron entries or report that only on-demand execution is available.
 
 During interactive install, `init-primary`, `init-secondary`, and `add-peer` must never print or persist secrets such as private key material. They may persist paths to key files and trusted host-key fingerprints.
 
@@ -650,7 +668,87 @@ sync_runs(
 - Pending secondary outbox count if reachable.
 - Whether Primary and Secondary have matching latest canonical manifest hash.
 
-## 16. Test Plan
+## 16. Local Web UI Control Plane
+
+The sync topology should expose a lightweight local Web UI as an optional control plane. The Web UI is not a public Brain service and must not become a second source of truth.
+
+Default command:
+
+```bash
+brain ui --host 127.0.0.1 --port 8765
+```
+
+Default access:
+
+```text
+http://127.0.0.1:8765
+```
+
+Default behavior:
+
+- Bind to `127.0.0.1` only.
+- Start on demand and stop when the user exits the command.
+- Use a local token or equivalent local authentication gate.
+- Avoid writing raw document contents into server logs.
+- Keep polling bounded so idle CPU is effectively zero and idle memory stays modest.
+
+Optional always-on service:
+
+```bash
+brain ui service install
+brain ui service status
+brain ui service uninstall
+```
+
+Always-on mode is optional. A laptop Primary should work well with on-demand UI startup. A stationary Secondary may use an always-on local service, still bound to loopback.
+
+Access modes:
+
+- Same-machine access: run `brain ui` on the machine and open `http://127.0.0.1:8765`.
+- Secondary access from the Primary laptop: keep the Secondary UI loopback-only and use SSH port forwarding.
+
+```bash
+ssh -L 8765:127.0.0.1:8765 <ssh-user>@<secondary-host>
+```
+
+The browser still opens `http://127.0.0.1:8765` on the laptop; traffic reaches the Secondary only through SSH.
+
+LAN-visible mode is not default. If supported, it must require explicit flags, authentication, and a warning:
+
+```bash
+brain ui --host 0.0.0.0 --port 8765
+```
+
+Required UI areas:
+
+- Status: Brain home, role, node ID, database/index size, last ingest, last nightly run, last sync, and current warnings.
+- Setup wizard: normal single-machine setup, optional Primary/Secondary sync setup, peer connection testing, and scheduled job installation.
+- Sync: configured peers, reachability, dry-run pull/push, last run details, pending outbox counts, and conflict warnings.
+- Jobs: install, uninstall, status, and test actions for supported background schedulers.
+- Logs: recent capture, ingest, sync, nightly maintenance, and Web UI errors.
+- Memory review: proposed, active, rejected, and archived memories with source evidence and review actions.
+
+Memory review behavior:
+
+- The Web UI must call the same service-layer operations as the CLI-equivalent memory commands.
+- It may approve, reject with reason, archive, and inspect memories.
+- It must show source IDs, confidence, scope, memory type, status, reviewed timestamp, and review reason.
+- It should surface mechanical validation from `brain memory audit`.
+- It should flag missing sources, low confidence, likely duplicates, stale claims, and possible conflicts when those checks exist.
+- It must treat `active` memories as reviewed guidance and `proposed` memories as unreviewed candidates.
+- MCP agents may propose memories, but memory approval remains a local human action through CLI or local UI.
+
+Implementation boundary:
+
+- The Web UI should be a thin layer over existing Brain service functions and JSON-style status endpoints.
+- It should not create a separate data model, separate memory store, or separate sync engine.
+- Initial endpoints should mirror existing CLI concepts: doctor, index status, memory list/inspect/approve/reject/archive/audit, launch job status, capture, ingest, and future sync status.
+- The Web UI should be platform-neutral. Background service installation should use an adapter layer:
+  - macOS: LaunchAgent.
+  - Linux: systemd user service/timer.
+  - Generic Unix fallback: cron or on-demand only.
+
+## 17. Test Plan
 
 Unit tests:
 
@@ -688,25 +786,75 @@ Manual acceptance test:
 10. Push canonical source material back to the Secondary.
 11. Confirm Secondary local retrieval sees the same source after rebuild.
 
-## 17. Open Questions
+## 18. Open Questions
 
 - Should reviewed memories be exported as Markdown files in `memory/`, or remain SQLite-only with a separate export step?
 - Should Primary sync import Secondary `agent_sessions` MCP-written structured records, or only captured agent log Markdown?
 - Should remote ingest run automatically after every push, or only during scheduled mirror refresh?
 - Should the Secondary have a local read-only MCP mode when configured as Secondary?
 - Should the default topology use hostnames, static LAN IPs, or both?
+- Should the Web UI use a small local web framework or a framework-free local HTTP server for V1?
+- Should the Web UI be on-demand only for V1, with always-on service installation deferred until sync jobs exist?
 
-## 18. Implementation Order
+## 19. Implementation Status And Drift Audit
 
-1. Add the main `brain setup` or `brain init --wizard` installer flow.
-2. Add sync config model and `brain sync doctor`.
-3. Add role initialization commands.
-4. Add peer connection test over SSH.
-5. Add rsync command builder and dry-run mode.
-6. Add Secondary outbox export for captured agent logs.
-7. Add Primary pull into `inbox/external/<node_id>/`.
-8. Add Primary push of canonical source directories.
-9. Add remote Secondary ingest command.
-10. Add sync run logging and status.
-11. Add LaunchAgent installers for Primary sync and Secondary capture.
-12. Add docs to README install flow.
+Audit date: 2026-05-18.
+
+This spec is a target design. The current codebase implements several prerequisite pieces, but the Primary/Secondary sync topology and Web UI are not implemented yet.
+
+Currently implemented in code:
+
+- Direct workspace initialization through `brain init`.
+- General `brain doctor`, ingest, search, retrieve-context, MCP server, and index status commands.
+- Agent capture for Codex, Claude, OpenCode, and opt-in Hyprnote into the local inbox.
+- Latest-snapshot retention for re-ingested `agent_session_log` source paths.
+- Memory proposal, list, inspect, approve, reject, archive, and audit commands.
+- Retrieval contract that separates reviewed `active_memories` from unreviewed `candidate_memories`.
+- MCP memory proposal and memory retrieval with status filtering.
+- macOS LaunchAgent installation, status, rendering, and uninstall for local capture and nightly maintenance.
+- Nightly maintenance with optional wiki proposals and optional failure-memory proposals.
+
+Not yet implemented in code:
+
+- `brain setup` and `brain init --wizard`.
+- `brain sync` command group.
+- `sync_config.py` and `config/sync.yaml` role validation.
+- Primary/Secondary role initialization.
+- SSH peer validation and host-key pinning.
+- `rsync` pull/push command builder.
+- Secondary outbox export and `manifest.jsonl`.
+- Primary import into `inbox/external/<secondary-node-id>/` as a named sync operation.
+- Remote Secondary ingest orchestration after Primary push.
+- `sync_runs` SQLite table and `brain sync status`.
+- `brain scheduler` command group.
+- Primary sync LaunchAgent and Secondary outbox-capture LaunchAgent labels.
+- `brain ui`, Web UI HTTP server, Web UI service installer, or UI auth token.
+- systemd user timers or cron fallback for non-macOS systems.
+- Memory file export under `memory/`; typed memories currently live in SQLite.
+- `config/shared/` and `config/local/` directory semantics; the code currently writes a single `config/config.yaml`.
+
+Spec drift notes:
+
+- The target scheduling model is platform-neutral, but current code scheduling support is macOS-specific.
+- The sync design treats `memory/` as canonical source material. Current typed memories are stored in SQLite, so sync requires either a memory export/import step or a decision to keep reviewed memories SQLite-only with a separate export artifact.
+- The external inbox layout should work with the current generic ingest scanner, but no sync-specific node identity, manifest validation, or status accounting exists yet.
+- The current LaunchAgent commands install local capture and nightly jobs only. They do not install Primary sync or Secondary outbox export jobs.
+- The current memory audit is basic: it validates type, status, scope, source presence, and confidence. Duplicate, stale, conflict, and broken-source validation are future checks for the Web UI to surface once implemented.
+
+## 20. Implementation Order
+
+1. Add shared status/service helpers that expose doctor, ingest, index, job, and memory-review state as JSON-safe objects.
+2. Add the main `brain setup` or `brain init --wizard` installer flow.
+3. Add local Web UI foundation with loopback binding, local auth, status page, and memory review over existing service methods.
+4. Add sync config model and `brain sync doctor`.
+5. Add role initialization commands.
+6. Add peer connection test over SSH.
+7. Add rsync command builder and dry-run mode.
+8. Add Secondary outbox export for captured agent logs.
+9. Add Primary pull into `inbox/external/<node_id>/`.
+10. Add Primary push of canonical source directories.
+11. Add remote Secondary ingest command.
+12. Add sync run logging and status.
+13. Add scheduler adapter abstraction with macOS LaunchAgent support first, then systemd user timers and cron/on-demand fallback.
+14. Add Web UI setup/sync/job management pages over the same lower-level commands.
+15. Add docs to README install flow.
