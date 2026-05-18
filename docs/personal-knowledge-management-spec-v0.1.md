@@ -165,7 +165,9 @@ web_clip
 manual_entry
 ```
 
-Raw files must not be mutated after ingestion. If content changes, create a new version with a new hash.
+Raw files must not be mutated after ingestion. If content changes, create a new version with a new hash unless a source type has an explicit retention policy.
+
+Implemented exception: captured `agent_session_log` sources retain only the latest/final snapshot per agent session. A changed snapshot for the same captured session path replaces the prior document, chunks, FTS rows, vector rows, and raw copy. This saves storage and avoids duplicate indexing of long-running session logs produced by scheduled polling.
 
 ## 7. SQLite Schema
 
@@ -386,6 +388,7 @@ Hyprnote meeting captures:
 Agent session logs:
 
 ```text
+- Retain only the latest/final captured snapshot per agent session.
 - Preserve user request.
 - Preserve commands run.
 - Preserve files touched.

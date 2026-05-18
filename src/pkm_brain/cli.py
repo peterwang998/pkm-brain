@@ -27,6 +27,7 @@ from .automation import (
 from .capture import AgentLogCapture
 from .db import connection, rows
 from .llm import provider_status
+from .memory_proposals import propose_failure_memories_from_sources
 from .mcp_server import create_mcp
 from .paths import BrainPaths
 from .service import BrainService
@@ -36,7 +37,7 @@ from .wiki_proposals import (
     generate_interview_questions,
     inspect_wiki_proposal,
     list_wiki_proposals,
-    propose_from_sources,
+    propose_from_sources as propose_wiki_from_sources,
     record_wiki_interview,
     reject_wiki_proposal,
 )
@@ -110,9 +111,10 @@ def retrieve_context(
     task: str = typer.Option(...),
     project: Optional[str] = typer.Option(None),
     budget: int = typer.Option(8000),
+    debug: bool = typer.Option(False, "--debug"),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
-    result = service(home).retrieve_context(task, project=project, budget=budget)
+    result = service(home).retrieve_context(task, project=project, budget=budget, debug=debug)
     console.print_json(json.dumps(result))
 
 
@@ -252,7 +254,7 @@ def wiki_propose_from_sources(
 ) -> None:
     svc = service(home)
     svc.init_workspace()
-    result = propose_from_sources(svc.paths, provider_name=provider, limit=limit)
+    result = propose_wiki_from_sources(svc.paths, provider_name=provider, limit=limit)
     console.print_json(json.dumps(result))
 
 
@@ -277,28 +279,64 @@ def memory_propose(
 @memory_app.command("list")
 def memory_list(status: Optional[str] = typer.Option(None), home: Optional[Path] = typer.Option(None)) -> None:
     svc = service(home)
-    svc.init_workspace()
-    query = "SELECT * FROM memories"
-    params: list[str] = []
-    if status:
-        query += " WHERE status = ?"
-        params.append(status)
-    query += " ORDER BY created_at DESC"
-    with connection(svc.paths.sqlite_path) as conn:
-        found = [dict(row) for row in conn.execute(query, params)]
-    console.print_json(json.dumps(found))
+    console.print_json(json.dumps(svc.list_memories(status=status)))
 
 
 @memory_app.command("inspect")
 def memory_inspect(memory_id: str, home: Optional[Path] = typer.Option(None)) -> None:
     svc = service(home)
-    svc.init_workspace()
-    with connection(svc.paths.sqlite_path) as conn:
-        row = conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
-    if not row:
+    try:
+        row = svc.get_memory(memory_id)
+    except ValueError:
         console.print(f"Memory not found: {memory_id}")
         raise typer.Exit(1)
-    console.print_json(json.dumps(dict(row)))
+    console.print_json(json.dumps(row))
+
+
+@memory_app.command("approve")
+def memory_approve(memory_id: str, home: Optional[Path] = typer.Option(None)) -> None:
+    try:
+        result = service(home).approve_memory(memory_id)
+    except ValueError as exc:
+        console.print(str(exc))
+        raise typer.Exit(1)
+    console.print_json(json.dumps(result))
+
+
+@memory_app.command("reject")
+def memory_reject(
+    memory_id: str,
+    reason: str = typer.Option(..., "--reason", help="Reason for rejecting the proposed memory."),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    try:
+        result = service(home).reject_memory(memory_id, reason)
+    except ValueError as exc:
+        console.print(str(exc))
+        raise typer.Exit(1)
+    console.print_json(json.dumps(result))
+
+
+@memory_app.command("archive")
+def memory_archive(memory_id: str, home: Optional[Path] = typer.Option(None)) -> None:
+    try:
+        result = service(home).archive_memory(memory_id)
+    except ValueError as exc:
+        console.print(str(exc))
+        raise typer.Exit(1)
+    console.print_json(json.dumps(result))
+
+
+@memory_app.command("propose-from-sources")
+def memory_propose_from_sources(
+    provider: Optional[str] = typer.Option("codex"),
+    limit: int = typer.Option(12),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    svc = service(home)
+    svc.init_workspace()
+    result = propose_failure_memories_from_sources(svc.paths, provider_name=provider, limit=limit)
+    console.print_json(json.dumps(result))
 
 
 @memory_app.command("audit")
@@ -381,6 +419,7 @@ def automation_nightly(
     include_hyprnote: bool = typer.Option(False, "--include-hyprnote", help="Include Hyprnote when --agent all is used."),
     hyprnote_root: Optional[Path] = typer.Option(None, help="Hyprnote root directory."),
     with_llm_wiki_proposals: bool = typer.Option(False, "--with-llm-wiki-proposals"),
+    with_llm_memory_proposals: bool = typer.Option(False, "--with-llm-memory-proposals"),
     provider: Optional[str] = typer.Option(None),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
@@ -393,6 +432,7 @@ def automation_nightly(
         hyprnote_root=hyprnote_root,
         include_hyprnote=include_hyprnote,
         with_llm_wiki_proposals=with_llm_wiki_proposals,
+        with_llm_memory_proposals=with_llm_memory_proposals,
         provider=provider,
     )
     console.print_json(json.dumps(as_jsonable(result)))
@@ -448,7 +488,8 @@ def launch_agent_install_nightly(
     interval: int = typer.Option(3600, help="Wake-check interval in seconds."),
     due_after_hours: int = typer.Option(20, help="Minimum hours between successful nightly runs."),
     with_llm_wiki_proposals: bool = typer.Option(False, "--with-llm-wiki-proposals"),
-    provider: Optional[str] = typer.Option(None, help="LLM provider for wiki proposals: codex, openai, anthropic, or ollama."),
+    with_llm_memory_proposals: bool = typer.Option(False, "--with-llm-memory-proposals"),
+    provider: Optional[str] = typer.Option(None, help="LLM provider for proposals: codex, openai, anthropic, or ollama."),
     dry_run: bool = typer.Option(False, "--dry-run"),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
@@ -462,6 +503,7 @@ def launch_agent_install_nightly(
         interval=interval,
         due_after_hours=due_after_hours,
         with_llm_wiki_proposals=with_llm_wiki_proposals,
+        with_llm_memory_proposals=with_llm_memory_proposals,
         provider=provider,
         dry_run=dry_run,
     )
@@ -483,7 +525,8 @@ def launch_agent_render_nightly(
     interval: int = typer.Option(3600),
     due_after_hours: int = typer.Option(20),
     with_llm_wiki_proposals: bool = typer.Option(False, "--with-llm-wiki-proposals"),
-    provider: Optional[str] = typer.Option(None, help="LLM provider for wiki proposals: codex, openai, anthropic, or ollama."),
+    with_llm_memory_proposals: bool = typer.Option(False, "--with-llm-memory-proposals"),
+    provider: Optional[str] = typer.Option(None, help="LLM provider for proposals: codex, openai, anthropic, or ollama."),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
     paths = BrainPaths.from_value(home)
@@ -495,6 +538,7 @@ def launch_agent_render_nightly(
         interval=interval,
         due_after_hours=due_after_hours,
         with_llm_wiki_proposals=with_llm_wiki_proposals,
+        with_llm_memory_proposals=with_llm_memory_proposals,
         provider=provider,
     )
     console.print_json(json.dumps(plist))

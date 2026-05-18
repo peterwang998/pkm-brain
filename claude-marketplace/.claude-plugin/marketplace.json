@@ -1,0 +1,22 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "pkm-brain-local",
+  "description": "Local Claude Code plugins for PKM Brain integrations",
+  "owner": {
+    "name": "Local"
+  },
+  "plugins": [
+    {
+      "name": "pkm-brain-memory",
+      "description": "Use local PKM Brain memory through Claude Code skills and MCP retrieval tools.",
+      "source": "./plugins/pkm-brain-memory",
+      "category": "productivity"
+    },
+    {
+      "name": "teachme",
+      "description": "Teach new concepts through guided dialogue, worked examples, retrieval practice, and teach-back.",
+      "source": "./plugins/teachme",
+      "category": "productivity"
+    }
+  ]
+}

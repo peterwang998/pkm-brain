@@ -1,0 +1,8 @@
+{
+  "name": "teachme",
+  "version": "0.1.0",
+  "description": "Teach new concepts through guided text dialogue, worked examples, retrieval practice, and teach-back.",
+  "author": {
+    "name": "Local"
+  }
+}

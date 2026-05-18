@@ -83,7 +83,9 @@ CREATE TABLE IF NOT EXISTS memories (
   status TEXT NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  last_seen_at TEXT
+  last_seen_at TEXT,
+  reviewed_at TEXT,
+  review_reason TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status);
@@ -249,6 +251,14 @@ def init_db(db_path: Path) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with connection(db_path) as conn:
         conn.executescript(SCHEMA)
+        ensure_column(conn, "memories", "reviewed_at", "TEXT")
+        ensure_column(conn, "memories", "review_reason", "TEXT")
+
+
+def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def rows(conn: sqlite3.Connection, query: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:

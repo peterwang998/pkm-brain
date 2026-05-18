@@ -15,6 +15,7 @@ from .audit import audit_memories, provenance_check
 from .capture import AgentLogCapture
 from .db import connection, dumps
 from .llm import get_provider
+from .memory_proposals import propose_failure_memories_from_sources
 from .paths import BrainPaths
 from .service import BrainService
 from .util import new_id, now_iso
@@ -94,6 +95,7 @@ def run_nightly_maintenance(
     hyprnote_root: Path | None = None,
     include_hyprnote: bool = False,
     with_llm_wiki_proposals: bool = False,
+    with_llm_memory_proposals: bool = False,
     provider: str | None = None,
 ) -> NightlyMaintenanceResult:
     service = BrainService(paths)
@@ -117,7 +119,7 @@ def run_nightly_maintenance(
                 summary={},
             )
 
-        if with_llm_wiki_proposals:
+        if with_llm_wiki_proposals or with_llm_memory_proposals:
             try:
                 get_provider(provider)
             except Exception as exc:
@@ -129,7 +131,10 @@ def run_nightly_maintenance(
                     due=True,
                     skipped=False,
                     reason=None,
-                    summary={"with_llm_wiki_proposals": True},
+                    summary={
+                        "with_llm_wiki_proposals": with_llm_wiki_proposals,
+                        "with_llm_memory_proposals": with_llm_memory_proposals,
+                    },
                     error=str(exc),
                 )
 
@@ -170,9 +175,11 @@ def run_nightly_maintenance(
             summary["index_status"] = index_status(paths, service)
             summary["provenance_check"] = provenance_check(paths)
             summary["wiki_lint"] = lint_wiki(paths)
-            summary["memory_audit"] = audit_memories(paths)
             if with_llm_wiki_proposals:
                 summary["wiki_proposals"] = propose_from_sources(paths, provider_name=provider)
+            if with_llm_memory_proposals:
+                summary["memory_proposals"] = propose_failure_memories_from_sources(paths, provider_name=provider)
+            summary["memory_audit"] = audit_memories(paths)
 
             errors = (
                 summary["capture"].get("errors", [])
@@ -317,11 +324,15 @@ def render_nightly_launch_agent(
     interval: int = 3600,
     due_after_hours: int = 20,
     with_llm_wiki_proposals: bool = False,
+    with_llm_memory_proposals: bool = False,
     provider: str | None = None,
 ) -> dict[str, Any]:
     llm_args = ""
     if with_llm_wiki_proposals:
         llm_args = " --with-llm-wiki-proposals"
+    if with_llm_memory_proposals:
+        llm_args += " --with-llm-memory-proposals"
+    if with_llm_wiki_proposals or with_llm_memory_proposals:
         if provider:
             llm_args += f" --provider {provider}"
     command = (
@@ -337,7 +348,7 @@ def render_nightly_launch_agent(
         "StandardErrorPath": str(brain_home / "logs" / "nightly-maintenance.err.log"),
         "WorkingDirectory": str(repo_path),
     }
-    if with_llm_wiki_proposals:
+    if with_llm_wiki_proposals or with_llm_memory_proposals:
         environment = {}
         if provider:
             environment["PKM_BRAIN_LLM_PROVIDER"] = provider
@@ -383,6 +394,7 @@ def install_nightly_launch_agent(
     interval: int = 3600,
     due_after_hours: int = 20,
     with_llm_wiki_proposals: bool = False,
+    with_llm_memory_proposals: bool = False,
     provider: str | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
@@ -393,6 +405,7 @@ def install_nightly_launch_agent(
         interval,
         due_after_hours,
         with_llm_wiki_proposals=with_llm_wiki_proposals,
+        with_llm_memory_proposals=with_llm_memory_proposals,
         provider=provider,
     )
     path = nightly_launch_agent_path()

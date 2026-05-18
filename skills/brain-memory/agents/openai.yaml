@@ -1,0 +1,12 @@
+interface:
+  display_name: "Brain Memory"
+  short_description: "Use local Brain memory context"
+  default_prompt: "Use $brain-memory to check local Brain memory for relevant prior context before answering."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "pkm-brain"
+      description: "Local PKM Brain MCP server"
+      transport: "stdio"
+policy:
+  allow_implicit_invocation: true

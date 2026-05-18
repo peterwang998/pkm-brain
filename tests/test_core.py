@@ -4,6 +4,8 @@ from pathlib import Path
 
 from pkm_brain.audit import audit_memories
 from pkm_brain.db import connection
+from pkm_brain.indexes import table_names
+from pkm_brain.memory_proposals import propose_failure_memories_from_sources
 from pkm_brain.paths import BrainPaths
 from pkm_brain.service import BrainService
 from pkm_brain.wiki import lint_wiki, synthesize_wiki
@@ -47,6 +49,17 @@ def test_ingest_markdown_chunks_and_searches(tmp_path: Path) -> None:
     assert context["supporting_chunks"]
 
 
+def test_lancedb_table_names_accepts_result_objects() -> None:
+    class Result:
+        tables = ["chunks"]
+
+    class DB:
+        def list_tables(self) -> Result:
+            return Result()
+
+    assert table_names(DB()) == ["chunks"]
+
+
 def test_duplicate_ingest_skips_unchanged_content(tmp_path: Path) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()
@@ -59,6 +72,62 @@ def test_duplicate_ingest_skips_unchanged_content(tmp_path: Path) -> None:
     assert first.changed == 1
     assert second.changed == 0
     assert second.skipped == 1
+
+
+def test_agent_session_log_reingest_replaces_previous_snapshot(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    log = svc.paths.inbox / "agent_logs" / "codex" / "codex-session-1.md"
+    log.parent.mkdir(parents=True)
+    log.write_text(
+        "---\n"
+        'source_type: "agent_session_log"\n'
+        'agent: "codex"\n'
+        'session_id: "codex-session-1"\n'
+        'title: "Codex Session One"\n'
+        "---\n\n"
+        "# Agent Session: Codex Session One\n\n"
+        "## User Requests\n\n"
+        "- first-only-token\n",
+        encoding="utf-8",
+    )
+
+    first = svc.ingest()
+    with connection(svc.paths.sqlite_path) as conn:
+        first_doc = conn.execute("SELECT id, raw_path FROM documents WHERE source_path = ?", (str(log),)).fetchone()
+    assert first.changed == 1
+    assert first_doc is not None
+    first_raw = Path(first_doc["raw_path"])
+    assert first_raw.exists()
+
+    log.write_text(
+        "---\n"
+        'source_type: "agent_session_log"\n'
+        'agent: "codex"\n'
+        'session_id: "codex-session-1"\n'
+        'title: "Codex Session One"\n'
+        "---\n\n"
+        "# Agent Session: Codex Session One\n\n"
+        "## User Requests\n\n"
+        "- second-only-token\n",
+        encoding="utf-8",
+    )
+
+    second = svc.ingest()
+
+    assert second.changed == 1
+    assert second.documents_replaced == 1
+    assert not first_raw.exists()
+    with connection(svc.paths.sqlite_path) as conn:
+        docs = [dict(row) for row in conn.execute("SELECT id, raw_path FROM documents WHERE source_path = ?", (str(log),))]
+        chunks = [row["text"] for row in conn.execute("SELECT text FROM chunks")]
+        fts_text = [row["text"] for row in conn.execute("SELECT text FROM chunk_fts")]
+    assert len(docs) == 1
+    assert docs[0]["id"] != first_doc["id"]
+    assert any("second-only-token" in text for text in chunks)
+    assert not any("first-only-token" in text for text in chunks)
+    assert any("second-only-token" in text for text in fts_text)
+    assert not any("first-only-token" in text for text in fts_text)
 
 
 def test_wiki_lint_accepts_valid_decision_page(tmp_path: Path) -> None:
@@ -166,6 +235,95 @@ def test_wiki_synthesis_compiles_semantic_pages(tmp_path: Path) -> None:
     assert any(str(citation).startswith("document:") for citation in context["citations"])
 
 
+def test_retrieve_context_reranks_clean_sources_and_source_linked_wiki(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    clean = svc.paths.inbox / "ketch-guidepoint.md"
+    clean.write_text(
+        "---\n"
+        'source_type: "hyprnote_meeting"\n'
+        'title: "Ketch Guidepoint Teleconference"\n'
+        "---\n\n"
+        "# Meeting: Ketch Guidepoint Teleconference\n\n"
+        "## ROI Framing and Business Case\n\n"
+        "Ketch's commercial value to enterprise customers is cost avoidance from regulatory fines, "
+        "litigation risk, and audit costs. It also improves operational compliance by automating "
+        "data subject requests and consent enforcement across downstream enterprise systems.\n\n"
+        "## Go-to-Market Motion\n\n"
+        "The enterprise buying motion spans legal, privacy, engineering, data, and marketing teams.\n",
+        encoding="utf-8",
+    )
+    noisy = svc.paths.inbox / "ketch-agent-log.md"
+    noisy.write_text(
+        "---\n"
+        'source_type: "agent_session_log"\n'
+        'title: "restore previous session discussion about Ketch"\n'
+        "---\n\n"
+        "- session_meta: You are Codex, a coding agent based on GPT-5.\n"
+        "- response_item: What is the commercial value of Ketch to enterprise customers?\n"
+        "- event_msg: Ketch commercial value enterprise customers regulatory fines operational compliance.\n"
+        "- response_item: Ketch commercial value enterprise customers regulatory fines operational compliance.\n",
+        encoding="utf-8",
+    )
+    svc.ingest()
+    with connection(svc.paths.sqlite_path) as conn:
+        row = conn.execute("SELECT id FROM documents WHERE title = ?", ("Ketch Guidepoint Teleconference",)).fetchone()
+    assert row is not None
+
+    reference_dir = svc.paths.wiki / "references" / "hyprnote_meeting"
+    reference_dir.mkdir(parents=True)
+    (reference_dir / "ketch-guidepoint.md").write_text(
+        "---\n"
+        "title: Ketch Guidepoint Teleconference\n"
+        "page_type: reference\n"
+        "id: reference-ketch-guidepoint\n"
+        "status: active\n"
+        f"source_ids:\n  - document:{row['id']}\n"
+        "related: []\n"
+        "tags:\n  - ketch\n"
+        "---\n\n"
+        "# Ketch Guidepoint Teleconference\n\n"
+        "## Summary\n\nKetch enterprise value centers on privacy compliance automation.\n",
+        encoding="utf-8",
+    )
+    concept_dir = svc.paths.wiki / "concepts"
+    concept_dir.mkdir(parents=True)
+    (concept_dir / "local-first-agent-memory.md").write_text(
+        "---\n"
+        "title: Local First Agent Memory\n"
+        "page_type: concept\n"
+        "id: concept-local-first-agent-memory\n"
+        "status: active\n"
+        "source_ids: []\n"
+        "related: []\n"
+        "tags:\n  - brain\n"
+        "---\n\n"
+        "# Local First Agent Memory\n\n"
+        "## Summary\n\nLocal brain evidence can be used by agents during retrieval.\n",
+        encoding="utf-8",
+    )
+
+    context = svc.retrieve_context(
+        "Explain the commercial value of Ketch to enterprise customers. Use only local brain evidence.",
+        budget=4000,
+        debug=True,
+    )
+
+    assert context["supporting_chunks"][0]["source_type"] == "hyprnote_meeting"
+    assert "session_meta" not in context["supporting_chunks"][0]["text"].lower()
+    assert context["supporting_chunks"][0]["selection_reasons"]
+    assert context["supporting_chunks"][0]["raw_context"]["raw_path"]
+    assert context["supporting_chunks"][0]["raw_context"]["source_path"]
+    assert any("recency boost" in reason for reason in context["supporting_chunks"][0]["selection_reasons"])
+    assert any(
+        row["source_type"] == "agent_session_log"
+        for row in context["retrieval_debug"]["suppressed_chunk_reasons"]
+    )
+    wiki_paths = [page["relative_path"] for page in context["relevant_wiki_pages"]]
+    assert "references/hyprnote_meeting/ketch-guidepoint.md" in wiki_paths
+    assert "concepts/local-first-agent-memory.md" not in wiki_paths
+
+
 def test_memory_audit_warns_on_missing_source(tmp_path: Path) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()
@@ -175,6 +333,98 @@ def test_memory_audit_warns_on_missing_source(tmp_path: Path) -> None:
 
     assert audit["errors"] == []
     assert any(memory_id in warning for warning in audit["warnings"])
+
+
+def test_memory_audit_accepts_failure_pattern_and_rejects_invalid_type(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    svc.propose_memory("AgentFailurePatternMemory", "agent:codex", "When tests fail, inspect the failing assertion before editing.", ["agent_session:test"], 0.8)
+    invalid_id = svc.propose_memory("NopeMemory", "global", "Invalid memory type.", ["agent_session:test"], 0.4)
+
+    audit = audit_memories(svc.paths)
+
+    assert any(invalid_id in error and "invalid memory_type" in error for error in audit["errors"])
+    assert not any("AgentFailurePatternMemory" in error for error in audit["errors"])
+
+
+def test_memory_review_status_updates(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    approved_id = svc.propose_memory("AgentFailurePatternMemory", "agent:codex", "Approved failure pattern.", ["agent_session:test"], 0.8)
+    rejected_id = svc.propose_memory("AgentFailurePatternMemory", "agent:codex", "Rejected failure pattern.", ["agent_session:test"], 0.8)
+    archived_id = svc.propose_memory("AgentFailurePatternMemory", "agent:codex", "Archived failure pattern.", ["agent_session:test"], 0.8)
+
+    approved = svc.approve_memory(approved_id)
+    rejected = svc.reject_memory(rejected_id, "Too speculative.")
+    archived = svc.archive_memory(archived_id)
+
+    assert approved["status"] == "active"
+    assert approved["reviewed_at"]
+    assert rejected["status"] == "rejected"
+    assert rejected["review_reason"] == "Too speculative."
+    assert archived["status"] == "archived"
+
+
+def test_retrieve_context_separates_active_and_candidate_memories(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    active_id = svc.propose_memory("AgentFailurePatternMemory", "global", "Active memory is trusted.", ["agent_session:test"], 0.8)
+    candidate_id = svc.propose_memory("AgentFailurePatternMemory", "global", "Candidate memory needs review.", ["agent_session:test"], 0.7)
+    svc.approve_memory(active_id)
+
+    context = svc.retrieve_context("Use memory guidance for the current agent task.")
+
+    active_ids = {memory["id"] for memory in context["active_memories"]}
+    candidate_ids = {memory["id"] for memory in context["candidate_memories"]}
+    assert active_id in active_ids
+    assert candidate_id not in active_ids
+    assert candidate_id in candidate_ids
+    assert active_id not in candidate_ids
+
+
+def test_failure_memory_proposals_dedupe_existing_active_and_create_proposed(tmp_path: Path, monkeypatch) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    session_id = svc.write_agent_session(
+        "Tests failed after editing retrieval.",
+        ["src/pkm_brain/service.py"],
+        ["uv run pytest tests/test_core.py"],
+        "failed",
+        ["The agent did not inspect the assertion before changing code."],
+    )
+    existing_id = svc.propose_memory(
+        "AgentFailurePatternMemory",
+        "agent:codex",
+        "When tests fail, inspect the failing assertion before editing.",
+        [f"agent_session:{session_id}"],
+        0.8,
+    )
+    svc.approve_memory(existing_id)
+
+    class FakeProvider:
+        name = "fake"
+        model = "test"
+
+        def complete(self, prompt: str) -> str:
+            return (
+                '{"memories": ['
+                '{"content": "When tests fail, inspect the failing assertion before editing.", "scope": "agent:codex", '
+                f'"source_ids": ["agent_session:{session_id}"], "confidence": 0.8}},'
+                '{"content": "When pytest fails after retrieval edits, inspect the failing assertion and selected context before changing ranking code.", '
+                '"scope": "agent:codex", '
+                f'"source_ids": ["agent_session:{session_id}"], "confidence": 0.82}}'
+                "]}"
+            )
+
+    monkeypatch.setattr("pkm_brain.memory_proposals.get_provider", lambda provider_name=None: FakeProvider())
+
+    result = propose_failure_memories_from_sources(svc.paths, provider_name="fake")
+
+    assert result["created_count"] == 1
+    assert len(result["skipped_duplicates"]) == 1
+    created = svc.get_memory(result["memory_ids"][0])
+    assert created["memory_type"] == "AgentFailurePatternMemory"
+    assert created["status"] == "proposed"
 
 
 def test_wiki_proposal_interview_and_apply_patches_section(tmp_path: Path) -> None:

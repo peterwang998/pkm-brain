@@ -14,6 +14,7 @@ VALID_MEMORY_TYPES = {
     "RepoInstructionMemory",
     "OpenLoopMemory",
     "FactMemory",
+    "AgentFailurePatternMemory",
 }
 VALID_MEMORY_STATUSES = {"proposed", "active", "superseded", "rejected", "archived"}
 VALID_SCOPE_PREFIXES = ("global", "project:", "repo:", "agent:", "topic:")

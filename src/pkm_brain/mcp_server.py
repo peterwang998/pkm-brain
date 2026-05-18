@@ -17,24 +17,12 @@ def create_mcp(home: str | None = None):
         return service.search(query, limit=limit, caller="mcp")
 
     @mcp.tool()
-    def retrieve_context(task: str, project: str | None = None, budget: int = 8000) -> dict:
-        return service.retrieve_context(task=task, project=project, budget=budget)
+    def retrieve_context(task: str, project: str | None = None, budget: int = 8000, debug: bool = False) -> dict:
+        return service.retrieve_context(task=task, project=project, budget=budget, debug=debug)
 
     @mcp.tool()
-    def get_memories(scope: str | None = None, memory_type: str | None = None) -> list[dict]:
-        service.init_workspace()
-        query = "SELECT * FROM memories WHERE 1=1"
-        params: list[str] = []
-        if scope:
-            query += " AND scope = ?"
-            params.append(scope)
-        if memory_type:
-            query += " AND memory_type = ?"
-            params.append(memory_type)
-        from .db import connection
-
-        with connection(paths.sqlite_path) as conn:
-            return [dict(row) for row in conn.execute(query, params)]
+    def get_memories(scope: str | None = None, memory_type: str | None = None, status: str | None = "active") -> list[dict]:
+        return service.list_memories(scope=scope, memory_type=memory_type, status=status)
 
     @mcp.tool()
     def propose_memory(

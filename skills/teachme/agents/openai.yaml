@@ -1,0 +1,4 @@
+interface:
+  display_name: "TeachMe"
+  short_description: "Teach new concepts through guided dialogue"
+  default_prompt: "Use $teachme to teach me a new concept with guided practice."

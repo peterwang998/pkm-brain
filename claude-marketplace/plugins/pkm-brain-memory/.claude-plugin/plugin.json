@@ -1,0 +1,8 @@
+{
+  "name": "pkm-brain-memory",
+  "version": "0.1.0",
+  "description": "Use local PKM Brain memory through Claude Code skills and MCP retrieval tools.",
+  "author": {
+    "name": "Local"
+  }
+}

@@ -3,13 +3,14 @@ from __future__ import annotations
 import shutil
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .chunking import chunk_text
-from .db import connection, dumps, init_db, rows
+from .db import connection, dumps, init_db, loads, rows
 from .embeddings import get_embedding_provider
-from .indexes import search_vectors, upsert_vectors
+from .indexes import delete_vectors, search_vectors, upsert_vectors
 from .paths import BrainPaths
 from .util import file_sha256, new_id, now_iso, slugify
 from .wiki_proposals import create_wiki_proposal
@@ -24,6 +25,71 @@ class IngestResult:
     chunks_created: int
     embeddings_created: int
     errors: list[str]
+    documents_replaced: int = 0
+
+
+GENERIC_CONTEXT_TERMS = {
+    "about",
+    "answer",
+    "based",
+    "brain",
+    "context",
+    "detail",
+    "details",
+    "evidence",
+    "explain",
+    "fetch",
+    "from",
+    "local",
+    "memory",
+    "only",
+    "retrieve",
+    "show",
+    "summarize",
+    "use",
+    "using",
+    "what",
+}
+
+GENERIC_BUSINESS_TERMS = {
+    "business",
+    "commercial",
+    "customer",
+    "customers",
+    "enterprise",
+    "enterprises",
+    "market",
+    "regulatory",
+    "value",
+}
+
+AGENT_QUERY_TERMS = {
+    "agent",
+    "agents",
+    "claude",
+    "codex",
+    "command",
+    "commands",
+    "implementation",
+    "log",
+    "logs",
+    "mcp",
+    "opencode",
+    "session",
+    "sessions",
+    "tool",
+    "tools",
+}
+
+SOURCE_TYPE_WEIGHTS = {
+    "hyprnote_meeting": 4.0,
+    "markdown_note": 3.0,
+    "meeting_transcript": 2.0,
+    "agent_session_log": -5.0,
+}
+
+RECENCY_MAX_BOOST = 2.0
+RECENCY_HALF_LIFE_DAYS = 30.0
 
 
 class BrainService:
@@ -62,7 +128,9 @@ class BrainService:
         changed = 0
         skipped = 0
         chunks_created = 0
+        documents_replaced = 0
         vector_rows: list[dict[str, Any]] = []
+        stale_vector_chunk_ids: list[str] = []
 
         if dry_run:
             return IngestResult(run_id, len(candidates), 0, 0, 0, 0, [])
@@ -86,11 +154,19 @@ class BrainService:
                     text = path.read_text(encoding="utf-8", errors="replace")
                     title = markdown_frontmatter_value(text, "title") or path.stem.replace("-", " ").replace("_", " ").strip() or path.name
                     if existing:
+                        if source_type == "agent_session_log":
+                            replaced = remove_superseded_agent_session_snapshots(conn, path, keep_document_id=existing["id"])
+                            stale_vector_chunk_ids.extend(replaced.chunk_ids)
+                            documents_replaced += replaced.documents
                         refresh_existing_document_metadata(conn, existing["id"], source_type, title, path)
                         skipped += 1
                         continue
                     document_id = new_id("doc")
                     ingested_at = now_iso()
+                    if source_type == "agent_session_log":
+                        replaced = remove_superseded_agent_session_snapshots(conn, path)
+                        stale_vector_chunk_ids.extend(replaced.chunk_ids)
+                        documents_replaced += replaced.documents
                     raw_path = self._copy_raw(path, source_type, ingested_at, content_hash)
                     conn.execute(
                         """
@@ -158,6 +234,7 @@ class BrainService:
                     chunks_created += len(doc_chunks)
                 except Exception as exc:
                     errors.append(f"{path}: {exc}")
+            delete_vectors(self.paths.lancedb_path, stale_vector_chunk_ids)
             embeddings_created = upsert_vectors(self.paths.lancedb_path, vector_rows)
             conn.execute(
                 """
@@ -178,7 +255,7 @@ class BrainService:
                 ),
             )
 
-        return IngestResult(run_id, len(candidates), changed, skipped, chunks_created, embeddings_created, errors)
+        return IngestResult(run_id, len(candidates), changed, skipped, chunks_created, embeddings_created, errors, documents_replaced)
 
     def _copy_raw(self, source: Path, source_type: str, ingested_at: str, content_hash: str) -> Path:
         date = ingested_at[:10].split("-")
@@ -233,25 +310,86 @@ class BrainService:
             "debug": {"lexical": lexical, "vector": vector_debug, "fused": fused_ids} if debug else None,
         }
 
-    def retrieve_context(self, task: str, project: str | None = None, budget: int = 8000) -> dict[str, Any]:
+    def retrieve_context(
+        self,
+        task: str,
+        project: str | None = None,
+        budget: int = 8000,
+        debug: bool = False,
+    ) -> dict[str, Any]:
         query = f"{project or ''} {task}".strip()
-        wiki_pages = self.search_wiki_pages(query, limit=8)
-        search_result = self.search(query, limit=8, caller="retrieve_context")
+        chunk_candidates, fanout_debug = self._fanout_chunk_candidates(query, limit=60)
+        reranked_chunks = rerank_chunks(query, chunk_candidates, fanout_debug)
+        supporting_chunks = select_context_chunks(reranked_chunks, limit=8, budget=budget)
+        wiki_pages = self.select_wiki_pages(query, supporting_chunks, limit=8)
         memories = self.active_memories(project)
+        candidate_memories = self.candidate_memories(project)
         citations = dedupe_preserve_order(
-            [row["chunk_id"] for row in search_result["results"]]
+            [row["chunk_id"] for row in supporting_chunks]
             + [source_id for page in wiki_pages for source_id in page.get("source_ids", [])]
         )
+        event_id = new_id("retrieval")
+        retrieval_debug = build_retrieval_debug(
+            query,
+            fanout_debug,
+            supporting_chunks,
+            reranked_chunks,
+            wiki_pages,
+            debug=debug,
+        )
+        with connection(self.paths.sqlite_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO retrieval_events(
+                  id, query, timestamp, caller, returned_chunk_ids, selected_chunk_ids, cited_chunk_ids, debug
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    query,
+                    now_iso(),
+                    "retrieve_context",
+                    dumps(fanout_debug["fused"]),
+                    dumps([row["chunk_id"] for row in supporting_chunks]),
+                    dumps(citations),
+                    dumps(retrieval_debug),
+                ),
+            )
         return {
             "task": task,
             "project": project,
             "budget": budget,
             "active_memories": memories,
+            "candidate_memories": candidate_memories,
             "relevant_wiki_pages": wiki_pages,
-            "supporting_chunks": search_result["results"],
+            "supporting_chunks": supporting_chunks,
             "citations": citations,
             "open_questions": [],
-            "retrieval_event_id": search_result["event_id"],
+            "retrieval_event_id": event_id,
+            "retrieval_debug": retrieval_debug,
+        }
+
+    def _fanout_chunk_candidates(self, query: str, limit: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        lexical = self._search_fts(query, limit)
+        vector = search_vectors(self.paths.lancedb_path, self.embedding_provider, query, limit)
+        vector_debug = [
+            {
+                "chunk_id": row.get("chunk_id"),
+                "document_id": row.get("document_id"),
+                "distance": row.get("_distance"),
+                "preview": str(row.get("text", ""))[:160],
+            }
+            for row in vector
+        ]
+        lexical_ids = [row["chunk_id"] for row in lexical]
+        vector_ids = [row["chunk_id"] for row in vector if row.get("chunk_id")]
+        fused_ids = reciprocal_rank_fusion(lexical_ids, vector_ids)
+        candidate_ids = dedupe_preserve_order(fused_ids + lexical_ids + vector_ids)
+        return self._chunks_by_ids(candidate_ids), {
+            "lexical": lexical,
+            "vector": vector_debug,
+            "fused": fused_ids,
+            "candidate_ids": candidate_ids,
         }
 
     def search_wiki_pages(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
@@ -300,15 +438,137 @@ class BrainService:
         results.sort(key=lambda page: (-page["score"], page["page_type"] == "reference", page["title"]))
         return results[:limit]
 
+    def select_wiki_pages(
+        self,
+        query: str,
+        selected_chunks: list[dict[str, Any]],
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        self.init_workspace()
+        terms = important_query_terms(query)
+        agent_query = is_agent_query(terms)
+        if not terms or not self.paths.wiki.exists():
+            return []
+
+        selected_sources = {
+            f"document:{row['document_id']}"
+            for row in selected_chunks
+            if row.get("document_id")
+        } | {row["chunk_id"] for row in selected_chunks if row.get("chunk_id")}
+
+        from .wiki import parse_frontmatter
+
+        results: list[dict[str, Any]] = []
+        for path in sorted(self.paths.wiki.rglob("*.md")):
+            text = path.read_text(encoding="utf-8", errors="replace")
+            frontmatter, body = parse_frontmatter(text)
+            if frontmatter is None:
+                continue
+
+            title = str(frontmatter.get("title") or path.stem)
+            page_type = str(frontmatter.get("page_type") or "")
+            source_ids = list(frontmatter.get("source_ids") or [])
+            relative_path = str(path.relative_to(self.paths.wiki))
+            is_agent_reference = "agent_session_log" in relative_path
+            title_haystack = " ".join(
+                [
+                    title,
+                    page_type,
+                    relative_path,
+                    " ".join(frontmatter.get("tags") or []),
+                ]
+            ).lower()
+            body_haystack = body.lower()
+            title_hits = sorted({term for term in terms if term in title_haystack})
+            body_hits = sorted({term for term in terms if term in body_haystack})
+            source_overlap = sorted(selected_sources.intersection(source_ids))
+
+            if not title_hits and not (page_type == "reference" and source_overlap) and len(body_hits) < 2:
+                continue
+            if is_agent_reference and not agent_query and not source_overlap:
+                continue
+
+            score = 0.0
+            reasons: list[str] = []
+            if title_hits:
+                boost = 5.0 * len(title_hits)
+                score += boost
+                reasons.append(f"title/path matched {', '.join(title_hits)} (+{boost:g})")
+            if body_hits:
+                boost = float(min(len(body_hits), 6))
+                score += boost
+                reasons.append(f"body matched {', '.join(body_hits[:6])} (+{boost:g})")
+            if source_overlap:
+                boost = 8.0 if page_type == "reference" else 2.0
+                boost += min(6.0, float(len(source_overlap) * 2))
+                score += boost
+                reasons.append(f"shares selected source evidence (+{boost:g})")
+            if page_type == "reference":
+                score += 2.0
+                reasons.append("reference page (+2)")
+            elif page_type == "index":
+                score -= 4.0
+                reasons.append("index page penalty (-4)")
+            if is_agent_reference and not agent_query:
+                score -= 6.0
+                reasons.append("agent-log reference penalty (-6)")
+
+            results.append(
+                {
+                    "title": title,
+                    "page_type": page_type,
+                    "path": str(path),
+                    "relative_path": relative_path,
+                    "source_ids": source_ids[:8],
+                    "source_count": len(source_ids),
+                    "summary": first_section(body, "Summary"),
+                    "score": round(score, 4),
+                    "selection_reasons": reasons,
+                }
+            )
+
+        results.sort(key=lambda page: (-page["score"], page["page_type"] != "reference", page["title"]))
+        return results[:limit]
+
     def active_memories(self, project: str | None = None) -> list[dict[str, Any]]:
+        return self.list_memories(status="active", project=project)
+
+    def candidate_memories(self, project: str | None = None) -> list[dict[str, Any]]:
+        return self.list_memories(status="proposed", project=project)
+
+    def list_memories(
+        self,
+        status: str | None = None,
+        scope: str | None = None,
+        memory_type: str | None = None,
+        project: str | None = None,
+    ) -> list[dict[str, Any]]:
         self.init_workspace()
         with connection(self.paths.sqlite_path) as conn:
-            query = "SELECT * FROM memories WHERE status = 'active'"
-            params: tuple[Any, ...] = ()
+            query = "SELECT * FROM memories WHERE 1=1"
+            params: list[Any] = []
+            if status:
+                query += " AND status = ?"
+                params.append(status)
+            if scope:
+                query += " AND scope = ?"
+                params.append(scope)
             if project:
                 query += " AND (scope = ? OR scope = 'global')"
-                params = (f"project:{project}",)
-            return [dict(row) for row in conn.execute(query, params)]
+                params.append(f"project:{project}")
+            if memory_type:
+                query += " AND memory_type = ?"
+                params.append(memory_type)
+            query += " ORDER BY updated_at DESC, created_at DESC"
+            return [row_to_memory(row) for row in conn.execute(query, params)]
+
+    def get_memory(self, memory_id: str) -> dict[str, Any]:
+        self.init_workspace()
+        with connection(self.paths.sqlite_path) as conn:
+            row = conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+        if not row:
+            raise ValueError(f"memory not found: {memory_id}")
+        return row_to_memory(row)
 
     def propose_memory(
         self,
@@ -330,6 +590,35 @@ class BrainService:
                 (memory_id, memory_type, scope, content, confidence, dumps(sources), "proposed", timestamp, timestamp),
             )
         return memory_id
+
+    def approve_memory(self, memory_id: str) -> dict[str, Any]:
+        return self._set_memory_status(memory_id, "active")
+
+    def reject_memory(self, memory_id: str, reason: str) -> dict[str, Any]:
+        if not reason.strip():
+            raise ValueError("reject reason is required")
+        return self._set_memory_status(memory_id, "rejected", reason=reason.strip())
+
+    def archive_memory(self, memory_id: str) -> dict[str, Any]:
+        return self._set_memory_status(memory_id, "archived")
+
+    def _set_memory_status(self, memory_id: str, status: str, reason: str | None = None) -> dict[str, Any]:
+        timestamp = now_iso()
+        with connection(self.paths.sqlite_path) as conn:
+            result = conn.execute(
+                """
+                UPDATE memories
+                SET status = ?, updated_at = ?, reviewed_at = ?, review_reason = ?
+                WHERE id = ?
+                """,
+                (status, timestamp, timestamp, reason, memory_id),
+            )
+            if result.rowcount == 0:
+                raise ValueError(f"memory not found: {memory_id}")
+            row = conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+        if not row:
+            raise ValueError(f"memory not found: {memory_id}")
+        return row_to_memory(row)
 
     def propose_wiki_update(
         self,
@@ -407,8 +696,10 @@ class BrainService:
             found = rows(
                 conn,
                 f"""
-                SELECT c.id AS chunk_id, c.text, c.heading_path, c.chunk_index,
-                       d.id AS document_id, d.title, d.source_type, d.source_path, d.raw_path
+                SELECT c.id AS chunk_id, c.text, c.heading_path, c.chunk_index, c.token_count,
+                       c.created_at AS chunk_created_at,
+                       d.id AS document_id, d.title, d.source_type, d.source_path, d.raw_path,
+                       d.created_at AS document_created_at, d.ingested_at AS document_ingested_at
                 FROM chunks c
                 JOIN documents d ON d.id = c.document_id
                 WHERE c.id IN ({placeholders})
@@ -419,13 +710,328 @@ class BrainService:
         return [by_id[chunk_id] for chunk_id in chunk_ids if chunk_id in by_id]
 
 
+def row_to_memory(row: Any) -> dict[str, Any]:
+    output = dict(row)
+    output["source_ids"] = loads(output.get("source_ids"), [])
+    return output
+
+
+def rerank_chunks(query: str, chunks: list[dict[str, Any]], fanout_debug: dict[str, Any]) -> list[dict[str, Any]]:
+    terms = important_query_terms(query)
+    anchors = anchor_query_terms(terms, chunks)
+    agent_query = is_agent_query(terms)
+    lexical_rank = {
+        row["chunk_id"]: rank
+        for rank, row in enumerate(fanout_debug.get("lexical", []), start=1)
+        if row.get("chunk_id")
+    }
+    vector_rank = {
+        row["chunk_id"]: rank
+        for rank, row in enumerate(fanout_debug.get("vector", []), start=1)
+        if row.get("chunk_id")
+    }
+
+    scored: list[dict[str, Any]] = []
+    for row in chunks:
+        candidate = dict(row)
+        chunk_id = str(candidate.get("chunk_id") or "")
+        title = str(candidate.get("title") or "").lower()
+        heading = str(candidate.get("heading_path") or "").lower()
+        text = str(candidate.get("text") or "")
+        text_lower = text.lower()
+        score = 0.0
+        reasons: list[str] = []
+        suppressed = False
+        suppress_reasons: list[str] = []
+
+        if chunk_id in lexical_rank:
+            boost = 10.0 / (lexical_rank[chunk_id] ** 0.5)
+            score += boost
+            reasons.append(f"BM25 rank {lexical_rank[chunk_id]} (+{boost:.2f})")
+        if chunk_id in vector_rank:
+            boost = 8.0 / (vector_rank[chunk_id] ** 0.5)
+            score += boost
+            reasons.append(f"vector rank {vector_rank[chunk_id]} (+{boost:.2f})")
+
+        title_hits = sorted({term for term in terms if term in title})
+        heading_hits = sorted({term for term in terms if term in heading})
+        text_hits = sorted({term for term in terms if term in text_lower})
+        anchor_hits = sorted({term for term in anchors if term in title or term in heading or term in text_lower})
+        title_heading_anchor_hits = sorted({term for term in anchors if term in title or term in heading})
+        if title_hits:
+            boost = 4.0 * len(title_hits)
+            score += boost
+            reasons.append(f"title matched {', '.join(title_hits)} (+{boost:g})")
+        if heading_hits:
+            boost = 2.5 * len(heading_hits)
+            score += boost
+            reasons.append(f"heading matched {', '.join(heading_hits)} (+{boost:g})")
+        if text_hits and terms:
+            boost = 6.0 * (len(text_hits) / len(terms))
+            score += boost
+            reasons.append(f"text covered {len(text_hits)}/{len(terms)} important terms (+{boost:.2f})")
+        if anchors:
+            if anchor_hits:
+                boost = 3.0 * len(anchor_hits)
+                score += boost
+                reasons.append(f"entity anchor matched {', '.join(anchor_hits)} (+{boost:g})")
+                if not title_heading_anchor_hits:
+                    score -= 6.0
+                    reasons.append(f"entity anchor absent from title/heading {', '.join(anchors)} (-6)")
+            else:
+                score -= 8.0
+                reasons.append(f"missed entity anchor {', '.join(anchors)} (-8)")
+
+        source_type = str(candidate.get("source_type") or "")
+        source_weight = SOURCE_TYPE_WEIGHTS.get(source_type, 0.0)
+        if source_type == "agent_session_log" and agent_query:
+            source_weight = 1.5
+        if source_weight:
+            score += source_weight
+            reasons.append(f"source_type {source_type} ({source_weight:+g})")
+
+        noise_reasons = chunk_noise_reasons(candidate)
+        if noise_reasons:
+            if agent_query:
+                penalty = 2.0
+                score -= penalty
+                reasons.append(f"minor noise penalty ({-penalty:g})")
+            else:
+                strong_noise = [reason for reason in noise_reasons if reason != "raw transcript chunk"]
+                penalty = 4.0 if not strong_noise else 12.0 + (2.0 * len(strong_noise))
+                score -= penalty
+                reasons.append(f"noise penalty ({-penalty:g})")
+                if strong_noise:
+                    suppressed = True
+                    suppress_reasons.extend(strong_noise)
+        if source_type == "agent_session_log" and not agent_query and not suppressed:
+            score -= 4.0
+            reasons.append("agent log downranked for non-agent query (-4)")
+
+        if not suppressed:
+            recency_boost, recency_reason = recency_score(candidate)
+            if recency_boost:
+                score += recency_boost
+                reasons.append(recency_reason)
+
+        candidate["retrieval_score"] = round(score, 4)
+        candidate["raw_context"] = raw_context_links(candidate)
+        candidate["selection_reasons"] = reasons
+        candidate["suppressed"] = suppressed
+        candidate["suppress_reasons"] = suppress_reasons
+        candidate["retrieval_noise_reasons"] = noise_reasons
+        candidate["entity_anchor_title_heading_match"] = bool(title_heading_anchor_hits)
+        scored.append(candidate)
+
+    scored.sort(key=lambda row: (row.get("suppressed", False), -float(row["retrieval_score"]), row["chunk_index"]))
+    return scored
+
+
+def select_context_chunks(reranked_chunks: list[dict[str, Any]], limit: int, budget: int) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    remaining = max(budget, 1)
+    eligible = [row for row in reranked_chunks if not row.get("suppressed")]
+    if not eligible:
+        eligible = reranked_chunks
+    anchored = [row for row in eligible if row.get("entity_anchor_title_heading_match")]
+    if anchored:
+        eligible = anchored
+    non_transcript = [
+        row
+        for row in eligible
+        if "raw transcript chunk" not in row.get("retrieval_noise_reasons", [])
+    ]
+    if len(non_transcript) >= min(3, limit):
+        eligible = non_transcript
+    for row in eligible:
+        if len(selected) >= limit:
+            break
+        token_count = int(row.get("token_count") or max(1, len(str(row.get("text") or "")) // 4))
+        if selected and token_count > remaining:
+            continue
+        selected.append(row)
+        remaining -= token_count
+    return selected
+
+
+def chunk_noise_reasons(chunk: dict[str, Any]) -> list[str]:
+    text = str(chunk.get("text") or "")
+    text_lower = text.lower()
+    heading = str(chunk.get("heading_path") or "").lower()
+    source_type = str(chunk.get("source_type") or "")
+    reasons: list[str] = []
+    if source_type == "agent_session_log":
+        if "session_meta:" in text_lower or "- session_meta:" in text_lower:
+            reasons.append("session metadata")
+        if "you are codex" in text_lower or "<permissions instructions>" in text_lower:
+            reasons.append("system prompt text")
+        trace_markers = text_lower.count("event_msg") + text_lower.count("response_item")
+        if trace_markers >= 2:
+            reasons.append("tool/session trace")
+    if looks_frontmatter_only(text):
+        reasons.append("frontmatter-only chunk")
+    if "no summary was captured" in text_lower and len(text_lower) < 600:
+        reasons.append("empty generated summary")
+    if "transcript" in heading or text_lower.startswith("## transcript"):
+        reasons.append("raw transcript chunk")
+    return dedupe_preserve_order(reasons)
+
+
+def recency_score(chunk: dict[str, Any]) -> tuple[float, str]:
+    timestamp = parse_iso_timestamp(str(chunk.get("document_created_at") or chunk.get("document_ingested_at") or ""))
+    if not timestamp:
+        return 0.0, ""
+    age_days = max(0.0, (datetime.now(timezone.utc) - timestamp).total_seconds() / 86400.0)
+    boost = RECENCY_MAX_BOOST * (RECENCY_HALF_LIFE_DAYS / (RECENCY_HALF_LIFE_DAYS + age_days))
+    if boost < 0.05:
+        return 0.0, ""
+    return round(boost, 4), f"recency boost age {age_days:.1f}d (+{boost:.2f})"
+
+
+def parse_iso_timestamp(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def raw_context_links(chunk: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "document_id": chunk.get("document_id"),
+        "chunk_id": chunk.get("chunk_id"),
+        "source_path": chunk.get("source_path"),
+        "raw_path": chunk.get("raw_path"),
+        "source_type": chunk.get("source_type"),
+        "title": chunk.get("title"),
+        "heading_path": chunk.get("heading_path"),
+        "chunk_index": chunk.get("chunk_index"),
+        "document_created_at": chunk.get("document_created_at"),
+        "document_ingested_at": chunk.get("document_ingested_at"),
+    }
+
+
+def looks_frontmatter_only(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped.startswith("---"):
+        return False
+    end = stripped.find("\n---", 3)
+    if end == -1:
+        return False
+    tail = stripped[end + 4 :].strip()
+    return not tail or len(tail) < 80
+
+
+def build_retrieval_debug(
+    query: str,
+    fanout_debug: dict[str, Any],
+    selected_chunks: list[dict[str, Any]],
+    reranked_chunks: list[dict[str, Any]],
+    wiki_pages: list[dict[str, Any]],
+    debug: bool,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "important_query_terms": important_query_terms(query),
+        "selected_chunk_reasons": summarize_ranked_chunks(selected_chunks, limit=8),
+        "suppressed_chunk_reasons": summarize_ranked_chunks(
+            [row for row in reranked_chunks if row.get("suppressed")],
+            limit=8,
+        ),
+        "selected_wiki_reasons": [
+            {
+                "relative_path": page.get("relative_path"),
+                "score": page.get("score"),
+                "reasons": page.get("selection_reasons", []),
+            }
+            for page in wiki_pages
+        ],
+    }
+    if debug:
+        payload["fanout"] = fanout_debug
+        payload["reranked_candidates"] = summarize_ranked_chunks(reranked_chunks, limit=30)
+    else:
+        payload["fanout_counts"] = {
+            "lexical": len(fanout_debug.get("lexical", [])),
+            "vector": len(fanout_debug.get("vector", [])),
+            "fused": len(fanout_debug.get("fused", [])),
+            "candidates": len(fanout_debug.get("candidate_ids", [])),
+        }
+    return payload
+
+
+def summarize_ranked_chunks(chunks: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    return [
+        {
+            "chunk_id": row.get("chunk_id"),
+            "title": row.get("title"),
+            "source_type": row.get("source_type"),
+            "score": row.get("retrieval_score"),
+            "raw_context": row.get("raw_context"),
+            "suppressed": row.get("suppressed", False),
+            "reasons": row.get("selection_reasons", []),
+            "suppress_reasons": row.get("suppress_reasons", []),
+            "preview": str(row.get("text", ""))[:160],
+        }
+        for row in chunks[:limit]
+    ]
+
+
+@dataclass
+class ReplacedDocuments:
+    documents: int
+    chunk_ids: list[str]
+
+
+def remove_superseded_agent_session_snapshots(conn: Any, path: Path, keep_document_id: str | None = None) -> ReplacedDocuments:
+    query = """
+        SELECT id, raw_path
+        FROM documents
+        WHERE source_type = 'agent_session_log'
+          AND source_path = ?
+    """
+    params: list[Any] = [str(path)]
+    if keep_document_id:
+        query += " AND id != ?"
+        params.append(keep_document_id)
+    stale_documents = [dict(row) for row in conn.execute(query, params)]
+    if not stale_documents:
+        return ReplacedDocuments(0, [])
+
+    document_ids = [row["id"] for row in stale_documents]
+    placeholders = ",".join("?" for _ in document_ids)
+    stale_chunk_ids = [
+        row["id"]
+        for row in conn.execute(
+            f"SELECT id FROM chunks WHERE document_id IN ({placeholders})",
+            document_ids,
+        )
+    ]
+    if stale_chunk_ids:
+        chunk_placeholders = ",".join("?" for _ in stale_chunk_ids)
+        conn.execute(f"DELETE FROM chunk_fts WHERE chunk_id IN ({chunk_placeholders})", stale_chunk_ids)
+    conn.execute(f"DELETE FROM documents WHERE id IN ({placeholders})", document_ids)
+
+    for row in stale_documents:
+        raw_path = Path(str(row["raw_path"]))
+        try:
+            if raw_path.exists():
+                raw_path.unlink()
+        except OSError:
+            pass
+    return ReplacedDocuments(len(stale_documents), stale_chunk_ids)
+
+
 def detect_source_type(path: Path) -> str | None:
     suffix = path.suffix.lower()
     if suffix == ".md":
         text = path.read_text(encoding="utf-8", errors="replace")[:2000].lower()
-        if "source_type: hyprnote_meeting" in text or "/documents/hyprnote/" in str(path):
+        if re.search(r"source_type:\s*['\"]?hyprnote_meeting", text) or "/documents/hyprnote/" in str(path):
             return "hyprnote_meeting"
-        if "source_type: agent_session_log" in text or "/agent_logs/" in str(path):
+        if re.search(r"source_type:\s*['\"]?agent_session_log", text) or "/agent_logs/" in str(path):
             return "agent_session_log"
         return "agent_session_log" if "commands" in text and "outcome" in text else "markdown_note"
     if suffix == ".txt":
@@ -499,6 +1105,25 @@ def query_terms(query: str) -> list[str]:
         "with",
     }
     return [term.lower() for term in re.findall(r"[A-Za-z0-9_]+", query) if term.lower() not in stopwords]
+
+
+def important_query_terms(query: str) -> list[str]:
+    terms = [term for term in query_terms(query) if term not in GENERIC_CONTEXT_TERMS]
+    return terms or query_terms(query)
+
+
+def anchor_query_terms(terms: list[str], chunks: list[dict[str, Any]]) -> list[str]:
+    anchors: list[str] = []
+    for term in terms:
+        if term in GENERIC_BUSINESS_TERMS or len(term) < 4:
+            continue
+        if any(term in str(row.get("title") or "").lower() for row in chunks):
+            anchors.append(term)
+    return anchors
+
+
+def is_agent_query(terms: list[str]) -> bool:
+    return bool(set(terms).intersection(AGENT_QUERY_TERMS))
 
 
 def first_section(markdown: str, heading: str) -> str:

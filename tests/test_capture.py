@@ -365,6 +365,49 @@ def test_nightly_llm_proposals_fail_without_provider(tmp_path: Path, monkeypatch
     assert "PKM_BRAIN_LLM_PROVIDER" in str(due_check.error)
 
 
+def test_nightly_memory_proposal_flag_creates_only_proposed_memories(tmp_path: Path, monkeypatch) -> None:
+    svc = make_service(tmp_path)
+    session_id = svc.write_agent_session(
+        "Nightly run found a repeated failure pattern.",
+        ["src/pkm_brain/service.py"],
+        ["uv run pytest"],
+        "failed",
+        ["The agent treated an unreviewed proposal as active guidance."],
+    )
+
+    class FakeProvider:
+        name = "fake"
+        model = "test"
+
+        def complete(self, prompt: str) -> str:
+            return (
+                '{"memories": ['
+                '{"content": "When reviewing Brain memories, treat proposed records as candidates until local CLI review approves them.", '
+                '"scope": "agent:codex", '
+                f'"source_ids": ["agent_session:{session_id}"], "confidence": 0.84}}'
+                "]}"
+            )
+
+    monkeypatch.setattr("pkm_brain.automation.get_provider", lambda provider_name=None: FakeProvider())
+    monkeypatch.setattr("pkm_brain.memory_proposals.get_provider", lambda provider_name=None: FakeProvider())
+
+    result = run_nightly_maintenance(
+        svc.paths,
+        with_llm_memory_proposals=True,
+        provider="fake",
+        codex_state=tmp_path / "missing-codex.sqlite",
+        claude_projects=tmp_path / "missing-claude",
+        opencode_db=tmp_path / "missing-opencode.sqlite",
+    )
+
+    assert result.status == "success"
+    assert result.summary["memory_proposals"]["created_count"] == 1
+    with connection(svc.paths.sqlite_path) as conn:
+        row = conn.execute("SELECT memory_type, status FROM memories").fetchone()
+    assert row["memory_type"] == "AgentFailurePatternMemory"
+    assert row["status"] == "proposed"
+
+
 def test_llm_provider_status_reports_missing_configuration(monkeypatch) -> None:
     monkeypatch.delenv("PKM_BRAIN_LLM_PROVIDER", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -387,9 +430,11 @@ def test_codex_provider_status_uses_local_cli() -> None:
 
 
 def test_launch_agent_plist_render() -> None:
+    repo_path = Path.home() / "pkm-brain"
+    brain_home = Path.home() / "brain"
     plist = render_launch_agent(
-        repo_path=Path("/Users/Peter/pkm-brain"),
-        brain_home=Path("/Users/Peter/brain"),
+        repo_path=repo_path,
+        brain_home=brain_home,
         uv_path=Path("/opt/homebrew/bin/uv"),
         interval=600,
     )
@@ -403,9 +448,11 @@ def test_launch_agent_plist_render() -> None:
 
 
 def test_launch_agent_plist_render_with_hyprnote_opt_in() -> None:
+    repo_path = Path.home() / "pkm-brain"
+    brain_home = Path.home() / "brain"
     plist = render_launch_agent(
-        repo_path=Path("/Users/Peter/pkm-brain"),
-        brain_home=Path("/Users/Peter/brain"),
+        repo_path=repo_path,
+        brain_home=brain_home,
         uv_path=Path("/opt/homebrew/bin/uv"),
         interval=600,
         include_hyprnote=True,
@@ -417,9 +464,11 @@ def test_launch_agent_plist_render_with_hyprnote_opt_in() -> None:
 
 
 def test_nightly_launch_agent_plist_render() -> None:
+    repo_path = Path.home() / "pkm-brain"
+    brain_home = Path.home() / "brain"
     plist = render_nightly_launch_agent(
-        repo_path=Path("/Users/Peter/pkm-brain"),
-        brain_home=Path("/Users/Peter/brain"),
+        repo_path=repo_path,
+        brain_home=brain_home,
         uv_path=Path("/opt/homebrew/bin/uv"),
         interval=3600,
         due_after_hours=20,
@@ -434,9 +483,11 @@ def test_nightly_launch_agent_plist_render() -> None:
 
 
 def test_nightly_launch_agent_plist_render_with_openai_wiki_proposals() -> None:
+    repo_path = Path.home() / "pkm-brain"
+    brain_home = Path.home() / "brain"
     plist = render_nightly_launch_agent(
-        repo_path=Path("/Users/Peter/pkm-brain"),
-        brain_home=Path("/Users/Peter/brain"),
+        repo_path=repo_path,
+        brain_home=brain_home,
         uv_path=Path("/opt/homebrew/bin/uv"),
         interval=3600,
         due_after_hours=20,
@@ -456,9 +507,11 @@ def test_nightly_launch_agent_plist_render_with_openai_wiki_proposals() -> None:
 
 def test_nightly_launch_agent_plist_render_with_codex_wiki_proposals(monkeypatch) -> None:
     monkeypatch.setenv("PKM_BRAIN_CODEX_BIN", "/opt/homebrew/bin/codex")
+    repo_path = Path.home() / "pkm-brain"
+    brain_home = Path.home() / "brain"
     plist = render_nightly_launch_agent(
-        repo_path=Path("/Users/Peter/pkm-brain"),
-        brain_home=Path("/Users/Peter/brain"),
+        repo_path=repo_path,
+        brain_home=brain_home,
         uv_path=Path("/opt/homebrew/bin/uv"),
         interval=3600,
         due_after_hours=20,
@@ -475,7 +528,31 @@ def test_nightly_launch_agent_plist_render_with_codex_wiki_proposals(monkeypatch
     assert decoded["EnvironmentVariables"]["PKM_BRAIN_LLM_PROVIDER"] == "codex"
     assert decoded["EnvironmentVariables"]["PKM_BRAIN_CODEX_MODEL"] == "gpt-5.5"
     assert decoded["EnvironmentVariables"]["PKM_BRAIN_CODEX_BIN"] == "/opt/homebrew/bin/codex"
-    assert decoded["EnvironmentVariables"]["PKM_BRAIN_CODEX_CWD"] == "/Users/Peter/pkm-brain"
+    assert decoded["EnvironmentVariables"]["PKM_BRAIN_CODEX_CWD"] == str(repo_path)
+
+
+def test_nightly_launch_agent_plist_render_with_codex_memory_proposals(monkeypatch) -> None:
+    monkeypatch.setenv("PKM_BRAIN_CODEX_BIN", "/opt/homebrew/bin/codex")
+    repo_path = Path.home() / "pkm-brain"
+    brain_home = Path.home() / "brain"
+    plist = render_nightly_launch_agent(
+        repo_path=repo_path,
+        brain_home=brain_home,
+        uv_path=Path("/opt/homebrew/bin/uv"),
+        interval=3600,
+        due_after_hours=20,
+        with_llm_memory_proposals=True,
+        provider="codex",
+    )
+    encoded = plistlib.dumps(plist)
+    decoded = plistlib.loads(encoded)
+
+    command = decoded["ProgramArguments"][-1]
+    assert decoded["Label"] == "com.pkm-brain.nightly-maintenance"
+    assert "--with-llm-memory-proposals" in command
+    assert "--provider codex" in command
+    assert decoded["EnvironmentVariables"]["PKM_BRAIN_LLM_PROVIDER"] == "codex"
+    assert decoded["EnvironmentVariables"]["PKM_BRAIN_CODEX_CWD"] == str(repo_path)
 
 
 def test_redact_text_scrubs_embedded_secret_values() -> None:
