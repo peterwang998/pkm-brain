@@ -28,8 +28,6 @@ Skip Brain for trivial commands, purely mechanical local edits, or questions ful
 1. Use MCP `retrieve_context` first.
    - `task`: restate the user task as a retrieval-oriented question.
    - `project`: include it when the project is clear.
-   - `budget`: use the default unless the user asks for a broad survey.
-   - `debug`: keep `false` unless results are noisy, surprising, or insufficient.
 
 2. Read the returned context as evidence, not as guaranteed truth.
    - Treat `active_memories` as reviewed operational guidance.
@@ -71,13 +69,19 @@ Use MCP `write_agent_session` at the end of substantial work when the session pr
 If MCP is unavailable, use the local CLI from the pkm-brain repo:
 
 ```bash
-uv run brain retrieve-context --task "<task>" --budget 8000 --home ~/brain
+uv run brain retrieve-context --task "<task>" --mode default --home ~/brain
 ```
 
 For debugging noisy retrieval:
 
 ```bash
-uv run brain retrieve-context --task "<task>" --budget 8000 --debug --home ~/brain
+uv run brain retrieve-context --task "<task>" --mode compact --debug --home ~/brain
+```
+
+For an explicit broad survey:
+
+```bash
+uv run brain retrieve-context --task "<task>" --mode broad --home ~/brain
 ```
 
 For direct search:

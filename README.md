@@ -114,6 +114,8 @@ Agents should use these tools instead of reading SQLite or LanceDB directly.
 
 `retrieve_context` returns reviewed `active_memories` separately from unreviewed `candidate_memories`. Active memories are trusted operational guidance. Candidate memories are proposed hypotheses and should not be treated as authoritative until a human approves them through the local CLI. MCP agents can propose memories with `propose_memory`, but they cannot approve, reject, or archive memories.
 
+`retrieve_context` uses bounded retrieval so noisy sources do not consume the whole agent context. The default mode uses an 8,000-token context budget, source-specific caps, and excerpts oversized chunks. Agent session logs are compressed more aggressively than curated notes or meeting sources. The MCP tool intentionally keeps a simple `task`/`project` surface and uses the default bounded mode. The CLI and service layer also support `--mode compact`, `--mode broad`, and `--mode inspect` for manual or scripted use. Returned chunks include `original_token_count`, `returned_token_count`, `omitted_tokens`, and `excerpted` metadata.
+
 ### Codex Persistent Memory
 
 For Codex, use MCP as the live data-access layer and the bundled `brain-memory` skill as the activation policy.

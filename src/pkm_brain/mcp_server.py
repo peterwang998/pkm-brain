@@ -17,8 +17,11 @@ def create_mcp(home: str | None = None):
         return service.search(query, limit=limit, caller="mcp")
 
     @mcp.tool()
-    def retrieve_context(task: str, project: str | None = None, budget: int = 8000, debug: bool = False) -> dict:
-        return service.retrieve_context(task=task, project=project, budget=budget, debug=debug)
+    def retrieve_context(
+        task: str,
+        project: str | None = None,
+    ) -> dict:
+        return service.retrieve_context(task=task, project=project)
 
     @mcp.tool()
     def get_memories(scope: str | None = None, memory_type: str | None = None, status: str | None = "active") -> list[dict]:

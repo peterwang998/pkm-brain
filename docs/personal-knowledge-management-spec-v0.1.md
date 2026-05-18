@@ -576,6 +576,10 @@ Reciprocal Rank Fusion
   ↓
 Rerank top candidates
   ↓
+Apply retrieval policy and source-specific caps
+  ↓
+Excerpt or compress oversized chunks
+  ↓
 Expand neighboring chunks
   ↓
 Deduplicate
@@ -589,6 +593,7 @@ Context packet format:
 
 ```text
 query
+retrieval_mode
 selected_chunks
 source_citations
 active_memories
@@ -599,6 +604,34 @@ omitted_due_to_budget
 ```
 
 `active_memories` are reviewed and trusted. `candidate_memories` are proposed, unreviewed hypotheses surfaced separately for awareness; agents must not treat them as authoritative operational instructions.
+
+Retrieval modes:
+
+```text
+compact: small packet for routine agent context checks
+default: bounded general-purpose packet
+broad: explicit opt-in for larger surveys
+inspect: explicit source-inspection mode with larger caps
+```
+
+The default packet must be bounded for usefulness, not model maximum context size. Reranking decides which chunks deserve attention; retrieval policy decides how much text each source type may consume. No selected chunk, including the first chunk, may exceed the remaining context budget.
+
+The default context budget is 8,000 tokens. `retrieval_policy` and detailed reranking diagnostics should be returned only when debug output is explicitly requested, because MCP responses should stay compact for normal agent use.
+
+Chunk records should include:
+
+```text
+text
+original_token_count
+returned_token_count
+omitted_tokens
+excerpted
+source_token_cap
+raw_context
+selection_reasons
+```
+
+Noisy source types such as `agent_session_log` must use lower default caps and should strip or downsample session metadata, system prompts, tool traces, repeated raw events, and giant command outputs. Curated wiki pages and typed memories may be returned more densely because they are already synthesized.
 
 ## 11. Wiki Synthesis Layer
 
@@ -1265,7 +1298,7 @@ Required MCP tools:
 
 ```text
 search_knowledge(query, filters)
-retrieve_context(task, project, repo, budget)
+retrieve_context(task, project, repo)
 get_memories(scope, memory_type, status)
 propose_memory(memory_type, scope, content, sources, confidence)
 write_agent_session(summary, files_touched, commands_run, outcome)

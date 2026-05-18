@@ -12,7 +12,7 @@ from .db import connection, dumps, init_db, loads, rows
 from .embeddings import get_embedding_provider
 from .indexes import delete_vectors, search_vectors, upsert_vectors
 from .paths import BrainPaths
-from .util import file_sha256, new_id, now_iso, slugify
+from .util import file_sha256, new_id, now_iso, slugify, token_count as estimate_tokens
 from .wiki_proposals import create_wiki_proposal
 
 
@@ -90,6 +90,34 @@ SOURCE_TYPE_WEIGHTS = {
 
 RECENCY_MAX_BOOST = 2.0
 RECENCY_HALF_LIFE_DAYS = 30.0
+DEFAULT_RETRIEVAL_MODE = "default"
+VALID_RETRIEVAL_MODES = {"compact", "default", "broad", "inspect"}
+RECENCY_INTENT_TERMS = {
+    "current",
+    "last",
+    "latest",
+    "month",
+    "new",
+    "newest",
+    "recent",
+    "recently",
+    "this",
+    "today",
+    "week",
+    "yesterday",
+}
+
+
+@dataclass(frozen=True)
+class RetrievalPolicy:
+    mode: str
+    total_budget: int
+    max_chunks: int
+    max_wiki_pages: int
+    max_memories: int
+    default_chunk_cap: int
+    source_caps: dict[str, int]
+    include_full_text: bool = False
 
 
 class BrainService:
@@ -314,16 +342,18 @@ class BrainService:
         self,
         task: str,
         project: str | None = None,
-        budget: int = 8000,
+        budget: int | None = None,
+        mode: str = DEFAULT_RETRIEVAL_MODE,
         debug: bool = False,
     ) -> dict[str, Any]:
+        policy = retrieval_policy(mode, budget)
         query = f"{project or ''} {task}".strip()
         chunk_candidates, fanout_debug = self._fanout_chunk_candidates(query, limit=60)
         reranked_chunks = rerank_chunks(query, chunk_candidates, fanout_debug)
-        supporting_chunks = select_context_chunks(reranked_chunks, limit=8, budget=budget)
-        wiki_pages = self.select_wiki_pages(query, supporting_chunks, limit=8)
-        memories = self.active_memories(project)
-        candidate_memories = self.candidate_memories(project)
+        supporting_chunks = select_context_chunks(reranked_chunks, query=query, policy=policy)
+        wiki_pages = self.select_wiki_pages(query, supporting_chunks, limit=policy.max_wiki_pages)
+        memories = self.active_memories(project)[: policy.max_memories]
+        candidate_memories = self.candidate_memories(project)[: policy.max_memories]
         citations = dedupe_preserve_order(
             [row["chunk_id"] for row in supporting_chunks]
             + [source_id for page in wiki_pages for source_id in page.get("source_ids", [])]
@@ -355,19 +385,41 @@ class BrainService:
                     dumps(retrieval_debug),
                 ),
             )
-        return {
+        result = {
             "task": task,
             "project": project,
-            "budget": budget,
+            "budget": policy.total_budget,
+            "retrieval_mode": policy.mode,
             "active_memories": memories,
             "candidate_memories": candidate_memories,
             "relevant_wiki_pages": wiki_pages,
             "supporting_chunks": supporting_chunks,
             "citations": citations,
             "open_questions": [],
+            "omitted_due_to_budget": [
+                {
+                    "chunk_id": row.get("chunk_id"),
+                    "document_id": row.get("document_id"),
+                    "source_type": row.get("source_type"),
+                    "omitted_tokens": row.get("omitted_tokens", 0),
+                }
+                for row in supporting_chunks
+                if int(row.get("omitted_tokens") or 0) > 0
+            ],
             "retrieval_event_id": event_id,
-            "retrieval_debug": retrieval_debug,
         }
+        if debug:
+            result["retrieval_policy"] = {
+                "total_budget": policy.total_budget,
+                "max_chunks": policy.max_chunks,
+                "max_wiki_pages": policy.max_wiki_pages,
+                "max_memories": policy.max_memories,
+                "default_chunk_cap": policy.default_chunk_cap,
+                "source_caps": policy.source_caps,
+                "include_full_text": policy.include_full_text,
+            }
+            result["retrieval_debug"] = retrieval_debug
+        return result
 
     def _fanout_chunk_candidates(self, query: str, limit: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         lexical = self._search_fts(query, limit)
@@ -716,10 +768,85 @@ def row_to_memory(row: Any) -> dict[str, Any]:
     return output
 
 
+def retrieval_policy(mode: str, budget: int | None = None) -> RetrievalPolicy:
+    normalized = mode.strip().lower() if mode else DEFAULT_RETRIEVAL_MODE
+    if normalized not in VALID_RETRIEVAL_MODES:
+        raise ValueError(f"invalid retrieval mode: {mode}")
+    presets = {
+        "compact": RetrievalPolicy(
+            mode="compact",
+            total_budget=2500,
+            max_chunks=4,
+            max_wiki_pages=4,
+            max_memories=6,
+            default_chunk_cap=900,
+            source_caps={
+                "agent_session_log": 600,
+                "hyprnote_meeting": 900,
+                "markdown_note": 1000,
+            },
+        ),
+        "default": RetrievalPolicy(
+            mode="default",
+            total_budget=8000,
+            max_chunks=8,
+            max_wiki_pages=8,
+            max_memories=8,
+            default_chunk_cap=1400,
+            source_caps={
+                "agent_session_log": 1000,
+                "hyprnote_meeting": 1400,
+                "markdown_note": 1800,
+            },
+        ),
+        "broad": RetrievalPolicy(
+            mode="broad",
+            total_budget=12000,
+            max_chunks=8,
+            max_wiki_pages=8,
+            max_memories=12,
+            default_chunk_cap=2200,
+            source_caps={
+                "agent_session_log": 1800,
+                "hyprnote_meeting": 2500,
+                "markdown_note": 3000,
+            },
+        ),
+        "inspect": RetrievalPolicy(
+            mode="inspect",
+            total_budget=16000,
+            max_chunks=8,
+            max_wiki_pages=8,
+            max_memories=12,
+            default_chunk_cap=16000,
+            source_caps={
+                "agent_session_log": 16000,
+                "hyprnote_meeting": 16000,
+                "markdown_note": 16000,
+            },
+            include_full_text=True,
+        ),
+    }
+    policy = presets[normalized]
+    if budget is None:
+        return policy
+    return RetrievalPolicy(
+        mode=policy.mode,
+        total_budget=max(1, budget),
+        max_chunks=policy.max_chunks,
+        max_wiki_pages=policy.max_wiki_pages,
+        max_memories=policy.max_memories,
+        default_chunk_cap=policy.default_chunk_cap,
+        source_caps=policy.source_caps,
+        include_full_text=policy.include_full_text,
+    )
+
+
 def rerank_chunks(query: str, chunks: list[dict[str, Any]], fanout_debug: dict[str, Any]) -> list[dict[str, Any]]:
     terms = important_query_terms(query)
     anchors = anchor_query_terms(terms, chunks)
     agent_query = is_agent_query(terms)
+    recency_intent = has_recency_intent(query, terms)
     lexical_rank = {
         row["chunk_id"]: rank
         for rank, row in enumerate(fanout_debug.get("lexical", []), start=1)
@@ -811,6 +938,9 @@ def rerank_chunks(query: str, chunks: list[dict[str, Any]], fanout_debug: dict[s
         if not suppressed:
             recency_boost, recency_reason = recency_score(candidate)
             if recency_boost:
+                if recency_intent:
+                    recency_boost *= 2
+                    recency_reason = recency_reason.replace("recency boost", "recency intent boost")
                 score += recency_boost
                 reasons.append(recency_reason)
 
@@ -827,9 +957,9 @@ def rerank_chunks(query: str, chunks: list[dict[str, Any]], fanout_debug: dict[s
     return scored
 
 
-def select_context_chunks(reranked_chunks: list[dict[str, Any]], limit: int, budget: int) -> list[dict[str, Any]]:
+def select_context_chunks(reranked_chunks: list[dict[str, Any]], query: str, policy: RetrievalPolicy) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
-    remaining = max(budget, 1)
+    remaining = max(policy.total_budget, 1)
     eligible = [row for row in reranked_chunks if not row.get("suppressed")]
     if not eligible:
         eligible = reranked_chunks
@@ -841,17 +971,187 @@ def select_context_chunks(reranked_chunks: list[dict[str, Any]], limit: int, bud
         for row in eligible
         if "raw transcript chunk" not in row.get("retrieval_noise_reasons", [])
     ]
-    if len(non_transcript) >= min(3, limit):
+    if len(non_transcript) >= min(3, policy.max_chunks):
         eligible = non_transcript
     for row in eligible:
-        if len(selected) >= limit:
+        if len(selected) >= policy.max_chunks or remaining <= 0:
             break
-        token_count = int(row.get("token_count") or max(1, len(str(row.get("text") or "")) // 4))
-        if selected and token_count > remaining:
+        chunk = apply_retrieval_policy(row, query, policy, remaining)
+        if not chunk:
             continue
-        selected.append(row)
-        remaining -= token_count
+        selected.append(chunk)
+        remaining -= int(chunk.get("returned_token_count") or 0)
     return selected
+
+
+def apply_retrieval_policy(
+    chunk: dict[str, Any],
+    query: str,
+    policy: RetrievalPolicy,
+    remaining_budget: int,
+) -> dict[str, Any] | None:
+    if remaining_budget <= 0:
+        return None
+    source_type = str(chunk.get("source_type") or "")
+    source_cap = policy.source_caps.get(source_type, policy.default_chunk_cap)
+    allowed = min(remaining_budget, source_cap)
+    if allowed <= 0:
+        return None
+
+    original_text = str(chunk.get("text") or "")
+    original_count = int(chunk.get("token_count") or estimate_tokens(original_text))
+    if policy.include_full_text and original_count <= allowed:
+        text = original_text
+    elif original_count <= allowed:
+        text = original_text
+    else:
+        text = excerpt_chunk_text(original_text, query, source_type, allowed)
+
+    returned_count = estimate_tokens(text)
+    if returned_count > allowed:
+        text = trim_to_token_budget(text, allowed)
+        returned_count = estimate_tokens(text)
+
+    output = dict(chunk)
+    output["text"] = text
+    output["original_token_count"] = original_count
+    output["returned_token_count"] = returned_count
+    output["omitted_tokens"] = max(0, original_count - returned_count)
+    output["excerpted"] = returned_count < original_count
+    output["retrieval_mode"] = policy.mode
+    output["source_token_cap"] = source_cap
+    return output
+
+
+def excerpt_chunk_text(text: str, query: str, source_type: str, max_tokens: int) -> str:
+    cleaned = clean_context_text(text, source_type)
+    if estimate_tokens(cleaned) <= max_tokens:
+        return cleaned
+    excerpt = focused_excerpt(cleaned, query, max_tokens)
+    if excerpt:
+        return excerpt
+    return trim_to_token_budget(cleaned, max_tokens)
+
+
+def clean_context_text(text: str, source_type: str) -> str:
+    cleaned = strip_frontmatter(text)
+    if source_type == "agent_session_log":
+        return clean_agent_session_log(cleaned)
+    return cleaned.strip()
+
+
+def strip_frontmatter(text: str) -> str:
+    stripped = text.lstrip()
+    if not stripped.startswith("---"):
+        return text.strip()
+    end = stripped.find("\n---", 3)
+    if end == -1:
+        return text.strip()
+    return stripped[end + 4 :].strip()
+
+
+def clean_agent_session_log(text: str) -> str:
+    output: list[str] = []
+    for line in text.splitlines():
+        lowered = line.lower()
+        if "session_meta:" in lowered:
+            continue
+        if "you are codex" in lowered or "<permissions instructions>" in lowered:
+            continue
+        if lowered.lstrip("- ").startswith("event_msg:"):
+            continue
+        if lowered.lstrip("- ").startswith("response_item:") and len(line) > 1000:
+            continue
+        output.append(line)
+    cleaned = "\n".join(output)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def focused_excerpt(text: str, query: str, max_tokens: int) -> str:
+    terms = set(important_query_terms(query))
+    blocks = context_blocks(text)
+    scored: list[tuple[int, int, str]] = []
+    for index, block in enumerate(blocks):
+        lowered = block.lower()
+        hits = sum(1 for term in terms if term in lowered)
+        section_bonus = 0
+        if any(marker in lowered for marker in ["## user requests", "## summary", "## assistant responses"]):
+            section_bonus = 2
+        if hits or section_bonus:
+            scored.append((hits + section_bonus, index, block))
+    if not scored:
+        return trim_to_token_budget(text, max_tokens)
+
+    selected_indexes = {index for _, index, _ in sorted(scored, key=lambda item: (-item[0], item[1]))[:8]}
+    selected_blocks = [block for index, block in enumerate(blocks) if index in selected_indexes]
+    return pack_blocks(selected_blocks, max_tokens, terms)
+
+
+def context_blocks(text: str) -> list[str]:
+    raw_blocks = re.split(r"\n\s*\n", text)
+    blocks: list[str] = []
+    for block in raw_blocks:
+        stripped = block.strip()
+        if not stripped:
+            continue
+        if estimate_tokens(stripped) > 220:
+            lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+            blocks.extend(line for line in lines if line)
+        else:
+            blocks.append(stripped)
+    return blocks
+
+
+def pack_blocks(blocks: list[str], max_tokens: int, terms: set[str]) -> str:
+    selected: list[str] = []
+    remaining = max_tokens
+    for block in blocks:
+        if remaining <= 0:
+            break
+        block_tokens = estimate_tokens(block)
+        if block_tokens > remaining:
+            selected.append(trim_to_token_budget_around_terms(block, remaining, terms))
+            remaining = 0
+        else:
+            selected.append(block)
+            remaining -= block_tokens
+    return "\n\n".join(selected).strip()
+
+
+def trim_to_token_budget(text: str, max_tokens: int) -> str:
+    words = re.findall(r"\S+", text)
+    if len(words) <= max_tokens:
+        return text.strip()
+    if max_tokens <= 3:
+        return " ".join(words[:max_tokens])
+    return " ".join(words[: max_tokens - 3] + ["...", "[truncated]"])
+
+
+def trim_to_token_budget_around_terms(text: str, max_tokens: int, terms: set[str]) -> str:
+    words = re.findall(r"\S+", text)
+    if len(words) <= max_tokens:
+        return text.strip()
+    if max_tokens <= 6 or not terms:
+        return trim_to_token_budget(text, max_tokens)
+    lowered_terms = {term.lower() for term in terms}
+    hit_index = next(
+        (
+            index
+            for index, word in enumerate(words)
+            if any(term in word.lower() for term in lowered_terms)
+        ),
+        0,
+    )
+    body_budget = max_tokens - 4
+    start = max(0, hit_index - max(0, body_budget // 3))
+    end = min(len(words), start + body_budget)
+    if end - start < body_budget:
+        start = max(0, end - body_budget)
+    excerpt_words = words[start:end]
+    prefix = ["...", "[excerpt]"] if start > 0 else []
+    suffix = ["...", "[truncated]"] if end < len(words) else []
+    return " ".join(prefix + excerpt_words + suffix)
 
 
 def chunk_noise_reasons(chunk: dict[str, Any]) -> list[str]:
@@ -1124,6 +1424,13 @@ def anchor_query_terms(terms: list[str], chunks: list[dict[str, Any]]) -> list[s
 
 def is_agent_query(terms: list[str]) -> bool:
     return bool(set(terms).intersection(AGENT_QUERY_TERMS))
+
+
+def has_recency_intent(query: str, terms: list[str]) -> bool:
+    lowered = query.lower()
+    return bool(set(terms).intersection(RECENCY_INTENT_TERMS)) or any(
+        phrase in lowered for phrase in ["this week", "last week", "last month"]
+    )
 
 
 def first_section(markdown: str, heading: str) -> str:

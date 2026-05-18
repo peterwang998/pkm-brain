@@ -324,6 +324,126 @@ def test_retrieve_context_reranks_clean_sources_and_source_linked_wiki(tmp_path:
     assert "concepts/local-first-agent-memory.md" not in wiki_paths
 
 
+def test_retrieve_context_compacts_noisy_agent_logs_with_hard_budget(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    log = svc.paths.inbox / "agent_logs" / "codex" / "retrieval-policy-session.md"
+    log.parent.mkdir(parents=True)
+    noisy_words = " ".join(f"noise{i}" for i in range(1800))
+    log.write_text(
+        "---\n"
+        'source_type: "agent_session_log"\n'
+        'agent: "codex"\n'
+        'session_id: "retrieval-policy-session"\n'
+        'title: "Retrieval Policy Session"\n'
+        "---\n\n"
+        "# Agent Session: Retrieval Policy Session\n\n"
+        "- session_meta: You are Codex, a coding agent based on GPT-5.\n\n"
+        "## User Requests\n\n"
+        f"Build a retrieval policy with a hard budget and compact noisy agent logs. {noisy_words}\n",
+        encoding="utf-8",
+    )
+    svc.ingest()
+
+    context = svc.retrieve_context(
+        "agent retrieval policy hard budget compact noisy logs",
+        mode="compact",
+        debug=True,
+    )
+
+    chunk = context["supporting_chunks"][0]
+    assert context["retrieval_mode"] == "compact"
+    assert chunk["source_type"] == "agent_session_log"
+    assert chunk["excerpted"] is True
+    assert chunk["returned_token_count"] <= 600
+    assert chunk["original_token_count"] > chunk["returned_token_count"]
+    assert "session_meta" not in chunk["text"].lower()
+    assert sum(row["returned_token_count"] for row in context["supporting_chunks"]) <= context["budget"]
+
+
+def test_retrieve_context_explicit_budget_caps_first_selected_chunk(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "huge-retrieval-policy.md"
+    note.write_text(
+        "---\n"
+        "title: Huge Retrieval Policy\n"
+        "---\n\n"
+        "# Huge Retrieval Policy\n\n"
+        + "retrieval policy budget "
+        + " ".join(f"filler{i}" for i in range(600)),
+        encoding="utf-8",
+    )
+    svc.ingest()
+
+    context = svc.retrieve_context("retrieval policy budget", budget=80)
+
+    assert context["budget"] == 80
+    assert context["supporting_chunks"]
+    assert sum(row["returned_token_count"] for row in context["supporting_chunks"]) <= 80
+    assert context["supporting_chunks"][0]["returned_token_count"] <= 80
+    assert context["supporting_chunks"][0]["excerpted"] is True
+
+
+def test_retrieve_context_broad_mode_returns_more_agent_log_text_than_compact(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    log = svc.paths.inbox / "agent_logs" / "codex" / "broad-retrieval-session.md"
+    log.parent.mkdir(parents=True)
+    log.write_text(
+        "agent retrieval broad compact comparison "
+        + " ".join(f"detail{i}" for i in range(2200))
+        + " final retrieval policy detail",
+        encoding="utf-8",
+    )
+    svc.ingest()
+
+    compact = svc.retrieve_context("agent retrieval broad compact comparison", mode="compact")
+    broad = svc.retrieve_context("agent retrieval broad compact comparison", mode="broad")
+
+    assert compact["supporting_chunks"][0]["returned_token_count"] <= 600
+    assert broad["supporting_chunks"][0]["returned_token_count"] > compact["supporting_chunks"][0]["returned_token_count"]
+    assert broad["supporting_chunks"][0]["returned_token_count"] <= 1800
+
+
+def test_retrieve_context_latest_query_boosts_recent_documents(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    old_note = svc.paths.inbox / "old-policy.md"
+    new_note = svc.paths.inbox / "new-policy.md"
+    old_note.write_text(
+        "---\n"
+        "title: Retrieval Policy Reference\n"
+        "---\n\n"
+        "# Retrieval Policy Reference\n\n"
+        "retrieval policy shared marker old-only detail.\n",
+        encoding="utf-8",
+    )
+    new_note.write_text(
+        "---\n"
+        "title: Retrieval Policy Reference\n"
+        "---\n\n"
+        "# Retrieval Policy Reference\n\n"
+        "retrieval policy shared marker new-only detail.\n",
+        encoding="utf-8",
+    )
+    svc.ingest()
+    with connection(svc.paths.sqlite_path) as conn:
+        conn.execute(
+            "UPDATE documents SET created_at = ?, ingested_at = ? WHERE source_path = ?",
+            ("2020-01-01T00:00:00+00:00", "2020-01-01T00:00:00+00:00", str(old_note)),
+        )
+        conn.execute(
+            "UPDATE documents SET created_at = ?, ingested_at = ? WHERE source_path = ?",
+            ("2026-05-18T00:00:00+00:00", "2026-05-18T00:00:00+00:00", str(new_note)),
+        )
+
+    context = svc.retrieve_context("latest retrieval policy shared marker")
+
+    assert "new-only" in context["supporting_chunks"][0]["text"]
+    assert any("recency intent boost" in reason for reason in context["supporting_chunks"][0]["selection_reasons"])
+
+
 def test_memory_audit_warns_on_missing_source(tmp_path: Path) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()

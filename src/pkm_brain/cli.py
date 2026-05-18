@@ -110,11 +110,12 @@ def search(
 def retrieve_context(
     task: str = typer.Option(...),
     project: Optional[str] = typer.Option(None),
-    budget: int = typer.Option(8000),
+    budget: Optional[int] = typer.Option(None, help="Override the selected retrieval mode's token budget."),
+    mode: str = typer.Option("default", help="Retrieval mode: compact, default, broad, or inspect."),
     debug: bool = typer.Option(False, "--debug"),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
-    result = service(home).retrieve_context(task, project=project, budget=budget, debug=debug)
+    result = service(home).retrieve_context(task, project=project, budget=budget, mode=mode, debug=debug)
     console.print_json(json.dumps(result))
 
 
