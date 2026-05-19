@@ -630,7 +630,7 @@ required = [
   'brain sync pull', 'brain sync push', 'brain sync run', 'brain sync status',
   'brain sync conflicts', 'brain scheduler install-sync',
   'brain scheduler install-secondary-capture', 'brain scheduler status',
-  'brain ui', 'brain memory export-all', 'brain memory import',
+  'brain sync acceptance', 'brain ui', 'brain memory export-all', 'brain memory import',
   'brain automation secondary-tick',
 ]
 help_out = subprocess.run(['uv','run','brain','--help'], capture_output=True, text=True).stdout
@@ -642,6 +642,8 @@ print('top-level groups present')
 
 # 4. Manual acceptance: run spec §17 acceptance flow once and check off each step.
 # Capture results in docs/runbooks/sync-acceptance.md.
+uv run brain sync acceptance --home ~/brain --peer <secondary-node-id> \
+  --run-sync --retrieval-phrase "<unique Secondary session phrase>" --json
 ```
 
 ---

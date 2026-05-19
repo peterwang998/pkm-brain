@@ -27,6 +27,7 @@ uv run pytest -q
 uv run ruff check .
 sqlite3 ~/brain/db/brain.sqlite "SELECT version, applied_at FROM schema_migrations ORDER BY version;"
 sqlite3 ~/brain/db/brain.sqlite "PRAGMA table_info(sync_runs);"
+uv run brain sync acceptance --home ~/brain --peer <secondary-node-id> --json
 ```
 
 Expected schema state:
@@ -90,6 +91,22 @@ Result column.
 | 9 | `uv run brain retrieve-context --home ~/brain --task "<unique Secondary session phrase>"` finds the Secondary session. | |
 | 10 | Confirm push mirrored canonical `raw/`, `wiki/`, `memory/`, and `config/shared/` content to Secondary. | |
 | 11 | Confirm Secondary retrieval sees the pushed source after rebuild/remote ingest. | |
+
+The automated portion can run the connection test, real sync, and Primary
+retrieval verification in one report:
+
+```bash
+uv run brain sync acceptance \
+  --home ~/brain \
+  --peer <secondary-node-id> \
+  --run-sync \
+  --retrieval-phrase "<unique Secondary session phrase>" \
+  --json
+```
+
+`complete: true` means the automated checks passed. The table above should
+still be filled in with the observed real-machine setup and Secondary-side
+retrieval result.
 
 ## Failure Checks
 

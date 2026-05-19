@@ -834,6 +834,7 @@ Currently implemented in code:
 - Staged Primary pull into `inbox/external/<secondary-node-id>/`, manifest hash verification, rejection/quarantine paths, and ingest orchestration.
 - Primary push of `raw/`, `wiki/`, `memory/`, and `config/shared/`, followed by remote Secondary ingest.
 - `sync_runs` SQLite table, `brain sync status`, and advisory `brain sync conflicts`.
+- `brain sync acceptance` preflight report for the V1 two-machine acceptance flow.
 - `brain scheduler` command group with macOS LaunchAgent jobs for Primary sync and Secondary capture.
 - `brain ui` with loopback binding, local auth token, JSON API, and browser pages for Status, Setup, Sync, Jobs, Logs, and Memory Review.
 

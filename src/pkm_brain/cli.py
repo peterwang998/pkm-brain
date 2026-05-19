@@ -33,6 +33,7 @@ from .mcp_server import create_mcp
 from .paths import BrainPaths
 from .service import BrainService
 from .setup_wizard import run_setup_plan
+from .sync_acceptance import run_acceptance_report
 from .sync_connection import test_connection as run_sync_test_connection
 from .sync_setup import add_peer as sync_add_peer_config
 from .sync_setup import init_primary as sync_init_primary_config
@@ -942,6 +943,42 @@ def sync_conflicts(
         )
     console.print(table)
     console.print(f"Conflicts: {result['count']}")
+
+
+@sync_app.command("acceptance")
+def sync_acceptance(
+    peer_node_id: Optional[str] = typer.Option(None, "--peer", help="Secondary peer node_id. Inferred when exactly one peer is configured."),
+    run_sync: bool = typer.Option(False, "--run-sync", help="Execute the real pull/push/remote-ingest sync step."),
+    skip_connection: bool = typer.Option(False, "--skip-connection", help="Skip the SSH/rsync connection test."),
+    retrieval_phrase: Optional[str] = typer.Option(None, "--retrieval-phrase", help="Unique Secondary session phrase to verify retrieval after sync."),
+    home: Optional[Path] = typer.Option(None),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    report = run_acceptance_report(
+        BrainPaths.from_value(home),
+        peer_node_id=peer_node_id,
+        test_connection_now=not skip_connection,
+        run_sync_now=run_sync,
+        retrieval_phrase=retrieval_phrase,
+    )
+    if json_output:
+        console.print_json(json.dumps(report))
+    else:
+        table = Table(title="Sync Acceptance")
+        table.add_column("Check")
+        table.add_column("Status")
+        table.add_column("Message")
+        for check in report["checks"]:
+            table.add_row(check["name"], check["status"], check["message"])
+        console.print(f"Home: {report['home']}")
+        console.print(f"Peer: {report['peer_node_id'] or 'not selected'}")
+        console.print(table)
+        console.print(f"Ready: {'yes' if report['ready'] else 'no'}")
+        console.print(f"Complete: {'yes' if report['complete'] else 'no'}")
+        if not report["complete"]:
+            console.print("Run with --run-sync and --retrieval-phrase after the Secondary has produced a unique session.")
+    if not report["ready"]:
+        raise typer.Exit(1)
 
 
 @app.command()
