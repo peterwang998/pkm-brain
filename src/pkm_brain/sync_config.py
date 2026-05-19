@@ -20,6 +20,7 @@ class PeerConfig:
     host: str | None = None
     user: str | None = None
     brain_home: Path | None = None
+    outbox_path: Path | None = None
     transport: str = "ssh"
     trust: str | None = None
     identity_path: Path | None = None
@@ -40,6 +41,7 @@ class PeerConfig:
             host=optional_string(data, "host"),
             user=optional_string(data, "user"),
             brain_home=optional_path(data, "brain_home"),
+            outbox_path=optional_path(data, "outbox_path"),
             transport=str(data.get("transport") or "ssh"),
             trust=optional_string(data, "trust"),
             identity_path=optional_path(data, "identity_path"),
@@ -54,6 +56,7 @@ class PeerConfig:
             "host": self.host,
             "user": self.user,
             "brain_home": str(self.brain_home) if self.brain_home else None,
+            "outbox_path": str(self.outbox_path) if self.outbox_path else None,
             "transport": self.transport,
             "trust": self.trust,
             "identity_path": str(self.identity_path) if self.identity_path else None,

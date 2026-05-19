@@ -512,6 +512,7 @@ def sync_add_peer(
     host: Optional[str] = typer.Option(None, "--host"),
     user: Optional[str] = typer.Option(None, "--user"),
     brain_home: Optional[Path] = typer.Option(None, "--brain-home"),
+    outbox_path: Optional[Path] = typer.Option(None, "--outbox-path", help="Remote outbox path when not <brain-home>/outbox/<node-id>."),
     identity_path: Optional[Path] = typer.Option(None, "--identity-path"),
     allow_first_host_key: bool = typer.Option(False, "--allow-first-host-key"),
     test_connection_now: bool = typer.Option(False, "--test-connection", help="Run test-connection after adding the peer."),
@@ -537,6 +538,7 @@ def sync_add_peer(
             resolved_host,
             resolved_user,
             resolved_brain_home,
+            outbox_path=outbox_path,
             identity_path=identity_path,
             host_key_candidate=host_key_candidate,
         )

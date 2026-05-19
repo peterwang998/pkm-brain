@@ -55,6 +55,7 @@ def add_peer(
     host: str,
     user: str,
     brain_home: Path,
+    outbox_path: Path | None = None,
     identity_path: Path | None = None,
     host_key_candidate: HostKeyCandidate | None = None,
 ) -> dict[str, object]:
@@ -75,6 +76,7 @@ def add_peer(
         host=host,
         user=user,
         brain_home=brain_home.expanduser(),
+        outbox_path=outbox_path.expanduser() if outbox_path else None,
         transport="ssh",
         trust="lan-only",
         identity_path=identity_path.expanduser() if identity_path else None,

@@ -103,7 +103,7 @@ def run_secondary_tick(
     hyprnote_root: Path | None = None,
     include_hyprnote: bool = False,
 ) -> SecondaryTickResult:
-    service = BrainService(paths)
+    service = BrainService(paths, prefer_model_embeddings=False)
     service.init_workspace()
     lock_path = paths.logs / "secondary-tick.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)

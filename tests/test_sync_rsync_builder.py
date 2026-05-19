@@ -21,6 +21,21 @@ def test_pull_builder_targets_staging_not_live_external_inbox(tmp_path: Path) ->
     assert f"{paths.inbox}/external/secondary/" != argv[-1]
 
 
+def test_pull_builder_uses_peer_outbox_path_when_configured(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "primary")
+    secondary = PeerConfig(
+        node_id="secondary",
+        host="secondary.local",
+        user="peter",
+        brain_home=tmp_path / "secondary",
+        outbox_path=tmp_path / "custom-outbox" / "secondary",
+    )
+
+    argv = build_pull(paths, secondary, "run-1")
+
+    assert argv[-2] == f"peter@secondary.local:{tmp_path}/custom-outbox/secondary/"
+
+
 def test_push_builder_includes_atomic_flags_and_excludes_for_each_source(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "primary")
     secondary = peer(tmp_path / "secondary")

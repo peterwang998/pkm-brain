@@ -51,6 +51,38 @@ def test_add_peer_writes_peer_config(tmp_path) -> None:
     assert peer.user == "peter"
 
 
+def test_add_peer_can_store_custom_outbox_path(tmp_path) -> None:
+    home = str(tmp_path / "primary")
+    init_primary(home)
+    outbox = tmp_path / "external-disk" / "secondary-outbox"
+
+    result = runner.invoke(
+        app,
+        [
+            "sync",
+            "add-peer",
+            "--node-id",
+            "secondary",
+            "--host",
+            "secondary.local",
+            "--user",
+            "peter",
+            "--brain-home",
+            "/remote/brain",
+            "--outbox-path",
+            str(outbox),
+            "--yes",
+            "--home",
+            home,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    config = load_sync_config(BrainPaths.from_value(home))
+    assert config.primary is not None
+    assert config.primary.peers[0].outbox_path == outbox
+
+
 def test_add_peer_can_chain_connection_test(tmp_path, monkeypatch) -> None:
     class FakeConnectionResult:
         def as_dict(self) -> dict[str, object]:

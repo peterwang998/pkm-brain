@@ -29,7 +29,7 @@ def build_pull(paths: BrainPaths, peer: PeerConfig, run_id: str) -> list[str]:
     require_ssh_peer(peer)
     if not peer.brain_home:
         raise ValueError(f"peer {peer.node_id} is missing brain_home")
-    remote_source = remote_rsync_path(peer, peer.brain_home / "outbox" / peer.node_id)
+    remote_source = remote_rsync_path(peer, peer_outbox_path(peer))
     local_target = paths.inbox / "external" / peer.node_id / "_staging" / run_id
     return [
         "rsync",
@@ -92,6 +92,14 @@ def rsync_ssh_command(paths: BrainPaths, peer: PeerConfig) -> str:
 def remote_rsync_path(peer: PeerConfig, path: Path) -> str:
     require_ssh_peer(peer)
     return f"{peer.user}@{peer.host}:{path.expanduser()}"
+
+
+def peer_outbox_path(peer: PeerConfig) -> Path:
+    if peer.outbox_path:
+        return peer.outbox_path
+    if not peer.brain_home:
+        raise ValueError(f"peer {peer.node_id} is missing brain_home")
+    return peer.brain_home / "outbox" / peer.node_id
 
 
 def ensure_trailing_slash(path: str | Path) -> str:
