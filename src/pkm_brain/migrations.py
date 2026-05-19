@@ -40,8 +40,37 @@ def _migration_001_add_origin_identity(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_002_create_sync_runs(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sync_runs (
+          id TEXT PRIMARY KEY,
+          peer_node_id TEXT NOT NULL,
+          direction TEXT NOT NULL,
+          started_at TEXT NOT NULL,
+          finished_at TEXT,
+          status TEXT NOT NULL,
+          files_pulled INTEGER NOT NULL DEFAULT 0,
+          files_pushed INTEGER NOT NULL DEFAULT 0,
+          bytes_pulled INTEGER NOT NULL DEFAULT 0,
+          bytes_pushed INTEGER NOT NULL DEFAULT 0,
+          primary_ingest_run_id TEXT,
+          remote_ingest_status TEXT,
+          errors TEXT NOT NULL DEFAULT '[]'
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_sync_runs_peer_status
+        ON sync_runs(peer_node_id, status, finished_at)
+        """
+    )
+
+
 MIGRATIONS: list[Migration] = [
     (1, "add_origin_identity", _migration_001_add_origin_identity),
+    (2, "create_sync_runs", _migration_002_create_sync_runs),
 ]
 
 

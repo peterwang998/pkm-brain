@@ -171,6 +171,25 @@ CREATE TABLE IF NOT EXISTS ingestion_runs (
   warnings TEXT NOT NULL DEFAULT '[]'
 );
 
+CREATE TABLE IF NOT EXISTS sync_runs (
+  id TEXT PRIMARY KEY,
+  peer_node_id TEXT NOT NULL,
+  direction TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  status TEXT NOT NULL,
+  files_pulled INTEGER NOT NULL DEFAULT 0,
+  files_pushed INTEGER NOT NULL DEFAULT 0,
+  bytes_pulled INTEGER NOT NULL DEFAULT 0,
+  bytes_pushed INTEGER NOT NULL DEFAULT 0,
+  primary_ingest_run_id TEXT,
+  remote_ingest_status TEXT,
+  errors TEXT NOT NULL DEFAULT '[]'
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_runs_peer_status
+ON sync_runs(peer_node_id, status, finished_at);
+
 CREATE TABLE IF NOT EXISTS automation_runs (
   id TEXT PRIMARY KEY,
   job_name TEXT NOT NULL,

@@ -158,6 +158,76 @@ class BrainService:
 
         return run_sync_doctor(self.paths).as_dict()
 
+    def record_sync_run(
+        self,
+        peer_node_id: str,
+        direction: str,
+        started_at: str,
+        finished_at: str,
+        status: str,
+        files_pulled: int = 0,
+        files_pushed: int = 0,
+        bytes_pulled: int = 0,
+        bytes_pushed: int = 0,
+        primary_ingest_run_id: str | None = None,
+        remote_ingest_status: str | None = None,
+        errors: list[str] | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        self.init_workspace()
+        sync_run_id = run_id or new_id("sync_run")
+        payload = {
+            "id": sync_run_id,
+            "peer_node_id": peer_node_id,
+            "direction": direction,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "status": status,
+            "files_pulled": int(files_pulled),
+            "files_pushed": int(files_pushed),
+            "bytes_pulled": int(bytes_pulled),
+            "bytes_pushed": int(bytes_pushed),
+            "primary_ingest_run_id": primary_ingest_run_id,
+            "remote_ingest_status": remote_ingest_status,
+            "errors": errors or [],
+        }
+        with connection(self.paths.sqlite_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO sync_runs(
+                  id, peer_node_id, direction, started_at, finished_at, status,
+                  files_pulled, files_pushed, bytes_pulled, bytes_pushed,
+                  primary_ingest_run_id, remote_ingest_status, errors
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    payload["id"],
+                    payload["peer_node_id"],
+                    payload["direction"],
+                    payload["started_at"],
+                    payload["finished_at"],
+                    payload["status"],
+                    payload["files_pulled"],
+                    payload["files_pushed"],
+                    payload["bytes_pulled"],
+                    payload["bytes_pushed"],
+                    payload["primary_ingest_run_id"],
+                    payload["remote_ingest_status"],
+                    dumps(payload["errors"]),
+                ),
+            )
+        return payload
+
+    def sync_status(self) -> dict[str, Any]:
+        from .sync_status import sync_status
+
+        return sync_status(self.paths)
+
+    def sync_conflicts(self) -> dict[str, Any]:
+        from .sync_status import sync_conflicts
+
+        return sync_conflicts(self.paths)
+
     def ingest(
         self,
         source: Path | None = None,

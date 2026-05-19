@@ -1,0 +1,201 @@
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+from typing import Any
+
+from .db import connection, loads
+from .paths import BrainPaths
+from .sync_config import PeerConfig, load_sync_config
+from .util import file_sha256
+
+
+CANONICAL_SUBDIRS = ("raw", "wiki", "memory", "config/shared")
+CANONICAL_EXCLUDED_PARTS = {"db", "indexes", "logs", "outbox", "config/local"}
+
+
+def sync_status(paths: BrainPaths) -> dict[str, Any]:
+    try:
+        config = load_sync_config(paths)
+    except FileNotFoundError:
+        return {"configured": False, "role": None, "node_id": None, "peers": [], "warnings": ["sync config missing"]}
+
+    peers = config.primary.peers if config.primary else []
+    peer_statuses = [status_for_peer(paths, peer) for peer in peers]
+    warnings = [warning for peer_status in peer_statuses for warning in peer_status.get("warnings", [])]
+    return {
+        "configured": True,
+        "role": config.role,
+        "node_id": config.node_id,
+        "peers": peer_statuses,
+        "warnings": warnings,
+    }
+
+
+def status_for_peer(paths: BrainPaths, peer: PeerConfig) -> dict[str, Any]:
+    with connection(paths.sqlite_path) as conn:
+        last_successful_pull = latest_sync_row(
+            conn,
+            peer.node_id,
+            "direction IN ('pull', 'run') AND status IN ('ok', 'ok_with_remote_ingest_failure')",
+        )
+        last_successful_push = latest_sync_row(
+            conn,
+            peer.node_id,
+            "direction IN ('push', 'run') AND status IN ('ok', 'ok_with_remote_ingest_failure')",
+        )
+        last_failed_run = latest_sync_row(conn, peer.node_id, "status = 'failed'")
+        last_run = latest_sync_row(conn, peer.node_id, "1=1")
+
+    primary_hash = canonical_manifest_hash(paths.home)
+    remote_hash = canonical_manifest_hash(peer.brain_home) if peer.brain_home and peer.brain_home.exists() else None
+    mirror_current = remote_hash is not None and primary_hash == remote_hash
+    warnings: list[str] = []
+    if remote_hash is not None and primary_hash != remote_hash:
+        warnings.append(f"mirror divergence for {peer.node_id}: primary canonical hash differs from remote mirror")
+    pending_outbox_count = pending_outbox_manifest_count(peer)
+    return {
+        "peer_node_id": peer.node_id,
+        "host": peer.host,
+        "last_run": last_run,
+        "last_successful_pull": last_successful_pull,
+        "last_successful_push": last_successful_push,
+        "last_failed_run": summarize_failed_run(last_failed_run),
+        "pending_outbox_count": pending_outbox_count,
+        "canonical_manifest_hash": primary_hash,
+        "remote_manifest_hash": remote_hash,
+        "mirror_current": mirror_current,
+        "warnings": warnings,
+    }
+
+
+def latest_sync_row(conn: Any, peer_node_id: str, where: str) -> dict[str, Any] | None:
+    row = conn.execute(
+        f"""
+        SELECT *
+        FROM sync_runs
+        WHERE peer_node_id = ? AND {where}
+        ORDER BY COALESCE(finished_at, started_at) DESC
+        LIMIT 1
+        """,
+        (peer_node_id,),
+    ).fetchone()
+    return row_to_sync_run(row) if row else None
+
+
+def row_to_sync_run(row: Any) -> dict[str, Any]:
+    payload = dict(row)
+    payload["errors"] = loads(payload.get("errors"), [])
+    return payload
+
+
+def summarize_failed_run(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not row:
+        return None
+    errors = row.get("errors") or []
+    return {
+        "id": row["id"],
+        "direction": row["direction"],
+        "started_at": row["started_at"],
+        "finished_at": row["finished_at"],
+        "status": row["status"],
+        "error_summary": "; ".join(str(error) for error in errors[:3]),
+        "errors": errors,
+    }
+
+
+def pending_outbox_manifest_count(peer: PeerConfig) -> int | None:
+    if not peer.brain_home:
+        return None
+    manifest = peer.brain_home / "outbox" / peer.node_id / "manifest.jsonl"
+    if not manifest.exists():
+        return None
+    count = 0
+    for line in manifest.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            count += 1
+    return count
+
+
+def canonical_manifest_hash(home: Path | None) -> str | None:
+    if home is None:
+        return None
+    root = home.expanduser()
+    if not root.exists():
+        return None
+    h = hashlib.sha256()
+    seen = False
+    for subdir in CANONICAL_SUBDIRS:
+        base = root / subdir
+        if not base.exists():
+            continue
+        for path in sorted(base.rglob("*")):
+            if not path.is_file() or canonical_path_excluded(path, root):
+                continue
+            relative = path.relative_to(root).as_posix()
+            h.update(relative.encode("utf-8"))
+            h.update(b"\0")
+            h.update(file_sha256(path).encode("ascii"))
+            h.update(b"\n")
+            seen = True
+    return h.hexdigest() if seen else hashlib.sha256(b"").hexdigest()
+
+
+def canonical_path_excluded(path: Path, root: Path) -> bool:
+    relative_parts = path.relative_to(root).parts
+    joined = "/".join(relative_parts)
+    if any(part in CANONICAL_EXCLUDED_PARTS for part in relative_parts):
+        return True
+    if joined.startswith("config/sync.yaml") or joined.startswith("config/local/"):
+        return True
+    return path.name == ".DS_Store" or ".sqlite" in path.name
+
+
+def sync_conflicts(paths: BrainPaths) -> dict[str, Any]:
+    with connection(paths.sqlite_path) as conn:
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT logical_source_key,
+                       COUNT(DISTINCT origin_node_id) AS origin_count,
+                       GROUP_CONCAT(DISTINCT origin_node_id) AS origins,
+                       GROUP_CONCAT(id) AS document_ids,
+                       GROUP_CONCAT(source_path) AS source_paths
+                FROM documents
+                WHERE logical_source_key IS NOT NULL
+                GROUP BY logical_source_key
+                HAVING COUNT(DISTINCT origin_node_id) > 1
+                ORDER BY logical_source_key
+                """
+            )
+        ]
+    conflicts = [
+        {
+            "logical_source_key": row["logical_source_key"],
+            "origin_count": row["origin_count"],
+            "origins": sorted(filter(None, str(row["origins"] or "").split(","))),
+            "document_ids": sorted(filter(None, str(row["document_ids"] or "").split(","))),
+            "source_paths": sorted(set(filter(None, str(row["source_paths"] or "").split(",")))),
+        }
+        for row in rows
+    ]
+    return {"conflicts": conflicts, "count": len(conflicts)}
+
+
+def format_status_table_rows(status: dict[str, Any]) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for peer in status.get("peers", []):
+        pull = peer.get("last_successful_pull") or {}
+        push = peer.get("last_successful_push") or {}
+        failed = peer.get("last_failed_run") or {}
+        rows.append(
+            [
+                str(peer.get("peer_node_id") or ""),
+                str((pull.get("finished_at") or pull.get("started_at") or "never")),
+                str((push.get("finished_at") or push.get("started_at") or "never")),
+                str(failed.get("error_summary") or ""),
+                "yes" if peer.get("mirror_current") else "unknown" if peer.get("remote_manifest_hash") is None else "no",
+            ]
+        )
+    return rows

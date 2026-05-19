@@ -37,6 +37,7 @@ from .sync_setup import add_peer as sync_add_peer_config
 from .sync_setup import init_primary as sync_init_primary_config
 from .sync_setup import init_secondary as sync_init_secondary_config
 from .sync_ssh import first_host_key_with_fingerprint
+from .sync_status import format_status_table_rows
 from .sync_transfer import sync_pull as run_sync_pull
 from .sync_transfer import sync_push as run_sync_push
 from .sync_transfer import sync_run as run_sync_run
@@ -64,6 +65,7 @@ capture_app = typer.Typer(help="Capture external sources into the inbox.")
 automation_app = typer.Typer(help="Scheduled automation commands.")
 launch_agent_app = typer.Typer(help="macOS LaunchAgent commands.")
 sync_app = typer.Typer(help="Primary/Secondary sync commands.")
+scheduler_app = typer.Typer(help="Logical scheduler commands.")
 app.add_typer(inspect_app, name="inspect")
 app.add_typer(index_app, name="index")
 app.add_typer(wiki_app, name="wiki")
@@ -76,6 +78,7 @@ app.add_typer(capture_app, name="capture")
 app.add_typer(automation_app, name="automation")
 app.add_typer(launch_agent_app, name="launch-agent")
 app.add_typer(sync_app, name="sync")
+app.add_typer(scheduler_app, name="scheduler")
 console = Console()
 
 
@@ -610,17 +613,71 @@ def sync_push(
 @sync_app.command("run")
 def sync_run(
     peer_node_id: str,
+    if_reachable: bool = typer.Option(False, "--if-reachable", help="Skip cleanly when the peer is unreachable."),
     no_remote_ingest: bool = typer.Option(False, "--no-remote-ingest", help="Skip remote ingest after a successful push."),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
     try:
-        result = run_sync_run(BrainPaths.from_value(home), peer_node_id, remote_ingest=not no_remote_ingest).as_dict()
+        result = run_sync_run(
+            BrainPaths.from_value(home),
+            peer_node_id,
+            remote_ingest=not no_remote_ingest,
+            if_reachable=if_reachable,
+        ).as_dict()
     except ValueError as exc:
         console.print(str(exc))
         raise typer.Exit(1)
     console.print_json(json.dumps(result))
     if result["status"] == "failed":
         raise typer.Exit(1)
+
+
+@sync_app.command("status")
+def sync_status(
+    home: Optional[Path] = typer.Option(None),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    result = service(home).sync_status()
+    if json_output:
+        console.print_json(json.dumps(result))
+        return
+    if not result["configured"]:
+        console.print("Sync is not configured.")
+        for warning in result.get("warnings", []):
+            console.print(f"warning: {warning}")
+        return
+    table = Table(title="Sync Status")
+    for column in ["Peer", "Last Pull", "Last Push", "Last Failure", "Mirror Current"]:
+        table.add_column(column)
+    for row in format_status_table_rows(result):
+        table.add_row(*row)
+    console.print(f"Role: {result['role']}")
+    console.print(f"Node: {result['node_id']}")
+    console.print(table)
+    for warning in result.get("warnings", []):
+        console.print(f"warning: {warning}")
+
+
+@sync_app.command("conflicts")
+def sync_conflicts(
+    home: Optional[Path] = typer.Option(None),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    result = service(home).sync_conflicts()
+    if json_output:
+        console.print_json(json.dumps(result))
+        return
+    table = Table(title="Sync Conflicts")
+    for column in ["Logical Source", "Origins", "Documents"]:
+        table.add_column(column)
+    for conflict in result["conflicts"]:
+        table.add_row(
+            conflict["logical_source_key"],
+            ", ".join(conflict["origins"]),
+            ", ".join(conflict["document_ids"]),
+        )
+    console.print(table)
+    console.print(f"Conflicts: {result['count']}")
 
 
 @app.command()
@@ -703,6 +760,62 @@ def automation_nightly(
     console.print_json(json.dumps(as_jsonable(result)))
     if result.status == "failed":
         raise typer.Exit(1)
+
+
+@scheduler_app.command("install-sync")
+def scheduler_install_sync(
+    peer: str = typer.Option(..., "--peer", help="Secondary peer node_id."),
+    interval: int = typer.Option(1800, help="Polling interval in seconds."),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    from .scheduler.launchd import LaunchdScheduler, sync_primary_job
+
+    paths = BrainPaths.from_value(home)
+    BrainService(paths).init_workspace()
+    uv = shutil.which("uv") or "/opt/homebrew/bin/uv"
+    job = sync_primary_job(Path.cwd(), paths.home, Path(uv), peer, interval=interval)
+    result = LaunchdScheduler().install(job, dry_run=dry_run)
+    console.print_json(json.dumps(result))
+
+
+@scheduler_app.command("install-secondary-capture")
+def scheduler_install_secondary_capture(
+    interval: int = typer.Option(600, help="Polling interval in seconds."),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    from .scheduler.launchd import LaunchdScheduler, secondary_capture_job
+
+    paths = BrainPaths.from_value(home)
+    BrainService(paths).init_workspace()
+    uv = shutil.which("uv") or "/opt/homebrew/bin/uv"
+    job = secondary_capture_job(Path.cwd(), paths.home, Path(uv), interval=interval)
+    result = LaunchdScheduler().install(job, dry_run=dry_run)
+    console.print_json(json.dumps(result))
+
+
+@scheduler_app.command("status")
+def scheduler_status() -> None:
+    from .scheduler.launchd import LaunchdScheduler
+
+    result = [status.as_dict() for status in LaunchdScheduler().status()]
+    console.print_json(json.dumps(result))
+
+
+@scheduler_app.command("uninstall-sync")
+def scheduler_uninstall_sync(peer: str = typer.Option(..., "--peer", help="Secondary peer node_id.")) -> None:
+    from .scheduler.launchd import LaunchdScheduler, SYNC_PRIMARY_LABEL
+
+    _ = peer
+    console.print_json(json.dumps(LaunchdScheduler().uninstall(SYNC_PRIMARY_LABEL)))
+
+
+@scheduler_app.command("uninstall-secondary-capture")
+def scheduler_uninstall_secondary_capture() -> None:
+    from .scheduler.launchd import CAPTURE_SECONDARY_LABEL, LaunchdScheduler
+
+    console.print_json(json.dumps(LaunchdScheduler().uninstall(CAPTURE_SECONDARY_LABEL)))
 
 
 @launch_agent_app.command("install")

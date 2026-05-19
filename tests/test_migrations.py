@@ -17,7 +17,7 @@ def test_fresh_db_applies_registered_migrations(tmp_path: Path) -> None:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(documents)")}
         indexes = {row["name"] for row in conn.execute("PRAGMA index_list(documents)")}
 
-    assert versions == [1]
+    assert versions == [1, 2]
     assert "origin_node_id" in columns
     assert "logical_source_key" in columns
     assert "idx_documents_origin_logical" in indexes
@@ -31,7 +31,7 @@ def test_migrations_rerun_is_noop(tmp_path: Path) -> None:
     with connection(db_path) as conn:
         versions = [row["version"] for row in conn.execute("SELECT version FROM schema_migrations")]
 
-    assert versions == [1]
+    assert versions == [1, 2]
 
 
 def test_failed_migration_rolls_back_that_migration() -> None:

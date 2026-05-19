@@ -20,6 +20,7 @@ class FakeTransport:
         remote_rsync: bool = True,
         ssh: bool = True,
         remote_ingest: bool = True,
+        fail_rsync_call: int | None = None,
     ) -> None:
         self.remote_node_id = remote_node_id
         self.remote_role = remote_role
@@ -30,6 +31,7 @@ class FakeTransport:
         self.remote_rsync = remote_rsync
         self.ssh = ssh
         self.remote_ingest = remote_ingest
+        self.fail_rsync_call = fail_rsync_call
         self.commands: list[list[str]] = []
         self.rsync_commands: list[list[str]] = []
 
@@ -78,7 +80,8 @@ class LocalRsyncTransport(FakeTransport):
         self.rsync_commands.append(args)
         if args == ["rsync", "--version"]:
             return SubprocessResult(0 if self.local_rsync else 1, "rsync version\n", "missing rsync")
-        if self.fail_rsync:
+        rsync_call_number = len([command for command in self.rsync_commands if command != ["rsync", "--version"]])
+        if self.fail_rsync or self.fail_rsync_call == rsync_call_number:
             return SubprocessResult(23, "", "simulated rsync failure")
         excludes = excludes_from_rsync_args(args)
         source = local_path_from_rsync_endpoint(args[-2])
