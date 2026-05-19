@@ -533,6 +533,39 @@ brain automation nightly --with-llm-memory-proposals --provider <provider>
 
 `--with-llm-memory-proposals` analyzes recent agent logs, structured `agent_sessions`, unresolved issues, failed or suspicious command history, retrieval events, and existing failure memories. It may create only `proposed` `AgentFailurePatternMemory` records and must deduplicate against existing proposed or active failure memories. It uses the existing `com.pkm-brain.nightly-maintenance` LaunchAgent; no separate memory proposal LaunchAgent should be created.
 
+### 9.2 Future Work: Tension Audit
+
+A future version should add an optional tension audit that detects possible contradictions, stale claims, unresolved assumptions, and competing interpretations across recent sources, generated wiki pages, and active memories.
+
+The tension audit should behave like the existing proposal systems: nightly automation may create durable `proposed` tension items, but it must not directly mutate approved wiki Markdown or active memories. Human review may happen asynchronously after multiple nightly runs, so tension items must be stored with stable ids, source evidence, creation time, originating automation run id, confidence, status, and deduplication keys.
+
+Tension items should cite both sides of the possible issue. Examples include a recent source that conflicts with an active memory, a wiki page that appears stale against newer evidence, or two sources that preserve a meaningful disagreement that should not be smoothed into a single synthesized narrative.
+
+Potential tension statuses:
+
+```text
+proposed
+accepted
+dismissed
+resolved
+superseded
+archived
+```
+
+Potential human review actions:
+
+```text
+dismiss as false positive
+accept as real tension
+convert to open loop
+propose wiki update
+propose memory update
+mark older memory or wiki claim superseded
+link to an existing decision
+```
+
+The audit should deduplicate against unresolved prior tension items so repeated nightly runs do not create duplicate review work. Agents must not treat proposed tension items as authoritative context; they are review candidates until a human resolves them.
+
 Nightly maintenance status rules:
 
 ```text
