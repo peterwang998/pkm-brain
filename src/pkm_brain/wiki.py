@@ -22,6 +22,7 @@ ALLOWED_PAGE_TYPES = {
     "reference",
 }
 ALLOWED_STATUSES = {"draft", "active", "stale", "superseded", "archived"}
+REFERENCE_FILENAME_SLUG_MAX_CHARS = 120
 COMMON_SECTIONS = ["Summary", "Key Points", "Source Evidence", "Related Pages", "Open Questions"]
 TYPE_SECTIONS = {
     "project": ["Current State", "Goals", "Decisions", "Open Loops", "Timeline"],
@@ -41,342 +42,6 @@ SEMANTIC_FOLDERS = {
     "open_loop": "open_loops",
     "timeline": "timelines",
 }
-COMPILED_PAGE_SPECS: list[dict[str, Any]] = [
-    {
-        "page_type": "project",
-        "slug": "pkm-brain",
-        "title": "PKM Brain",
-        "patterns": [
-            r"\bpkm[- ]brain\b",
-            r"personal knowledge management",
-            r"\bsecond brain\b",
-            r"knowledge management tool",
-        ],
-        "summary": "PKM Brain is the local-first personal knowledge and agent memory system being built in this workspace.",
-        "key_points": [
-            "The system keeps raw captures immutable and derives searchable indexes, references, wiki pages, and memories from them.",
-            "Agent session logs, working notes, and source documents are treated as evidence for durable compiled pages.",
-            "The intended user-facing wiki is a linked synthesis layer, while reference pages remain provenance artifacts.",
-        ],
-        "related": [
-            "concepts/wiki-synthesis-layer",
-            "concepts/agent-session-capture",
-            "concepts/local-first-agent-memory",
-            "decisions/use-sqlite-for-canonical-metadata",
-        ],
-        "tags": ["pkm", "second-brain", "agent-memory"],
-        "sections": {
-            "Current State": "The project has a working local ingestion, retrieval, agent-log capture, reference page generation, and wiki linting pipeline.",
-            "Goals": "Build a searchable second brain that agents can query for durable personal and project context.",
-            "Decisions": "- [[decisions/use-sqlite-for-canonical-metadata]]\n- [[decisions/use-launchagent-for-agent-log-polling]]\n- [[decisions/maintain-wiki-as-compiled-markdown]]",
-            "Open Loops": "- [[open_loops/nightly-ingest-catch-up-after-sleep]]\n- [[open_loops/improve-agent-log-distillation]]",
-            "Timeline": "Use source evidence and ingestion logs for detailed chronology.",
-        },
-    },
-    {
-        "page_type": "concept",
-        "slug": "wiki-synthesis-layer",
-        "title": "Wiki Synthesis Layer",
-        "patterns": [
-            r"wiki synthesis",
-            r"compiled wiki",
-            r"human-readable",
-            r"personal wikipedia",
-            r"karpathy",
-            r"llm wiki",
-        ],
-        "summary": "The wiki synthesis layer compiles raw notes and logs into durable, linked Markdown pages.",
-        "definition": "A generated Markdown layer that summarizes current understanding across many sources and links related projects, concepts, decisions, and open loops.",
-        "key_points": [
-            "Compiled wiki pages should be human-readable and concept-oriented.",
-            "Reference pages support provenance but should not be the main reading surface.",
-            "Every generated semantic page needs source evidence so claims remain auditable.",
-        ],
-        "related": [
-            "projects/pkm-brain",
-            "concepts/agent-session-capture",
-            "decisions/maintain-wiki-as-compiled-markdown",
-        ],
-        "tags": ["wiki", "synthesis", "markdown"],
-        "sections": {
-            "Why It Matters": "Compiled wiki pages let knowledge compound instead of being rediscovered from raw chunks during every query.",
-            "How It Works": "The compiler reads ingested sources, identifies recurring topics, writes typed pages, links related pages, and records source evidence.",
-            "Related Decisions": "- [[decisions/maintain-wiki-as-compiled-markdown]]",
-        },
-    },
-    {
-        "page_type": "concept",
-        "slug": "agent-session-capture",
-        "title": "Agent Session Capture",
-        "patterns": [
-            r"agent session",
-            r"session logs",
-            r"codex",
-            r"claude",
-            r"opencode",
-            r"capture agents",
-        ],
-        "summary": "Agent session capture imports Codex, Claude, and OpenCode logs into the local brain as source material.",
-        "definition": "A capture layer that polls local agent history, redacts sensitive payloads, and writes normalized Markdown artifacts into the inbox.",
-        "key_points": [
-            "Captured logs become evidence for later wiki synthesis and memory proposals.",
-            "The capture format is versioned so redaction and parser improvements can force safe recapture.",
-            "Captured sessions should be distilled before they become user-facing wiki knowledge.",
-        ],
-        "related": [
-            "projects/pkm-brain",
-            "concepts/wiki-synthesis-layer",
-            "decisions/use-launchagent-for-agent-log-polling",
-            "open_loops/improve-agent-log-distillation",
-        ],
-        "tags": ["agents", "capture", "logs"],
-        "sections": {
-            "Why It Matters": "Agent work contains decisions, preferences, repeated workflows, and unresolved issues that should survive context resets.",
-            "How It Works": "A scheduled capture command discovers local agent logs, normalizes them into Markdown, ingests them, and makes them available for search and synthesis.",
-            "Related Decisions": "- [[decisions/use-launchagent-for-agent-log-polling]]",
-        },
-    },
-    {
-        "page_type": "concept",
-        "slug": "local-first-agent-memory",
-        "title": "Local-First Agent Memory",
-        "patterns": [
-            r"local-first",
-            r"agent memory",
-            r"typed memory",
-            r"memory layer",
-            r"mcp",
-        ],
-        "summary": "Local-first agent memory keeps durable context on the user's machine while exposing retrieval tools to agents.",
-        "definition": "A local storage and retrieval pattern where agents query durable personal context through tools instead of relying on chat history.",
-        "key_points": [
-            "Storage and indexes live under the local brain home.",
-            "Agents interact through MCP and CLI surfaces.",
-            "Memories should cite evidence and remain separate from raw documents and wiki pages.",
-        ],
-        "related": [
-            "projects/pkm-brain",
-            "concepts/hybrid-retrieval",
-            "concepts/sqlite-metadata-store",
-        ],
-        "tags": ["memory", "agents", "local-first"],
-        "sections": {
-            "Why It Matters": "Local-first memory gives agents continuity without sending the whole corpus to a cloud service.",
-            "How It Works": "The system stores documents, chunks, memories, retrieval logs, and wiki metadata locally, then exposes selected context through retrieval commands and MCP.",
-            "Related Decisions": "- [[decisions/use-sqlite-for-canonical-metadata]]",
-        },
-    },
-    {
-        "page_type": "concept",
-        "slug": "hybrid-retrieval",
-        "title": "Hybrid Retrieval",
-        "patterns": [
-            r"hybrid retrieval",
-            r"hybrid search",
-            r"bm25",
-            r"vector",
-            r"rerank",
-            r"rrf",
-        ],
-        "summary": "Hybrid retrieval combines lexical and vector search so agents can find both exact terms and semantically related material.",
-        "definition": "A retrieval approach that fuses BM25-style keyword results with dense vector similarity results.",
-        "key_points": [
-            "Lexical search is useful for exact terms, filenames, tools, and identifiers.",
-            "Vector search is useful for paraphrases and conceptual similarity.",
-            "Compiled wiki pages and raw chunks should both be searchable.",
-        ],
-        "related": [
-            "concepts/wiki-synthesis-layer",
-            "concepts/local-first-agent-memory",
-        ],
-        "tags": ["retrieval", "search", "rag"],
-        "sections": {
-            "Why It Matters": "Personal corpora mix exact names with fuzzy concepts, so a single retrieval strategy is brittle.",
-            "How It Works": "The V1 search path uses SQLite FTS for lexical search and LanceDB for vector search, then fuses candidates with reciprocal rank fusion.",
-            "Related Decisions": "- [[decisions/use-sqlite-for-canonical-metadata]]",
-        },
-    },
-    {
-        "page_type": "concept",
-        "slug": "sqlite-metadata-store",
-        "title": "SQLite Metadata Store",
-        "patterns": [
-            r"\bsqlite\b",
-            r"canonical metadata",
-            r"metadata store",
-            r"database",
-        ],
-        "summary": "SQLite is the local canonical store for metadata, chunks, memory records, retrieval events, and wiki page metadata.",
-        "definition": "The inspectable local relational database that records the system's durable metadata and processing state.",
-        "key_points": [
-            "Raw artifacts remain on disk by default.",
-            "SQLite tracks document and chunk metadata, ingestion runs, retrieval logs, memories, and wiki pages.",
-            "Keeping metadata in SQLite makes the system debuggable with standard tools.",
-        ],
-        "related": [
-            "concepts/local-first-agent-memory",
-            "concepts/hybrid-retrieval",
-            "decisions/use-sqlite-for-canonical-metadata",
-        ],
-        "tags": ["sqlite", "metadata", "storage"],
-        "sections": {
-            "Why It Matters": "A local metadata store keeps the system portable and easy to inspect during debugging.",
-            "How It Works": "Ingestion writes document, chunk, index, memory, retrieval, and wiki records into SQLite while raw files stay in the filesystem.",
-            "Related Decisions": "- [[decisions/use-sqlite-for-canonical-metadata]]",
-        },
-    },
-    {
-        "page_type": "decision",
-        "slug": "use-sqlite-for-canonical-metadata",
-        "title": "Use SQLite For Canonical Metadata",
-        "patterns": [
-            r"\bsqlite\b",
-            r"canonical metadata",
-            r"metadata store",
-        ],
-        "summary": "Use SQLite as the canonical local metadata database for V1.",
-        "key_points": [
-            "SQLite is simple to install, inspect, back up, and rebuild.",
-            "Raw artifacts remain on the filesystem rather than being stored primarily inside SQLite.",
-            "Vector indexes can remain separate while SQLite owns canonical metadata.",
-        ],
-        "related": [
-            "concepts/sqlite-metadata-store",
-            "concepts/local-first-agent-memory",
-            "projects/pkm-brain",
-        ],
-        "tags": ["decision", "sqlite", "storage"],
-        "sections": {
-            "Context": "The system needs a local, low-operational-burden source of truth for metadata and pipeline state.",
-            "Decision": "Use SQLite as the canonical metadata store for V1.",
-            "Rationale": "SQLite is portable, inspectable, and sufficient for a local single-user workload.",
-            "Alternatives Considered": "- Postgres with pgvector\n- SQLite-only retrieval with vector extensions\n- SQLite plus a separate vector index",
-            "Consequences": "The system remains simple locally, but high-scale vector search may continue to use a separate index.",
-        },
-    },
-    {
-        "page_type": "decision",
-        "slug": "use-launchagent-for-agent-log-polling",
-        "title": "Use LaunchAgent For Agent Log Polling",
-        "patterns": [
-            r"launchagent",
-            r"scheduled polling",
-            r"every 10 min",
-            r"every 10 minutes",
-            r"agent-log-ingest",
-        ],
-        "summary": "Use a macOS LaunchAgent to poll local agent session logs on a recurring schedule.",
-        "key_points": [
-            "The installed schedule polls for Codex, Claude, and OpenCode session logs.",
-            "This is scheduled polling, not a general filesystem watcher.",
-            "Nightly ingestion can use a separate LaunchAgent if needed.",
-        ],
-        "related": [
-            "concepts/agent-session-capture",
-            "open_loops/nightly-ingest-catch-up-after-sleep",
-            "projects/pkm-brain",
-        ],
-        "tags": ["decision", "launchagent", "automation"],
-        "sections": {
-            "Context": "Agent logs change outside the PKM tool and need to be captured without manual commands.",
-            "Decision": "Use a macOS LaunchAgent to run scheduled local polling for agent logs.",
-            "Rationale": "LaunchAgent is native to macOS, survives shell sessions, and is appropriate for a laptop-local background job.",
-            "Alternatives Considered": "- Manual capture commands\n- Filesystem hooks\n- A long-running custom daemon",
-            "Consequences": "The system captures recent logs automatically, but missed runs after sleep need explicit catch-up handling.",
-        },
-    },
-    {
-        "page_type": "decision",
-        "slug": "maintain-wiki-as-compiled-markdown",
-        "title": "Maintain Wiki As Compiled Markdown",
-        "patterns": [
-            r"compiled markdown",
-            r"personal wikipedia",
-            r"human-readable",
-            r"wiki synthesis",
-            r"llm wiki",
-            r"karpathy",
-        ],
-        "summary": "Treat the wiki as the durable compiled Markdown layer, not as raw source dumps.",
-        "key_points": [
-            "Semantic pages should group related concepts across sources.",
-            "Reference pages are useful for provenance but are not the main wiki surface.",
-            "Compiled pages should link to related concepts, projects, decisions, and open loops.",
-        ],
-        "related": [
-            "concepts/wiki-synthesis-layer",
-            "concepts/agent-session-capture",
-            "projects/pkm-brain",
-        ],
-        "tags": ["decision", "wiki", "markdown"],
-        "sections": {
-            "Context": "The project needs a wiki that feels like a personal knowledge base rather than a list of captured files.",
-            "Decision": "Maintain semantic Markdown pages as the primary wiki layer and keep reference pages as supporting provenance.",
-            "Rationale": "This follows the Karpathy LLM Wiki pattern where knowledge compounds in maintained Markdown pages.",
-            "Alternatives Considered": "- Use only hybrid search over raw chunks\n- Generate one summary page per source\n- Keep all context in agent chat history",
-            "Consequences": "The wiki compiler must update links, indexes, and source-backed semantic pages instead of only generating references.",
-        },
-    },
-    {
-        "page_type": "open_loop",
-        "slug": "nightly-ingest-catch-up-after-sleep",
-        "title": "Nightly Ingest Catch-Up After Sleep",
-        "patterns": [
-            r"nightly",
-            r"after waking",
-            r"after sleep",
-            r"missed one run",
-            r"catch-up",
-        ],
-        "summary": "The nightly ingest job should eventually catch up when the laptop wakes after missing a scheduled run.",
-        "key_points": [
-            "A LaunchAgent can schedule a nightly job when the laptop is awake.",
-            "Wake-after-missed-run behavior needs explicit design.",
-            "This has been tracked as follow-up work.",
-        ],
-        "related": [
-            "decisions/use-launchagent-for-agent-log-polling",
-            "projects/pkm-brain",
-        ],
-        "tags": ["open-loop", "automation", "launchagent"],
-        "sections": {
-            "Question": "How should nightly ingestion run after wake if the laptop was asleep during the scheduled time?",
-            "Current Understanding": "A regular LaunchAgent can schedule the nightly run, but missed-run catch-up needs additional state or a self-healing check.",
-            "Needed Evidence": "Confirm macOS launchd behavior for missed StartCalendarInterval jobs and decide whether to add a custom last-run check.",
-            "Next Review": "Review before implementing the nightly maintenance LaunchAgent.",
-        },
-    },
-    {
-        "page_type": "open_loop",
-        "slug": "improve-agent-log-distillation",
-        "title": "Improve Agent Log Distillation",
-        "patterns": [
-            r"agent logs",
-            r"raw session",
-            r"distill",
-            r"distillation",
-            r"session dump",
-        ],
-        "summary": "Captured agent logs need stronger distillation before they become high-quality wiki knowledge.",
-        "key_points": [
-            "Raw session logs are noisy and may include tool output, repeated context, and operational details.",
-            "The compiled wiki should extract durable concepts, decisions, and open loops instead of exposing raw dumps.",
-            "Redaction and source evidence must remain part of the capture pipeline.",
-        ],
-        "related": [
-            "concepts/agent-session-capture",
-            "concepts/wiki-synthesis-layer",
-            "projects/pkm-brain",
-        ],
-        "tags": ["open-loop", "agents", "distillation"],
-        "sections": {
-            "Question": "How should agent sessions be summarized into durable knowledge without carrying forward irrelevant noise?",
-            "Current Understanding": "The current system captures and indexes sessions, but semantic extraction is still template and keyword driven.",
-            "Needed Evidence": "Evaluate generated pages against real session logs and identify missing concepts, decisions, and false positives.",
-            "Next Review": "Review after several automated capture and wiki synthesis runs.",
-        },
-    },
-]
 
 
 def lint_wiki(paths: BrainPaths) -> dict[str, Any]:
@@ -415,7 +80,7 @@ def lint_wiki(paths: BrainPaths) -> dict[str, Any]:
         source_ids = frontmatter.get("source_ids") or []
         if page_type == "decision" and not source_ids:
             errors.append(f"{rel}: decision page requires source_ids")
-        if not source_ids and page_type not in {"index", "reference"} and status != "draft":
+        if not source_ids and page_type not in {"index", "reference"} and page_id != "log" and status != "draft":
             warnings.append(f"{rel}: active non-reference page has no source_ids")
         pages.append(
             {
@@ -439,8 +104,12 @@ def lint_wiki(paths: BrainPaths) -> dict[str, Any]:
 def parse_frontmatter(text: str) -> tuple[dict[str, Any] | None, str]:
     if not text.startswith("---\n"):
         return None, text
+    match = re.match(r"\A---\n(.*?)\n---[ \t]*(?:\n|\Z)", text, flags=re.DOTALL)
+    if not match:
+        return None, text
     try:
-        _, yaml_text, body = text.split("---", 2)
+        yaml_text = match.group(1)
+        body = text[match.end() :]
         parsed = yaml.safe_load(yaml_text) or {}
         return parsed, body
     except Exception:
@@ -482,7 +151,16 @@ def sync_wiki_pages(paths: BrainPaths, pages: list[dict[str, Any]]) -> None:
             )
 
 
-def synthesize_wiki(paths: BrainPaths, dry_run: bool = False, overwrite_generated: bool = False) -> dict[str, Any]:
+def synthesize_wiki(
+    paths: BrainPaths,
+    dry_run: bool = False,
+    overwrite_generated: bool = False,
+    with_llm: bool = True,
+    provider_name: str | None = None,
+    require_llm: bool = False,
+    auto_apply_confidence: float = 0.75,
+    llm_source_limit: int = 12,
+) -> dict[str, Any]:
     paths.wiki.mkdir(parents=True, exist_ok=True)
     existing_sources = existing_generated_sources(paths)
     created: list[str] = []
@@ -507,7 +185,75 @@ def synthesize_wiki(paths: BrainPaths, dry_run: bool = False, overwrite_generate
             """,
         )
     document_dicts = [dict(document) for document in documents]
-    for document in document_dicts:
+    write_reference_pages(paths, document_dicts, existing_sources, created, updated, skipped, dry_run, overwrite_generated)
+
+    llm_result: dict[str, Any] = {"enabled": with_llm, "status": "disabled"}
+    if with_llm and document_dicts:
+        try:
+            from .wiki_compiler import compile_semantic_wiki
+
+            llm_result = compile_semantic_wiki(
+                paths,
+                document_dicts,
+                dry_run=dry_run,
+                overwrite_generated=overwrite_generated,
+                provider_name=provider_name,
+                auto_apply_confidence=auto_apply_confidence,
+                source_limit=llm_source_limit,
+            )
+            created.extend(llm_result.get("created", []))
+            updated.extend(llm_result.get("updated", []))
+            skipped.extend(llm_result.get("skipped", []))
+        except Exception as exc:
+            if require_llm:
+                raise
+            llm_result = {
+                "enabled": True,
+                "status": "skipped",
+                "error": str(exc),
+                "created": [],
+                "updated": [],
+                "skipped": [],
+                "proposals": [],
+            }
+
+    index_action = write_index_page(paths, dry_run=dry_run, overwrite_generated=overwrite_generated)
+    if index_action == "create":
+        created.append(str(paths.wiki / "index.md"))
+    elif index_action == "update":
+        updated.append(str(paths.wiki / "index.md"))
+    elif index_action == "skip":
+        skipped.append(str(paths.wiki / "index.md"))
+
+    log_action = write_log_page(paths, document_count=len(document_dicts), llm_result=llm_result, dry_run=dry_run)
+    if log_action == "create":
+        created.append(str(paths.wiki / "log.md"))
+    elif log_action == "update":
+        updated.append(str(paths.wiki / "log.md"))
+
+    lint_result = lint_wiki(paths) if not dry_run else None
+    return {
+        "documents": len(documents),
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+        "dry_run": dry_run,
+        "llm_compile": llm_result,
+        "lint": lint_result,
+    }
+
+
+def write_reference_pages(
+    paths: BrainPaths,
+    documents: list[dict[str, Any]],
+    existing_sources: dict[str, Any],
+    created: list[str],
+    updated: list[str],
+    skipped: list[str],
+    dry_run: bool,
+    overwrite_generated: bool,
+) -> None:
+    for document in documents:
         source_id = f"document:{document['id']}"
         path = reference_page_path(paths, document)
         source_path_key = f"source_path:{document['source_path']}"
@@ -529,79 +275,6 @@ def synthesize_wiki(paths: BrainPaths, dry_run: bool = False, overwrite_generate
             updated.append(str(target))
         else:
             created.append(str(target))
-
-    compiled_pages = compile_semantic_pages(paths, document_dicts)
-    for page in compiled_pages:
-        path = page["path"]
-        markdown = page["markdown"]
-        action = generated_write_action(path, overwrite_generated=overwrite_generated)
-        if action == "skip":
-            skipped.append(str(path))
-            continue
-        if dry_run:
-            if action == "update":
-                updated.append(str(path))
-            else:
-                created.append(str(path))
-            continue
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(markdown, encoding="utf-8")
-        if action == "update":
-            updated.append(str(path))
-        else:
-            created.append(str(path))
-
-    lint_result = lint_wiki(paths) if not dry_run else None
-    return {
-        "documents": len(documents),
-        "created": created,
-        "updated": updated,
-        "skipped": skipped,
-        "dry_run": dry_run,
-        "lint": lint_result,
-    }
-
-
-def compile_semantic_pages(paths: BrainPaths, documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    pages: list[dict[str, Any]] = []
-    compiled: list[dict[str, Any]] = []
-    for spec in COMPILED_PAGE_SPECS:
-        evidence = matching_documents(spec, documents)
-        if not evidence:
-            continue
-        page = render_compiled_page(spec, evidence)
-        pages.append({"path": semantic_page_path(paths, spec["page_type"], spec["slug"]), "markdown": page})
-        compiled.append(
-            {
-                "title": spec["title"],
-                "page_type": spec["page_type"],
-                "slug": spec["slug"],
-                "summary": spec["summary"],
-            }
-        )
-
-    pages.append({"path": paths.wiki / "index.md", "markdown": render_index_page(compiled)})
-    return pages
-
-
-def matching_documents(spec: dict[str, Any], documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    matches: list[dict[str, Any]] = []
-    for document in documents:
-        haystack = document_search_text(document)
-        if any(re.search(pattern, haystack, flags=re.IGNORECASE) for pattern in spec["patterns"]):
-            matches.append(document)
-    return matches
-
-
-def document_search_text(document: dict[str, Any]) -> str:
-    return "\n".join(
-        [
-            str(document.get("title") or ""),
-            str(document.get("source_type") or ""),
-            str(document.get("source_path") or ""),
-            str(document.get("chunk_texts") or ""),
-        ]
-    )
 
 
 def semantic_page_path(paths: BrainPaths, page_type: str, slug: str) -> Any:
@@ -785,13 +458,157 @@ def render_index_page(compiled_pages: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def write_index_page(paths: BrainPaths, dry_run: bool, overwrite_generated: bool) -> str:
+    path = paths.wiki / "index.md"
+    markdown = render_index_page(collect_semantic_pages(paths))
+    action = generated_write_action(path, overwrite_generated=overwrite_generated)
+    if dry_run or action == "skip":
+        return action
+    path.write_text(markdown, encoding="utf-8")
+    return action
+
+
+def collect_semantic_pages(paths: BrainPaths) -> list[dict[str, Any]]:
+    pages: list[dict[str, Any]] = []
+    if not paths.wiki.exists():
+        return pages
+    for path in sorted(paths.wiki.rglob("*.md")):
+        rel = path.relative_to(paths.wiki)
+        if rel.parts[0] == "references" or rel.name in {"index.md", "log.md"}:
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        frontmatter, body = parse_frontmatter(text)
+        if not frontmatter:
+            continue
+        page_type = str(frontmatter.get("page_type") or "")
+        expected_folder = SEMANTIC_FOLDERS.get(page_type)
+        if not expected_folder or rel.parts[0] != expected_folder:
+            continue
+        pages.append(
+            {
+                "title": str(frontmatter.get("title") or path.stem),
+                "page_type": page_type,
+                "slug": path.stem,
+                "summary": first_section_paragraph(body, "Summary") or "No summary yet.",
+            }
+        )
+    return pages
+
+
+def first_section_paragraph(markdown: str, section_name: str) -> str:
+    pattern = re.compile(rf"^##\s+{re.escape(section_name)}\s*\n(.*?)(?=^##\s+|\Z)", flags=re.MULTILINE | re.DOTALL)
+    match = pattern.search(markdown)
+    if not match:
+        return ""
+    body = match.group(1).strip()
+    for paragraph in re.split(r"\n\s*\n", body):
+        paragraph = paragraph.strip()
+        if paragraph and not paragraph.startswith("- "):
+            return re.sub(r"\s+", " ", paragraph)
+    return re.sub(r"\s+", " ", body.splitlines()[0].strip()) if body else ""
+
+
 def index_related_items(compiled_pages: list[dict[str, Any]]) -> list[str]:
-    if not compiled_pages:
-        return ["- None yet."]
-    items: list[str] = []
+    items: list[str] = ["- [[log]]"]
     for page in sorted(compiled_pages, key=lambda item: (item["page_type"], item["title"]))[:20]:
         items.append(f"- [[{SEMANTIC_FOLDERS[page['page_type']]}/{page['slug']}]]")
     return items
+
+
+def write_log_page(paths: BrainPaths, document_count: int, llm_result: dict[str, Any], dry_run: bool) -> str:
+    path = paths.wiki / "log.md"
+    action = generated_write_action(path)
+    if action == "skip":
+        return action
+    existing_events = existing_log_events(path)
+    event = wiki_log_event(document_count, llm_result)
+    markdown = render_log_page(existing_events, event)
+    if dry_run:
+        return action
+    path.write_text(markdown, encoding="utf-8")
+    return action
+
+
+def existing_log_events(path: Any) -> str:
+    if not path.exists():
+        return ""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    _, body = parse_frontmatter(text)
+    pattern = re.compile(r"^##\s+Events\s*\n(.*?)(?=^##\s+|\Z)", flags=re.MULTILINE | re.DOTALL)
+    match = pattern.search(body)
+    return match.group(1).strip() if match else ""
+
+
+def wiki_log_event(document_count: int, llm_result: dict[str, Any]) -> str:
+    timestamp = now_iso()
+    status = llm_result.get("status") or "disabled"
+    created = len(llm_result.get("created") or [])
+    updated = len(llm_result.get("updated") or [])
+    proposals = len(llm_result.get("proposals") or [])
+    return (
+        f"### [{timestamp[:10]}] wiki_synthesize | {status}\n\n"
+        f"- Documents considered: {document_count}\n"
+        f"- LLM semantic pages created: {created}\n"
+        f"- LLM semantic pages updated: {updated}\n"
+        f"- Review proposals created: {proposals}\n"
+    )
+
+
+def render_log_page(existing_events: str, event: str) -> str:
+    timestamp = now_iso()[:10]
+    frontmatter = {
+        "title": "PKM Brain Wiki Log",
+        "page_type": "timeline",
+        "id": "log",
+        "status": "active",
+        "created_at": timestamp,
+        "updated_at": timestamp,
+        "source_ids": [],
+        "related": [],
+        "tags": ["wiki", "log"],
+    }
+    events = "\n\n".join(item for item in [existing_events, event.strip()] if item)
+    return "\n".join(
+        [
+            "---",
+            yaml.safe_dump(frontmatter, sort_keys=False).strip(),
+            "---",
+            "",
+            GENERATED_MARKER,
+            "",
+            "# PKM Brain Wiki Log",
+            "",
+            "## Summary",
+            "",
+            "Chronological record of wiki synthesis, LLM compile, and maintenance events.",
+            "",
+            "## Key Points",
+            "",
+            "- `index.md` is the content-oriented navigation surface.",
+            "- `log.md` records how the wiki changed over time.",
+            "",
+            "## Events",
+            "",
+            events or "- No events yet.",
+            "",
+            "## Current Status",
+            "",
+            "The wiki log is maintained automatically by `brain wiki synthesize`.",
+            "",
+            "## Source Evidence",
+            "",
+            "- Generated from local wiki synthesis runs.",
+            "",
+            "## Related Pages",
+            "",
+            "- [[index]]",
+            "",
+            "## Open Questions",
+            "",
+            "- Which synthesis events should be promoted into durable decision or open-loop pages?",
+            "",
+        ]
+    )
 
 
 def existing_generated_sources(paths: BrainPaths) -> dict[str, Any]:
@@ -813,7 +630,8 @@ def existing_generated_sources(paths: BrainPaths) -> dict[str, Any]:
 def reference_page_path(paths: BrainPaths, document: dict[str, Any]) -> Any:
     title = document["title"] or document["id"]
     stable_id = hashlib.sha256(str(document["source_path"]).encode("utf-8")).hexdigest()[:8]
-    filename = f"{slugify(title)}-{stable_id}.md"
+    title_slug = slugify(title)[:REFERENCE_FILENAME_SLUG_MAX_CHARS].rstrip("-") or "untitled"
+    filename = f"{title_slug}-{stable_id}.md"
     return paths.wiki / "references" / document["source_type"] / filename
 
 

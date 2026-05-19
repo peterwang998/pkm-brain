@@ -14,7 +14,7 @@ from .wiki import lint_wiki
 
 
 VALID_BATCH_STATUSES = {"proposed", "needs_interview", "approved", "rejected", "applied", "superseded", "failed"}
-VALID_ITEM_OPERATIONS = {"replace_section", "append_section", "create_page"}
+VALID_ITEM_OPERATIONS = {"replace_section", "append_section", "create_page", "replace_page"}
 
 
 @dataclass(frozen=True)
@@ -214,6 +214,10 @@ def apply_wiki_proposal(paths: BrainPaths, batch_id: str) -> dict[str, Any]:
             if target.exists():
                 raise ValueError(f"target already exists for create_page: {item['target_path']}")
             target.write_text(item["proposed_markdown"].rstrip() + "\n", encoding="utf-8")
+        elif item["operation"] == "replace_page":
+            if not target.exists():
+                raise ValueError(f"target does not exist: {item['target_path']}")
+            target.write_text(item["proposed_markdown"].rstrip() + "\n", encoding="utf-8")
         else:
             if not target.exists():
                 raise ValueError(f"target does not exist: {item['target_path']}")
@@ -332,7 +336,7 @@ def proposal_prompt(documents: list[dict[str, Any]]) -> str:
         "You maintain a local Markdown personal wiki. Propose source-backed wiki changes as JSON.\n"
         "Only propose durable, human-readable semantic wiki updates. Do not dump raw logs.\n"
         "Return this JSON shape exactly: {\"title\": str, \"rationale\": str, \"confidence\": number, "
-        "\"source_ids\": [str], \"changes\": [{\"target_path\": str, \"operation\": \"replace_section\"|\"append_section\"|\"create_page\", "
+        "\"source_ids\": [str], \"changes\": [{\"target_path\": str, \"operation\": \"replace_section\"|\"append_section\"|\"create_page\"|\"replace_page\", "
         "\"section_name\": str|null, \"proposed_markdown\": str, \"rationale\": str, \"source_ids\": [str], \"confidence\": number}]}.\n"
         "Target paths must be relative to wiki root, like concepts/example.md or decisions/example.md.\n\n"
         f"Sources:\n{json.dumps(documents, indent=2)}"

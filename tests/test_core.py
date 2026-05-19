@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from pkm_brain.audit import audit_memories
@@ -8,7 +9,7 @@ from pkm_brain.indexes import table_names
 from pkm_brain.memory_proposals import propose_failure_memories_from_sources
 from pkm_brain.paths import BrainPaths
 from pkm_brain.service import BrainService
-from pkm_brain.wiki import lint_wiki, synthesize_wiki
+from pkm_brain.wiki import lint_wiki, parse_frontmatter, synthesize_wiki
 from pkm_brain.wiki_proposals import apply_wiki_proposal, create_wiki_proposal, inspect_wiki_proposal, record_wiki_interview
 
 
@@ -169,6 +170,16 @@ def test_wiki_lint_accepts_valid_decision_page(tmp_path: Path) -> None:
     assert result["pages"] == 1
 
 
+def test_parse_frontmatter_ignores_delimiters_inside_yaml_values() -> None:
+    text = "---\ntitle: \"Plan --- Section\"\npage_type: reference\n---\n\n# Body\n"
+
+    frontmatter, body = parse_frontmatter(text)
+
+    assert frontmatter is not None
+    assert frontmatter["title"] == "Plan --- Section"
+    assert body.startswith("\n# Body")
+
+
 def test_wiki_synthesis_creates_reference_pages_for_documents(tmp_path: Path) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()
@@ -179,11 +190,11 @@ def test_wiki_synthesis_creates_reference_pages_for_documents(tmp_path: Path) ->
     )
     svc.ingest()
 
-    dry = synthesize_wiki(svc.paths, dry_run=True)
+    dry = synthesize_wiki(svc.paths, dry_run=True, with_llm=False)
     assert dry["created"]
     assert not list(svc.paths.wiki.rglob("*.md"))
 
-    result = synthesize_wiki(svc.paths)
+    result = synthesize_wiki(svc.paths, with_llm=False)
     assert result["created"]
     assert result["lint"]["errors"] == []
     pages = list((svc.paths.wiki / "references").rglob("*.md"))
@@ -192,12 +203,26 @@ def test_wiki_synthesis_creates_reference_pages_for_documents(tmp_path: Path) ->
     assert "page_type: reference" in text
     assert "document:" in text
 
-    second = synthesize_wiki(svc.paths)
+    second = synthesize_wiki(svc.paths, with_llm=False)
     assert second["created"] == []
     assert second["skipped"]
 
 
-def test_wiki_synthesis_compiles_semantic_pages(tmp_path: Path) -> None:
+def test_wiki_synthesis_caps_reference_filenames(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "long-title.md"
+    note.write_text(f"# {'very long title ' * 80}\n\nBody.\n", encoding="utf-8")
+    svc.ingest()
+
+    result = synthesize_wiki(svc.paths, with_llm=False)
+
+    assert result["lint"]["errors"] == []
+    page = next((svc.paths.wiki / "references").rglob("*.md"))
+    assert len(page.name) < 150
+
+
+def test_wiki_synthesis_compiles_semantic_pages_with_default_llm(tmp_path: Path, monkeypatch) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()
     note = svc.paths.inbox / "pkm-architecture.md"
@@ -209,10 +234,85 @@ def test_wiki_synthesis_compiles_semantic_pages(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     svc.ingest()
+    with connection(svc.paths.sqlite_path) as conn:
+        document_id = conn.execute("SELECT id FROM documents").fetchone()["id"]
+    source_id = f"document:{document_id}"
+
+    class FakeProvider:
+        name = "fake"
+        model = "test"
+
+        def complete(self, prompt: str) -> str:
+            return json.dumps(
+                {
+                    "title": "Compile PKM wiki",
+                    "rationale": "Source-backed semantic pages from architecture note.",
+                    "confidence": 0.9,
+                    "pages": [
+                        {
+                            "page_type": "project",
+                            "slug": "pkm-brain",
+                            "title": "PKM Brain",
+                            "summary": "PKM Brain is a personal knowledge management second brain.",
+                            "key_points": ["The wiki is compiled from immutable source documents."],
+                            "sections": {
+                                "Current State": "The project has local ingestion and LLM wiki synthesis.",
+                                "Goals": "Keep a durable, source-backed second brain.",
+                                "Decisions": "- [[decisions/use-sqlite-for-canonical-metadata]]",
+                                "Open Loops": "- None yet.",
+                                "Timeline": "Compiled from source-backed ingestion events.",
+                            },
+                            "related": ["concepts/wiki-synthesis-layer", "decisions/use-sqlite-for-canonical-metadata"],
+                            "tags": ["pkm", "second-brain"],
+                            "source_ids": [source_id],
+                            "confidence": 0.9,
+                        },
+                        {
+                            "page_type": "concept",
+                            "slug": "wiki-synthesis-layer",
+                            "title": "Wiki Synthesis Layer",
+                            "summary": "The wiki synthesis layer creates human-readable compiled Markdown pages.",
+                            "key_points": ["Semantic pages are the main reading layer."],
+                            "sections": {
+                                "Definition": "A source-backed Markdown compilation layer.",
+                                "Why It Matters": "It keeps knowledge from being re-derived from raw chunks on every query.",
+                                "How It Works": "The LLM proposes source-backed pages and the system renders/lints them.",
+                                "Related Decisions": "- [[decisions/use-sqlite-for-canonical-metadata]]",
+                            },
+                            "related": ["projects/pkm-brain", "decisions/use-sqlite-for-canonical-metadata"],
+                            "tags": ["wiki", "synthesis"],
+                            "source_ids": [source_id],
+                            "confidence": 0.9,
+                        },
+                        {
+                            "page_type": "decision",
+                            "slug": "use-sqlite-for-canonical-metadata",
+                            "title": "Use SQLite For Canonical Metadata",
+                            "summary": "Use SQLite as the canonical metadata store.",
+                            "key_points": ["SQLite is local and inspectable."],
+                            "sections": {
+                                "Context": "The system needs a local metadata store.",
+                                "Decision": "Use SQLite as the canonical metadata store.",
+                                "Rationale": "SQLite is portable, inspectable, and sufficient for local use.",
+                                "Alternatives Considered": "- Postgres\n- Files only",
+                                "Consequences": "Indexes can be rebuilt while SQLite keeps canonical metadata.",
+                            },
+                            "related": ["projects/pkm-brain", "concepts/wiki-synthesis-layer"],
+                            "tags": ["decision", "sqlite"],
+                            "source_ids": [source_id],
+                            "confidence": 0.9,
+                        },
+                    ],
+                }
+            )
+
+    monkeypatch.setattr("pkm_brain.wiki_compiler.get_provider", lambda provider_name=None: FakeProvider())
 
     result = synthesize_wiki(svc.paths)
 
     assert result["lint"]["errors"] == []
+    assert result["llm_compile"]["provider"] == "fake"
+    assert result["llm_compile"]["status"] == "ok"
     index = (svc.paths.wiki / "index.md").read_text(encoding="utf-8")
     concept = (svc.paths.wiki / "concepts" / "wiki-synthesis-layer.md").read_text(encoding="utf-8")
     decision = (svc.paths.wiki / "decisions" / "use-sqlite-for-canonical-metadata.md").read_text(encoding="utf-8")
@@ -221,7 +321,7 @@ def test_wiki_synthesis_compiles_semantic_pages(tmp_path: Path) -> None:
     assert "[[concepts/wiki-synthesis-layer]]" in index
     assert "page_type: concept" in concept
     assert "Reference page synthesized from" not in concept
-    assert "[[decisions/maintain-wiki-as-compiled-markdown]]" in concept
+    assert "[[decisions/use-sqlite-for-canonical-metadata]]" in concept
     assert "document:" in concept
     assert "page_type: decision" in decision
     assert "Use SQLite as the canonical metadata store" in decision

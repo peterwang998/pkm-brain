@@ -14,7 +14,7 @@ from typing import Any
 from .audit import audit_memories, provenance_check
 from .capture import AgentLogCapture
 from .db import connection, dumps
-from .llm import get_provider
+from .llm import CODEX_DEFAULT_MODEL, DEFAULT_LLM_PROVIDER, OPENAI_DEFAULT_MODEL, get_provider
 from .memory_proposals import propose_failure_memories_from_sources
 from .paths import BrainPaths
 from .service import BrainService
@@ -142,6 +142,7 @@ def run_nightly_maintenance(
     include_hyprnote: bool = False,
     with_llm_wiki_proposals: bool = False,
     with_llm_memory_proposals: bool = False,
+    llm_wiki: bool = True,
     provider: str | None = None,
 ) -> NightlyMaintenanceResult:
     service = BrainService(paths)
@@ -215,7 +216,7 @@ def run_nightly_maintenance(
             ingest_result = service.ingest()
             summary["ingest"] = ingest_result.__dict__
 
-            wiki_result = synthesize_wiki(paths, overwrite_generated=True)
+            wiki_result = synthesize_wiki(paths, overwrite_generated=True, with_llm=llm_wiki, provider_name=provider)
             summary["wiki_synthesize"] = wiki_result
 
             summary["index_status"] = index_status(paths, service)
@@ -371,6 +372,7 @@ def render_nightly_launch_agent(
     due_after_hours: int = 20,
     with_llm_wiki_proposals: bool = False,
     with_llm_memory_proposals: bool = False,
+    llm_wiki: bool = True,
     provider: str | None = None,
 ) -> dict[str, Any]:
     llm_args = ""
@@ -378,9 +380,12 @@ def render_nightly_launch_agent(
         llm_args = " --with-llm-wiki-proposals"
     if with_llm_memory_proposals:
         llm_args += " --with-llm-memory-proposals"
-    if with_llm_wiki_proposals or with_llm_memory_proposals:
-        if provider:
-            llm_args += f" --provider {provider}"
+    if not llm_wiki:
+        llm_args += " --no-llm-wiki"
+    llm_provider = provider or (DEFAULT_LLM_PROVIDER if llm_wiki or with_llm_wiki_proposals or with_llm_memory_proposals else None)
+    if llm_wiki or with_llm_wiki_proposals or with_llm_memory_proposals:
+        if llm_provider:
+            llm_args += f" --provider {llm_provider}"
     command = (
         f"cd {repo_path} && "
         f"{uv_path} run brain automation nightly --if-due --due-after-hours {due_after_hours} --home {brain_home}{llm_args}"
@@ -394,14 +399,18 @@ def render_nightly_launch_agent(
         "StandardErrorPath": str(brain_home / "logs" / "nightly-maintenance.err.log"),
         "WorkingDirectory": str(repo_path),
     }
-    if with_llm_wiki_proposals or with_llm_memory_proposals:
+    if llm_wiki or with_llm_wiki_proposals or with_llm_memory_proposals:
         environment = {}
-        if provider:
-            environment["PKM_BRAIN_LLM_PROVIDER"] = provider
-        if provider == "openai":
-            environment["PKM_BRAIN_OPENAI_MODEL"] = os.environ.get("PKM_BRAIN_OPENAI_MODEL", "gpt-5.5")
-        if provider == "codex":
-            environment["PKM_BRAIN_CODEX_MODEL"] = os.environ.get("PKM_BRAIN_CODEX_MODEL", "gpt-5.5")
+        if llm_provider:
+            environment["PKM_BRAIN_LLM_PROVIDER"] = llm_provider
+        if llm_provider == "openai":
+            environment["PKM_BRAIN_OPENAI_MODEL"] = os.environ.get("PKM_BRAIN_OPENAI_MODEL", OPENAI_DEFAULT_MODEL)
+            if os.environ.get("PKM_BRAIN_OPENAI_MODEL_FALLBACKS"):
+                environment["PKM_BRAIN_OPENAI_MODEL_FALLBACKS"] = os.environ["PKM_BRAIN_OPENAI_MODEL_FALLBACKS"]
+        if llm_provider == "codex":
+            environment["PKM_BRAIN_CODEX_MODEL"] = os.environ.get("PKM_BRAIN_CODEX_MODEL", CODEX_DEFAULT_MODEL)
+            if os.environ.get("PKM_BRAIN_CODEX_MODEL_FALLBACKS"):
+                environment["PKM_BRAIN_CODEX_MODEL_FALLBACKS"] = os.environ["PKM_BRAIN_CODEX_MODEL_FALLBACKS"]
             codex_bin = os.environ.get("PKM_BRAIN_CODEX_BIN") or shutil.which("codex")
             if codex_bin:
                 environment["PKM_BRAIN_CODEX_BIN"] = codex_bin
@@ -441,6 +450,7 @@ def install_nightly_launch_agent(
     due_after_hours: int = 20,
     with_llm_wiki_proposals: bool = False,
     with_llm_memory_proposals: bool = False,
+    llm_wiki: bool = True,
     provider: str | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
@@ -452,6 +462,7 @@ def install_nightly_launch_agent(
         due_after_hours,
         with_llm_wiki_proposals=with_llm_wiki_proposals,
         with_llm_memory_proposals=with_llm_memory_proposals,
+        llm_wiki=llm_wiki,
         provider=provider,
     )
     path = nightly_launch_agent_path()

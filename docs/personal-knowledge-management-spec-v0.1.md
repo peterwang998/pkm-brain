@@ -509,7 +509,7 @@ brain automation nightly --if-due --due-after-hours 20
 
 The nightly job should use an hourly due-check instead of only `StartCalendarInterval`. This makes it laptop-friendly: if the machine sleeps through the intended overnight window, the next hourly check after wake can run maintenance when the last successful run is older than the threshold.
 
-Nightly maintenance should run these local deterministic tasks:
+Nightly maintenance should run these tasks:
 
 ```text
 1. capture agents
@@ -522,9 +522,9 @@ Nightly maintenance should run these local deterministic tasks:
 8. record automation run summary
 ```
 
-These steps do not call an LLM by default. They are local Python pipeline operations. LLM-assisted enrichment must be enabled explicitly with proposal flags.
+Wiki synthesis calls the default LLM provider by default so the semantic wiki compounds from new sources, while capture, ingest, status checks, provenance, lint, and memory audit remain local Python pipeline operations. The default provider should be the Codex CLI adapter so users with a local Codex subscription do not need to configure a separate API key for normal wiki maintenance. Operators may disable LLM semantic compilation with `--no-llm-wiki`.
 
-Optional nightly LLM proposal stages:
+Optional nightly LLM proposal stages remain separate from direct generated-page maintenance:
 
 ```text
 brain automation nightly --with-llm-wiki-proposals --provider <provider>
@@ -683,6 +683,7 @@ wiki/decisions/
 wiki/open_loops/
 wiki/timelines/
 wiki/references/
+wiki/log.md
 ```
 
 Agents may update wiki pages only from cited sources.
@@ -724,8 +725,9 @@ The command `brain wiki synthesize` must do both:
 1. Maintain source-backed reference pages for provenance.
 2. Compile or update semantic wiki pages from the current corpus.
 3. Maintain wiki/index.md as the human and agent entrypoint.
-4. Insert links between related semantic pages using Obsidian-style wikilinks.
-5. Cite source document ids for every generated page.
+4. Maintain wiki/log.md as the chronological synthesis log.
+5. Insert links between related semantic pages using Obsidian-style wikilinks.
+6. Cite source document ids for every generated page.
 ```
 
 The command must not silently overwrite hand-edited human pages. A generated page is safe to update only if it contains the generated marker. If a target page exists without the marker, the system must skip it and report the skip.
@@ -912,12 +914,24 @@ The wiki compiler should process sources in this order:
 4. Merge candidates with existing generated semantic pages.
 5. Update semantic pages with source-backed summaries, links, and open questions.
 6. Update wiki/index.md.
-7. Run wiki lint.
+7. Append a chronological summary to wiki/log.md.
+8. Run wiki lint.
 ```
 
-The V1 compiler may use deterministic extraction rules and templates.
+The V1 compiler should use the default LLM provider for semantic compilation, following [Karpathy's LLM Wiki pattern](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f): raw sources are immutable evidence, generated Markdown is the maintained knowledge layer, `index.md` is content-oriented, and `log.md` is chronological. The deterministic local path is a fallback for reference pages, index maintenance, logging, and explicit `--no-llm` runs; it should not be the normal semantic compiler.
 
-LLM-written wiki maintenance must use a two-state workflow:
+Generated semantic page maintenance may directly create or update pages only when all of these are true:
+
+```text
+1. The page is source-cited.
+2. The compiler confidence meets the configured auto-apply threshold.
+3. The target page is new or already contains the generated marker.
+4. The update can preserve the required frontmatter and page sections.
+```
+
+If the target page exists without the generated marker, the compiler must skip direct overwrite and create a proposal instead. Lower-confidence or riskier changes should also become proposals.
+
+LLM-written proposal maintenance uses a two-state workflow:
 
 ```text
 Unapproved state
@@ -930,6 +944,8 @@ Approved state
 ```
 
 Agents and nightly jobs may propose changes, but they must not directly write approved wiki pages. This keeps the workflow close to the LLM Wiki pattern while preserving reviewability and rollback.
+
+This restriction applies to proposal batches and hand-edited pages. It does not prohibit the default semantic compiler from maintaining machine-generated pages that are clearly marked as generated and source-cited.
 
 Required proposal entrypoints:
 

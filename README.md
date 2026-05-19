@@ -390,7 +390,7 @@ tail -n 40 ~/brain/logs/launchagent.out.log
 tail -n 40 ~/brain/logs/nightly-maintenance.out.log
 ```
 
-The capture LaunchAgent is a deterministic local Python job. The nightly LaunchAgent is also deterministic unless installed with `--with-llm-wiki-proposals` or `--with-llm-memory-proposals`, in which case it calls the configured LLM provider to create unapproved wiki proposals or unreviewed failure-memory candidates.
+The capture LaunchAgent is a deterministic local Python job. The nightly LaunchAgent runs LLM semantic wiki compilation by default through the `codex` provider, so generated wiki pages keep compounding from new sources. Use `--no-llm-wiki` to disable that default. Extra proposal/memory jobs remain controlled by `--with-llm-wiki-proposals` and `--with-llm-memory-proposals`.
 
 ### 11. Uninstall scheduled jobs
 
@@ -491,7 +491,7 @@ The nightly job runs:
 
 - agent-log capture
 - inbox ingestion
-- generated wiki synthesis with generated-page overwrite
+- generated wiki synthesis with default LLM semantic compilation
 - index status collection
 - provenance check
 - wiki lint
@@ -510,7 +510,7 @@ The nightly LaunchAgent uses an hourly wake-check by default:
 ```text
 com.pkm-brain.nightly-maintenance
 StartInterval = 3600
-command = brain automation nightly --if-due --due-after-hours 20
+command = brain automation nightly --if-due --due-after-hours 20 --provider codex
 ```
 
 This pattern is intentional for laptops. If the machine sleeps through a fixed overnight time, the next hourly check after wake can run maintenance if the last successful run is old enough.
@@ -533,10 +533,10 @@ Nightly logs are written to:
 
 PKM Brain maintains two wiki layers:
 
-- compiled semantic pages under `~/brain/wiki/projects/`, `concepts/`, `decisions/`, and `open_loops/`
+- LLM-compiled semantic pages under `~/brain/wiki/projects/`, `concepts/`, `decisions/`, `people/`, `open_loops/`, and `timelines/`
 - source-backed reference pages under `~/brain/wiki/references/<source_type>/`
 
-The compiled pages are the intended human-readable wiki. They group evidence across sources, cite document IDs, and link related concepts with Obsidian-style wikilinks. Reference pages are provenance aids for inspecting a single ingested source.
+This follows [Karpathy's LLM Wiki pattern](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f): raw sources remain immutable, while the LLM maintains a persistent, interlinked Markdown wiki that compounds over time. The compiled pages are the intended human-readable wiki. They group evidence across sources, cite document IDs, and link related concepts with Obsidian-style wikilinks. Reference pages are provenance aids for inspecting a single ingested source.
 
 Preview generated pages:
 
@@ -544,20 +544,30 @@ Preview generated pages:
 uv run brain wiki synthesize --dry-run
 ```
 
-Create or update generated wiki pages:
+Create or update generated wiki pages with the default Codex-backed LLM compiler:
 
 ```bash
 uv run brain wiki synthesize
+```
+
+Disable the LLM compiler for a deterministic reference/index/log pass:
+
+```bash
+uv run brain wiki synthesize --no-llm
+uv run brain automation nightly --no-llm-wiki
 ```
 
 Generated semantic pages are written under:
 
 ```text
 ~/brain/wiki/index.md
+~/brain/wiki/log.md
 ~/brain/wiki/projects/
 ~/brain/wiki/concepts/
 ~/brain/wiki/decisions/
+~/brain/wiki/people/
 ~/brain/wiki/open_loops/
+~/brain/wiki/timelines/
 ```
 
 Generated reference pages are written under:
@@ -566,9 +576,11 @@ Generated reference pages are written under:
 ~/brain/wiki/references/<source_type>/
 ```
 
-The V1 compiler is deterministic and conservative:
+The default compiler is LLM-backed and conservative:
 
-- updates generated semantic pages only when source evidence matches known compiler patterns
+- routes through the local `codex` provider unless another provider is specified
+- creates or updates generated semantic pages automatically when confidence is high enough
+- sends low-confidence, human-edited, or otherwise risky page replacements to the wiki proposal workflow
 - cites source document IDs on generated semantic pages
 - uses `[[path/to/page]]` wikilinks for related pages
 - keeps noisy source excerpts in reference pages rather than concept pages
@@ -593,7 +605,7 @@ agent or nightly LLM proposes a batch
   -> status: proposed or needs_interview
   -> human runs an interview/review
   -> status: approved or rejected
-  -> approved batch patches wiki files section-by-section
+  -> approved batch patches wiki sections or whole generated pages
   -> status: applied
 ```
 
@@ -627,7 +639,7 @@ Enable proposal generation during nightly maintenance:
 uv run brain automation nightly --with-llm-wiki-proposals --provider codex
 ```
 
-If `--with-llm-wiki-proposals` is set and the provider is not configured, the nightly run fails. Normal nightly maintenance without this flag remains deterministic local Python.
+LLM semantic wiki compilation is already on by default during nightly maintenance. `--with-llm-wiki-proposals` is still available as an extra proposal-only pass; if that flag is set and the provider is not configured, the nightly run fails.
 
 Agents can also create proposals through MCP with `propose_wiki_update`.
 
@@ -671,6 +683,19 @@ This creates only `proposed` memories. Future agents should use `active_memories
 
 ### LLM Provider Configuration
 
+Normal capture, ingest, search, MCP retrieval, and sync do not call an LLM. Wiki semantic compilation is LLM-backed by default, and the provider is also used by commands that generate unapproved proposal drafts, such as:
+
+```bash
+uv run brain wiki synthesize
+uv run brain automation nightly
+uv run brain memory propose-from-sources
+uv run brain wiki propose-from-sources
+uv run brain automation nightly --with-llm-wiki-proposals
+uv run brain automation nightly --with-llm-memory-proposals
+```
+
+`codex` is the default provider when no provider is specified. That path shells out to the local Codex CLI. If the Codex CLI is signed in with ChatGPT, usage is handled by the ChatGPT/Codex account rather than by an `OPENAI_API_KEY`. The `openai` and `anthropic` providers call paid API endpoints directly; use them only when API billing is intended. `ollama` stays local.
+
 Check provider configuration without printing secrets:
 
 ```bash
@@ -687,12 +712,13 @@ codex login
 export PKM_BRAIN_LLM_PROVIDER=codex
 export PKM_BRAIN_CODEX_MODEL=gpt-5.5
 # Optional:
+export PKM_BRAIN_CODEX_MODEL_FALLBACKS=gpt-5.4,gpt-5.3-codex,gpt-5.2,gpt-5
 export PKM_BRAIN_CODEX_BIN=/path/to/codex
 export PKM_BRAIN_CODEX_CWD=~/pkm-brain
 export PKM_BRAIN_CODEX_TIMEOUT_SECONDS=900
 ```
 
-The Codex provider runs `codex exec` in read-only, non-interactive mode and captures the final message as JSON. It can create unapproved wiki proposal batches, but it cannot directly patch approved wiki Markdown.
+The Codex provider runs `codex exec` in read-only, non-interactive mode and captures the final message as JSON. It can create unapproved wiki proposal batches, but it cannot directly patch approved wiki Markdown. If the selected model is unavailable to the local Codex account, Brain tries the fallback list in order.
 
 OpenAI-compatible:
 
@@ -701,8 +727,11 @@ export PKM_BRAIN_LLM_PROVIDER=openai
 export OPENAI_API_KEY=...
 export PKM_BRAIN_OPENAI_MODEL=gpt-5.5
 # Optional:
+export PKM_BRAIN_OPENAI_MODEL_FALLBACKS=gpt-5.4,gpt-5.4-mini,gpt-5
 export PKM_BRAIN_OPENAI_BASE_URL=https://api.openai.com/v1
 ```
+
+The OpenAI provider uses `OPENAI_API_KEY` and is billed through the OpenAI API platform. ChatGPT Plus/Pro subscription usage does not cover these calls.
 
 Anthropic:
 
@@ -711,6 +740,7 @@ export PKM_BRAIN_LLM_PROVIDER=anthropic
 export ANTHROPIC_API_KEY=...
 export PKM_BRAIN_ANTHROPIC_MODEL=claude-sonnet-4-5
 # Optional:
+export PKM_BRAIN_ANTHROPIC_MODEL_FALLBACKS=<alternate-model-1>,<alternate-model-2>
 export PKM_BRAIN_ANTHROPIC_BASE_URL=https://api.anthropic.com
 ```
 
@@ -720,6 +750,7 @@ Ollama:
 export PKM_BRAIN_LLM_PROVIDER=ollama
 export PKM_BRAIN_OLLAMA_MODEL=llama3.1
 # Optional:
+export PKM_BRAIN_OLLAMA_MODEL_FALLBACKS=<alternate-local-model>
 export PKM_BRAIN_OLLAMA_BASE_URL=http://localhost:11434
 ```
 

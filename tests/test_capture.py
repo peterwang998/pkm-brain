@@ -8,7 +8,7 @@ from pathlib import Path
 from pkm_brain.automation import render_launch_agent, render_nightly_launch_agent, run_agent_log_ingest, run_nightly_maintenance
 from pkm_brain.capture import AgentLogCapture, redact_text
 from pkm_brain.db import connection
-from pkm_brain.llm import provider_status
+from pkm_brain.llm import CODEX_DEFAULT_MODEL, DEFAULT_LLM_PROVIDER, OPENAI_DEFAULT_MODEL, provider_status
 from pkm_brain.paths import BrainPaths
 from pkm_brain.service import BrainService
 
@@ -342,12 +342,13 @@ def test_nightly_maintenance_skips_when_not_due(tmp_path: Path) -> None:
     assert second.run_id is None
 
 
-def test_nightly_llm_proposals_fail_without_provider(tmp_path: Path, monkeypatch) -> None:
+def test_nightly_llm_proposals_fail_without_configured_default_provider(tmp_path: Path, monkeypatch) -> None:
     svc = make_service(tmp_path)
     monkeypatch.delenv("PKM_BRAIN_LLM_PROVIDER", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("PKM_BRAIN_OLLAMA_MODEL", raising=False)
+    monkeypatch.setenv("PKM_BRAIN_CODEX_BIN", str(tmp_path / "missing-codex"))
 
     result = run_nightly_maintenance(
         svc.paths,
@@ -358,11 +359,11 @@ def test_nightly_llm_proposals_fail_without_provider(tmp_path: Path, monkeypatch
     )
 
     assert result.status == "failed"
-    assert "PKM_BRAIN_LLM_PROVIDER" in str(result.error)
+    assert "codex login" in str(result.error)
 
     due_check = run_nightly_maintenance(svc.paths, if_due=True, with_llm_wiki_proposals=True)
     assert due_check.status == "failed"
-    assert "PKM_BRAIN_LLM_PROVIDER" in str(due_check.error)
+    assert "codex login" in str(due_check.error)
 
 
 def test_nightly_memory_proposal_flag_creates_only_proposed_memories(tmp_path: Path, monkeypatch) -> None:
@@ -411,21 +412,26 @@ def test_nightly_memory_proposal_flag_creates_only_proposed_memories(tmp_path: P
 def test_llm_provider_status_reports_missing_configuration(monkeypatch) -> None:
     monkeypatch.delenv("PKM_BRAIN_LLM_PROVIDER", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("PKM_BRAIN_CODEX_BIN", "/missing/codex")
 
-    unset = provider_status()
+    default = provider_status()
     openai = provider_status("openai")
 
-    assert unset["configured"] is False
-    assert "PKM_BRAIN_LLM_PROVIDER" in unset["missing"]
+    assert default["provider"] == DEFAULT_LLM_PROVIDER
+    assert default["configured"] is False
+    assert "codex login" in default["missing"]
     assert openai["configured"] is False
     assert "OPENAI_API_KEY" in openai["missing"]
+    assert "API billing" in openai["cost_source"]
 
 
 def test_codex_provider_status_uses_local_cli() -> None:
     status = provider_status("codex")
 
     assert status["provider"] == "codex"
-    assert status["model"] == "gpt-5.5"
+    assert status["model"] == CODEX_DEFAULT_MODEL
+    assert "gpt-5.2" in status["fallback_models"]
+    assert "ChatGPT plan" in status["cost_source"]
     assert isinstance(status["configured"], bool)
 
 
@@ -502,7 +508,7 @@ def test_nightly_launch_agent_plist_render_with_openai_wiki_proposals() -> None:
     assert "--provider openai" in command
     assert "OPENAI_API_KEY" not in command
     assert decoded["EnvironmentVariables"]["PKM_BRAIN_LLM_PROVIDER"] == "openai"
-    assert decoded["EnvironmentVariables"]["PKM_BRAIN_OPENAI_MODEL"] == "gpt-5.5"
+    assert decoded["EnvironmentVariables"]["PKM_BRAIN_OPENAI_MODEL"] == OPENAI_DEFAULT_MODEL
 
 
 def test_nightly_launch_agent_plist_render_with_codex_wiki_proposals(monkeypatch) -> None:
@@ -526,9 +532,30 @@ def test_nightly_launch_agent_plist_render_with_codex_wiki_proposals(monkeypatch
     assert "--provider codex" in command
     assert "OPENAI_API_KEY" not in command
     assert decoded["EnvironmentVariables"]["PKM_BRAIN_LLM_PROVIDER"] == "codex"
-    assert decoded["EnvironmentVariables"]["PKM_BRAIN_CODEX_MODEL"] == "gpt-5.5"
+    assert decoded["EnvironmentVariables"]["PKM_BRAIN_CODEX_MODEL"] == CODEX_DEFAULT_MODEL
     assert decoded["EnvironmentVariables"]["PKM_BRAIN_CODEX_BIN"] == "/opt/homebrew/bin/codex"
     assert decoded["EnvironmentVariables"]["PKM_BRAIN_CODEX_CWD"] == str(repo_path)
+
+
+def test_nightly_launch_agent_plist_render_uses_codex_as_default_llm_provider(monkeypatch) -> None:
+    monkeypatch.setenv("PKM_BRAIN_CODEX_BIN", "/opt/homebrew/bin/codex")
+    repo_path = Path.home() / "pkm-brain"
+    brain_home = Path.home() / "brain"
+    plist = render_nightly_launch_agent(
+        repo_path=repo_path,
+        brain_home=brain_home,
+        uv_path=Path("/opt/homebrew/bin/uv"),
+        interval=3600,
+        due_after_hours=20,
+        with_llm_memory_proposals=True,
+    )
+    decoded = plistlib.loads(plistlib.dumps(plist))
+
+    command = decoded["ProgramArguments"][-1]
+    assert "--with-llm-memory-proposals" in command
+    assert "--provider codex" in command
+    assert decoded["EnvironmentVariables"]["PKM_BRAIN_LLM_PROVIDER"] == "codex"
+    assert decoded["EnvironmentVariables"]["PKM_BRAIN_CODEX_BIN"] == "/opt/homebrew/bin/codex"
 
 
 def test_nightly_launch_agent_plist_render_with_codex_memory_proposals(monkeypatch) -> None:

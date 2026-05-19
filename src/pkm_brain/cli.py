@@ -452,11 +452,25 @@ def wiki_lint(home: Optional[Path] = typer.Option(None)) -> None:
 def wiki_synthesize(
     dry_run: bool = typer.Option(False, "--dry-run"),
     overwrite_generated: bool = typer.Option(False, "--overwrite-generated"),
+    llm: bool = typer.Option(True, "--llm/--no-llm"),
+    provider: Optional[str] = typer.Option(None),
+    require_llm: bool = typer.Option(False, "--require-llm"),
+    auto_apply_confidence: float = typer.Option(0.75, "--auto-apply-confidence"),
+    llm_source_limit: int = typer.Option(12, "--llm-source-limit"),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
     svc = service(home)
     svc.init_workspace()
-    result = synthesize_wiki(svc.paths, dry_run=dry_run, overwrite_generated=overwrite_generated)
+    result = synthesize_wiki(
+        svc.paths,
+        dry_run=dry_run,
+        overwrite_generated=overwrite_generated,
+        with_llm=llm,
+        provider_name=provider,
+        require_llm=require_llm,
+        auto_apply_confidence=auto_apply_confidence,
+        llm_source_limit=llm_source_limit,
+    )
     console.print_json(json.dumps(result))
     lint_result = result.get("lint")
     if lint_result and lint_result["errors"]:
@@ -1053,6 +1067,7 @@ def automation_nightly(
     hyprnote_root: Optional[Path] = typer.Option(None, help="Hyprnote root directory."),
     with_llm_wiki_proposals: bool = typer.Option(False, "--with-llm-wiki-proposals"),
     with_llm_memory_proposals: bool = typer.Option(False, "--with-llm-memory-proposals"),
+    llm_wiki: bool = typer.Option(True, "--llm-wiki/--no-llm-wiki"),
     provider: Optional[str] = typer.Option(None),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
@@ -1066,6 +1081,7 @@ def automation_nightly(
         include_hyprnote=include_hyprnote,
         with_llm_wiki_proposals=with_llm_wiki_proposals,
         with_llm_memory_proposals=with_llm_memory_proposals,
+        llm_wiki=llm_wiki,
         provider=provider,
     )
     console.print_json(json.dumps(as_jsonable(result)))
@@ -1177,6 +1193,7 @@ def launch_agent_install_nightly(
     due_after_hours: int = typer.Option(20, help="Minimum hours between successful nightly runs."),
     with_llm_wiki_proposals: bool = typer.Option(False, "--with-llm-wiki-proposals"),
     with_llm_memory_proposals: bool = typer.Option(False, "--with-llm-memory-proposals"),
+    llm_wiki: bool = typer.Option(True, "--llm-wiki/--no-llm-wiki"),
     provider: Optional[str] = typer.Option(None, help="LLM provider for proposals: codex, openai, anthropic, or ollama."),
     dry_run: bool = typer.Option(False, "--dry-run"),
     home: Optional[Path] = typer.Option(None),
@@ -1192,6 +1209,7 @@ def launch_agent_install_nightly(
         due_after_hours=due_after_hours,
         with_llm_wiki_proposals=with_llm_wiki_proposals,
         with_llm_memory_proposals=with_llm_memory_proposals,
+        llm_wiki=llm_wiki,
         provider=provider,
         dry_run=dry_run,
     )
@@ -1214,6 +1232,7 @@ def launch_agent_render_nightly(
     due_after_hours: int = typer.Option(20),
     with_llm_wiki_proposals: bool = typer.Option(False, "--with-llm-wiki-proposals"),
     with_llm_memory_proposals: bool = typer.Option(False, "--with-llm-memory-proposals"),
+    llm_wiki: bool = typer.Option(True, "--llm-wiki/--no-llm-wiki"),
     provider: Optional[str] = typer.Option(None, help="LLM provider for proposals: codex, openai, anthropic, or ollama."),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
@@ -1227,6 +1246,7 @@ def launch_agent_render_nightly(
         due_after_hours=due_after_hours,
         with_llm_wiki_proposals=with_llm_wiki_proposals,
         with_llm_memory_proposals=with_llm_memory_proposals,
+        llm_wiki=llm_wiki,
         provider=provider,
     )
     console.print_json(json.dumps(plist))
