@@ -67,6 +67,14 @@ class FakeTransport:
             return SubprocessResult(0 if self.outbox_probe else 1, "", "outbox probe failed")
         if command == "rsync --version":
             return SubprocessResult(0 if self.remote_rsync else 1, "rsync version\n", "missing rsync")
+        if command.startswith("brain sync rebuild-mirror-index --home"):
+            if not self.remote_ingest:
+                return SubprocessResult(1, "", "remote ingest failed")
+            from pkm_brain.paths import BrainPaths
+            from pkm_brain.service import BrainService
+
+            result = BrainService(BrainPaths.from_value(self.remote_home), prefer_model_embeddings=False).rebuild_mirror_index()
+            return SubprocessResult(0, json.dumps(result) + "\n", "")
         if command.startswith("brain ingest --home"):
             return SubprocessResult(0 if self.remote_ingest else 1, '{"changed":0}\n', "remote ingest failed")
         return SubprocessResult(1, "", f"unexpected command: {command}")

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
-import shutil
 import re
+import shutil
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -418,6 +419,148 @@ class BrainService:
             )
 
         return IngestResult(run_id, len(candidates), changed, skipped, chunks_created, embeddings_created, errors, documents_replaced)
+
+    def rebuild_mirror_index(self) -> dict[str, Any]:
+        self.init_workspace()
+        raw_root = self.paths.raw.resolve()
+        candidates = sorted(
+            path
+            for path in self.paths.raw.rglob("*")
+            if path.is_file() and not path.name.startswith(".") and not reserved_ingest_path(path)
+        )
+        run_id = new_id("run")
+        started = now_iso()
+        errors: list[str] = []
+        indexed = 0
+        skipped = 0
+        chunks_created = 0
+        vector_rows: list[dict[str, Any]] = []
+
+        with connection(self.paths.sqlite_path) as conn:
+            conn.execute(
+                "INSERT INTO ingestion_runs(id, started_at, status, documents_discovered) VALUES (?, ?, ?, ?)",
+                (run_id, started, "running", len(candidates)),
+            )
+            stale_chunk_ids = remove_mirror_index_documents(conn, raw_root)
+            delete_vectors(self.paths.lancedb_path, stale_chunk_ids)
+
+            for path in candidates:
+                try:
+                    source_type = detect_source_type(path)
+                    if not source_type:
+                        skipped += 1
+                        continue
+                    content_hash = file_sha256(path)
+                    text = path.read_text(encoding="utf-8", errors="replace")
+                    title = markdown_frontmatter_value(text, "title") or path.stem.replace("-", " ").replace("_", " ").strip() or path.name
+                    relative_path = path.resolve().relative_to(raw_root).as_posix()
+                    document_id = deterministic_mirror_id("doc", relative_path)
+                    ingested_at = now_iso()
+                    conn.execute(
+                        """
+                        INSERT INTO documents(
+                          id, source_type, title, source_path, raw_path, content_hash,
+                          origin_node_id, logical_source_key, created_at, ingested_at,
+                          project, tags, sensitivity, version, status
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            document_id,
+                            source_type,
+                            title,
+                            str(path),
+                            str(path),
+                            content_hash,
+                            "mirror",
+                            relative_path,
+                            ingested_at,
+                            ingested_at,
+                            None,
+                            dumps([]),
+                            "normal",
+                            1,
+                            "active",
+                        ),
+                    )
+                    doc_chunks = chunk_text(text, source_type)
+                    for chunk in doc_chunks:
+                        chunk_id = deterministic_mirror_id("chunk", f"{relative_path}:{chunk.chunk_index}:{chunk.content_hash}")
+                        conn.execute(
+                            """
+                            INSERT INTO chunks(
+                              id, document_id, chunk_index, corpus_type, text, heading_path,
+                              start_offset, end_offset, token_count, content_hash, created_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                chunk_id,
+                                document_id,
+                                chunk.chunk_index,
+                                "raw",
+                                chunk.text,
+                                chunk.heading_path,
+                                chunk.start_offset,
+                                chunk.end_offset,
+                                chunk.token_count,
+                                chunk.content_hash,
+                                ingested_at,
+                            ),
+                        )
+                        conn.execute(
+                            """
+                            INSERT INTO chunk_fts(chunk_id, title, text, heading_path, project, tags)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                            """,
+                            (chunk_id, title, chunk.text, chunk.heading_path, "", ""),
+                        )
+                        vector_rows.append(
+                            {
+                                "chunk_id": chunk_id,
+                                "document_id": document_id,
+                                "text": chunk.text,
+                                "vector": self.embedding_provider.embed([chunk.text])[0],
+                            }
+                        )
+                    indexed += 1
+                    chunks_created += len(doc_chunks)
+                except Exception as exc:
+                    errors.append(f"{path}: {exc}")
+
+            embeddings_created = upsert_vectors(self.paths.lancedb_path, vector_rows)
+            conn.execute(
+                """
+                UPDATE ingestion_runs
+                SET finished_at = ?, status = ?, documents_changed = ?, documents_skipped = ?,
+                    chunks_created = ?, embeddings_created = ?, errors = ?
+                WHERE id = ?
+                """,
+                (
+                    now_iso(),
+                    "failed" if errors else "success",
+                    indexed,
+                    skipped,
+                    chunks_created,
+                    embeddings_created,
+                    dumps(errors),
+                    run_id,
+                ),
+            )
+
+        from .wiki import lint_wiki
+
+        wiki = lint_wiki(self.paths)
+        memories = self.import_memories(self.paths.memory, allow_missing_sources=True)
+        return {
+            "run_id": run_id,
+            "raw_files_discovered": len(candidates),
+            "documents_indexed": indexed,
+            "documents_skipped": skipped,
+            "chunks_created": chunks_created,
+            "embeddings_created": embeddings_created,
+            "errors": errors,
+            "wiki": wiki,
+            "memories": memories,
+        }
 
     def _copy_raw(self, source: Path, source_type: str, ingested_at: str, content_hash: str) -> Path:
         date = ingested_at[:10].split("-")
@@ -1661,6 +1804,38 @@ def summarize_ranked_chunks(chunks: list[dict[str, Any]], limit: int) -> list[di
 class ReplacedDocuments:
     documents: int
     chunk_ids: list[str]
+
+
+def deterministic_mirror_id(prefix: str, value: str) -> str:
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
+    return f"{prefix}_mirror_{digest}"
+
+
+def remove_mirror_index_documents(conn: Any, raw_root: Path) -> list[str]:
+    raw_root = raw_root.resolve()
+    stale_documents = []
+    for row in conn.execute("SELECT id, source_path FROM documents WHERE origin_node_id = 'mirror'"):
+        try:
+            Path(str(row["source_path"])).resolve().relative_to(raw_root)
+        except ValueError:
+            continue
+        stale_documents.append(dict(row))
+    if not stale_documents:
+        return []
+    document_ids = [row["id"] for row in stale_documents]
+    placeholders = ",".join("?" for _ in document_ids)
+    stale_chunk_ids = [
+        row["id"]
+        for row in conn.execute(
+            f"SELECT id FROM chunks WHERE document_id IN ({placeholders})",
+            document_ids,
+        )
+    ]
+    if stale_chunk_ids:
+        chunk_placeholders = ",".join("?" for _ in stale_chunk_ids)
+        conn.execute(f"DELETE FROM chunk_fts WHERE chunk_id IN ({chunk_placeholders})", stale_chunk_ids)
+    conn.execute(f"DELETE FROM documents WHERE id IN ({placeholders})", document_ids)
+    return stale_chunk_ids
 
 
 def remove_documents(conn: Any, document_rows: list[dict[str, Any]]) -> ReplacedDocuments:

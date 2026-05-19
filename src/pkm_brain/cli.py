@@ -923,6 +923,16 @@ def sync_mirror_hash(
     console.print(table)
 
 
+@sync_app.command("rebuild-mirror-index")
+def sync_rebuild_mirror_index(
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    result = service(home).rebuild_mirror_index()
+    console.print_json(json.dumps(result))
+    if result["errors"]:
+        raise typer.Exit(1)
+
+
 @sync_app.command("conflicts")
 def sync_conflicts(
     home: Optional[Path] = typer.Option(None),

@@ -3,6 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from fake_transport import LocalRsyncTransport
+from pkm_brain.db import connection
+from pkm_brain.paths import BrainPaths
+from pkm_brain.service import BrainService
 from pkm_brain.sync_transfer import sync_run
 from test_sync_pull_ingest import agent_markdown
 from test_sync_pull_staging import primary_with_secondary, write_outbox_file
@@ -23,8 +26,13 @@ def test_sync_run_pulls_pushes_and_runs_remote_ingest(tmp_path: Path) -> None:
     assert result.remote_ingest is not None
     assert result.remote_ingest["returncode"] == 0
     assert len(transport.rsync_commands) == 5
-    assert transport.commands[-1][-1].startswith("brain ingest --home")
+    assert transport.commands[-1][-1].startswith("brain sync rebuild-mirror-index --home")
     assert (secondary_home / "raw" / "agent_session_log").exists()
+    with connection(secondary_home / "db" / "brain.sqlite") as conn:
+        assert conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] >= 1
+    search = BrainService(BrainPaths.from_value(secondary_home), prefer_model_embeddings=False).search("secondary-token")
+    assert search["results"]
 
 
 def test_sync_run_aborts_push_when_pull_fails(tmp_path: Path) -> None:

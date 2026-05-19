@@ -272,7 +272,7 @@ def sync_run(
     status = "ok"
     remote_ingest_status = None
     if remote_ingest:
-        command = f"brain ingest --home {quote_path(peer.brain_home)}"
+        command = f"brain sync rebuild-mirror-index --home {quote_path(peer.brain_home)}"
         completed = run_remote(paths, peer, command, transport)
         remote_result = {
             "command": command,
