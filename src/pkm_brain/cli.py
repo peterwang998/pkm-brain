@@ -31,6 +31,11 @@ from .memory_proposals import propose_failure_memories_from_sources
 from .mcp_server import create_mcp
 from .paths import BrainPaths
 from .service import BrainService
+from .sync_connection import test_connection as run_sync_test_connection
+from .sync_setup import add_peer as sync_add_peer_config
+from .sync_setup import init_primary as sync_init_primary_config
+from .sync_setup import init_secondary as sync_init_secondary_config
+from .sync_ssh import first_host_key_with_fingerprint
 from .wiki import lint_wiki, synthesize_wiki
 from .wiki_proposals import (
     apply_wiki_proposal,
@@ -72,6 +77,14 @@ console = Console()
 
 def service(home: Optional[Path] = None) -> BrainService:
     return BrainService(BrainPaths.from_value(home))
+
+
+def required_or_prompt(value: Optional[str], flag: str, prompt: str, yes: bool) -> str:
+    if value and value.strip():
+        return value.strip()
+    if yes:
+        raise ValueError(f"{flag} is required with --yes")
+    return str(typer.prompt(prompt)).strip()
 
 
 @app.command()
@@ -438,6 +451,117 @@ def sync_doctor(
         console.print(f"Node: {result['node_id'] or 'unknown'}")
         console.print(table)
         console.print(f"Ready: {'yes' if result['ready'] else 'no'}")
+    if not result["ready"]:
+        raise typer.Exit(1)
+
+
+@sync_app.command("init-primary")
+def sync_init_primary(
+    node_id: Optional[str] = typer.Option(None, "--node-id"),
+    yes: bool = typer.Option(False, "--yes", help="Run non-interactively; required fields must be provided."),
+    force: bool = typer.Option(False, "--force", help="Overwrite an existing sync.yaml."),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    paths = BrainPaths.from_value(home)
+    try:
+        resolved_node_id = required_or_prompt(node_id, "--node-id", "Primary node_id", yes)
+        result = sync_init_primary_config(paths, resolved_node_id, force=force)
+    except ValueError as exc:
+        console.print(str(exc))
+        raise typer.Exit(1)
+    console.print_json(json.dumps(result))
+
+
+@sync_app.command("init-secondary")
+def sync_init_secondary(
+    node_id: Optional[str] = typer.Option(None, "--node-id"),
+    primary_node_id: Optional[str] = typer.Option(None, "--primary-node-id"),
+    outbox_path: Optional[Path] = typer.Option(None, "--outbox-path"),
+    yes: bool = typer.Option(False, "--yes", help="Run non-interactively; required fields must be provided."),
+    force: bool = typer.Option(False, "--force", help="Overwrite an existing sync.yaml."),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    paths = BrainPaths.from_value(home)
+    try:
+        resolved_node_id = required_or_prompt(node_id, "--node-id", "Secondary node_id", yes)
+        resolved_primary_node_id = required_or_prompt(primary_node_id, "--primary-node-id", "Expected Primary node_id", yes)
+        result = sync_init_secondary_config(
+            paths,
+            resolved_node_id,
+            resolved_primary_node_id,
+            outbox_path=outbox_path,
+            force=force,
+        )
+    except ValueError as exc:
+        console.print(str(exc))
+        raise typer.Exit(1)
+    console.print_json(json.dumps(result))
+
+
+@sync_app.command("add-peer")
+def sync_add_peer(
+    node_id: Optional[str] = typer.Option(None, "--node-id"),
+    host: Optional[str] = typer.Option(None, "--host"),
+    user: Optional[str] = typer.Option(None, "--user"),
+    brain_home: Optional[Path] = typer.Option(None, "--brain-home"),
+    identity_path: Optional[Path] = typer.Option(None, "--identity-path"),
+    allow_first_host_key: bool = typer.Option(False, "--allow-first-host-key"),
+    yes: bool = typer.Option(False, "--yes", help="Run non-interactively; required fields must be provided."),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    paths = BrainPaths.from_value(home)
+    try:
+        resolved_node_id = required_or_prompt(node_id, "--node-id", "Secondary node_id", yes)
+        resolved_host = required_or_prompt(host, "--host", "SSH host", yes)
+        resolved_user = required_or_prompt(user, "--user", "SSH user", yes)
+        resolved_brain_home = Path(required_or_prompt(str(brain_home) if brain_home else None, "--brain-home", "Remote Brain home", yes))
+        host_key_candidate = None
+        if allow_first_host_key:
+            candidate, observed_fingerprint = first_host_key_with_fingerprint(resolved_host)
+            console.print(f"Observed host key fingerprint for {resolved_host}: {observed_fingerprint}")
+            if not yes and not typer.confirm("Accept this host key fingerprint after out-of-band verification?"):
+                raise ValueError("host key was not accepted")
+            host_key_candidate = candidate
+        result = sync_add_peer_config(
+            paths,
+            resolved_node_id,
+            resolved_host,
+            resolved_user,
+            resolved_brain_home,
+            identity_path=identity_path,
+            host_key_candidate=host_key_candidate,
+        )
+    except (RuntimeError, ValueError) as exc:
+        console.print(str(exc))
+        raise typer.Exit(1)
+    console.print_json(json.dumps(result))
+
+
+@sync_app.command("test-connection")
+def sync_test_connection(
+    peer_node_id: str,
+    home: Optional[Path] = typer.Option(None),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    paths = BrainPaths.from_value(home)
+    try:
+        result = run_sync_test_connection(paths, peer_node_id).as_dict()
+    except ValueError as exc:
+        console.print(str(exc))
+        raise typer.Exit(1)
+    if json_output:
+        console.print_json(json.dumps(result))
+    else:
+        table = Table(title=f"Connection Test: {peer_node_id}")
+        table.add_column("Check")
+        table.add_column("Status")
+        for check, status in result["checks"].items():
+            table.add_row(check, status)
+        console.print(f"Role: {result['local_role']}")
+        console.print(f"Node: {result['local_node_id']}")
+        console.print(f"Peer: {result['peer_node_id']}")
+        console.print(table)
+        console.print(f"Ready for scheduled sync: {'yes' if result['ready'] else 'no'}")
     if not result["ready"]:
         raise typer.Exit(1)
 
