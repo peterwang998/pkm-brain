@@ -37,6 +37,34 @@ def request_status(host: str, port: int, token: str | None = None) -> tuple[int,
     return response.status, json.loads(body)
 
 
+def request_html(host: str, port: int) -> tuple[int, str]:
+    conn = http.client.HTTPConnection(host, port, timeout=5)
+    conn.request("GET", "/")
+    response = conn.getresponse()
+    body = response.read().decode("utf-8")
+    conn.close()
+    return response.status, body
+
+
+def test_ui_shell_renders_token_driven_browser_pages(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+
+    with running_ui(paths) as (host, port, _token):
+        status, body = request_html(host, port)
+
+    assert status == 200
+    assert 'id="token-input"' in body
+    assert 'data-view="status"' in body
+    assert 'data-view="setup"' in body
+    assert 'data-view="sync"' in body
+    assert 'data-view="jobs"' in body
+    assert 'data-view="logs"' in body
+    assert 'data-view="memory"' in body
+    assert "Authorization" in body
+    assert "Bearer" in body
+    assert 'href="/api/' not in body
+
+
 def test_ui_rejects_missing_token(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
 
