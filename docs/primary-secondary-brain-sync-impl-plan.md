@@ -266,18 +266,18 @@ uv run pytest tests/test_sync_ssh.py tests/test_sync_init.py \
   tests/test_sync_add_peer.py tests/test_sync_test_connection.py -q
 
 # 2. Init writes config
-rm -rf /tmp/brain-m2-primary && uv run brain --home /tmp/brain-m2-primary init
-uv run brain --home /tmp/brain-m2-primary sync init-primary \
+rm -rf /tmp/brain-m2-primary && uv run brain init --home /tmp/brain-m2-primary
+uv run brain sync init-primary --home /tmp/brain-m2-primary \
   --node-id primary-test --yes
 test -f /tmp/brain-m2-primary/config/sync.yaml
 grep -q "role: primary" /tmp/brain-m2-primary/config/sync.yaml
 
 # 3. Re-init refused without --force
-! uv run brain --home /tmp/brain-m2-primary sync init-primary \
+! uv run brain sync init-primary --home /tmp/brain-m2-primary \
     --node-id primary-test --yes 2>/dev/null
 
 # 4. Pinned known_hosts location (after a fake add-peer in tests)
-uv run brain --home /tmp/brain-m2-primary sync add-peer --help \
+uv run brain sync add-peer --home /tmp/brain-m2-primary --help \
   | grep -q -- --allow-first-host-key
 
 # 5. test-connection JSON shape
@@ -433,7 +433,7 @@ uv run brain automation secondary-tick --help
   - `brain scheduler install-sync --peer <node> --interval 1800`
   - `brain scheduler install-secondary-capture --interval 600` (invokes `brain automation secondary-tick`)
   - `brain scheduler status`
-  - `brain scheduler uninstall-sync --peer <node>`
+  - `brain scheduler uninstall-sync`
   - `brain scheduler uninstall-secondary-capture`
 - Existing `brain launch-agent ...` commands keep working as lower-level adapters.
 
@@ -496,8 +496,8 @@ uv run brain scheduler install-secondary-capture --interval 600 --dry-run \
 
 **M5.2 — Web UI**
 
-- `brain ui --host 127.0.0.1 --port 8765` — FastAPI server bound to loopback by default.
-- Local auth token: generated at first run, stored at `config/local/ui_token` with `0600`. Required as `Authorization: Bearer <token>` header (or signed cookie).
+- `brain ui --host 127.0.0.1 --port 8765` — stdlib `ThreadingHTTPServer` control plane bound to loopback by default. The implementation deliberately avoided a FastAPI dependency for V1; porting to FastAPI remains possible if typed schemas/OpenAPI become valuable.
+- Local auth token: generated at first run, stored at `config/local/ui_token` with `0600`. Required as `Authorization: Bearer <token>` header for API calls; the browser shell stores the token locally and sends authenticated fetches.
 - Pages per spec §16: Status, Setup, Sync, Jobs, Logs, Memory Review.
 - Every page calls into the M1 service layer; no separate data model.
 - `--host 0.0.0.0` requires `--i-understand-this-binds-to-lan` flag and prints a warning.
@@ -521,7 +521,7 @@ uv run pytest tests/test_setup_wizard.py tests/test_ui_auth.py \
 
 # 2. Wizard dry-run touches nothing
 ls /tmp/brain-m5/ 2>/dev/null && rm -rf /tmp/brain-m5
-uv run brain --home /tmp/brain-m5 setup --dry-run --json \
+uv run brain setup --home /tmp/brain-m5 --dry-run --json \
   | python -c "import json,sys; p=json.load(sys.stdin); assert 'planned_writes' in p"
 test ! -e /tmp/brain-m5/config/sync.yaml
 
@@ -621,7 +621,7 @@ uv run ruff check .
 sqlite3 ~/brain/db/brain.sqlite "SELECT version, applied_at FROM schema_migrations ORDER BY version;"
 # Expect at least: 001 (origin identity), 002 (sync_runs).
 
-# 3. Spec drift audit — confirm no "Not yet implemented" item is still missing in code
+# 3. Spec drift audit — confirm deferred items are explicitly tracked
 uv run python -c "
 import subprocess
 required = [
@@ -654,8 +654,8 @@ These are flagged inline in the spec §18. The plan resolves the first three at 
 |----------|-----------------|
 | Export reviewed memories as Markdown vs SQLite-only? | **Markdown export** — added in M1.3. `memory/` is plain files, mirror-able by rsync. SQLite remains canonical. |
 | Remote ingest cadence after push? | **After every successful push** (M3.7). Revisit if push frequency increases. |
-| Web UI framework? | **FastAPI** (M5.2). Typed endpoints, low ceremony, mirrors service layer cleanly. |
+| Web UI framework? | **Framework-free stdlib HTTP server** (M5.2). Keeps V1 dependency surface small; tradeoff is hand-rolled routing instead of FastAPI schemas/OpenAPI. |
 | Should Secondary import structured `agent_sessions` records, or only Markdown? | Defer to post-V1. Markdown is sufficient for retrieval. |
 | Secondary read-only MCP mode? | Defer. Current MCP server works against local SQLite; Secondary will surface its mirror naturally. |
 | Default topology: hostnames, static IPs, or both? | Spec accepts both; `add-peer` accepts either. No further work needed. |
-| Always-on UI service in V1? | **Deferred.** On-demand only in M5; `brain ui service install` not implemented until requested. |
+| Always-on UI service in V1? | **Deferred.** On-demand only in M5; `brain ui service install` waits until requested. |

@@ -274,6 +274,14 @@ def connection(db_path: Path) -> Iterator[sqlite3.Connection]:
 def init_db(db_path: Path) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with connection(db_path) as conn:
+        # Existing pre-sync databases need these columns before SCHEMA creates
+        # idx_documents_origin_logical.
+        documents_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='documents'"
+        ).fetchone()
+        if documents_table:
+            ensure_column(conn, "documents", "origin_node_id", "TEXT")
+            ensure_column(conn, "documents", "logical_source_key", "TEXT")
         conn.executescript(SCHEMA)
         ensure_column(conn, "memories", "reviewed_at", "TEXT")
         ensure_column(conn, "memories", "review_reason", "TEXT")

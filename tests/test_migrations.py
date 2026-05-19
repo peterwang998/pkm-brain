@@ -34,6 +34,56 @@ def test_migrations_rerun_is_noop(tmp_path: Path) -> None:
     assert versions == [1, 2]
 
 
+def test_init_db_migrates_pre_sync_documents_table(tmp_path: Path) -> None:
+    db_path = tmp_path / "brain.sqlite"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE documents (
+              id TEXT PRIMARY KEY,
+              source_type TEXT NOT NULL,
+              title TEXT NOT NULL,
+              source_path TEXT NOT NULL,
+              raw_path TEXT NOT NULL,
+              content_hash TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              ingested_at TEXT NOT NULL,
+              project TEXT,
+              tags TEXT NOT NULL DEFAULT '[]',
+              sensitivity TEXT NOT NULL DEFAULT 'normal',
+              version INTEGER NOT NULL DEFAULT 1,
+              status TEXT NOT NULL DEFAULT 'active'
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO documents(
+              id, source_type, title, source_path, raw_path, content_hash,
+              created_at, ingested_at, tags
+            ) VALUES (
+              'doc_legacy', 'note', 'Legacy', '/tmp/legacy.md',
+              '/tmp/raw.md', 'abc', '2026-05-18T00:00:00Z',
+              '2026-05-18T00:00:00Z', '[]'
+            )
+            """
+        )
+
+    init_db(db_path)
+
+    with connection(db_path) as conn:
+        versions = [row["version"] for row in conn.execute("SELECT version FROM schema_migrations")]
+        row = conn.execute(
+            "SELECT origin_node_id, logical_source_key FROM documents WHERE id = 'doc_legacy'"
+        ).fetchone()
+        indexes = {row["name"] for row in conn.execute("PRAGMA index_list(documents)")}
+
+    assert versions == [1, 2]
+    assert row["origin_node_id"] == "<local>"
+    assert row["logical_source_key"] == "/tmp/legacy.md"
+    assert "idx_documents_origin_logical" in indexes
+
+
 def test_failed_migration_rolls_back_that_migration() -> None:
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row

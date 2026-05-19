@@ -479,7 +479,7 @@ Secondary scheduled capture job:
 ```text
 com.pkm-brain.capture-secondary
 StartInterval = 600
-command = brain capture agents --export-outbox
+command = brain automation secondary-tick
 ```
 
 The initial implementation may render these as macOS LaunchAgents. The scheduler interface should not assume launchd-only semantics because Linux support should map the same logical jobs to systemd user timers, and generic Unix support should be able to fall back to cron or on-demand commands.
@@ -490,9 +490,13 @@ Add a logical scheduler command group:
 brain scheduler install-sync --peer <secondary-node-id> --interval 1800
 brain scheduler install-secondary-capture --interval 600
 brain scheduler status
-brain scheduler uninstall-sync --peer <secondary-node-id>
+brain scheduler uninstall-sync
 brain scheduler uninstall-secondary-capture
 ```
+
+V1 uses a single fixed Primary sync LaunchAgent label, so `uninstall-sync` does
+not accept a peer argument. Multi-Secondary per-peer scheduling labels are a
+post-V1 extension.
 
 macOS-specific `brain launch-agent ...` commands may remain as lower-level adapter commands, but user-facing setup and Web UI flows should prefer the scheduler abstraction.
 
@@ -692,7 +696,7 @@ Default behavior:
 - Avoid writing raw document contents into server logs.
 - Keep polling bounded so idle CPU is effectively zero and idle memory stays modest.
 
-Optional always-on service:
+Reserved post-V1 always-on service commands:
 
 ```bash
 brain ui service install
@@ -700,7 +704,9 @@ brain ui service status
 brain ui service uninstall
 ```
 
-Always-on mode is optional. A laptop Primary should work well with on-demand UI startup. A stationary Secondary may use an always-on local service, still bound to loopback.
+Always-on mode is optional and not required for V1. A laptop Primary should work
+well with on-demand UI startup. A stationary Secondary may later use an always-on
+local service, still bound to loopback.
 
 Access modes:
 
@@ -742,7 +748,7 @@ Implementation boundary:
 
 - The Web UI should be a thin layer over existing Brain service functions and JSON-style status endpoints.
 - It should not create a separate data model, separate memory store, or separate sync engine.
-- Initial endpoints should mirror existing CLI concepts: doctor, index status, memory list/inspect/approve/reject/archive/audit, launch job status, capture, ingest, and future sync status.
+- Initial endpoints should mirror existing CLI concepts: doctor, index status, memory list/inspect/approve/reject/archive/audit, launch job status, capture, ingest, sync status, and sync conflicts.
 - The Web UI should be platform-neutral. Background service installation should use an adapter layer:
   - macOS: LaunchAgent.
   - Linux: systemd user service/timer.
@@ -786,60 +792,65 @@ Manual acceptance test:
 10. Push canonical source material back to the Secondary.
 11. Confirm Secondary local retrieval sees the same source after rebuild.
 
-## 18. Open Questions
+## 18. Implementation Decisions And Deferred Questions
 
-- Should reviewed memories be exported as Markdown files in `memory/`, or remain SQLite-only with a separate export step?
-- Should Primary sync import Secondary `agent_sessions` MCP-written structured records, or only captured agent log Markdown?
-- Should remote ingest run automatically after every push, or only during scheduled mirror refresh?
-- Should the Secondary have a local read-only MCP mode when configured as Secondary?
-- Should the default topology use hostnames, static LAN IPs, or both?
-- Should the Web UI use a small local web framework or a framework-free local HTTP server for V1?
-- Should the Web UI be on-demand only for V1, with always-on service installation deferred until sync jobs exist?
+- Reviewed memories are exported as Markdown files under `memory/` and imported by `memory_id`. SQLite remains the canonical local store.
+- Primary sync imports captured Secondary Markdown from the outbox. Structured `agent_sessions` record sync is deferred to post-V1.
+- Remote ingest runs after each successful push.
+- Secondary read-only MCP mode is deferred. The normal local MCP server can read the Secondary's local mirror.
+- Peer configuration accepts hostnames or static LAN IPs.
+- V1 Web UI uses a framework-free stdlib HTTP server rather than FastAPI. This keeps dependencies small; typed schemas/OpenAPI would require a future port.
+- V1 Web UI is on-demand only. `brain ui service install/status/uninstall` is reserved for post-V1.
+- V1 scheduler supports one fixed Primary sync LaunchAgent label. Multi-Secondary per-peer scheduler labels are deferred.
 
 ## 19. Implementation Status And Drift Audit
 
-Audit date: 2026-05-18.
+Audit date: 2026-05-19.
 
-This spec is a target design. The current codebase implements several prerequisite pieces, but the Primary/Secondary sync topology and Web UI are not implemented yet.
+This spec began as a target design. The codebase now implements the V1
+Primary/Secondary sync path through the setup wizard, local UI, scheduler
+adapter, and sync transport. The remaining work before tagging V1 is real
+two-machine acceptance.
 
 Currently implemented in code:
 
 - Direct workspace initialization through `brain init`.
+- Guided setup through `brain setup` and `brain init --wizard`.
 - General `brain doctor`, ingest, search, retrieve-context, MCP server, and index status commands.
 - Agent capture for Codex, Claude, OpenCode, and opt-in Hyprnote into the local inbox.
-- Latest-snapshot retention for re-ingested `agent_session_log` source paths.
+- Origin-aware latest-snapshot retention for re-ingested `agent_session_log` source paths.
 - Memory proposal, list, inspect, approve, reject, archive, and audit commands.
+- Memory export/import under `memory/`.
 - Retrieval contract that separates reviewed `active_memories` from unreviewed `candidate_memories`.
 - MCP memory proposal and memory retrieval with status filtering.
 - macOS LaunchAgent installation, status, rendering, and uninstall for local capture and nightly maintenance.
 - Nightly maintenance with optional wiki proposals and optional failure-memory proposals.
-
-Not yet implemented in code:
-
-- `brain setup` and `brain init --wizard`.
-- `brain sync` command group.
+- `config/shared/` and `config/local/` split, with a deprecation shim for legacy `config/config.yaml`.
 - `sync_config.py` and `config/sync.yaml` role validation.
 - Primary/Secondary role initialization.
 - SSH peer validation and host-key pinning.
-- `rsync` pull/push command builder.
-- Secondary outbox export and `manifest.jsonl`.
-- Primary import into `inbox/external/<secondary-node-id>/` as a named sync operation.
-- Remote Secondary ingest orchestration after Primary push.
-- `sync_runs` SQLite table and `brain sync status`.
-- `brain scheduler` command group.
-- Primary sync LaunchAgent and Secondary outbox-capture LaunchAgent labels.
-- `brain ui`, Web UI HTTP server, Web UI service installer, or UI auth token.
-- systemd user timers or cron fallback for non-macOS systems.
-- Memory file export under `memory/`; typed memories currently live in SQLite.
-- `config/shared/` and `config/local/` directory semantics; the code currently writes a single `config/config.yaml`.
+- Pure `rsync` pull/push command builders.
+- Secondary outbox export with `manifest.jsonl`.
+- Staged Primary pull into `inbox/external/<secondary-node-id>/`, manifest hash verification, rejection/quarantine paths, and ingest orchestration.
+- Primary push of `raw/`, `wiki/`, `memory/`, and `config/shared/`, followed by remote Secondary ingest.
+- `sync_runs` SQLite table, `brain sync status`, and advisory `brain sync conflicts`.
+- `brain scheduler` command group with macOS LaunchAgent jobs for Primary sync and Secondary capture.
+- `brain ui` with loopback binding, local auth token, JSON API, and browser pages for Status, Setup, Sync, Jobs, Logs, and Memory Review.
+
+Deferred or post-V1:
+
+- Manual two-machine acceptance is still required before tagging V1.
+- `brain ui service install/status/uninstall`.
+- Real systemd user timer and cron implementations. V1 non-macOS adapters intentionally raise a clear not-yet-implemented error.
+- Structured `agent_sessions` import from Secondary.
+- Secondary read-only MCP mode.
+- Multi-Secondary per-peer scheduler labels.
 
 Spec drift notes:
 
-- The target scheduling model is platform-neutral, but current code scheduling support is macOS-specific.
-- The sync design treats `memory/` as canonical source material. Current typed memories are stored in SQLite, so sync requires either a memory export/import step or a decision to keep reviewed memories SQLite-only with a separate export artifact.
-- The external inbox layout should work with the current generic ingest scanner, but no sync-specific node identity, manifest validation, or status accounting exists yet.
-- The current LaunchAgent commands install local capture and nightly jobs only. They do not install Primary sync or Secondary outbox export jobs.
-- The current memory audit is basic: it validates type, status, scope, source presence, and confidence. Duplicate, stale, conflict, and broken-source validation are future checks for the Web UI to surface once implemented.
+- The target scheduling model remains platform-neutral, but V1 implementation support is macOS LaunchAgent only.
+- The implemented Web UI uses stdlib `http.server`, not FastAPI. This is an intentional V1 dependency tradeoff.
+- The current memory audit is basic: it validates type, status, scope, source presence, and confidence. Duplicate, stale, conflict, and broken-source validation remain future checks for the Web UI to surface.
 
 ## 20. Implementation Order
 
