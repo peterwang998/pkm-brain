@@ -38,7 +38,7 @@ from .sync_setup import add_peer as sync_add_peer_config
 from .sync_setup import init_primary as sync_init_primary_config
 from .sync_setup import init_secondary as sync_init_secondary_config
 from .sync_ssh import first_host_key_with_fingerprint
-from .sync_status import format_status_table_rows
+from .sync_status import format_status_table_rows, local_sync_snapshot
 from .sync_transfer import sync_pull as run_sync_pull
 from .sync_transfer import sync_push as run_sync_push
 from .sync_transfer import sync_run as run_sync_run
@@ -903,6 +903,25 @@ def sync_status(
         console.print(f"warning: {warning}")
 
 
+@sync_app.command("mirror-hash")
+def sync_mirror_hash(
+    home: Optional[Path] = typer.Option(None),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    result = local_sync_snapshot(BrainPaths.from_value(home))
+    if json_output:
+        console.print_json(json.dumps(result))
+        return
+    table = Table(title="Sync Mirror Hash")
+    table.add_column("Field")
+    table.add_column("Value")
+    table.add_row("home", result["brain_home"])
+    table.add_row("canonical_manifest_hash", str(result["canonical_manifest_hash"]))
+    table.add_row("pending_outbox_count", str(result["pending_outbox_count"]))
+    table.add_row("outbox_path", str(result["outbox_path"] or ""))
+    console.print(table)
+
+
 @sync_app.command("conflicts")
 def sync_conflicts(
     home: Optional[Path] = typer.Option(None),
@@ -1049,10 +1068,9 @@ def scheduler_status() -> None:
 
 
 @scheduler_app.command("uninstall-sync")
-def scheduler_uninstall_sync(peer: str = typer.Option(..., "--peer", help="Secondary peer node_id.")) -> None:
+def scheduler_uninstall_sync() -> None:
     from .scheduler.launchd import LaunchdScheduler, SYNC_PRIMARY_LABEL
 
-    _ = peer
     console.print_json(json.dumps(LaunchdScheduler().uninstall(SYNC_PRIMARY_LABEL)))
 
 

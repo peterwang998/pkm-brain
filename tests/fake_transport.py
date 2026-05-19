@@ -58,6 +58,11 @@ class FakeTransport:
                 ),
                 "",
             )
+        if command.startswith("brain sync mirror-hash --json"):
+            from pkm_brain.paths import BrainPaths
+            from pkm_brain.sync_status import local_sync_snapshot
+
+            return SubprocessResult(0, json.dumps(local_sync_snapshot(BrainPaths.from_value(self.remote_home))), "")
         if "printf ok" in command:
             return SubprocessResult(0 if self.outbox_probe else 1, "", "outbox probe failed")
         if command == "rsync --version":

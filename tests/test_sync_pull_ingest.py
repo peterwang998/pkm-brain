@@ -51,3 +51,25 @@ def test_primary_and_secondary_same_session_id_coexist_after_pull(tmp_path: Path
         {"origin_node_id": "primary", "logical_source_key": str(local_log)},
         {"origin_node_id": "secondary", "logical_source_key": "agent_logs/codex/same-session.md"},
     ]
+
+
+def test_pull_ingest_errors_return_and_record_failed_status(tmp_path: Path, monkeypatch) -> None:
+    class FailedIngest:
+        def as_dict(self) -> dict[str, object]:
+            return {"run_id": "ingest-failed", "errors": ["ingest exploded"]}
+
+    def fake_ingest(self, path, dry_run=False, origin_node_id=None, retry_quarantine=False):
+        return FailedIngest()
+
+    primary, secondary_home = primary_with_secondary(tmp_path)
+    write_outbox_file(secondary_home, "agent_logs/codex/session.md", agent_markdown("session", "secondary-token"))
+    monkeypatch.setattr(BrainService, "ingest", fake_ingest)
+
+    result = sync_pull(primary, "secondary", transport=LocalRsyncTransport(remote_home=secondary_home), run_id="run-ingest-error")
+
+    assert result.status == "failed"
+    assert result.errors == ["ingest exploded"]
+    with connection(primary.sqlite_path) as conn:
+        row = conn.execute("SELECT status, errors FROM sync_runs WHERE peer_node_id = 'secondary'").fetchone()
+    assert row["status"] == "failed"
+    assert "ingest exploded" in row["errors"]

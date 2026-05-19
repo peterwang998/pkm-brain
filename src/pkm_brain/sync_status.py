@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
 from .db import connection, loads
 from .paths import BrainPaths
 from .sync_config import PeerConfig, load_sync_config
+from .sync_connection import ProductionTransport, SubprocessResult, Transport, quote_path, run_remote
+from .sync_rsync import peer_outbox_path
 from .util import file_sha256
 
 
@@ -14,14 +17,15 @@ CANONICAL_SUBDIRS = ("raw", "wiki", "memory", "config/shared")
 CANONICAL_EXCLUDED_PARTS = {"db", "indexes", "logs", "outbox", "config/local"}
 
 
-def sync_status(paths: BrainPaths) -> dict[str, Any]:
+def sync_status(paths: BrainPaths, transport: Transport | None = None) -> dict[str, Any]:
     try:
         config = load_sync_config(paths)
     except FileNotFoundError:
         return {"configured": False, "role": None, "node_id": None, "peers": [], "warnings": ["sync config missing"]}
 
     peers = config.primary.peers if config.primary else []
-    peer_statuses = [status_for_peer(paths, peer) for peer in peers]
+    transport = transport or ProductionTransport()
+    peer_statuses = [status_for_peer(paths, peer, transport) for peer in peers]
     warnings = [warning for peer_status in peer_statuses for warning in peer_status.get("warnings", [])]
     return {
         "configured": True,
@@ -32,7 +36,7 @@ def sync_status(paths: BrainPaths) -> dict[str, Any]:
     }
 
 
-def status_for_peer(paths: BrainPaths, peer: PeerConfig) -> dict[str, Any]:
+def status_for_peer(paths: BrainPaths, peer: PeerConfig, transport: Transport) -> dict[str, Any]:
     with connection(paths.sqlite_path) as conn:
         last_successful_pull = latest_sync_row(
             conn,
@@ -48,12 +52,15 @@ def status_for_peer(paths: BrainPaths, peer: PeerConfig) -> dict[str, Any]:
         last_run = latest_sync_row(conn, peer.node_id, "1=1")
 
     primary_hash = canonical_manifest_hash(paths.home)
-    remote_hash = canonical_manifest_hash(peer.brain_home) if peer.brain_home and peer.brain_home.exists() else None
+    remote_snapshot = remote_sync_snapshot(paths, peer, transport)
+    remote_hash = remote_snapshot.get("canonical_manifest_hash")
     mirror_current = remote_hash is not None and primary_hash == remote_hash
     warnings: list[str] = []
+    if remote_snapshot.get("error"):
+        warnings.append(f"remote status unavailable for {peer.node_id}: {remote_snapshot['error']}")
     if remote_hash is not None and primary_hash != remote_hash:
         warnings.append(f"mirror divergence for {peer.node_id}: primary canonical hash differs from remote mirror")
-    pending_outbox_count = pending_outbox_manifest_count(peer)
+    pending_outbox_count = remote_snapshot.get("pending_outbox_count")
     return {
         "peer_node_id": peer.node_id,
         "host": peer.host,
@@ -64,6 +71,7 @@ def status_for_peer(paths: BrainPaths, peer: PeerConfig) -> dict[str, Any]:
         "pending_outbox_count": pending_outbox_count,
         "canonical_manifest_hash": primary_hash,
         "remote_manifest_hash": remote_hash,
+        "remote_outbox_path": remote_snapshot.get("outbox_path"),
         "mirror_current": mirror_current,
         "warnings": warnings,
     }
@@ -104,10 +112,73 @@ def summarize_failed_run(row: dict[str, Any] | None) -> dict[str, Any] | None:
     }
 
 
-def pending_outbox_manifest_count(peer: PeerConfig) -> int | None:
+def remote_sync_snapshot(paths: BrainPaths, peer: PeerConfig, transport: Transport) -> dict[str, Any]:
     if not peer.brain_home:
+        return {"error": "peer is missing brain_home"}
+    try:
+        completed = run_remote(paths, peer, f"brain sync mirror-hash --json --home {quote_path(peer.brain_home)}", transport)
+    except Exception as exc:
+        return {"error": str(exc)}
+    if completed.returncode != 0:
+        return {"error": remote_error_detail(completed)}
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        return {"error": f"invalid remote mirror-hash JSON: {exc}"}
+    return payload if isinstance(payload, dict) else {"error": "remote mirror-hash JSON must be an object"}
+
+
+def remote_error_detail(completed: SubprocessResult) -> str:
+    return completed.stderr.strip() or completed.stdout.strip() or f"exit {completed.returncode}"
+
+
+def local_sync_snapshot(paths: BrainPaths) -> dict[str, Any]:
+    outbox_path = local_secondary_outbox_path(paths)
+    return {
+        "brain_home": str(paths.home),
+        "canonical_manifest_hash": canonical_manifest_hash(paths.home),
+        "pending_outbox_count": local_pending_outbox_manifest_count(paths, outbox_path),
+        "outbox_path": str(outbox_path) if outbox_path else None,
+    }
+
+
+def local_secondary_outbox_path(paths: BrainPaths) -> Path | None:
+    try:
+        config = load_sync_config(paths)
+    except FileNotFoundError:
         return None
-    manifest = peer.brain_home / "outbox" / peer.node_id / "manifest.jsonl"
+    if config.role == "secondary" and config.secondary and config.secondary.outbox_path:
+        return config.secondary.outbox_path
+    if config.role == "secondary":
+        return paths.outbox / config.node_id
+    return None
+
+
+def local_pending_outbox_manifest_count(paths: BrainPaths, outbox_path: Path | None = None) -> int | None:
+    if outbox_path:
+        return manifest_row_count(outbox_path / "manifest.jsonl")
+    if not paths.outbox.exists():
+        return None
+    total = 0
+    found = False
+    for manifest in sorted(paths.outbox.glob("*/manifest.jsonl")):
+        count = manifest_row_count(manifest)
+        if count is None:
+            continue
+        found = True
+        total += count
+    return total if found else None
+
+
+def pending_outbox_manifest_count(peer: PeerConfig) -> int | None:
+    try:
+        manifest = peer_outbox_path(peer) / "manifest.jsonl"
+    except ValueError:
+        return None
+    return manifest_row_count(manifest)
+
+
+def manifest_row_count(manifest: Path) -> int | None:
     if not manifest.exists():
         return None
     count = 0

@@ -117,22 +117,24 @@ def sync_pull(
         live_external = paths.inbox / "external" / peer.node_id
         ingest_result = service.ingest(live_external, origin_node_id=peer.node_id).as_dict()
     bytes_pulled = bytes_for_relative_paths(paths.inbox / "external" / peer.node_id, promoted)
+    ingest_errors = list(ingest_result.get("errors", []) if ingest_result else [])
+    result_errors = errors + ingest_errors
     status = "ok"
     if errors:
         status = "ok_with_rejections"
-    if ingest_result and ingest_result.get("errors"):
-        status = "ok_with_ingest_errors"
+    if ingest_errors:
+        status = "failed"
     if record:
         service.record_sync_run(
             peer.node_id,
             "pull",
             started_at,
             now_iso(),
-            "failed" if status == "ok_with_ingest_errors" else "ok",
+            status if status == "failed" else "ok",
             files_pulled=len(promoted),
             bytes_pulled=bytes_pulled,
             primary_ingest_run_id=str(ingest_result.get("run_id")) if ingest_result else None,
-            errors=errors + list(ingest_result.get("errors", []) if ingest_result else []),
+            errors=result_errors,
         )
     return SyncPullResult(
         peer_node_id=peer.node_id,
@@ -141,7 +143,7 @@ def sync_pull(
         staging_path=str(staging),
         promoted=promoted,
         rejected=rejected,
-        errors=errors,
+        errors=result_errors,
         ingest=ingest_result,
         bytes_pulled=bytes_pulled,
     )
