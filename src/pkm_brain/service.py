@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import shutil
 import re
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -156,13 +158,25 @@ class BrainService:
 
         return run_sync_doctor(self.paths).as_dict()
 
-    def ingest(self, source: Path | None = None, dry_run: bool = False, origin_node_id: str | None = None) -> IngestResult:
+    def ingest(
+        self,
+        source: Path | None = None,
+        dry_run: bool = False,
+        origin_node_id: str | None = None,
+        retry_quarantine: bool = False,
+    ) -> IngestResult:
         self.init_workspace()
+        if retry_quarantine and not dry_run:
+            self.retry_quarantine()
         source = source.expanduser().resolve() if source else self.paths.inbox
         if source.is_file():
             candidates = [source]
         else:
-            candidates = sorted(path for path in source.rglob("*") if path.is_file() and not path.name.startswith("."))
+            candidates = sorted(
+                path
+                for path in source.rglob("*")
+                if path.is_file() and not path.name.startswith(".") and not reserved_ingest_path(path)
+            )
         run_id = new_id("run")
         started = now_iso()
         errors: list[str] = []
@@ -308,7 +322,10 @@ class BrainService:
                     changed += 1
                     chunks_created += len(doc_chunks)
                 except Exception as exc:
-                    errors.append(f"{path}: {exc}")
+                    if self._quarantine_external_ingest_failure(path, exc):
+                        errors.append(f"{path}: quarantined after ingest failure: {exc}")
+                    else:
+                        errors.append(f"{path}: {exc}")
             delete_vectors(self.paths.lancedb_path, stale_vector_chunk_ids)
             embeddings_created = upsert_vectors(self.paths.lancedb_path, vector_rows)
             conn.execute(
@@ -341,17 +358,60 @@ class BrainService:
         return target
 
     def _origin_identity_for_path(self, path: Path, origin_node_id: str | None = None) -> tuple[str, str]:
-        if origin_node_id:
-            origin = origin_node_id
-        else:
-            origin = local_node_id(self.paths)
-            try:
-                external_relative = path.resolve().relative_to((self.paths.inbox / "external").resolve())
-            except ValueError:
-                external_relative = None
-            if external_relative and external_relative.parts:
-                origin = external_relative.parts[0]
+        try:
+            external_relative = path.resolve().relative_to((self.paths.inbox / "external").resolve())
+        except ValueError:
+            external_relative = None
+        origin = origin_node_id or local_node_id(self.paths)
+        if external_relative and external_relative.parts:
+            origin = origin_node_id or external_relative.parts[0]
+            if len(external_relative.parts) > 1:
+                return origin, Path(*external_relative.parts[1:]).as_posix()
         return origin, str(path)
+
+    def retry_quarantine(self) -> dict[str, Any]:
+        external_root = self.paths.inbox / "external"
+        restored: list[str] = []
+        if not external_root.exists():
+            return {"restored": restored}
+        for quarantine_root in sorted(external_root.glob("*/_quarantine")):
+            peer_root = quarantine_root.parent
+            for path in sorted(quarantine_root.rglob("*")):
+                if not path.is_file() or path.name.endswith(".error.json") or path.name.startswith("."):
+                    continue
+                relative_path = path.relative_to(quarantine_root)
+                target = peer_root / relative_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                path.replace(target)
+                error_path = quarantine_error_path(quarantine_root, relative_path)
+                if error_path.exists():
+                    error_path.unlink()
+                restored.append(str(target))
+            remove_empty_dirs(quarantine_root)
+        return {"restored": restored}
+
+    def _quarantine_external_ingest_failure(self, path: Path, exc: Exception) -> bool:
+        info = external_inbox_path_info(self.paths, path)
+        if info is None:
+            return False
+        peer_root, relative_path = info
+        if relative_path.parts and relative_path.parts[0] in {"_staging", "_quarantine", "_rejected"}:
+            return False
+        if not path.exists():
+            return False
+        quarantine_root = peer_root / "_quarantine"
+        target = quarantine_root / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        path.replace(target)
+        error_path = quarantine_error_path(quarantine_root, relative_path)
+        error_payload = {
+            "source_path": str(path),
+            "quarantined_path": str(target),
+            "error": str(exc),
+            "traceback": "".join(traceback.format_exception_only(type(exc), exc)).strip(),
+        }
+        error_path.write_text(json.dumps(error_payload, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        return True
 
     def search(self, query: str, limit: int = 10, debug: bool = False, caller: str = "cli") -> dict[str, Any]:
         self.init_workspace()
@@ -907,6 +967,42 @@ class BrainService:
             )
         by_id = {row["chunk_id"]: dict(row) for row in found}
         return [by_id[chunk_id] for chunk_id in chunk_ids if chunk_id in by_id]
+
+
+def reserved_ingest_path(path: Path) -> bool:
+    reserved = {"_staging", "_quarantine", "_rejected", ".rsync-partial"}
+    return bool(set(path.parts).intersection(reserved)) or path.name.endswith(".error.json")
+
+
+def external_inbox_path_info(paths: BrainPaths, path: Path) -> tuple[Path, Path] | None:
+    external_root = paths.inbox / "external"
+    try:
+        relative = path.resolve().relative_to(external_root.resolve())
+    except ValueError:
+        return None
+    if len(relative.parts) < 2:
+        return None
+    peer_root = external_root / relative.parts[0]
+    return peer_root, Path(*relative.parts[1:])
+
+
+def quarantine_error_path(quarantine_root: Path, relative_path: Path) -> Path:
+    return quarantine_root / Path(f"{relative_path.as_posix()}.error.json")
+
+
+def remove_empty_dirs(root: Path) -> None:
+    if not root.exists():
+        return
+    for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        if path.is_dir():
+            try:
+                path.rmdir()
+            except OSError:
+                pass
+    try:
+        root.rmdir()
+    except OSError:
+        pass
 
 
 def row_to_memory(row: Any) -> dict[str, Any]:

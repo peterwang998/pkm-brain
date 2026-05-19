@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import sqlite3
@@ -11,7 +12,8 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .db import connection
-from .paths import BrainPaths
+from .paths import BrainPaths, local_node_id
+from .sync_config import load_sync_config
 from .util import file_sha256, now_iso, slugify, text_sha256
 
 MAX_ITEM_CHARS = 4000
@@ -74,9 +76,11 @@ class CaptureResult:
     discovered: int = 0
     captured: int = 0
     skipped: int = 0
+    exported: int = 0
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     artifacts: list[str] = field(default_factory=list)
+    outbox_artifacts: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
@@ -121,7 +125,7 @@ class AgentLogCapture:
             adapters.append(HyprnoteAdapter(self.hyprnote_root))
         return adapters
 
-    def capture(self, agent: str = "all", dry_run: bool = False) -> CaptureResult:
+    def capture(self, agent: str = "all", dry_run: bool = False, export_outbox: bool = False) -> CaptureResult:
         self.paths.inbox.mkdir(parents=True, exist_ok=True)
         result = CaptureResult()
         for adapter in self.adapters(agent):
@@ -136,16 +140,32 @@ class AgentLogCapture:
                 output = self.paths.inbox / session.output_group / session.agent / f"{slugify(session.session_id)}.md"
                 if self._is_unchanged(session):
                     result.skipped += 1
+                    if export_outbox and not dry_run and output.exists():
+                        try:
+                            export = export_capture_to_outbox(self.paths, session, output)
+                            if export.exported:
+                                result.exported += 1
+                            result.outbox_artifacts.append(str(export.path))
+                        except Exception as exc:
+                            result.errors.append(f"{session.agent}:{session.session_id}: outbox export failed: {exc}")
                     continue
                 if dry_run:
                     result.captured += 1
                     result.artifacts.append(str(output))
                     continue
                 output.parent.mkdir(parents=True, exist_ok=True)
-                output.write_text(session.markdown, encoding="utf-8")
+                write_text_atomic(output, session.markdown)
                 self._record_capture(session, output, "captured", None)
                 result.captured += 1
                 result.artifacts.append(str(output))
+                if export_outbox:
+                    try:
+                        export = export_capture_to_outbox(self.paths, session, output)
+                        if export.exported:
+                            result.exported += 1
+                        result.outbox_artifacts.append(str(export.path))
+                    except Exception as exc:
+                        result.errors.append(f"{session.agent}:{session.session_id}: outbox export failed: {exc}")
         return result
 
     def _is_unchanged(self, session: AgentSessionCapture) -> bool:
@@ -441,6 +461,119 @@ class HyprnoteAdapter:
             source_kind="hyprnote_meeting",
             output_group="documents",
         )
+
+
+@dataclass(frozen=True)
+class OutboxExport:
+    node_id: str
+    path: Path
+    manifest_path: Path
+    relative_path: str
+    content_hash: str
+    exported: bool
+    manifest_changed: bool
+
+
+def export_capture_to_outbox(paths: BrainPaths, session: AgentSessionCapture, captured_path: Path) -> OutboxExport:
+    node_id, outbox_root = outbox_destination(paths)
+    relative_path = Path(session.output_group) / session.agent / f"{slugify(session.session_id)}.md"
+    target = outbox_root / relative_path
+    content_hash = file_sha256(captured_path)
+    exported = link_or_copy_if_changed(captured_path, target, content_hash)
+    manifest_path = outbox_root / "manifest.jsonl"
+    manifest_changed = update_outbox_manifest(
+        manifest_path,
+        {
+            "node_id": node_id,
+            "source_kind": session.source_kind,
+            "agent": session.agent,
+            "session_id": session.session_id,
+            "relative_path": relative_path.as_posix(),
+            "content_hash": content_hash,
+            "captured_at": now_iso(),
+            "source_path": str(session.source_path),
+        },
+    )
+    return OutboxExport(
+        node_id=node_id,
+        path=target,
+        manifest_path=manifest_path,
+        relative_path=relative_path.as_posix(),
+        content_hash=content_hash,
+        exported=exported,
+        manifest_changed=manifest_changed,
+    )
+
+
+def outbox_destination(paths: BrainPaths) -> tuple[str, Path]:
+    try:
+        config = load_sync_config(paths)
+    except FileNotFoundError:
+        node_id = local_node_id(paths)
+        return node_id, paths.outbox / node_id
+    if config.role == "secondary" and config.secondary and config.secondary.outbox_path:
+        return config.node_id, config.secondary.outbox_path
+    return config.node_id, paths.outbox / config.node_id
+
+
+def link_or_copy_if_changed(source: Path, target: Path, content_hash: str | None = None) -> bool:
+    content_hash = content_hash or file_sha256(source)
+    if target.exists() and file_sha256(target) == content_hash:
+        return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f".{target.name}.tmp")
+    if tmp.exists():
+        tmp.unlink()
+    try:
+        os.link(source, tmp)
+    except OSError:
+        shutil.copy2(source, tmp)
+    os.replace(tmp, target)
+    return True
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def update_outbox_manifest(manifest_path: Path, row: dict[str, Any]) -> bool:
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    rows_by_path = {
+        str(existing.get("relative_path")): existing
+        for existing in read_manifest_rows(manifest_path)
+        if existing.get("relative_path")
+    }
+    existing = rows_by_path.get(str(row["relative_path"]))
+    if existing and existing.get("content_hash") == row["content_hash"]:
+        row = existing
+    rows_by_path[str(row["relative_path"])] = row
+    serialized = "".join(
+        json.dumps(rows_by_path[key], sort_keys=True, separators=(",", ":")) + "\n"
+        for key in sorted(rows_by_path)
+    )
+    current = manifest_path.read_text(encoding="utf-8") if manifest_path.exists() else ""
+    if current == serialized:
+        return False
+    tmp = manifest_path.with_suffix(".jsonl.tmp")
+    tmp.write_text(serialized, encoding="utf-8")
+    os.replace(tmp, manifest_path)
+    return True
+
+
+def read_manifest_rows(manifest_path: Path) -> list[dict[str, Any]]:
+    if not manifest_path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in manifest_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        parsed = json.loads(line)
+        if isinstance(parsed, dict):
+            rows.append(parsed)
+    return rows
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:

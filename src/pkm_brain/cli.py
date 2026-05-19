@@ -23,6 +23,7 @@ from .automation import (
     uninstall_nightly_launch_agent,
     run_agent_log_ingest,
     run_nightly_maintenance,
+    run_secondary_tick,
 )
 from .capture import AgentLogCapture
 from .db import connection, rows
@@ -36,6 +37,9 @@ from .sync_setup import add_peer as sync_add_peer_config
 from .sync_setup import init_primary as sync_init_primary_config
 from .sync_setup import init_secondary as sync_init_secondary_config
 from .sync_ssh import first_host_key_with_fingerprint
+from .sync_transfer import sync_pull as run_sync_pull
+from .sync_transfer import sync_push as run_sync_push
+from .sync_transfer import sync_run as run_sync_run
 from .wiki import lint_wiki, synthesize_wiki
 from .wiki_proposals import (
     apply_wiki_proposal,
@@ -117,9 +121,10 @@ def doctor(home: Optional[Path] = typer.Option(None), json_output: bool = typer.
 def ingest(
     path: Optional[Path] = typer.Argument(None, help="Path to ingest. Defaults to inbox."),
     dry_run: bool = typer.Option(False, "--dry-run"),
+    retry_quarantine: bool = typer.Option(False, "--retry-quarantine", help="Restore and retry files in external inbox quarantine."),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
-    result = service(home).ingest(path, dry_run=dry_run)
+    result = service(home).ingest(path, dry_run=dry_run, retry_quarantine=retry_quarantine)
     console.print_json(json.dumps(result.as_dict()))
 
 
@@ -572,6 +577,52 @@ def sync_test_connection(
         raise typer.Exit(1)
 
 
+@sync_app.command("pull")
+def sync_pull(
+    peer_node_id: str,
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    try:
+        result = run_sync_pull(BrainPaths.from_value(home), peer_node_id).as_dict()
+    except ValueError as exc:
+        console.print(str(exc))
+        raise typer.Exit(1)
+    console.print_json(json.dumps(result))
+    if result["status"] == "failed":
+        raise typer.Exit(1)
+
+
+@sync_app.command("push")
+def sync_push(
+    peer_node_id: str,
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    try:
+        result = run_sync_push(BrainPaths.from_value(home), peer_node_id).as_dict()
+    except ValueError as exc:
+        console.print(str(exc))
+        raise typer.Exit(1)
+    console.print_json(json.dumps(result))
+    if result["status"] == "failed":
+        raise typer.Exit(1)
+
+
+@sync_app.command("run")
+def sync_run(
+    peer_node_id: str,
+    no_remote_ingest: bool = typer.Option(False, "--no-remote-ingest", help="Skip remote ingest after a successful push."),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    try:
+        result = run_sync_run(BrainPaths.from_value(home), peer_node_id, remote_ingest=not no_remote_ingest).as_dict()
+    except ValueError as exc:
+        console.print(str(exc))
+        raise typer.Exit(1)
+    console.print_json(json.dumps(result))
+    if result["status"] == "failed":
+        raise typer.Exit(1)
+
+
 @app.command()
 def mcp(home: Optional[Path] = typer.Option(None)) -> None:
     create_mcp(str(home) if home else None).run()
@@ -583,11 +634,21 @@ def capture_agents(
     include_hyprnote: bool = typer.Option(False, "--include-hyprnote", help="Include Hyprnote when --agent all is used."),
     hyprnote_root: Optional[Path] = typer.Option(None, help="Hyprnote root directory."),
     dry_run: bool = typer.Option(False, "--dry-run"),
+    export_outbox: bool = typer.Option(False, "--export-outbox", help="Export captured files into this node's sync outbox."),
+    also_ingest: bool = typer.Option(False, "--also-ingest", help="Run local ingest after capture."),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
     svc = service(home)
     svc.init_workspace()
-    result = AgentLogCapture(svc.paths, hyprnote_root=hyprnote_root, include_hyprnote=include_hyprnote).capture(agent=agent, dry_run=dry_run)
+    result = AgentLogCapture(svc.paths, hyprnote_root=hyprnote_root, include_hyprnote=include_hyprnote).capture(
+        agent=agent,
+        dry_run=dry_run,
+        export_outbox=export_outbox,
+    )
+    if also_ingest and not dry_run:
+        ingest_result = svc.ingest()
+        console.print_json(json.dumps({"capture": result.as_dict(), "ingest": ingest_result.as_dict()}))
+        return
     console.print_json(json.dumps(result.as_dict()))
 
 
@@ -600,6 +661,18 @@ def automation_run_agent_log_ingest(
 ) -> None:
     paths = BrainPaths.from_value(home)
     result = run_agent_log_ingest(paths, agent=agent, hyprnote_root=hyprnote_root, include_hyprnote=include_hyprnote)
+    console.print_json(json.dumps(as_jsonable(result)))
+
+
+@automation_app.command("secondary-tick")
+def automation_secondary_tick(
+    agent: str = typer.Option("all", help="Source to capture: all, codex, claude, opencode, or hyprnote."),
+    include_hyprnote: bool = typer.Option(False, "--include-hyprnote", help="Include Hyprnote when --agent all is used."),
+    hyprnote_root: Optional[Path] = typer.Option(None, help="Hyprnote root directory."),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    paths = BrainPaths.from_value(home)
+    result = run_secondary_tick(paths, agent=agent, hyprnote_root=hyprnote_root, include_hyprnote=include_hyprnote)
     console.print_json(json.dumps(as_jsonable(result)))
 
 

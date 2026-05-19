@@ -50,6 +50,16 @@ class NightlyMaintenanceResult:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class SecondaryTickResult:
+    started_at: str
+    capture: dict[str, Any]
+    ingest: dict[str, Any] | None
+    index_status: dict[str, Any] | None
+    skipped: bool = False
+    reason: str | None = None
+
+
 def run_agent_log_ingest(
     paths: BrainPaths,
     agent: str = "all",
@@ -81,6 +91,42 @@ def run_agent_log_ingest(
             started_at=now_iso(),
             capture=capture_result.__dict__,
             ingest=ingest_result.__dict__,
+        )
+
+
+def run_secondary_tick(
+    paths: BrainPaths,
+    agent: str = "all",
+    codex_state: Path | None = None,
+    claude_projects: Path | None = None,
+    opencode_db: Path | None = None,
+    hyprnote_root: Path | None = None,
+    include_hyprnote: bool = False,
+) -> SecondaryTickResult:
+    service = BrainService(paths)
+    service.init_workspace()
+    lock_path = paths.logs / "secondary-tick.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("w") as lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return SecondaryTickResult(now_iso(), {}, None, None, skipped=True, reason="another secondary tick is already active")
+        capture_result = AgentLogCapture(
+            paths,
+            codex_state=codex_state,
+            claude_projects=claude_projects,
+            opencode_db=opencode_db,
+            hyprnote_root=hyprnote_root,
+            include_hyprnote=include_hyprnote,
+        ).capture(agent=agent, export_outbox=True)
+        ingest_result = service.ingest()
+        status = index_status(paths, service)
+        return SecondaryTickResult(
+            started_at=now_iso(),
+            capture=capture_result.__dict__,
+            ingest=ingest_result.__dict__,
+            index_status=status,
         )
 
 
@@ -473,5 +519,5 @@ def nightly_launch_agent_status() -> dict[str, Any]:
     }
 
 
-def as_jsonable(result: AutomationResult | NightlyMaintenanceResult) -> dict[str, Any]:
+def as_jsonable(result: AutomationResult | NightlyMaintenanceResult | SecondaryTickResult) -> dict[str, Any]:
     return json.loads(json.dumps(result.__dict__))
