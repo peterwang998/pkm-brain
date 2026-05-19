@@ -7,11 +7,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from .chunking import chunk_text
 from .db import connection, dumps, init_db, loads, rows
 from .embeddings import get_embedding_provider
 from .indexes import delete_vectors, search_vectors, upsert_vectors
-from .paths import BrainPaths
+from .paths import BrainPaths, local_node_id
 from .util import file_sha256, new_id, now_iso, slugify, token_count as estimate_tokens
 from .wiki_proposals import create_wiki_proposal
 
@@ -26,6 +28,9 @@ class IngestResult:
     embeddings_created: int
     errors: list[str]
     documents_replaced: int = 0
+
+    def as_dict(self) -> dict[str, Any]:
+        return dict(self.__dict__)
 
 
 GENERIC_CONTEXT_TERMS = {
@@ -146,10 +151,18 @@ class BrainService:
             "embedding_provider": self.embedding_provider.name,
         }
 
-    def ingest(self, source: Path | None = None, dry_run: bool = False) -> IngestResult:
+    def sync_doctor(self) -> dict[str, Any]:
+        from .sync_doctor import run_sync_doctor
+
+        return run_sync_doctor(self.paths).as_dict()
+
+    def ingest(self, source: Path | None = None, dry_run: bool = False, origin_node_id: str | None = None) -> IngestResult:
         self.init_workspace()
         source = source.expanduser().resolve() if source else self.paths.inbox
-        candidates = sorted(path for path in source.rglob("*") if path.is_file() and not path.name.startswith("."))
+        if source.is_file():
+            candidates = [source]
+        else:
+            candidates = sorted(path for path in source.rglob("*") if path.is_file() and not path.name.startswith("."))
         run_id = new_id("run")
         started = now_iso()
         errors: list[str] = []
@@ -175,24 +188,55 @@ class BrainService:
                         skipped += 1
                         continue
                     content_hash = file_sha256(path)
-                    existing = conn.execute(
-                        "SELECT id, source_type, title FROM documents WHERE content_hash = ?",
-                        (content_hash,),
-                    ).fetchone()
                     text = path.read_text(encoding="utf-8", errors="replace")
                     title = markdown_frontmatter_value(text, "title") or path.stem.replace("-", " ").replace("_", " ").strip() or path.name
+                    origin, logical_source_key = self._origin_identity_for_path(path, origin_node_id)
+                    existing = conn.execute(
+                        """
+                        SELECT id, source_type, title, content_hash, raw_path
+                        FROM documents
+                        WHERE origin_node_id = ? AND logical_source_key = ?
+                        ORDER BY ingested_at DESC
+                        LIMIT 1
+                        """,
+                        (origin, logical_source_key),
+                    ).fetchone()
                     if existing:
+                        if existing["content_hash"] == content_hash:
+                            if source_type == "agent_session_log":
+                                replaced = remove_superseded_agent_session_snapshots(
+                                    conn,
+                                    path,
+                                    origin_node_id=origin,
+                                    keep_document_id=existing["id"],
+                                )
+                                stale_vector_chunk_ids.extend(replaced.chunk_ids)
+                                documents_replaced += replaced.documents
+                            refresh_existing_document_metadata(
+                                conn,
+                                existing["id"],
+                                source_type,
+                                title,
+                                path,
+                                origin,
+                                logical_source_key,
+                            )
+                            skipped += 1
+                            continue
+                        replaced = remove_documents(conn, [dict(existing)])
                         if source_type == "agent_session_log":
-                            replaced = remove_superseded_agent_session_snapshots(conn, path, keep_document_id=existing["id"])
+                            superseded = remove_superseded_agent_session_snapshots(conn, path, origin_node_id=origin)
+                            replaced = ReplacedDocuments(
+                                replaced.documents + superseded.documents,
+                                replaced.chunk_ids + superseded.chunk_ids,
+                            )
+                        if replaced.documents:
                             stale_vector_chunk_ids.extend(replaced.chunk_ids)
                             documents_replaced += replaced.documents
-                        refresh_existing_document_metadata(conn, existing["id"], source_type, title, path)
-                        skipped += 1
-                        continue
                     document_id = new_id("doc")
                     ingested_at = now_iso()
                     if source_type == "agent_session_log":
-                        replaced = remove_superseded_agent_session_snapshots(conn, path)
+                        replaced = remove_superseded_agent_session_snapshots(conn, path, origin_node_id=origin)
                         stale_vector_chunk_ids.extend(replaced.chunk_ids)
                         documents_replaced += replaced.documents
                     raw_path = self._copy_raw(path, source_type, ingested_at, content_hash)
@@ -200,8 +244,9 @@ class BrainService:
                         """
                         INSERT INTO documents(
                           id, source_type, title, source_path, raw_path, content_hash,
-                          created_at, ingested_at, project, tags, sensitivity, version, status
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                          origin_node_id, logical_source_key, created_at, ingested_at,
+                          project, tags, sensitivity, version, status
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             document_id,
@@ -210,6 +255,8 @@ class BrainService:
                             str(path),
                             str(raw_path),
                             content_hash,
+                            origin,
+                            logical_source_key,
                             ingested_at,
                             ingested_at,
                             None,
@@ -292,6 +339,19 @@ class BrainService:
         target = target_dir / f"{slugify(source.stem)}-{content_hash[:12]}{source.suffix}"
         shutil.copy2(source, target)
         return target
+
+    def _origin_identity_for_path(self, path: Path, origin_node_id: str | None = None) -> tuple[str, str]:
+        if origin_node_id:
+            origin = origin_node_id
+        else:
+            origin = local_node_id(self.paths)
+            try:
+                external_relative = path.resolve().relative_to((self.paths.inbox / "external").resolve())
+            except ValueError:
+                external_relative = None
+            if external_relative and external_relative.parts:
+                origin = external_relative.parts[0]
+        return origin, str(path)
 
     def search(self, query: str, limit: int = 10, debug: bool = False, caller: str = "cli") -> dict[str, Any]:
         self.init_workspace()
@@ -654,6 +714,86 @@ class BrainService:
     def archive_memory(self, memory_id: str) -> dict[str, Any]:
         return self._set_memory_status(memory_id, "archived")
 
+    def export_all_memories(self) -> dict[str, Any]:
+        self.init_workspace()
+        written: list[str] = []
+        removed: list[str] = []
+        with connection(self.paths.sqlite_path) as conn:
+            all_memories = [row_to_memory(row) for row in conn.execute("SELECT * FROM memories ORDER BY id")]
+        active_ids = {memory["id"] for memory in all_memories if memory["status"] == "active"}
+        for memory in all_memories:
+            if memory["status"] == "active":
+                written.append(str(write_memory_export(self.paths, memory)))
+            else:
+                path = memory_export_path(self.paths, memory)
+                if path.exists():
+                    path.unlink()
+                    removed.append(str(path))
+        for path in self.paths.memory.rglob("*.md") if self.paths.memory.exists() else []:
+            if path.stem.startswith("mem_") and path.stem not in active_ids:
+                path.unlink()
+                removed.append(str(path))
+        return {"written": written, "removed": sorted(set(removed))}
+
+    def import_memories(self, source_dir: Path, allow_missing_sources: bool = False) -> dict[str, Any]:
+        self.init_workspace()
+        source_dir = source_dir.expanduser().resolve()
+        imported: list[str] = []
+        errors: list[str] = []
+        if not source_dir.exists():
+            raise ValueError(f"memory import directory not found: {source_dir}")
+        with connection(self.paths.sqlite_path) as conn:
+            document_ids = {row["id"] for row in conn.execute("SELECT id FROM documents")}
+            for path in sorted(source_dir.rglob("*.md")):
+                try:
+                    memory = read_memory_export(path)
+                    missing = [
+                        source_id
+                        for source_id in memory["source_ids"]
+                        if source_id.startswith("document:") and source_id.removeprefix("document:") not in document_ids
+                    ]
+                    if missing and not allow_missing_sources:
+                        errors.append(f"{path}: missing source documents: {', '.join(missing)}")
+                        continue
+                    timestamp = now_iso()
+                    conn.execute(
+                        """
+                        INSERT INTO memories(
+                          id, memory_type, scope, content, confidence, source_ids,
+                          status, created_at, updated_at, last_seen_at, reviewed_at, review_reason
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                          memory_type = excluded.memory_type,
+                          scope = excluded.scope,
+                          content = excluded.content,
+                          confidence = excluded.confidence,
+                          source_ids = excluded.source_ids,
+                          status = excluded.status,
+                          updated_at = excluded.updated_at,
+                          last_seen_at = excluded.last_seen_at,
+                          reviewed_at = excluded.reviewed_at,
+                          review_reason = excluded.review_reason
+                        """,
+                        (
+                            memory["id"],
+                            memory["memory_type"],
+                            memory["scope"],
+                            memory["content"],
+                            memory["confidence"],
+                            dumps(memory["source_ids"]),
+                            memory["status"],
+                            memory.get("created_at") or timestamp,
+                            timestamp,
+                            memory.get("last_seen_at"),
+                            memory.get("reviewed_at"),
+                            memory.get("review_reason"),
+                        ),
+                    )
+                    imported.append(memory["id"])
+                except Exception as exc:
+                    errors.append(f"{path}: {exc}")
+        return {"imported": imported, "errors": errors}
+
     def _set_memory_status(self, memory_id: str, status: str, reason: str | None = None) -> dict[str, Any]:
         timestamp = now_iso()
         with connection(self.paths.sqlite_path) as conn:
@@ -670,7 +810,14 @@ class BrainService:
             row = conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
         if not row:
             raise ValueError(f"memory not found: {memory_id}")
-        return row_to_memory(row)
+        memory = row_to_memory(row)
+        if status == "active":
+            write_memory_export(self.paths, memory)
+        else:
+            path = memory_export_path(self.paths, memory)
+            if path.exists():
+                path.unlink()
+        return memory
 
     def propose_wiki_update(
         self,
@@ -766,6 +913,70 @@ def row_to_memory(row: Any) -> dict[str, Any]:
     output = dict(row)
     output["source_ids"] = loads(output.get("source_ids"), [])
     return output
+
+
+def memory_scope_dir(scope: str) -> str:
+    cleaned = scope.strip().replace("/", "_")
+    return cleaned or "global"
+
+
+def memory_export_path(paths: BrainPaths, memory: dict[str, Any]) -> Path:
+    return paths.memory / memory_scope_dir(str(memory["scope"])) / f"{memory['id']}.md"
+
+
+def write_memory_export(paths: BrainPaths, memory: dict[str, Any]) -> Path:
+    path = memory_export_path(paths, memory)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frontmatter = {
+        "id": memory["id"],
+        "memory_type": memory["memory_type"],
+        "scope": memory["scope"],
+        "confidence": memory["confidence"],
+        "source_ids": memory.get("source_ids", []),
+        "reviewed_at": memory.get("reviewed_at"),
+        "reviewed_by": "brain",
+        "status": memory["status"],
+        "created_at": memory.get("created_at"),
+        "updated_at": memory.get("updated_at"),
+        "last_seen_at": memory.get("last_seen_at"),
+        "review_reason": memory.get("review_reason"),
+    }
+    serialized = yaml.safe_dump(frontmatter, sort_keys=True, allow_unicode=False).strip()
+    path.write_text(f"---\n{serialized}\n---\n\n{memory['content'].rstrip()}\n", encoding="utf-8")
+    return path
+
+
+def read_memory_export(path: Path) -> dict[str, Any]:
+    text = path.read_text(encoding="utf-8")
+    if not text.startswith("---\n"):
+        raise ValueError("missing YAML frontmatter")
+    end = text.find("\n---", 4)
+    if end == -1:
+        raise ValueError("unterminated YAML frontmatter")
+    frontmatter = yaml.safe_load(text[4:end]) or {}
+    content = text[end + 4 :].lstrip("\n")
+    memory_id = str(frontmatter.get("id") or path.stem)
+    source_ids = frontmatter.get("source_ids") or []
+    if not isinstance(source_ids, list):
+        raise ValueError("source_ids must be a list")
+    required = ["memory_type", "scope", "confidence", "status"]
+    missing = [key for key in required if frontmatter.get(key) in (None, "")]
+    if missing:
+        raise ValueError(f"missing frontmatter keys: {', '.join(missing)}")
+    return {
+        "id": memory_id,
+        "memory_type": str(frontmatter["memory_type"]),
+        "scope": str(frontmatter["scope"]),
+        "content": content.rstrip(),
+        "confidence": float(frontmatter["confidence"]),
+        "source_ids": [str(source_id) for source_id in source_ids],
+        "status": str(frontmatter["status"]),
+        "created_at": frontmatter.get("created_at"),
+        "updated_at": frontmatter.get("updated_at"),
+        "last_seen_at": frontmatter.get("last_seen_at"),
+        "reviewed_at": frontmatter.get("reviewed_at"),
+        "review_reason": frontmatter.get("review_reason"),
+    }
 
 
 def retrieval_policy(mode: str, budget: int | None = None) -> RetrievalPolicy:
@@ -1286,22 +1497,10 @@ class ReplacedDocuments:
     chunk_ids: list[str]
 
 
-def remove_superseded_agent_session_snapshots(conn: Any, path: Path, keep_document_id: str | None = None) -> ReplacedDocuments:
-    query = """
-        SELECT id, raw_path
-        FROM documents
-        WHERE source_type = 'agent_session_log'
-          AND source_path = ?
-    """
-    params: list[Any] = [str(path)]
-    if keep_document_id:
-        query += " AND id != ?"
-        params.append(keep_document_id)
-    stale_documents = [dict(row) for row in conn.execute(query, params)]
-    if not stale_documents:
+def remove_documents(conn: Any, document_rows: list[dict[str, Any]]) -> ReplacedDocuments:
+    if not document_rows:
         return ReplacedDocuments(0, [])
-
-    document_ids = [row["id"] for row in stale_documents]
+    document_ids = [row["id"] for row in document_rows]
     placeholders = ",".join("?" for _ in document_ids)
     stale_chunk_ids = [
         row["id"]
@@ -1315,14 +1514,37 @@ def remove_superseded_agent_session_snapshots(conn: Any, path: Path, keep_docume
         conn.execute(f"DELETE FROM chunk_fts WHERE chunk_id IN ({chunk_placeholders})", stale_chunk_ids)
     conn.execute(f"DELETE FROM documents WHERE id IN ({placeholders})", document_ids)
 
-    for row in stale_documents:
+    for row in document_rows:
         raw_path = Path(str(row["raw_path"]))
         try:
             if raw_path.exists():
                 raw_path.unlink()
         except OSError:
             pass
-    return ReplacedDocuments(len(stale_documents), stale_chunk_ids)
+    return ReplacedDocuments(len(document_rows), stale_chunk_ids)
+
+
+def remove_superseded_agent_session_snapshots(
+    conn: Any,
+    path: Path,
+    origin_node_id: str | None = None,
+    keep_document_id: str | None = None,
+) -> ReplacedDocuments:
+    query = """
+        SELECT id, raw_path
+        FROM documents
+        WHERE source_type = 'agent_session_log'
+          AND source_path = ?
+    """
+    params: list[Any] = [str(path)]
+    if origin_node_id is not None:
+        query += " AND origin_node_id = ?"
+        params.append(origin_node_id)
+    if keep_document_id:
+        query += " AND id != ?"
+        params.append(keep_document_id)
+    stale_documents = [dict(row) for row in conn.execute(query, params)]
+    return remove_documents(conn, stale_documents)
 
 
 def detect_source_type(path: Path) -> str | None:
@@ -1355,14 +1577,22 @@ def markdown_frontmatter_value(text: str, key: str) -> str | None:
     return None
 
 
-def refresh_existing_document_metadata(conn: Any, document_id: str, source_type: str, title: str, path: Path) -> None:
+def refresh_existing_document_metadata(
+    conn: Any,
+    document_id: str,
+    source_type: str,
+    title: str,
+    path: Path,
+    origin_node_id: str,
+    logical_source_key: str,
+) -> None:
     conn.execute(
         """
         UPDATE documents
-        SET source_type = ?, title = ?, source_path = ?
+        SET source_type = ?, title = ?, source_path = ?, origin_node_id = ?, logical_source_key = ?
         WHERE id = ?
         """,
-        (source_type, title, str(path), document_id),
+        (source_type, title, str(path), origin_node_id, logical_source_key, document_id),
     )
     conn.execute(
         """

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import os
+import socket
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
 
 DEFAULT_BRAIN_HOME = Path("~/brain").expanduser()
+_warned_legacy_config = False
 
 
 @dataclass(frozen=True)
@@ -50,8 +53,20 @@ class BrainPaths:
         return self.home / "config"
 
     @property
+    def config_local(self) -> Path:
+        return self.config / "local"
+
+    @property
+    def config_shared(self) -> Path:
+        return self.config / "shared"
+
+    @property
     def evals(self) -> Path:
         return self.home / "evals"
+
+    @property
+    def outbox(self) -> Path:
+        return self.home / "outbox"
 
     @property
     def sqlite_path(self) -> Path:
@@ -63,7 +78,32 @@ class BrainPaths:
 
     @property
     def config_file(self) -> Path:
+        return self.config_local / "config.yaml"
+
+    @property
+    def legacy_config_file(self) -> Path:
         return self.config / "config.yaml"
+
+    @property
+    def sync_config_file(self) -> Path:
+        return self.config / "sync.yaml"
+
+    @property
+    def local_node_id_file(self) -> Path:
+        return self.config_local / "node_id"
+
+    def config_file_for_read(self) -> Path:
+        global _warned_legacy_config
+        if self.config_file.exists() or not self.legacy_config_file.exists():
+            return self.config_file
+        if not _warned_legacy_config:
+            warnings.warn(
+                f"{self.legacy_config_file} is deprecated; use {self.config_file}",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            _warned_legacy_config = True
+        return self.legacy_config_file
 
     @property
     def golden_queries_file(self) -> Path:
@@ -80,5 +120,16 @@ class BrainPaths:
             self.db_dir,
             self.logs,
             self.config,
+            self.config_local,
+            self.config_shared,
             self.evals,
         ]
+
+
+def local_node_id(home: str | Path | BrainPaths) -> str:
+    paths = home if isinstance(home, BrainPaths) else BrainPaths.from_value(home)
+    if paths.local_node_id_file.exists():
+        value = paths.local_node_id_file.read_text(encoding="utf-8").strip()
+        if value:
+            return value
+    return socket.gethostname()

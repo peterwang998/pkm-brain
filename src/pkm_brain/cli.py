@@ -54,6 +54,7 @@ provenance_app = typer.Typer(help="Provenance validation commands.")
 capture_app = typer.Typer(help="Capture external sources into the inbox.")
 automation_app = typer.Typer(help="Scheduled automation commands.")
 launch_agent_app = typer.Typer(help="macOS LaunchAgent commands.")
+sync_app = typer.Typer(help="Primary/Secondary sync commands.")
 app.add_typer(inspect_app, name="inspect")
 app.add_typer(index_app, name="index")
 app.add_typer(wiki_app, name="wiki")
@@ -65,6 +66,7 @@ app.add_typer(provenance_app, name="provenance")
 app.add_typer(capture_app, name="capture")
 app.add_typer(automation_app, name="automation")
 app.add_typer(launch_agent_app, name="launch-agent")
+app.add_typer(sync_app, name="sync")
 console = Console()
 
 
@@ -80,9 +82,22 @@ def init(home: Optional[Path] = typer.Option(None, help="Brain home directory.")
 
 
 @app.command()
-def doctor(home: Optional[Path] = typer.Option(None)) -> None:
+def doctor(home: Optional[Path] = typer.Option(None), json_output: bool = typer.Option(False, "--json")) -> None:
     status = service(home).doctor()
-    console.print_json(json.dumps(status))
+    if json_output:
+        console.print_json(json.dumps(status))
+        return
+    table = Table(title="Brain Doctor")
+    table.add_column("Check")
+    table.add_column("Status")
+    table.add_column("Detail")
+    table.add_row("home", "ok", status["home"])
+    table.add_row("sqlite", "ok" if status["sqlite"] else "missing", str(status["sqlite"]))
+    table.add_row("lancedb", "ok" if status["lancedb"] else "missing", str(status["lancedb"]))
+    table.add_row("embedding_provider", "ok", status["embedding_provider"])
+    for name, exists in status["directories"].items():
+        table.add_row(f"directory:{name}", "ok" if exists else "missing", str(exists))
+    console.print(table)
 
 
 @app.command()
@@ -92,7 +107,7 @@ def ingest(
     home: Optional[Path] = typer.Option(None),
 ) -> None:
     result = service(home).ingest(path, dry_run=dry_run)
-    console.print_json(json.dumps(result.__dict__))
+    console.print_json(json.dumps(result.as_dict()))
 
 
 @app.command()
@@ -328,6 +343,28 @@ def memory_archive(memory_id: str, home: Optional[Path] = typer.Option(None)) ->
     console.print_json(json.dumps(result))
 
 
+@memory_app.command("export-all")
+def memory_export_all(home: Optional[Path] = typer.Option(None)) -> None:
+    result = service(home).export_all_memories()
+    console.print_json(json.dumps(result))
+
+
+@memory_app.command("import")
+def memory_import(
+    from_dir: Path = typer.Option(..., "--from", help="Directory containing memory markdown exports."),
+    allow_missing_sources: bool = typer.Option(False, "--allow-missing-sources"),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    try:
+        result = service(home).import_memories(from_dir, allow_missing_sources=allow_missing_sources)
+    except ValueError as exc:
+        console.print(str(exc))
+        raise typer.Exit(1)
+    console.print_json(json.dumps(result))
+    if result["errors"]:
+        raise typer.Exit(1)
+
+
 @memory_app.command("propose-from-sources")
 def memory_propose_from_sources(
     provider: Optional[str] = typer.Option("codex"),
@@ -381,6 +418,30 @@ def runs_inspect(run_id: str, home: Optional[Path] = typer.Option(None)) -> None
     console.print_json(json.dumps(dict(row)))
 
 
+@sync_app.command("doctor")
+def sync_doctor(
+    home: Optional[Path] = typer.Option(None),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    svc = BrainService(BrainPaths.from_value(home), prefer_model_embeddings=False)
+    result = svc.sync_doctor()
+    if json_output:
+        console.print_json(json.dumps(result))
+    else:
+        table = Table(title="Sync Doctor")
+        table.add_column("Check")
+        table.add_column("Status")
+        table.add_column("Message")
+        for check in result["checks"]:
+            table.add_row(check["name"], check["status"], check["message"])
+        console.print(f"Role: {result['role'] or 'unknown'}")
+        console.print(f"Node: {result['node_id'] or 'unknown'}")
+        console.print(table)
+        console.print(f"Ready: {'yes' if result['ready'] else 'no'}")
+    if not result["ready"]:
+        raise typer.Exit(1)
+
+
 @app.command()
 def mcp(home: Optional[Path] = typer.Option(None)) -> None:
     create_mcp(str(home) if home else None).run()
@@ -397,7 +458,7 @@ def capture_agents(
     svc = service(home)
     svc.init_workspace()
     result = AgentLogCapture(svc.paths, hyprnote_root=hyprnote_root, include_hyprnote=include_hyprnote).capture(agent=agent, dry_run=dry_run)
-    console.print_json(json.dumps(result.__dict__))
+    console.print_json(json.dumps(result.as_dict()))
 
 
 @automation_app.command("run-agent-log-ingest")

@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS documents (
   source_path TEXT NOT NULL,
   raw_path TEXT NOT NULL,
   content_hash TEXT NOT NULL,
+  origin_node_id TEXT,
+  logical_source_key TEXT,
   created_at TEXT NOT NULL,
   ingested_at TEXT NOT NULL,
   project TEXT,
@@ -27,8 +29,11 @@ CREATE TABLE IF NOT EXISTS documents (
   status TEXT NOT NULL DEFAULT 'active'
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_content_hash
+CREATE INDEX IF NOT EXISTS idx_documents_content_hash
 ON documents(content_hash);
+
+CREATE INDEX IF NOT EXISTS idx_documents_origin_logical
+ON documents(origin_node_id, logical_source_key);
 
 CREATE TABLE IF NOT EXISTS chunks (
   id TEXT PRIMARY KEY,
@@ -253,6 +258,9 @@ def init_db(db_path: Path) -> None:
         conn.executescript(SCHEMA)
         ensure_column(conn, "memories", "reviewed_at", "TEXT")
         ensure_column(conn, "memories", "review_reason", "TEXT")
+        from .migrations import run_migrations
+
+        run_migrations(conn)
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:

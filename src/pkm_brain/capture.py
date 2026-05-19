@@ -78,6 +78,9 @@ class CaptureResult:
     warnings: list[str] = field(default_factory=list)
     artifacts: list[str] = field(default_factory=list)
 
+    def as_dict(self) -> dict[str, Any]:
+        return dict(self.__dict__)
+
 
 class AgentLogAdapter(Protocol):
     agent: str
