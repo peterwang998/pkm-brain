@@ -32,6 +32,7 @@ from .memory_proposals import propose_failure_memories_from_sources
 from .mcp_server import create_mcp
 from .paths import BrainPaths
 from .service import BrainService
+from .setup_wizard import run_setup_plan
 from .sync_connection import test_connection as run_sync_test_connection
 from .sync_setup import add_peer as sync_add_peer_config
 from .sync_setup import init_primary as sync_init_primary_config
@@ -41,6 +42,7 @@ from .sync_status import format_status_table_rows
 from .sync_transfer import sync_pull as run_sync_pull
 from .sync_transfer import sync_push as run_sync_push
 from .sync_transfer import sync_run as run_sync_run
+from .ui_server import create_ui_server, ensure_ui_token, ui_token_path, validate_ui_bind
 from .wiki import lint_wiki, synthesize_wiki
 from .wiki_proposals import (
     apply_wiki_proposal,
@@ -94,11 +96,252 @@ def required_or_prompt(value: Optional[str], flag: str, prompt: str, yes: bool) 
     return str(typer.prompt(prompt)).strip()
 
 
+def run_setup_cli(
+    *,
+    home: Optional[Path],
+    role: Optional[str],
+    node_id: Optional[str],
+    primary_node_id: Optional[str],
+    peer_node_id: Optional[str],
+    peer_host: Optional[str],
+    peer_user: Optional[str],
+    peer_brain_home: Optional[Path],
+    peer_outbox_path: Optional[Path],
+    identity_path: Optional[Path],
+    secondary_outbox_path: Optional[Path],
+    install_scheduler: bool,
+    interval: int,
+    dry_run: bool,
+    json_output: bool,
+    yes: bool,
+    force: bool,
+) -> None:
+    interactive = not yes and not dry_run and not json_output
+    paths = resolve_setup_home(home, interactive)
+    role = resolve_setup_role(role, interactive)
+    if interactive:
+        (
+            node_id,
+            primary_node_id,
+            peer_node_id,
+            peer_host,
+            peer_user,
+            peer_brain_home,
+            identity_path,
+            secondary_outbox_path,
+        ) = prompt_setup_fields(
+            paths=paths,
+            role=role,
+            node_id=node_id,
+            primary_node_id=primary_node_id,
+            peer_node_id=peer_node_id,
+            peer_host=peer_host,
+            peer_user=peer_user,
+            peer_brain_home=peer_brain_home,
+            identity_path=identity_path,
+            secondary_outbox_path=secondary_outbox_path,
+        )
+        if role in {"primary", "secondary"} and not install_scheduler:
+            install_scheduler = typer.confirm("Install the scheduled sync job after validation?", default=False)
+    try:
+        result = run_setup_plan(
+            paths,
+            role=role,
+            node_id=node_id,
+            primary_node_id=primary_node_id,
+            peer_node_id=peer_node_id,
+            peer_host=peer_host,
+            peer_user=peer_user,
+            peer_brain_home=peer_brain_home,
+            peer_outbox_path=peer_outbox_path,
+            identity_path=identity_path,
+            secondary_outbox_path=secondary_outbox_path,
+            install_scheduler=install_scheduler,
+            interval=interval,
+            dry_run=dry_run,
+            force=force,
+            repo_path=Path.cwd(),
+        )
+    except (RuntimeError, ValueError) as exc:
+        console.print(str(exc))
+        raise typer.Exit(1)
+    emit_setup_result(result, json_output=json_output)
+
+
+def resolve_setup_home(home: Optional[Path], interactive: bool) -> BrainPaths:
+    if home is not None or not interactive:
+        return BrainPaths.from_value(home)
+    default_home = BrainPaths.from_value(None).home
+    selected = str(typer.prompt("Brain home", default=str(default_home))).strip()
+    return BrainPaths.from_value(selected or default_home)
+
+
+def resolve_setup_role(role: Optional[str], interactive: bool) -> str:
+    if role:
+        return role
+    if not interactive:
+        return "single"
+    if not typer.confirm("Set up multi-device Primary/Secondary sync now?", default=False):
+        return "single"
+    return str(typer.prompt("Role for this machine (primary/secondary)")).strip().lower()
+
+
+def prompt_setup_fields(
+    *,
+    paths: BrainPaths,
+    role: str,
+    node_id: Optional[str],
+    primary_node_id: Optional[str],
+    peer_node_id: Optional[str],
+    peer_host: Optional[str],
+    peer_user: Optional[str],
+    peer_brain_home: Optional[Path],
+    identity_path: Optional[Path],
+    secondary_outbox_path: Optional[Path],
+) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[Path], Optional[Path], Optional[Path]]:
+    if role == "primary":
+        node_id = node_id or str(typer.prompt("Primary node_id")).strip()
+        if typer.confirm("Add a Secondary now?", default=False):
+            peer_node_id = peer_node_id or str(typer.prompt("Secondary node_id")).strip()
+            peer_host = peer_host or str(typer.prompt("SSH host")).strip()
+            peer_user = peer_user or str(typer.prompt("SSH user")).strip()
+            peer_brain_home = peer_brain_home or Path(str(typer.prompt("Remote Brain home")).strip())
+            identity = str(typer.prompt("SSH identity file path (optional)", default="")).strip()
+            identity_path = identity_path or (Path(identity) if identity else None)
+    elif role == "secondary":
+        node_id = node_id or str(typer.prompt("Secondary node_id")).strip()
+        primary_node_id = primary_node_id or str(typer.prompt("Expected Primary node_id")).strip()
+        default_outbox = paths.outbox / node_id
+        outbox = str(typer.prompt("Secondary outbox path", default=str(default_outbox))).strip()
+        secondary_outbox_path = secondary_outbox_path or Path(outbox)
+    return node_id, primary_node_id, peer_node_id, peer_host, peer_user, peer_brain_home, identity_path, secondary_outbox_path
+
+
+def emit_setup_result(result: dict[str, object], *, json_output: bool) -> None:
+    if json_output:
+        console.print_json(json.dumps(result))
+        return
+    table = Table(title="Brain Setup")
+    table.add_column("Field")
+    table.add_column("Value")
+    table.add_row("home", str(result["brain_home"]))
+    table.add_row("role", str(result["role"]))
+    table.add_row("node_id", str(result.get("node_id") or ""))
+    table.add_row("planned_writes", str(len(result.get("planned_writes", []))))
+    table.add_row("validations", ", ".join(result.get("validation_steps", [])))  # type: ignore[arg-type]
+    labels = result.get("planned_launch_agent_labels", [])
+    table.add_row("launch_agents", ", ".join(labels) if isinstance(labels, list) else "")
+    table.add_row("dry_run", str(result.get("dry_run", False)))
+    table.add_row("applied", str(result.get("applied", False)))
+    if result.get("scheduler_install_blocked"):
+        table.add_row("scheduler_blocked", str(result.get("scheduler_block_reason") or "yes"))
+    console.print(table)
+
+
 @app.command()
-def init(home: Optional[Path] = typer.Option(None, help="Brain home directory.")) -> None:
+def init(
+    home: Optional[Path] = typer.Option(None, help="Brain home directory."),
+    wizard: bool = typer.Option(False, "--wizard", help="Run the guided setup flow."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview setup writes when used with --wizard."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable setup output when used with --wizard."),
+    yes: bool = typer.Option(False, "--yes", help="Run wizard non-interactively."),
+) -> None:
+    if wizard:
+        run_setup_cli(
+            home=home,
+            role=None,
+            node_id=None,
+            primary_node_id=None,
+            peer_node_id=None,
+            peer_host=None,
+            peer_user=None,
+            peer_brain_home=None,
+            peer_outbox_path=None,
+            identity_path=None,
+            secondary_outbox_path=None,
+            install_scheduler=False,
+            interval=1800,
+            dry_run=dry_run,
+            json_output=json_output,
+            yes=yes,
+            force=False,
+        )
+        return
     svc = service(home)
     svc.init_workspace()
     console.print(f"Initialized brain workspace at [bold]{svc.paths.home}[/bold]")
+
+
+@app.command()
+def setup(
+    role: Optional[str] = typer.Option(None, "--role", help="Setup role: single, primary, or secondary."),
+    node_id: Optional[str] = typer.Option(None, "--node-id"),
+    primary_node_id: Optional[str] = typer.Option(None, "--primary-node-id"),
+    peer_node_id: Optional[str] = typer.Option(None, "--peer-node-id"),
+    peer_host: Optional[str] = typer.Option(None, "--peer-host"),
+    peer_user: Optional[str] = typer.Option(None, "--peer-user"),
+    peer_brain_home: Optional[Path] = typer.Option(None, "--peer-brain-home"),
+    peer_outbox_path: Optional[Path] = typer.Option(None, "--peer-outbox-path"),
+    identity_path: Optional[Path] = typer.Option(None, "--identity-path"),
+    secondary_outbox_path: Optional[Path] = typer.Option(None, "--outbox-path"),
+    install_scheduler: bool = typer.Option(False, "--install-scheduler"),
+    interval: int = typer.Option(1800, help="Scheduled sync/capture interval in seconds."),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    json_output: bool = typer.Option(False, "--json"),
+    yes: bool = typer.Option(False, "--yes", help="Run non-interactively; required fields must be provided."),
+    force: bool = typer.Option(False, "--force", help="Overwrite an existing sync.yaml."),
+    home: Optional[Path] = typer.Option(None, help="Brain home directory."),
+) -> None:
+    run_setup_cli(
+        home=home,
+        role=role,
+        node_id=node_id,
+        primary_node_id=primary_node_id,
+        peer_node_id=peer_node_id,
+        peer_host=peer_host,
+        peer_user=peer_user,
+        peer_brain_home=peer_brain_home,
+        peer_outbox_path=peer_outbox_path,
+        identity_path=identity_path,
+        secondary_outbox_path=secondary_outbox_path,
+        install_scheduler=install_scheduler,
+        interval=interval,
+        dry_run=dry_run,
+        json_output=json_output,
+        yes=yes,
+        force=force,
+    )
+
+
+@app.command()
+def ui(
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8765, "--port"),
+    allow_lan: bool = typer.Option(False, "--i-understand-this-binds-to-lan"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    home: Optional[Path] = typer.Option(None, help="Brain home directory."),
+) -> None:
+    paths = BrainPaths.from_value(home)
+    try:
+        bind = validate_ui_bind(host, allow_lan=allow_lan)
+    except ValueError as exc:
+        console.print(str(exc))
+        raise typer.Exit(1)
+    if dry_run:
+        if bind["warning"]:
+            console.print(bind["warning"])
+        console.print_json(json.dumps({**bind, "port": port, "token_path": str(ui_token_path(paths)), "dry_run": True}))
+        return
+    token = ensure_ui_token(paths)
+    if bind["warning"]:
+        console.print(bind["warning"])
+    console.print(f"Brain UI listening on http://{host}:{port}")
+    console.print(f"Token file: {ui_token_path(paths)}")
+    server = create_ui_server(paths, host, port, token=token)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        server.server_close()
 
 
 @app.command()
