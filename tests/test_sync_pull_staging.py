@@ -57,6 +57,33 @@ def test_pull_promotes_valid_files_and_removes_empty_staging(tmp_path: Path) -> 
     assert not (primary.inbox / "external" / "secondary" / "_staging" / "run-ok").exists()
 
 
+def test_pull_empty_outbox_without_manifest_is_ok(tmp_path: Path) -> None:
+    primary, secondary_home = primary_with_secondary(tmp_path)
+    (secondary_home / "outbox" / "secondary").mkdir(parents=True)
+    transport = LocalRsyncTransport(remote_home=secondary_home)
+
+    result = sync_pull(primary, "secondary", transport=transport, run_id="run-empty", run_ingest=False)
+
+    assert result.status == "ok"
+    assert result.promoted == []
+    assert result.rejected == []
+    assert result.errors == []
+    assert not (primary.inbox / "external" / "secondary" / "_staging" / "run-empty").exists()
+
+
+def test_pull_files_without_manifest_still_fails(tmp_path: Path) -> None:
+    primary, secondary_home = primary_with_secondary(tmp_path)
+    path = secondary_home / "outbox" / "secondary" / "agent_logs" / "codex" / "session.md"
+    path.parent.mkdir(parents=True)
+    path.write_text("# Session\n", encoding="utf-8")
+    transport = LocalRsyncTransport(remote_home=secondary_home)
+
+    result = sync_pull(primary, "secondary", transport=transport, run_id="run-missing-manifest", run_ingest=False)
+
+    assert result.status == "failed"
+    assert any("missing manifest" in error for error in result.errors)
+
+
 def test_pull_rejects_hash_mismatch_without_touching_live_file(tmp_path: Path) -> None:
     primary, secondary_home = primary_with_secondary(tmp_path)
     live_file = primary.inbox / "external" / "secondary" / "agent_logs" / "codex" / "bad.md"

@@ -324,6 +324,9 @@ def load_primary_peer(paths: BrainPaths, peer_node_id: str) -> PeerConfig:
 def validate_and_promote_staging(paths: BrainPaths, peer_node_id: str, staging: Path) -> tuple[list[str], list[str], list[str]]:
     manifest = staging / "manifest.jsonl"
     if not manifest.exists():
+        if not any(path.is_file() for path in staging.rglob("*")):
+            remove_empty_staging_dirs(staging)
+            return [], [], []
         raise ValueError(f"missing manifest: {manifest}")
 
     live_external = paths.inbox / "external" / peer_node_id
