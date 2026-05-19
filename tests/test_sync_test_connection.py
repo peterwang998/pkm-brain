@@ -8,6 +8,7 @@ from fake_transport import FakeTransport
 from pkm_brain.cli import app
 from pkm_brain.paths import BrainPaths
 from pkm_brain.sync_connection import test_connection as run_connection_test
+from pkm_brain.sync_ssh import HostKeyMismatchError
 from pkm_brain.sync_setup import add_peer, init_primary
 
 
@@ -81,6 +82,21 @@ def test_connection_fails_on_missing_rsync(tmp_path: Path) -> None:
 
     assert result["ready"] is False
     assert result["checks"]["rsync"] == "fail"
+
+
+def test_connection_reports_host_key_mismatch(tmp_path: Path) -> None:
+    paths, remote_home = primary_with_peer(tmp_path)
+    fake = FakeTransport(remote_node_id="secondary", remote_role="secondary", remote_home=remote_home)
+
+    def verifier(peer):
+        raise HostKeyMismatchError(peer.host or "secondary.local", "SHA256:pinned", ["SHA256:observed"])
+
+    try:
+        run_connection_test(paths, "secondary", transport=fake, host_key_verifier=verifier)
+    except ValueError as exc:
+        assert "pinned SHA256:pinned; observed SHA256:observed" in str(exc)
+    else:
+        raise AssertionError("expected host key mismatch")
 
 
 def test_connection_help_exposes_json_flag() -> None:

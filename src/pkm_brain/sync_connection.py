@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 import shlex
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
 from .paths import BrainPaths
 from .sync_config import PeerConfig, load_sync_config
-from .sync_ssh import build_ssh_argv
+from .sync_ssh import HostKeyMismatchError, build_ssh_argv, verify_peer_host_key_fingerprint
 
 
 CONNECTION_CHECK_KEYS = ["ssh", "remote_brain", "remote_role", "remote_outbox_probe", "rsync"]
@@ -62,6 +63,7 @@ def test_connection(
     paths: BrainPaths,
     peer_node_id: str,
     transport: Transport | None = None,
+    host_key_verifier: Callable[[PeerConfig], None] | None = None,
 ) -> ConnectionTestResult:
     config = load_sync_config(paths)
     if config.role != "primary" or not config.primary:
@@ -73,6 +75,11 @@ def test_connection(
         raise ValueError(f"peer {peer_node_id} is missing host")
     transport = transport or ProductionTransport()
     checks = {key: "not_run" for key in CONNECTION_CHECK_KEYS}
+    verifier = host_key_verifier or verify_peer_host_key_fingerprint
+    try:
+        verifier(peer)
+    except HostKeyMismatchError as exc:
+        raise ValueError(str(exc)) from exc
 
     if run_remote(paths, peer, "true", transport).returncode != 0:
         checks["ssh"] = "fail"

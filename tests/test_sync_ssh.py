@@ -9,10 +9,12 @@ import pytest
 from pkm_brain.paths import BrainPaths
 from pkm_brain.sync_config import PeerConfig
 from pkm_brain.sync_ssh import (
+    HostKeyMismatchError,
     HostKeyCandidate,
     build_ssh_argv,
     fingerprint,
     pinned_known_hosts_path,
+    verify_peer_host_key_fingerprint,
     write_pinned_host_key,
 )
 
@@ -63,3 +65,28 @@ def test_ssh_argv_uses_pinned_known_hosts_and_batch_mode(tmp_path: Path) -> None
     assert f"UserKnownHostsFile={paths.config_local / 'known_hosts'}" in argv
     assert "~/.ssh/known_hosts" not in joined
     assert argv[-2:] == ["peter@secondary.local", "true"]
+
+
+def test_verify_peer_host_key_fingerprint_passes_on_match() -> None:
+    peer = PeerConfig(
+        node_id="secondary",
+        host="secondary.local",
+        user="peter",
+        host_key_fingerprint="SHA256:pinned",
+    )
+    candidate = HostKeyCandidate("secondary.local", "ssh-ed25519", "AAAATEST", "secondary.local ssh-ed25519 AAAATEST")
+
+    verify_peer_host_key_fingerprint(peer, fetcher=lambda host: [candidate], fingerprinter=lambda key: "SHA256:pinned")
+
+
+def test_verify_peer_host_key_fingerprint_reports_pinned_vs_observed() -> None:
+    peer = PeerConfig(
+        node_id="secondary",
+        host="secondary.local",
+        user="peter",
+        host_key_fingerprint="SHA256:pinned",
+    )
+    candidate = HostKeyCandidate("secondary.local", "ssh-ed25519", "AAAATEST", "secondary.local ssh-ed25519 AAAATEST")
+
+    with pytest.raises(HostKeyMismatchError, match="pinned SHA256:pinned; observed SHA256:observed"):
+        verify_peer_host_key_fingerprint(peer, fetcher=lambda host: [candidate], fingerprinter=lambda key: "SHA256:observed")

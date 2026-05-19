@@ -506,6 +506,7 @@ def sync_add_peer(
     brain_home: Optional[Path] = typer.Option(None, "--brain-home"),
     identity_path: Optional[Path] = typer.Option(None, "--identity-path"),
     allow_first_host_key: bool = typer.Option(False, "--allow-first-host-key"),
+    test_connection_now: bool = typer.Option(False, "--test-connection", help="Run test-connection after adding the peer."),
     yes: bool = typer.Option(False, "--yes", help="Run non-interactively; required fields must be provided."),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
@@ -531,6 +532,11 @@ def sync_add_peer(
             identity_path=identity_path,
             host_key_candidate=host_key_candidate,
         )
+        should_test = test_connection_now
+        if not yes and not should_test:
+            should_test = typer.confirm("Test connection now?", default=False)
+        if should_test:
+            result["connection_test"] = run_sync_test_connection(paths, resolved_node_id).as_dict()
     except (RuntimeError, ValueError) as exc:
         console.print(str(exc))
         raise typer.Exit(1)
@@ -546,7 +552,7 @@ def sync_test_connection(
     paths = BrainPaths.from_value(home)
     try:
         result = run_sync_test_connection(paths, peer_node_id).as_dict()
-    except ValueError as exc:
+    except (RuntimeError, ValueError) as exc:
         console.print(str(exc))
         raise typer.Exit(1)
     if json_output:

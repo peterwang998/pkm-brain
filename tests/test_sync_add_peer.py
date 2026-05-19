@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
+
 from typer.testing import CliRunner
 
+import pkm_brain.cli as cli_module
 from pkm_brain.cli import app
 from pkm_brain.paths import BrainPaths
 from pkm_brain.sync_config import load_sync_config
@@ -46,6 +49,53 @@ def test_add_peer_writes_peer_config(tmp_path) -> None:
     assert peer.node_id == "secondary"
     assert peer.host == "secondary.local"
     assert peer.user == "peter"
+
+
+def test_add_peer_can_chain_connection_test(tmp_path, monkeypatch) -> None:
+    class FakeConnectionResult:
+        def as_dict(self) -> dict[str, object]:
+            return {
+                "local_role": "primary",
+                "local_node_id": "primary",
+                "peer_node_id": "secondary",
+                "checks": {"ssh": "ok"},
+                "ready": True,
+            }
+
+    home = str(tmp_path / "primary")
+    init_primary(home)
+    called: list[str] = []
+
+    def fake_test_connection(paths, peer_node_id):
+        called.append(peer_node_id)
+        return FakeConnectionResult()
+
+    monkeypatch.setattr(cli_module, "run_sync_test_connection", fake_test_connection)
+
+    result = runner.invoke(
+        app,
+        [
+            "sync",
+            "add-peer",
+            "--node-id",
+            "secondary",
+            "--host",
+            "secondary.local",
+            "--user",
+            "peter",
+            "--brain-home",
+            "/remote/brain",
+            "--test-connection",
+            "--yes",
+            "--home",
+            home,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert called == ["secondary"]
+    payload = json.loads(result.output)
+    assert payload["connection_test"]["ready"] is True
 
 
 def test_add_peer_refuses_duplicate_node_id(tmp_path) -> None:

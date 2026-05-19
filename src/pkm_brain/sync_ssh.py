@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,6 +15,15 @@ class HostKeyCandidate:
     key_type: str
     key: str
     line: str
+
+
+class HostKeyMismatchError(RuntimeError):
+    def __init__(self, host: str, pinned: str, observed: list[str]) -> None:
+        self.host = host
+        self.pinned = pinned
+        self.observed = observed
+        observed_text = ", ".join(observed) if observed else "none"
+        super().__init__(f"host key fingerprint mismatch for {host}: pinned {pinned}; observed {observed_text}")
 
 
 def pinned_known_hosts_path(home: str | Path | BrainPaths) -> Path:
@@ -108,3 +118,25 @@ def first_host_key_with_fingerprint(host: str) -> tuple[HostKeyCandidate, str]:
         raise RuntimeError(f"no host keys found for {host}")
     candidate = candidates[0]
     return candidate, fingerprint(candidate)
+
+
+def observed_host_key_fingerprints(
+    host: str,
+    fetcher: Callable[[str], list[HostKeyCandidate]] = fetch_host_keys,
+    fingerprinter: Callable[[HostKeyCandidate | str], str] = fingerprint,
+) -> list[str]:
+    return [fingerprinter(candidate) for candidate in fetcher(host)]
+
+
+def verify_peer_host_key_fingerprint(
+    peer: PeerConfig,
+    fetcher: Callable[[str], list[HostKeyCandidate]] = fetch_host_keys,
+    fingerprinter: Callable[[HostKeyCandidate | str], str] = fingerprint,
+) -> None:
+    if not peer.host_key_fingerprint:
+        return
+    if not peer.host:
+        raise ValueError(f"peer {peer.node_id} is missing host")
+    observed = observed_host_key_fingerprints(peer.host, fetcher=fetcher, fingerprinter=fingerprinter)
+    if peer.host_key_fingerprint not in observed:
+        raise HostKeyMismatchError(peer.host, peer.host_key_fingerprint, observed)
