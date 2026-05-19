@@ -4,7 +4,7 @@ Spec version: 0.1
 
 Status: Draft target design; current implementation status is tracked in Section 19
 
-Last updated: 2026-05-18
+Last updated: 2026-05-19
 
 ## 1. Purpose
 
@@ -154,7 +154,7 @@ Secondary workspace:
       agent_logs/
       documents/
       manifest.jsonl
-  raw/         mirror from primary or local rebuild source
+  raw/         canonical source mirror from primary
   wiki/        mirror from primary
   memory/      mirror from primary
   config/
@@ -205,6 +205,31 @@ Config split:
 - `config/local/` stays machine-local.
 - `config/sync.yaml` is local role configuration and should not be blindly overwritten.
 
+### 7.1 SQLite and Index Ownership
+
+Brain sync never copies a live SQLite database, SQLite WAL/SHM file, LanceDB
+directory, or other runtime index between machines.
+
+The Primary remains the source of truth for durable Brain source artifacts:
+`raw/`, `wiki/`, reviewed memory exports under `memory/`, and `config/shared/`.
+The Primary's `db/brain.sqlite` and `indexes/` are authoritative only for the
+Primary process itself. They are not a portable replication format.
+
+Each Secondary keeps its own local `db/` and `indexes/` as rebuildable derived
+state. After the Primary pushes canonical files to the Secondary, the Secondary
+rebuilds its local SQLite rows, FTS rows, vector index, wiki metadata, and memory
+rows from those mirrored files. This gives the Secondary local retrieval without
+making it a second source of truth.
+
+This avoids:
+
+- copying a live SQLite database while WAL/SHM state may be in flight,
+- overwriting machine-local run history, retrieval events, sync history, logs, or
+  scheduler state,
+- preserving absolute paths from the wrong machine inside SQLite rows,
+- creating bidirectional DB conflicts when both machines run local capture or
+  scheduled jobs.
+
 ## 8. Sync Direction
 
 Primary pull from Secondary:
@@ -220,7 +245,7 @@ Primary push to Secondary:
 ```text
 primary canonical source dirs
   -> secondary mirror source dirs
-  -> secondary: brain ingest
+  -> secondary: brain sync rebuild-mirror-index
 ```
 
 The Primary initiates both pull and push over SSH when it is on the LAN. The Secondary does not need public inbound access from outside the home network.
@@ -241,7 +266,7 @@ On Primary:
 rsync pull
   -> ~/brain/inbox/external/<secondary-node-id>/agent_logs/<agent>/<session_id>.md
   -> brain ingest
-  -> canonical raw/SQLite/wiki/memory/indexes
+  -> canonical raw/wiki/memory plus Primary-local SQLite/index updates
 ```
 
 The existing latest-snapshot retention rule applies after import:
@@ -294,7 +319,7 @@ Command meanings:
 - `test-connection`: validates SSH, remote Brain path, remote role config, and remote node identity.
 - `pull`: pulls secondary outbox into primary external inbox.
 - `push`: pushes canonical source material to secondary.
-- `run`: executes pull, primary ingest, push, and remote secondary ingest.
+- `run`: executes pull, Primary ingest, push, and remote Secondary mirror-index rebuild.
 - `status`: reports last sync times, peer reachability, and pending outbox file counts.
 
 All setup commands must be interactive by default. Flags are optional for scripts and CI, but a human install should be able to run the commands with no arguments and answer prompts.
@@ -456,13 +481,28 @@ logs/
 
 ### 10.6 Remote Commands
 
-After push, the Primary may ask the Secondary to rebuild derived state:
+After push, the Primary asks the Secondary to rebuild derived state from the
+mirrored canonical files:
 
 ```bash
-ssh <ssh-user>@<secondary-host> 'cd <pkm-brain-repo> && uv run brain ingest --home <secondary-brain-home>'
+ssh <ssh-user>@<secondary-host> \
+  'brain sync rebuild-mirror-index --home <secondary-brain-home>'
 ```
 
 This command is LAN-only and initiated by the Primary.
+
+`brain sync rebuild-mirror-index` must:
+
+- index files under the Secondary's mirrored `raw/` directory into the
+  Secondary-local SQLite `documents`, `chunks`, and FTS tables,
+- rebuild or update the Secondary-local vector index,
+- parse mirrored `wiki/` Markdown into local wiki metadata,
+- import mirrored reviewed memories from `memory/`,
+- treat the Secondary's `db/`, `indexes/`, `logs/`, `config/local/`, and
+  `config/sync.yaml` as local state.
+
+It must not copy the Primary SQLite database or Primary vector index to the
+Secondary.
 
 ### 10.7 Scheduling
 
@@ -505,7 +545,7 @@ Failure behavior:
 - If the Secondary is unreachable, Primary sync exits success with `reachable=false`.
 - If SSH works but remote validation fails, sync exits failure.
 - If pull succeeds but ingest fails, do not push back to Secondary.
-- If push succeeds but remote ingest fails, report degraded mirror.
+- If push succeeds but remote mirror-index rebuild fails, report degraded mirror.
 
 ## 11. Install-Time Validation
 
