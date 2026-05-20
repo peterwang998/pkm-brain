@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from typer.testing import CliRunner
 
+import pkm_brain.cli as cli_module
 from fake_transport import FakeTransport
 from pkm_brain.cli import app
 from pkm_brain.paths import BrainPaths
@@ -99,8 +101,25 @@ def test_connection_reports_host_key_mismatch(tmp_path: Path) -> None:
         raise AssertionError("expected host key mismatch")
 
 
-def test_connection_help_exposes_json_flag() -> None:
-    result = runner.invoke(app, ["sync", "test-connection", "--help"])
+def test_connection_json_flag_outputs_machine_readable_payload(monkeypatch, tmp_path: Path) -> None:
+    class FakeConnectionResult:
+        def as_dict(self) -> dict[str, object]:
+            return {
+                "local_role": "primary",
+                "local_node_id": "primary",
+                "peer_node_id": "secondary",
+                "checks": {"ssh": "ok"},
+                "ready": True,
+            }
 
-    assert result.exit_code == 0
-    assert "--json" in result.output
+    def fake_test_connection(paths, peer_node_id):
+        return FakeConnectionResult()
+
+    monkeypatch.setattr(cli_module, "run_sync_test_connection", fake_test_connection)
+
+    result = runner.invoke(app, ["sync", "test-connection", "secondary", "--json", "--home", str(tmp_path / "brain")])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["peer_node_id"] == "secondary"
+    assert payload["ready"] is True
