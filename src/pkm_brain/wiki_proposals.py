@@ -9,7 +9,7 @@ from typing import Any
 from .db import connection, dumps, loads, rows
 from .llm import get_provider
 from .paths import BrainPaths
-from .util import new_id, now_iso, slugify
+from .util import new_id, now_iso
 from .wiki import lint_wiki
 
 
@@ -386,79 +386,3 @@ def row_to_interview(row: Any) -> dict[str, Any]:
     output["questions"] = loads(output.get("questions"), [])
     output["answers"] = loads(output.get("answers"), [])
     return output
-
-
-def proposed_concept_change(title: str, summary: str, source_ids: list[str], slug: str | None = None) -> dict[str, Any]:
-    page_slug = slug or slugify(title)
-    return {
-        "target_path": f"concepts/{page_slug}.md",
-        "operation": "create_page",
-        "section_name": None,
-        "proposed_markdown": concept_page_markdown(title, summary, source_ids, page_slug),
-        "rationale": "Create a new source-backed concept page.",
-        "source_ids": source_ids,
-        "confidence": 0.75,
-    }
-
-
-def concept_page_markdown(title: str, summary: str, source_ids: list[str], slug: str) -> str:
-    today = now_iso()[:10]
-    frontmatter = {
-        "title": title,
-        "page_type": "concept",
-        "id": f"concept-{slug}",
-        "status": "active",
-        "created_at": today,
-        "updated_at": today,
-        "source_ids": source_ids,
-        "related": [],
-        "tags": [],
-    }
-    import yaml
-
-    return "\n".join(
-        [
-            "---",
-            yaml.safe_dump(frontmatter, sort_keys=False).strip(),
-            "---",
-            "",
-            f"# {title}",
-            "",
-            "## Summary",
-            "",
-            summary,
-            "",
-            "## Key Points",
-            "",
-            "- Proposed concept page pending review.",
-            "",
-            "## Definition",
-            "",
-            summary,
-            "",
-            "## Why It Matters",
-            "",
-            "Pending human review.",
-            "",
-            "## How It Works",
-            "",
-            "Pending human review.",
-            "",
-            "## Related Decisions",
-            "",
-            "- None yet.",
-            "",
-            "## Source Evidence",
-            "",
-            *[f"- `{source_id}`" for source_id in source_ids],
-            "",
-            "## Related Pages",
-            "",
-            "- None yet.",
-            "",
-            "## Open Questions",
-            "",
-            "- What should be refined before this page becomes durable?",
-            "",
-        ]
-    )

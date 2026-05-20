@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 from .util import text_sha256, token_count
+
+DEFAULT_TARGET_TOKENS = 1200
+DEFAULT_OVERLAP_TOKENS = 200
 
 
 @dataclass(frozen=True)
@@ -16,13 +20,22 @@ class Chunk:
     content_hash: str
 
 
-def chunk_text(text: str, source_type: str, target_tokens: int = 650) -> list[Chunk]:
+def chunk_text(
+    text: str,
+    source_type: str,
+    target_tokens: int = DEFAULT_TARGET_TOKENS,
+    overlap_tokens: int = DEFAULT_OVERLAP_TOKENS,
+) -> list[Chunk]:
     if source_type == "markdown_note":
-        return chunk_markdown(text, target_tokens)
-    return chunk_blocks(text, target_tokens)
+        return chunk_markdown(text, target_tokens, overlap_tokens)
+    return chunk_blocks(text, target_tokens, overlap_tokens)
 
 
-def chunk_markdown(text: str, target_tokens: int = 650) -> list[Chunk]:
+def chunk_markdown(
+    text: str,
+    target_tokens: int = DEFAULT_TARGET_TOKENS,
+    overlap_tokens: int = DEFAULT_OVERLAP_TOKENS,
+) -> list[Chunk]:
     lines = text.splitlines(keepends=True)
     sections: list[tuple[str, int, str]] = []
     headings: list[str] = []
@@ -55,29 +68,39 @@ def chunk_markdown(text: str, target_tokens: int = 650) -> list[Chunk]:
 
     chunks: list[Chunk] = []
     for heading, section_start, section_text in sections or [("", 0, text)]:
-        chunks.extend(_split_section(section_text, heading, section_start, len(chunks), target_tokens))
+        chunks.extend(_split_section(section_text, heading, section_start, len(chunks), target_tokens, overlap_tokens))
     return chunks
 
 
-def chunk_blocks(text: str, target_tokens: int = 650) -> list[Chunk]:
-    paragraphs = text.split("\n\n")
+def chunk_blocks(
+    text: str,
+    target_tokens: int = DEFAULT_TARGET_TOKENS,
+    overlap_tokens: int = DEFAULT_OVERLAP_TOKENS,
+) -> list[Chunk]:
     chunks: list[Chunk] = []
     current: list[str] = []
     current_start = 0
-    offset = 0
-    for para in paragraphs:
-        block = para + "\n\n"
+    current_end = 0
+    for block_start, block_end, block in _paragraph_blocks(text):
+        if not block.strip():
+            continue
+        if token_count(block) > target_tokens:
+            if current:
+                chunks.append(_make_chunk(len(chunks), "".join(current).strip(), "", current_start, current_end))
+                current = []
+            chunks.extend(_split_section(block, "", block_start, len(chunks), target_tokens, overlap_tokens))
+            continue
         if not current:
-            current_start = offset
+            current_start = block_start
         if current and token_count("".join(current) + block) > target_tokens:
-            chunks.append(_make_chunk(len(chunks), "".join(current).strip(), "", current_start, offset))
+            chunks.append(_make_chunk(len(chunks), "".join(current).strip(), "", current_start, current_end))
             current = [block]
-            current_start = offset
+            current_start = block_start
         else:
             current.append(block)
-        offset += len(block)
+        current_end = block_end
     if current:
-        chunks.append(_make_chunk(len(chunks), "".join(current).strip(), "", current_start, len(text)))
+        chunks.append(_make_chunk(len(chunks), "".join(current).strip(), "", current_start, current_end))
     return [chunk for chunk in chunks if chunk.text]
 
 
@@ -87,27 +110,47 @@ def _split_section(
     start_offset: int,
     start_index: int,
     target_tokens: int,
+    overlap_tokens: int,
 ) -> list[Chunk]:
-    words = text.split()
-    if len(words) <= target_tokens:
+    spans = list(re.finditer(r"\S+", text))
+    if len(spans) <= target_tokens:
         return [_make_chunk(start_index, text.strip(), heading_path, start_offset, start_offset + len(text))]
 
     chunks: list[Chunk] = []
     cursor = 0
-    while cursor < len(words):
-        piece_words = words[cursor: cursor + target_tokens]
-        piece = " ".join(piece_words)
+    step = max(1, target_tokens - min(overlap_tokens, target_tokens - 1))
+    while cursor < len(spans):
+        end_cursor = min(cursor + target_tokens, len(spans))
+        piece_start = spans[cursor].start()
+        piece_end = spans[end_cursor - 1].end()
+        piece = text[piece_start:piece_end].strip()
         chunks.append(
             _make_chunk(
                 start_index + len(chunks),
                 piece,
                 heading_path,
-                start_offset,
-                start_offset + len(text),
+                start_offset + piece_start,
+                start_offset + piece_end,
             )
         )
-        cursor += target_tokens
+        if end_cursor == len(spans):
+            break
+        cursor += step
     return chunks
+
+
+def _paragraph_blocks(text: str) -> list[tuple[int, int, str]]:
+    blocks: list[tuple[int, int, str]] = []
+    offset = 0
+    parts = text.split("\n\n")
+    for index, part in enumerate(parts):
+        separator = "\n\n" if index < len(parts) - 1 else ""
+        block = part + separator
+        start = offset
+        end = start + len(block)
+        blocks.append((start, end, block))
+        offset = end
+    return blocks
 
 
 def _make_chunk(index: int, text: str, heading_path: str, start: int, end: int) -> Chunk:

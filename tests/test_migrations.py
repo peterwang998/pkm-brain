@@ -16,11 +16,13 @@ def test_fresh_db_applies_registered_migrations(tmp_path: Path) -> None:
         versions = [row["version"] for row in conn.execute("SELECT version FROM schema_migrations")]
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(documents)")}
         indexes = {row["name"] for row in conn.execute("PRAGMA index_list(documents)")}
+        lineage_columns = {row["name"] for row in conn.execute("PRAGMA table_info(context_lineage_events)")}
 
-    assert versions == [1, 2]
+    assert versions == [1, 2, 3]
     assert "origin_node_id" in columns
     assert "logical_source_key" in columns
     assert "idx_documents_origin_logical" in indexes
+    assert {"target_type", "target_id", "event_type", "metadata"}.issubset(lineage_columns)
 
 
 def test_migrations_rerun_is_noop(tmp_path: Path) -> None:
@@ -31,7 +33,7 @@ def test_migrations_rerun_is_noop(tmp_path: Path) -> None:
     with connection(db_path) as conn:
         versions = [row["version"] for row in conn.execute("SELECT version FROM schema_migrations")]
 
-    assert versions == [1, 2]
+    assert versions == [1, 2, 3]
 
 
 def test_init_db_migrates_pre_sync_documents_table(tmp_path: Path) -> None:
@@ -78,7 +80,7 @@ def test_init_db_migrates_pre_sync_documents_table(tmp_path: Path) -> None:
         ).fetchone()
         indexes = {row["name"] for row in conn.execute("PRAGMA index_list(documents)")}
 
-    assert versions == [1, 2]
+    assert versions == [1, 2, 3]
     assert row["origin_node_id"] == "<local>"
     assert row["logical_source_key"] == "/tmp/legacy.md"
     assert "idx_documents_origin_logical" in indexes

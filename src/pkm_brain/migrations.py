@@ -68,9 +68,47 @@ def _migration_002_create_sync_runs(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_003_create_context_lineage_events(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS context_lineage_events (
+          id TEXT PRIMARY KEY,
+          target_type TEXT NOT NULL,
+          target_id TEXT NOT NULL,
+          event_type TEXT NOT NULL,
+          retrieval_event_id TEXT,
+          agent_session_id TEXT,
+          query TEXT,
+          weight REAL NOT NULL DEFAULT 0.0,
+          metadata TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_context_lineage_target
+        ON context_lineage_events(target_type, target_id, event_type, created_at)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_context_lineage_retrieval
+        ON context_lineage_events(retrieval_event_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_context_lineage_agent_session
+        ON context_lineage_events(agent_session_id, event_type)
+        """
+    )
+
+
 MIGRATIONS: list[Migration] = [
     (1, "add_origin_identity", _migration_001_add_origin_identity),
     (2, "create_sync_runs", _migration_002_create_sync_runs),
+    (3, "create_context_lineage_events", _migration_003_create_context_lineage_events),
 ]
 
 

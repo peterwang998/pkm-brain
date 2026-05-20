@@ -9,7 +9,6 @@ from .db import connection, loads
 from .paths import BrainPaths
 from .sync_config import PeerConfig, load_sync_config
 from .sync_connection import ProductionTransport, SubprocessResult, Transport, quote_path, run_remote
-from .sync_rsync import peer_outbox_path
 from .util import file_sha256
 
 
@@ -168,14 +167,6 @@ def local_pending_outbox_manifest_count(paths: BrainPaths, outbox_path: Path | N
         found = True
         total += count
     return total if found else None
-
-
-def pending_outbox_manifest_count(peer: PeerConfig) -> int | None:
-    try:
-        manifest = peer_outbox_path(peer) / "manifest.jsonl"
-    except ValueError:
-        return None
-    return manifest_row_count(manifest)
 
 
 def manifest_row_count(manifest: Path) -> int | None:

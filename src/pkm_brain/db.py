@@ -214,6 +214,28 @@ CREATE TABLE IF NOT EXISTS retrieval_events (
   debug TEXT NOT NULL DEFAULT '{}'
 );
 
+CREATE TABLE IF NOT EXISTS context_lineage_events (
+  id TEXT PRIMARY KEY,
+  target_type TEXT NOT NULL,
+  target_id TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  retrieval_event_id TEXT,
+  agent_session_id TEXT,
+  query TEXT,
+  weight REAL NOT NULL DEFAULT 0.0,
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_context_lineage_target
+ON context_lineage_events(target_type, target_id, event_type, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_context_lineage_retrieval
+ON context_lineage_events(retrieval_event_id);
+
+CREATE INDEX IF NOT EXISTS idx_context_lineage_agent_session
+ON context_lineage_events(agent_session_id, event_type);
+
 CREATE TABLE IF NOT EXISTS agent_sessions (
   id TEXT PRIMARY KEY,
   summary TEXT NOT NULL,

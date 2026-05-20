@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import plistlib
+import shlex
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -60,7 +61,8 @@ class LaunchdScheduler:
 
 
 def sync_primary_job(repo_path: Path, brain_home: Path, uv_path: Path, peer: str, interval: int = 1800) -> ScheduledJob:
-    command = f"cd {repo_path} && {uv_path} run brain sync run {peer} --if-reachable --home {brain_home}"
+    args = [str(uv_path), "run", "brain", "sync", "run", peer, "--if-reachable", "--home", str(brain_home)]
+    command = f"cd {shlex.quote(str(repo_path))} && {shlex.join(args)}"
     return ScheduledJob(
         label=SYNC_PRIMARY_LABEL,
         command=command,
@@ -73,7 +75,8 @@ def sync_primary_job(repo_path: Path, brain_home: Path, uv_path: Path, peer: str
 
 
 def secondary_capture_job(repo_path: Path, brain_home: Path, uv_path: Path, interval: int = 600) -> ScheduledJob:
-    command = f"cd {repo_path} && {uv_path} run brain automation secondary-tick --home {brain_home}"
+    args = [str(uv_path), "run", "brain", "automation", "secondary-tick", "--home", str(brain_home)]
+    command = f"cd {shlex.quote(str(repo_path))} && {shlex.join(args)}"
     return ScheduledJob(
         label=CAPTURE_SECONDARY_LABEL,
         command=command,

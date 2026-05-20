@@ -243,6 +243,7 @@ wiki_pages
 ingestion_runs
 automation_runs
 retrieval_events
+context_lineage_events
 agent_sessions
 forget_events
 ```
@@ -327,6 +328,25 @@ automation_runs(
 ```
 
 Automation run records should track scheduled jobs separately from ingestion runs. A nightly maintenance run may include capture, ingestion, wiki synthesis, audits, and status checks in one job summary.
+
+Minimum lineage event schema:
+
+```sql
+context_lineage_events(
+  id TEXT PRIMARY KEY,
+  target_type TEXT,
+  target_id TEXT,
+  event_type TEXT,
+  retrieval_event_id TEXT,
+  agent_session_id TEXT,
+  query TEXT,
+  weight REAL,
+  metadata TEXT,
+  created_at TEXT
+)
+```
+
+`target_type` is one of `memory`, `chunk`, `document`, or `wiki_page`. `event_type` is one of `exposed`, `explicit_useful`, `explicit_not_useful`, `agent_referenced_id`, or `memory_proposed_from_lineage`. Lineage data is advisory, auditable, and rebuildable; approved memories remain the durable trust boundary.
 
 Minimum wiki proposal schema:
 
@@ -531,7 +551,7 @@ brain automation nightly --with-llm-wiki-proposals --provider <provider>
 brain automation nightly --with-llm-memory-proposals --provider <provider>
 ```
 
-`--with-llm-memory-proposals` analyzes recent agent logs, structured `agent_sessions`, unresolved issues, failed or suspicious command history, retrieval events, and existing failure memories. It may create only `proposed` `AgentFailurePatternMemory` records and must deduplicate against existing proposed or active failure memories. It uses the existing `com.pkm-brain.nightly-maintenance` LaunchAgent; no separate memory proposal LaunchAgent should be created.
+`--with-llm-memory-proposals` analyzes recent agent logs, structured `agent_sessions`, unresolved issues, failed or suspicious command history, retrieval events, context lineage events, and existing memories. It may create only `proposed` memories and must deduplicate against existing proposed or active memories. Failure-source synthesis should still produce `AgentFailurePatternMemory` records; lineage synthesis may propose other durable memory types only after conservative independent-evidence thresholds pass. It uses the existing `com.pkm-brain.nightly-maintenance` LaunchAgent; no separate memory proposal LaunchAgent should be created.
 
 ### 9.2 Future Work: Tension Audit
 
@@ -609,6 +629,8 @@ Reciprocal Rank Fusion
   ↓
 Rerank top candidates
   ↓
+Apply source-aware and capped lineage tie-breakers
+  ↓
 Apply retrieval policy and source-specific caps
   ↓
 Excerpt or compress oversized chunks
@@ -621,6 +643,8 @@ Assemble context packet
 ```
 
 Use RRF instead of hand-weighted score blending for V1 because BM25 and vector scores are not directly comparable.
+
+`search_knowledge` and `retrieve_context` should share the same reranking model: broad BM25/vector fan-out, reciprocal-rank candidate collection, source-aware reranking, and top-N selection with recall backfill from lower-ranked candidates when filtering leaves too few results. Meetings, notes, transcripts, web clips, and working documents receive a positive source signal for normal knowledge queries. Agent session logs are downranked for normal knowledge queries but may rank highly for agent/session/tool/implementation-history queries.
 
 Context packet format:
 
@@ -650,6 +674,8 @@ inspect: explicit source-inspection mode with larger caps
 The default packet must be bounded for usefulness, not model maximum context size. Reranking decides which chunks deserve attention; retrieval policy decides how much text each source type may consume. No selected chunk, including the first chunk, may exceed the remaining context budget.
 
 The default context budget is 8,000 tokens. `retrieval_policy` and detailed reranking diagnostics should be returned only when debug output is explicitly requested, because MCP responses should stay compact for normal agent use.
+
+Debug output should include `retrieval_score`, `selection_reasons`, `suppressed`, `suppress_reasons`, `retrieval_noise_reasons`, and raw-context pointers. Lineage boosts must be capped at `+2.0` as a tie-breaker, decay with a 90-day half-life, and never treat exposure-only events as positive feedback. Explicit useful feedback is strongest, explicit not-useful feedback is negative, and repeated stable-ID re-references from independent agent sessions are weak.
 
 Chunk records should include:
 
@@ -731,6 +757,10 @@ The command `brain wiki synthesize` must do both:
 ```
 
 The command must not silently overwrite hand-edited human pages. A generated page is safe to update only if it contains the generated marker. If a target page exists without the marker, the system must skip it and report the skip.
+
+LLM semantic compilation must use an LLM-guided source selection pass instead of simply passing the latest N documents. The default `llm_source_limit` is 12 selected sources. The selector receives bounded candidate cards and a soft preference for user-supplied/manual sources, meetings, notes, transcripts, web clips, and working documents. Agent logs remain eligible when they are directly relevant, such as implementation history, workflow preferences, or failure patterns. Dry-run diagnostics must report candidate counts, selected source IDs, selected/dropped counts by type, selector rationale, and selector warnings.
+
+Source previews should be cleaned by type. Meetings, articles, and notes may include richer summaries and relevant chunks. Agent-log previews must strip system prompts, permission blocks, tool traces, long command output, raw event noise, and should be aggressively capped.
 
 ### 11.2 Compiled Page Requirements
 
@@ -1348,6 +1378,7 @@ Required MCP tools:
 ```text
 search_knowledge(query, filters)
 retrieve_context(task, project, repo)
+record_context_feedback(target_type, target_id, useful, note)
 get_memories(scope, memory_type, status)
 propose_memory(memory_type, scope, content, sources, confidence)
 write_agent_session(summary, files_touched, commands_run, outcome)
@@ -1380,7 +1411,7 @@ caller
 returned_chunk_ids
 selected_chunk_ids
 cited_chunk_ids
-user_feedback
+context_lineage_events
 agent_outcome
 ```
 
@@ -1394,7 +1425,9 @@ agent behavior analysis
 memory refinement
 ```
 
-V1 only needs logging. Ranking feedback can come later.
+V1 records exposure events for returned chunks, active memories, and wiki pages. Exposure-only events must not improve ranking. Explicit context feedback is recorded through `brain context feedback <target-type> <target-id> --useful/--not-useful --note ...` and MCP `record_context_feedback`. Agent-log ingestion may create weak lineage only for explicit stable IDs such as `mem_...`, `chunk_...`, `doc_...`, `document:...`, and wiki relative paths; V1 must not use fuzzy text matching.
+
+Repeated agent-log popularity is review input, not truth. Memory proposals generated from lineage require independent evidence by default: at least three distinct agent sessions, or two sessions plus explicit useful feedback, or two sessions plus a later stable-ID re-reference. Generated memories remain `status='proposed'` until human approval.
 
 ## 17. Execution Phases
 
@@ -1605,6 +1638,10 @@ Command:
 
 ```text
 brain index status
+brain index doctor
+brain index optimize
+brain index rebuild-vectors
+brain db reindex-chunks
 ```
 
 Output should include:
@@ -1615,10 +1652,18 @@ chunk count
 lexical index row count
 embedded chunk count
 missing embedding count
+LanceDB row count
+LanceDB version count
+LanceDB data file count
+LanceDB retained version bytes
 embedding model
 last index run
 failed index jobs
 ```
+
+LanceDB is a derived index cache and may be optimized or rebuilt from SQLite chunks. Routine optimization must not delete SQLite rows, raw files, wiki pages, memories, or source evidence. Scheduled optimization should use a conservative cleanup window; one-time manual cleanup may pass `--cleanup-older-than-days 0` when no long-running readers are active. Full vector rebuilds must verify the rebuilt row count against SQLite chunk count and retain the previous LanceDB directory as a timestamped backup unless explicitly requested otherwise.
+
+Oversized chunks should be automatically split into bounded overlapping chunks during ingest. Existing oversized documents may be reindexed from raw files; this rewrites derived SQLite chunks, FTS rows, and LanceDB vectors without deleting source evidence.
 
 The index health check should answer:
 

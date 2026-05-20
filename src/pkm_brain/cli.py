@@ -28,7 +28,7 @@ from .automation import (
 from .capture import AgentLogCapture
 from .db import connection, rows
 from .llm import provider_status
-from .memory_proposals import propose_failure_memories_from_sources
+from .memory_proposals import propose_failure_memories_from_sources, propose_memories_from_lineage
 from .mcp_server import create_mcp
 from .paths import BrainPaths
 from .service import BrainService
@@ -58,9 +58,11 @@ from .wiki_proposals import (
 app = typer.Typer(help="Local personal knowledge management and agent memory tool.")
 inspect_app = typer.Typer(help="Inspect documents and chunks.")
 index_app = typer.Typer(help="Index health commands.")
+db_app = typer.Typer(help="SQLite database maintenance commands.")
 wiki_app = typer.Typer(help="Wiki commands.")
 wiki_proposals_app = typer.Typer(help="Wiki proposal review commands.")
 memory_app = typer.Typer(help="Typed memory commands.")
+context_app = typer.Typer(help="Context lineage and feedback commands.")
 llm_app = typer.Typer(help="LLM provider commands.")
 runs_app = typer.Typer(help="Pipeline run commands.")
 provenance_app = typer.Typer(help="Provenance validation commands.")
@@ -71,9 +73,11 @@ sync_app = typer.Typer(help="Primary/Secondary sync commands.")
 scheduler_app = typer.Typer(help="Logical scheduler commands.")
 app.add_typer(inspect_app, name="inspect")
 app.add_typer(index_app, name="index")
+app.add_typer(db_app, name="db")
 app.add_typer(wiki_app, name="wiki")
 wiki_app.add_typer(wiki_proposals_app, name="proposals")
 app.add_typer(memory_app, name="memory")
+app.add_typer(context_app, name="context")
 app.add_typer(llm_app, name="llm")
 app.add_typer(runs_app, name="runs")
 app.add_typer(provenance_app, name="provenance")
@@ -239,6 +243,13 @@ def emit_setup_result(result: dict[str, object], *, json_output: bool) -> None:
     console.print(table)
 
 
+def ui_startup_lines(host: str, port: int, token: str) -> list[str]:
+    return [
+        f"Brain UI listening on http://{host}:{port}",
+        f"Token: {token}",
+    ]
+
+
 @app.command()
 def init(
     home: Optional[Path] = typer.Option(None, help="Brain home directory."),
@@ -336,8 +347,8 @@ def ui(
     token = ensure_ui_token(paths)
     if bind["warning"]:
         console.print(bind["warning"])
-    console.print(f"Brain UI listening on http://{host}:{port}")
-    console.print(f"Token file: {ui_token_path(paths)}")
+    for line in ui_startup_lines(host, port, token):
+        console.print(line)
     server = create_ui_server(paths, host, port, token=token)
     try:
         server.serve_forever()
@@ -399,6 +410,26 @@ def retrieve_context(
     console.print_json(json.dumps(result))
 
 
+@context_app.command("feedback")
+def context_feedback(
+    target_type: str,
+    target_id: str,
+    useful: bool = typer.Option(False, "--useful", help="Mark the target as useful context."),
+    not_useful: bool = typer.Option(False, "--not-useful", help="Mark the target as not useful context."),
+    note: Optional[str] = typer.Option(None, "--note"),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    if useful == not_useful:
+        console.print("Choose exactly one of --useful or --not-useful.")
+        raise typer.Exit(1)
+    try:
+        result = service(home).record_context_feedback(target_type, target_id, useful=useful, note=note)
+    except ValueError as exc:
+        console.print(str(exc))
+        raise typer.Exit(1)
+    console.print_json(json.dumps(result))
+
+
 @inspect_app.command("document")
 def inspect_document(document_id: str, home: Optional[Path] = typer.Option(None)) -> None:
     svc = service(home)
@@ -436,6 +467,49 @@ def index_status(home: Optional[Path] = typer.Option(None)) -> None:
     svc = service(home)
     svc.init_workspace()
     console.print_json(json.dumps(automation_index_status(svc.paths, svc)))
+
+
+@index_app.command("doctor")
+def index_doctor(home: Optional[Path] = typer.Option(None)) -> None:
+    console.print_json(json.dumps(service(home).index_doctor()))
+
+
+@index_app.command("optimize")
+def index_optimize(
+    cleanup_older_than_days: int = typer.Option(1, "--cleanup-older-than-days", help="Delete LanceDB versions older than this many days."),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    console.print_json(json.dumps(service(home).optimize_indexes(cleanup_older_than_days=cleanup_older_than_days)))
+
+
+@index_app.command("rebuild-vectors")
+def index_rebuild_vectors(
+    delete_backup: bool = typer.Option(False, "--delete-backup", help="Delete the previous LanceDB backup after verification succeeds."),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    result = service(home).rebuild_vector_index(delete_backup=delete_backup)
+    console.print_json(json.dumps(result))
+    if result["status"] != "ok":
+        raise typer.Exit(1)
+
+
+@db_app.command("reindex-chunks")
+def db_reindex_chunks(
+    source_type: str = typer.Option("agent_session_log", "--source-type", help="Only reindex documents with this source_type."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Report affected documents and projected chunks without writing."),
+    target_tokens: int = typer.Option(1200, "--target-tokens", help="Maximum tokens per regenerated chunk."),
+    overlap_tokens: int = typer.Option(200, "--overlap-tokens", help="Tokens to overlap between split oversized chunks."),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    result = service(home).reindex_chunks(
+        source_type=source_type,
+        dry_run=dry_run,
+        target_tokens=target_tokens,
+        overlap_tokens=overlap_tokens,
+    )
+    console.print_json(json.dumps(result))
+    if result["status"] == "failed":
+        raise typer.Exit(1)
 
 
 @wiki_app.command("lint")
@@ -653,6 +727,18 @@ def memory_propose_from_sources(
     svc = service(home)
     svc.init_workspace()
     result = propose_failure_memories_from_sources(svc.paths, provider_name=provider, limit=limit)
+    console.print_json(json.dumps(result))
+
+
+@memory_app.command("propose-from-lineage")
+def memory_propose_from_lineage(
+    provider: Optional[str] = typer.Option("codex"),
+    limit: int = typer.Option(12),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    svc = service(home)
+    svc.init_workspace()
+    result = propose_memories_from_lineage(svc.paths, provider_name=provider, limit=limit)
     console.print_json(json.dumps(result))
 
 

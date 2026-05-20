@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,17 @@ from .wiki import (
 from .wiki_proposals import create_wiki_proposal, parse_json_object
 
 SEMANTIC_PAGE_TYPES = set(SEMANTIC_FOLDERS)
+PREFERRED_SEMANTIC_SOURCE_TYPES = {
+    "hyprnote_meeting",
+    "manual_entry",
+    "markdown_note",
+    "meeting_transcript",
+    "web_clip",
+    "working_document",
+}
+SOURCE_SELECTOR_MIN_CANDIDATES = 20
+SOURCE_SELECTOR_MAX_CANDIDATES = 50
+SOURCE_SELECTOR_CANDIDATE_MULTIPLIER = 4
 
 
 def compile_semantic_wiki(
@@ -31,19 +43,32 @@ def compile_semantic_wiki(
     provider_name: str | None = None,
     auto_apply_confidence: float = 0.75,
     source_limit: int = 12,
+    agent_focus: bool = False,
 ) -> dict[str, Any]:
     provider = get_provider(provider_name)
-    source_documents = compiler_documents(documents[:source_limit])
+    existing_pages = existing_semantic_pages(paths)
+    source_selection = select_compiler_sources(
+        provider,
+        documents,
+        source_limit=source_limit,
+        agent_focus=agent_focus,
+        existing_pages=existing_pages,
+    )
+    source_documents = compiler_documents(source_selection["selected_documents"])
     if not source_documents:
-        return llm_result("no_sources", provider, [], [], [], [])
+        return {
+            **llm_result("no_sources", provider, [], [], [], []),
+            "source_selection": source_selection["diagnostics"],
+        }
 
     document_by_source_id = {document["source_id"]: document["raw_document"] for document in compiler_documents(documents)}
-    prompt = semantic_compile_prompt(source_documents, existing_semantic_pages(paths))
+    prompt = semantic_compile_prompt(source_documents, existing_pages)
     parsed = parse_json_object(provider.complete(prompt))
     raw_pages = parsed.get("pages") or []
     if not isinstance(raw_pages, list) or not raw_pages:
         return {
             **llm_result("no_changes", provider, [], [], [], []),
+            "source_selection": source_selection["diagnostics"],
             "rationale": str(parsed.get("rationale") or ""),
         }
 
@@ -103,6 +128,7 @@ def compile_semantic_wiki(
         status = "ok_with_errors"
     return {
         **llm_result(status, provider, created, updated, skipped, proposals),
+        "source_selection": source_selection["diagnostics"],
         "errors": errors,
         "rationale": str(parsed.get("rationale") or ""),
     }
@@ -132,10 +158,7 @@ def compiler_documents(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
     output = []
     for document in documents:
         source_id = f"document:{document['id']}"
-        chunk_texts = split_chunks(document.get("chunk_texts") or "")
-        preview = "\n\n".join(clean_excerpt(text, max_chars=900) for text in chunk_texts[:3])
-        if not preview:
-            preview = clean_excerpt(str(document.get("title") or ""), max_chars=900)
+        preview = compiler_preview(document)
         output.append(
             {
                 "source_id": source_id,
@@ -148,6 +171,235 @@ def compiler_documents(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
             }
         )
     return output
+
+
+def select_compiler_sources(
+    provider: Any,
+    documents: list[dict[str, Any]],
+    source_limit: int,
+    agent_focus: bool = False,
+    existing_pages: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    limit = max(0, source_limit)
+    documents = list(documents)
+    candidate_documents = source_selector_candidate_documents(documents, limit)
+    candidates_by_type = count_by_source_type(candidate_documents)
+    if limit == 0 or not documents:
+        return {
+            "selected_documents": [],
+            "diagnostics": {
+                "candidate_count": 0,
+                "candidates_by_type": candidates_by_type,
+                "selected_by_type": {},
+                "selected_source_ids": [],
+                "dropped_by_type": candidates_by_type,
+                "dropped_agent_log_count": candidates_by_type.get("agent_session_log", 0),
+                "selector_rationale": "",
+                "source_rationales": [],
+                "selector_warnings": [],
+                "agent_focus": agent_focus,
+            },
+        }
+
+    candidate_cards = source_selector_documents(candidate_documents)
+    parsed = parse_json_object(
+        provider.complete(source_selection_prompt(candidate_cards, existing_pages or [], limit, agent_focus=agent_focus))
+    )
+    candidate_by_source_id = {f"document:{document['id']}": document for document in candidate_documents}
+    selected_source_ids, warnings = normalize_selected_source_ids(parsed.get("selected_source_ids"), candidate_by_source_id, limit)
+    selected = [candidate_by_source_id[source_id] for source_id in selected_source_ids]
+    selected_by_type = count_by_source_type(selected)
+    dropped_by_type = dropped_type_counts(candidates_by_type, selected_by_type)
+    return {
+        "selected_documents": selected,
+        "diagnostics": {
+            "candidate_count": len(candidate_documents),
+            "candidates_by_type": candidates_by_type,
+            "selected_by_type": selected_by_type,
+            "selected_source_ids": selected_source_ids,
+            "dropped_by_type": dropped_by_type,
+            "dropped_agent_log_count": dropped_by_type.get("agent_session_log", 0),
+            "selector_rationale": str(parsed.get("rationale") or ""),
+            "source_rationales": normalize_source_rationales(parsed.get("source_rationales")),
+            "selector_warnings": normalize_string_list(parsed.get("warnings")) + warnings,
+            "agent_focus": agent_focus,
+            "source_limit": limit,
+        },
+    }
+
+
+def source_selector_candidate_documents(documents: list[dict[str, Any]], source_limit: int) -> list[dict[str, Any]]:
+    if source_limit <= 0:
+        return []
+    candidate_limit = min(
+        len(documents),
+        max(
+            source_limit,
+            min(SOURCE_SELECTOR_MAX_CANDIDATES, max(SOURCE_SELECTOR_MIN_CANDIDATES, source_limit * SOURCE_SELECTOR_CANDIDATE_MULTIPLIER)),
+        ),
+    )
+    return documents[:candidate_limit]
+
+
+def source_selector_documents(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    output = []
+    for document in documents:
+        source_id = f"document:{document['id']}"
+        source_type = str(document.get("source_type") or "")
+        output.append(
+            {
+                "source_id": source_id,
+                "title": document.get("title") or document["id"],
+                "source_type": source_type,
+                "source_path": document.get("source_path"),
+                "ingested_at": document.get("ingested_at"),
+                "source_preference_hint": source_preference_hint(source_type),
+                "preview": compiler_preview(document)[:1200 if source_type in PREFERRED_SEMANTIC_SOURCE_TYPES else 700],
+            }
+        )
+    return output
+
+
+def source_selection_prompt(
+    candidate_documents: list[dict[str, Any]],
+    existing_pages: list[dict[str, Any]],
+    source_limit: int,
+    agent_focus: bool = False,
+) -> str:
+    schema = {
+        "selected_source_ids": ["document:..."],
+        "rationale": "why these are the most important sources for this synthesis pass",
+        "source_rationales": [{"source_id": "document:...", "reason": "why this source matters"}],
+        "warnings": ["optional issue or uncertainty"],
+    }
+    focus = (
+        "This run is explicitly about agent behavior, implementation history, or failure patterns; agent logs may be primary evidence."
+        if agent_focus
+        else "This is a general semantic wiki synthesis run. Prefer user-supplied/manual sources, notes, meetings, transcripts, working documents, and web clips. Use agent logs only when they are directly important evidence, such as implementation history, explicit workflow preferences, or recurring failure patterns."
+    )
+    prompt_candidates = [{key: value for key, value in document.items() if value not in (None, "")} for document in candidate_documents]
+    return (
+        "You are selecting source documents for a local PKM Brain wiki synthesis pass.\n"
+        "Choose the sources most likely to improve durable, human-readable semantic wiki pages.\n"
+        f"{focus}\n"
+        "Do not select sources just because they are recent. Do not select raw agent logs unless their content is meaningfully relevant.\n"
+        "Select up to the requested limit; selecting fewer is fine when fewer sources are actually useful.\n"
+        "Return only valid JSON matching this schema exactly enough for parsing.\n"
+        f"Requested source limit: {source_limit}\n"
+        f"Return schema: {json.dumps(schema, sort_keys=True)}\n\n"
+        f"Existing semantic pages:\n{json.dumps(existing_pages[:40], indent=2)}\n\n"
+        f"Candidate source documents:\n{json.dumps(prompt_candidates, indent=2)}"
+    )
+
+
+def source_preference_hint(source_type: str) -> str:
+    if source_type in PREFERRED_SEMANTIC_SOURCE_TYPES:
+        return "preferred semantic source"
+    if source_type == "agent_session_log":
+        return "use when directly relevant, not as default semantic evidence"
+    return "neutral source"
+
+
+def normalize_selected_source_ids(value: Any, candidates: dict[str, dict[str, Any]], limit: int) -> tuple[list[str], list[str]]:
+    warnings: list[str] = []
+    if not isinstance(value, list):
+        return [], ["selector did not return selected_source_ids as a list"]
+    selected: list[str] = []
+    seen: set[str] = set()
+    for raw_id in value:
+        source_id = str(raw_id).strip()
+        if not source_id:
+            continue
+        if source_id in seen:
+            continue
+        seen.add(source_id)
+        if source_id not in candidates:
+            warnings.append(f"selector returned unknown source_id: {source_id}")
+            continue
+        selected.append(source_id)
+    if len(selected) > limit:
+        warnings.append(f"selector returned {len(selected)} sources; trimmed to requested limit {limit}")
+        selected = selected[:limit]
+    return selected, warnings
+
+
+def normalize_source_rationales(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    output = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        source_id = str(item.get("source_id") or "").strip()
+        reason = str(item.get("reason") or "").strip()
+        if source_id and reason:
+            output.append({"source_id": source_id, "reason": reason})
+    return output
+
+
+def dropped_type_counts(candidates_by_type: dict[str, int], selected_by_type: dict[str, int]) -> dict[str, int]:
+    return {
+        source_type: max(0, count - selected_by_type.get(source_type, 0))
+        for source_type, count in candidates_by_type.items()
+        if max(0, count - selected_by_type.get(source_type, 0)) > 0
+    }
+
+
+def count_by_source_type(documents: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for document in documents:
+        source_type = str(document.get("source_type") or "unknown")
+        counts[source_type] = counts.get(source_type, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def compiler_preview(document: dict[str, Any]) -> str:
+    source_type = str(document.get("source_type") or "")
+    chunk_texts = split_chunks(document.get("chunk_texts") or "")
+    if source_type == "agent_session_log":
+        preview = "\n\n".join(clean_agent_log_preview(text, max_chars=450) for text in chunk_texts[:2])
+        return (preview or clean_agent_log_preview(str(document.get("title") or ""), max_chars=450))[:900]
+    chunk_limit = 5 if source_type in PREFERRED_SEMANTIC_SOURCE_TYPES else 3
+    char_limit = 1200 if source_type in PREFERRED_SEMANTIC_SOURCE_TYPES else 900
+    preview = "\n\n".join(clean_excerpt(text, max_chars=char_limit) for text in chunk_texts[:chunk_limit])
+    if not preview:
+        preview = clean_excerpt(str(document.get("title") or ""), max_chars=char_limit)
+    return preview[:5000 if source_type in PREFERRED_SEMANTIC_SOURCE_TYPES else 3000]
+
+
+def clean_agent_log_preview(text: str, max_chars: int = 900) -> str:
+    text = re.sub(r"\A---\n.*?\n---\n", "", text, flags=re.DOTALL)
+    output: list[str] = []
+    skip_section = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        lowered = stripped.lower()
+        if lowered.startswith("## "):
+            skip_section = lowered in {"## raw event notes", "## tool / command activity"}
+        if skip_section:
+            continue
+        if not stripped:
+            output.append("")
+            continue
+        if any(
+            marker in lowered
+            for marker in [
+                "session_meta:",
+                "you are codex",
+                "<permissions instructions>",
+                "sandbox_mode",
+                "response_item:",
+                "event_msg:",
+                "tool_use:",
+            ]
+        ):
+            continue
+        output.append(stripped)
+    cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(output)).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return f"{cleaned[:max_chars]}... [truncated]"
 
 
 def split_chunks(value: str) -> list[str]:

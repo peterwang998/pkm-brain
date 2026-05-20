@@ -30,7 +30,7 @@ pkm-brain/
     primary-secondary-brain-sync-impl-plan.md   # this file
 ```
 
-There is no `sync_config.py`, no `brain sync` group, no `brain setup`, no scheduler abstraction, and no Web UI. Several spec-listed prerequisites must be added before the transport layer can land safely (origin-aware identity, atomic schema migration, memory export). M1 absorbs those prerequisites.
+The original pre-M1 repo lacked `sync_config.py`, a `brain sync` group, `brain setup`, a scheduler abstraction, and a Web UI. Those pieces have since landed; see the drift audit below for current implementation status and remaining post-V1 items.
 
 ---
 

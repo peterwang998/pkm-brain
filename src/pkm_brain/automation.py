@@ -4,6 +4,7 @@ import fcntl
 import json
 import os
 import plistlib
+import shlex
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -14,8 +15,9 @@ from typing import Any
 from .audit import audit_memories, provenance_check
 from .capture import AgentLogCapture
 from .db import connection, dumps
+from .indexes import lancedb_stats, optimize_vectors, should_optimize_vectors
 from .llm import CODEX_DEFAULT_MODEL, DEFAULT_LLM_PROVIDER, OPENAI_DEFAULT_MODEL, get_provider
-from .memory_proposals import propose_failure_memories_from_sources
+from .memory_proposals import propose_failure_memories_from_sources, propose_memories_from_lineage
 from .paths import BrainPaths
 from .service import BrainService
 from .util import new_id, now_iso
@@ -220,18 +222,21 @@ def run_nightly_maintenance(
             summary["wiki_synthesize"] = wiki_result
 
             summary["index_status"] = index_status(paths, service)
+            summary["index_maintenance"] = run_index_maintenance(paths)
             summary["provenance_check"] = provenance_check(paths)
             summary["wiki_lint"] = lint_wiki(paths)
             if with_llm_wiki_proposals:
                 summary["wiki_proposals"] = propose_from_sources(paths, provider_name=provider)
             if with_llm_memory_proposals:
                 summary["memory_proposals"] = propose_failure_memories_from_sources(paths, provider_name=provider)
+                summary["lineage_memory_proposals"] = propose_memories_from_lineage(paths, provider_name=provider)
             summary["memory_audit"] = audit_memories(paths)
 
             errors = (
                 summary["capture"].get("errors", [])
                 + summary["ingest"].get("errors", [])
                 + summary["wiki_synthesize"].get("lint", {}).get("errors", [])
+                + summary["index_maintenance"].get("errors", [])
                 + summary["provenance_check"].get("errors", [])
                 + summary["wiki_lint"].get("errors", [])
                 + summary["memory_audit"].get("errors", [])
@@ -266,14 +271,27 @@ def index_status(paths: BrainPaths, service: BrainService | None = None) -> dict
         fts = conn.execute("SELECT COUNT(*) FROM chunk_fts").fetchone()[0]
         run = conn.execute("SELECT * FROM ingestion_runs ORDER BY started_at DESC LIMIT 1").fetchone()
     lancedb_exists = paths.lancedb_path.exists() and any(paths.lancedb_path.iterdir())
+    lancedb = lancedb_stats(paths.lancedb_path)
     return {
         "documents": docs,
         "chunks": chunks,
         "fts_rows": fts,
         "lancedb_exists": lancedb_exists,
+        "lancedb": lancedb,
         "embedding_provider": service.embedding_provider.name,
         "last_run": dict(run) if run else None,
     }
+
+
+def run_index_maintenance(paths: BrainPaths) -> dict[str, Any]:
+    try:
+        before = lancedb_stats(paths.lancedb_path)
+        if not should_optimize_vectors(before):
+            return {"status": "skipped", "reason": "below LanceDB optimization thresholds", "before": before, "errors": []}
+        result = optimize_vectors(paths.lancedb_path, cleanup_older_than_days=1)
+        return {**result, "errors": []}
+    except Exception as exc:
+        return {"status": "failed", "error": str(exc), "errors": [str(exc)]}
 
 
 def nightly_due(paths: BrainPaths, due_after_hours: int) -> bool:
@@ -348,11 +366,18 @@ def render_launch_agent(
     interval: int = 600,
     include_hyprnote: bool = False,
 ) -> dict[str, Any]:
-    hyprnote_arg = " --include-hyprnote" if include_hyprnote else ""
-    command = (
-        f"cd {repo_path} && "
-        f"{uv_path} run brain automation run-agent-log-ingest --home {brain_home}{hyprnote_arg}"
-    )
+    args = [
+        str(uv_path),
+        "run",
+        "brain",
+        "automation",
+        "run-agent-log-ingest",
+        "--home",
+        str(brain_home),
+    ]
+    if include_hyprnote:
+        args.append("--include-hyprnote")
+    command = f"cd {shlex.quote(str(repo_path))} && {shlex.join(args)}"
     return {
         "Label": LAUNCH_AGENT_LABEL,
         "ProgramArguments": ["/bin/zsh", "-lc", command],
@@ -375,21 +400,29 @@ def render_nightly_launch_agent(
     llm_wiki: bool = True,
     provider: str | None = None,
 ) -> dict[str, Any]:
-    llm_args = ""
+    args = [
+        str(uv_path),
+        "run",
+        "brain",
+        "automation",
+        "nightly",
+        "--if-due",
+        "--due-after-hours",
+        str(due_after_hours),
+        "--home",
+        str(brain_home),
+    ]
     if with_llm_wiki_proposals:
-        llm_args = " --with-llm-wiki-proposals"
+        args.append("--with-llm-wiki-proposals")
     if with_llm_memory_proposals:
-        llm_args += " --with-llm-memory-proposals"
+        args.append("--with-llm-memory-proposals")
     if not llm_wiki:
-        llm_args += " --no-llm-wiki"
+        args.append("--no-llm-wiki")
     llm_provider = provider or (DEFAULT_LLM_PROVIDER if llm_wiki or with_llm_wiki_proposals or with_llm_memory_proposals else None)
     if llm_wiki or with_llm_wiki_proposals or with_llm_memory_proposals:
         if llm_provider:
-            llm_args += f" --provider {llm_provider}"
-    command = (
-        f"cd {repo_path} && "
-        f"{uv_path} run brain automation nightly --if-due --due-after-hours {due_after_hours} --home {brain_home}{llm_args}"
-    )
+            args.extend(["--provider", llm_provider])
+    command = f"cd {shlex.quote(str(repo_path))} && {shlex.join(args)}"
     plist = {
         "Label": NIGHTLY_LAUNCH_AGENT_LABEL,
         "ProgramArguments": ["/bin/zsh", "-lc", command],

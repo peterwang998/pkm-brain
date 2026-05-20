@@ -5,7 +5,7 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
-from pkm_brain.cli import app
+from pkm_brain.cli import app, ui_startup_lines
 from pkm_brain.ui_server import validate_ui_bind
 
 
@@ -48,3 +48,13 @@ def test_ui_lan_bind_allows_with_warning(tmp_path: Path) -> None:
     payload = json.loads(result.output[result.output.index("{") :])
     assert payload["host"] == "0.0.0.0"
     assert payload["port"] == 18766
+
+
+def test_ui_startup_lines_print_copyable_token() -> None:
+    lines = ui_startup_lines("127.0.0.1", 8765, "copy-me")
+
+    assert lines == [
+        "Brain UI listening on http://127.0.0.1:8765",
+        "Token: copy-me",
+    ]
+    assert "Token file" not in "\n".join(lines)

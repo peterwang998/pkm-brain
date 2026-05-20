@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -875,10 +874,6 @@ def find_provider(events: list[dict[str, Any]]) -> str:
         if event.get("provider"):
             return str(event["provider"])
     return "Unknown"
-
-
-def hash_bytes(value: bytes) -> str:
-    return hashlib.sha256(value).hexdigest()
 
 
 def capture_state_hash(source_hash: str) -> str:

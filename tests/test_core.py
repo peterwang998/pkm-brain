@@ -4,12 +4,15 @@ import json
 from pathlib import Path
 
 from pkm_brain.audit import audit_memories
+from pkm_brain.chunking import chunk_text
 from pkm_brain.db import connection
-from pkm_brain.indexes import table_names
-from pkm_brain.memory_proposals import propose_failure_memories_from_sources
+from pkm_brain.indexes import lancedb_stats, table_names, upsert_vectors
+from pkm_brain.memory_proposals import propose_failure_memories_from_sources, propose_memories_from_lineage
 from pkm_brain.paths import BrainPaths
 from pkm_brain.service import BrainService
+from pkm_brain.util import text_sha256, token_count
 from pkm_brain.wiki import lint_wiki, parse_frontmatter, synthesize_wiki
+from pkm_brain.wiki_compiler import clean_agent_log_preview, select_compiler_sources
 from pkm_brain.wiki_proposals import apply_wiki_proposal, create_wiki_proposal, inspect_wiki_proposal, record_wiki_interview
 
 
@@ -48,6 +51,230 @@ def test_ingest_markdown_chunks_and_searches(tmp_path: Path) -> None:
     assert search["event_id"]
     context = svc.retrieve_context("explain sqlite metadata", project="pkm-system")
     assert context["supporting_chunks"]
+
+
+def test_search_uses_source_aware_reranking_and_backfill(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    meeting = svc.paths.inbox / "alpha-meeting.md"
+    meeting.write_text(
+        "---\n"
+        'source_type: "hyprnote_meeting"\n'
+        'title: "Alpha Pricing Meeting"\n'
+        "---\n\n"
+        "# Meeting\n\nAlpha pricing marker describes durable customer context.\n",
+        encoding="utf-8",
+    )
+    log = svc.paths.inbox / "agent_logs" / "codex" / "alpha-log.md"
+    log.parent.mkdir(parents=True)
+    log.write_text(
+        "---\n"
+        'source_type: "agent_session_log"\n'
+        'title: "Alpha Pricing Agent Log"\n'
+        "---\n\n"
+        "- session_meta: You are Codex, a coding agent based on GPT-5.\n"
+        "- event_msg: alpha pricing marker command trace noise.\n",
+        encoding="utf-8",
+    )
+    svc.ingest()
+
+    result = svc.search("alpha pricing marker", limit=2, debug=True)
+
+    assert len(result["results"]) == 2
+    assert result["results"][0]["source_type"] == "hyprnote_meeting"
+    assert result["results"][0]["retrieval_score"] >= result["results"][1]["retrieval_score"]
+    assert result["debug"]["selected_chunk_reasons"][0]["retrieval_noise_reasons"] == []
+    assert any(
+        row["source_type"] == "agent_session_log"
+        for row in result["debug"]["reranked_candidates"]
+    )
+
+
+def test_search_agent_query_can_rank_agent_logs_highly(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    log = svc.paths.inbox / "agent_logs" / "codex" / "tool-session.md"
+    log.parent.mkdir(parents=True)
+    log.write_text(
+        "---\n"
+        'source_type: "agent_session_log"\n'
+        'title: "Codex Agent Tool Session"\n'
+        "---\n\n"
+        "## User Requests\n\nInvestigate the agent tool session retry marker.\n",
+        encoding="utf-8",
+    )
+    note = svc.paths.inbox / "tool-note.md"
+    note.write_text("# Tool Note\n\nInvestigate the tool session retry marker.\n", encoding="utf-8")
+    svc.ingest()
+
+    result = svc.search("agent tool session retry marker", limit=2, debug=True)
+
+    assert result["results"][0]["source_type"] == "agent_session_log"
+    assert any("source_type agent_session_log" in reason for reason in result["results"][0]["selection_reasons"])
+
+
+def test_oversized_block_splits_with_overlap() -> None:
+    text = " ".join(f"word{i}" for i in range(2600))
+
+    chunks = chunk_text(text, "agent_session_log", target_tokens=1000, overlap_tokens=200)
+
+    assert len(chunks) == 3
+    assert all(chunk.token_count <= 1000 for chunk in chunks)
+    assert chunks[0].text.split()[-200:] == chunks[1].text.split()[:200]
+    assert chunks[1].text.split()[-200:] == chunks[2].text.split()[:200]
+    assert [chunk.chunk_index for chunk in chunks] == [0, 1, 2]
+    assert chunks[0].start_offset < chunks[1].start_offset < chunks[2].start_offset
+    assert chunks[0].end_offset < chunks[1].end_offset < chunks[2].end_offset
+
+
+def test_small_block_keeps_single_chunk() -> None:
+    chunks = chunk_text("short note\n\nwith two paragraphs", "agent_session_log", target_tokens=1000, overlap_tokens=200)
+
+    assert len(chunks) == 1
+    assert chunks[0].text == "short note\n\nwith two paragraphs"
+
+
+def test_index_doctor_reports_lancedb_health(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "sqlite-decision.md"
+    note.write_text("# SQLite Decision\n\nSQLite stores metadata and chunks.\n", encoding="utf-8")
+    svc.ingest()
+
+    result = svc.index_doctor()
+
+    assert result["status"] == "ok"
+    assert result["sqlite_chunks"] >= 1
+    assert result["lancedb"]["rows"] == result["sqlite_chunks"]
+    assert result["missing_vector_count"] == 0
+    assert result["stale_vector_count"] == 0
+
+
+def test_rebuild_vector_index_from_sqlite_chunks(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "sqlite-decision.md"
+    note.write_text("# SQLite Decision\n\nSQLite stores metadata and chunks.\n", encoding="utf-8")
+    svc.ingest()
+    before = lancedb_stats(svc.paths.lancedb_path)
+
+    result = svc.rebuild_vector_index()
+
+    assert result["status"] == "ok"
+    assert result["sqlite_chunks"] == before["rows"]
+    assert result["after"]["rows"] == before["rows"]
+    assert result["backup_retained"] is True
+    assert Path(result["backup_path"]).exists()
+    search = svc.search("SQLite metadata", limit=3)
+    assert search["results"]
+
+
+def test_optimize_indexes_is_safe_when_lancedb_exists(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "sqlite-decision.md"
+    note.write_text("# SQLite Decision\n\nSQLite stores metadata and chunks.\n", encoding="utf-8")
+    svc.ingest()
+
+    result = svc.optimize_indexes()
+
+    assert result["status"] == "ok"
+    assert result["after"]["rows"] == result["before"]["rows"]
+
+
+def test_reindex_chunks_rewrites_existing_oversized_document(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    raw_path = svc.paths.raw / "agent_session_log" / "2026" / "05" / "oversized.md"
+    raw_path.parent.mkdir(parents=True)
+    text = " ".join(f"token{i}" for i in range(2600))
+    raw_path.write_text(text, encoding="utf-8")
+    document_id = "doc_oversized"
+    chunk_id = "chunk_oversized"
+
+    with connection(svc.paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO documents(
+              id, source_type, title, source_path, raw_path, content_hash,
+              origin_node_id, logical_source_key, created_at, ingested_at,
+              project, tags, sensitivity, version, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                document_id,
+                "agent_session_log",
+                "Oversized Session",
+                str(raw_path),
+                str(raw_path),
+                text_sha256(text),
+                "<local>",
+                str(raw_path),
+                "2026-05-20T00:00:00+00:00",
+                "2026-05-20T00:00:00+00:00",
+                None,
+                "[]",
+                "normal",
+                1,
+                "active",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO chunks(
+              id, document_id, chunk_index, corpus_type, text, heading_path,
+              start_offset, end_offset, token_count, content_hash, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                chunk_id,
+                document_id,
+                0,
+                "raw",
+                text,
+                "",
+                0,
+                len(text),
+                token_count(text),
+                text_sha256(text),
+                "2026-05-20T00:00:00+00:00",
+            ),
+        )
+        conn.execute(
+            "INSERT INTO chunk_fts(chunk_id, title, text, heading_path, project, tags) VALUES (?, ?, ?, ?, ?, ?)",
+            (chunk_id, "Oversized Session", text, "", "", ""),
+        )
+    upsert_vectors(
+        svc.paths.lancedb_path,
+        [
+            {
+                "chunk_id": chunk_id,
+                "document_id": document_id,
+                "text": text,
+                "vector": svc.embedding_provider.embed([text])[0],
+            }
+        ],
+    )
+
+    dry_run = svc.reindex_chunks(dry_run=True, target_tokens=1000, overlap_tokens=200)
+    result = svc.reindex_chunks(target_tokens=1000, overlap_tokens=200)
+
+    assert dry_run["status"] == "dry_run"
+    assert dry_run["affected_documents"] == 1
+    assert dry_run["documents"][0]["current_chunks"] == 1
+    assert dry_run["documents"][0]["projected_chunks"] == 3
+    assert result["status"] == "ok"
+    assert result["rewritten_chunks"] == 3
+    with connection(svc.paths.sqlite_path) as conn:
+        chunk_rows = list(conn.execute("SELECT * FROM chunks WHERE document_id = ? ORDER BY chunk_index", (document_id,)))
+        fts_count = conn.execute("SELECT COUNT(*) FROM chunk_fts WHERE chunk_id IN (SELECT id FROM chunks WHERE document_id = ?)", (document_id,)).fetchone()[0]
+    assert len(chunk_rows) == 3
+    assert fts_count == 3
+    assert max(row["token_count"] for row in chunk_rows) <= 1000
+    assert lancedb_stats(svc.paths.lancedb_path)["rows"] == 3
+    assert svc.index_doctor()["status"] == "ok"
+    search = svc.search("token999 token1000", limit=5)
+    assert search["results"]
 
 
 def test_lancedb_table_names_accepts_result_objects() -> None:
@@ -243,6 +470,16 @@ def test_wiki_synthesis_compiles_semantic_pages_with_default_llm(tmp_path: Path,
         model = "test"
 
         def complete(self, prompt: str) -> str:
+            if "You are selecting source documents" in prompt:
+                assert "Prefer user-supplied/manual sources" in prompt
+                return json.dumps(
+                    {
+                        "selected_source_ids": [source_id],
+                        "rationale": "The architecture note directly supports semantic wiki pages.",
+                        "source_rationales": [{"source_id": source_id, "reason": "Primary architecture evidence."}],
+                        "warnings": [],
+                    }
+                )
             return json.dumps(
                 {
                     "title": "Compile PKM wiki",
@@ -313,6 +550,7 @@ def test_wiki_synthesis_compiles_semantic_pages_with_default_llm(tmp_path: Path,
     assert result["lint"]["errors"] == []
     assert result["llm_compile"]["provider"] == "fake"
     assert result["llm_compile"]["status"] == "ok"
+    assert result["llm_compile"]["source_selection"]["selected_by_type"]["markdown_note"] == 1
     index = (svc.paths.wiki / "index.md").read_text(encoding="utf-8")
     concept = (svc.paths.wiki / "concepts" / "wiki-synthesis-layer.md").read_text(encoding="utf-8")
     decision = (svc.paths.wiki / "decisions" / "use-sqlite-for-canonical-metadata.md").read_text(encoding="utf-8")
@@ -333,6 +571,139 @@ def test_wiki_synthesis_compiles_semantic_pages_with_default_llm(tmp_path: Path,
     assert context["supporting_chunks"]
     assert any(page["relative_path"] == "concepts/wiki-synthesis-layer.md" for page in context["relevant_wiki_pages"])
     assert any(str(citation).startswith("document:") for citation in context["citations"])
+
+
+def test_wiki_source_selection_uses_llm_choice_without_hard_agent_log_cap() -> None:
+    documents: list[dict[str, object]] = []
+    for index in range(8):
+        documents.append(
+            {
+                "id": f"doc_log_{index}",
+                "title": f"Recent Agent Log {index}",
+                "source_type": "agent_session_log",
+                "source_path": f"/tmp/log-{index}.md",
+                "ingested_at": f"2026-05-20T0{index}:00:00+00:00",
+            }
+        )
+    documents.extend(
+        [
+            {
+                "id": "doc_meeting",
+                "title": "Older Meeting",
+                "source_type": "hyprnote_meeting",
+                "source_path": "/tmp/meeting.md",
+                "ingested_at": "2026-05-01T00:00:00+00:00",
+            },
+            {
+                "id": "doc_note",
+                "title": "Older Note",
+                "source_type": "markdown_note",
+                "source_path": "/tmp/note.md",
+                "ingested_at": "2026-05-02T00:00:00+00:00",
+            },
+        ]
+    )
+
+    class FakeProvider:
+        name = "fake"
+        model = "test"
+
+        def complete(self, prompt: str) -> str:
+            assert "Prefer user-supplied/manual sources" in prompt
+            assert "Recent Agent Log 7" in prompt
+            assert "Older Meeting" in prompt
+            return json.dumps(
+                {
+                    "selected_source_ids": [
+                        "document:doc_meeting",
+                        "document:doc_note",
+                        "document:doc_log_7",
+                        "document:doc_log_6",
+                        "document:doc_log_5",
+                    ],
+                    "rationale": "The older human sources are semantic evidence, and three logs are relevant implementation history.",
+                    "source_rationales": [
+                        {"source_id": "document:doc_meeting", "reason": "Meeting evidence."},
+                        {"source_id": "document:doc_note", "reason": "Manual note evidence."},
+                        {"source_id": "document:doc_log_7", "reason": "Relevant implementation history."},
+                    ],
+                    "warnings": [],
+                }
+            )
+
+    selected = select_compiler_sources(FakeProvider(), documents, source_limit=5)
+
+    selected_ids = selected["diagnostics"]["selected_source_ids"]
+    assert "document:doc_meeting" in selected_ids
+    assert "document:doc_note" in selected_ids
+    assert selected["diagnostics"]["selected_by_type"]["agent_session_log"] == 3
+    assert "agent_log_cap" not in selected["diagnostics"]
+    assert selected["diagnostics"]["dropped_agent_log_count"] == 5
+    assert selected["diagnostics"]["selector_rationale"].startswith("The older human sources")
+
+
+def test_wiki_source_selector_filters_unknown_ids_and_trims_to_limit() -> None:
+    documents = [
+        {
+            "id": "doc_note",
+            "title": "Manual Note",
+            "source_type": "manual_entry",
+            "source_path": "/tmp/note.md",
+            "ingested_at": "2026-05-02T00:00:00+00:00",
+        },
+        {
+            "id": "doc_transcript",
+            "title": "Meeting Transcript",
+            "source_type": "meeting_transcript",
+            "source_path": "/tmp/transcript.txt",
+            "ingested_at": "2026-05-03T00:00:00+00:00",
+        },
+    ]
+
+    class FakeProvider:
+        name = "fake"
+        model = "test"
+
+        def complete(self, prompt: str) -> str:
+            assert "preferred semantic source" in prompt
+            return json.dumps(
+                {
+                    "selected_source_ids": [
+                        "document:doc_note",
+                        "document:missing",
+                        "document:doc_transcript",
+                    ],
+                    "rationale": "Manual source first.",
+                    "source_rationales": [],
+                    "warnings": ["missing id should be ignored"],
+                }
+            )
+
+    selected = select_compiler_sources(FakeProvider(), documents, source_limit=1)
+
+    assert selected["diagnostics"]["selected_source_ids"] == ["document:doc_note"]
+    assert any("unknown source_id" in warning for warning in selected["diagnostics"]["selector_warnings"])
+    assert any("trimmed to requested limit 1" in warning for warning in selected["diagnostics"]["selector_warnings"])
+
+
+def test_agent_log_compiler_preview_is_cleaned_and_capped() -> None:
+    preview = clean_agent_log_preview(
+        "# Agent Session\n\n"
+        "- session_meta: You are Codex, a coding agent based on GPT-5.\n"
+        "## User Requests\n\n"
+        "Keep the useful request.\n\n"
+        "## Tool / Command Activity\n\n"
+        "- event_msg: noisy tool output\n"
+        "## Assistant Responses\n\n"
+        + " ".join(f"detail{i}" for i in range(400)),
+        max_chars=300,
+    )
+
+    assert "session_meta" not in preview
+    assert "You are Codex" not in preview
+    assert "event_msg" not in preview
+    assert "Keep the useful request" in preview
+    assert len(preview) <= 320
 
 
 def test_retrieve_context_reranks_clean_sources_and_source_linked_wiki(tmp_path: Path) -> None:
@@ -544,6 +915,106 @@ def test_retrieve_context_latest_query_boosts_recent_documents(tmp_path: Path) -
     assert any("recency intent boost" in reason for reason in context["supporting_chunks"][0]["selection_reasons"])
 
 
+def test_retrieve_context_records_exposures_without_rank_boost(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "lineage-note.md"
+    note.write_text("# Lineage Note\n\nlineage exposure marker local evidence.\n", encoding="utf-8")
+    svc.ingest()
+    memory_id = svc.propose_memory("FactMemory", "global", "Lineage exposure memory.", ["document:test"], 0.8)
+    svc.approve_memory(memory_id)
+    wiki_dir = svc.paths.wiki / "concepts"
+    wiki_dir.mkdir(parents=True)
+    (wiki_dir / "lineage-exposure.md").write_text(
+        "---\n"
+        "title: Lineage Exposure\n"
+        "page_type: concept\n"
+        "id: concept-lineage-exposure\n"
+        "status: active\n"
+        "source_ids: []\n"
+        "related: []\n"
+        "tags: []\n"
+        "---\n\n"
+        "# Lineage Exposure\n\n"
+        "## Summary\n\nlineage exposure marker wiki page.\n",
+        encoding="utf-8",
+    )
+
+    first = svc.retrieve_context("lineage exposure marker", debug=True)
+    second = svc.retrieve_context("lineage exposure marker", debug=True)
+
+    with connection(svc.paths.sqlite_path) as conn:
+        counts = {
+            row["target_type"]: row["count"]
+            for row in conn.execute(
+                """
+                SELECT target_type, COUNT(*) AS count
+                FROM context_lineage_events
+                WHERE event_type = 'exposed'
+                GROUP BY target_type
+                """
+            )
+        }
+    assert first["retrieval_event_id"]
+    assert counts["chunk"] >= 1
+    assert counts["memory"] >= 1
+    assert counts["wiki_page"] >= 1
+    assert all(chunk.get("lineage_score", 0.0) == 0.0 for chunk in second["supporting_chunks"])
+
+
+def test_context_feedback_adjusts_ranking_as_capped_tiebreaker(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    first = svc.paths.inbox / "feedback-a.md"
+    second = svc.paths.inbox / "feedback-b.md"
+    first.write_text("# Feedback A\n\nlineage feedback marker alpha.\n", encoding="utf-8")
+    second.write_text("# Feedback B\n\nlineage feedback marker beta.\n", encoding="utf-8")
+    svc.ingest()
+    with connection(svc.paths.sqlite_path) as conn:
+        chunks = [dict(row) for row in conn.execute("SELECT c.id, d.title FROM chunks c JOIN documents d ON d.id = c.document_id")]
+    first_chunk = next(row["id"] for row in chunks if row["title"] == "feedback a")
+    second_chunk = next(row["id"] for row in chunks if row["title"] == "feedback b")
+
+    svc.record_context_feedback("chunk", second_chunk, useful=True, note="good context")
+    svc.record_context_feedback("chunk", first_chunk, useful=False, note="wrong context")
+    result = svc.search("lineage feedback marker", limit=2, debug=True)
+
+    by_id = {row["chunk_id"]: row for row in result["results"]}
+    assert by_id[second_chunk]["lineage_score"] > 0
+    assert by_id[first_chunk]["lineage_score"] < 0
+    assert result["results"][0]["chunk_id"] == second_chunk
+    assert any("explicit useful" in reason for reason in by_id[second_chunk]["selection_reasons"])
+    assert any("explicit not useful" in reason for reason in by_id[first_chunk]["selection_reasons"])
+
+
+def test_agent_log_ingest_records_stable_id_lineage_once_per_session(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    log = svc.paths.inbox / "agent_logs" / "codex" / "stable-refs.md"
+    log.parent.mkdir(parents=True)
+    log.write_text(
+        "---\n"
+        'source_type: "agent_session_log"\n'
+        'session_id: "stable-session"\n'
+        'title: "Stable refs"\n'
+        "---\n\n"
+        "Referenced chunk_repeat and chunk_repeat plus document:doc_repeat and concepts/retrieval.md.\n",
+        encoding="utf-8",
+    )
+
+    svc.ingest()
+    svc.ingest()
+
+    with connection(svc.paths.sqlite_path) as conn:
+        events = [dict(row) for row in conn.execute("SELECT target_type, target_id, agent_session_id FROM context_lineage_events")]
+    assert sorted((event["target_type"], event["target_id"]) for event in events) == [
+        ("chunk", "chunk_repeat"),
+        ("document", "doc_repeat"),
+        ("wiki_page", "concepts/retrieval.md"),
+    ]
+    assert {event["agent_session_id"] for event in events} == {"stable-session"}
+
+
 def test_memory_audit_warns_on_missing_source(tmp_path: Path) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()
@@ -645,6 +1116,128 @@ def test_failure_memory_proposals_dedupe_existing_active_and_create_proposed(tmp
     created = svc.get_memory(result["memory_ids"][0])
     assert created["memory_type"] == "AgentFailurePatternMemory"
     assert created["status"] == "proposed"
+
+
+def test_lineage_memory_proposal_requires_independent_evidence(tmp_path: Path, monkeypatch) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    with connection(svc.paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO context_lineage_events(
+              id, target_type, target_id, event_type, agent_session_id,
+              weight, metadata, created_at
+            ) VALUES (
+              'lineage_one', 'chunk', 'chunk_noisy', 'agent_referenced_id',
+              'session-one', 0.25, '{}', '2026-05-20T00:00:00+00:00'
+            )
+            """
+        )
+
+    result = propose_memories_from_lineage(svc.paths, provider_name="fake")
+
+    assert result["created"] is False
+    assert result["reason"] == "no eligible lineage clusters found"
+
+
+def test_lineage_memory_proposal_creates_proposed_memory_from_three_sessions(tmp_path: Path, monkeypatch) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    with connection(svc.paths.sqlite_path) as conn:
+        for index in range(3):
+            conn.execute(
+                """
+                INSERT INTO context_lineage_events(
+                  id, target_type, target_id, event_type, agent_session_id,
+                  weight, metadata, created_at
+                ) VALUES (?, 'chunk', 'chunk_shared', 'agent_referenced_id', ?, 0.25, ?, ?)
+                """,
+                (
+                    f"lineage_ref_{index}",
+                    f"session-{index}",
+                    json.dumps({"source_id": f"document:doc_log_{index}"}),
+                    f"2026-05-20T0{index}:00:00+00:00",
+                ),
+            )
+
+    class FakeProvider:
+        name = "fake"
+        model = "test"
+
+        def complete(self, prompt: str) -> str:
+            assert "chunk:chunk_shared" in prompt
+            return json.dumps(
+                {
+                    "memories": [
+                        {
+                            "cluster_id": "chunk:chunk_shared",
+                            "memory_type": "FactMemory",
+                            "scope": "global",
+                            "content": "Use the shared retrieval chunk as durable evidence when answering this recurring workflow question.",
+                            "source_ids": ["chunk_shared", "document:doc_log_0", "document:doc_log_1", "document:doc_log_2"],
+                            "rationale": "Three independent sessions referenced the same stable chunk id.",
+                            "confidence": 0.78,
+                        }
+                    ]
+                }
+            )
+
+    monkeypatch.setattr("pkm_brain.memory_proposals.get_provider", lambda provider_name=None: FakeProvider())
+
+    result = propose_memories_from_lineage(svc.paths, provider_name="fake")
+
+    assert result["created_count"] == 1
+    proposed = svc.get_memory(result["memory_ids"][0])
+    assert proposed["status"] == "proposed"
+    assert proposed["source_ids"]
+    assert result["memories"][0]["independent_session_count"] == 3
+    assert result["memories"][0]["rationale"]
+
+
+def test_lineage_memory_proposal_accepts_two_sessions_plus_useful_feedback(tmp_path: Path, monkeypatch) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    with connection(svc.paths.sqlite_path) as conn:
+        for index in range(2):
+            conn.execute(
+                """
+                INSERT INTO context_lineage_events(
+                  id, target_type, target_id, event_type, agent_session_id,
+                  weight, metadata, created_at
+                ) VALUES (?, 'document', 'doc_shared', 'agent_referenced_id', ?, 0.25, '{}', ?)
+                """,
+                (f"lineage_doc_ref_{index}", f"session-{index}", f"2026-05-20T0{index}:00:00+00:00"),
+            )
+    svc.record_context_feedback("document", "document:doc_shared", useful=True)
+
+    class FakeProvider:
+        name = "fake"
+        model = "test"
+
+        def complete(self, prompt: str) -> str:
+            assert "2 distinct sessions plus explicit useful feedback" in prompt
+            return json.dumps(
+                {
+                    "memories": [
+                        {
+                            "cluster_id": "document:doc_shared",
+                            "memory_type": "ProjectMemory",
+                            "scope": "global",
+                            "content": "Treat the shared document as recurring project context when related questions come up.",
+                            "source_ids": ["document:doc_shared"],
+                            "rationale": "Two sessions referenced it and a reviewer marked it useful.",
+                            "confidence": 0.8,
+                        }
+                    ]
+                }
+            )
+
+    monkeypatch.setattr("pkm_brain.memory_proposals.get_provider", lambda provider_name=None: FakeProvider())
+
+    result = propose_memories_from_lineage(svc.paths, provider_name="fake")
+
+    assert result["created_count"] == 1
+    assert svc.get_memory(result["memory_ids"][0])["status"] == "proposed"
 
 
 def test_wiki_proposal_interview_and_apply_patches_section(tmp_path: Path) -> None:

@@ -102,6 +102,7 @@ The MCP server exposes tools for:
 
 - `search_knowledge`
 - `retrieve_context`
+- `record_context_feedback`
 - `get_memories`
 - `propose_memory`
 - `propose_wiki_update`
@@ -114,7 +115,18 @@ Agents should use these tools instead of reading SQLite or LanceDB directly.
 
 `retrieve_context` returns reviewed `active_memories` separately from unreviewed `candidate_memories`. Active memories are trusted operational guidance. Candidate memories are proposed hypotheses and should not be treated as authoritative until a human approves them through the local CLI. MCP agents can propose memories with `propose_memory`, but they cannot approve, reject, or archive memories.
 
-`retrieve_context` uses bounded retrieval so noisy sources do not consume the whole agent context. The default mode uses an 8,000-token context budget, source-specific caps, and excerpts oversized chunks. Agent session logs are compressed more aggressively than curated notes or meeting sources. The MCP tool intentionally keeps a simple `task`/`project` surface and uses the default bounded mode. The CLI and service layer also support `--mode compact`, `--mode broad`, and `--mode inspect` for manual or scripted use. Returned chunks include `original_token_count`, `returned_token_count`, `omitted_tokens`, and `excerpted` metadata.
+`search_knowledge` and `retrieve_context` use source-aware reranking after BM25/vector fan-out. Meetings, notes, transcripts, web clips, and working documents get a positive default signal for normal knowledge queries. Agent session logs are still searchable, but they are downranked for general knowledge and can rank highly for agent/session/tool/implementation-history queries.
+
+`retrieve_context` uses bounded retrieval so noisy sources do not consume the whole agent context. The default mode uses an 8,000-token context budget, source-specific caps, and excerpts oversized chunks. Agent session logs are compressed more aggressively than curated notes or meeting sources. The MCP tool intentionally keeps a simple `task`/`project` surface and uses the default bounded mode. The CLI and service layer also support `--mode compact`, `--mode broad`, and `--mode inspect` for manual or scripted use. Returned chunks include `retrieval_score`, `selection_reasons`, `suppressed`, `suppress_reasons`, `retrieval_noise_reasons`, `original_token_count`, `returned_token_count`, `omitted_tokens`, and `excerpted` metadata.
+
+Context feedback is explicit and advisory:
+
+```bash
+uv run brain context feedback chunk chunk_<id> --useful --note "good source for this topic"
+uv run brain context feedback document doc_<id> --not-useful --note "wrong project"
+```
+
+Exposure-only lineage is recorded for returned chunks, active memories, and wiki pages, but exposure does not improve ranking. Explicit useful/not-useful feedback and repeated stable-ID references from independent agent sessions act only as capped tie-breakers.
 
 ### Codex Persistent Memory
 
@@ -238,6 +250,7 @@ Run core checks:
 
 ```bash
 uv run brain index status --home ~/brain
+uv run brain index doctor --home ~/brain
 uv run brain provenance check --home ~/brain
 uv run brain wiki lint --home ~/brain
 uv run brain memory audit --home ~/brain
@@ -493,6 +506,7 @@ The nightly job runs:
 - inbox ingestion
 - generated wiki synthesis with default LLM semantic compilation
 - index status collection
+- conservative LanceDB optimization when index bloat crosses maintenance thresholds
 - provenance check
 - wiki lint
 - memory audit
@@ -543,6 +557,8 @@ Preview generated pages:
 ```bash
 uv run brain wiki synthesize --dry-run
 ```
+
+The LLM compiler asks the LLM to select the source documents for each semantic synthesis pass instead of simply taking the latest documents. It sends bounded candidate cards with a soft preference for user-supplied/manual sources, meetings, notes, transcripts, web clips, and working documents. Agent logs remain available when they are directly relevant, such as implementation history, workflow preferences, or failure patterns. Dry-run output includes `llm_compile.source_selection` with candidate counts, selected source IDs, selected/dropped counts by type, selector rationale, and selector warnings.
 
 Create or update generated wiki pages with the default Codex-backed LLM compiler:
 
@@ -672,6 +688,14 @@ Generate failure-memory proposals from recent agent sessions, logs, retrieval ev
 uv run brain memory propose-from-sources --provider codex
 ```
 
+Generate broader memory proposals from repeated lineage signals:
+
+```bash
+uv run brain memory propose-from-lineage --provider codex
+```
+
+Lineage-based proposals require independent evidence by default: at least three distinct agent sessions, or two sessions plus explicit useful feedback, or two sessions plus a later stable-ID re-reference. Agent-log popularity is review input, not truth. The job should propose only durable, actionable memories, and every generated memory remains `status: proposed` until a human approves it.
+
 Enable the same synthesis during nightly maintenance:
 
 ```bash
@@ -679,7 +703,7 @@ uv run brain automation nightly --with-llm-memory-proposals --provider codex
 uv run brain launch-agent install-nightly --with-llm-memory-proposals --provider codex
 ```
 
-This creates only `proposed` memories. Future agents should use `active_memories` as trusted guidance and treat `candidate_memories` as unreviewed lower-priority candidates.
+This creates only `proposed` memories. Future agents should use `active_memories` as trusted guidance and treat `candidate_memories` as unreviewed lower-priority candidates. Lineage data is advisory, rebuildable, and auditable; human memory approval remains the trust boundary.
 
 ### LLM Provider Configuration
 
@@ -689,6 +713,7 @@ Normal capture, ingest, search, MCP retrieval, and sync do not call an LLM. Wiki
 uv run brain wiki synthesize
 uv run brain automation nightly
 uv run brain memory propose-from-sources
+uv run brain memory propose-from-lineage
 uv run brain wiki propose-from-sources
 uv run brain automation nightly --with-llm-wiki-proposals
 uv run brain automation nightly --with-llm-memory-proposals
@@ -766,6 +791,45 @@ uv run brain mcp
 
 Runtime data is stored outside the repo in `~/brain` by default.
 
+## Index Maintenance
+
+SQLite stores canonical document and chunk metadata. LanceDB under `~/brain/indexes/lancedb` is a rebuildable vector index and can accumulate old table versions during continuous capture, ingest, and sync.
+
+Inspect index health:
+
+```bash
+uv run brain index doctor --home ~/brain
+```
+
+Prune old LanceDB versions without touching SQLite, raw files, wiki pages, or memories:
+
+```bash
+uv run brain index optimize --home ~/brain
+```
+
+The default cleanup window is conservative for scheduled maintenance. For a one-time manual cleanup when no long-running Brain readers are active, use:
+
+```bash
+uv run brain index optimize --home ~/brain --cleanup-older-than-days 0
+```
+
+If the vector index becomes inconsistent with SQLite, rebuild it from canonical chunks:
+
+```bash
+uv run brain index rebuild-vectors --home ~/brain
+```
+
+`rebuild-vectors` keeps the previous LanceDB directory as a timestamped backup unless `--delete-backup` is passed after successful verification.
+
+If older agent-session logs contain oversized chunks, preview and then regenerate bounded overlapping chunks from the preserved raw files:
+
+```bash
+uv run brain db reindex-chunks --home ~/brain --source-type agent_session_log --dry-run
+uv run brain db reindex-chunks --home ~/brain --source-type agent_session_log
+```
+
+Reindexing rewrites SQLite chunks, FTS rows, and LanceDB vectors for affected documents only. It does not delete raw files, wiki pages, memories, or source evidence.
+
 ## Current V1 Scope
 
 Implemented:
@@ -792,6 +856,8 @@ Implemented:
 - Codex, Claude, OpenCode, and Hyprnote capture
 - macOS LaunchAgent scheduled polling
 - hourly due-check nightly maintenance LaunchAgent
+- local Web UI with token-authenticated JSON API for status, setup, sync, jobs, logs, and memory review
+- Primary/Secondary sync setup, scheduler commands, transport, and acceptance preflight
 - MCP server wrapper
 
 Not yet implemented:
@@ -801,8 +867,7 @@ Not yet implemented:
 - local reranking
 - cloud embedding providers
 - general-purpose background filesystem watcher
-- HTTP API
-- GUI or Obsidian plugin
+- packaged desktop GUI or Obsidian plugin
 
 ## Development
 

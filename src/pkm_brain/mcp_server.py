@@ -24,6 +24,15 @@ def create_mcp(home: str | None = None):
         return service.retrieve_context(task=task, project=project)
 
     @mcp.tool()
+    def record_context_feedback(
+        target_type: str,
+        target_id: str,
+        useful: bool,
+        note: str | None = None,
+    ) -> dict:
+        return service.record_context_feedback(target_type=target_type, target_id=target_id, useful=useful, note=note)
+
+    @mcp.tool()
     def get_memories(scope: str | None = None, memory_type: str | None = None, status: str | None = "active") -> list[dict]:
         return service.list_memories(scope=scope, memory_type=memory_type, status=status)
 

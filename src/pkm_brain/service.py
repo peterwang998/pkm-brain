@@ -12,10 +12,18 @@ from typing import Any
 
 import yaml
 
-from .chunking import chunk_text
+from .chunking import DEFAULT_OVERLAP_TOKENS, DEFAULT_TARGET_TOKENS, chunk_text
 from .db import connection, dumps, init_db, loads, rows
 from .embeddings import get_embedding_provider
-from .indexes import delete_vectors, search_vectors, upsert_vectors
+from .indexes import (
+    delete_vectors,
+    lancedb_stats,
+    optimize_vectors,
+    search_vectors,
+    should_optimize_vectors,
+    upsert_vectors,
+    vector_chunk_ids,
+)
 from .paths import BrainPaths, local_node_id
 from .util import file_sha256, new_id, now_iso, slugify, token_count as estimate_tokens
 from .wiki_proposals import create_wiki_proposal
@@ -93,11 +101,22 @@ SOURCE_TYPE_WEIGHTS = {
     "hyprnote_meeting": 4.0,
     "markdown_note": 3.0,
     "meeting_transcript": 2.0,
+    "web_clip": 3.0,
+    "working_document": 3.0,
     "agent_session_log": -5.0,
 }
 
 RECENCY_MAX_BOOST = 2.0
 RECENCY_HALF_LIFE_DAYS = 30.0
+LINEAGE_HALF_LIFE_DAYS = 90.0
+LINEAGE_MAX_ABS_BOOST = 2.0
+LINEAGE_EVENT_WEIGHTS = {
+    "exposed": 0.0,
+    "explicit_useful": 1.5,
+    "explicit_not_useful": -1.75,
+    "agent_referenced_id": 0.25,
+    "memory_proposed_from_lineage": 0.0,
+}
 DEFAULT_RETRIEVAL_MODE = "default"
 VALID_RETRIEVAL_MODES = {"compact", "default", "broad", "inspect"}
 RECENCY_INTENT_TERMS = {
@@ -153,6 +172,261 @@ class BrainService:
             "lancedb": self.paths.lancedb_path.exists(),
             "embedding_provider": self.embedding_provider.name,
         }
+
+    def index_doctor(self) -> dict[str, Any]:
+        self.init_workspace()
+        with connection(self.paths.sqlite_path) as conn:
+            sqlite_chunk_ids = {row["id"] for row in conn.execute("SELECT id FROM chunks")}
+        stats = lancedb_stats(self.paths.lancedb_path)
+        try:
+            lancedb_chunk_ids = vector_chunk_ids(self.paths.lancedb_path)
+            vector_error = None
+        except Exception as exc:
+            lancedb_chunk_ids = set()
+            vector_error = str(exc)
+
+        missing_vectors = sorted(sqlite_chunk_ids - lancedb_chunk_ids)
+        stale_vectors = sorted(lancedb_chunk_ids - sqlite_chunk_ids)
+        reasons: list[str] = []
+        status = "ok"
+        if vector_error:
+            status = "rebuild_recommended"
+            reasons.append(f"could not enumerate LanceDB vectors: {vector_error}")
+        if sqlite_chunk_ids and not stats["table_exists"]:
+            status = "rebuild_recommended"
+            reasons.append("SQLite has chunks but LanceDB table is missing")
+        if missing_vectors or stale_vectors:
+            status = "rebuild_recommended"
+            reasons.append("LanceDB chunk ids differ from SQLite chunks")
+        elif should_optimize_vectors(stats):
+            status = "optimize_recommended"
+            reasons.append("LanceDB table has accumulated versions, data files, or bytes above maintenance thresholds")
+
+        return {
+            "status": status,
+            "reasons": reasons,
+            "sqlite_chunks": len(sqlite_chunk_ids),
+            "lancedb": stats,
+            "missing_vector_count": len(missing_vectors),
+            "stale_vector_count": len(stale_vectors),
+            "missing_vector_sample": missing_vectors[:20],
+            "stale_vector_sample": stale_vectors[:20],
+        }
+
+    def optimize_indexes(self, cleanup_older_than_days: int = 1) -> dict[str, Any]:
+        self.init_workspace()
+        return optimize_vectors(self.paths.lancedb_path, cleanup_older_than_days=cleanup_older_than_days)
+
+    def rebuild_vector_index(self, delete_backup: bool = False, batch_size: int = 128) -> dict[str, Any]:
+        self.init_workspace()
+        before = lancedb_stats(self.paths.lancedb_path)
+        with connection(self.paths.sqlite_path) as conn:
+            chunk_rows = rows(conn, "SELECT id, document_id, text FROM chunks ORDER BY document_id, chunk_index")
+
+        backup_path = None
+        failed_path = None
+        if self.paths.lancedb_path.exists():
+            backup_path = unique_backup_path(self.paths.indexes, "lancedb.backup")
+            shutil.move(str(self.paths.lancedb_path), str(backup_path))
+
+        try:
+            embedded = 0
+            for offset in range(0, len(chunk_rows), batch_size):
+                batch = chunk_rows[offset : offset + batch_size]
+                vectors = self.embedding_provider.embed([row["text"] for row in batch])
+                vector_rows = [
+                    {
+                        "chunk_id": row["id"],
+                        "document_id": row["document_id"],
+                        "text": row["text"],
+                        "vector": vector,
+                    }
+                    for row, vector in zip(batch, vectors)
+                ]
+                embedded += upsert_vectors(self.paths.lancedb_path, vector_rows)
+            after = lancedb_stats(self.paths.lancedb_path)
+            if int(after["rows"]) != len(chunk_rows):
+                raise RuntimeError(f"rebuilt LanceDB row count {after['rows']} did not match SQLite chunks {len(chunk_rows)}")
+            if delete_backup and backup_path and backup_path.exists():
+                shutil.rmtree(backup_path)
+                backup_retained = False
+            else:
+                backup_retained = bool(backup_path and backup_path.exists())
+            return {
+                "status": "ok",
+                "sqlite_chunks": len(chunk_rows),
+                "vectors_written": embedded,
+                "before": before,
+                "after": after,
+                "backup_path": str(backup_path) if backup_path else None,
+                "backup_retained": backup_retained,
+            }
+        except Exception as exc:
+            if self.paths.lancedb_path.exists():
+                failed_path = unique_backup_path(self.paths.indexes, "lancedb.failed")
+                shutil.move(str(self.paths.lancedb_path), str(failed_path))
+            if backup_path and backup_path.exists():
+                shutil.move(str(backup_path), str(self.paths.lancedb_path))
+            return {
+                "status": "failed",
+                "error": str(exc),
+                "sqlite_chunks": len(chunk_rows),
+                "before": before,
+                "after": lancedb_stats(self.paths.lancedb_path),
+                "backup_path": str(backup_path) if backup_path else None,
+                "failed_path": str(failed_path) if failed_path else None,
+            }
+
+    def reindex_chunks(
+        self,
+        source_type: str = "agent_session_log",
+        dry_run: bool = False,
+        target_tokens: int = DEFAULT_TARGET_TOKENS,
+        overlap_tokens: int = DEFAULT_OVERLAP_TOKENS,
+    ) -> dict[str, Any]:
+        self.init_workspace()
+        if target_tokens <= 0:
+            raise ValueError("target_tokens must be positive")
+        if overlap_tokens < 0 or overlap_tokens >= target_tokens:
+            raise ValueError("overlap_tokens must be >= 0 and less than target_tokens")
+
+        with connection(self.paths.sqlite_path) as conn:
+            affected = rows(
+                conn,
+                """
+                SELECT d.id, d.source_type, d.title, d.source_path, d.raw_path,
+                       COUNT(c.id) AS current_chunks,
+                       MAX(c.token_count) AS max_chunk_tokens,
+                       MAX(LENGTH(c.text)) AS max_chunk_bytes
+                FROM documents d
+                JOIN chunks c ON c.document_id = d.id
+                WHERE d.source_type = ?
+                GROUP BY d.id
+                HAVING MAX(c.token_count) > ?
+                ORDER BY max_chunk_tokens DESC, d.ingested_at DESC
+                """,
+                (source_type, target_tokens),
+            )
+            plans: list[dict[str, Any]] = []
+            errors: list[str] = []
+            total_projected_chunks = 0
+            total_current_chunks = 0
+            max_projected_tokens = 0
+
+            for row in affected:
+                document = dict(row)
+                source_path = document_text_path(document)
+                if source_path is None:
+                    errors.append(f"{document['id']}: no readable raw_path or source_path")
+                    continue
+                text = source_path.read_text(encoding="utf-8", errors="replace")
+                projected_chunks = chunk_text(
+                    text,
+                    str(document["source_type"]),
+                    target_tokens=target_tokens,
+                    overlap_tokens=overlap_tokens,
+                )
+                projected_max_tokens = max((chunk.token_count for chunk in projected_chunks), default=0)
+                plan = {
+                    "document_id": document["id"],
+                    "title": document["title"],
+                    "source_type": document["source_type"],
+                    "source_path": document["source_path"],
+                    "raw_path": document["raw_path"],
+                    "text_path": str(source_path),
+                    "current_chunks": int(document["current_chunks"]),
+                    "projected_chunks": len(projected_chunks),
+                    "max_chunk_tokens": int(document["max_chunk_tokens"] or 0),
+                    "max_chunk_bytes": int(document["max_chunk_bytes"] or 0),
+                    "projected_max_chunk_tokens": projected_max_tokens,
+                    "_chunks": projected_chunks,
+                }
+                plans.append(plan)
+                total_current_chunks += plan["current_chunks"]
+                total_projected_chunks += len(projected_chunks)
+                max_projected_tokens = max(max_projected_tokens, projected_max_tokens)
+
+            public_documents = [{key: value for key, value in plan.items() if key != "_chunks"} for plan in plans]
+            summary = {
+                "status": "dry_run" if dry_run else "ok",
+                "dry_run": dry_run,
+                "source_type": source_type,
+                "target_tokens": target_tokens,
+                "overlap_tokens": overlap_tokens,
+                "affected_documents": len(plans),
+                "current_chunks": total_current_chunks,
+                "projected_chunks": total_projected_chunks,
+                "max_projected_chunk_tokens": max_projected_tokens,
+                "errors": errors,
+                "documents": public_documents,
+            }
+            if dry_run or not plans or errors:
+                if errors and not dry_run:
+                    summary["status"] = "failed"
+                return summary
+
+            rewritten_chunks = 0
+            reindexed_at = now_iso()
+            for plan in plans:
+                document_id = str(plan["document_id"])
+                old_chunk_ids = [
+                    row["id"]
+                    for row in conn.execute(
+                        "SELECT id FROM chunks WHERE document_id = ? ORDER BY chunk_index",
+                        (document_id,),
+                    )
+                ]
+                if old_chunk_ids:
+                    placeholders = ",".join("?" for _ in old_chunk_ids)
+                    conn.execute(f"DELETE FROM chunk_fts WHERE chunk_id IN ({placeholders})", old_chunk_ids)
+                conn.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
+
+                for chunk in plan["_chunks"]:
+                    chunk_id = new_id("chunk")
+                    conn.execute(
+                        """
+                        INSERT INTO chunks(
+                          id, document_id, chunk_index, corpus_type, text, heading_path,
+                          start_offset, end_offset, token_count, content_hash, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            chunk_id,
+                            document_id,
+                            chunk.chunk_index,
+                            "raw",
+                            chunk.text,
+                            chunk.heading_path,
+                            chunk.start_offset,
+                            chunk.end_offset,
+                            chunk.token_count,
+                            chunk.content_hash,
+                            reindexed_at,
+                        ),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO chunk_fts(chunk_id, title, text, heading_path, project, tags)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (chunk_id, plan["title"], chunk.text, chunk.heading_path, "", ""),
+                    )
+                    rewritten_chunks += 1
+
+        if dry_run or not plans or errors:
+            return summary
+
+        rebuild = self.rebuild_vector_index()
+        doctor = self.index_doctor()
+        summary.update(
+            {
+                "status": "ok" if rebuild["status"] == "ok" and doctor["status"] in {"ok", "optimize_recommended"} else "rebuild_recommended",
+                "rewritten_chunks": rewritten_chunks,
+                "index_rebuild": rebuild,
+                "index_doctor": doctor,
+            }
+        )
+        return summary
 
     def sync_doctor(self) -> dict[str, Any]:
         from .sync_doctor import run_sync_doctor
@@ -390,6 +664,14 @@ class BrainService:
                                 "vector": self.embedding_provider.embed([chunk.text])[0],
                             }
                         )
+                    if source_type == "agent_session_log":
+                        record_agent_log_lineage_references(
+                            conn,
+                            text=text,
+                            document_id=document_id,
+                            agent_session_id=markdown_frontmatter_value(text, "session_id"),
+                            created_at=ingested_at,
+                        )
                     changed += 1
                     chunks_created += len(doc_chunks)
                 except Exception as exc:
@@ -521,6 +803,14 @@ class BrainService:
                                 "vector": self.embedding_provider.embed([chunk.text])[0],
                             }
                         )
+                    if source_type == "agent_session_log":
+                        record_agent_log_lineage_references(
+                            conn,
+                            text=text,
+                            document_id=document_id,
+                            agent_session_id=markdown_frontmatter_value(text, "session_id"),
+                            created_at=ingested_at,
+                        )
                     indexed += 1
                     chunks_created += len(doc_chunks)
                 except Exception as exc:
@@ -628,23 +918,13 @@ class BrainService:
 
     def search(self, query: str, limit: int = 10, debug: bool = False, caller: str = "cli") -> dict[str, Any]:
         self.init_workspace()
-        lexical = self._search_fts(query, limit * 3)
-        vector = search_vectors(self.paths.lancedb_path, self.embedding_provider, query, limit * 3)
-        vector_debug = [
-            {
-                "chunk_id": row.get("chunk_id"),
-                "document_id": row.get("document_id"),
-                "distance": row.get("_distance"),
-                "preview": str(row.get("text", ""))[:160],
-            }
-            for row in vector
-        ]
-        fused_ids = reciprocal_rank_fusion(
-            [row["chunk_id"] for row in lexical],
-            [row["chunk_id"] for row in vector],
-        )
-        selected_ids = fused_ids[:limit]
-        selected = self._chunks_by_ids(selected_ids)
+        fanout_limit = max(60, limit * 6)
+        chunk_candidates, fanout_debug = self._fanout_chunk_candidates(query, limit=fanout_limit)
+        lineage_scores = self._lineage_scores_for_chunks(chunk_candidates)
+        reranked_chunks = rerank_chunks(query, chunk_candidates, fanout_debug, lineage_scores=lineage_scores)
+        selected = select_search_results(reranked_chunks, limit=limit)
+        selected_ids = [row["chunk_id"] for row in selected]
+        search_debug = build_search_debug(fanout_debug, selected, reranked_chunks, debug=debug)
         event_id = new_id("retrieval")
         with connection(self.paths.sqlite_path) as conn:
             conn.execute(
@@ -658,17 +938,17 @@ class BrainService:
                     query,
                     now_iso(),
                     caller,
-                    dumps(fused_ids),
+                    dumps(fanout_debug["candidate_ids"]),
                     dumps(selected_ids),
                     dumps(selected_ids),
-                    dumps({"lexical": lexical, "vector": vector_debug}) if debug else "{}",
+                    dumps(search_debug) if debug else "{}",
                 ),
             )
         return {
             "event_id": event_id,
             "query": query,
             "results": selected,
-            "debug": {"lexical": lexical, "vector": vector_debug, "fused": fused_ids} if debug else None,
+            "debug": search_debug if debug else None,
         }
 
     def retrieve_context(
@@ -682,7 +962,8 @@ class BrainService:
         policy = retrieval_policy(mode, budget)
         query = f"{project or ''} {task}".strip()
         chunk_candidates, fanout_debug = self._fanout_chunk_candidates(query, limit=60)
-        reranked_chunks = rerank_chunks(query, chunk_candidates, fanout_debug)
+        lineage_scores = self._lineage_scores_for_chunks(chunk_candidates)
+        reranked_chunks = rerank_chunks(query, chunk_candidates, fanout_debug, lineage_scores=lineage_scores)
         supporting_chunks = select_context_chunks(reranked_chunks, query=query, policy=policy)
         wiki_pages = self.select_wiki_pages(query, supporting_chunks, limit=policy.max_wiki_pages)
         memories = self.active_memories(project)[: policy.max_memories]
@@ -717,6 +998,14 @@ class BrainService:
                     dumps(citations),
                     dumps(retrieval_debug),
                 ),
+            )
+            self._record_retrieval_exposures(
+                conn,
+                retrieval_event_id=event_id,
+                query=query,
+                supporting_chunks=supporting_chunks,
+                wiki_pages=wiki_pages,
+                active_memories=memories,
             )
         result = {
             "task": task,
@@ -753,6 +1042,180 @@ class BrainService:
             }
             result["retrieval_debug"] = retrieval_debug
         return result
+
+    def record_context_feedback(
+        self,
+        target_type: str,
+        target_id: str,
+        useful: bool,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        self.init_workspace()
+        normalized_type, normalized_id = normalize_lineage_target(target_type, target_id)
+        event_type = "explicit_useful" if useful else "explicit_not_useful"
+        weight = LINEAGE_EVENT_WEIGHTS[event_type]
+        metadata = {"note": note} if note else {}
+        event_id = new_id("lineage")
+        created_at = now_iso()
+        with connection(self.paths.sqlite_path) as conn:
+            insert_context_lineage_event(
+                conn,
+                event_id=event_id,
+                target_type=normalized_type,
+                target_id=normalized_id,
+                event_type=event_type,
+                retrieval_event_id=None,
+                agent_session_id=None,
+                query=None,
+                weight=weight,
+                metadata=metadata,
+                created_at=created_at,
+            )
+        return {
+            "event_id": event_id,
+            "target_type": normalized_type,
+            "target_id": normalized_id,
+            "event_type": event_type,
+            "weight": weight,
+            "created_at": created_at,
+        }
+
+    def _lineage_scores_for_chunks(self, chunks: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        chunk_ids = sorted({str(chunk.get("chunk_id") or "") for chunk in chunks if chunk.get("chunk_id")})
+        document_ids = sorted({str(chunk.get("document_id") or "") for chunk in chunks if chunk.get("document_id")})
+        if not chunk_ids and not document_ids:
+            return {}
+
+        clauses: list[str] = []
+        params: list[Any] = []
+        if chunk_ids:
+            clauses.append(f"(target_type = 'chunk' AND target_id IN ({','.join('?' for _ in chunk_ids)}))")
+            params.extend(chunk_ids)
+        if document_ids:
+            clauses.append(f"(target_type = 'document' AND target_id IN ({','.join('?' for _ in document_ids)}))")
+            params.extend(document_ids)
+        with connection(self.paths.sqlite_path) as conn:
+            lineage_rows = rows(
+                conn,
+                f"""
+                SELECT *
+                FROM context_lineage_events
+                WHERE {' OR '.join(clauses)}
+                ORDER BY created_at DESC
+                """,
+                params,
+            )
+
+        chunk_ids_by_document: dict[str, list[str]] = {}
+        for chunk in chunks:
+            document_id = str(chunk.get("document_id") or "")
+            chunk_id = str(chunk.get("chunk_id") or "")
+            if document_id and chunk_id:
+                chunk_ids_by_document.setdefault(document_id, []).append(chunk_id)
+
+        score_by_chunk: dict[str, float] = {chunk_id: 0.0 for chunk_id in chunk_ids}
+        reasons_by_chunk: dict[str, dict[str, float | int]] = {chunk_id: {} for chunk_id in chunk_ids}
+        seen_agent_references: set[tuple[str, str, str]] = set()
+        now = datetime.now(timezone.utc)
+
+        for lineage in lineage_rows:
+            event_type = str(lineage["event_type"])
+            target_type = str(lineage["target_type"])
+            target_id = str(lineage["target_id"])
+            if event_type == "agent_referenced_id":
+                agent_session_id = str(lineage["agent_session_id"] or "")
+                dedupe_key = (target_type, target_id, agent_session_id)
+                if agent_session_id and dedupe_key in seen_agent_references:
+                    continue
+                if agent_session_id:
+                    seen_agent_references.add(dedupe_key)
+
+            base_weight = float(lineage["weight"] or LINEAGE_EVENT_WEIGHTS.get(event_type, 0.0))
+            if base_weight == 0.0:
+                continue
+            decay = lineage_decay(str(lineage["created_at"]), now)
+            weighted = base_weight * decay
+            affected_chunk_ids = [target_id] if target_type == "chunk" else chunk_ids_by_document.get(target_id, [])
+            for chunk_id in affected_chunk_ids:
+                if chunk_id not in score_by_chunk:
+                    continue
+                score_by_chunk[chunk_id] += weighted
+                reason_counts = reasons_by_chunk[chunk_id]
+                reason_counts[event_type] = float(reason_counts.get(event_type, 0.0)) + weighted
+                reason_counts[f"{event_type}:count"] = int(reason_counts.get(f"{event_type}:count", 0)) + 1
+
+        output: dict[str, dict[str, Any]] = {}
+        for chunk_id, score in score_by_chunk.items():
+            capped = max(-LINEAGE_MAX_ABS_BOOST, min(LINEAGE_MAX_ABS_BOOST, score))
+            if capped == 0.0:
+                continue
+            output[chunk_id] = {
+                "boost": round(capped, 4),
+                "reasons": lineage_reason_strings(reasons_by_chunk.get(chunk_id, {}), capped),
+            }
+        return output
+
+    def _record_retrieval_exposures(
+        self,
+        conn: Any,
+        retrieval_event_id: str,
+        query: str,
+        supporting_chunks: list[dict[str, Any]],
+        wiki_pages: list[dict[str, Any]],
+        active_memories: list[dict[str, Any]],
+    ) -> None:
+        created_at = now_iso()
+        for chunk in supporting_chunks:
+            chunk_id = str(chunk.get("chunk_id") or "")
+            if not chunk_id:
+                continue
+            insert_context_lineage_event(
+                conn,
+                event_id=new_id("lineage"),
+                target_type="chunk",
+                target_id=chunk_id,
+                event_type="exposed",
+                retrieval_event_id=retrieval_event_id,
+                agent_session_id=None,
+                query=query,
+                weight=0.0,
+                metadata={"document_id": chunk.get("document_id"), "source_type": chunk.get("source_type")},
+                created_at=created_at,
+            )
+        for page in wiki_pages:
+            target_id = str(page.get("relative_path") or page.get("path") or "")
+            if not target_id:
+                continue
+            insert_context_lineage_event(
+                conn,
+                event_id=new_id("lineage"),
+                target_type="wiki_page",
+                target_id=target_id,
+                event_type="exposed",
+                retrieval_event_id=retrieval_event_id,
+                agent_session_id=None,
+                query=query,
+                weight=0.0,
+                metadata={"title": page.get("title"), "page_type": page.get("page_type")},
+                created_at=created_at,
+            )
+        for memory in active_memories:
+            memory_id = str(memory.get("id") or "")
+            if not memory_id:
+                continue
+            insert_context_lineage_event(
+                conn,
+                event_id=new_id("lineage"),
+                target_type="memory",
+                target_id=memory_id,
+                event_type="exposed",
+                retrieval_event_id=retrieval_event_id,
+                agent_session_id=None,
+                query=query,
+                weight=0.0,
+                metadata={"memory_type": memory.get("memory_type"), "scope": memory.get("scope")},
+                created_at=created_at,
+            )
 
     def _fanout_chunk_candidates(self, query: str, limit: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         lexical = self._search_fts(query, limit)
@@ -1362,11 +1825,17 @@ def retrieval_policy(mode: str, budget: int | None = None) -> RetrievalPolicy:
     )
 
 
-def rerank_chunks(query: str, chunks: list[dict[str, Any]], fanout_debug: dict[str, Any]) -> list[dict[str, Any]]:
+def rerank_chunks(
+    query: str,
+    chunks: list[dict[str, Any]],
+    fanout_debug: dict[str, Any],
+    lineage_scores: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     terms = important_query_terms(query)
     anchors = anchor_query_terms(terms, chunks)
     agent_query = is_agent_query(terms)
     recency_intent = has_recency_intent(query, terms)
+    lineage_scores = lineage_scores or {}
     lexical_rank = {
         row["chunk_id"]: rank
         for rank, row in enumerate(fanout_debug.get("lexical", []), start=1)
@@ -1464,12 +1933,20 @@ def rerank_chunks(query: str, chunks: list[dict[str, Any]], fanout_debug: dict[s
                 score += recency_boost
                 reasons.append(recency_reason)
 
+        lineage = lineage_scores.get(chunk_id) or {}
+        lineage_boost = float(lineage.get("boost") or 0.0)
+        if lineage_boost:
+            score += lineage_boost
+            reasons.extend(lineage.get("reasons") or [f"lineage tie-breaker ({lineage_boost:+.2f})"])
+
         candidate["retrieval_score"] = round(score, 4)
         candidate["raw_context"] = raw_context_links(candidate)
         candidate["selection_reasons"] = reasons
         candidate["suppressed"] = suppressed
         candidate["suppress_reasons"] = suppress_reasons
         candidate["retrieval_noise_reasons"] = noise_reasons
+        candidate["lineage_score"] = round(lineage_boost, 4)
+        candidate["lineage_reasons"] = lineage.get("reasons") or []
         candidate["entity_anchor_title_heading_match"] = bool(title_heading_anchor_hits)
         scored.append(candidate)
 
@@ -1501,6 +1978,29 @@ def select_context_chunks(reranked_chunks: list[dict[str, Any]], query: str, pol
             continue
         selected.append(chunk)
         remaining -= int(chunk.get("returned_token_count") or 0)
+    return selected
+
+
+def select_search_results(reranked_chunks: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    selected: list[dict[str, Any]] = []
+    selected_ids: set[str] = set()
+    for row in reranked_chunks:
+        if row.get("suppressed"):
+            continue
+        selected.append(row)
+        selected_ids.add(str(row.get("chunk_id")))
+        if len(selected) >= limit:
+            return selected
+    for row in reranked_chunks:
+        chunk_id = str(row.get("chunk_id"))
+        if chunk_id in selected_ids:
+            continue
+        selected.append(row)
+        selected_ids.add(chunk_id)
+        if len(selected) >= limit:
+            return selected
     return selected
 
 
@@ -1743,7 +2243,7 @@ def looks_frontmatter_only(text: str) -> bool:
     if end == -1:
         return False
     tail = stripped[end + 4 :].strip()
-    return not tail or len(tail) < 80
+    return not tail
 
 
 def build_retrieval_debug(
@@ -1783,6 +2283,31 @@ def build_retrieval_debug(
     return payload
 
 
+def build_search_debug(
+    fanout_debug: dict[str, Any],
+    selected_chunks: list[dict[str, Any]],
+    reranked_chunks: list[dict[str, Any]],
+    debug: bool,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "fanout_counts": {
+            "lexical": len(fanout_debug.get("lexical", [])),
+            "vector": len(fanout_debug.get("vector", [])),
+            "fused": len(fanout_debug.get("fused", [])),
+            "candidates": len(fanout_debug.get("candidate_ids", [])),
+        },
+        "selected_chunk_reasons": summarize_ranked_chunks(selected_chunks, limit=len(selected_chunks)),
+        "suppressed_chunk_reasons": summarize_ranked_chunks(
+            [row for row in reranked_chunks if row.get("suppressed")],
+            limit=8,
+        ),
+    }
+    if debug:
+        payload["fanout"] = fanout_debug
+        payload["reranked_candidates"] = summarize_ranked_chunks(reranked_chunks, limit=30)
+    return payload
+
+
 def summarize_ranked_chunks(chunks: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
     return [
         {
@@ -1794,10 +2319,83 @@ def summarize_ranked_chunks(chunks: list[dict[str, Any]], limit: int) -> list[di
             "suppressed": row.get("suppressed", False),
             "reasons": row.get("selection_reasons", []),
             "suppress_reasons": row.get("suppress_reasons", []),
+            "retrieval_noise_reasons": row.get("retrieval_noise_reasons", []),
+            "lineage_score": row.get("lineage_score", 0.0),
+            "lineage_reasons": row.get("lineage_reasons", []),
             "preview": str(row.get("text", ""))[:160],
         }
         for row in chunks[:limit]
     ]
+
+
+def normalize_lineage_target(target_type: str, target_id: str) -> tuple[str, str]:
+    normalized_type = target_type.strip().lower()
+    normalized_id = target_id.strip()
+    if normalized_type not in {"memory", "chunk", "document", "wiki_page"}:
+        raise ValueError("target_type must be one of memory, chunk, document, or wiki_page")
+    if normalized_type == "document" and normalized_id.startswith("document:"):
+        normalized_id = normalized_id.split(":", 1)[1]
+    if not normalized_id:
+        raise ValueError("target_id must not be empty")
+    return normalized_type, normalized_id
+
+
+def insert_context_lineage_event(
+    conn: Any,
+    event_id: str,
+    target_type: str,
+    target_id: str,
+    event_type: str,
+    retrieval_event_id: str | None,
+    agent_session_id: str | None,
+    query: str | None,
+    weight: float,
+    metadata: dict[str, Any] | None,
+    created_at: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO context_lineage_events(
+          id, target_type, target_id, event_type, retrieval_event_id,
+          agent_session_id, query, weight, metadata, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            event_id,
+            target_type,
+            target_id,
+            event_type,
+            retrieval_event_id,
+            agent_session_id,
+            query,
+            float(weight),
+            dumps(metadata or {}),
+            created_at,
+        ),
+    )
+
+
+def lineage_decay(created_at: str, now: datetime) -> float:
+    timestamp = parse_iso_timestamp(created_at)
+    if timestamp is None:
+        return 1.0
+    age_days = max(0.0, (now - timestamp).total_seconds() / 86400.0)
+    return 0.5 ** (age_days / LINEAGE_HALF_LIFE_DAYS)
+
+
+def lineage_reason_strings(reason_values: dict[str, float | int], capped_boost: float) -> list[str]:
+    reasons: list[str] = []
+    for event_type in ["explicit_useful", "explicit_not_useful", "agent_referenced_id"]:
+        value = float(reason_values.get(event_type, 0.0))
+        count = int(reason_values.get(f"{event_type}:count", 0))
+        if not value:
+            continue
+        label = event_type.replace("_", " ")
+        reasons.append(f"lineage {label} x{count} ({value:+.2f})")
+    total = sum(float(reason_values.get(event_type, 0.0)) for event_type in ["explicit_useful", "explicit_not_useful", "agent_referenced_id"])
+    if abs(total - capped_boost) > 0.01:
+        reasons.append(f"lineage capped tie-breaker ({capped_boost:+.2f})")
+    return reasons or [f"lineage tie-breaker ({capped_boost:+.2f})"]
 
 
 @dataclass
@@ -1809,6 +2407,14 @@ class ReplacedDocuments:
 def deterministic_mirror_id(prefix: str, value: str) -> str:
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
     return f"{prefix}_mirror_{digest}"
+
+
+def document_text_path(document: dict[str, Any]) -> Path | None:
+    for key in ("raw_path", "source_path"):
+        path = Path(str(document.get(key) or ""))
+        if path.exists() and path.is_file():
+            return path
+    return None
 
 
 def remove_mirror_index_documents(conn: Any, raw_root: Path) -> list[str]:
@@ -1918,6 +2524,77 @@ def markdown_frontmatter_value(text: str, key: str) -> str | None:
     return None
 
 
+def stable_lineage_references(text: str) -> list[tuple[str, str, str]]:
+    references: list[tuple[str, str, str]] = []
+    for memory_id in re.findall(r"\bmem_[A-Za-z0-9_]+\b", text):
+        references.append(("memory", memory_id, memory_id))
+    for chunk_id in re.findall(r"\bchunk_[A-Za-z0-9_]+\b", text):
+        references.append(("chunk", chunk_id, chunk_id))
+    for document_source_id in re.findall(r"\bdocument:doc_[A-Za-z0-9_]+\b", text):
+        references.append(("document", document_source_id.split(":", 1)[1], document_source_id))
+    for document_id in re.findall(r"\bdoc_[A-Za-z0-9_]+\b", text):
+        references.append(("document", document_id, document_id))
+    wiki_pattern = re.compile(
+        r"\b((?:concepts|decisions|projects|people|open_loops|timelines|references)/(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+\.md)\b"
+    )
+    for wiki_path in wiki_pattern.findall(text):
+        references.append(("wiki_page", wiki_path, wiki_path))
+
+    deduped: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for target_type, target_id, original in references:
+        key = (target_type, target_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((target_type, target_id, original))
+    return deduped
+
+
+def record_agent_log_lineage_references(
+    conn: Any,
+    text: str,
+    document_id: str,
+    agent_session_id: str | None,
+    created_at: str,
+) -> int:
+    references = stable_lineage_references(text)
+    if not references:
+        return 0
+    session_id = agent_session_id or f"document:{document_id}"
+    created = 0
+    for target_type, target_id, original in references:
+        exists = conn.execute(
+            """
+            SELECT 1
+            FROM context_lineage_events
+            WHERE target_type = ?
+              AND target_id = ?
+              AND event_type = 'agent_referenced_id'
+              AND agent_session_id = ?
+            LIMIT 1
+            """,
+            (target_type, target_id, session_id),
+        ).fetchone()
+        if exists:
+            continue
+        insert_context_lineage_event(
+            conn,
+            event_id=new_id("lineage"),
+            target_type=target_type,
+            target_id=target_id,
+            event_type="agent_referenced_id",
+            retrieval_event_id=None,
+            agent_session_id=session_id,
+            query=None,
+            weight=LINEAGE_EVENT_WEIGHTS["agent_referenced_id"],
+            metadata={"document_id": document_id, "source_id": f"document:{document_id}", "referenced_id": original},
+            created_at=created_at,
+        )
+        created += 1
+    return created
+
+
 def refresh_existing_document_metadata(
     conn: Any,
     document_id: str,
@@ -2019,3 +2696,13 @@ def dedupe_preserve_order(values: list[str]) -> list[str]:
             seen.add(value)
             output.append(value)
     return output
+
+
+def unique_backup_path(parent: Path, stem: str) -> Path:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    candidate = parent / f"{stem}-{timestamp}"
+    suffix = 1
+    while candidate.exists():
+        suffix += 1
+        candidate = parent / f"{stem}-{timestamp}-{suffix}"
+    return candidate

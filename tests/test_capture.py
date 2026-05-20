@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import plistlib
+import shlex
 import sqlite3
 from pathlib import Path
 
@@ -453,6 +454,21 @@ def test_launch_agent_plist_render() -> None:
     assert "--include-hyprnote" not in decoded["ProgramArguments"][-1]
 
 
+def test_launch_agent_plist_render_quotes_paths_with_spaces(tmp_path: Path) -> None:
+    repo_path = tmp_path / "repo with space"
+    brain_home = tmp_path / "brain with space"
+    plist = render_launch_agent(
+        repo_path=repo_path,
+        brain_home=brain_home,
+        uv_path=Path("/opt/homebrew/bin/uv"),
+        interval=600,
+    )
+    command = plist["ProgramArguments"][-1]
+
+    assert f"cd {shlex.quote(str(repo_path))}" in command
+    assert f"--home {shlex.quote(str(brain_home))}" in command
+
+
 def test_launch_agent_plist_render_with_hyprnote_opt_in() -> None:
     repo_path = Path.home() / "pkm-brain"
     brain_home = Path.home() / "brain"
@@ -486,6 +502,22 @@ def test_nightly_launch_agent_plist_render() -> None:
     assert decoded["StartInterval"] == 3600
     assert "brain automation nightly --if-due --due-after-hours 20" in decoded["ProgramArguments"][-1]
     assert decoded["StandardOutPath"].endswith("nightly-maintenance.out.log")
+
+
+def test_nightly_launch_agent_plist_render_quotes_paths_with_spaces(tmp_path: Path) -> None:
+    repo_path = tmp_path / "repo with space"
+    brain_home = tmp_path / "brain with space"
+    plist = render_nightly_launch_agent(
+        repo_path=repo_path,
+        brain_home=brain_home,
+        uv_path=Path("/opt/homebrew/bin/uv"),
+        interval=3600,
+        due_after_hours=20,
+    )
+    command = plist["ProgramArguments"][-1]
+
+    assert f"cd {shlex.quote(str(repo_path))}" in command
+    assert f"--home {shlex.quote(str(brain_home))}" in command
 
 
 def test_nightly_launch_agent_plist_render_with_openai_wiki_proposals() -> None:
