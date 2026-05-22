@@ -1,6 +1,10 @@
 # PKM Brain
 
-PKM Brain is a local-first personal knowledge management and agent memory tool.
+[![CI](https://github.com/peterwang998/pkm-brain/actions/workflows/ci.yml/badge.svg)](https://github.com/peterwang998/pkm-brain/actions/workflows/ci.yml)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB)](pyproject.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
+PKM Brain is a local-first personal knowledge management and agent memory system for Codex, Claude Code, and other MCP-aware tools.
 
 The goal is to create a practical "second brain" that can store messy personal working knowledge, make it searchable, and expose useful context to coding agents through MCP.
 
@@ -21,6 +25,30 @@ Wiki pages are synthesized knowledge.
 Memories are curated, typed claims derived from evidence.
 Indexes are rebuildable derived artifacts.
 ```
+
+## Highlights
+
+- Local-first runtime layout: private knowledge lives in `~/brain`, while the source repo stays clean.
+- Hybrid retrieval: SQLite FTS5, LanceDB vectors, reciprocal-rank fusion, source-aware reranking, and bounded context packets.
+- Agent access through MCP tools for search, context retrieval, memory proposals, wiki proposals, and session logging.
+- Review-gated memory and wiki workflows, so agents can propose durable knowledge without silently approving it.
+- Scheduled capture for Codex, Claude Code, OpenCode, and Hyprnote logs, with optional Primary/Secondary sync.
+
+## Quickstart
+
+```bash
+uv sync
+uv run brain init --home ~/brain
+uv run brain ingest --home ~/brain
+uv run brain search "sqlite metadata" --debug --home ~/brain
+uv run brain mcp --home ~/brain
+```
+
+Runtime data is stored outside the repo in `~/brain` by default.
+
+## Privacy Model
+
+PKM Brain is designed to keep private knowledge artifacts out of git. Raw sources, SQLite databases, LanceDB indexes, logs, local config, and secrets belong in the runtime workspace, not the public repository.
 
 ## Architecture
 
@@ -195,7 +223,7 @@ Clone the project into the expected source directory:
 
 ```bash
 cd ~
-git clone https://github.com/YOUR_GITHUB_OWNER/pkm-brain.git
+git clone https://github.com/peterwang998/pkm-brain.git
 cd ~/pkm-brain
 ```
 
@@ -779,7 +807,7 @@ export PKM_BRAIN_OLLAMA_MODEL_FALLBACKS=<alternate-local-model>
 export PKM_BRAIN_OLLAMA_BASE_URL=http://localhost:11434
 ```
 
-## Quickstart
+## Minimal Local Smoke Test
 
 ```bash
 uv sync
@@ -868,6 +896,16 @@ Not yet implemented:
 - cloud embedding providers
 - general-purpose background filesystem watcher
 - packaged desktop GUI or Obsidian plugin
+
+## License
+
+PKM Brain is released under the MIT License. See [LICENSE](LICENSE) for the full license text.
+
+## Contributing And Security
+
+Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md) for local setup, testing, and privacy expectations.
+
+For vulnerability reports or data-exposure concerns, use the guidance in [SECURITY.md](SECURITY.md).
 
 ## Development
 

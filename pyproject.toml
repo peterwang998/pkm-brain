@@ -1,9 +1,37 @@
 [project]
 name = "pkm-brain"
 version = "0.1.0"
-description = "Local personal knowledge management and agent memory tool"
+description = "Local-first personal knowledge management and agent memory for MCP-aware coding agents"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Peter Wang" },
+]
+keywords = [
+    "agent-memory",
+    "codex",
+    "claude",
+    "lancedb",
+    "local-first",
+    "mcp",
+    "personal-knowledge-management",
+    "sqlite",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Documentation",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
     "lancedb>=0.30.2",
     "mcp>=1.27.0",
@@ -16,6 +44,12 @@ dependencies = [
 [project.scripts]
 brain = "pkm_brain:main"
 pkm-brain = "pkm_brain:main"
+
+[project.urls]
+Homepage = "https://github.com/peterwang998/pkm-brain"
+Repository = "https://github.com/peterwang998/pkm-brain"
+Issues = "https://github.com/peterwang998/pkm-brain/issues"
+Documentation = "https://github.com/peterwang998/pkm-brain#readme"
 
 [build-system]
 requires = ["uv_build>=0.10.12,<0.11.0"]
