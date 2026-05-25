@@ -839,15 +839,13 @@ class BrainService:
         indexed = 0
         skipped = 0
         chunks_created = 0
-        vector_rows: list[dict[str, Any]] = []
 
         with connection(self.paths.sqlite_path) as conn:
             conn.execute(
                 "INSERT INTO ingestion_runs(id, started_at, status, documents_discovered) VALUES (?, ?, ?, ?)",
                 (run_id, started, "running", len(candidates)),
             )
-            stale_chunk_ids = remove_mirror_index_documents(conn, raw_root)
-            delete_vectors(self.paths.lancedb_path, stale_chunk_ids)
+            remove_mirror_index_documents(conn, raw_root)
 
             for path in candidates:
                 try:
@@ -918,14 +916,6 @@ class BrainService:
                             """,
                             (chunk_id, title, chunk.text, chunk.heading_path, "", ""),
                         )
-                        vector_rows.append(
-                            {
-                                "chunk_id": chunk_id,
-                                "document_id": document_id,
-                                "text": chunk.text,
-                                "vector": self.embedding_provider.embed([chunk.text])[0],
-                            }
-                        )
                     if source_type == "agent_session_log":
                         record_agent_log_lineage_references(
                             conn,
@@ -939,7 +929,12 @@ class BrainService:
                 except Exception as exc:
                     errors.append(f"{path}: {exc}")
 
-            embeddings_created = upsert_vectors(self.paths.lancedb_path, vector_rows)
+        vector_rebuild = self.rebuild_vector_index(delete_backup=True)
+        embeddings_created = int(vector_rebuild.get("vectors_written") or 0) if vector_rebuild["status"] == "ok" else 0
+        if vector_rebuild["status"] != "ok":
+            errors.append(str(vector_rebuild.get("error") or "vector rebuild failed"))
+
+        with connection(self.paths.sqlite_path) as conn:
             conn.execute(
                 """
                 UPDATE ingestion_runs
@@ -971,6 +966,7 @@ class BrainService:
             "chunks_created": chunks_created,
             "embeddings_created": embeddings_created,
             "errors": errors,
+            "vector_rebuild": vector_rebuild,
             "wiki": wiki,
             "memories": memories,
         }
