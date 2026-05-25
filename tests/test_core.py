@@ -1226,29 +1226,27 @@ def test_memory_audit_accepts_failure_pattern_and_rejects_invalid_type(tmp_path:
     svc.init_workspace()
     svc.propose_memory("AgentFailurePatternMemory", "agent:codex", "When tests fail, inspect the failing assertion before editing.", ["agent_session:test"], 0.8)
     invalid_id = svc.propose_memory("NopeMemory", "global", "Invalid memory type.", ["agent_session:test"], 0.4)
-
-    audit = audit_memories(svc.paths)
-
-    assert any(invalid_id in error and "invalid memory_type" in error for error in audit["errors"])
-    assert not any("AgentFailurePatternMemory" in error for error in audit["errors"])
-
-
-def test_memory_audit_warns_for_known_legacy_memory_metadata(tmp_path: Path) -> None:
-    svc = service_for(tmp_path)
-    svc.init_workspace()
-    legacy_id = svc.propose_memory(
+    legacy_type_id = svc.propose_memory(
         "infrastructure",
-        "user",
-        "Legacy infrastructure facts remain readable until migrated.",
+        "global",
+        "Legacy infrastructure type must be migrated before audit.",
         ["agent_session:test"],
-        0.8,
+        0.4,
+    )
+    invalid_scope_id = svc.propose_memory(
+        "FactMemory",
+        "user",
+        "Legacy user scope must be migrated before audit.",
+        ["agent_session:test"],
+        0.4,
     )
 
     audit = audit_memories(svc.paths)
 
-    assert audit["errors"] == []
-    assert any(legacy_id in warning and "legacy memory_type infrastructure" in warning for warning in audit["warnings"])
-    assert any(legacy_id in warning and "legacy scope user" in warning for warning in audit["warnings"])
+    assert any(invalid_id in error and "invalid memory_type" in error for error in audit["errors"])
+    assert any(legacy_type_id in error and "invalid memory_type infrastructure" in error for error in audit["errors"])
+    assert any(invalid_scope_id in error and "invalid scope user" in error for error in audit["errors"])
+    assert not any("AgentFailurePatternMemory" in error for error in audit["errors"])
 
 
 def test_memory_review_status_updates(tmp_path: Path) -> None:

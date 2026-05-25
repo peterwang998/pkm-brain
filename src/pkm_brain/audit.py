@@ -18,14 +18,6 @@ VALID_MEMORY_TYPES = {
 }
 VALID_MEMORY_STATUSES = {"proposed", "active", "superseded", "rejected", "archived"}
 VALID_SCOPE_PREFIXES = ("global", "project:", "repo:", "agent:", "topic:")
-LEGACY_MEMORY_TYPE_ALIASES = {
-    "infrastructure": "FactMemory",
-    "project_roadmap": "ProjectMemory",
-}
-LEGACY_SCOPE_ALIASES = {
-    "user": "global",
-    "pkm-brain": "project:pkm-brain",
-}
 
 
 def audit_memories(paths: BrainPaths) -> dict[str, Any]:
@@ -38,19 +30,11 @@ def audit_memories(paths: BrainPaths) -> dict[str, Any]:
             memory_type = str(memory["memory_type"])
             scope = str(memory["scope"])
             if memory_type not in VALID_MEMORY_TYPES:
-                if memory_type in LEGACY_MEMORY_TYPE_ALIASES:
-                    warnings.append(
-                        f"{mid}: legacy memory_type {memory_type} should migrate to {LEGACY_MEMORY_TYPE_ALIASES[memory_type]}"
-                    )
-                else:
-                    errors.append(f"{mid}: invalid memory_type {memory_type}")
+                errors.append(f"{mid}: invalid memory_type {memory_type}")
             if memory["status"] not in VALID_MEMORY_STATUSES:
                 errors.append(f"{mid}: invalid status {memory['status']}")
             if not any(scope.startswith(prefix) for prefix in VALID_SCOPE_PREFIXES):
-                if scope in LEGACY_SCOPE_ALIASES:
-                    warnings.append(f"{mid}: legacy scope {scope} should migrate to {LEGACY_SCOPE_ALIASES[scope]}")
-                else:
-                    errors.append(f"{mid}: invalid scope {scope}")
+                errors.append(f"{mid}: invalid scope {scope}")
             if not loads(memory["source_ids"], []):
                 warnings.append(f"{mid}: missing source_ids")
             if memory["confidence"] is None:

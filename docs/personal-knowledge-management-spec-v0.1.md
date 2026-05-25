@@ -1288,8 +1288,9 @@ Propagation rules. When a target is forgotten, the system must, in order:
 8. Update wiki_change_batches and wiki_change_items: pending proposals that cite only
    the forgotten source must be moved to status='superseded' with
    error='source forgotten'.
-9. Update retrieval_events: redact selected and cited chunk ids that no longer
-   resolve, and append a tombstone marker to the event's debug payload.
+9. Update retrieval_events: redact returned/selected operational chunk ids that
+   no longer resolve, redact citation_snapshots for forgotten sources, and
+   append a tombstone marker to the event's debug payload.
 10. Update capture_sources: mark the corresponding capture as status='forgotten' so
     the next polling pass does not re-import the same session.
 11. Insert a forget_events row recording the operation.
@@ -1410,7 +1411,7 @@ timestamp
 caller
 returned_chunk_ids
 selected_chunk_ids
-cited_chunk_ids
+citation_snapshots
 context_lineage_events
 agent_outcome
 ```
@@ -1542,7 +1543,7 @@ Start with the smallest useful vertical slice:
 5. Embed chunks.
 6. Index chunks in LanceDB.
 7. Add CLI search.
-8. Return cited chunks.
+8. Return structured citation snapshots.
 ```
 
 Do not start with the wiki or memory system until raw ingestion and retrieval are working end to end.

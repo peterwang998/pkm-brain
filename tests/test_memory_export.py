@@ -41,6 +41,25 @@ def test_approve_writes_memory_export_and_export_all_is_idempotent(tmp_path: Pat
     assert first == second
 
 
+def test_export_all_removes_stale_export_after_scope_change(tmp_path: Path) -> None:
+    svc = service_for(tmp_path / "brain")
+    svc.init_workspace()
+    memory_id = svc.propose_memory("FactMemory", "user", "Migrated memory.", [], 0.8)
+    svc.approve_memory(memory_id)
+    stale_path = svc.paths.memory / "user" / f"{memory_id}.md"
+    assert stale_path.exists()
+
+    with connection(svc.paths.sqlite_path) as conn:
+        conn.execute("UPDATE memories SET scope = ? WHERE id = ?", ("global", memory_id))
+
+    result = svc.export_all_memories()
+    canonical_path = svc.paths.memory / "global" / f"{memory_id}.md"
+
+    assert canonical_path.exists()
+    assert not stale_path.exists()
+    assert str(stale_path) in result["removed"]
+
+
 def test_memory_import_refuses_missing_sources_unless_allowed(tmp_path: Path) -> None:
     source = service_for(tmp_path / "source-brain")
     target = service_for(tmp_path / "target-brain")

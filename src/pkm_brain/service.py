@@ -1581,6 +1581,7 @@ class BrainService:
         with connection(self.paths.sqlite_path) as conn:
             all_memories = [row_to_memory(row) for row in conn.execute("SELECT * FROM memories ORDER BY id")]
         active_ids = {memory["id"] for memory in all_memories if memory["status"] == "active"}
+        active_paths = {memory["id"]: memory_export_path(self.paths, memory) for memory in all_memories if memory["status"] == "active"}
         for memory in all_memories:
             if memory["status"] == "active":
                 written.append(str(write_memory_export(self.paths, memory)))
@@ -1590,7 +1591,7 @@ class BrainService:
                     path.unlink()
                     removed.append(str(path))
         for path in self.paths.memory.rglob("*.md") if self.paths.memory.exists() else []:
-            if path.stem.startswith("mem_") and path.stem not in active_ids:
+            if path.stem.startswith("mem_") and (path.stem not in active_ids or path != active_paths.get(path.stem)):
                 path.unlink()
                 removed.append(str(path))
         return {"written": written, "removed": sorted(set(removed))}
