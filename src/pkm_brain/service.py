@@ -278,6 +278,128 @@ class BrainService:
                 "failed_path": str(failed_path) if failed_path else None,
             }
 
+    def reset_retrieval_index(self) -> dict[str, Any]:
+        self.init_workspace()
+        with connection(self.paths.sqlite_path) as conn:
+            document_rows = rows(
+                conn,
+                """
+                SELECT *
+                FROM documents
+                WHERE status = 'active'
+                ORDER BY ingested_at, id
+                """,
+            )
+
+        plans: list[dict[str, Any]] = []
+        errors: list[str] = []
+        for row in document_rows:
+            document = dict(row)
+            source_path = document_text_path(document)
+            if source_path is None:
+                errors.append(f"{document['id']}: no readable raw_path or source_path")
+                continue
+            try:
+                text = source_path.read_text(encoding="utf-8", errors="replace")
+                plans.append(
+                    {
+                        "document": document,
+                        "text_path": source_path,
+                        "content_hash": file_sha256(source_path),
+                        "chunks": chunk_text(text, str(document["source_type"])),
+                    }
+                )
+            except Exception as exc:
+                errors.append(f"{document['id']}: {source_path}: {exc}")
+
+        if errors:
+            return {
+                "status": "failed",
+                "documents": len(document_rows),
+                "documents_planned": len(plans),
+                "chunks_planned": sum(len(plan["chunks"]) for plan in plans),
+                "errors": errors,
+            }
+
+        reset_at = now_iso()
+        chunks_created = 0
+        with connection(self.paths.sqlite_path) as conn:
+            retrieval_events_deleted = conn.execute("DELETE FROM retrieval_events").rowcount
+            lineage_events_deleted = conn.execute(
+                "DELETE FROM context_lineage_events WHERE retrieval_event_id IS NOT NULL"
+            ).rowcount
+            conn.execute("DELETE FROM chunk_fts")
+            chunks_deleted = conn.execute("DELETE FROM chunks").rowcount
+
+            for plan in plans:
+                document = plan["document"]
+                conn.execute(
+                    """
+                    UPDATE documents
+                    SET content_hash = ?
+                    WHERE id = ?
+                    """,
+                    (plan["content_hash"], document["id"]),
+                )
+                for chunk in plan["chunks"]:
+                    chunk_id = new_id("chunk")
+                    conn.execute(
+                        """
+                        INSERT INTO chunks(
+                          id, document_id, chunk_index, corpus_type, text, heading_path,
+                          start_offset, end_offset, token_count, content_hash, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            chunk_id,
+                            document["id"],
+                            chunk.chunk_index,
+                            "raw",
+                            chunk.text,
+                            chunk.heading_path,
+                            chunk.start_offset,
+                            chunk.end_offset,
+                            chunk.token_count,
+                            chunk.content_hash,
+                            reset_at,
+                        ),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO chunk_fts(chunk_id, title, text, heading_path, project, tags)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            chunk_id,
+                            document["title"],
+                            chunk.text,
+                            chunk.heading_path,
+                            document.get("project") or "",
+                            document.get("tags") or "",
+                        ),
+                    )
+                    chunks_created += 1
+
+        if self.paths.lancedb_path.exists():
+            if self.paths.lancedb_path.is_dir():
+                shutil.rmtree(self.paths.lancedb_path)
+            else:
+                self.paths.lancedb_path.unlink()
+        vector_rebuild = self.rebuild_vector_index(delete_backup=True)
+        doctor = self.index_doctor()
+        status = "ok" if vector_rebuild["status"] == "ok" and doctor["status"] in {"ok", "optimize_recommended"} else "failed"
+        return {
+            "status": status,
+            "documents": len(document_rows),
+            "chunks_deleted": chunks_deleted,
+            "chunks_created": chunks_created,
+            "retrieval_events_deleted": retrieval_events_deleted,
+            "retrieval_lineage_events_deleted": lineage_events_deleted,
+            "vector_rebuild": vector_rebuild,
+            "index_doctor": doctor,
+            "errors": [] if status == "ok" else vector_rebuild.get("errors", []) or [vector_rebuild.get("error", "index reset failed")],
+        }
+
     def reindex_chunks(
         self,
         source_type: str = "agent_session_log",
@@ -925,13 +1047,14 @@ class BrainService:
         reranked_chunks = rerank_chunks(query, chunk_candidates, fanout_debug, lineage_scores=lineage_scores)
         selected = select_search_results(reranked_chunks, limit=limit)
         selected_ids = [row["chunk_id"] for row in selected]
+        citation_snapshots = chunk_citation_snapshots(selected)
         search_debug = build_search_debug(fanout_debug, selected, reranked_chunks, debug=debug)
         event_id = new_id("retrieval")
         with connection(self.paths.sqlite_path) as conn:
             conn.execute(
                 """
                 INSERT INTO retrieval_events(
-                  id, query, timestamp, caller, returned_chunk_ids, selected_chunk_ids, cited_chunk_ids, debug
+                  id, query, timestamp, caller, returned_chunk_ids, selected_chunk_ids, citation_snapshots, debug
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
@@ -941,7 +1064,7 @@ class BrainService:
                     caller,
                     dumps(fanout_debug["candidate_ids"]),
                     dumps(selected_ids),
-                    dumps(selected_ids),
+                    dumps(citation_snapshots),
                     dumps(search_debug) if debug else "{}",
                 ),
             )
@@ -949,6 +1072,8 @@ class BrainService:
             "event_id": event_id,
             "query": query,
             "results": selected,
+            "citations": citation_snapshots,
+            "citation_snapshots": citation_snapshots,
             "debug": search_debug if debug else None,
         }
 
@@ -969,10 +1094,7 @@ class BrainService:
         wiki_pages = self.select_wiki_pages(query, supporting_chunks, limit=policy.max_wiki_pages)
         memories = self.active_memories(project)[: policy.max_memories]
         candidate_memories = self.candidate_memories(project)[: policy.max_memories]
-        citations = dedupe_preserve_order(
-            [row["chunk_id"] for row in supporting_chunks]
-            + [source_id for page in wiki_pages for source_id in page.get("source_ids", [])]
-        )
+        citation_snapshots = chunk_citation_snapshots(supporting_chunks) + wiki_page_citation_snapshots(wiki_pages)
         event_id = new_id("retrieval")
         retrieval_debug = build_retrieval_debug(
             query,
@@ -986,7 +1108,7 @@ class BrainService:
             conn.execute(
                 """
                 INSERT INTO retrieval_events(
-                  id, query, timestamp, caller, returned_chunk_ids, selected_chunk_ids, cited_chunk_ids, debug
+                  id, query, timestamp, caller, returned_chunk_ids, selected_chunk_ids, citation_snapshots, debug
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
@@ -996,7 +1118,7 @@ class BrainService:
                     "retrieve_context",
                     dumps(fanout_debug["fused"]),
                     dumps([row["chunk_id"] for row in supporting_chunks]),
-                    dumps(citations),
+                    dumps(citation_snapshots),
                     dumps(retrieval_debug),
                 ),
             )
@@ -1017,7 +1139,8 @@ class BrainService:
             "candidate_memories": candidate_memories,
             "relevant_wiki_pages": wiki_pages,
             "supporting_chunks": supporting_chunks,
-            "citations": citations,
+            "citations": citation_snapshots,
+            "citation_snapshots": citation_snapshots,
             "open_questions": [],
             "omitted_due_to_budget": [
                 {
@@ -1633,8 +1756,9 @@ class BrainService:
                 conn,
                 f"""
                 SELECT c.id AS chunk_id, c.text, c.heading_path, c.chunk_index, c.token_count,
-                       c.created_at AS chunk_created_at,
+                       c.content_hash, c.created_at AS chunk_created_at,
                        d.id AS document_id, d.title, d.source_type, d.source_path, d.raw_path,
+                       d.origin_node_id, d.logical_source_key,
                        d.created_at AS document_created_at, d.ingested_at AS document_ingested_at
                 FROM chunks c
                 JOIN documents d ON d.id = c.document_id
@@ -2234,6 +2358,38 @@ def raw_context_links(chunk: dict[str, Any]) -> dict[str, Any]:
         "document_created_at": chunk.get("document_created_at"),
         "document_ingested_at": chunk.get("document_ingested_at"),
     }
+
+
+def chunk_citation_snapshots(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    snapshots: list[dict[str, Any]] = []
+    for chunk in chunks:
+        snapshots.append(
+            {
+                "type": "chunk",
+                "chunk_id": str(chunk.get("chunk_id") or ""),
+                "document_id": str(chunk.get("document_id") or ""),
+                "origin_node_id": chunk.get("origin_node_id"),
+                "logical_source_key": str(chunk.get("logical_source_key") or chunk.get("source_path") or ""),
+                "content_hash": str(chunk.get("content_hash") or ""),
+                "heading_path": chunk.get("heading_path") or "",
+                "text": str(chunk.get("text") or ""),
+            }
+        )
+    return snapshots
+
+
+def wiki_page_citation_snapshots(wiki_pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    snapshots: list[dict[str, Any]] = []
+    for page in wiki_pages:
+        snapshots.append(
+            {
+                "type": "wiki_page",
+                "relative_path": str(page.get("relative_path") or ""),
+                "title": str(page.get("title") or ""),
+                "source_ids": list(page.get("source_ids") or []),
+            }
+        )
+    return snapshots
 
 
 def looks_frontmatter_only(text: str) -> bool:

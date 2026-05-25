@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from pkm_brain.audit import audit_memories
+from pkm_brain.audit import audit_memories, provenance_check
 from pkm_brain.chunking import chunk_text
 from pkm_brain.db import connection
 from pkm_brain.indexes import lancedb_stats, table_names, upsert_vectors
@@ -50,8 +50,22 @@ def test_ingest_markdown_chunks_and_searches(tmp_path: Path) -> None:
     assert search["results"][0]["title"] == "sqlite decision"
     assert search["results"][0]["chunk_id"]
     assert search["event_id"]
+    assert search["citation_snapshots"][0]["type"] == "chunk"
+    assert search["citation_snapshots"][0]["document_id"]
+    assert search["citation_snapshots"][0]["logical_source_key"]
+    assert search["citation_snapshots"][0]["content_hash"]
+    assert "SQLite is the canonical metadata store" in search["citation_snapshots"][0]["text"]
+    with connection(svc.paths.sqlite_path) as conn:
+        retrieval = conn.execute(
+            "SELECT citation_snapshots FROM retrieval_events WHERE id = ?",
+            (search["event_id"],),
+        ).fetchone()
+    stored_snapshots = json.loads(retrieval["citation_snapshots"])
+    assert stored_snapshots[0]["type"] == "chunk"
     context = svc.retrieve_context("explain sqlite metadata", project="pkm-system")
     assert context["supporting_chunks"]
+    assert context["citations"] == context["citation_snapshots"]
+    assert context["citation_snapshots"][0]["type"] == "chunk"
 
 
 def test_ingest_bounds_frontmatter_title_without_dropping_body(tmp_path: Path) -> None:
@@ -318,6 +332,138 @@ def test_reindex_chunks_rewrites_existing_oversized_document(tmp_path: Path) -> 
     assert svc.index_doctor()["status"] == "ok"
     search = svc.search("token999 token1000", limit=5)
     assert search["results"]
+
+
+def test_provenance_check_allows_snapshot_drift_and_flags_malformed_snapshots(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "snapshot-drift.md"
+    note.write_text("# Snapshot Drift\n\nsnapshot drift marker original evidence.\n", encoding="utf-8")
+    svc.ingest()
+    context = svc.retrieve_context("snapshot drift marker")
+    snapshot = context["citation_snapshots"][0]
+
+    with connection(svc.paths.sqlite_path) as conn:
+        conn.execute("DELETE FROM chunk_fts")
+        conn.execute("DELETE FROM chunks")
+
+    audit = provenance_check(svc.paths)
+
+    assert audit["errors"] == []
+    assert any(snapshot["chunk_id"] in warning for warning in audit["warnings"])
+    assert any("no longer matches a current chunk" in warning for warning in audit["warnings"])
+
+    with connection(svc.paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO retrieval_events(
+              id, query, timestamp, caller, returned_chunk_ids, selected_chunk_ids, citation_snapshots, debug
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "retrieval_malformed",
+                "bad",
+                "2026-05-20T00:00:00+00:00",
+                "test",
+                "[]",
+                "[]",
+                json.dumps({"not": "a list"}),
+                "{}",
+            ),
+        )
+
+    audit = provenance_check(svc.paths)
+
+    assert any("malformed citation_snapshots" in error for error in audit["errors"])
+
+
+def test_reset_retrieval_index_preserves_documents_and_rebuilds_artifacts(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "reset-index.md"
+    note.write_text("# Reset Index\n\nreset index marker preserves document identity.\n", encoding="utf-8")
+    svc.ingest()
+    with connection(svc.paths.sqlite_path) as conn:
+        document_id = conn.execute("SELECT id FROM documents").fetchone()["id"]
+        old_chunk_ids = {row["id"] for row in conn.execute("SELECT id FROM chunks")}
+
+    wiki_dir = svc.paths.wiki / "concepts"
+    wiki_dir.mkdir(parents=True)
+    (wiki_dir / "reset-index.md").write_text(
+        "---\n"
+        "title: Reset Index\n"
+        "page_type: concept\n"
+        "id: concept-reset-index\n"
+        "status: active\n"
+        f"source_ids:\n  - document:{document_id}\n"
+        "related: []\n"
+        "tags: []\n"
+        "---\n\n"
+        "# Reset Index\n\n"
+        "## Summary\n\nreset index marker wiki evidence.\n",
+        encoding="utf-8",
+    )
+    batch_id = svc.propose_wiki_update(
+        "Reset index proposal",
+        "Verify document references survive index reset.",
+        [f"document:{document_id}"],
+        [
+            {
+                "target_path": "concepts/reset-index.md",
+                "operation": "append_section",
+                "section_name": "Notes",
+                "proposed_markdown": "## Notes\n\nPreserve document identity.\n",
+                "rationale": "Regression coverage.",
+                "source_ids": [f"document:{document_id}"],
+                "confidence": 0.8,
+            }
+        ],
+        0.8,
+    )
+    svc.retrieve_context("reset index marker")
+    svc.record_context_feedback("document", f"document:{document_id}", useful=True)
+    upsert_vectors(
+        svc.paths.lancedb_path,
+        [
+            {
+                "chunk_id": "chunk_stale",
+                "document_id": "doc_stale",
+                "text": "stale vector",
+                "vector": svc.embedding_provider.embed(["stale vector"])[0],
+            }
+        ],
+    )
+
+    result = svc.reset_retrieval_index()
+
+    assert result["status"] == "ok"
+    with connection(svc.paths.sqlite_path) as conn:
+        document_ids = {row["id"] for row in conn.execute("SELECT id FROM documents")}
+        new_chunk_ids = {row["id"] for row in conn.execute("SELECT id FROM chunks")}
+        retrieval_count = conn.execute("SELECT COUNT(*) FROM retrieval_events").fetchone()[0]
+        exposed_count = conn.execute(
+            "SELECT COUNT(*) FROM context_lineage_events WHERE retrieval_event_id IS NOT NULL"
+        ).fetchone()[0]
+        feedback_count = conn.execute(
+            "SELECT COUNT(*) FROM context_lineage_events WHERE event_type = 'explicit_useful'"
+        ).fetchone()[0]
+        fts_count = conn.execute("SELECT COUNT(*) FROM chunk_fts").fetchone()[0]
+        proposal_sources = json.loads(
+            conn.execute("SELECT source_ids FROM wiki_change_batches WHERE id = ?", (batch_id,)).fetchone()["source_ids"]
+        )
+
+    assert document_ids == {document_id}
+    assert new_chunk_ids
+    assert new_chunk_ids.isdisjoint(old_chunk_ids)
+    assert retrieval_count == 0
+    assert exposed_count == 0
+    assert feedback_count == 1
+    assert fts_count == len(new_chunk_ids)
+    assert proposal_sources == [f"document:{document_id}"]
+    doctor = svc.index_doctor()
+    assert doctor["missing_vector_count"] == 0
+    assert doctor["stale_vector_count"] == 0
+    assert provenance_check(svc.paths)["errors"] == []
 
 
 def test_lancedb_table_names_accepts_result_objects() -> None:
@@ -613,7 +759,13 @@ def test_wiki_synthesis_compiles_semantic_pages_with_default_llm(tmp_path: Path,
     assert context["relevant_wiki_pages"]
     assert context["supporting_chunks"]
     assert any(page["relative_path"] == "concepts/wiki-synthesis-layer.md" for page in context["relevant_wiki_pages"])
-    assert any(str(citation).startswith("document:") for citation in context["citations"])
+    assert any(citation["type"] == "chunk" for citation in context["citations"])
+    assert any(
+        citation["type"] == "wiki_page"
+        and citation["relative_path"] == "concepts/wiki-synthesis-layer.md"
+        and any(source_id.startswith("document:") for source_id in citation["source_ids"])
+        for citation in context["citations"]
+    )
 
 
 def test_wiki_source_selection_uses_llm_choice_without_hard_agent_log_cap() -> None:
@@ -1079,6 +1231,24 @@ def test_memory_audit_accepts_failure_pattern_and_rejects_invalid_type(tmp_path:
 
     assert any(invalid_id in error and "invalid memory_type" in error for error in audit["errors"])
     assert not any("AgentFailurePatternMemory" in error for error in audit["errors"])
+
+
+def test_memory_audit_warns_for_known_legacy_memory_metadata(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    legacy_id = svc.propose_memory(
+        "infrastructure",
+        "user",
+        "Legacy infrastructure facts remain readable until migrated.",
+        ["agent_session:test"],
+        0.8,
+    )
+
+    audit = audit_memories(svc.paths)
+
+    assert audit["errors"] == []
+    assert any(legacy_id in warning and "legacy memory_type infrastructure" in warning for warning in audit["warnings"])
+    assert any(legacy_id in warning and "legacy scope user" in warning for warning in audit["warnings"])
 
 
 def test_memory_review_status_updates(tmp_path: Path) -> None:

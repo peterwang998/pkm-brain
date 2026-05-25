@@ -210,7 +210,7 @@ CREATE TABLE IF NOT EXISTS retrieval_events (
   caller TEXT NOT NULL,
   returned_chunk_ids TEXT NOT NULL DEFAULT '[]',
   selected_chunk_ids TEXT NOT NULL DEFAULT '[]',
-  cited_chunk_ids TEXT NOT NULL DEFAULT '[]',
+  citation_snapshots TEXT NOT NULL DEFAULT '[]',
   debug TEXT NOT NULL DEFAULT '{}'
 );
 

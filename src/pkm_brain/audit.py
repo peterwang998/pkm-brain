@@ -18,6 +18,14 @@ VALID_MEMORY_TYPES = {
 }
 VALID_MEMORY_STATUSES = {"proposed", "active", "superseded", "rejected", "archived"}
 VALID_SCOPE_PREFIXES = ("global", "project:", "repo:", "agent:", "topic:")
+LEGACY_MEMORY_TYPE_ALIASES = {
+    "infrastructure": "FactMemory",
+    "project_roadmap": "ProjectMemory",
+}
+LEGACY_SCOPE_ALIASES = {
+    "user": "global",
+    "pkm-brain": "project:pkm-brain",
+}
 
 
 def audit_memories(paths: BrainPaths) -> dict[str, Any]:
@@ -27,12 +35,22 @@ def audit_memories(paths: BrainPaths) -> dict[str, Any]:
         memories = rows(conn, "SELECT * FROM memories ORDER BY created_at DESC")
         for memory in memories:
             mid = memory["id"]
-            if memory["memory_type"] not in VALID_MEMORY_TYPES:
-                errors.append(f"{mid}: invalid memory_type {memory['memory_type']}")
+            memory_type = str(memory["memory_type"])
+            scope = str(memory["scope"])
+            if memory_type not in VALID_MEMORY_TYPES:
+                if memory_type in LEGACY_MEMORY_TYPE_ALIASES:
+                    warnings.append(
+                        f"{mid}: legacy memory_type {memory_type} should migrate to {LEGACY_MEMORY_TYPE_ALIASES[memory_type]}"
+                    )
+                else:
+                    errors.append(f"{mid}: invalid memory_type {memory_type}")
             if memory["status"] not in VALID_MEMORY_STATUSES:
                 errors.append(f"{mid}: invalid status {memory['status']}")
-            if not any(str(memory["scope"]).startswith(prefix) for prefix in VALID_SCOPE_PREFIXES):
-                errors.append(f"{mid}: invalid scope {memory['scope']}")
+            if not any(scope.startswith(prefix) for prefix in VALID_SCOPE_PREFIXES):
+                if scope in LEGACY_SCOPE_ALIASES:
+                    warnings.append(f"{mid}: legacy scope {scope} should migrate to {LEGACY_SCOPE_ALIASES[scope]}")
+                else:
+                    errors.append(f"{mid}: invalid scope {scope}")
             if not loads(memory["source_ids"], []):
                 warnings.append(f"{mid}: missing source_ids")
             if memory["confidence"] is None:
@@ -42,6 +60,7 @@ def audit_memories(paths: BrainPaths) -> dict[str, Any]:
 
 def provenance_check(paths: BrainPaths) -> dict[str, Any]:
     errors: list[str] = []
+    warnings: list[str] = []
     with connection(paths.sqlite_path) as conn:
         chunk_orphans = rows(
             conn,
@@ -53,10 +72,56 @@ def provenance_check(paths: BrainPaths) -> dict[str, Any]:
         )
         for row in chunk_orphans:
             errors.append(f"chunk {row['id']} has no valid document")
-        retrievals = rows(conn, "SELECT id, cited_chunk_ids FROM retrieval_events")
-        valid_chunks = {row["id"] for row in rows(conn, "SELECT id FROM chunks")}
+        retrievals = rows(conn, "SELECT id, citation_snapshots FROM retrieval_events")
+        current_chunks = rows(
+            conn,
+            """
+            SELECT c.id, c.content_hash, d.logical_source_key
+            FROM chunks c
+            JOIN documents d ON d.id = c.document_id
+            """,
+        )
+        valid_chunks = {row["id"] for row in current_chunks}
+        current_chunk_keys = {
+            (row["logical_source_key"], row["content_hash"])
+            for row in current_chunks
+            if row["logical_source_key"] and row["content_hash"]
+        }
         for event in retrievals:
-            for chunk_id in loads(event["cited_chunk_ids"], []):
-                if chunk_id not in valid_chunks:
-                    errors.append(f"retrieval {event['id']} cites missing chunk {chunk_id}")
-    return {"errors": errors}
+            try:
+                snapshots = loads(event["citation_snapshots"], [])
+            except Exception as exc:
+                errors.append(f"retrieval {event['id']} has malformed citation_snapshots: {exc}")
+                continue
+            if not isinstance(snapshots, list):
+                errors.append(f"retrieval {event['id']} has malformed citation_snapshots: expected list")
+                continue
+            for index, snapshot in enumerate(snapshots):
+                if not isinstance(snapshot, dict):
+                    errors.append(f"retrieval {event['id']} snapshot {index} is malformed: expected object")
+                    continue
+                snapshot_type = snapshot.get("type")
+                if snapshot_type == "chunk":
+                    required = ["text", "document_id", "logical_source_key", "content_hash"]
+                    missing = [key for key in required if not snapshot.get(key)]
+                    if missing:
+                        errors.append(
+                            f"retrieval {event['id']} chunk snapshot {index} missing {', '.join(missing)}"
+                        )
+                        continue
+                    chunk_id = str(snapshot.get("chunk_id") or "")
+                    if chunk_id and chunk_id not in valid_chunks:
+                        warnings.append(f"retrieval {event['id']} snapshot chunk {chunk_id} no longer exists")
+                    key = (snapshot.get("logical_source_key"), snapshot.get("content_hash"))
+                    if key not in current_chunk_keys:
+                        warnings.append(
+                            f"retrieval {event['id']} chunk snapshot {index} no longer matches a current chunk"
+                        )
+                elif snapshot_type == "wiki_page":
+                    if not snapshot.get("relative_path") or not snapshot.get("title"):
+                        errors.append(f"retrieval {event['id']} wiki_page snapshot {index} is malformed")
+                    if not isinstance(snapshot.get("source_ids", []), list):
+                        errors.append(f"retrieval {event['id']} wiki_page snapshot {index} has non-list source_ids")
+                else:
+                    errors.append(f"retrieval {event['id']} snapshot {index} has unknown type {snapshot_type!r}")
+    return {"errors": errors, "warnings": warnings}

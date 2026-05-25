@@ -105,10 +105,29 @@ def _migration_003_create_context_lineage_events(conn: sqlite3.Connection) -> No
     )
 
 
+def _migration_004_recreate_retrieval_events_with_snapshots(conn: sqlite3.Connection) -> None:
+    conn.execute("DROP TABLE IF EXISTS retrieval_events")
+    conn.execute(
+        """
+        CREATE TABLE retrieval_events (
+          id TEXT PRIMARY KEY,
+          query TEXT NOT NULL,
+          timestamp TEXT NOT NULL,
+          caller TEXT NOT NULL,
+          returned_chunk_ids TEXT NOT NULL DEFAULT '[]',
+          selected_chunk_ids TEXT NOT NULL DEFAULT '[]',
+          citation_snapshots TEXT NOT NULL DEFAULT '[]',
+          debug TEXT NOT NULL DEFAULT '{}'
+        )
+        """
+    )
+
+
 MIGRATIONS: list[Migration] = [
     (1, "add_origin_identity", _migration_001_add_origin_identity),
     (2, "create_sync_runs", _migration_002_create_sync_runs),
     (3, "create_context_lineage_events", _migration_003_create_context_lineage_events),
+    (4, "recreate_retrieval_events_with_snapshots", _migration_004_recreate_retrieval_events_with_snapshots),
 ]
 
 

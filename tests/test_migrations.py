@@ -17,12 +17,15 @@ def test_fresh_db_applies_registered_migrations(tmp_path: Path) -> None:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(documents)")}
         indexes = {row["name"] for row in conn.execute("PRAGMA index_list(documents)")}
         lineage_columns = {row["name"] for row in conn.execute("PRAGMA table_info(context_lineage_events)")}
+        retrieval_columns = {row["name"] for row in conn.execute("PRAGMA table_info(retrieval_events)")}
 
-    assert versions == [1, 2, 3]
+    assert versions == [1, 2, 3, 4]
     assert "origin_node_id" in columns
     assert "logical_source_key" in columns
     assert "idx_documents_origin_logical" in indexes
     assert {"target_type", "target_id", "event_type", "metadata"}.issubset(lineage_columns)
+    assert "citation_snapshots" in retrieval_columns
+    assert "cited_chunk_ids" not in retrieval_columns
 
 
 def test_migrations_rerun_is_noop(tmp_path: Path) -> None:
@@ -33,7 +36,7 @@ def test_migrations_rerun_is_noop(tmp_path: Path) -> None:
     with connection(db_path) as conn:
         versions = [row["version"] for row in conn.execute("SELECT version FROM schema_migrations")]
 
-    assert versions == [1, 2, 3]
+    assert versions == [1, 2, 3, 4]
 
 
 def test_init_db_migrates_pre_sync_documents_table(tmp_path: Path) -> None:
@@ -80,10 +83,59 @@ def test_init_db_migrates_pre_sync_documents_table(tmp_path: Path) -> None:
         ).fetchone()
         indexes = {row["name"] for row in conn.execute("PRAGMA index_list(documents)")}
 
-    assert versions == [1, 2, 3]
+    assert versions == [1, 2, 3, 4]
     assert row["origin_node_id"] == "<local>"
     assert row["logical_source_key"] == "/tmp/legacy.md"
     assert "idx_documents_origin_logical" in indexes
+
+
+def test_retrieval_events_migration_drops_legacy_cited_chunk_ids() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        CREATE TABLE schema_migrations (
+          version INTEGER PRIMARY KEY,
+          applied_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.executemany(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, '2026-05-20T00:00:00+00:00')",
+        [(1,), (2,), (3,)],
+    )
+    conn.execute(
+        """
+        CREATE TABLE retrieval_events (
+          id TEXT PRIMARY KEY,
+          query TEXT NOT NULL,
+          timestamp TEXT NOT NULL,
+          caller TEXT NOT NULL,
+          returned_chunk_ids TEXT NOT NULL DEFAULT '[]',
+          selected_chunk_ids TEXT NOT NULL DEFAULT '[]',
+          cited_chunk_ids TEXT NOT NULL DEFAULT '[]',
+          debug TEXT NOT NULL DEFAULT '{}'
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO retrieval_events(
+          id, query, timestamp, caller, returned_chunk_ids, selected_chunk_ids, cited_chunk_ids, debug
+        ) VALUES ('retrieval_legacy', 'q', '2026-05-20T00:00:00+00:00', 'test', '[]', '[]', '["chunk_old"]', '{}')
+        """
+    )
+
+    run_migrations(conn)
+
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(retrieval_events)")}
+    versions = [row["version"] for row in conn.execute("SELECT version FROM schema_migrations")]
+    count = conn.execute("SELECT COUNT(*) FROM retrieval_events").fetchone()[0]
+
+    assert versions == [1, 2, 3, 4]
+    assert "citation_snapshots" in columns
+    assert "cited_chunk_ids" not in columns
+    assert count == 0
 
 
 def test_failed_migration_rolls_back_that_migration() -> None:

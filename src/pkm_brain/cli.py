@@ -493,6 +493,22 @@ def index_rebuild_vectors(
         raise typer.Exit(1)
 
 
+@index_app.command("reset-retrieval")
+def index_reset_retrieval(
+    yes: bool = typer.Option(False, "--yes", help="Confirm destructive retrieval/index reset."),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    if not yes:
+        typer.confirm(
+            "Delete retrieval events, retrieval lineage, chunks, FTS rows, and LanceDB vectors, then rebuild chunks/vectors from active documents?",
+            abort=True,
+        )
+    result = service(home).reset_retrieval_index()
+    console.print_json(json.dumps(result))
+    if result["status"] != "ok":
+        raise typer.Exit(1)
+
+
 @db_app.command("reindex-chunks")
 def db_reindex_chunks(
     source_type: str = typer.Option("agent_session_log", "--source-type", help="Only reindex documents with this source_type."),
