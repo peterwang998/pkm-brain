@@ -13,6 +13,7 @@ from typing import Any, Protocol
 from .db import connection
 from .paths import BrainPaths, local_node_id
 from .sync_config import load_sync_config
+from .title_utils import is_self_generated_codex_provider_session
 from .util import file_sha256, now_iso, slugify, text_sha256
 
 MAX_ITEM_CHARS = 4000
@@ -249,6 +250,9 @@ class CodexAdapter:
             events = read_jsonl(rollout)
             stat = rollout.stat()
             title = row["title"] or f"Codex session {row['id']}"
+            user_messages = extracted_role_messages(events, "user")
+            if is_self_generated_codex_provider_session("codex", title, user_messages):
+                continue
             metadata = {
                 "source_type": "agent_session_log",
                 "agent": "codex",
@@ -725,6 +729,17 @@ def markdown_items(items: list[str]) -> list[str]:
     for item in items:
         rendered.append("- " + truncate_text(item, MAX_ITEM_CHARS).replace("\n", "\n  "))
     return rendered
+
+
+def extracted_role_messages(events: list[dict[str, Any]], expected_role: str) -> list[str]:
+    messages: list[str] = []
+    for event in events:
+        role = str(event.get("role") or event.get("type") or event.get("kind") or "").lower()
+        if role == expected_role:
+            text = extract_text(event)
+            if text:
+                messages.append(text)
+    return messages
 
 
 def extract_text(value: Any) -> str:

@@ -9,6 +9,7 @@ from typing import Any
 from .db import connection, dumps, loads, rows
 from .llm import get_provider
 from .paths import BrainPaths
+from .title_utils import bounded_document_title
 from .util import new_id, now_iso
 from .wiki import lint_wiki
 
@@ -321,7 +322,7 @@ def latest_documents(paths: BrainPaths, limit: int) -> list[dict[str, Any]]:
         output.append(
             {
                 "source_id": f"document:{row['id']}",
-                "title": row["title"],
+                "title": bounded_document_title(row["title"], str(row["id"])),
                 "source_type": row["source_type"],
                 "source_path": row["source_path"],
                 "ingested_at": row["ingested_at"],

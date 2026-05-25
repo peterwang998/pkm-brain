@@ -12,6 +12,7 @@ from pkm_brain.db import connection
 from pkm_brain.llm import CODEX_DEFAULT_MODEL, DEFAULT_LLM_PROVIDER, OPENAI_DEFAULT_MODEL, provider_status
 from pkm_brain.paths import BrainPaths
 from pkm_brain.service import BrainService
+from pkm_brain.title_utils import CODEX_PROVIDER_PROMPT_PREFIX
 
 
 def make_service(tmp_path: Path) -> BrainService:
@@ -46,6 +47,39 @@ def make_codex_fixture(tmp_path: Path) -> Path:
     conn.execute(
         "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         ("codex-session-1", str(rollout), "/repo", "Codex Capture", "gpt-test", "high", 1, 2),
+    )
+    conn.commit()
+    conn.close()
+    return state
+
+
+def make_codex_provider_fixture(tmp_path: Path) -> Path:
+    state = tmp_path / "codex-provider-state.sqlite"
+    rollout = tmp_path / "codex-provider-rollout.jsonl"
+    prompt = f"{CODEX_PROVIDER_PROMPT_PREFIX}\nReturn only valid JSON.\n\n{{\"task\": \"propose wiki changes\"}}"
+    rollout.write_text(
+        json.dumps({"type": "user", "text": prompt}) + "\n"
+        + json.dumps({"type": "assistant", "text": "{\"changes\": []}"}) + "\n",
+        encoding="utf-8",
+    )
+    conn = sqlite3.connect(state)
+    conn.execute(
+        """
+        CREATE TABLE threads(
+          id TEXT PRIMARY KEY,
+          rollout_path TEXT,
+          cwd TEXT,
+          title TEXT,
+          model TEXT,
+          reasoning_effort TEXT,
+          created_at_ms INTEGER,
+          updated_at_ms INTEGER
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("codex-provider-session", str(rollout), "/repo", prompt, "gpt-test", "high", 1, 2),
     )
     conn.commit()
     conn.close()
@@ -190,6 +224,23 @@ def test_capture_agents_writes_markdown_and_skips_unchanged(tmp_path: Path) -> N
     second = capture.capture()
     assert second.skipped == 3
     assert second.captured == 0
+
+
+def test_capture_skips_pkm_brain_codex_provider_sessions(tmp_path: Path) -> None:
+    svc = make_service(tmp_path)
+    capture = AgentLogCapture(
+        svc.paths,
+        codex_state=make_codex_provider_fixture(tmp_path),
+        claude_projects=tmp_path / "missing-claude",
+        opencode_db=tmp_path / "missing-opencode.sqlite",
+        hyprnote_root=tmp_path / "missing-hyprnote",
+    )
+
+    result = capture.capture(agent="codex")
+
+    assert result.discovered == 0
+    assert result.captured == 0
+    assert not list((svc.paths.inbox / "agent_logs").glob("**/*.md"))
 
 
 def test_captured_agent_logs_ingest_as_agent_session_logs(tmp_path: Path) -> None:

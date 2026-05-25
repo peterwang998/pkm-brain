@@ -10,10 +10,11 @@ from pkm_brain.indexes import lancedb_stats, table_names, upsert_vectors
 from pkm_brain.memory_proposals import propose_failure_memories_from_sources, propose_memories_from_lineage
 from pkm_brain.paths import BrainPaths
 from pkm_brain.service import BrainService
+from pkm_brain.title_utils import MAX_DOCUMENT_TITLE_CHARS, TITLE_TRUNCATION_SUFFIX
 from pkm_brain.util import text_sha256, token_count
 from pkm_brain.wiki import lint_wiki, parse_frontmatter, synthesize_wiki
 from pkm_brain.wiki_compiler import clean_agent_log_preview, select_compiler_sources
-from pkm_brain.wiki_proposals import apply_wiki_proposal, create_wiki_proposal, inspect_wiki_proposal, record_wiki_interview
+from pkm_brain.wiki_proposals import apply_wiki_proposal, create_wiki_proposal, inspect_wiki_proposal, latest_documents, record_wiki_interview
 
 
 def service_for(tmp_path: Path) -> BrainService:
@@ -51,6 +52,48 @@ def test_ingest_markdown_chunks_and_searches(tmp_path: Path) -> None:
     assert search["event_id"]
     context = svc.retrieve_context("explain sqlite metadata", project="pkm-system")
     assert context["supporting_chunks"]
+
+
+def test_ingest_bounds_frontmatter_title_without_dropping_body(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    long_title = "Title " + ("x" * 2000)
+    note = svc.paths.inbox / "long-title.md"
+    note.write_text(
+        "---\n"
+        f'title: "{long_title}"\n'
+        "---\n\n"
+        "# Full Body\n\n"
+        "body-content-marker is retained in chunks.\n",
+        encoding="utf-8",
+    )
+
+    result = svc.ingest()
+
+    assert result.changed == 1
+    with connection(svc.paths.sqlite_path) as conn:
+        row = conn.execute("SELECT id, title FROM documents").fetchone()
+        chunk_text = conn.execute("SELECT GROUP_CONCAT(text, '\n') AS text FROM chunks WHERE document_id = ?", (row["id"],)).fetchone()
+    assert len(row["title"]) == MAX_DOCUMENT_TITLE_CHARS
+    assert row["title"].endswith(TITLE_TRUNCATION_SUFFIX)
+    assert "body-content-marker" in chunk_text["text"]
+
+
+def test_latest_documents_bounds_historical_giant_titles(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "historical-title.md"
+    note.write_text("# Historical Title\n\nShort preview body.\n", encoding="utf-8")
+    svc.ingest()
+    giant_title = "Historical " + ("y" * 2000)
+    with connection(svc.paths.sqlite_path) as conn:
+        conn.execute("UPDATE documents SET title = ?", (giant_title,))
+
+    documents = latest_documents(svc.paths, limit=8)
+
+    assert len(documents[0]["title"]) == MAX_DOCUMENT_TITLE_CHARS
+    assert documents[0]["title"].endswith(TITLE_TRUNCATION_SUFFIX)
+    assert documents[0]["preview"] == "# Historical Title Short preview body."
 
 
 def test_search_uses_source_aware_reranking_and_backfill(tmp_path: Path) -> None:

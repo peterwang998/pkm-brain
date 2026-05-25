@@ -25,6 +25,7 @@ from .indexes import (
     vector_chunk_ids,
 )
 from .paths import BrainPaths, local_node_id
+from .title_utils import bounded_document_title
 from .util import file_sha256, new_id, now_iso, slugify, token_count as estimate_tokens
 from .wiki_proposals import create_wiki_proposal
 
@@ -548,7 +549,7 @@ class BrainService:
                         continue
                     content_hash = file_sha256(path)
                     text = path.read_text(encoding="utf-8", errors="replace")
-                    title = markdown_frontmatter_value(text, "title") or path.stem.replace("-", " ").replace("_", " ").strip() or path.name
+                    title = document_title_for_text(text, path)
                     origin, logical_source_key = self._origin_identity_for_path(path, origin_node_id)
                     existing = conn.execute(
                         """
@@ -734,7 +735,7 @@ class BrainService:
                         continue
                     content_hash = file_sha256(path)
                     text = path.read_text(encoding="utf-8", errors="replace")
-                    title = markdown_frontmatter_value(text, "title") or path.stem.replace("-", " ").replace("_", " ").strip() or path.name
+                    title = document_title_for_text(text, path)
                     relative_path = path.resolve().relative_to(raw_root).as_posix()
                     document_id = deterministic_mirror_id("doc", relative_path)
                     ingested_at = now_iso()
@@ -2522,6 +2523,11 @@ def markdown_frontmatter_value(text: str, key: str) -> str | None:
             value = line[len(prefix) :].strip()
             return value.strip('"').strip("'").strip() or None
     return None
+
+
+def document_title_for_text(text: str, path: Path) -> str:
+    fallback = path.stem.replace("-", " ").replace("_", " ").strip() or path.name
+    return bounded_document_title(markdown_frontmatter_value(text, "title"), fallback)
 
 
 def stable_lineage_references(text: str) -> list[tuple[str, str, str]]:

@@ -7,6 +7,7 @@ from typing import Any
 
 from .llm import get_provider
 from .paths import BrainPaths
+from .title_utils import bounded_document_title
 from .util import slugify
 from .wiki import (
     GENERATED_MARKER,
@@ -162,7 +163,7 @@ def compiler_documents(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
         output.append(
             {
                 "source_id": source_id,
-                "title": document.get("title") or document["id"],
+                "title": bounded_document_title(document.get("title"), document["id"]),
                 "source_type": document.get("source_type"),
                 "source_path": document.get("source_path"),
                 "ingested_at": document.get("ingested_at"),
@@ -249,7 +250,7 @@ def source_selector_documents(documents: list[dict[str, Any]]) -> list[dict[str,
         output.append(
             {
                 "source_id": source_id,
-                "title": document.get("title") or document["id"],
+                "title": bounded_document_title(document.get("title"), document["id"]),
                 "source_type": source_type,
                 "source_path": document.get("source_path"),
                 "ingested_at": document.get("ingested_at"),
