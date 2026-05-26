@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from pkm_brain.audit import audit_memories, provenance_check
-from pkm_brain.chunking import chunk_text
+from pkm_brain.chunking import chunk_text, sanitize_agent_session_log
 from pkm_brain.db import connection
 from pkm_brain.indexes import lancedb_stats, table_names, upsert_vectors
 from pkm_brain.memory_proposals import propose_failure_memories_from_sources, propose_memories_from_lineage
@@ -217,6 +217,71 @@ def test_agent_session_log_chunking_sanitizes_retrieval_and_tool_noise() -> None
     assert "tool-line" not in indexed
     assert "[omitted retrieved context dump]" in indexed
     assert "[omitted large tool output]" in indexed
+
+
+def test_agent_session_log_sanitizer_preserves_message_progression_and_compact_tools() -> None:
+    indexed = sanitize_agent_session_log(
+        "---\n"
+        'source_type: "agent_session_log"\n'
+        "---\n\n"
+        "## User Requests\n\n"
+        "User asked to diagnose nightly ingest failures.\n\n"
+        "## Assistant Responses\n\n"
+        "I will inspect the failing run and verify the index after cleanup.\n\n"
+        "## Tool / Command Activity\n\n"
+        "- tool_call: functions.exec_command cmd='uv run brain index doctor --home /Users/Peter/brain'\n"
+        "- event_msg: index doctor returned missing_vector_count=0 and stale_vector_count=0.\n\n"
+        "## Assistant Responses\n\n"
+        "Nightly ingest is healthy after the cleanup.\n"
+    )
+
+    assert "User asked to diagnose nightly ingest failures." in indexed
+    assert "I will inspect the failing run" in indexed
+    assert "uv run brain index doctor" in indexed
+    assert "missing_vector_count=0" in indexed
+    assert "Nightly ingest is healthy after the cleanup." in indexed
+    assert "[omitted" not in indexed
+
+
+def test_agent_session_log_sanitizer_truncates_verbose_tool_output_without_losing_summary() -> None:
+    noisy_output = "\n".join(f"stack frame {index}: verbose dependency resolver trace" for index in range(80))
+    indexed = sanitize_agent_session_log(
+        "## User Requests\n\n"
+        "User asked to add regression tests for agent session sanitization.\n\n"
+        "## Tool / Command Activity\n\n"
+        "- tool_call: functions.exec_command cmd='uv run pytest tests/test_core.py'\n"
+        "Output:\n"
+        "FAILED tests/test_core.py::test_agent_session_marker - AssertionError: marker missing\n"
+        f"{noisy_output}\n"
+        "Process exited with code 1\n"
+        "Wall time: 12.3 seconds\n\n"
+        "## Assistant Responses\n\n"
+        "I fixed the sanitizer and reran the focused test.\n"
+    )
+
+    assert "User asked to add regression tests" in indexed
+    assert "uv run pytest tests/test_core.py" in indexed
+    assert "FAILED tests/test_core.py::test_agent_session_marker" in indexed
+    assert "Process exited with code 1" in indexed
+    assert "Wall time: 12.3 seconds" in indexed
+    assert "I fixed the sanitizer" in indexed
+    assert "stack frame 0" in indexed
+    assert "stack frame 4" not in indexed
+    assert "[omitted large tool output]" in indexed
+
+
+def test_agent_session_log_sanitizer_preserves_short_tool_arguments() -> None:
+    indexed = sanitize_agent_session_log(
+        "## Tool / Command Activity\n\n"
+        '- function_call: {"name": "update_plan", "arguments": {"step": "Add focused sanitizer tests"}}\n\n'
+        "## Assistant Responses\n\n"
+        "The compact tool call explains why the next edit happened.\n"
+    )
+
+    assert '"name": "update_plan"' in indexed
+    assert "Add focused sanitizer tests" in indexed
+    assert "compact tool call explains" in indexed
+    assert "[omitted" not in indexed
 
 
 def test_index_doctor_reports_lancedb_health(tmp_path: Path) -> None:

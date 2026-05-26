@@ -9,6 +9,7 @@ DEFAULT_TARGET_TOKENS = 1200
 DEFAULT_OVERLAP_TOKENS = 200
 MAX_AGENT_SESSION_BLOCK_CHARS = 3000
 MAX_AGENT_SESSION_LINE_CHARS = 1200
+MAX_AGENT_SESSION_TOOL_DETAIL_LINES = 4
 
 RETRIEVAL_BLOB_MARKERS = (
     '"active_memories"',
@@ -101,7 +102,7 @@ def sanitize_agent_session_block(block: str) -> str:
     if looks_like_retrieval_blob(stripped):
         return "[omitted retrieved context dump]"
     if looks_like_large_tool_output(stripped):
-        return "[omitted large tool output]"
+        return summarize_large_tool_output(stripped)
     if looks_like_large_json_blob(stripped):
         return "[omitted large JSON tool result]"
 
@@ -132,6 +133,60 @@ def sanitize_agent_session_block(block: str) -> str:
     if omitted_long_lines:
         lines.append(f"[omitted {omitted_long_lines} noisy log line(s)]")
     return "\n".join(lines).strip()
+
+
+def summarize_large_tool_output(text: str) -> str:
+    lines: list[str] = []
+    omitted_lines = 0
+    output_detail_lines = 0
+    in_tool_output = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        lowered = stripped.lower()
+        if any(marker in lowered for marker in RETRIEVAL_BLOB_MARKERS):
+            omitted_lines += 1
+            continue
+        if len(line) > MAX_AGENT_SESSION_LINE_CHARS:
+            omitted_lines += 1
+            continue
+        if lowered.startswith(("output:", "stdout:", "stderr:", "traceback")):
+            in_tool_output = True
+            lines.append(line)
+            continue
+        if is_tool_summary_line(lowered):
+            lines.append(line)
+            continue
+        if in_tool_output:
+            if output_detail_lines < MAX_AGENT_SESSION_TOOL_DETAIL_LINES:
+                lines.append(line)
+                output_detail_lines += 1
+            else:
+                omitted_lines += 1
+            continue
+        lines.append(line)
+
+    lines.append("[omitted large tool output]")
+    if omitted_lines:
+        lines.append(f"[omitted {omitted_lines} noisy log line(s)]")
+    return "\n".join(lines).strip()
+
+
+def is_tool_summary_line(lowered_line: str) -> bool:
+    normalized = lowered_line.lstrip("- ")
+    if normalized.startswith(("event_msg:", "response_item:", "tool_call:", "function_call:", "command:", "cmd:")):
+        return True
+    return any(
+        marker in lowered_line
+        for marker in (
+            "assertionerror",
+            "error:",
+            "failed",
+            "process exited with code",
+            "wall time:",
+        )
+    )
 
 
 def looks_like_retrieval_blob(text: str) -> bool:
