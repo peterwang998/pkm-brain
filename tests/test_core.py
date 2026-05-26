@@ -348,8 +348,8 @@ def test_reindex_chunks_rewrites_existing_oversized_document(tmp_path: Path) -> 
             INSERT INTO documents(
               id, source_type, title, source_path, raw_path, content_hash,
               origin_node_id, logical_source_key, created_at, ingested_at,
-              project, tags, sensitivity, version, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              project, tags, version, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 document_id,
@@ -364,7 +364,6 @@ def test_reindex_chunks_rewrites_existing_oversized_document(tmp_path: Path) -> 
                 "2026-05-20T00:00:00+00:00",
                 None,
                 "[]",
-                "normal",
                 1,
                 "active",
             ),

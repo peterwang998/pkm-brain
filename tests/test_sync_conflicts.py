@@ -20,8 +20,8 @@ def test_sync_conflicts_lists_logical_sources_seen_under_multiple_origins(tmp_pa
                 INSERT INTO documents(
                   id, source_type, title, source_path, raw_path, content_hash,
                   origin_node_id, logical_source_key, created_at, ingested_at,
-                  project, tags, sensitivity, version, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  project, tags, version, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     document_id,
@@ -36,7 +36,6 @@ def test_sync_conflicts_lists_logical_sources_seen_under_multiple_origins(tmp_pa
                     timestamp,
                     None,
                     dumps([]),
-                    "normal",
                     1,
                     "active",
                 ),

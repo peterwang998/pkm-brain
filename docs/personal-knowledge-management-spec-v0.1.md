@@ -208,7 +208,6 @@ content_hash
 origin_uri
 project
 tags
-sensitivity
 version
 status
 ```
@@ -264,7 +263,6 @@ documents(
   ingested_at TEXT,
   project TEXT,
   tags TEXT,
-  sensitivity TEXT,
   version INTEGER,
   status TEXT
 )
@@ -296,7 +294,6 @@ memories(
   id TEXT PRIMARY KEY,
   memory_type TEXT,
   scope TEXT,
-  sensitivity TEXT,        -- pending; not yet added by migration
   content TEXT,
   confidence REAL,
   source_ids TEXT,
@@ -308,8 +305,6 @@ memories(
   review_reason TEXT
 )
 ```
-
-The `sensitivity` column is part of the Section 13 design target and has not yet been added to the live SQLite schema. Until it ships, memory sensitivity is unenforced and Section 13 controls apply to documents only.
 
 Memory statuses:
 
@@ -1187,25 +1182,11 @@ sources: [agent_session_2026_05_04]
 status: proposed
 ```
 
-## 13. Sensitivity And Egress Controls
+## 13. Provider Privacy Boundaries
 
-Personal knowledge is mixed-sensitivity. The system must let the user mark sources and memories with a sensitivity tier and must enforce those tiers at retrieval, synthesis, and proposal time.
+The system is local-first, but some optional maintenance paths may call external model providers. V1 should keep provider use explicit and inspectable without adding per-document or per-memory classification tiers.
 
-Sensitivity tiers (stored on `documents.sensitivity` and `memories.sensitivity`):
-
-```text
-public      Shareable freely. Eligible for any retrieval, synthesis, or proposal target.
-normal      Default. Eligible for all local operations and for cloud-LLM-backed
-            enrichment.
-private     Local-only. Must not be sent to any cloud LLM provider for synthesis,
-            proposal, or retrieval-time prompting. May still be returned by local CLI
-            search and by local MCP retrieve_context.
-secret      Excluded from automatic retrieval. Must be opted in per call via an explicit
-            filter. Must never be sent to a cloud LLM provider. Must never be embedded
-            against a cloud embedding API.
-```
-
-Provider classification for egress purposes:
+Provider classes:
 
 ```text
 local   ollama, local hash embedding, local SentenceTransformer
@@ -1214,66 +1195,20 @@ cloud   anthropic, openai-compatible, codex, cloud embedding providers
 
 The Codex provider is treated as cloud because requests flow through a remote model even though the CLI is local.
 
-Required egress rules:
+Required rules:
 
 ```text
-1. Any code path that calls a cloud provider for completion or embedding must filter
-   out documents, chunks, and memories with sensitivity in {private, secret} before
-   constructing the prompt or embedding payload.
-2. Nightly automation that uses a cloud provider must abort with a clear error if any
-   candidate source carries sensitivity=secret, unless --include-secret is passed
-   explicitly with a reason recorded on the automation run.
-3. Wiki and memory proposal generation must record the effective sensitivity filter
-   and the count of sources excluded by tier on every run.
-4. The local hash embedding provider and the local SentenceTransformer provider may
-   embed all tiers.
+1. `brain llm doctor` must identify the configured provider and must not print tokens,
+   API keys, private keys, or raw prompts.
+2. Optional cloud-backed wiki and memory proposal commands must be explicit operator
+   actions or explicitly enabled automation flags.
+3. Automation run summaries and errors must cap large prompts, stderr streams, and
+   provider payloads before writing to SQLite.
+4. Capture and setup paths must redact secret-shaped values before writing agent logs,
+   setup output, or run summaries.
 ```
 
-Default sensitivity inference at ingest:
-
-```text
-- agent_session_log captures default to normal unless the capture adapter detected
-  secret-shaped material during redaction; those documents must be marked private at
-  ingest time.
-- markdown_note and meeting_transcript default to normal.
-- hyprnote_meeting defaults to private. The user must promote a meeting explicitly to
-  send it to a cloud provider.
-- manual_entry defaults to normal.
-```
-
-Retrieval rules:
-
-```text
-- retrieve_context must include the effective sensitivity of each returned chunk,
-  wiki page, and memory so callers can decide whether to forward content to a cloud
-  LLM in their own pipeline.
-- search_knowledge must accept a max_sensitivity filter. The default is normal for
-  MCP callers and unrestricted for local CLI callers.
-- Retrieval events must record the effective sensitivity filter applied, the counts
-  excluded by tier, and the caller's transport.
-```
-
-Required commands:
-
-```text
-brain set-sensitivity document <document_id> <tier> [--reason <text>]
-brain set-sensitivity memory <memory_id> <tier> [--reason <text>]
-brain list documents --sensitivity <tier>
-brain list memories --sensitivity <tier>
-brain doctor                          # must report configured egress policy and
-                                       # provider classifications
-brain egress preview --provider <p>   # show counts of sources eligible vs excluded
-                                       # for a given provider, without sending data
-```
-
-Sensitivity is mutable and audited:
-
-```text
-- Every sensitivity change must be logged with old tier, new tier, reason, and actor.
-- Promoting a document from private or secret to normal or public must require an
-  explicit --confirm flag.
-- Demoting from public to a more restrictive tier may happen without confirmation.
-```
+Privacy remains a source-capture and provider-boundary concern in V1. The schema does not model tiered content controls.
 
 ## 14. Forgetting And Redaction
 
@@ -1901,7 +1836,7 @@ V1 should prioritize simple local observability over a full evaluation platform.
 
 Audit date: 2026-05-25.
 
-This spec is the target design for a single-user local-first PKM/agent-memory system. The codebase implements most of the V1 surface; some sections (Sensitivity controls, Forgetting, Tension audit, retrieval-quality polish) are partially or not yet implemented. This section lists the current state so the spec stays honest about what ships today.
+This spec is the target design for a single-user local-first PKM/agent-memory system. The codebase implements most of the V1 surface; some sections (Forgetting, Tension audit, retrieval-quality polish) are partially or not yet implemented. This section lists the current state so the spec stays honest about what ships today.
 
 ### 21.1 Implemented
 
@@ -1944,18 +1879,11 @@ Operability:
 
 - **Retrieval quality (Section 10 / Phase 4):** RRF, source-aware rerank, lineage tie-breakers, neighbor caps, and excerpting ship. Query expansion, hypothetical-question vector search, neighbor-chunk expansion, and a true cross-encoder local reranker are not yet implemented.
 - **Embeddings (Section 4 stack):** local hash embedding + optional `SentenceTransformer` ship. Cloud embedding providers and a configurable provider toggle are not yet implemented.
-- **Doctor (Section 13.6):** `brain doctor` reports home / SQLite / LanceDB / embedding provider / directories, but does not yet report the configured egress policy or per-provider classification.
 - **Memory audit (Section 20 Memory Audit):** validates `memory_type`, `status`, `scope`, `source_ids` presence, and `confidence` presence. Duplicate detection, staleness flagging, conflict detection, and broken-source surfacing are pending.
 - **Run logs (Section 20 Pipeline Run Logs):** `ingestion_runs` tracks discovered/changed/skipped/chunks/embeddings/errors/warnings. `wiki pages proposed` and `memories proposed` per-run counters are not yet populated.
 
 ### 21.3 Not Yet Implemented
 
-- **Section 13 Sensitivity And Egress Controls.** `documents.sensitivity` exists and defaults to `normal`, but there are no CLI surfaces and no enforcement:
-  - `brain set-sensitivity document|memory <id> <tier>` is missing.
-  - `brain list documents --sensitivity <tier>` and `brain list memories --sensitivity <tier>` are missing.
-  - `brain egress preview --provider <p>` is missing.
-  - `memories.sensitivity` column is not yet in the schema.
-  - Cloud provider egress filtering, default-sensitivity inference at ingest, retrieval-time `max_sensitivity` filters, and sensitivity-change audit logging are not yet implemented.
 - **Section 14 Forgetting And Redaction.** `forget_events` table does not exist. None of `brain forget source|session|memory|pattern|range|list|inspect|undo` is implemented. There is no tombstone-based re-ingestion guard. `brain provenance check` does not yet detect dangling references caused by forgets.
 - **Section 9.2 Tension Audit.** Explicitly future work; no implementation.
 - **Section 20 Golden Query Eval Set.** `~/brain/evals/golden_queries.yaml` is created at workspace init, but there is no `brain eval` runner producing `recall@5`, `recall@10`, `MRR`, or expected-source/page/memory metrics.

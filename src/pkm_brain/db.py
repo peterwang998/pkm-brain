@@ -24,7 +24,6 @@ CREATE TABLE IF NOT EXISTS documents (
   ingested_at TEXT NOT NULL,
   project TEXT,
   tags TEXT NOT NULL DEFAULT '[]',
-  sensitivity TEXT NOT NULL DEFAULT 'normal',
   version INTEGER NOT NULL DEFAULT 1,
   status TEXT NOT NULL DEFAULT 'active'
 );

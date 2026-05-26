@@ -729,8 +729,8 @@ class BrainService:
                         INSERT INTO documents(
                           id, source_type, title, source_path, raw_path, content_hash,
                           origin_node_id, logical_source_key, created_at, ingested_at,
-                          project, tags, sensitivity, version, status
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                          project, tags, version, status
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             document_id,
@@ -745,7 +745,6 @@ class BrainService:
                             ingested_at,
                             None,
                             dumps([]),
-                            "normal",
                             1,
                             "active",
                         ),
@@ -866,8 +865,8 @@ class BrainService:
                         INSERT INTO documents(
                           id, source_type, title, source_path, raw_path, content_hash,
                           origin_node_id, logical_source_key, created_at, ingested_at,
-                          project, tags, sensitivity, version, status
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                          project, tags, version, status
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             document_id,
@@ -882,7 +881,6 @@ class BrainService:
                             ingested_at,
                             None,
                             dumps([]),
-                            "normal",
                             1,
                             "active",
                         ),
