@@ -4,6 +4,7 @@ import fcntl
 import json
 import os
 import plistlib
+import hashlib
 import shlex
 import shutil
 import subprocess
@@ -28,6 +29,9 @@ from .wiki_proposals import propose_from_sources
 LAUNCH_AGENT_LABEL = "com.pkm-brain.agent-log-ingest"
 NIGHTLY_LAUNCH_AGENT_LABEL = "com.pkm-brain.nightly-maintenance"
 NIGHTLY_JOB_NAME = "nightly-maintenance"
+MAX_STORED_ERROR_CHARS = 4000
+MAX_STORED_ERROR_LIST_ITEMS = 20
+ERROR_FIELD_NAMES = {"error", "errors", "stderr", "traceback"}
 
 
 @dataclass(frozen=True)
@@ -340,6 +344,8 @@ def record_automation_finish(
     summary: dict[str, Any],
     error: str | None,
 ) -> None:
+    compacted_summary = compact_automation_errors(summary)
+    compacted_error = compact_error_text(error) if error is not None else None
     with connection(paths.sqlite_path) as conn:
         conn.execute(
             """
@@ -347,8 +353,54 @@ def record_automation_finish(
             SET finished_at = ?, status = ?, summary = ?, error = ?
             WHERE id = ?
             """,
-            (finished_at, status, dumps(summary), error, run_id),
+            (finished_at, status, dumps(compacted_summary), compacted_error, run_id),
         )
+
+
+def compact_automation_errors(value: Any) -> Any:
+    if isinstance(value, dict):
+        output: dict[str, Any] = {}
+        for key, nested in value.items():
+            if normalized_error_key(key) in ERROR_FIELD_NAMES:
+                output[key] = compact_error_value(nested)
+            else:
+                output[key] = compact_automation_errors(nested)
+        return output
+    if isinstance(value, list):
+        return [compact_automation_errors(item) for item in value]
+    return value
+
+
+def compact_error_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return compact_error_text(value)
+    if isinstance(value, list):
+        output = [compact_error_value(item) for item in value[:MAX_STORED_ERROR_LIST_ITEMS]]
+        omitted = len(value) - len(output)
+        if omitted > 0:
+            output.append(f"[omitted {omitted} additional error item(s)]")
+        return output
+    if isinstance(value, dict):
+        return {key: compact_error_value(nested) for key, nested in value.items()}
+    return value
+
+
+def compact_error_text(text: str, max_chars: int = MAX_STORED_ERROR_CHARS) -> str:
+    if len(text) <= max_chars:
+        return text
+    digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+    head_chars = max(1, int(max_chars * 0.7))
+    tail_chars = max(1, max_chars - head_chars - 120)
+    omitted = len(text) - head_chars - tail_chars
+    return (
+        text[:head_chars].rstrip()
+        + f"\n[truncated {omitted} chars; sha256={digest}]\n"
+        + text[-tail_chars:].lstrip()
+    )
+
+
+def normalized_error_key(key: str) -> str:
+    return key.lower().replace("-", "_")
 
 
 def launch_agent_path() -> Path:

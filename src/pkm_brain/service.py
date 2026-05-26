@@ -12,7 +12,7 @@ from typing import Any
 
 import yaml
 
-from .chunking import DEFAULT_OVERLAP_TOKENS, DEFAULT_TARGET_TOKENS, chunk_text
+from .chunking import DEFAULT_OVERLAP_TOKENS, DEFAULT_TARGET_TOKENS, chunk_text, prepare_text_for_indexing, sanitize_agent_session_log
 from .db import connection, dumps, init_db, loads, rows
 from .embeddings import get_embedding_provider
 from .indexes import (
@@ -404,6 +404,7 @@ class BrainService:
         self,
         source_type: str = "agent_session_log",
         dry_run: bool = False,
+        all_documents: bool = False,
         target_tokens: int = DEFAULT_TARGET_TOKENS,
         overlap_tokens: int = DEFAULT_OVERLAP_TOKENS,
     ) -> dict[str, Any]:
@@ -414,22 +415,22 @@ class BrainService:
             raise ValueError("overlap_tokens must be >= 0 and less than target_tokens")
 
         with connection(self.paths.sqlite_path) as conn:
-            affected = rows(
-                conn,
-                """
-                SELECT d.id, d.source_type, d.title, d.source_path, d.raw_path,
-                       COUNT(c.id) AS current_chunks,
-                       MAX(c.token_count) AS max_chunk_tokens,
-                       MAX(LENGTH(c.text)) AS max_chunk_bytes
-                FROM documents d
-                JOIN chunks c ON c.document_id = d.id
-                WHERE d.source_type = ?
-                GROUP BY d.id
-                HAVING MAX(c.token_count) > ?
-                ORDER BY max_chunk_tokens DESC, d.ingested_at DESC
-                """,
-                (source_type, target_tokens),
-            )
+            query = """
+            SELECT d.id, d.source_type, d.title, d.source_path, d.raw_path,
+                   COUNT(c.id) AS current_chunks,
+                   MAX(c.token_count) AS max_chunk_tokens,
+                   MAX(LENGTH(c.text)) AS max_chunk_bytes
+            FROM documents d
+            JOIN chunks c ON c.document_id = d.id
+            WHERE d.source_type = ?
+            GROUP BY d.id
+            """
+            params: tuple[Any, ...] = (source_type,)
+            if not all_documents:
+                query += " HAVING MAX(c.token_count) > ?"
+                params = (source_type, target_tokens)
+            query += " ORDER BY max_chunk_tokens DESC, d.ingested_at DESC"
+            affected = rows(conn, query, params)
             plans: list[dict[str, Any]] = []
             errors: list[str] = []
             total_projected_chunks = 0
@@ -474,6 +475,7 @@ class BrainService:
                 "status": "dry_run" if dry_run else "ok",
                 "dry_run": dry_run,
                 "source_type": source_type,
+                "all_documents": all_documents,
                 "target_tokens": target_tokens,
                 "overlap_tokens": overlap_tokens,
                 "affected_documents": len(plans),
@@ -790,7 +792,7 @@ class BrainService:
                     if source_type == "agent_session_log":
                         record_agent_log_lineage_references(
                             conn,
-                            text=text,
+                            text=prepare_text_for_indexing(text, source_type),
                             document_id=document_id,
                             agent_session_id=markdown_frontmatter_value(text, "session_id"),
                             created_at=ingested_at,
@@ -919,7 +921,7 @@ class BrainService:
                     if source_type == "agent_session_log":
                         record_agent_log_lineage_references(
                             conn,
-                            text=text,
+                            text=prepare_text_for_indexing(text, source_type),
                             document_id=document_id,
                             agent_session_id=markdown_frontmatter_value(text, "session_id"),
                             created_at=ingested_at,
@@ -2193,21 +2195,7 @@ def strip_frontmatter(text: str) -> str:
 
 
 def clean_agent_session_log(text: str) -> str:
-    output: list[str] = []
-    for line in text.splitlines():
-        lowered = line.lower()
-        if "session_meta:" in lowered:
-            continue
-        if "you are codex" in lowered or "<permissions instructions>" in lowered:
-            continue
-        if lowered.lstrip("- ").startswith("event_msg:"):
-            continue
-        if lowered.lstrip("- ").startswith("response_item:") and len(line) > 1000:
-            continue
-        output.append(line)
-    cleaned = "\n".join(output)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    return cleaned.strip()
+    return sanitize_agent_session_log(text)
 
 
 def focused_excerpt(text: str, query: str, max_tokens: int) -> str:

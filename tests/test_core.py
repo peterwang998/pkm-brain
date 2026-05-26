@@ -191,6 +191,34 @@ def test_small_block_keeps_single_chunk() -> None:
     assert chunks[0].text == "short note\n\nwith two paragraphs"
 
 
+def test_agent_session_log_chunking_sanitizes_retrieval_and_tool_noise() -> None:
+    text = (
+        "---\n"
+        'source_type: "agent_session_log"\n'
+        "---\n\n"
+        "## User Requests\n\n"
+        "Keep the durable request.\n\n"
+        '{"supporting_chunks": [{"chunk_id": "chunk_noise", "document_id": "doc_noise", '
+        '"content_hash": "abc", "text": "retrieved text should not be indexed"}], '
+        '"citation_snapshots": [{"type": "chunk", "text": "citation text"}]}\n\n'
+        "Output:\n"
+        + ("tool-line " * 700)
+        + "\n\n"
+        "Referenced chunk_stable and document:doc_stable.\n"
+    )
+
+    chunks = chunk_text(text, "agent_session_log", target_tokens=1000, overlap_tokens=200)
+    indexed = "\n".join(chunk.text for chunk in chunks)
+
+    assert "Keep the durable request." in indexed
+    assert "Referenced chunk_stable" in indexed
+    assert "retrieved text should not be indexed" not in indexed
+    assert "citation_snapshots" not in indexed
+    assert "tool-line" not in indexed
+    assert "[omitted retrieved context dump]" in indexed
+    assert "[omitted large tool output]" in indexed
+
+
 def test_index_doctor_reports_lancedb_health(tmp_path: Path) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()

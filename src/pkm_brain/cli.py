@@ -513,6 +513,7 @@ def index_reset_retrieval(
 def db_reindex_chunks(
     source_type: str = typer.Option("agent_session_log", "--source-type", help="Only reindex documents with this source_type."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Report affected documents and projected chunks without writing."),
+    all_documents: bool = typer.Option(False, "--all-documents", help="Reindex all documents of the source type, not only oversized chunks."),
     target_tokens: int = typer.Option(1200, "--target-tokens", help="Maximum tokens per regenerated chunk."),
     overlap_tokens: int = typer.Option(200, "--overlap-tokens", help="Tokens to overlap between split oversized chunks."),
     home: Optional[Path] = typer.Option(None),
@@ -520,6 +521,7 @@ def db_reindex_chunks(
     result = service(home).reindex_chunks(
         source_type=source_type,
         dry_run=dry_run,
+        all_documents=all_documents,
         target_tokens=target_tokens,
         overlap_tokens=overlap_tokens,
     )

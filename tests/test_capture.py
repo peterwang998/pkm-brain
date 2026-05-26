@@ -6,7 +6,15 @@ import shlex
 import sqlite3
 from pathlib import Path
 
-from pkm_brain.automation import render_launch_agent, render_nightly_launch_agent, run_agent_log_ingest, run_nightly_maintenance
+from pkm_brain.automation import (
+    MAX_STORED_ERROR_CHARS,
+    record_automation_finish,
+    record_automation_start,
+    render_launch_agent,
+    render_nightly_launch_agent,
+    run_agent_log_ingest,
+    run_nightly_maintenance,
+)
 from pkm_brain.capture import AgentLogCapture, redact_text
 from pkm_brain.db import connection
 from pkm_brain.llm import CODEX_DEFAULT_MODEL, DEFAULT_LLM_PROVIDER, OPENAI_DEFAULT_MODEL, provider_status
@@ -375,6 +383,32 @@ def test_nightly_maintenance_runs_self_healing_tasks(tmp_path: Path) -> None:
         row = conn.execute("SELECT * FROM automation_runs WHERE job_name = ?", ("nightly-maintenance",)).fetchone()
     assert row is not None
     assert row["status"] == "success"
+
+
+def test_automation_run_persistence_caps_error_payloads(tmp_path: Path) -> None:
+    svc = make_service(tmp_path)
+    run_id = "automation_large_error"
+    large_error = "provider failed\n" + ("prompt payload " * 2000)
+    record_automation_start(svc.paths, run_id, "nightly-maintenance", "2026-05-20T00:00:00+00:00")
+
+    record_automation_finish(
+        svc.paths,
+        run_id,
+        "failed",
+        "2026-05-20T00:01:00+00:00",
+        {"wiki_synthesize": {"llm_compile": {"error": large_error}}, "normal": {"text": large_error}},
+        large_error,
+    )
+
+    with connection(svc.paths.sqlite_path) as conn:
+        row = conn.execute("SELECT summary, error FROM automation_runs WHERE id = ?", (run_id,)).fetchone()
+    summary = json.loads(row["summary"])
+
+    assert len(row["error"]) <= MAX_STORED_ERROR_CHARS + 100
+    assert "sha256=" in row["error"]
+    assert len(summary["wiki_synthesize"]["llm_compile"]["error"]) <= MAX_STORED_ERROR_CHARS + 100
+    assert "sha256=" in summary["wiki_synthesize"]["llm_compile"]["error"]
+    assert summary["normal"]["text"] == large_error
 
 
 def test_nightly_maintenance_skips_when_not_due(tmp_path: Path) -> None:

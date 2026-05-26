@@ -4,7 +4,7 @@ Spec version: 0.1
 
 Status: Draft for human review
 
-Last updated: 2026-05-17
+Last updated: 2026-05-25
 
 ## 1. Purpose
 
@@ -87,9 +87,9 @@ Orchestration: cron or Makefile initially
 Human frontend: Obsidian / VSCode / filesystem
 ```
 
-### 4.1 Pending Installation Wizard
+### 4.1 Installation Wizard
 
-The current V1 CLI initialization path is a direct workspace initializer, not a guided installation wizard. A publishable install flow should add an interactive wizard as a pending implementation item.
+The guided installation wizard is implemented. `brain init` runs the direct workspace initializer; `brain setup` and `brain init --wizard` run the interactive flow.
 
 Required command:
 
@@ -120,9 +120,9 @@ If the user chooses Primary / Secondary sync setup, the wizard must hand off to 
 
 The wizard must support `--dry-run`, `--json`, and non-interactive flags for scripted installs, but the default human path should be guided prompts.
 
-### 4.2 Pending Local Web UI
+### 4.2 Local Web UI
 
-Add an optional local Web UI as a human control plane for Brain status, setup, scheduled jobs, sync validation, and memory review.
+An optional local Web UI is implemented as a human control plane for Brain status, setup, scheduled jobs, sync validation, and memory review. V1 uses stdlib `http.server`, not FastAPI. `brain ui service install/status/uninstall` for running the UI as a managed service is deferred.
 
 Default behavior:
 
@@ -256,15 +256,21 @@ documents(
   source_type TEXT,
   title TEXT,
   source_path TEXT,
+  raw_path TEXT,
   content_hash TEXT,
+  origin_node_id TEXT,
+  logical_source_key TEXT,
   created_at TEXT,
   ingested_at TEXT,
   project TEXT,
   tags TEXT,
   sensitivity TEXT,
+  version INTEGER,
   status TEXT
 )
 ```
+
+`raw_path` is the immutable normalized copy under `~/brain/raw/<source_type>/`. `origin_node_id` and `logical_source_key` support multi-machine sync: rows captured on a Secondary preserve the Secondary's node id and the canonical local path, so re-ingestion deduplicates by (origin, logical key) rather than by per-machine path.
 
 Minimum chunk schema:
 
@@ -290,7 +296,7 @@ memories(
   id TEXT PRIMARY KEY,
   memory_type TEXT,
   scope TEXT,
-  sensitivity TEXT,
+  sensitivity TEXT,        -- pending; not yet added by migration
   content TEXT,
   confidence REAL,
   source_ids TEXT,
@@ -302,6 +308,8 @@ memories(
   review_reason TEXT
 )
 ```
+
+The `sensitivity` column is part of the Section 13 design target and has not yet been added to the live SQLite schema. Until it ships, memory sensitivity is unenforced and Section 13 controls apply to documents only.
 
 Memory statuses:
 
@@ -403,7 +411,7 @@ superseded
 failed
 ```
 
-Minimum forget event schema:
+Minimum forget event schema (pending; not yet created by migration):
 
 ```sql
 forget_events(
@@ -469,12 +477,16 @@ Agent session logs:
 
 ```text
 - Retain only the latest/final captured snapshot per agent session.
+- Preserve the raw captured Markdown under raw_path for auditability.
+- Build derived chunks, FTS rows, vectors, and lineage from sanitized text.
 - Preserve user request.
 - Preserve commands run.
 - Preserve files touched.
 - Preserve errors.
 - Preserve final outcome.
 - Extract decisions and unresolved issues.
+- Strip system prompts, permission blocks, retrieved-context dumps, citation snapshots,
+  MCP/CLI JSON blobs, and large tool outputs from the indexed representation.
 ```
 
 Code snippets:
@@ -543,6 +555,8 @@ Nightly maintenance should run these tasks:
 ```
 
 Wiki synthesis calls the default LLM provider by default so the semantic wiki compounds from new sources, while capture, ingest, status checks, provenance, lint, and memory audit remain local Python pipeline operations. The default provider should be the Codex CLI adapter so users with a local Codex subscription do not need to configure a separate API key for normal wiki maintenance. Operators may disable LLM semantic compilation with `--no-llm-wiki`.
+
+Automation run persistence must keep normal status summaries useful but cap fields named `error`, `errors`, `stderr`, or `traceback` before writing `automation_runs`. Failed provider calls must not persist full LLM prompts, full stderr streams, or retrieved context dumps inline; compacted error text should include enough prefix/suffix detail plus a digest to correlate with logs.
 
 Optional nightly LLM proposal stages remain separate from direct generated-page maintenance:
 
@@ -646,19 +660,25 @@ Use RRF instead of hand-weighted score blending for V1 because BM25 and vector s
 
 `search_knowledge` and `retrieve_context` should share the same reranking model: broad BM25/vector fan-out, reciprocal-rank candidate collection, source-aware reranking, and top-N selection with recall backfill from lower-ranked candidates when filtering leaves too few results. Meetings, notes, transcripts, web clips, and working documents receive a positive source signal for normal knowledge queries. Agent session logs are downranked for normal knowledge queries but may rank highly for agent/session/tool/implementation-history queries.
 
-Context packet format:
+Context packet format (as returned by `service.retrieve_context`):
 
 ```text
-query
+task
+project
+budget
 retrieval_mode
-selected_chunks
-source_citations
+supporting_chunks
+citation_snapshots
+citations                  # alias of citation_snapshots for back-compat
 active_memories
 candidate_memories
-related_wiki_pages
-confidence_notes
+relevant_wiki_pages
+open_questions
 omitted_due_to_budget
+retrieval_event_id
 ```
+
+Debug mode additionally returns `retrieval_policy` and `retrieval_debug`. The previously named fields `selected_chunks`, `source_citations`, `related_wiki_pages`, and `confidence_notes` have been renamed or replaced by the fields above; consumers should treat the field names listed here as canonical.
 
 `active_memories` are reviewed and trusted. `candidate_memories` are proposed, unreviewed hypotheses surfaced separately for awareness; agents must not treat them as authoritative operational instructions.
 
@@ -1377,16 +1397,19 @@ Expose the system through MCP first.
 Required MCP tools:
 
 ```text
-search_knowledge(query, filters)
-retrieve_context(task, project, repo)
+search_knowledge(query, limit)
+retrieve_context(task, project)
 record_context_feedback(target_type, target_id, useful, note)
 get_memories(scope, memory_type, status)
 propose_memory(memory_type, scope, content, sources, confidence)
-write_agent_session(summary, files_touched, commands_run, outcome)
+propose_wiki_update(title, rationale, source_ids, changes, confidence)
+list_wiki_proposals(status)
+inspect_wiki_proposal(batch_id)
+write_agent_session(summary, files_touched, commands_run, outcome, unresolved_issues)
 get_project_context(project)
 ```
 
-`retrieve_context` must return `active_memories` and `candidate_memories` as separate fields. `get_memories` may support status filtering, but memory approval must remain a local human action through the CLI or local Web UI.
+`retrieve_context` must return `active_memories` and `candidate_memories` as separate fields. `get_memories` may support status filtering, but memory approval must remain a local human action through the CLI or local Web UI. Memory and wiki *approval* tools are intentionally not exposed over MCP; agents may only propose. The CLI exposes additional retrieval knobs (`--budget`, `--mode`, `--debug`) that are not surfaced on MCP to keep agent calls compact.
 
 Optional HTTP endpoints:
 
@@ -1643,6 +1666,7 @@ brain index doctor
 brain index optimize
 brain index rebuild-vectors
 brain db reindex-chunks
+brain db reindex-chunks --all-documents
 ```
 
 Output should include:
@@ -1664,7 +1688,7 @@ failed index jobs
 
 LanceDB is a derived index cache and may be optimized or rebuilt from SQLite chunks. Routine optimization must not delete SQLite rows, raw files, wiki pages, memories, or source evidence. Scheduled optimization should use a conservative cleanup window; one-time manual cleanup may pass `--cleanup-older-than-days 0` when no long-running readers are active. Full vector rebuilds must verify the rebuilt row count against SQLite chunk count and retain the previous LanceDB directory as a timestamped backup unless explicitly requested otherwise.
 
-Oversized chunks should be automatically split into bounded overlapping chunks during ingest. Existing oversized documents may be reindexed from raw files; this rewrites derived SQLite chunks, FTS rows, and LanceDB vectors without deleting source evidence.
+Oversized chunks should be automatically split into bounded overlapping chunks during ingest. Existing oversized documents may be reindexed from raw files; this rewrites derived SQLite chunks, FTS rows, and LanceDB vectors without deleting source evidence. `--all-documents` intentionally rewrites every document of the selected source type, which is useful after sanitizer or chunking-policy changes.
 
 The index health check should answer:
 
@@ -1872,3 +1896,79 @@ warnings
 ```
 
 V1 should prioritize simple local observability over a full evaluation platform.
+
+## 21. Implementation Status And Drift Audit
+
+Audit date: 2026-05-25.
+
+This spec is the target design for a single-user local-first PKM/agent-memory system. The codebase implements most of the V1 surface; some sections (Sensitivity controls, Forgetting, Tension audit, retrieval-quality polish) are partially or not yet implemented. This section lists the current state so the spec stays honest about what ships today.
+
+### 21.1 Implemented
+
+Workspace, ingestion, retrieval:
+
+- Filesystem layout creation under `~/brain`.
+- SQLite schema with `documents`, `chunks`, `entities`, `relations`, `memories`, `wiki_pages`, `wiki_change_batches`, `wiki_change_items`, `wiki_interviews`, `ingestion_runs`, `sync_runs`, `automation_runs`, `retrieval_events`, `context_lineage_events`, `agent_sessions`, and `capture_sources` tables, with versioned migrations.
+- Markdown / plain-text / agent-log ingestion with `agent_session_log` latest-snapshot retention.
+- Source-specific chunking with provenance, including Hyprnote meeting captures and sanitized derived indexing for agent-session logs.
+- LanceDB vector index plus SQLite FTS5 lexical search.
+- Default deterministic hash embedding provider; optional `SentenceTransformer` (`BAAI/bge-small-en-v1.5`) provider when installed.
+- Reciprocal-rank fusion between BM25 and vector candidates.
+- Source-aware reranking with capped lineage tie-breakers.
+- Retrieval modes (`compact`, `default`, `broad`, `inspect`) with bounded token budgets and per-source caps.
+- Citation snapshots, retrieval event logging, and context lineage exposure events.
+
+Wiki, memory, agent interface:
+
+- `brain wiki synthesize` with deterministic reference-page maintenance and LLM-guided semantic compilation (Codex CLI / OpenAI-compatible / Anthropic / Ollama).
+- Wiki proposal batches with the `proposed → needs_interview → approved → applied` workflow.
+- `brain wiki lint` and `brain provenance check`.
+- Memory propose / list / inspect / approve / reject / archive / audit / export-all / import.
+- `AgentFailurePatternMemory` proposal synthesis from agent logs and lineage-driven proposal synthesis with independent-evidence thresholds.
+- `record_context_feedback` (CLI + MCP) and exposure-aware lineage scoring.
+- MCP server with `search_knowledge`, `retrieve_context`, `record_context_feedback`, `get_memories`, `propose_memory`, `propose_wiki_update`, `list_wiki_proposals`, `inspect_wiki_proposal`, `write_agent_session`, `get_project_context`.
+
+Operability:
+
+- `brain init`, `brain setup`, `brain init --wizard` guided installer with `--dry-run`, `--json`, `--yes`.
+- `brain ui` loopback Web UI with token auth and pages for status, setup, sync, jobs, logs, and memory review (stdlib `http.server`).
+- `brain doctor`, `brain inspect document|chunks`, `brain index status|doctor|optimize|rebuild-vectors`, `brain db reindex-chunks`, `brain runs list|inspect`.
+- `brain capture agents` for Codex, Claude Code, OpenCode, and opt-in Hyprnote.
+- `brain automation nightly --if-due` with optional `--with-llm-wiki-proposals` and `--with-llm-memory-proposals`.
+- Automation run storage caps nested error/stderr/traceback payloads to avoid persisting full prompts or provider failure streams in SQLite.
+- macOS LaunchAgent install/render/status for the frequent capture job and the nightly maintenance job.
+- Primary/Secondary sync: config model, role init, peer add, SSH host-key pinning, rsync transport, outbox export, staged pull/push with manifest verification, `sync_runs` log, `brain sync status|conflicts|acceptance|mirror-hash|rebuild-mirror-index`.
+- `brain scheduler` adapter with macOS LaunchAgent support (systemd and cron stubs intentionally not-yet-implemented).
+
+### 21.2 Partially Implemented
+
+- **Retrieval quality (Section 10 / Phase 4):** RRF, source-aware rerank, lineage tie-breakers, neighbor caps, and excerpting ship. Query expansion, hypothetical-question vector search, neighbor-chunk expansion, and a true cross-encoder local reranker are not yet implemented.
+- **Embeddings (Section 4 stack):** local hash embedding + optional `SentenceTransformer` ship. Cloud embedding providers and a configurable provider toggle are not yet implemented.
+- **Doctor (Section 13.6):** `brain doctor` reports home / SQLite / LanceDB / embedding provider / directories, but does not yet report the configured egress policy or per-provider classification.
+- **Memory audit (Section 20 Memory Audit):** validates `memory_type`, `status`, `scope`, `source_ids` presence, and `confidence` presence. Duplicate detection, staleness flagging, conflict detection, and broken-source surfacing are pending.
+- **Run logs (Section 20 Pipeline Run Logs):** `ingestion_runs` tracks discovered/changed/skipped/chunks/embeddings/errors/warnings. `wiki pages proposed` and `memories proposed` per-run counters are not yet populated.
+
+### 21.3 Not Yet Implemented
+
+- **Section 13 Sensitivity And Egress Controls.** `documents.sensitivity` exists and defaults to `normal`, but there are no CLI surfaces and no enforcement:
+  - `brain set-sensitivity document|memory <id> <tier>` is missing.
+  - `brain list documents --sensitivity <tier>` and `brain list memories --sensitivity <tier>` are missing.
+  - `brain egress preview --provider <p>` is missing.
+  - `memories.sensitivity` column is not yet in the schema.
+  - Cloud provider egress filtering, default-sensitivity inference at ingest, retrieval-time `max_sensitivity` filters, and sensitivity-change audit logging are not yet implemented.
+- **Section 14 Forgetting And Redaction.** `forget_events` table does not exist. None of `brain forget source|session|memory|pattern|range|list|inspect|undo` is implemented. There is no tombstone-based re-ingestion guard. `brain provenance check` does not yet detect dangling references caused by forgets.
+- **Section 9.2 Tension Audit.** Explicitly future work; no implementation.
+- **Section 20 Golden Query Eval Set.** `~/brain/evals/golden_queries.yaml` is created at workspace init, but there is no `brain eval` runner producing `recall@5`, `recall@10`, `MRR`, or expected-source/page/memory metrics.
+- **Section 20 `brain list documents --status failed`.** No `brain list documents` command exists at all yet.
+- **Section 15 HTTP API.** The optional HTTP endpoints (`POST /query`, `POST /retrieve-context`, `POST /ingest`, `GET /memory`, `POST /memory/propose`, `POST /session`) are not implemented; only MCP and the local Web UI are.
+- **`brain ui service install/status/uninstall`** for running the Web UI as a managed service.
+- **Non-macOS schedulers.** systemd user timers and cron adapters intentionally raise a clear not-yet-implemented error.
+- **Structured `agent_sessions` import from Secondary** and **Secondary read-only MCP mode** (also called out in the sync spec).
+- **`entities` and `relations` tables.** Present in the schema but no writer/reader uses them; entity extraction during enrichment is not implemented.
+
+### 21.4 Spec Drift Notes
+
+- The retrieval context packet field names returned by `service.retrieve_context` were originally specified as `selected_chunks`, `source_citations`, `related_wiki_pages`, and `confidence_notes`. The implementation uses `supporting_chunks`, `citation_snapshots` (with `citations` as a back-compat alias), and `relevant_wiki_pages`. Section 10 has been updated to match.
+- The MCP `retrieve_context` signature in the spec previously included a `repo` parameter. The implementation accepts only `task` and `project`. Section 15 has been updated. Per-call `budget` and `mode` knobs are CLI-only by design to keep MCP payloads compact.
+- The `documents` table schema in Section 7 has been expanded to match the live schema (`raw_path`, `origin_node_id`, `logical_source_key`, `version`). These columns are required to support Primary/Secondary sync.
+- The Web UI is built on stdlib `http.server` rather than FastAPI; this is an intentional V1 dependency tradeoff also noted in the sync spec.
