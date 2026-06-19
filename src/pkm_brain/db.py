@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator, TypeVar
 
+
+SQLITE_BUSY_TIMEOUT_SECONDS = 1.0
+SQLITE_BUSY_TIMEOUT_MS = int(SQLITE_BUSY_TIMEOUT_SECONDS * 1000)
+SQLITE_LOCK_RETRY_DELAYS_SECONDS = (0.5, 1.0, 2.0, 4.0, 8.0)
+T = TypeVar("T")
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -275,9 +281,54 @@ def loads(value: str | None, default: Any = None) -> Any:
     return json.loads(value)
 
 
+def is_sqlite_locked_error(exc: sqlite3.OperationalError) -> bool:
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+        return True
+    message = str(exc).lower()
+    return "database is locked" in message or "database table is locked" in message
+
+
+def retry_sqlite_lock(operation: Callable[[], T]) -> T:
+    for delay in SQLITE_LOCK_RETRY_DELAYS_SECONDS:
+        try:
+            return operation()
+        except sqlite3.OperationalError as exc:
+            if not is_sqlite_locked_error(exc):
+                raise
+            time.sleep(delay)
+    # One final attempt lets the original sqlite3 error surface if the lock
+    # outlives all configured backoff windows.
+    return operation()
+
+
+class RetryingConnection(sqlite3.Connection):
+    """SQLite connection that backs off on transient writer lock contention.
+
+    PKM Brain has several LaunchAgents that can write to the same local SQLite
+    database. WAL plus SQLite's busy timeout handle normal contention; this
+    retry layer covers short lock races that still surface as SQLITE_BUSY or
+    SQLITE_LOCKED.
+    """
+
+    def execute(self, sql: str, parameters: Any = (), /) -> sqlite3.Cursor:
+        return retry_sqlite_lock(lambda: super(RetryingConnection, self).execute(sql, parameters))
+
+    def executemany(self, sql: str, parameters: Any, /) -> sqlite3.Cursor:
+        return retry_sqlite_lock(lambda: super(RetryingConnection, self).executemany(sql, parameters))
+
+    def executescript(self, sql_script: str, /) -> sqlite3.Cursor:
+        return retry_sqlite_lock(lambda: super(RetryingConnection, self).executescript(sql_script))
+
+    def commit(self) -> None:
+        return retry_sqlite_lock(lambda: super(RetryingConnection, self).commit())
+
+
 def connect(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=SQLITE_BUSY_TIMEOUT_SECONDS, factory=RetryingConnection)
     conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
 

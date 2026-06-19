@@ -78,6 +78,7 @@ V1 uses:
 
 - filesystem workspace at `~/brain`
 - SQLite canonical metadata store at `~/brain/db/brain.sqlite`
+  - Brain opens this database in WAL mode and applies a short busy timeout plus five incremental retries for transient writer-lock contention from overlapping scheduled jobs.
 - SQLite FTS5 lexical search
 - LanceDB vector index under `~/brain/indexes/lancedb`
 - deterministic local hash embeddings by default, so the tool works offline
