@@ -59,10 +59,20 @@ def test_ui_shell_renders_token_driven_browser_pages(tmp_path: Path) -> None:
     assert 'data-view="sync"' in body
     assert 'data-view="jobs"' in body
     assert 'data-view="logs"' in body
+    assert 'data-view="wiki"' in body
+    assert 'data-view="packets"' in body
+    assert 'data-view="curation"' in body
+    assert 'data-view="review"' in body
     assert 'data-view="memory"' in body
     assert "Authorization" in body
     assert "Bearer" in body
     assert 'href="/api/' not in body
+    assert "applyWikiProposal" not in body
+    assert 'recordWikiInterview(${jsString(id)}, "approved")' not in body
+    assert "generatePacketBrief" in body
+    assert "absorbPacketIntoFacts" in body
+    assert "reconcileChiefOfStaffQuestions" in body
+    assert "migrateExistingWikiFacts" in body
 
 
 def test_ui_rejects_missing_token(tmp_path: Path) -> None:

@@ -142,11 +142,15 @@ CREATE TABLE IF NOT EXISTS wiki_change_items (
   proposed_markdown TEXT NOT NULL,
   rationale TEXT NOT NULL,
   source_ids TEXT NOT NULL DEFAULT '[]',
-  confidence REAL NOT NULL
+  confidence REAL NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending'
 );
 
 CREATE INDEX IF NOT EXISTS idx_wiki_change_items_batch_id
 ON wiki_change_items(batch_id);
+
+CREATE INDEX IF NOT EXISTS idx_wiki_change_items_status_target
+ON wiki_change_items(status, target_path);
 
 CREATE TABLE IF NOT EXISTS wiki_interviews (
   id TEXT PRIMARY KEY,
@@ -312,20 +316,28 @@ class RetryingConnection(sqlite3.Connection):
     """
 
     def execute(self, sql: str, parameters: Any = (), /) -> sqlite3.Cursor:
-        return retry_sqlite_lock(lambda: super(RetryingConnection, self).execute(sql, parameters))
+        return retry_sqlite_lock(
+            lambda: super(RetryingConnection, self).execute(sql, parameters)
+        )
 
     def executemany(self, sql: str, parameters: Any, /) -> sqlite3.Cursor:
-        return retry_sqlite_lock(lambda: super(RetryingConnection, self).executemany(sql, parameters))
+        return retry_sqlite_lock(
+            lambda: super(RetryingConnection, self).executemany(sql, parameters)
+        )
 
     def executescript(self, sql_script: str, /) -> sqlite3.Cursor:
-        return retry_sqlite_lock(lambda: super(RetryingConnection, self).executescript(sql_script))
+        return retry_sqlite_lock(
+            lambda: super(RetryingConnection, self).executescript(sql_script)
+        )
 
     def commit(self) -> None:
         return retry_sqlite_lock(lambda: super(RetryingConnection, self).commit())
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path, timeout=SQLITE_BUSY_TIMEOUT_SECONDS, factory=RetryingConnection)
+    conn = sqlite3.connect(
+        db_path, timeout=SQLITE_BUSY_TIMEOUT_SECONDS, factory=RetryingConnection
+    )
     conn.row_factory = sqlite3.Row
     conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
     conn.execute("PRAGMA journal_mode=WAL")
@@ -354,6 +366,13 @@ def init_db(db_path: Path) -> None:
         if documents_table:
             ensure_column(conn, "documents", "origin_node_id", "TEXT")
             ensure_column(conn, "documents", "logical_source_key", "TEXT")
+        wiki_change_items_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='wiki_change_items'"
+        ).fetchone()
+        if wiki_change_items_table:
+            ensure_column(
+                conn, "wiki_change_items", "status", "TEXT NOT NULL DEFAULT 'pending'"
+            )
         conn.executescript(SCHEMA)
         ensure_column(conn, "memories", "reviewed_at", "TEXT")
         ensure_column(conn, "memories", "review_reason", "TEXT")
@@ -362,11 +381,15 @@ def init_db(db_path: Path) -> None:
         run_migrations(conn)
 
 
-def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+def ensure_column(
+    conn: sqlite3.Connection, table: str, column: str, definition: str
+) -> None:
     existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
     if column not in existing:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
-def rows(conn: sqlite3.Connection, query: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
+def rows(
+    conn: sqlite3.Connection, query: str, params: Iterable[Any] = ()
+) -> list[sqlite3.Row]:
     return list(conn.execute(query, tuple(params)))

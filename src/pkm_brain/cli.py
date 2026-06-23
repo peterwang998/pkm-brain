@@ -45,6 +45,9 @@ from .sync_transfer import sync_push as run_sync_push
 from .sync_transfer import sync_run as run_sync_run
 from .ui_server import create_ui_server, ensure_ui_token, ui_token_path, validate_ui_bind
 from .wiki import lint_wiki, synthesize_wiki
+from .wiki_curation_promote import promote_wiki_curation
+from .wiki_fact_migration import migrate_existing_wiki_to_facts
+from .wiki_facts import curate_all_managed_fact_pages
 from .wiki_proposals import (
     apply_wiki_proposal,
     generate_interview_questions,
@@ -567,6 +570,71 @@ def wiki_synthesize(
     lint_result = result.get("lint")
     if lint_result and lint_result["errors"]:
         raise typer.Exit(1)
+
+
+@wiki_app.command("migrate-to-facts")
+def wiki_migrate_to_facts(
+    dry_run: bool = typer.Option(True, "--dry-run/--apply", help="Preview by default; pass --apply to write facts."),
+    overwrite_existing: bool = typer.Option(False, "--overwrite-existing", help="Allow managed page regeneration to overwrite existing wiki pages."),
+    include_references: bool = typer.Option(False, "--include-references", help="Also import reference pages; usually not needed for this one-time migration."),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    svc = service(home)
+    svc.init_workspace()
+    result = migrate_existing_wiki_to_facts(
+        svc.paths,
+        dry_run=dry_run,
+        overwrite_existing=overwrite_existing,
+        include_references=include_references,
+    )
+    console.print_json(json.dumps(result))
+    lint_errors = result.get("curation", {}).get("lint_errors", [])
+    if lint_errors:
+        raise typer.Exit(1)
+
+
+@wiki_app.command("curate-facts")
+def wiki_curate_facts(
+    overwrite_existing: bool = typer.Option(False, "--overwrite-existing", help="Allow managed page regeneration to overwrite existing wiki pages."),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    svc = service(home)
+    svc.init_workspace()
+    result = curate_all_managed_fact_pages(
+        svc.paths,
+        overwrite_existing=overwrite_existing,
+    )
+    console.print_json(json.dumps(result))
+    lint_errors = result.get("curation", {}).get("lint_errors", [])
+    final_lint_errors = result.get("lint", {}).get("errors", [])
+    projection_errors = [
+        error
+        for page in result.get("curation", {}).get("pages", [])
+        for error in page.get("projection_errors", [])
+    ]
+    if lint_errors or final_lint_errors or projection_errors:
+        raise typer.Exit(1)
+
+
+@wiki_app.command("promote-curation")
+def wiki_promote_curation(
+    source_home: Path = typer.Option(..., "--source-home", help="Forked Brain home containing resolved curation state."),
+    dry_run: bool = typer.Option(True, "--dry-run/--apply", help="Preview by default; pass --apply to promote curation state."),
+    replace_existing: bool = typer.Option(False, "--replace-existing", help="Allow replacing existing target facts/questions/runs."),
+    backup: bool = typer.Option(True, "--backup/--no-backup", help="Back up the target DB and wiki before applying."),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    target = BrainPaths.from_value(home)
+    source = BrainPaths.from_value(source_home)
+    BrainService(target).init_workspace()
+    result = promote_wiki_curation(
+        source,
+        target,
+        dry_run=dry_run,
+        replace_existing=replace_existing,
+        backup=backup,
+    )
+    console.print_json(json.dumps(result))
 
 
 @wiki_proposals_app.command("list")
