@@ -24,6 +24,8 @@ def test_promote_wiki_curation_preserves_target_only_proposals(tmp_path: Path) -
     BrainService(target).init_workspace()
     shared_batch = "batch_shared"
     shared_item = "item_shared"
+    second_shared_batch = "batch_shared_second"
+    second_shared_item = "item_shared_second"
     target_only_batch = "batch_target_only"
     target_only_item = "item_target_only"
     for paths, shared_status, item_status in [
@@ -33,6 +35,12 @@ def test_promote_wiki_curation_preserves_target_only_proposals(tmp_path: Path) -
         with connection(paths.sqlite_path) as conn:
             insert_test_wiki_batch(conn, shared_batch, shared_status)
             insert_test_wiki_item(conn, shared_item, shared_batch, item_status)
+    with connection(source.sqlite_path) as conn:
+        insert_test_wiki_batch(conn, second_shared_batch, "needs_interview")
+        insert_test_wiki_item(conn, second_shared_item, second_shared_batch, "pending")
+    with connection(target.sqlite_path) as conn:
+        insert_test_wiki_batch(conn, second_shared_batch, "rejected")
+        insert_test_wiki_item(conn, second_shared_item, second_shared_batch, "rejected")
     with connection(target.sqlite_path) as conn:
         insert_test_wiki_batch(conn, target_only_batch, "needs_interview")
         insert_test_wiki_item(conn, target_only_item, target_only_batch, "pending")
@@ -136,7 +144,8 @@ def test_promote_wiki_curation_preserves_target_only_proposals(tmp_path: Path) -
     dry_run = promote_wiki_curation(source, target, dry_run=True)
     result = promote_wiki_curation(source, target, dry_run=False, backup=False)
 
-    assert dry_run["shared_batches_to_update"] == 1
+    assert dry_run["shared_batches_to_update"] == 2
+    assert dry_run["shared_items_to_update"] == 2
     assert result["applied"] is True
     assert (target.wiki / "projects" / "promoted.md").read_text(encoding="utf-8").count("Promoted curation fact") == 1
     with connection(target.sqlite_path) as conn:
@@ -144,6 +153,8 @@ def test_promote_wiki_curation_preserves_target_only_proposals(tmp_path: Path) -
         assert conn.execute("SELECT status FROM open_questions WHERE id = 'question_promoted'").fetchone()[0] == "answered"
         assert conn.execute("SELECT status FROM wiki_change_batches WHERE id = ?", (shared_batch,)).fetchone()[0] == "absorbed_by_facts"
         assert conn.execute("SELECT status FROM wiki_change_items WHERE id = ?", (shared_item,)).fetchone()[0] == "absorbed_by_facts"
+        assert conn.execute("SELECT status FROM wiki_change_batches WHERE id = ?", (second_shared_batch,)).fetchone()[0] == "needs_interview"
+        assert conn.execute("SELECT status FROM wiki_change_items WHERE id = ?", (second_shared_item,)).fetchone()[0] == "pending"
         assert conn.execute("SELECT status FROM wiki_change_batches WHERE id = ?", (target_only_batch,)).fetchone()[0] == "needs_interview"
         assert conn.execute("SELECT status FROM wiki_change_items WHERE id = ?", (target_only_item,)).fetchone()[0] == "pending"
         page = conn.execute("SELECT managed, fact_ids FROM wiki_pages WHERE id = 'managed-promoted'").fetchone()

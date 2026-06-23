@@ -58,24 +58,32 @@ def promote_wiki_curation(
             conn.execute(f"INSERT INTO {table} SELECT * FROM source.{table}")
         conn.execute(
             """
-            UPDATE wiki_change_batches
+            UPDATE wiki_change_batches AS target
             SET status = (
-              SELECT source.wiki_change_batches.status
-              FROM source.wiki_change_batches
-              WHERE source.wiki_change_batches.id = wiki_change_batches.id
+              SELECT source_batch.status
+              FROM source.wiki_change_batches AS source_batch
+              WHERE source_batch.id = target.id
             )
-            WHERE id IN (SELECT id FROM source.wiki_change_batches)
+            WHERE EXISTS (
+              SELECT 1
+              FROM source.wiki_change_batches AS source_batch
+              WHERE source_batch.id = target.id
+            )
             """
         )
         conn.execute(
             """
-            UPDATE wiki_change_items
+            UPDATE wiki_change_items AS target
             SET status = (
-              SELECT source.wiki_change_items.status
-              FROM source.wiki_change_items
-              WHERE source.wiki_change_items.id = wiki_change_items.id
+              SELECT source_item.status
+              FROM source.wiki_change_items AS source_item
+              WHERE source_item.id = target.id
             )
-            WHERE id IN (SELECT id FROM source.wiki_change_items)
+            WHERE EXISTS (
+              SELECT 1
+              FROM source.wiki_change_items AS source_item
+              WHERE source_item.id = target.id
+            )
             """
         )
         upsert_source_managed_wiki_pages(conn)
