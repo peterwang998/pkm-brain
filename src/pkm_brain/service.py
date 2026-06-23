@@ -51,18 +51,43 @@ GENERIC_CONTEXT_TERMS = {
     "based",
     "brain",
     "context",
+    "current",
     "detail",
     "details",
     "evidence",
     "explain",
     "fetch",
     "from",
+    "give",
+    "idea",
+    "ideas",
+    "include",
+    "includes",
+    "including",
+    "know",
+    "knows",
     "local",
     "memory",
+    "open",
     "only",
+    "people",
+    "project",
+    "projects",
+    "plan",
+    "plans",
+    "question",
+    "questions",
     "retrieve",
     "show",
+    "state",
+    "status",
     "summarize",
+    "tell",
+    "test",
+    "tests",
+    "them",
+    "topic",
+    "topics",
     "use",
     "using",
     "what",
@@ -78,6 +103,31 @@ GENERIC_BUSINESS_TERMS = {
     "market",
     "regulatory",
     "value",
+}
+
+BROAD_RETRIEVAL_TERMS = GENERIC_CONTEXT_TERMS | GENERIC_BUSINESS_TERMS | {
+    "access",
+    "architecture",
+    "decision",
+    "decisions",
+    "deployment",
+    "engineering",
+    "hardware",
+    "maintenance",
+    "model",
+    "network",
+    "personal",
+    "pipeline",
+    "pipelines",
+    "rollout",
+    "sensor",
+    "status",
+    "timeline",
+    "user",
+    "users",
+    "vendor",
+    "vendors",
+    "venture",
 }
 
 AGENT_QUERY_TERMS = {
@@ -111,6 +161,16 @@ RECENCY_MAX_BOOST = 2.0
 RECENCY_HALF_LIFE_DAYS = 30.0
 LINEAGE_HALF_LIFE_DAYS = 90.0
 LINEAGE_MAX_ABS_BOOST = 2.0
+SEARCH_RESULT_SCORE_FLOOR = 12.0
+CONTEXT_CHUNK_SCORE_FLOOR = 12.0
+WIKI_PAGE_SCORE_FLOOR = 12.0
+FOUND_CHUNK_SCORE = 24.0
+FOUND_WIKI_SCORE = 24.0
+MEMORY_ACTIVE_SCORE_FLOOR = 1
+MEMORY_CANDIDATE_SCORE_FLOOR = 2
+MAX_CHUNKS_PER_DOCUMENT = 2
+MANAGED_WIKI_BOOST = 8.0
+SEMANTIC_WIKI_BOOST = 3.0
 LINEAGE_EVENT_WEIGHTS = {
     "exposed": 0.0,
     "explicit_useful": 1.5,
@@ -1042,9 +1102,20 @@ class BrainService:
         lineage_scores = self._lineage_scores_for_chunks(chunk_candidates)
         reranked_chunks = rerank_chunks(query, chunk_candidates, fanout_debug, lineage_scores=lineage_scores)
         selected = select_search_results(reranked_chunks, limit=limit)
+        wiki_pages = self.select_wiki_pages(query, selected, limit=min(limit, 5))
         selected_ids = [row["chunk_id"] for row in selected]
-        citation_snapshots = chunk_citation_snapshots(selected)
+        citation_snapshots = chunk_citation_snapshots(selected) + wiki_page_citation_snapshots(wiki_pages)
         search_debug = build_search_debug(fanout_debug, selected, reranked_chunks, debug=debug)
+        search_debug["selected_wiki_reasons"] = [
+            {
+                "relative_path": page.get("relative_path"),
+                "score": page.get("score"),
+                "reasons": page.get("selection_reasons", []),
+            }
+            for page in wiki_pages
+        ]
+        assessment = retrieval_assessment(selected, wiki_pages, [], [])
+        search_debug["assessment"] = assessment
         event_id = new_id("retrieval")
         with connection(self.paths.sqlite_path) as conn:
             conn.execute(
@@ -1067,7 +1138,11 @@ class BrainService:
         return {
             "event_id": event_id,
             "query": query,
+            "retrieval_verdict": assessment["verdict"],
+            "retrieval_confidence": assessment["confidence"],
+            "retrieval_reasons": assessment["reasons"],
             "results": selected,
+            "relevant_wiki_pages": wiki_pages,
             "citations": citation_snapshots,
             "citation_snapshots": citation_snapshots,
             "debug": search_debug if debug else None,
@@ -1088,9 +1163,20 @@ class BrainService:
         reranked_chunks = rerank_chunks(query, chunk_candidates, fanout_debug, lineage_scores=lineage_scores)
         supporting_chunks = select_context_chunks(reranked_chunks, query=query, policy=policy)
         wiki_pages = self.select_wiki_pages(query, supporting_chunks, limit=policy.max_wiki_pages)
-        memories = self.active_memories(project)[: policy.max_memories]
-        candidate_memories = self.candidate_memories(project)[: policy.max_memories]
+        memories = relevant_memories_for_query(
+            self.active_memories(project),
+            query,
+            limit=policy.max_memories,
+            score_floor=MEMORY_ACTIVE_SCORE_FLOOR,
+        )
+        candidate_memories = relevant_memories_for_query(
+            self.candidate_memories(project),
+            query,
+            limit=min(policy.max_memories, 3),
+            score_floor=MEMORY_CANDIDATE_SCORE_FLOOR,
+        )
         citation_snapshots = chunk_citation_snapshots(supporting_chunks) + wiki_page_citation_snapshots(wiki_pages)
+        assessment = retrieval_assessment(supporting_chunks, wiki_pages, memories, candidate_memories)
         event_id = new_id("retrieval")
         retrieval_debug = build_retrieval_debug(
             query,
@@ -1100,6 +1186,7 @@ class BrainService:
             wiki_pages,
             debug=debug,
         )
+        retrieval_debug["assessment"] = assessment
         with connection(self.paths.sqlite_path) as conn:
             conn.execute(
                 """
@@ -1131,6 +1218,9 @@ class BrainService:
             "project": project,
             "budget": policy.total_budget,
             "retrieval_mode": policy.mode,
+            "retrieval_verdict": assessment["verdict"],
+            "retrieval_confidence": assessment["confidence"],
+            "retrieval_reasons": assessment["reasons"],
             "active_memories": memories,
             "candidate_memories": candidate_memories,
             "relevant_wiki_pages": wiki_pages,
@@ -1414,6 +1504,8 @@ class BrainService:
     ) -> list[dict[str, Any]]:
         self.init_workspace()
         terms = important_query_terms(query)
+        specific_terms = specific_query_terms(query)
+        required_specific_hits = required_specific_hit_count(specific_terms)
         agent_query = is_agent_query(terms)
         if not terms or not self.paths.wiki.exists():
             return []
@@ -1435,25 +1527,34 @@ class BrainService:
 
             title = str(frontmatter.get("title") or path.stem)
             page_type = str(frontmatter.get("page_type") or "")
+            status = str(frontmatter.get("status") or "active")
             source_ids = list(frontmatter.get("source_ids") or [])
             relative_path = str(path.relative_to(self.paths.wiki))
             is_agent_reference = "agent_session_log" in relative_path
+            tags = list(frontmatter.get("tags") or [])
+            managed = bool(frontmatter.get("managed")) or "managed" in tags or str(frontmatter.get("id") or "").startswith("managed-")
+            semantic_page = page_type not in {"index", "reference"}
+            if status == "archived":
+                continue
             title_haystack = " ".join(
                 [
                     title,
                     page_type,
                     relative_path,
-                    " ".join(frontmatter.get("tags") or []),
+                    " ".join(tags),
                 ]
             ).lower()
             body_haystack = body.lower()
-            title_hits = sorted({term for term in terms if term in title_haystack})
-            body_hits = sorted({term for term in terms if term in body_haystack})
+            title_hits = terms_in_text(terms, title_haystack)
+            body_hits = terms_in_text(terms, body_haystack)
+            specific_hits = sorted(set(terms_in_text(specific_terms, title_haystack)).union(terms_in_text(specific_terms, body_haystack)))
             source_overlap = sorted(selected_sources.intersection(source_ids))
 
             if not title_hits and not (page_type == "reference" and source_overlap) and len(body_hits) < 2:
                 continue
             if is_agent_reference and not agent_query and not source_overlap:
+                continue
+            if required_specific_hits and len(specific_hits) < required_specific_hits and not source_overlap:
                 continue
 
             score = 0.0
@@ -1467,19 +1568,27 @@ class BrainService:
                 score += boost
                 reasons.append(f"body matched {', '.join(body_hits[:6])} (+{boost:g})")
             if source_overlap:
-                boost = 8.0 if page_type == "reference" else 2.0
+                boost = 4.0 if page_type == "reference" else 6.0
                 boost += min(6.0, float(len(source_overlap) * 2))
                 score += boost
                 reasons.append(f"shares selected source evidence (+{boost:g})")
+            if managed:
+                score += MANAGED_WIKI_BOOST
+                reasons.append(f"managed chief-of-staff page (+{MANAGED_WIKI_BOOST:g})")
+            elif semantic_page:
+                score += SEMANTIC_WIKI_BOOST
+                reasons.append(f"semantic wiki page (+{SEMANTIC_WIKI_BOOST:g})")
             if page_type == "reference":
-                score += 2.0
-                reasons.append("reference page (+2)")
+                score -= 1.0
+                reasons.append("reference page penalty (-1)")
             elif page_type == "index":
                 score -= 4.0
                 reasons.append("index page penalty (-4)")
             if is_agent_reference and not agent_query:
-                score -= 6.0
-                reasons.append("agent-log reference penalty (-6)")
+                score -= 16.0
+                reasons.append("agent-log reference penalty (-16)")
+            if score < WIKI_PAGE_SCORE_FLOOR:
+                continue
 
             results.append(
                 {
@@ -1492,10 +1601,12 @@ class BrainService:
                     "summary": first_section(body, "Summary"),
                     "score": round(score, 4),
                     "selection_reasons": reasons,
+                    "managed": managed,
+                    "query_specific_hits": specific_hits,
                 }
             )
 
-        results.sort(key=lambda page: (-page["score"], page["page_type"] != "reference", page["title"]))
+        results.sort(key=lambda page: (-page["score"], not page.get("managed", False), page["page_type"] == "reference", page["title"]))
         return results[:limit]
 
     def active_memories(self, project: str | None = None) -> list[dict[str, Any]]:
@@ -1954,8 +2065,10 @@ def rerank_chunks(
     lineage_scores: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     terms = important_query_terms(query)
-    anchors = anchor_query_terms(terms, chunks)
+    specific_terms = specific_query_terms(query)
+    required_specific_hits = required_specific_hit_count(specific_terms)
     agent_query = is_agent_query(terms)
+    anchors = anchor_query_terms(terms, chunks, agent_query=agent_query)
     recency_intent = has_recency_intent(query, terms)
     lineage_scores = lineage_scores or {}
     lexical_rank = {
@@ -1991,15 +2104,35 @@ def rerank_chunks(
             score += boost
             reasons.append(f"vector rank {vector_rank[chunk_id]} (+{boost:.2f})")
 
-        title_hits = sorted({term for term in terms if term in title})
-        heading_hits = sorted({term for term in terms if term in heading})
-        text_hits = sorted({term for term in terms if term in text_lower})
-        anchor_hits = sorted({term for term in anchors if term in title or term in heading or term in text_lower})
-        title_heading_anchor_hits = sorted({term for term in anchors if term in title or term in heading})
-        if title_hits:
-            boost = 4.0 * len(title_hits)
+        title_hits = terms_in_text(terms, title)
+        heading_hits = terms_in_text(terms, heading)
+        text_hits = terms_in_text(terms, text_lower)
+        source_type = str(candidate.get("source_type") or "")
+        if source_type == "agent_session_log" and not agent_query:
+            title_boost_hits = sorted({term for term in title_hits if term in heading_hits or term in text_hits})
+        else:
+            title_boost_hits = title_hits
+        anchor_hits = sorted(
+            {
+                term
+                for term in anchors
+                if contains_query_term(title, term)
+                or contains_query_term(heading, term)
+                or contains_query_term(text_lower, term)
+            }
+        )
+        title_heading_anchor_hits = sorted(
+            {term for term in anchors if contains_query_term(title, term) or contains_query_term(heading, term)}
+        )
+        local_term_hits = sorted(set(heading_hits).union(text_hits))
+        local_specific_hits = sorted({term for term in specific_terms if term in local_term_hits})
+        if title_boost_hits:
+            boost = 4.0 * len(title_boost_hits)
             score += boost
-            reasons.append(f"title matched {', '.join(title_hits)} (+{boost:g})")
+            reasons.append(f"title matched {', '.join(title_boost_hits)} (+{boost:g})")
+        ignored_title_hits = sorted(set(title_hits) - set(title_boost_hits))
+        if ignored_title_hits:
+            reasons.append(f"title-only matches ignored {', '.join(ignored_title_hits)}")
         if heading_hits:
             boost = 2.5 * len(heading_hits)
             score += boost
@@ -2020,7 +2153,6 @@ def rerank_chunks(
                 score -= 8.0
                 reasons.append(f"missed entity anchor {', '.join(anchors)} (-8)")
 
-        source_type = str(candidate.get("source_type") or "")
         source_weight = SOURCE_TYPE_WEIGHTS.get(source_type, 0.0)
         if source_type == "agent_session_log" and agent_query:
             source_weight = 1.5
@@ -2070,6 +2202,13 @@ def rerank_chunks(
         candidate["lineage_score"] = round(lineage_boost, 4)
         candidate["lineage_reasons"] = lineage.get("reasons") or []
         candidate["entity_anchor_title_heading_match"] = bool(title_heading_anchor_hits)
+        candidate["query_title_hits"] = title_hits
+        candidate["query_local_hits"] = local_term_hits
+        candidate["query_local_hit_count"] = len(local_term_hits)
+        candidate["query_specific_terms"] = specific_terms
+        candidate["query_local_specific_hits"] = local_specific_hits
+        candidate["query_local_specific_hit_count"] = len(local_specific_hits)
+        candidate["required_specific_hit_count"] = required_specific_hits
         scored.append(candidate)
 
     scored.sort(key=lambda row: (row.get("suppressed", False), -float(row["retrieval_score"]), row["chunk_index"]))
@@ -2079,9 +2218,7 @@ def rerank_chunks(
 def select_context_chunks(reranked_chunks: list[dict[str, Any]], query: str, policy: RetrievalPolicy) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
     remaining = max(policy.total_budget, 1)
-    eligible = [row for row in reranked_chunks if not row.get("suppressed")]
-    if not eligible:
-        eligible = reranked_chunks
+    eligible = [row for row in reranked_chunks if chunk_passes_relevance_floor(row, CONTEXT_CHUNK_SCORE_FLOOR)]
     anchored = [row for row in eligible if row.get("entity_anchor_title_heading_match")]
     if anchored:
         eligible = anchored
@@ -2092,13 +2229,21 @@ def select_context_chunks(reranked_chunks: list[dict[str, Any]], query: str, pol
     ]
     if len(non_transcript) >= min(3, policy.max_chunks):
         eligible = non_transcript
+    document_counts: dict[str, int] = {}
     for row in eligible:
         if len(selected) >= policy.max_chunks or remaining <= 0:
             break
+        document_id = str(row.get("document_id") or "")
+        if document_id:
+            count = document_counts.get(document_id, 0)
+            if count >= MAX_CHUNKS_PER_DOCUMENT:
+                continue
         chunk = apply_retrieval_policy(row, query, policy, remaining)
         if not chunk:
             continue
         selected.append(chunk)
+        if document_id:
+            document_counts[document_id] = document_counts.get(document_id, 0) + 1
         remaining -= int(chunk.get("returned_token_count") or 0)
     return selected
 
@@ -2107,23 +2252,116 @@ def select_search_results(reranked_chunks: list[dict[str, Any]], limit: int) -> 
     if limit <= 0:
         return []
     selected: list[dict[str, Any]] = []
-    selected_ids: set[str] = set()
+    document_counts: dict[str, int] = {}
     for row in reranked_chunks:
-        if row.get("suppressed"):
+        if not chunk_passes_relevance_floor(row, SEARCH_RESULT_SCORE_FLOOR):
+            continue
+        document_id = str(row.get("document_id") or "")
+        if document_id and document_counts.get(document_id, 0) >= MAX_CHUNKS_PER_DOCUMENT:
             continue
         selected.append(row)
-        selected_ids.add(str(row.get("chunk_id")))
-        if len(selected) >= limit:
-            return selected
-    for row in reranked_chunks:
-        chunk_id = str(row.get("chunk_id"))
-        if chunk_id in selected_ids:
-            continue
-        selected.append(row)
-        selected_ids.add(chunk_id)
+        if document_id:
+            document_counts[document_id] = document_counts.get(document_id, 0) + 1
         if len(selected) >= limit:
             return selected
     return selected
+
+
+def chunk_passes_relevance_floor(row: dict[str, Any], floor: float) -> bool:
+    if row.get("suppressed"):
+        return False
+    score = float(row.get("retrieval_score") or 0.0)
+    if score < floor:
+        return False
+    local_hit_count = int(row.get("query_local_hit_count") or 0)
+    required_specific_hits = int(row.get("required_specific_hit_count") or 0)
+    local_specific_hits = int(row.get("query_local_specific_hit_count") or 0)
+    if required_specific_hits and local_specific_hits < required_specific_hits:
+        return False
+    if local_hit_count > 0:
+        return True
+    if row.get("entity_anchor_title_heading_match"):
+        return True
+    return False
+
+
+def relevant_memories_for_query(
+    memories: list[dict[str, Any]],
+    query: str,
+    limit: int,
+    score_floor: int,
+) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    terms = important_query_terms(query)
+    specific_terms = specific_query_terms(query)
+    if not terms:
+        return []
+    scored: list[dict[str, Any]] = []
+    for memory in memories:
+        haystack = " ".join(
+            [
+                str(memory.get("memory_type") or ""),
+                str(memory.get("scope") or ""),
+                str(memory.get("content") or ""),
+                " ".join(memory.get("source_ids") or []),
+            ]
+        ).lower()
+        matches = terms_in_text(terms, haystack)
+        specific_matches = terms_in_text(specific_terms, haystack)
+        score = len(matches)
+        if score < score_floor:
+            continue
+        if not specific_matches and score < max(2, score_floor):
+            continue
+        row = dict(memory)
+        row["memory_relevance_score"] = score
+        row["matched_query_terms"] = matches
+        row["matched_specific_query_terms"] = specific_matches
+        scored.append(row)
+    scored.sort(key=lambda row: (-int(row.get("memory_relevance_score") or 0), -float(row.get("confidence") or 0.0), row.get("id") or ""))
+    return scored[:limit]
+
+
+def retrieval_assessment(
+    chunks: list[dict[str, Any]],
+    wiki_pages: list[dict[str, Any]],
+    active_memories: list[dict[str, Any]],
+    candidate_memories: list[dict[str, Any]],
+) -> dict[str, Any]:
+    top_chunk_score = max((float(row.get("retrieval_score") or 0.0) for row in chunks), default=0.0)
+    top_wiki_score = max((float(row.get("score") or 0.0) for row in wiki_pages), default=0.0)
+    top_active_memory_score = max((int(row.get("memory_relevance_score") or 0) for row in active_memories), default=0)
+    top_candidate_memory_score = max((int(row.get("memory_relevance_score") or 0) for row in candidate_memories), default=0)
+    signal = max(top_chunk_score, top_wiki_score, float(top_active_memory_score * 8), float(top_candidate_memory_score * 6))
+    reasons = [
+        f"top chunk score {top_chunk_score:.1f}",
+        f"top wiki score {top_wiki_score:.1f}",
+        f"top active memory hits {top_active_memory_score}",
+        f"top candidate memory hits {top_candidate_memory_score}",
+    ]
+    if (
+        top_chunk_score >= FOUND_CHUNK_SCORE
+        or top_wiki_score >= FOUND_WIKI_SCORE
+        or top_active_memory_score >= 2
+    ):
+        verdict = "found"
+    elif (
+        top_chunk_score >= CONTEXT_CHUNK_SCORE_FLOOR
+        or top_wiki_score >= WIKI_PAGE_SCORE_FLOOR
+        or top_active_memory_score >= MEMORY_ACTIVE_SCORE_FLOOR
+        or top_candidate_memory_score >= MEMORY_CANDIDATE_SCORE_FLOOR
+    ):
+        verdict = "partial"
+    else:
+        verdict = "no_strong_match"
+        reasons.append("no selected evidence passed the relevance floor")
+    confidence = round(min(1.0, signal / 40.0), 3)
+    return {
+        "verdict": verdict,
+        "confidence": confidence,
+        "reasons": reasons,
+    }
 
 
 def apply_retrieval_policy(
@@ -2202,7 +2440,7 @@ def focused_excerpt(text: str, query: str, max_tokens: int) -> str:
     scored: list[tuple[int, int, str]] = []
     for index, block in enumerate(blocks):
         lowered = block.lower()
-        hits = sum(1 for term in terms if term in lowered)
+        hits = sum(1 for term in terms if contains_query_term(lowered, term))
         section_bonus = 0
         if any(marker in lowered for marker in ["## user requests", "## summary", "## assistant responses"]):
             section_bonus = 2
@@ -2462,6 +2700,8 @@ def summarize_ranked_chunks(chunks: list[dict[str, Any]], limit: int) -> list[di
             "retrieval_noise_reasons": row.get("retrieval_noise_reasons", []),
             "lineage_score": row.get("lineage_score", 0.0),
             "lineage_reasons": row.get("lineage_reasons", []),
+            "query_local_hits": row.get("query_local_hits", []),
+            "query_local_specific_hits": row.get("query_local_specific_hits", []),
             "preview": str(row.get("text", ""))[:160],
         }
         for row in chunks[:limit]
@@ -2776,7 +3016,7 @@ def reciprocal_rank_fusion(*rankings: list[str], k: int = 60) -> list[str]:
 
 
 def build_fts_query(query: str) -> str:
-    terms = re.findall(r"[A-Za-z0-9_]+", query)
+    terms = important_query_terms(query)
     return " OR ".join(f'"{term}"' for term in terms)
 
 
@@ -2785,19 +3025,69 @@ def query_terms(query: str) -> list[str]:
         "a",
         "an",
         "and",
+        "any",
         "are",
+        "as",
+        "at",
+        "be",
+        "been",
+        "being",
+        "by",
+        "can",
+        "could",
+        "did",
+        "do",
+        "does",
         "for",
         "how",
+        "i",
+        "if",
+        "in",
+        "into",
         "is",
+        "it",
+        "me",
+        "might",
+        "must",
+        "my",
+        "next",
+        "no",
+        "not",
         "of",
         "on",
         "or",
+        "s",
+        "shall",
+        "should",
+        "some",
+        "that",
         "the",
+        "these",
+        "this",
+        "those",
         "to",
         "what",
+        "whether",
+        "will",
         "with",
+        "would",
+        "yes",
+        "you",
+        "your",
     }
-    return [term.lower() for term in re.findall(r"[A-Za-z0-9_]+", query) if term.lower() not in stopwords]
+    output: list[str] = []
+    seen: set[str] = set()
+    for raw in re.findall(r"[A-Za-z0-9_]+", query):
+        term = raw.lower()
+        if term in stopwords:
+            continue
+        if len(term) < 2:
+            continue
+        if term in seen:
+            continue
+        seen.add(term)
+        output.append(term)
+    return output
 
 
 def important_query_terms(query: str) -> list[str]:
@@ -2805,13 +3095,51 @@ def important_query_terms(query: str) -> list[str]:
     return terms or query_terms(query)
 
 
-def anchor_query_terms(terms: list[str], chunks: list[dict[str, Any]]) -> list[str]:
+def specific_query_terms(query: str) -> list[str]:
+    return [term for term in important_query_terms(query) if term not in BROAD_RETRIEVAL_TERMS]
+
+
+def required_specific_hit_count(specific_terms: list[str]) -> int:
+    if len(specific_terms) >= 4:
+        return 2
+    if specific_terms:
+        return 1
+    return 0
+
+
+def contains_query_term(haystack: str, term: str) -> bool:
+    if not haystack or not term:
+        return False
+    if len(term) <= 3:
+        return re.search(rf"(?<![A-Za-z0-9_]){re.escape(term)}(?![A-Za-z0-9_])", haystack) is not None
+    return term in haystack
+
+
+def terms_in_text(terms: list[str], haystack: str) -> list[str]:
+    lowered = haystack.lower()
+    return sorted({term for term in terms if contains_query_term(lowered, term)})
+
+
+def anchor_query_terms(terms: list[str], chunks: list[dict[str, Any]], agent_query: bool = False) -> list[str]:
     anchors: list[str] = []
     for term in terms:
         if term in GENERIC_BUSINESS_TERMS or len(term) < 4:
             continue
-        if any(term in str(row.get("title") or "").lower() for row in chunks):
+        for row in chunks:
+            source_type = str(row.get("source_type") or "")
+            if source_type == "agent_session_log" and not agent_query:
+                continue
+            title = str(row.get("title") or "").lower()
+            heading = str(row.get("heading_path") or "").lower()
+            text = str(row.get("text") or "").lower()
+            if not contains_query_term(title, term):
+                continue
+            if source_type == "agent_session_log" and not (
+                contains_query_term(heading, term) or contains_query_term(text, term)
+            ):
+                continue
             anchors.append(term)
+            break
     return anchors
 
 
@@ -2821,7 +3149,8 @@ def is_agent_query(terms: list[str]) -> bool:
 
 def has_recency_intent(query: str, terms: list[str]) -> bool:
     lowered = query.lower()
-    return bool(set(terms).intersection(RECENCY_INTENT_TERMS)) or any(
+    raw_terms = {term.lower() for term in re.findall(r"[A-Za-z0-9_]+", query)}
+    return bool(set(terms).intersection(RECENCY_INTENT_TERMS) or raw_terms.intersection(RECENCY_INTENT_TERMS)) or any(
         phrase in lowered for phrase in ["this week", "last week", "last month"]
     )
 

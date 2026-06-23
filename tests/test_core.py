@@ -1082,6 +1082,107 @@ def test_retrieve_context_reranks_clean_sources_and_source_linked_wiki(tmp_path:
     assert "concepts/local-first-agent-memory.md" not in wiki_paths
 
 
+def test_retrieve_context_returns_no_strong_match_for_absent_topic(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "ketch-guidepoint.md"
+    note.write_text(
+        "---\n"
+        'source_type: "hyprnote_meeting"\n'
+        'title: "Ketch Guidepoint Teleconference"\n'
+        "---\n\n"
+        "# Meeting: Ketch Guidepoint Teleconference\n\n"
+        "Ketch enterprise privacy software helps customers automate consent and data subject requests.\n",
+        encoding="utf-8",
+    )
+    svc.ingest()
+
+    context = svc.retrieve_context(
+        "What does Brain know about ZephyrMart geothermal coffee roasting in Iceland?",
+        mode="compact",
+    )
+    search = svc.search("ZephyrMart geothermal coffee roasting Iceland", limit=5)
+
+    assert context["retrieval_verdict"] == "no_strong_match"
+    assert context["retrieval_confidence"] < 0.4
+    assert context["supporting_chunks"] == []
+    assert context["relevant_wiki_pages"] == []
+    assert search["retrieval_verdict"] == "no_strong_match"
+    assert search["results"] == []
+    assert search["relevant_wiki_pages"] == []
+
+
+def test_retrieve_context_prefers_managed_pages_and_ignores_agent_title_drag(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    log = svc.paths.inbox / "agent_logs" / "codex" / "ai-children-title-only.md"
+    log.parent.mkdir(parents=True)
+    log.write_text(
+        "---\n"
+        'source_type: "agent_session_log"\n'
+        'agent: "codex"\n'
+        'session_id: "ai-children-title-only"\n'
+        'title: "AI Chinese children songs publishing business idea"\n'
+        "---\n\n"
+        "# Agent Session\n\n"
+        "## Summary\n\n"
+        "SQLite retry backoff implementation notes and shell permission reminders unrelated to the idea.\n",
+        encoding="utf-8",
+    )
+    svc.ingest()
+    with connection(svc.paths.sqlite_path) as conn:
+        document_id = conn.execute("SELECT id FROM documents WHERE title = ?", ("AI Chinese children songs publishing business idea",)).fetchone()["id"]
+
+    project_dir = svc.paths.wiki / "projects"
+    reference_dir = svc.paths.wiki / "references" / "agent_session_log"
+    project_dir.mkdir(parents=True)
+    reference_dir.mkdir(parents=True)
+    (project_dir / "ai-childrens-song-localization-business.md").write_text(
+        "---\n"
+        "title: AI Children's Song Localization Business\n"
+        "page_type: project\n"
+        "id: managed-ai-childrens-song-localization-business\n"
+        "status: active\n"
+        "managed: true\n"
+        f"source_ids:\n  - document:{document_id}\n"
+        "related: []\n"
+        "tags:\n  - managed\n"
+        "---\n\n"
+        "# AI Children's Song Localization Business\n\n"
+        "## Summary\n\n"
+        "A managed page for using AI to adapt Chinese children's songs and publish English versions.\n",
+        encoding="utf-8",
+    )
+    (reference_dir / "ai-children-title-only.md").write_text(
+        "---\n"
+        "title: AI Chinese children songs publishing business idea\n"
+        "page_type: reference\n"
+        "id: reference-ai-children-title-only\n"
+        "status: active\n"
+        f"source_ids:\n  - document:{document_id}\n"
+        "related: []\n"
+        "tags:\n  - agent_session_log\n"
+        "---\n\n"
+        "# AI Chinese children songs publishing business idea\n\n"
+        "## Summary\n\n"
+        "Reference page synthesized from an agent session log.\n",
+        encoding="utf-8",
+    )
+
+    context = svc.retrieve_context(
+        "What does Brain know about the AI Chinese children songs publishing business idea?",
+        mode="compact",
+    )
+    search = svc.search("AI Chinese children songs publishing business idea", limit=5)
+
+    assert context["retrieval_verdict"] == "found"
+    assert context["relevant_wiki_pages"][0]["relative_path"] == "projects/ai-childrens-song-localization-business.md"
+    assert context["relevant_wiki_pages"][0]["managed"] is True
+    assert all(chunk["source_type"] != "agent_session_log" for chunk in context["supporting_chunks"])
+    assert search["retrieval_verdict"] == "found"
+    assert search["relevant_wiki_pages"][0]["relative_path"] == "projects/ai-childrens-song-localization-business.md"
+
+
 def test_retrieve_context_compacts_noisy_agent_logs_with_hard_budget(tmp_path: Path) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()
@@ -1364,9 +1465,10 @@ def test_retrieve_context_separates_active_and_candidate_memories(tmp_path: Path
     svc.init_workspace()
     active_id = svc.propose_memory("AgentFailurePatternMemory", "global", "Active memory is trusted.", ["agent_session:test"], 0.8)
     candidate_id = svc.propose_memory("AgentFailurePatternMemory", "global", "Candidate memory needs review.", ["agent_session:test"], 0.7)
+    unrelated_id = svc.propose_memory("FactMemory", "global", "Hightouch diligence discussed an agentic CDP role.", ["agent_session:test"], 0.7)
     svc.approve_memory(active_id)
 
-    context = svc.retrieve_context("Use memory guidance for the current agent task.")
+    context = svc.retrieve_context("Use active trusted memory and candidate review guidance for the current agent task.")
 
     active_ids = {memory["id"] for memory in context["active_memories"]}
     candidate_ids = {memory["id"] for memory in context["candidate_memories"]}
@@ -1374,6 +1476,12 @@ def test_retrieve_context_separates_active_and_candidate_memories(tmp_path: Path
     assert candidate_id not in active_ids
     assert candidate_id in candidate_ids
     assert active_id not in candidate_ids
+    assert unrelated_id not in candidate_ids
+
+    unrelated = svc.retrieve_context("What does Brain know about mango orchard irrigation sensors in Fresno?")
+    assert active_id not in {memory["id"] for memory in unrelated["active_memories"]}
+    assert candidate_id not in {memory["id"] for memory in unrelated["candidate_memories"]}
+    assert unrelated_id not in {memory["id"] for memory in unrelated["candidate_memories"]}
 
 
 def test_failure_memory_proposals_dedupe_existing_active_and_create_proposed(tmp_path: Path, monkeypatch) -> None:
