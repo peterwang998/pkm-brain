@@ -2984,6 +2984,11 @@ def score_retrieval_fact_for_query(
         return None
     if specific_terms and not specific_matches and len(matches) < 2:
         return None
+    if (
+        legacy_wiki_backfill_fact_without_spans(fact)
+        and len(matches) < legacy_wiki_backfill_required_match_count(terms)
+    ):
+        return None
 
     confidence = float(fact.get("truth_confidence") or fact.get("confidence") or 0.0)
     fts_component = min(FACT_FTS_SCORE_CAP, max(0.0, -float(fts_score or 0.0)))
@@ -3011,6 +3016,21 @@ def score_retrieval_fact_for_query(
             f"matched {len(specific_matches)}/{len(specific_terms)} specific terms"
         )
     return output
+
+
+def legacy_wiki_backfill_fact_without_spans(fact: dict[str, Any]) -> bool:
+    metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
+    is_backfill = (
+        metadata.get("migration") == "wiki_fact_backfill_v1"
+        or metadata.get("source") == "existing_wiki"
+    )
+    return bool(is_backfill and not fact.get("source_spans"))
+
+
+def legacy_wiki_backfill_required_match_count(terms: list[str]) -> int:
+    if len(terms) >= 3:
+        return max(3, (len(terms) + 1) // 2)
+    return len(terms)
 
 
 def dynamic_fact_cut(facts: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:

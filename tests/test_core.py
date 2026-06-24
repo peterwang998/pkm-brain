@@ -1821,11 +1821,40 @@ def test_retrieve_context_returns_facts_and_contested_pairs(tmp_path: Path) -> N
                     truth_confidence,
                 ),
             )
+        conn.execute(
+            """
+            INSERT INTO facts(
+              id, statement, entity_key, page_hint, section_hint, source_ids,
+              observed_at, confidence, status, metadata, created_at, truth_confidence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "fact_legacy_backfill",
+                "The available preview does not include the researched answer, so durable benefit claims should not yet be compiled.",
+                "open_loops:optum-fertility-reimbursement-partner-insurance:summary",
+                "open_loops/optum-fertility-reimbursement-partner-insurance.md",
+                "Summary",
+                "[]",
+                "2026-06-23T00:00:00+00:00",
+                0.68,
+                "active",
+                json.dumps(
+                    {
+                        "migration": "wiki_fact_backfill_v1",
+                        "source": "existing_wiki",
+                    }
+                ),
+                "2026-06-23T00:00:00+00:00",
+                0.68,
+            ),
+        )
         rebuild_fact_retrieval_index(conn)
 
     active_context = svc.retrieve_context("fact retrieval marker")
     contested_context = svc.retrieve_context("contested marker")
     negative_context = svc.retrieve_context("ZephyrMart geothermal coffee roasting in Iceland")
+    backfill_negative_context = svc.retrieve_context("Pixel lighthouse insurance claims")
+    backfill_positive_context = svc.retrieve_context("optum fertility insurance")
 
     active_ids = {fact["id"] for fact in active_context["relevant_facts"]}
     assert "fact_active" in active_ids
@@ -1843,6 +1872,10 @@ def test_retrieve_context_returns_facts_and_contested_pairs(tmp_path: Path) -> N
         "fact_right",
     }
     assert negative_context["relevant_facts"] == []
+    assert backfill_negative_context["relevant_facts"] == []
+    assert {
+        fact["id"] for fact in backfill_positive_context["relevant_facts"]
+    } == {"fact_legacy_backfill"}
 
 
 def test_agent_session_write(tmp_path: Path) -> None:
