@@ -154,6 +154,13 @@ def test_status_endpoint_returns_service_layer_json(tmp_path: Path) -> None:
     assert body["doctor"]["home"] == str(paths.home)
     assert "index" in body
     assert "memory" in body
+    surfaces = {surface["surface"]: surface for surface in body["retrieval_surfaces"]}
+    assert surfaces["Fact ledger"]["searched"] is True
+    assert surfaces["Raw source chunks"]["searched"] is True
+    assert surfaces["Wiki pages"]["searched"] is True
+    assert surfaces["Memories"]["searched"] is True
+    assert surfaces["Legacy wiki packets"]["searched"] is False
+    assert surfaces["CoS action ledger"]["searched"] is False
 
 
 def test_memory_endpoint_lists_status_filtered_memories(tmp_path: Path) -> None:

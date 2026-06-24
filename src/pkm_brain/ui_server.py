@@ -386,7 +386,107 @@ def ui_status(paths: BrainPaths) -> dict[str, Any]:
         "sync": safe_call(svc.sync_status),
         "index": index_status(paths, svc),
         "memory": audit_memories(paths),
+        "retrieval_surfaces": retrieval_surface_status(paths),
     }
+
+
+def retrieval_surface_status(paths: BrainPaths) -> list[dict[str, Any]]:
+    wiki_pages = sum(1 for path in paths.wiki.rglob("*.md")) if paths.wiki.exists() else 0
+    with connection(paths.sqlite_path) as conn:
+        chunk_rows = scalar_count(conn, "SELECT COUNT(*) FROM chunks")
+        fact_index_rows = scalar_count(
+            conn,
+            "SELECT COUNT(*) FROM retrieval_fts WHERE kind = 'fact'",
+            table="retrieval_fts",
+        )
+        searchable_facts = scalar_count(
+            conn,
+            """
+            SELECT COUNT(*)
+            FROM facts
+            WHERE status IN ('active', 'conflicted')
+              AND COALESCE(truth_confidence, confidence, 0) >= 0.5
+            """,
+            table="facts",
+        )
+        active_memories = scalar_count(
+            conn, "SELECT COUNT(*) FROM memories WHERE status = 'active'", table="memories"
+        )
+        proposed_memories = scalar_count(
+            conn, "SELECT COUNT(*) FROM memories WHERE status = 'proposed'", table="memories"
+        )
+        legacy_items = scalar_count(
+            conn,
+            "SELECT COUNT(*) FROM wiki_change_items WHERE status IN ('pending', 'needs_interview', 'proposed')",
+            table="wiki_change_items",
+        )
+        actions = scalar_count(conn, "SELECT COUNT(*) FROM cos_actions", table="cos_actions")
+    return [
+        {
+            "surface": "Fact ledger",
+            "searched": True,
+            "count": searchable_facts,
+            "indexed": fact_index_rows,
+            "role": "authoritative claims",
+            "details": "Active and contested facts that pass the truth-confidence floor. Inactive and superseded facts are excluded.",
+        },
+        {
+            "surface": "Raw source chunks",
+            "searched": True,
+            "count": chunk_rows,
+            "indexed": chunk_rows,
+            "role": "evidence fallback and citations",
+            "details": "FTS/vector chunk candidates from ingested source documents. Agent-session logs are downranked for non-agent queries.",
+        },
+        {
+            "surface": "Wiki pages",
+            "searched": True,
+            "count": wiki_pages,
+            "indexed": wiki_pages,
+            "role": "compiled projections",
+            "details": "Markdown wiki pages are searched as page-level context. Managed pages are deterministic projections from active facts.",
+        },
+        {
+            "surface": "Memories",
+            "searched": True,
+            "count": active_memories + proposed_memories,
+            "indexed": active_memories + proposed_memories,
+            "role": "curated memory hints",
+            "details": f"{active_memories} active and {proposed_memories} proposed memories can be returned; proposed memories are lower-trust candidates.",
+        },
+        {
+            "surface": "Legacy wiki packets",
+            "searched": False,
+            "count": legacy_items,
+            "indexed": 0,
+            "role": "backlog only",
+            "details": "Old wiki_change proposal items are visible for draining or absorption into facts, but retrieve_context does not search them directly.",
+        },
+        {
+            "surface": "CoS action ledger",
+            "searched": False,
+            "count": actions,
+            "indexed": 0,
+            "role": "governance/audit",
+            "details": "Actions, policy, contracts, and audits govern writes. They are not evidence returned by retrieval.",
+        },
+    ]
+
+
+def scalar_count(conn: Any, query: str, table: str | None = None) -> int:
+    if table and not ui_table_exists(conn, table):
+        return 0
+    row = conn.execute(query).fetchone()
+    return int(row[0] if row else 0)
+
+
+def ui_table_exists(conn: Any, table: str) -> bool:
+    return bool(
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?",
+            (table,),
+        ).fetchone()
+    )
 
 
 def ui_memories(paths: BrainPaths, query: dict[str, list[str]]) -> dict[str, Any]:
@@ -1389,6 +1489,19 @@ def ui_shell() -> str:
     .warn { color: var(--warn); }
     .danger { color: var(--danger); }
     .actions { display: flex; flex-wrap: wrap; gap: .35rem; }
+    .callout {
+      margin: .75rem 0;
+      padding: .65rem .75rem;
+      border: 1px solid #b7d8d2;
+      border-left: 4px solid var(--accent);
+      border-radius: 6px;
+      background: #eefaf7;
+    }
+    .callout.warn {
+      border-color: #e4c782;
+      border-left-color: var(--warn);
+      background: #fff8ea;
+    }
     .source-list { margin: .5rem 0 0; padding-left: 1.1rem; }
     .source-list li { margin-bottom: .35rem; overflow-wrap: anywhere; }
     .diff { background: #0f1720; color: #dbe6ef; }
@@ -1425,9 +1538,9 @@ def ui_shell() -> str:
     <button type="button" data-view="jobs">Jobs</button>
     <button type="button" data-view="logs">Logs</button>
     <button type="button" data-view="wiki">Wiki</button>
-    <button type="button" data-view="packets">Wiki Packets</button>
+    <button type="button" data-view="packets">Wiki Packets (legacy)</button>
     <button type="button" data-view="curation">Chief of Staff</button>
-    <button type="button" data-view="review">Review</button>
+    <button type="button" data-view="review">Review (mixed)</button>
     <button type="button" data-view="memory">Memory Review</button>
   </nav>
   <main id="app" aria-live="polite"></main>
@@ -1522,6 +1635,10 @@ def ui_shell() -> str:
             ${metric("Memories", data.memory.memories)}
             ${metric("Sync", data.sync.configured === false ? "not configured" : "configured")}
           </div>
+          <div class="callout">
+            <strong>Current retrieval path:</strong> <code>retrieve_context</code> searches active facts, raw source chunks, wiki pages, and memory records. Legacy wiki packets are backlog/review data only until they are absorbed into facts.
+          </div>
+          ${retrievalSurfacesHtml(data.retrieval_surfaces || [])}
           ${jsonBlock(data)}
         </section>`;
     }
@@ -1601,6 +1718,7 @@ def ui_shell() -> str:
         <section>
           <div class="toolbar">
             <h2>Wiki</h2>
+            <span class="badge ok">searched by retrieval</span>
             <input id="wiki-search" type="search" placeholder="Search wiki" value="${escapeHtml(wikiState.q)}">
             <select id="wiki-type">
               <option value="">All types</option>
@@ -1612,6 +1730,7 @@ def ui_shell() -> str:
             </select>
             <button type="button" onclick="loadView('wiki')">Refresh</button>
           </div>
+          <div class="callout">Wiki pages are searched as compiled page-level context. Managed pages are projections from active facts; reference pages and older semantic pages may still appear because they remain valid wiki files.</div>
           <div class="split">
             <div>
               <table><thead><tr><th>Group</th><th>Page</th><th>Status</th><th>Sources</th></tr></thead>
@@ -1767,11 +1886,13 @@ def ui_shell() -> str:
         <section>
           <div class="toolbar">
             <h2>Wiki Packets</h2>
+            <span class="badge warn">legacy backlog</span>
             <select id="packet-group">
               ${["topic", "day", "priority"].map(value => `<option value="${value}" ${value === packetState.groupBy ? "selected" : ""}>Group by ${value}</option>`).join("")}
             </select>
             <button type="button" onclick="loadView('packets')">Refresh</button>
           </div>
+          <div class="callout warn">These are legacy <code>wiki_change_*</code> proposal packets. They are not searched by <code>retrieve_context</code>; use absorption to move useful claims into the fact ledger.</div>
           <div class="grid">
             ${metric("Packets", data.totals?.packet_count ?? 0)}
             ${metric("Pages", data.totals?.target_count ?? 0)}
@@ -2057,6 +2178,7 @@ def ui_shell() -> str:
         <section>
           <div class="toolbar">
             <h2>Chief of Staff</h2>
+            <span class="badge ok">fact layer</span>
             <button type="button" onclick="loadView('curation')">Refresh</button>
             <button class="primary" type="button" onclick="regenerateCurationPage(false)" ${selectedPage ? "" : "disabled"}>Regenerate Page</button>
             <button type="button" onclick="regenerateCurationPage(true)" ${selectedPage ? "" : "disabled"}>Preview Page</button>
@@ -2064,6 +2186,7 @@ def ui_shell() -> str:
             <button type="button" onclick="migrateExistingWikiFacts(false)">Backfill Wiki Facts</button>
             <button type="button" onclick="reconcileChiefOfStaffQuestions()">Reconcile Duplicates</button>
           </div>
+          <div class="callout">This is the active fact/page curation path. Retrieval can return searchable active facts directly, and managed wiki pages are regenerated projections of those facts.</div>
           <div class="grid">
             ${metric("Facts", data.counts?.facts ?? 0)}
             ${metric("Active", data.counts?.by_status?.active ?? 0, "ok")}
@@ -2412,7 +2535,8 @@ def ui_shell() -> str:
       const detail = selected ? await reviewDetailHtml(selected.kind, selected.id) : `<section><h2>Review Detail</h2><div class="muted">Select an item.</div></section>`;
       app.innerHTML = `
         <section>
-          <div class="toolbar"><h2>Review</h2><button type="button" onclick="loadView('review')">Refresh</button></div>
+          <div class="toolbar"><h2>Review</h2><span class="badge warn">mixed legacy queue</span><button type="button" onclick="loadView('review')">Refresh</button></div>
+          <div class="callout warn">This queue can include proposed memories and legacy wiki proposals. It is not the same as the CoS fact/action/policy path, and legacy wiki proposals are not searched until absorbed into facts or rendered into wiki pages.</div>
           <div class="split">
             <div><table><thead><tr><th>Kind</th><th>Item</th><th>Status</th><th>Actions</th></tr></thead>
             <tbody>${items.map(reviewRow).join("") || emptyRow(4)}</tbody></table></div>
@@ -2697,6 +2821,18 @@ def ui_shell() -> str:
 
     function metric(label, value, state = "") {
       return `<div class="metric"><div class="label">${escapeHtml(label)}</div><div class="value ${state}">${escapeHtml(String(value ?? ""))}</div></div>`;
+    }
+
+    function retrievalSurfacesHtml(surfaces) {
+      return `<h2>Retrieval Surfaces</h2>
+        <table><thead><tr><th>Surface</th><th>Searched</th><th>Rows</th><th>Role</th><th>Details</th></tr></thead>
+        <tbody>${surfaces.map(surface => `<tr>
+          <td>${escapeHtml(surface.surface || "")}</td>
+          <td><span class="badge ${surface.searched ? "ok" : "warn"}">${surface.searched ? "searched" : "not searched"}</span></td>
+          <td>${escapeHtml(String(surface.count ?? 0))}${surface.indexed !== undefined ? `<br><span class="muted">${escapeHtml(String(surface.indexed))} indexed</span>` : ""}</td>
+          <td>${escapeHtml(surface.role || "")}</td>
+          <td>${escapeHtml(surface.details || "")}</td>
+        </tr>`).join("") || emptyRow(5)}</tbody></table>`;
     }
 
     function listSection(label, values) {
