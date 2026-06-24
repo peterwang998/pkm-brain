@@ -4,7 +4,7 @@
 
 The wiki review loop should feel like a chief of staff maintaining a durable
 knowledge base, not like a human approving hundreds of proposed Markdown
-patches. The system should absorb source-backed proposals, dedupe obvious
+patches. The system should extract source-backed facts, dedupe obvious
 duplicates, route facts to the right page, author managed wiki pages, and ask
 the human only when the available evidence contains a real factual conflict or
 an important missing answer.
@@ -25,10 +25,11 @@ discarded. Those are curator responsibilities.
 
 ## Architecture
 
-The old proposal backlog remains an ingestion source. The new curation flow is:
+The old proposal backlog was a bootstrap input and has been drained. The current
+curation flow is:
 
 1. Extract candidate facts from recent source documents, memories, agent
-   sessions, or existing `wiki_change_batches`.
+   sessions, and other raw evidence.
 2. Normalize and dedupe those facts into a fact ledger.
 3. Route facts to entity keys and page hints.
 4. Resolve stacks automatically:
@@ -81,7 +82,7 @@ The old proposal backlog remains an ingestion source. The new curation flow is:
 - `managed`: true for pages the chief-of-staff writer owns.
 - `fact_ids`: JSON list of facts used in the current page.
 
-`wiki_curation_runs` records packet absorption and page-authoring runs.
+`wiki_curation_runs` records fact curation and page-authoring runs.
 
 ## LLM Responsibilities
 
@@ -108,30 +109,22 @@ decisions and include its rationale in metadata.
 The forked implementation builds the first working slice:
 
 - Add migration `006_create_wiki_fact_curation`.
-- Add a `wiki_facts` module for ledger writes, packet absorption, conflict
+- Add a `wiki_facts` module for ledger writes, conflict
   resolution, question answering, and managed-page drafting.
 - Add a `wiki_fact_migration` module for one-time backfill from existing
   semantic wiki pages into the fact ledger. This is transitional bootstrap
-  code; future ingestion should create facts directly from source/proposal
-  evidence instead of reparsing rendered wiki prose.
+  code; future ingestion should create facts directly from source evidence
+  instead of reparsing rendered wiki prose.
 - Add UI endpoints:
   - `GET /api/wiki/facts`
-  - `POST /api/wiki/proposal-packets/facts`
   - `POST /api/wiki/facts/migrate-wiki`
   - `POST /api/wiki/facts/reconcile`
   - `POST /api/wiki/questions/<id>/answer`
 - Add a "Chief of Staff" browser view showing open questions, options, active
   facts, conflicted facts, and recent curation runs.
-- Add a packet-level "Absorb Into Fact Ledger" action.
-- Keep proposal approvals available as a fallback, but demote them from the
-  primary review path.
-
-The first absorber is deterministic so the current backlog can be tested
-without relying on a live LLM. It treats proposal packet items as candidate
-facts, dedupes exact and near-duplicate statements, auto-supersedes stale
-replacement stacks when the latest item is high confidence and source-backed,
-creates questions only for ambiguous materially incompatible replacements, and
-writes only missing or already managed wiki pages by default.
+- Retire packet-level absorption and proposal approval UI after the legacy
+  backlog is drained; archived `wiki_change_*` rows remain readable in SQLite
+  but are no longer an application workflow.
 
 The legacy wiki migration imports existing non-reference wiki sections as
 lower-confidence additive facts with `migration: wiki_fact_backfill_v1`

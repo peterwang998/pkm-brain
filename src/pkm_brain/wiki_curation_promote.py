@@ -25,9 +25,8 @@ def promote_wiki_curation(
     """Promote resolved chief-of-staff curation state from a fork into a target Brain.
 
     This intentionally avoids replacing the target Brain DB wholesale. It imports
-    the source fact-ledger state, copies managed wiki files, and updates proposal
-    statuses for shared proposal/change IDs while leaving target-only documents,
-    chunks, memories, and proposal rows intact.
+    the source fact-ledger state and copies managed wiki files while leaving
+    target-only documents, chunks, memories, and archived history intact.
     """
     source_paths = BrainPaths.from_value(source_paths.home)
     target_paths = BrainPaths.from_value(target_paths.home)
@@ -56,36 +55,6 @@ def promote_wiki_curation(
         for table in CURATION_TABLES:
             conn.execute(f"DELETE FROM {table}")
             conn.execute(f"INSERT INTO {table} SELECT * FROM source.{table}")
-        conn.execute(
-            """
-            UPDATE wiki_change_batches AS target
-            SET status = (
-              SELECT source_batch.status
-              FROM source.wiki_change_batches AS source_batch
-              WHERE source_batch.id = target.id
-            )
-            WHERE EXISTS (
-              SELECT 1
-              FROM source.wiki_change_batches AS source_batch
-              WHERE source_batch.id = target.id
-            )
-            """
-        )
-        conn.execute(
-            """
-            UPDATE wiki_change_items AS target
-            SET status = (
-              SELECT source_item.status
-              FROM source.wiki_change_items AS source_item
-              WHERE source_item.id = target.id
-            )
-            WHERE EXISTS (
-              SELECT 1
-              FROM source.wiki_change_items AS source_item
-              WHERE source_item.id = target.id
-            )
-            """
-        )
         upsert_source_managed_wiki_pages(conn)
 
     applied = promotion_plan(source_paths, target_paths)
@@ -101,36 +70,6 @@ def promotion_plan(source_paths: BrainPaths, target_paths: BrainPaths) -> dict[s
     source_counts = source_curation_counts(source_paths)
     target_counts = target_curation_counts(target_paths)
     managed_files = managed_wiki_files(source_paths)
-    with connection(target_paths.sqlite_path) as conn:
-        conn.execute("ATTACH DATABASE ? AS source", (str(source_paths.sqlite_path),))
-        shared_batches = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM wiki_change_batches
-            WHERE id IN (SELECT id FROM source.wiki_change_batches)
-            """
-        ).fetchone()[0]
-        shared_items = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM wiki_change_items
-            WHERE id IN (SELECT id FROM source.wiki_change_items)
-            """
-        ).fetchone()[0]
-        target_only_batches = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM wiki_change_batches
-            WHERE id NOT IN (SELECT id FROM source.wiki_change_batches)
-            """
-        ).fetchone()[0]
-        target_only_items = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM wiki_change_items
-            WHERE id NOT IN (SELECT id FROM source.wiki_change_items)
-            """
-        ).fetchone()[0]
     existing_target_managed = sum(1 for path in managed_files if (target_paths.wiki / path).exists())
     return {
         "promotion": PROMOTION_NAME,
@@ -141,10 +80,6 @@ def promotion_plan(source_paths: BrainPaths, target_paths: BrainPaths) -> dict[s
         "managed_wiki_files": len(managed_files),
         "managed_wiki_files_overwritten": existing_target_managed,
         "managed_wiki_file_preview": [path.as_posix() for path in managed_files[:20]],
-        "shared_batches_to_update": int(shared_batches),
-        "shared_items_to_update": int(shared_items),
-        "target_only_batches_preserved": int(target_only_batches),
-        "target_only_items_preserved": int(target_only_items),
     }
 
 

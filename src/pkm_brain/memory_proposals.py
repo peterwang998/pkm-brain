@@ -6,11 +6,10 @@ from pathlib import Path
 from typing import Any
 
 from .db import connection, dumps, loads, rows
-from .llm import get_provider
+from .llm import get_provider, parse_json_object
 from .paths import BrainPaths
 from .service import BrainService
 from .util import new_id, now_iso
-from .wiki_proposals import parse_json_object
 
 
 FAILURE_MEMORY_TYPE = "AgentFailurePatternMemory"

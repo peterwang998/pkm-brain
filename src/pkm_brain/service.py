@@ -27,7 +27,6 @@ from .indexes import (
 from .paths import BrainPaths, local_node_id
 from .title_utils import bounded_document_title
 from .util import file_sha256, new_id, now_iso, slugify, token_count as estimate_tokens
-from .wiki_proposals import create_wiki_proposal
 
 
 @dataclass
@@ -1918,28 +1917,6 @@ class BrainService:
             if path.exists():
                 path.unlink()
         return memory
-
-    def propose_wiki_update(
-        self,
-        title: str,
-        rationale: str,
-        source_ids: list[str],
-        changes: list[dict[str, Any]],
-        confidence: float,
-        author: str = "agent",
-        source: str = "mcp",
-    ) -> str:
-        self.init_workspace()
-        return create_wiki_proposal(
-            self.paths,
-            title=title,
-            rationale=rationale,
-            source_ids=source_ids,
-            changes=changes,
-            confidence=confidence,
-            author=author,
-            source=source,
-        )
 
     def write_agent_session(
         self,

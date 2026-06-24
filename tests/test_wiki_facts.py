@@ -17,37 +17,14 @@ from pkm_brain.wiki_facts import (
     render_managed_page,
     regenerate_managed_fact_page,
     revert_wiki_page_snapshot,
-    statement_from_change,
 )
 
 
-def test_promote_wiki_curation_preserves_target_only_proposals(tmp_path: Path) -> None:
+def test_promote_wiki_curation_promotes_fact_state(tmp_path: Path) -> None:
     source = BrainPaths.from_value(tmp_path / "source")
     target = BrainPaths.from_value(tmp_path / "target")
     BrainService(source).init_workspace()
     BrainService(target).init_workspace()
-    shared_batch = "batch_shared"
-    shared_item = "item_shared"
-    second_shared_batch = "batch_shared_second"
-    second_shared_item = "item_shared_second"
-    target_only_batch = "batch_target_only"
-    target_only_item = "item_target_only"
-    for paths, shared_status, item_status in [
-        (source, "absorbed_by_facts", "absorbed_by_facts"),
-        (target, "needs_interview", "pending"),
-    ]:
-        with connection(paths.sqlite_path) as conn:
-            insert_test_wiki_batch(conn, shared_batch, shared_status)
-            insert_test_wiki_item(conn, shared_item, shared_batch, item_status)
-    with connection(source.sqlite_path) as conn:
-        insert_test_wiki_batch(conn, second_shared_batch, "needs_interview")
-        insert_test_wiki_item(conn, second_shared_item, second_shared_batch, "pending")
-    with connection(target.sqlite_path) as conn:
-        insert_test_wiki_batch(conn, second_shared_batch, "rejected")
-        insert_test_wiki_item(conn, second_shared_item, second_shared_batch, "rejected")
-    with connection(target.sqlite_path) as conn:
-        insert_test_wiki_batch(conn, target_only_batch, "needs_interview")
-        insert_test_wiki_item(conn, target_only_item, target_only_batch, "pending")
     with connection(source.sqlite_path) as conn:
         conn.execute(
             """
@@ -102,7 +79,7 @@ def test_promote_wiki_curation_preserves_target_only_proposals(tmp_path: Path) -
             INSERT INTO wiki_curation_runs(id, source_packet_id, group_by, status, summary, created_at)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            ("run_promoted", shared_batch, "topic", "ok", "{}", "2026-06-23T00:00:00+00:00"),
+            ("run_promoted", None, "topic", "ok", "{}", "2026-06-23T00:00:00+00:00"),
         )
         conn.execute(
             """
@@ -148,57 +125,16 @@ def test_promote_wiki_curation_preserves_target_only_proposals(tmp_path: Path) -
     dry_run = promote_wiki_curation(source, target, dry_run=True)
     result = promote_wiki_curation(source, target, dry_run=False, backup=False)
 
-    assert dry_run["shared_batches_to_update"] == 2
-    assert dry_run["shared_items_to_update"] == 2
+    assert dry_run["source_counts"]["facts"] == 1
+    assert dry_run["managed_wiki_files"] == 1
     assert result["applied"] is True
     assert (target.wiki / "projects" / "promoted.md").read_text(encoding="utf-8").count("Promoted curation fact") == 1
     with connection(target.sqlite_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 1
         assert conn.execute("SELECT status FROM open_questions WHERE id = 'question_promoted'").fetchone()[0] == "answered"
-        assert conn.execute("SELECT status FROM wiki_change_batches WHERE id = ?", (shared_batch,)).fetchone()[0] == "absorbed_by_facts"
-        assert conn.execute("SELECT status FROM wiki_change_items WHERE id = ?", (shared_item,)).fetchone()[0] == "absorbed_by_facts"
-        assert conn.execute("SELECT status FROM wiki_change_batches WHERE id = ?", (second_shared_batch,)).fetchone()[0] == "needs_interview"
-        assert conn.execute("SELECT status FROM wiki_change_items WHERE id = ?", (second_shared_item,)).fetchone()[0] == "pending"
-        assert conn.execute("SELECT status FROM wiki_change_batches WHERE id = ?", (target_only_batch,)).fetchone()[0] == "needs_interview"
-        assert conn.execute("SELECT status FROM wiki_change_items WHERE id = ?", (target_only_item,)).fetchone()[0] == "pending"
         page = conn.execute("SELECT managed, fact_ids FROM wiki_pages WHERE id = 'managed-promoted'").fetchone()
     assert page["managed"] == 1
     assert json.loads(page["fact_ids"]) == ["fact_promoted"]
-
-
-def insert_test_wiki_batch(conn, batch_id: str, status: str) -> None:
-    conn.execute(
-        """
-        INSERT INTO wiki_change_batches(
-          id, title, rationale, author, source, status, confidence, source_ids, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (batch_id, "Test batch", "Test rationale", "test", "test", status, 0.8, "[]", "2026-06-23T00:00:00+00:00"),
-    )
-
-
-def insert_test_wiki_item(conn, item_id: str, batch_id: str, status: str) -> None:
-    conn.execute(
-        """
-        INSERT INTO wiki_change_items(
-          id, batch_id, order_index, target_path, operation, section_name,
-          proposed_markdown, rationale, source_ids, confidence, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            item_id,
-            batch_id,
-            0,
-            "projects/promoted.md",
-            "append_section",
-            "Summary",
-            "## Summary\n\nPromoted curation fact.\n",
-            "Test rationale",
-            "[]",
-            0.8,
-            status,
-        ),
-    )
 
 
 def test_managed_page_routes_each_fact_to_one_section() -> None:
@@ -291,32 +227,6 @@ def test_managed_page_suppresses_near_duplicate_facts_across_sections() -> None:
     assert "fact_new" in markdown
     assert markdown.count("major AI and data initiative around the CDP experience") == 1
     assert duplicate_fact_projection_errors("concepts/hightouch.md", markdown) == []
-
-
-def test_statement_from_change_removes_embedded_markdown_headings() -> None:
-    statement = statement_from_change(
-        {
-            "operation": "create_page",
-            "proposed_markdown": (
-                "---\n"
-                "title: Hightouch\n"
-                "page_type: concept\n"
-                "id: concept-hightouch\n"
-                "status: active\n"
-                "source_ids: []\n"
-                "---\n\n"
-                "# Hightouch\n\n"
-                "## Summary\n\n"
-                "### Recent Interview Signals\n"
-                "- **Signal:** Hightouch introduced an alternative PM opportunity around the CDP experience.\n"
-            ),
-        }
-    )
-
-    assert "#" not in statement
-    assert "**" not in statement
-    assert statement.startswith("Signal:")
-    assert len(statement) <= 420
 
 
 def test_compact_statement_preserves_legacy_inline_heading_prefixed_facts() -> None:

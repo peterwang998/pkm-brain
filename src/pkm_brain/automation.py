@@ -25,8 +25,7 @@ from .memory_proposals import propose_failure_memories_from_sources, propose_mem
 from .paths import BrainPaths
 from .service import BrainService
 from .util import new_id, now_iso
-from .wiki import lint_wiki, synthesize_wiki
-from .wiki_proposals import propose_from_sources
+from .wiki import lint_wiki
 
 
 LAUNCH_AGENT_LABEL = "com.pkm-brain.agent-log-ingest"
@@ -149,7 +148,6 @@ def run_nightly_maintenance(
     opencode_db: Path | None = None,
     hyprnote_root: Path | None = None,
     include_hyprnote: bool = False,
-    with_llm_wiki_proposals: bool = False,
     with_llm_memory_proposals: bool = False,
     llm_wiki: bool = True,
     provider: str | None = None,
@@ -175,7 +173,7 @@ def run_nightly_maintenance(
                 summary={},
             )
 
-        if with_llm_wiki_proposals or with_llm_memory_proposals:
+        if with_llm_memory_proposals:
             try:
                 get_provider(provider)
             except Exception as exc:
@@ -188,7 +186,6 @@ def run_nightly_maintenance(
                     skipped=False,
                     reason=None,
                     summary={
-                        "with_llm_wiki_proposals": with_llm_wiki_proposals,
                         "with_llm_memory_proposals": with_llm_memory_proposals,
                     },
                     error=str(exc),
@@ -229,9 +226,6 @@ def run_nightly_maintenance(
                 paths, limit=10, shadow=True
             )
 
-            wiki_result = synthesize_wiki(paths, overwrite_generated=True, with_llm=llm_wiki, provider_name=provider)
-            summary["wiki_synthesize"] = wiki_result
-
             summary["cos_gardener_shadow"] = generate_gardener_candidates(
                 paths, shadow=True
             )
@@ -241,8 +235,6 @@ def run_nightly_maintenance(
             summary["cos_audit"] = run_sampled_audit(paths)
             summary["provenance_check"] = provenance_check(paths)
             summary["wiki_lint"] = lint_wiki(paths)
-            if with_llm_wiki_proposals:
-                summary["wiki_proposals"] = propose_from_sources(paths, provider_name=provider)
             if with_llm_memory_proposals:
                 summary["memory_proposals"] = propose_failure_memories_from_sources(paths, provider_name=provider)
                 summary["lineage_memory_proposals"] = propose_memories_from_lineage(paths, provider_name=provider)
@@ -251,7 +243,6 @@ def run_nightly_maintenance(
             errors = (
                 summary["capture"].get("errors", [])
                 + summary["ingest"].get("errors", [])
-                + summary["wiki_synthesize"].get("lint", {}).get("errors", [])
                 + summary["index_maintenance"].get("errors", [])
                 + summary["provenance_check"].get("errors", [])
                 + summary["wiki_lint"].get("errors", [])
@@ -459,7 +450,6 @@ def render_nightly_launch_agent(
     uv_path: Path,
     interval: int = 3600,
     due_after_hours: int = 20,
-    with_llm_wiki_proposals: bool = False,
     with_llm_memory_proposals: bool = False,
     llm_wiki: bool = True,
     provider: str | None = None,
@@ -476,14 +466,12 @@ def render_nightly_launch_agent(
         "--home",
         str(brain_home),
     ]
-    if with_llm_wiki_proposals:
-        args.append("--with-llm-wiki-proposals")
     if with_llm_memory_proposals:
         args.append("--with-llm-memory-proposals")
     if not llm_wiki:
         args.append("--no-llm-wiki")
-    llm_provider = provider or (DEFAULT_LLM_PROVIDER if llm_wiki or with_llm_wiki_proposals or with_llm_memory_proposals else None)
-    if llm_wiki or with_llm_wiki_proposals or with_llm_memory_proposals:
+    llm_provider = provider or (DEFAULT_LLM_PROVIDER if llm_wiki or with_llm_memory_proposals else None)
+    if llm_wiki or with_llm_memory_proposals:
         if llm_provider:
             args.extend(["--provider", llm_provider])
     command = f"cd {shlex.quote(str(repo_path))} && {shlex.join(args)}"
@@ -496,7 +484,7 @@ def render_nightly_launch_agent(
         "StandardErrorPath": str(brain_home / "logs" / "nightly-maintenance.err.log"),
         "WorkingDirectory": str(repo_path),
     }
-    if llm_wiki or with_llm_wiki_proposals or with_llm_memory_proposals:
+    if llm_wiki or with_llm_memory_proposals:
         environment = {}
         if llm_provider:
             environment["PKM_BRAIN_LLM_PROVIDER"] = llm_provider
@@ -545,7 +533,6 @@ def install_nightly_launch_agent(
     uv_path: Path,
     interval: int = 3600,
     due_after_hours: int = 20,
-    with_llm_wiki_proposals: bool = False,
     with_llm_memory_proposals: bool = False,
     llm_wiki: bool = True,
     provider: str | None = None,
@@ -557,7 +544,6 @@ def install_nightly_launch_agent(
         uv_path,
         interval,
         due_after_hours,
-        with_llm_wiki_proposals=with_llm_wiki_proposals,
         with_llm_memory_proposals=with_llm_memory_proposals,
         llm_wiki=llm_wiki,
         provider=provider,

@@ -17,7 +17,7 @@ from pkm_brain.automation import (
 )
 from pkm_brain.capture import AgentLogCapture, redact_text
 from pkm_brain.db import connection
-from pkm_brain.llm import CODEX_DEFAULT_MODEL, DEFAULT_LLM_PROVIDER, OPENAI_DEFAULT_MODEL, provider_status
+from pkm_brain.llm import CODEX_DEFAULT_MODEL, DEFAULT_LLM_PROVIDER, provider_status
 from pkm_brain.paths import BrainPaths
 from pkm_brain.service import BrainService
 from pkm_brain.title_utils import CODEX_PROVIDER_PROMPT_PREFIX
@@ -378,7 +378,7 @@ def test_nightly_maintenance_runs_self_healing_tasks(tmp_path: Path) -> None:
     assert result.summary["provenance_check"]["errors"] == []
     assert result.summary["wiki_lint"]["errors"] == []
     assert result.summary["memory_audit"]["errors"] == []
-    assert (svc.paths.wiki / "index.md").exists()
+    assert "wiki_synthesize" not in result.summary
     with connection(svc.paths.sqlite_path) as conn:
         row = conn.execute("SELECT * FROM automation_runs WHERE job_name = ?", ("nightly-maintenance",)).fetchone()
     assert row is not None
@@ -396,7 +396,7 @@ def test_automation_run_persistence_caps_error_payloads(tmp_path: Path) -> None:
         run_id,
         "failed",
         "2026-05-20T00:01:00+00:00",
-        {"wiki_synthesize": {"llm_compile": {"error": large_error}}, "normal": {"text": large_error}},
+        {"cos_extraction_shadow": {"error": large_error}, "normal": {"text": large_error}},
         large_error,
     )
 
@@ -406,8 +406,8 @@ def test_automation_run_persistence_caps_error_payloads(tmp_path: Path) -> None:
 
     assert len(row["error"]) <= MAX_STORED_ERROR_CHARS + 100
     assert "sha256=" in row["error"]
-    assert len(summary["wiki_synthesize"]["llm_compile"]["error"]) <= MAX_STORED_ERROR_CHARS + 100
-    assert "sha256=" in summary["wiki_synthesize"]["llm_compile"]["error"]
+    assert len(summary["cos_extraction_shadow"]["error"]) <= MAX_STORED_ERROR_CHARS + 100
+    assert "sha256=" in summary["cos_extraction_shadow"]["error"]
     assert summary["normal"]["text"] == large_error
 
 
@@ -428,7 +428,7 @@ def test_nightly_maintenance_skips_when_not_due(tmp_path: Path) -> None:
     assert second.run_id is None
 
 
-def test_nightly_llm_proposals_fail_without_configured_default_provider(tmp_path: Path, monkeypatch) -> None:
+def test_nightly_memory_proposals_fail_without_configured_default_provider(tmp_path: Path, monkeypatch) -> None:
     svc = make_service(tmp_path)
     monkeypatch.delenv("PKM_BRAIN_LLM_PROVIDER", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -438,7 +438,7 @@ def test_nightly_llm_proposals_fail_without_configured_default_provider(tmp_path
 
     result = run_nightly_maintenance(
         svc.paths,
-        with_llm_wiki_proposals=True,
+        with_llm_memory_proposals=True,
         codex_state=tmp_path / "missing-codex.sqlite",
         claude_projects=tmp_path / "missing-claude",
         opencode_db=tmp_path / "missing-opencode.sqlite",
@@ -447,7 +447,7 @@ def test_nightly_llm_proposals_fail_without_configured_default_provider(tmp_path
     assert result.status == "failed"
     assert "codex login" in str(result.error)
 
-    due_check = run_nightly_maintenance(svc.paths, if_due=True, with_llm_wiki_proposals=True)
+    due_check = run_nightly_maintenance(svc.paths, if_due=True, with_llm_memory_proposals=True)
     assert due_check.status == "failed"
     assert "codex login" in str(due_check.error)
 
@@ -603,55 +603,6 @@ def test_nightly_launch_agent_plist_render_quotes_paths_with_spaces(tmp_path: Pa
 
     assert f"cd {shlex.quote(str(repo_path))}" in command
     assert f"--home {shlex.quote(str(brain_home))}" in command
-
-
-def test_nightly_launch_agent_plist_render_with_openai_wiki_proposals() -> None:
-    repo_path = Path.home() / "pkm-brain"
-    brain_home = Path.home() / "brain"
-    plist = render_nightly_launch_agent(
-        repo_path=repo_path,
-        brain_home=brain_home,
-        uv_path=Path("/opt/homebrew/bin/uv"),
-        interval=3600,
-        due_after_hours=20,
-        with_llm_wiki_proposals=True,
-        provider="openai",
-    )
-    encoded = plistlib.dumps(plist)
-    decoded = plistlib.loads(encoded)
-
-    command = decoded["ProgramArguments"][-1]
-    assert "--with-llm-wiki-proposals" in command
-    assert "--provider openai" in command
-    assert "OPENAI_API_KEY" not in command
-    assert decoded["EnvironmentVariables"]["PKM_BRAIN_LLM_PROVIDER"] == "openai"
-    assert decoded["EnvironmentVariables"]["PKM_BRAIN_OPENAI_MODEL"] == OPENAI_DEFAULT_MODEL
-
-
-def test_nightly_launch_agent_plist_render_with_codex_wiki_proposals(monkeypatch) -> None:
-    monkeypatch.setenv("PKM_BRAIN_CODEX_BIN", "/opt/homebrew/bin/codex")
-    repo_path = Path.home() / "pkm-brain"
-    brain_home = Path.home() / "brain"
-    plist = render_nightly_launch_agent(
-        repo_path=repo_path,
-        brain_home=brain_home,
-        uv_path=Path("/opt/homebrew/bin/uv"),
-        interval=3600,
-        due_after_hours=20,
-        with_llm_wiki_proposals=True,
-        provider="codex",
-    )
-    encoded = plistlib.dumps(plist)
-    decoded = plistlib.loads(encoded)
-
-    command = decoded["ProgramArguments"][-1]
-    assert "--with-llm-wiki-proposals" in command
-    assert "--provider codex" in command
-    assert "OPENAI_API_KEY" not in command
-    assert decoded["EnvironmentVariables"]["PKM_BRAIN_LLM_PROVIDER"] == "codex"
-    assert decoded["EnvironmentVariables"]["PKM_BRAIN_CODEX_MODEL"] == CODEX_DEFAULT_MODEL
-    assert decoded["EnvironmentVariables"]["PKM_BRAIN_CODEX_BIN"] == "/opt/homebrew/bin/codex"
-    assert decoded["EnvironmentVariables"]["PKM_BRAIN_CODEX_CWD"] == str(repo_path)
 
 
 def test_nightly_launch_agent_plist_render_uses_codex_as_default_llm_provider(monkeypatch) -> None:

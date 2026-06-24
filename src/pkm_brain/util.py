@@ -5,6 +5,10 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterable, TypeVar
+
+
+T = TypeVar("T")
 
 
 def now_iso() -> str:
@@ -35,3 +39,14 @@ def slugify(value: str) -> str:
 
 def token_count(text: str) -> int:
     return len(re.findall(r"\S+", text))
+
+
+def stable_unique(values: Iterable[T]) -> list[T]:
+    output: list[T] = []
+    seen: set[T] = set()
+    for value in values:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        output.append(value)
+    return output

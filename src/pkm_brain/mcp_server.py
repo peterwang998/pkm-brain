@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from .paths import BrainPaths
 from .service import BrainService
-from . import wiki_proposals
 
 
 def create_mcp(home: str | None = None):
@@ -49,35 +48,6 @@ def create_mcp(home: str | None = None):
     ) -> dict:
         memory_id = service.propose_memory(memory_type, scope, content, sources, confidence)
         return {"memory_id": memory_id, "status": "proposed"}
-
-    @mcp.tool()
-    def propose_wiki_update(
-        title: str,
-        rationale: str,
-        source_ids: list[str],
-        changes: list[dict],
-        confidence: float = 0.8,
-    ) -> dict:
-        batch_id = service.propose_wiki_update(
-            title=title,
-            rationale=rationale,
-            source_ids=source_ids,
-            changes=changes,
-            confidence=confidence,
-            author="mcp-agent",
-            source="mcp",
-        )
-        return {"batch_id": batch_id, "status": "proposed"}
-
-    @mcp.tool()
-    def list_wiki_proposals(status: str | None = None) -> list[dict]:
-        service.init_workspace()
-        return wiki_proposals.list_wiki_proposals(paths, status=status)
-
-    @mcp.tool()
-    def inspect_wiki_proposal(batch_id: str) -> dict:
-        service.init_workspace()
-        return wiki_proposals.inspect_wiki_proposal(paths, batch_id)
 
     @mcp.tool()
     def write_agent_session(

@@ -41,9 +41,9 @@ Proposed Action → Policy → Apply → Audit → Revert/Demote if needed
 
 ## 3. Current code baseline (gap)
 
-**Built:** evidence layer (`service.py`/`indexes.py`); basic `facts` (mig 006); `open_questions`, `wiki_curation_runs` (006); `wiki_page_snapshots` (008); legacy `wiki_change_*` + `absorb_wiki_packet_into_facts()`; `upsert_candidate_facts`, `resolve_fact_groups`, `curate_managed_pages`/`render_managed_page`; correction/revert; `LLMProvider.complete(prompt)->str` (`llm.py:32`); single LanceDB `chunks` table (`indexes.py:12`); `MANAGED_WIKI_BOOST=+8` (`service.py:1577`). Migration max = **8**.
+**Built:** evidence layer (`service.py`/`indexes.py`); enriched `facts`; `open_questions`, `wiki_curation_runs`, `wiki_page_snapshots`; `cos_actions`; versioned `cos_policy`; `page_contracts`; `wiki_page_syntheses`; shared retrieval FTS; fact lineage target validation; `upsert_candidate_facts`, `resolve_fact_groups`, `curate_managed_pages`/`render_managed_page`; correction/revert; role-aware JSON LLM calls; fact/chunk/wiki retrieval with eval fixtures; UI views for facts/actions/policy/contracts/audit. Legacy `wiki_change_*` tables remain as archived audit/migration compatibility data, but UI/CLI/MCP/nightly no longer create, apply, absorb, or search legacy wiki proposals. Migration max = **16**.
 
-**Not built:** source→facts extraction; source spans + 3 confidences; `cos_actions`; versioned policy; page contracts; gardener; two-zone synthesis; fact retrieval; audit/critic/demotion loop; timeout-into-uncertainty; legacy retirement.
+**Not built:** fully eval-gated autonomous topology writes beyond conservative policy, production LLM extraction beyond shadow/gated modes, and a physical table-drop migration for archived `wiki_change_*` history.
 
 ---
 
@@ -237,7 +237,7 @@ Retrieval negative controls are fixed golden fixtures, but their synthetic absen
 | 10 | L0/L1 topology auto-apply | only low-risk topology promoted (eval-gated); blast caps enforced; policy version on every auto action; truth stays manual/display |
 | 11 | Critic + audit + demotion + auto-revert | critic disagreement escalates; audit marks bad; demotion bumps policy version; revert refuses on drift |
 | 12 | Timeout-into-uncertainty (014) | tests prove truth never times out into a winner; stale residue doesn't block page regen |
-| 13 | Legacy retirement | `wiki_change_items.status='pending'`≈0; tests pass without legacy tables; nightly uses source→facts; UI shows CoS actions/policy/audit/residue |
+| 13 | Legacy retirement | Active UI/CLI/MCP/nightly legacy proposal creation/review/absorption paths are retired after backlog drain; `wiki_change_*` tables remain archived until a later explicit table-drop migration |
 
 (Migrations land in the phase that first needs them; `run_migrations` applies all pending idempotently.)
 

@@ -12,10 +12,8 @@ from pkm_brain.paths import BrainPaths
 from pkm_brain.service import BrainService
 from pkm_brain.title_utils import MAX_DOCUMENT_TITLE_CHARS, TITLE_TRUNCATION_SUFFIX
 from pkm_brain.util import text_sha256, token_count
-from pkm_brain.wiki import lint_wiki, parse_frontmatter, synthesize_wiki
-from pkm_brain.wiki_compiler import clean_agent_log_preview, select_compiler_sources
+from pkm_brain.wiki import lint_wiki, parse_frontmatter
 from pkm_brain.wiki_facts import rebuild_fact_retrieval_index
-from pkm_brain.wiki_proposals import apply_wiki_proposal, create_wiki_proposal, inspect_wiki_proposal, latest_documents, record_wiki_interview
 
 
 def service_for(tmp_path: Path) -> BrainService:
@@ -92,23 +90,6 @@ def test_ingest_bounds_frontmatter_title_without_dropping_body(tmp_path: Path) -
     assert len(row["title"]) == MAX_DOCUMENT_TITLE_CHARS
     assert row["title"].endswith(TITLE_TRUNCATION_SUFFIX)
     assert "body-content-marker" in chunk_text["text"]
-
-
-def test_latest_documents_bounds_historical_giant_titles(tmp_path: Path) -> None:
-    svc = service_for(tmp_path)
-    svc.init_workspace()
-    note = svc.paths.inbox / "historical-title.md"
-    note.write_text("# Historical Title\n\nShort preview body.\n", encoding="utf-8")
-    svc.ingest()
-    giant_title = "Historical " + ("y" * 2000)
-    with connection(svc.paths.sqlite_path) as conn:
-        conn.execute("UPDATE documents SET title = ?", (giant_title,))
-
-    documents = latest_documents(svc.paths, limit=8)
-
-    assert len(documents[0]["title"]) == MAX_DOCUMENT_TITLE_CHARS
-    assert documents[0]["title"].endswith(TITLE_TRUNCATION_SUFFIX)
-    assert documents[0]["preview"] == "# Historical Title Short preview body."
 
 
 def test_search_uses_source_aware_reranking_and_backfill(tmp_path: Path) -> None:
@@ -537,23 +518,6 @@ def test_reset_retrieval_index_preserves_documents_and_rebuilds_artifacts(tmp_pa
         "## Summary\n\nreset index marker wiki evidence.\n",
         encoding="utf-8",
     )
-    batch_id = svc.propose_wiki_update(
-        "Reset index proposal",
-        "Verify document references survive index reset.",
-        [f"document:{document_id}"],
-        [
-            {
-                "target_path": "concepts/reset-index.md",
-                "operation": "append_section",
-                "section_name": "Notes",
-                "proposed_markdown": "## Notes\n\nPreserve document identity.\n",
-                "rationale": "Regression coverage.",
-                "source_ids": [f"document:{document_id}"],
-                "confidence": 0.8,
-            }
-        ],
-        0.8,
-    )
     svc.retrieve_context("reset index marker")
     svc.record_context_feedback("document", f"document:{document_id}", useful=True)
     upsert_vectors(
@@ -582,9 +546,6 @@ def test_reset_retrieval_index_preserves_documents_and_rebuilds_artifacts(tmp_pa
             "SELECT COUNT(*) FROM context_lineage_events WHERE event_type = 'explicit_useful'"
         ).fetchone()[0]
         fts_count = conn.execute("SELECT COUNT(*) FROM chunk_fts").fetchone()[0]
-        proposal_sources = json.loads(
-            conn.execute("SELECT source_ids FROM wiki_change_batches WHERE id = ?", (batch_id,)).fetchone()["source_ids"]
-        )
 
     assert document_ids == {document_id}
     assert new_chunk_ids
@@ -593,7 +554,6 @@ def test_reset_retrieval_index_preserves_documents_and_rebuilds_artifacts(tmp_pa
     assert exposed_count == 0
     assert feedback_count == 1
     assert fts_count == len(new_chunk_ids)
-    assert proposal_sources == [f"document:{document_id}"]
     doctor = svc.index_doctor()
     assert doctor["missing_vector_count"] == 0
     assert doctor["stale_vector_count"] == 0
@@ -728,311 +688,6 @@ def test_parse_frontmatter_ignores_delimiters_inside_yaml_values() -> None:
     assert frontmatter is not None
     assert frontmatter["title"] == "Plan --- Section"
     assert body.startswith("\n# Body")
-
-
-def test_wiki_synthesis_creates_reference_pages_for_documents(tmp_path: Path) -> None:
-    svc = service_for(tmp_path)
-    svc.init_workspace()
-    note = svc.paths.inbox / "sqlite-decision.md"
-    note.write_text(
-        "# SQLite Decision\n\nSQLite is the canonical metadata store.\n",
-        encoding="utf-8",
-    )
-    svc.ingest()
-
-    dry = synthesize_wiki(svc.paths, dry_run=True, with_llm=False)
-    assert dry["created"]
-    assert not list(svc.paths.wiki.rglob("*.md"))
-
-    result = synthesize_wiki(svc.paths, with_llm=False)
-    assert result["created"]
-    assert result["lint"]["errors"] == []
-    pages = list((svc.paths.wiki / "references").rglob("*.md"))
-    assert len(pages) == 1
-    text = pages[0].read_text(encoding="utf-8")
-    assert "page_type: reference" in text
-    assert "document:" in text
-
-    second = synthesize_wiki(svc.paths, with_llm=False)
-    assert second["created"] == []
-    assert second["skipped"]
-
-
-def test_wiki_synthesis_caps_reference_filenames(tmp_path: Path) -> None:
-    svc = service_for(tmp_path)
-    svc.init_workspace()
-    note = svc.paths.inbox / "long-title.md"
-    note.write_text(f"# {'very long title ' * 80}\n\nBody.\n", encoding="utf-8")
-    svc.ingest()
-
-    result = synthesize_wiki(svc.paths, with_llm=False)
-
-    assert result["lint"]["errors"] == []
-    page = next((svc.paths.wiki / "references").rglob("*.md"))
-    assert len(page.name) < 150
-
-
-def test_wiki_synthesis_compiles_semantic_pages_with_default_llm(tmp_path: Path, monkeypatch) -> None:
-    svc = service_for(tmp_path)
-    svc.init_workspace()
-    note = svc.paths.inbox / "pkm-architecture.md"
-    note.write_text(
-        "# PKM Brain Architecture\n\n"
-        "PKM Brain is a personal knowledge management second brain.\n\n"
-        "SQLite is the canonical metadata store for documents and chunks.\n\n"
-        "The wiki synthesis layer should create human-readable compiled markdown pages.\n",
-        encoding="utf-8",
-    )
-    svc.ingest()
-    with connection(svc.paths.sqlite_path) as conn:
-        document_id = conn.execute("SELECT id FROM documents").fetchone()["id"]
-    source_id = f"document:{document_id}"
-
-    class FakeProvider:
-        name = "fake"
-        model = "test"
-
-        def complete(self, prompt: str) -> str:
-            if "You are selecting source documents" in prompt:
-                assert "Prefer user-supplied/manual sources" in prompt
-                return json.dumps(
-                    {
-                        "selected_source_ids": [source_id],
-                        "rationale": "The architecture note directly supports semantic wiki pages.",
-                        "source_rationales": [{"source_id": source_id, "reason": "Primary architecture evidence."}],
-                        "warnings": [],
-                    }
-                )
-            return json.dumps(
-                {
-                    "title": "Compile PKM wiki",
-                    "rationale": "Source-backed semantic pages from architecture note.",
-                    "confidence": 0.9,
-                    "pages": [
-                        {
-                            "page_type": "project",
-                            "slug": "pkm-brain",
-                            "title": "PKM Brain",
-                            "summary": "PKM Brain is a personal knowledge management second brain.",
-                            "key_points": ["The wiki is compiled from immutable source documents."],
-                            "sections": {
-                                "Current State": "The project has local ingestion and LLM wiki synthesis.",
-                                "Goals": "Keep a durable, source-backed second brain.",
-                                "Decisions": "- [[decisions/use-sqlite-for-canonical-metadata]]",
-                                "Open Loops": "- None yet.",
-                                "Timeline": "Compiled from source-backed ingestion events.",
-                            },
-                            "related": ["concepts/wiki-synthesis-layer", "decisions/use-sqlite-for-canonical-metadata"],
-                            "tags": ["pkm", "second-brain"],
-                            "source_ids": [source_id],
-                            "confidence": 0.9,
-                        },
-                        {
-                            "page_type": "concept",
-                            "slug": "wiki-synthesis-layer",
-                            "title": "Wiki Synthesis Layer",
-                            "summary": "The wiki synthesis layer creates human-readable compiled Markdown pages.",
-                            "key_points": ["Semantic pages are the main reading layer."],
-                            "sections": {
-                                "Definition": "A source-backed Markdown compilation layer.",
-                                "Why It Matters": "It keeps knowledge from being re-derived from raw chunks on every query.",
-                                "How It Works": "The LLM proposes source-backed pages and the system renders/lints them.",
-                                "Related Decisions": "- [[decisions/use-sqlite-for-canonical-metadata]]",
-                            },
-                            "related": ["projects/pkm-brain", "decisions/use-sqlite-for-canonical-metadata"],
-                            "tags": ["wiki", "synthesis"],
-                            "source_ids": [source_id],
-                            "confidence": 0.9,
-                        },
-                        {
-                            "page_type": "decision",
-                            "slug": "use-sqlite-for-canonical-metadata",
-                            "title": "Use SQLite For Canonical Metadata",
-                            "summary": "Use SQLite as the canonical metadata store.",
-                            "key_points": ["SQLite is local and inspectable."],
-                            "sections": {
-                                "Context": "The system needs a local metadata store.",
-                                "Decision": "Use SQLite as the canonical metadata store.",
-                                "Rationale": "SQLite is portable, inspectable, and sufficient for local use.",
-                                "Alternatives Considered": "- Postgres\n- Files only",
-                                "Consequences": "Indexes can be rebuilt while SQLite keeps canonical metadata.",
-                            },
-                            "related": ["projects/pkm-brain", "concepts/wiki-synthesis-layer"],
-                            "tags": ["decision", "sqlite"],
-                            "source_ids": [source_id],
-                            "confidence": 0.9,
-                        },
-                    ],
-                }
-            )
-
-    monkeypatch.setattr("pkm_brain.wiki_compiler.get_provider", lambda provider_name=None: FakeProvider())
-
-    result = synthesize_wiki(svc.paths)
-
-    assert result["lint"]["errors"] == []
-    assert result["llm_compile"]["provider"] == "fake"
-    assert result["llm_compile"]["status"] == "ok"
-    assert result["llm_compile"]["source_selection"]["selected_by_type"]["markdown_note"] == 1
-    index = (svc.paths.wiki / "index.md").read_text(encoding="utf-8")
-    concept = (svc.paths.wiki / "concepts" / "wiki-synthesis-layer.md").read_text(encoding="utf-8")
-    decision = (svc.paths.wiki / "decisions" / "use-sqlite-for-canonical-metadata.md").read_text(encoding="utf-8")
-    project = (svc.paths.wiki / "projects" / "pkm-brain.md").read_text(encoding="utf-8")
-
-    assert "[[concepts/wiki-synthesis-layer]]" in index
-    assert "page_type: concept" in concept
-    assert "Reference page synthesized from" not in concept
-    assert "[[decisions/use-sqlite-for-canonical-metadata]]" in concept
-    assert "document:" in concept
-    assert "page_type: decision" in decision
-    assert "Use SQLite as the canonical metadata store" in decision
-    assert "page_type: project" in project
-    assert "[[decisions/use-sqlite-for-canonical-metadata]]" in project
-
-    context = svc.retrieve_context("explain the wiki synthesis layer and sqlite metadata")
-    assert context["relevant_wiki_pages"]
-    assert context["supporting_chunks"]
-    assert any(page["relative_path"] == "concepts/wiki-synthesis-layer.md" for page in context["relevant_wiki_pages"])
-    assert any(citation["type"] == "chunk" for citation in context["citations"])
-    assert any(
-        citation["type"] == "wiki_page"
-        and citation["relative_path"] == "concepts/wiki-synthesis-layer.md"
-        and any(source_id.startswith("document:") for source_id in citation["source_ids"])
-        for citation in context["citations"]
-    )
-
-
-def test_wiki_source_selection_uses_llm_choice_without_hard_agent_log_cap() -> None:
-    documents: list[dict[str, object]] = []
-    for index in range(8):
-        documents.append(
-            {
-                "id": f"doc_log_{index}",
-                "title": f"Recent Agent Log {index}",
-                "source_type": "agent_session_log",
-                "source_path": f"/tmp/log-{index}.md",
-                "ingested_at": f"2026-05-20T0{index}:00:00+00:00",
-            }
-        )
-    documents.extend(
-        [
-            {
-                "id": "doc_meeting",
-                "title": "Older Meeting",
-                "source_type": "hyprnote_meeting",
-                "source_path": "/tmp/meeting.md",
-                "ingested_at": "2026-05-01T00:00:00+00:00",
-            },
-            {
-                "id": "doc_note",
-                "title": "Older Note",
-                "source_type": "markdown_note",
-                "source_path": "/tmp/note.md",
-                "ingested_at": "2026-05-02T00:00:00+00:00",
-            },
-        ]
-    )
-
-    class FakeProvider:
-        name = "fake"
-        model = "test"
-
-        def complete(self, prompt: str) -> str:
-            assert "Prefer user-supplied/manual sources" in prompt
-            assert "Recent Agent Log 7" in prompt
-            assert "Older Meeting" in prompt
-            return json.dumps(
-                {
-                    "selected_source_ids": [
-                        "document:doc_meeting",
-                        "document:doc_note",
-                        "document:doc_log_7",
-                        "document:doc_log_6",
-                        "document:doc_log_5",
-                    ],
-                    "rationale": "The older human sources are semantic evidence, and three logs are relevant implementation history.",
-                    "source_rationales": [
-                        {"source_id": "document:doc_meeting", "reason": "Meeting evidence."},
-                        {"source_id": "document:doc_note", "reason": "Manual note evidence."},
-                        {"source_id": "document:doc_log_7", "reason": "Relevant implementation history."},
-                    ],
-                    "warnings": [],
-                }
-            )
-
-    selected = select_compiler_sources(FakeProvider(), documents, source_limit=5)
-
-    selected_ids = selected["diagnostics"]["selected_source_ids"]
-    assert "document:doc_meeting" in selected_ids
-    assert "document:doc_note" in selected_ids
-    assert selected["diagnostics"]["selected_by_type"]["agent_session_log"] == 3
-    assert "agent_log_cap" not in selected["diagnostics"]
-    assert selected["diagnostics"]["dropped_agent_log_count"] == 5
-    assert selected["diagnostics"]["selector_rationale"].startswith("The older human sources")
-
-
-def test_wiki_source_selector_filters_unknown_ids_and_trims_to_limit() -> None:
-    documents = [
-        {
-            "id": "doc_note",
-            "title": "Manual Note",
-            "source_type": "manual_entry",
-            "source_path": "/tmp/note.md",
-            "ingested_at": "2026-05-02T00:00:00+00:00",
-        },
-        {
-            "id": "doc_transcript",
-            "title": "Meeting Transcript",
-            "source_type": "meeting_transcript",
-            "source_path": "/tmp/transcript.txt",
-            "ingested_at": "2026-05-03T00:00:00+00:00",
-        },
-    ]
-
-    class FakeProvider:
-        name = "fake"
-        model = "test"
-
-        def complete(self, prompt: str) -> str:
-            assert "preferred semantic source" in prompt
-            return json.dumps(
-                {
-                    "selected_source_ids": [
-                        "document:doc_note",
-                        "document:missing",
-                        "document:doc_transcript",
-                    ],
-                    "rationale": "Manual source first.",
-                    "source_rationales": [],
-                    "warnings": ["missing id should be ignored"],
-                }
-            )
-
-    selected = select_compiler_sources(FakeProvider(), documents, source_limit=1)
-
-    assert selected["diagnostics"]["selected_source_ids"] == ["document:doc_note"]
-    assert any("unknown source_id" in warning for warning in selected["diagnostics"]["selector_warnings"])
-    assert any("trimmed to requested limit 1" in warning for warning in selected["diagnostics"]["selector_warnings"])
-
-
-def test_agent_log_compiler_preview_is_cleaned_and_capped() -> None:
-    preview = clean_agent_log_preview(
-        "# Agent Session\n\n"
-        "- session_meta: You are Codex, a coding agent based on GPT-5.\n"
-        "## User Requests\n\n"
-        "Keep the useful request.\n\n"
-        "## Tool / Command Activity\n\n"
-        "- event_msg: noisy tool output\n"
-        "## Assistant Responses\n\n"
-        + " ".join(f"detail{i}" for i in range(400)),
-        max_chars=300,
-    )
-
-    assert "session_meta" not in preview
-    assert "You are Codex" not in preview
-    assert "event_msg" not in preview
-    assert "Keep the useful request" in preview
-    assert len(preview) <= 320
 
 
 def test_retrieve_context_reranks_clean_sources_and_source_linked_wiki(tmp_path: Path) -> None:
@@ -1713,76 +1368,6 @@ def test_lineage_memory_proposal_accepts_two_sessions_plus_useful_feedback(tmp_p
 
     assert result["created_count"] == 1
     assert svc.get_memory(result["memory_ids"][0])["status"] == "proposed"
-
-
-def test_wiki_proposal_interview_and_apply_patches_section(tmp_path: Path) -> None:
-    svc = service_for(tmp_path)
-    svc.init_workspace()
-    target = svc.paths.wiki / "concepts"
-    target.mkdir(parents=True)
-    (target / "test-concept.md").write_text(
-        "---\n"
-        "title: Test Concept\n"
-        "page_type: concept\n"
-        "id: concept-test\n"
-        "status: active\n"
-        "created_at: 2026-05-06\n"
-        "updated_at: 2026-05-06\n"
-        "source_ids:\n"
-        "  - document:test\n"
-        "related: []\n"
-        "tags: []\n"
-        "---\n\n"
-        "# Test Concept\n\n"
-        "## Summary\n\nOld summary.\n\n"
-        "## Key Points\n\n- Old point.\n\n"
-        "## Definition\n\nOld.\n\n"
-        "## Why It Matters\n\nOld.\n\n"
-        "## How It Works\n\nOld.\n\n"
-        "## Related Decisions\n\n- None.\n\n"
-        "## Source Evidence\n\n- document:test\n\n"
-        "## Related Pages\n\n- None.\n\n"
-        "## Open Questions\n\n- None.\n",
-        encoding="utf-8",
-    )
-    batch_id = create_wiki_proposal(
-        svc.paths,
-        title="Update test concept",
-        rationale="Better synthesis.",
-        source_ids=["document:test"],
-        changes=[
-            {
-                "target_path": "concepts/test-concept.md",
-                "operation": "replace_section",
-                "section_name": "Summary",
-                "proposed_markdown": "New source-backed summary.",
-                "rationale": "Improve summary.",
-                "source_ids": ["document:test"],
-                "confidence": 0.9,
-            }
-        ],
-        confidence=0.9,
-    )
-
-    proposal = inspect_wiki_proposal(svc.paths, batch_id)
-    assert proposal["status"] == "proposed"
-    assert proposal["items"][0]["target_path"] == "concepts/test-concept.md"
-
-    reviewed = record_wiki_interview(
-        svc.paths,
-        batch_id,
-        ["Approve?"],
-        ["Yes"],
-        "approved",
-    )
-    assert reviewed["status"] == "approved"
-
-    result = apply_wiki_proposal(svc.paths, batch_id)
-    assert result["lint"]["errors"] == []
-    text = (target / "test-concept.md").read_text(encoding="utf-8")
-    assert "New source-backed summary." in text
-    assert "Old summary." not in text
-    assert inspect_wiki_proposal(svc.paths, batch_id)["status"] == "applied"
 
 
 def test_retrieve_context_returns_facts_and_contested_pairs(tmp_path: Path) -> None:

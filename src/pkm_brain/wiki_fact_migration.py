@@ -6,6 +6,7 @@ from typing import Any
 
 from .db import connection
 from .paths import BrainPaths
+from .util import stable_unique
 from .wiki import GENERATED_MARKER, parse_frontmatter
 from .wiki_facts import (
     CHIEF_OF_STAFF_MARKER,
@@ -23,7 +24,6 @@ from .wiki_facts import (
     upsert_candidate_facts,
     wiki_fact_dashboard,
 )
-from .wiki_proposals import stable_unique
 
 
 MIGRATION_NAME = "wiki_fact_backfill_v1"

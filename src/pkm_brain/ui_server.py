@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import secrets
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -33,7 +32,6 @@ from .wiki import (
 )
 from .wiki_facts import (
     answer_open_question,
-    absorb_wiki_packet_into_facts,
     create_confirmed_page_fact,
     managed_fact_page_review,
     reconcile_open_fact_questions,
@@ -41,26 +39,9 @@ from .wiki_facts import (
     revert_wiki_page_snapshot,
     wiki_fact_dashboard,
 )
-from .wiki_proposals import (
-    PENDING_ITEM_STATUS,
-    PENDING_REVIEW_STATUSES,
-    append_to_section,
-    apply_wiki_proposal,
-    generate_interview_questions,
-    generate_wiki_review_packet_brief,
-    inspect_wiki_proposal,
-    list_wiki_review_packets,
-    list_wiki_proposals,
-    record_wiki_interview,
-    reject_wiki_proposal,
-    replace_section,
-    validate_target_path,
-    wiki_proposal_pending_item_counts,
-)
 
 
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
-PENDING_WIKI_PROPOSAL_STATUSES = PENDING_REVIEW_STATUSES
 
 
 class BadRequestError(ValueError):
@@ -135,14 +116,10 @@ class BrainUIHandler(BaseHTTPRequestHandler):
                 self.write_json(ui_wiki_pages(self.server.paths, query))
             elif path == "/api/wiki/page":
                 self.write_json(ui_wiki_page(self.server.paths, query))
-            elif path == "/api/wiki/proposal-packets":
-                self.write_json(ui_wiki_proposal_packets(self.server.paths, query))
             elif path == "/api/wiki/facts/page":
                 self.write_json(ui_wiki_fact_page_review(self.server.paths, query))
             elif path == "/api/wiki/facts":
                 self.write_json(ui_wiki_fact_dashboard(self.server.paths))
-            elif path == "/api/wiki/proposals":
-                self.write_json(ui_wiki_proposals(self.server.paths, query))
             elif path == "/api/cos/policy":
                 self.write_json(ui_cos_policy(self.server.paths))
             elif path == "/api/cos/actions":
@@ -151,11 +128,6 @@ class BrainUIHandler(BaseHTTPRequestHandler):
                 self.write_json(ui_cos_contracts(self.server.paths))
             elif path == "/api/cos/audit":
                 self.write_json(ui_cos_audit_status(self.server.paths))
-            elif path.startswith("/api/wiki/proposals/"):
-                batch_id = path.removeprefix("/api/wiki/proposals/").strip("/")
-                self.write_json(ui_wiki_proposal_detail(self.server.paths, batch_id))
-            elif path == "/api/review-queue":
-                self.write_json(ui_review_queue(self.server.paths))
             else:
                 self.write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
         except BadRequestError as exc:
@@ -172,11 +144,7 @@ class BrainUIHandler(BaseHTTPRequestHandler):
     def dispatch_post(self, path: str) -> None:
         try:
             parts = [part for part in path.removeprefix("/api/").split("/") if part]
-            if parts[:2] == ["wiki", "proposals"]:
-                self.dispatch_wiki_proposal_post(parts)
-            elif parts[:2] == ["wiki", "proposal-packets"]:
-                self.dispatch_wiki_proposal_packet_post(parts)
-            elif parts[:2] == ["wiki", "questions"]:
+            if parts[:2] == ["wiki", "questions"]:
                 self.dispatch_wiki_question_post(parts)
             elif parts[:2] == ["wiki", "facts"]:
                 self.dispatch_wiki_fact_post(parts)
@@ -225,56 +193,6 @@ class BrainUIHandler(BaseHTTPRequestHandler):
             self.write_json(
                 {"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR
             )
-
-    def dispatch_wiki_proposal_post(self, parts: list[str]) -> None:
-        if len(parts) == 2:
-            payload = self.read_json_body()
-            self.write_json(ui_create_wiki_proposal(self.server.paths, payload))
-            return
-        if len(parts) < 4:
-            self.write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
-            return
-        batch_id = parts[2]
-        action = parts[3:]
-        payload = self.read_json_body()
-        if action == ["interview"]:
-            self.write_json(
-                ui_record_wiki_interview(self.server.paths, batch_id, payload)
-            )
-        elif action == ["interview", "generate"]:
-            self.write_json(
-                generate_interview_questions(
-                    self.server.paths,
-                    batch_id,
-                    provider_name=optional_str(payload.get("provider")),
-                )
-            )
-        elif action == ["reject"]:
-            reason = str(payload.get("reason") or "").strip()
-            if not reason:
-                raise BadRequestError("reject reason is required")
-            self.write_json(
-                reject_wiki_proposal(self.server.paths, batch_id, reason=reason)
-            )
-        elif action == ["apply"]:
-            self.write_json(apply_wiki_proposal(self.server.paths, batch_id))
-        elif action == ["approve-and-apply"]:
-            self.write_json(
-                ui_approve_and_apply_wiki_proposal(self.server.paths, batch_id, payload)
-            )
-        else:
-            self.write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
-
-    def dispatch_wiki_proposal_packet_post(self, parts: list[str]) -> None:
-        if parts == ["wiki", "proposal-packets", "brief"]:
-            payload = self.read_json_body()
-            self.write_json(ui_generate_wiki_packet_brief(self.server.paths, payload))
-            return
-        if parts == ["wiki", "proposal-packets", "facts"]:
-            payload = self.read_json_body()
-            self.write_json(ui_absorb_wiki_packet_facts(self.server.paths, payload))
-            return
-        self.write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
     def dispatch_wiki_question_post(self, parts: list[str]) -> None:
         if len(parts) == 4 and parts[3] == "answer":
@@ -415,22 +333,6 @@ def retrieval_surface_status(paths: BrainPaths) -> list[dict[str, Any]]:
         proposed_memories = scalar_count(
             conn, "SELECT COUNT(*) FROM memories WHERE status = 'proposed'", table="memories"
         )
-        legacy_items = 0
-        if ui_table_exists(conn, "wiki_change_items") and ui_table_exists(
-            conn, "wiki_change_batches"
-        ):
-            review_statuses = tuple(sorted(PENDING_REVIEW_STATUSES))
-            placeholders = ",".join("?" for _ in review_statuses)
-            row = conn.execute(
-                f"""
-                SELECT COUNT(*)
-                FROM wiki_change_items i
-                JOIN wiki_change_batches b ON b.id = i.batch_id
-                WHERE b.status IN ({placeholders}) AND i.status = ?
-                """,
-                (*review_statuses, PENDING_ITEM_STATUS),
-            ).fetchone()
-            legacy_items = int(row[0] if row else 0)
         actions = scalar_count(conn, "SELECT COUNT(*) FROM cos_actions", table="cos_actions")
     return [
         {
@@ -464,14 +366,6 @@ def retrieval_surface_status(paths: BrainPaths) -> list[dict[str, Any]]:
             "indexed": active_memories + proposed_memories,
             "role": "curated memory hints",
             "details": f"{active_memories} active and {proposed_memories} proposed memories can be returned; proposed memories are lower-trust candidates.",
-        },
-        {
-            "surface": "Legacy wiki packets",
-            "searched": False,
-            "count": legacy_items,
-            "indexed": 0,
-            "role": "backlog only",
-            "details": "Old wiki_change proposal items are visible for draining or absorption into facts, but retrieve_context does not search them directly.",
         },
         {
             "surface": "CoS action ledger",
@@ -552,16 +446,13 @@ def ui_wiki_pages(paths: BrainPaths, query: dict[str, list[str]]) -> dict[str, A
     if status and status not in ALLOWED_STATUSES:
         raise BadRequestError(f"invalid wiki page status: {status}")
     q = first(query, "q")
-    pending_counts = pending_wiki_proposal_counts(paths)
     if q:
         pages = []
         for result in svc.search_wiki_pages(q, limit=50):
             relative_path = str(result.get("relative_path") or "")
             try:
                 target = safe_wiki_path(paths, relative_path)
-                page = wiki_page_entry(
-                    paths, target, pending_counts.get(relative_path, 0)
-                )
+                page = wiki_page_entry(paths, target)
             except (BadRequestError, NotFoundError):
                 continue
             if page_type and page["page_type"] != page_type:
@@ -572,9 +463,7 @@ def ui_wiki_pages(paths: BrainPaths, query: dict[str, list[str]]) -> dict[str, A
             page["summary"] = result.get("summary") or ""
             pages.append(page)
     else:
-        pages = wiki_pages_from_index(
-            paths, page_type=page_type, status=status, pending_counts=pending_counts
-        )
+        pages = wiki_pages_from_index(paths, page_type=page_type, status=status)
     return {"pages": pages, "count": len(pages)}
 
 
@@ -583,7 +472,6 @@ def wiki_pages_from_index(
     *,
     page_type: str | None,
     status: str | None,
-    pending_counts: dict[str, int],
 ) -> list[dict[str, Any]]:
     query = "SELECT * FROM wiki_pages WHERE 1=1"
     params: list[Any] = []
@@ -606,12 +494,7 @@ def wiki_pages_from_index(
             safe_target = safe_wiki_path(paths, relative_path)
         except (ValueError, BadRequestError, NotFoundError):
             continue
-        page = wiki_page_entry(
-            paths,
-            safe_target,
-            pending_counts.get(relative_path, 0),
-            indexed_row=dict(row),
-        )
+        page = wiki_page_entry(paths, safe_target, indexed_row=dict(row))
         pages.append(page)
     return pages
 
@@ -619,7 +502,6 @@ def wiki_pages_from_index(
 def wiki_page_entry(
     paths: BrainPaths,
     target: Path,
-    pending_count: int,
     indexed_row: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not target.exists():
@@ -652,7 +534,6 @@ def wiki_page_entry(
             frontmatter.get("updated_at") or (indexed_row or {}).get("updated_at") or ""
         ),
         "generated": GENERATED_MARKER in text,
-        "pending_proposal_count": pending_count,
         "related": list(
             frontmatter.get("related")
             or parse_stored_list((indexed_row or {}).get("related"))
@@ -680,91 +561,7 @@ def ui_wiki_page(paths: BrainPaths, query: dict[str, list[str]]) -> dict[str, An
         "source_ids": source_ids,
         "source_documents": source_document_summaries(paths, source_ids),
         "related": list(frontmatter.get("related") or []),
-        "pending_proposals": pending_wiki_proposals_for_path(
-            paths, target.relative_to(paths.wiki).as_posix()
-        ),
     }
-
-
-def ui_wiki_proposals(paths: BrainPaths, query: dict[str, list[str]]) -> dict[str, Any]:
-    service(paths).init_workspace()
-    statuses = status_filter_values(first(query, "status"))
-    proposals = list_wiki_proposals(
-        paths, status=None if len(statuses) != 1 else next(iter(statuses))
-    )
-    if len(statuses) > 1:
-        proposals = [
-            proposal for proposal in proposals if proposal.get("status") in statuses
-        ]
-    pending_counts = wiki_proposal_pending_item_counts(paths)
-    proposals = [
-        augment_wiki_proposal_summary(
-            proposal, pending_counts.get(str(proposal.get("id") or ""), 0)
-        )
-        for proposal in proposals
-    ]
-    return {"proposals": proposals, "count": len(proposals)}
-
-
-def augment_wiki_proposal_summary(
-    proposal: dict[str, Any], pending_item_count: int = 0
-) -> dict[str, Any]:
-    output = dict(proposal)
-    output["source_count"] = len(output.get("source_ids") or [])
-    output["pending_item_count"] = pending_item_count
-    return output
-
-
-def ui_wiki_proposal_detail(paths: BrainPaths, batch_id: str) -> dict[str, Any]:
-    service(paths).init_workspace()
-    try:
-        proposal = inspect_wiki_proposal(paths, batch_id)
-    except ValueError as exc:
-        raise NotFoundError(str(exc)) from exc
-    output = dict(proposal)
-    output["source_documents"] = source_document_summaries(
-        paths, output.get("source_ids") or []
-    )
-    output["source_count"] = len(output.get("source_ids") or [])
-    output["items"] = [
-        augment_wiki_proposal_item(paths, item) for item in output.get("items", [])
-    ]
-    return output
-
-
-def ui_wiki_proposal_packets(
-    paths: BrainPaths, query: dict[str, list[str]]
-) -> dict[str, Any]:
-    service(paths).init_workspace()
-    statuses = status_filter_values(first(query, "status")) or set(
-        PENDING_WIKI_PROPOSAL_STATUSES
-    )
-    group_by = first(query, "group_by") or "topic"
-    try:
-        return list_wiki_review_packets(paths, statuses=statuses, group_by=group_by)
-    except ValueError as exc:
-        raise BadRequestError(str(exc)) from exc
-
-
-def ui_generate_wiki_packet_brief(
-    paths: BrainPaths, payload: dict[str, Any]
-) -> dict[str, Any]:
-    service(paths).init_workspace()
-    packet_id = str(payload.get("packet_id") or "").strip()
-    if not packet_id:
-        raise BadRequestError("packet_id is required")
-    group_by = str(payload.get("group_by") or "topic").strip()
-    answers = object_list_payload(payload.get("answers"))
-    try:
-        return generate_wiki_review_packet_brief(
-            paths,
-            packet_id=packet_id,
-            group_by=group_by,
-            provider_name=optional_str(payload.get("provider")),
-            answers=answers,
-        )
-    except ValueError as exc:
-        raise BadRequestError(str(exc)) from exc
 
 
 def ui_wiki_fact_dashboard(paths: BrainPaths) -> dict[str, Any]:
@@ -850,26 +647,6 @@ def ui_wiki_fact_page_review(
         raise BadRequestError("path is required")
     try:
         return managed_fact_page_review(paths, page_hint)
-    except ValueError as exc:
-        raise BadRequestError(str(exc)) from exc
-
-
-def ui_absorb_wiki_packet_facts(
-    paths: BrainPaths, payload: dict[str, Any]
-) -> dict[str, Any]:
-    service(paths).init_workspace()
-    packet_id = str(payload.get("packet_id") or "").strip()
-    if not packet_id:
-        raise BadRequestError("packet_id is required")
-    group_by = str(payload.get("group_by") or "topic").strip()
-    overwrite_existing = bool(payload.get("overwrite_existing", False))
-    try:
-        return absorb_wiki_packet_into_facts(
-            paths,
-            packet_id=packet_id,
-            group_by=group_by,
-            overwrite_existing=overwrite_existing,
-        )
     except ValueError as exc:
         raise BadRequestError(str(exc)) from exc
 
@@ -966,244 +743,6 @@ def ui_create_wiki_fact_correction(
         )
     except ValueError as exc:
         raise BadRequestError(str(exc)) from exc
-
-
-def augment_wiki_proposal_item(
-    paths: BrainPaths, item: dict[str, Any]
-) -> dict[str, Any]:
-    output = dict(item)
-    output["source_documents"] = source_document_summaries(
-        paths, output.get("source_ids") or []
-    )
-    output["source_count"] = len(output.get("source_ids") or [])
-    try:
-        preview = preview_wiki_change_item(paths, output)
-    except Exception as exc:
-        preview = {
-            "target_exists": False,
-            "current_markdown": "",
-            "current_page_markdown": "",
-            "would_be_markdown": "",
-            "preview_error": str(exc),
-        }
-    output.update(preview)
-    return output
-
-
-def preview_wiki_change_item(paths: BrainPaths, item: dict[str, Any]) -> dict[str, Any]:
-    target_path = str(item.get("target_path") or "")
-    target = safe_wiki_path(paths, target_path, must_exist=False)
-    target_exists = target.exists()
-    current_page = (
-        target.read_text(encoding="utf-8", errors="replace") if target_exists else ""
-    )
-    operation = str(item.get("operation") or "")
-    proposed_markdown = str(item.get("proposed_markdown") or "")
-    section_name = str(item.get("section_name") or "")
-    preview_error = None
-    if operation == "create_page":
-        current = ""
-        would_be = proposed_markdown.rstrip() + "\n"
-        if target_exists:
-            preview_error = f"target already exists for create_page: {target_path}"
-    elif operation == "replace_page":
-        current = current_page
-        would_be = proposed_markdown.rstrip() + "\n"
-        if not target_exists:
-            preview_error = f"target does not exist: {target_path}"
-    elif operation == "replace_section":
-        current = section_body(current_page, section_name) if target_exists else ""
-        would_be = (
-            replace_section(current_page, section_name, proposed_markdown)
-            if target_exists
-            else ""
-        )
-        if not target_exists:
-            preview_error = f"target does not exist: {target_path}"
-    elif operation == "append_section":
-        current = section_body(current_page, section_name) if target_exists else ""
-        would_be = (
-            append_to_section(current_page, section_name, proposed_markdown)
-            if target_exists
-            else ""
-        )
-        if not target_exists:
-            preview_error = f"target does not exist: {target_path}"
-    else:
-        current = current_page
-        would_be = ""
-        preview_error = f"unsupported operation: {operation}"
-    return {
-        "target_exists": target_exists,
-        "current_markdown": current,
-        "current_page_markdown": current_page,
-        "would_be_markdown": would_be,
-        "preview_error": preview_error,
-    }
-
-
-def section_body(markdown: str, section_name: str) -> str:
-    if not section_name:
-        return ""
-    match = re.search(
-        rf"^##\s+{re.escape(section_name)}\s*\n(.*?)(?=^##\s+|\Z)",
-        markdown,
-        flags=re.MULTILINE | re.DOTALL,
-    )
-    return match.group(1).strip() if match else ""
-
-
-def ui_record_wiki_interview(
-    paths: BrainPaths, batch_id: str, payload: dict[str, Any]
-) -> dict[str, Any]:
-    return record_wiki_interview(
-        paths,
-        batch_id,
-        string_list(payload.get("questions")),
-        string_list(payload.get("answers")),
-        str(payload.get("disposition") or "needs_interview"),
-        provider=optional_str(payload.get("provider")),
-        model=optional_str(payload.get("model")),
-    )
-
-
-def ui_approve_and_apply_wiki_proposal(
-    paths: BrainPaths, batch_id: str, payload: dict[str, Any]
-) -> dict[str, Any]:
-    reviewed = record_wiki_interview(
-        paths,
-        batch_id,
-        string_list(payload.get("questions")),
-        string_list(payload.get("answers")),
-        "approved",
-        provider=optional_str(payload.get("provider")),
-        model=optional_str(payload.get("model")),
-    )
-    applied = apply_wiki_proposal(paths, batch_id)
-    applied["interview"] = reviewed
-    return applied
-
-
-def ui_create_wiki_proposal(
-    paths: BrainPaths, payload: dict[str, Any]
-) -> dict[str, Any]:
-    title = str(payload.get("title") or "Human wiki edit").strip()
-    rationale = str(payload.get("rationale") or "Human-authored browser edit.").strip()
-    source_ids = string_list(payload.get("source_ids"))
-    changes = payload.get("changes")
-    if not isinstance(changes, list) or not changes:
-        raise BadRequestError("proposal requires at least one change")
-    normalized_changes: list[dict[str, Any]] = []
-    for change in changes:
-        if not isinstance(change, dict):
-            raise BadRequestError("proposal changes must be objects")
-        target_path = str(change.get("target_path") or "").strip()
-        safe_wiki_path(paths, target_path, must_exist=False)
-        validate_target_path(target_path)
-        normalized_changes.append(
-            {
-                "target_path": target_path,
-                "operation": str(change.get("operation") or "replace_section"),
-                "section_name": optional_str(change.get("section_name")),
-                "proposed_markdown": str(change.get("proposed_markdown") or ""),
-                "rationale": str(change.get("rationale") or rationale),
-                "source_ids": string_list(change.get("source_ids")) or source_ids,
-                "confidence": float(change.get("confidence", 1.0)),
-            }
-        )
-    batch_id = service(paths).propose_wiki_update(
-        title=title,
-        rationale=rationale,
-        source_ids=source_ids,
-        changes=normalized_changes,
-        confidence=float(payload.get("confidence", 1.0)),
-        author="human",
-        source="ui",
-    )
-    return {"batch_id": batch_id, "proposal": ui_wiki_proposal_detail(paths, batch_id)}
-
-
-def ui_review_queue(paths: BrainPaths) -> dict[str, Any]:
-    svc = service(paths)
-    svc.init_workspace()
-    items: list[dict[str, Any]] = []
-    for memory in svc.list_memories(status="proposed"):
-        source_ids = memory.get("source_ids") or []
-        items.append(
-            {
-                "kind": "memory",
-                "id": memory["id"],
-                "title": f"{memory['memory_type']} / {memory['scope']}",
-                "preview": preview_text(memory.get("content")),
-                "status": memory.get("status"),
-                "confidence": memory.get("confidence"),
-                "created_at": memory.get("created_at"),
-                "source_count": len(source_ids),
-            }
-        )
-    review_statuses = {"proposed", "needs_interview"}
-    pending_counts = wiki_proposal_pending_item_counts(paths, review_statuses)
-    for proposal in list_wiki_proposals(paths):
-        if proposal.get("status") not in review_statuses:
-            continue
-        pending_item_count = pending_counts.get(str(proposal.get("id") or ""), 0)
-        if pending_item_count <= 0:
-            continue
-        items.append(
-            {
-                "kind": "wiki_proposal",
-                "id": proposal["id"],
-                "title": proposal.get("title") or proposal["id"],
-                "preview": preview_text(proposal.get("rationale")),
-                "status": proposal.get("status"),
-                "confidence": proposal.get("confidence"),
-                "created_at": proposal.get("created_at"),
-                "source_count": len(proposal.get("source_ids") or []),
-                "pending_item_count": pending_item_count,
-            }
-        )
-    items.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
-    return {"items": items, "count": len(items)}
-
-
-def pending_wiki_proposal_counts(paths: BrainPaths) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    placeholders = ",".join("?" for _ in PENDING_WIKI_PROPOSAL_STATUSES)
-    with connection(paths.sqlite_path) as conn:
-        found = list(
-            conn.execute(
-                f"""
-            SELECT i.target_path, COUNT(DISTINCT b.id) AS count
-            FROM wiki_change_items i
-            JOIN wiki_change_batches b ON b.id = i.batch_id
-            WHERE b.status IN ({placeholders}) AND i.status = ?
-            GROUP BY i.target_path
-            """,
-                (*tuple(sorted(PENDING_WIKI_PROPOSAL_STATUSES)), PENDING_ITEM_STATUS),
-            )
-        )
-    for row in found:
-        counts[str(row["target_path"])] = int(row["count"])
-    return counts
-
-
-def pending_wiki_proposals_for_path(
-    paths: BrainPaths, relative_path: str
-) -> list[dict[str, Any]]:
-    placeholders = ",".join("?" for _ in PENDING_WIKI_PROPOSAL_STATUSES)
-    params = [relative_path, *sorted(PENDING_WIKI_PROPOSAL_STATUSES)]
-    with connection(paths.sqlite_path) as conn:
-        found = conn.execute(
-            f"""
-            SELECT DISTINCT b.id, b.title, b.status, b.confidence, b.created_at
-            FROM wiki_change_batches b
-            JOIN wiki_change_items i ON i.batch_id = b.id
-            WHERE i.target_path = ? AND b.status IN ({placeholders}) AND i.status = ?
-            ORDER BY b.created_at DESC
-            """,
-            [*params, PENDING_ITEM_STATUS],
-        )
-        return [dict(row) for row in found]
 
 
 def source_document_summaries(
@@ -1331,12 +870,6 @@ def json_loads(value: Any, default: Any) -> Any:
         return default
 
 
-def object_list_payload(value: Any) -> list[dict[str, Any]]:
-    if not isinstance(value, list):
-        return []
-    return [dict(item) for item in value if isinstance(item, dict)]
-
-
 def parse_stored_list(value: Any) -> list[str]:
     if value is None:
         return []
@@ -1349,19 +882,6 @@ def parse_stored_list(value: Any) -> list[str]:
     if not isinstance(parsed, list):
         return []
     return [str(item) for item in parsed]
-
-
-def status_filter_values(value: str | None) -> set[str]:
-    if not value:
-        return set()
-    return {part.strip() for part in value.split(",") if part.strip()}
-
-
-def preview_text(value: Any, limit: int = 180) -> str:
-    text = re.sub(r"\s+", " ", str(value or "")).strip()
-    if len(text) <= limit:
-        return text
-    return text[: limit - 1].rstrip() + "..."
 
 
 def ui_shell() -> str:
@@ -1549,9 +1069,7 @@ def ui_shell() -> str:
     <button type="button" data-view="jobs">Jobs</button>
     <button type="button" data-view="logs">Logs</button>
     <button type="button" data-view="wiki">Wiki</button>
-    <button type="button" data-view="packets">Wiki Packets (legacy)</button>
     <button type="button" data-view="curation">Chief of Staff</button>
-    <button type="button" data-view="review">Review (mixed)</button>
     <button type="button" data-view="memory">Memory Review</button>
   </nav>
   <main id="app" aria-live="polite"></main>
@@ -1564,18 +1082,14 @@ def ui_shell() -> str:
       jobs: renderJobs,
       logs: renderLogs,
       wiki: renderWiki,
-      packets: renderPackets,
       curation: renderCuration,
-      review: renderReview,
       memory: renderMemory
     };
     let activeView = "status";
     let memoryStatus = "proposed";
     let selectedMemoryId = "";
-    const wikiState = {q: "", type: "", status: "", selectedPath: "", edit: false};
-    const reviewState = {selectedKind: "", selectedId: "", questions: [], answers: []};
-    const packetState = {groupBy: "topic", selectedPacketId: "", selectedTargetPath: "", briefs: {}, loadingPacketId: "", absorbingPacketId: ""};
-    const curationState = {selectedQuestionId: "", selectedPagePath: "", lastResult: null, groupBy: "topic", absorbingPacketId: ""};
+    const wikiState = {q: "", type: "", status: "", selectedPath: ""};
+    const curationState = {selectedQuestionId: "", selectedPagePath: "", lastResult: null};
 
     const app = document.getElementById("app");
     const message = document.getElementById("message");
@@ -1647,7 +1161,7 @@ def ui_shell() -> str:
             ${metric("Sync", data.sync.configured === false ? "not configured" : "configured")}
           </div>
           <div class="callout">
-            <strong>Current retrieval path:</strong> <code>retrieve_context</code> searches active facts, raw source chunks, wiki pages, and memory records. Legacy wiki packets are backlog/review data only until they are absorbed into facts.
+            <strong>Current retrieval path:</strong> raw sources are ingested into chunks, extracted into active facts, and rendered into managed wiki pages. <code>retrieve_context</code> searches active facts, raw source chunks, wiki pages, and memory records.
           </div>
           ${retrievalSurfacesHtml(data.retrieval_surfaces || [])}
           ${jsonBlock(data)}
@@ -1722,7 +1236,6 @@ def ui_shell() -> str:
       const pages = data.pages || [];
       if (!pages.find(page => page.relative_path === wikiState.selectedPath)) {
         wikiState.selectedPath = pages[0]?.relative_path || "";
-        wikiState.edit = false;
       }
       const detail = wikiState.selectedPath ? await wikiPageDetailHtml(wikiState.selectedPath) : `<section><h2>Page</h2><div class="muted">Select a page.</div></section>`;
       app.innerHTML = `
@@ -1765,15 +1278,11 @@ def ui_shell() -> str:
         wikiState.selectedPath = "";
         loadView("wiki");
       });
-      if (wikiState.edit) {
-        updateWikiEditor();
-      }
     }
 
     function wikiPageRow(page) {
       const selected = page.relative_path === wikiState.selectedPath ? "ok" : "";
-      const pending = page.pending_proposal_count ? ` <span class="badge">${page.pending_proposal_count} pending</span>` : "";
-      return `<tr><td>${escapeHtml(wikiGroup(page))}</td><td><button class="row-button ${selected}" type="button" onclick='openWikiPage(${jsString(page.relative_path)})'>${escapeHtml(page.title)}</button><div class="muted">${escapeHtml(page.relative_path)}${pending}</div></td><td>${escapeHtml(page.page_type)}<br><span class="badge">${escapeHtml(page.status)}</span></td><td>${page.source_count}</td></tr>`;
+      return `<tr><td>${escapeHtml(wikiGroup(page))}</td><td><button class="row-button ${selected}" type="button" onclick='openWikiPage(${jsString(page.relative_path)})'>${escapeHtml(page.title)}</button><div class="muted">${escapeHtml(page.relative_path)}</div></td><td>${escapeHtml(page.page_type)}<br><span class="badge">${escapeHtml(page.status)}</span></td><td>${page.source_count}</td></tr>`;
     }
 
     function wikiGroup(page) {
@@ -1783,395 +1292,31 @@ def ui_shell() -> str:
 
     async function openWikiPage(path) {
       wikiState.selectedPath = path;
-      wikiState.edit = false;
       await loadView("wiki");
     }
 
     async function wikiPageDetailHtml(path) {
       const page = await api(`/api/wiki/page?path=${encodeURIComponent(path)}`);
-      wikiState.currentPage = page;
-      const pending = page.pending_proposals || [];
       return `<section>
         <div class="toolbar">
           <h2>${escapeHtml(page.frontmatter.title || page.relative_path)}</h2>
           <span class="badge">${page.generated ? "generated" : "hand-edited"}</span>
-          <button type="button" onclick="toggleWikiEdit()">${wikiState.edit ? "Cancel edit" : "Edit via proposal"}</button>
         </div>
         <div class="grid">
           ${metric("Type", page.frontmatter.page_type || "")}
           ${metric("Status", page.frontmatter.status || "")}
           ${metric("Updated", page.frontmatter.updated_at || "")}
-          ${metric("Pending Proposals", pending.length)}
+          ${metric("Sources", page.source_ids?.length || 0)}
         </div>
-        ${pending.length ? `<h2>Pending Proposals</h2><table><tbody>${pending.map(proposal => `<tr><td><button class="row-button" type="button" onclick='openReviewItem("wiki_proposal", ${jsString(proposal.id)})'>${escapeHtml(proposal.title)}</button></td><td>${escapeHtml(proposal.status)}</td><td>${proposal.confidence ?? ""}</td></tr>`).join("")}</tbody></table>` : ""}
         <h2>Source Evidence</h2>
         ${sourceDocsList(page.source_documents, page.source_ids)}
-        ${wikiState.edit ? wikiEditorHtml(page) : ""}
         <h2>Markdown</h2>
         <pre>${escapeHtml(page.markdown)}</pre>
       </section>`;
     }
 
-    function wikiEditorHtml(page) {
-      const headings = extractHeadings(page.body);
-      return `<div class="stack">
-        <h2>Propose Edit</h2>
-        <div class="toolbar">
-          <select id="wiki-edit-operation" onchange="updateWikiEditor()">
-            <option value="replace_section">Section</option>
-            <option value="replace_page">Whole page</option>
-          </select>
-          <select id="wiki-edit-section" onchange="updateWikiEditor()">
-            ${headings.map(heading => `<option value="${escapeHtml(heading)}">${escapeHtml(heading)}</option>`).join("")}
-          </select>
-          <input id="wiki-edit-title" placeholder="Proposal title" value="${escapeHtml(`Human edit to ${page.frontmatter.title || page.relative_path}`)}">
-        </div>
-        <input id="wiki-edit-rationale" placeholder="Rationale" value="Human-authored update from browser review.">
-        <textarea id="wiki-edit-markdown"></textarea>
-        <div class="actions"><button class="primary" type="button" onclick="submitWikiEditProposal()">Create Proposal</button></div>
-      </div>`;
-    }
-
-    function toggleWikiEdit() {
-      wikiState.edit = !wikiState.edit;
-      loadView("wiki");
-    }
-
-    function updateWikiEditor() {
-      const page = wikiState.currentPage;
-      const operation = document.getElementById("wiki-edit-operation")?.value || "replace_section";
-      const section = document.getElementById("wiki-edit-section");
-      const textarea = document.getElementById("wiki-edit-markdown");
-      if (!page || !textarea) return;
-      if (operation === "replace_page") {
-        if (section) section.disabled = true;
-        textarea.value = page.markdown;
-      } else {
-        if (section) section.disabled = false;
-        textarea.value = extractSectionBody(page.body, section?.value || "");
-      }
-    }
-
-    async function submitWikiEditProposal() {
-      const page = wikiState.currentPage;
-      const operation = document.getElementById("wiki-edit-operation").value;
-      const section = document.getElementById("wiki-edit-section").value;
-      const proposed = document.getElementById("wiki-edit-markdown").value;
-      const title = document.getElementById("wiki-edit-title").value.trim() || `Human edit to ${page.relative_path}`;
-      const rationale = document.getElementById("wiki-edit-rationale").value.trim() || "Human-authored browser edit.";
-      const change = {
-        target_path: page.relative_path,
-        operation,
-        section_name: operation === "replace_section" ? section : null,
-        proposed_markdown: proposed,
-        rationale,
-        source_ids: page.source_ids,
-        confidence: 1.0
-      };
-      const result = await api("/api/wiki/proposals", {
-        method: "POST",
-        body: JSON.stringify({title, rationale, source_ids: page.source_ids, changes: [change], confidence: 1.0})
-      });
-      reviewState.selectedKind = "wiki_proposal";
-      reviewState.selectedId = result.batch_id;
-      reviewState.questions = [];
-      reviewState.answers = [];
-      setMessage("Wiki proposal created.");
-      await loadView("review");
-    }
-
-    async function renderPackets() {
-      const params = new URLSearchParams({group_by: packetState.groupBy});
-      const data = await api(`/api/wiki/proposal-packets?${params.toString()}`);
-      const packets = data.packets || [];
-      if (!packets.find(packet => packet.id === packetState.selectedPacketId)) {
-        packetState.selectedPacketId = packets[0]?.id || "";
-        packetState.selectedTargetPath = "";
-      }
-      const packet = packets.find(item => item.id === packetState.selectedPacketId);
-      if (packet && !packet.pages.find(page => page.target_path === packetState.selectedTargetPath)) {
-        packetState.selectedTargetPath = packet.pages[0]?.target_path || "";
-      }
-      const detail = packet ? packetDetailHtml(packet) : `<section><h2>Review Packet</h2><div class="muted">No pending wiki proposals.</div></section>`;
-      app.innerHTML = `
-        <section>
-          <div class="toolbar">
-            <h2>Wiki Packets</h2>
-            <span class="badge warn">legacy backlog</span>
-            <select id="packet-group">
-              ${["topic", "day", "priority"].map(value => `<option value="${value}" ${value === packetState.groupBy ? "selected" : ""}>Group by ${value}</option>`).join("")}
-            </select>
-            <button type="button" onclick="loadView('packets')">Refresh</button>
-          </div>
-          <div class="callout warn">These are legacy <code>wiki_change_*</code> proposal packets. They are not searched by <code>retrieve_context</code>; use absorption to move useful claims into the fact ledger.</div>
-          <div class="grid">
-            ${metric("Packets", data.totals?.packet_count ?? 0)}
-            ${metric("Pages", data.totals?.target_count ?? 0)}
-            ${metric("Proposals", data.totals?.batch_count ?? 0)}
-            ${metric("Changes", data.totals?.item_count ?? 0)}
-            ${metric("Conflict Pages", data.totals?.conflict_target_count ?? 0, data.totals?.conflict_target_count ? "danger" : "")}
-            ${metric("Stacked Pages", data.totals?.stacked_target_count ?? 0)}
-          </div>
-          <div class="split">
-            <div><table><thead><tr><th>Packet</th><th>Scope</th><th>Mix</th><th>Latest</th></tr></thead>
-            <tbody>${packets.map(packetRow).join("") || emptyRow(4)}</tbody></table></div>
-            <div>${detail}</div>
-          </div>
-        </section>`;
-      document.getElementById("packet-group").addEventListener("change", event => {
-        packetState.groupBy = event.target.value;
-        packetState.selectedPacketId = "";
-        packetState.selectedTargetPath = "";
-        loadView("packets");
-      });
-    }
-
-    function packetRow(packet) {
-      const selected = packet.id === packetState.selectedPacketId ? "ok" : "";
-      return `<tr>
-        <td><button class="row-button ${selected}" type="button" onclick='openPacket(${jsString(packet.id)})'>${escapeHtml(packet.label)}</button><div class="muted">${escapeHtml(packet.review_hint || "")}</div></td>
-        <td>${packet.target_count} pages<br>${packet.batch_count} proposals<br>${packet.item_count} changes</td>
-        <td>${countBadges(packet.operation_counts)}<br>${countBadges(packet.status_counts)}</td>
-        <td>${escapeHtml(packet.last_created_at || "")}</td>
-      </tr>`;
-    }
-
-    async function openPacket(id) {
-      packetState.selectedPacketId = id;
-      packetState.selectedTargetPath = "";
-      await loadView("packets");
-    }
-
-    async function openPacketTarget(path) {
-      packetState.selectedTargetPath = path;
-      await loadView("packets");
-    }
-
-    async function openPacketWikiPage(path) {
-      wikiState.selectedPath = path;
-      wikiState.edit = false;
-      await loadView("wiki");
-    }
-
-    function packetDetailHtml(packet) {
-      const selected = (packet.pages || []).find(page => page.target_path === packetState.selectedTargetPath);
-      const brief = packetState.briefs[packet.id];
-      const loading = packetState.loadingPacketId === packet.id;
-      const absorbing = packetState.absorbingPacketId === packet.id;
-      return `<section>
-        <div class="toolbar">
-          <h2>${escapeHtml(packet.label)}</h2>
-          <span class="badge">${packet.simple_page_count} clean</span>
-          <span class="badge">${packet.stacked_page_count} stacked</span>
-          <span class="badge ${packet.conflict_page_count ? "danger" : ""}">${packet.conflict_page_count} conflict</span>
-          <button class="primary" type="button" onclick='generatePacketBrief(${jsString(packet.id)})' ${loading ? "disabled" : ""}>${loading ? "Generating..." : "Generate LLM Brief"}</button>
-          <button type="button" onclick='absorbPacketIntoFacts(${jsString(packet.id)})' ${absorbing ? "disabled" : ""}>${absorbing ? "Absorbing..." : "Absorb Into Fact Ledger"}</button>
-        </div>
-        <p class="muted">${escapeHtml(packet.review_hint || "")}</p>
-        ${brief ? packetBriefHtml(packet.id, brief) : ""}
-        <table><thead><tr><th>Page</th><th>Shape</th><th>Volume</th><th>Latest</th></tr></thead>
-        <tbody>${(packet.pages || []).map(packetPageRow).join("") || emptyRow(4)}</tbody></table>
-      </section>
-      ${selected ? packetTargetDetailHtml(selected) : ""}`;
-    }
-
-    async function generatePacketBrief(packetId, withAnswers = false) {
-      const answers = withAnswers ? readPacketBriefAnswers(packetId) : [];
-      packetState.loadingPacketId = packetId;
-      await loadView("packets");
-      setMessage("Generating packet review brief...");
-      let finalMessage = "";
-      try {
-        const brief = await api("/api/wiki/proposal-packets/brief", {
-          method: "POST",
-          body: JSON.stringify({packet_id: packetId, group_by: packetState.groupBy, provider: null, answers})
-        });
-        packetState.briefs[packetId] = brief;
-        finalMessage = brief.error ? "Generated fallback brief; provider failed." : "Packet brief generated.";
-      } catch (error) {
-        finalMessage = error.message;
-      } finally {
-        packetState.loadingPacketId = "";
-        await loadView("packets");
-        setMessage(finalMessage);
-      }
-    }
-
-    function readPacketBriefAnswers(packetId) {
-      const brief = packetState.briefs[packetId];
-      if (!brief) return [];
-      return Array.from(document.querySelectorAll(".packet-question-answer")).map((textarea, index) => ({
-        target_path: brief.questions?.[index]?.target_path || "",
-        question: brief.questions?.[index]?.question || "",
-        answer: textarea.value.trim()
-      })).filter(item => item.question || item.answer);
-    }
-
-    function packetBriefHtml(packetId, brief) {
-      return `<section>
-        <div class="toolbar">
-          <h2>LLM Review Brief</h2>
-          <span class="badge">${escapeHtml(brief.provider || "fallback")}</span>
-          <span class="badge">${escapeHtml(brief.model || "")}</span>
-          ${brief.context?.truncated ? `<span class="badge warn">${brief.context.included_page_count}/${brief.context.page_count} pages included</span>` : ""}
-          <button type="button" onclick='generatePacketBrief(${jsString(packetId)}, true)'>Regenerate With Answers</button>
-        </div>
-        ${brief.error ? `<div class="warn">${escapeHtml(brief.error)}</div>` : ""}
-        ${brief.summary?.length ? `<h2>Summary</h2><ul>${brief.summary.map(item => `<li>${escapeHtml(item)}</li>`).join("")}</ul>` : ""}
-        ${brief.aggregation_strategy ? `<h2>Aggregation Strategy</h2><p>${escapeHtml(brief.aggregation_strategy)}</p>` : ""}
-        ${brief.priority_targets?.length ? `<h2>Priority Targets</h2>${priorityTargetsTable(brief.priority_targets)}` : ""}
-        ${brief.conflicts?.length ? `<h2>Conflicts</h2>${briefConflictsTable(brief.conflicts)}` : ""}
-        ${brief.questions?.length ? `<h2>Questions</h2>${packetQuestionsHtml(brief.questions)}` : ""}
-        ${brief.consolidated_drafts?.length ? `<h2>Consolidated Drafts</h2>${packetDraftsHtml(packetId, brief.consolidated_drafts)}` : ""}
-        ${brief.defer_or_reject?.length ? `<h2>Defer / Reject</h2>${jsonBlock(brief.defer_or_reject)}` : ""}
-      </section>`;
-    }
-
-    function priorityTargetsTable(targets) {
-      return `<table><thead><tr><th>Target</th><th>Priority</th><th>Action</th><th>Reason</th></tr></thead>
-        <tbody>${targets.map(item => `<tr><td>${escapeHtml(item.target_path || "")}</td><td>${escapeHtml(item.priority || "")}</td><td>${escapeHtml(item.recommended_action || "")}</td><td>${escapeHtml(item.reason || "")}</td></tr>`).join("") || emptyRow(4)}</tbody></table>`;
-    }
-
-    function briefConflictsTable(conflicts) {
-      return `<table><thead><tr><th>Target</th><th>Issue</th><th>Resolution</th></tr></thead>
-        <tbody>${conflicts.map(item => `<tr><td>${escapeHtml(item.target_path || "")}</td><td>${escapeHtml(item.issue || "")}</td><td>${escapeHtml(item.recommended_resolution || item.reason || "")}</td></tr>`).join("") || emptyRow(3)}</tbody></table>`;
-    }
-
-    function packetQuestionsHtml(questions) {
-      return `<div class="stack">${questions.map((item, index) => `
-        <div>
-          <div><strong>${escapeHtml(item.target_path || "Packet")}</strong> ${item.blocking ? `<span class="badge warn">blocking</span>` : ""}</div>
-          <p>${escapeHtml(item.question || "")}</p>
-          ${item.why ? `<div class="muted">${escapeHtml(item.why)}</div>` : ""}
-          <textarea class="packet-question-answer" placeholder="Answer ${index + 1}"></textarea>
-        </div>`).join("")}</div>`;
-    }
-
-    function packetDraftsHtml(packetId, drafts) {
-      return `<div class="stack">${drafts.map((draft, index) => `
-        <section>
-          <div class="toolbar">
-            <h2>${escapeHtml(draft.target_path || `Draft ${index + 1}`)}</h2>
-            <span class="badge">${escapeHtml(draft.operation || "")}</span>
-            ${draft.section_name ? `<span class="badge">${escapeHtml(draft.section_name)}</span>` : ""}
-            <span class="badge">${escapeHtml(draft.confidence ?? "")}</span>
-            <button type="button" onclick='createPacketDraftProposal(${jsString(packetId)}, ${index})'>Create Proposal From Draft</button>
-          </div>
-          ${draft.rationale ? `<p>${escapeHtml(draft.rationale)}</p>` : ""}
-          ${draft.review_notes ? `<div class="muted">${escapeHtml(draft.review_notes)}</div>` : ""}
-          ${draft.source_ids?.length ? `<div class="muted">Sources: ${escapeHtml(draft.source_ids.join(", "))}</div>` : ""}
-          ${draft.source_batch_ids?.length ? `<div class="muted">Proposal batches: ${escapeHtml(draft.source_batch_ids.join(", "))}</div>` : ""}
-          <textarea readonly>${escapeHtml(draft.proposed_markdown || "")}</textarea>
-        </section>`).join("")}</div>`;
-    }
-
-    async function createPacketDraftProposal(packetId, draftIndex) {
-      const draft = packetState.briefs[packetId]?.consolidated_drafts?.[draftIndex];
-      if (!draft) return;
-      const title = `Consolidated review draft for ${draft.target_path}`;
-      const rationale = draft.rationale || "LLM-assisted consolidated draft from packet review.";
-      const change = {
-        target_path: draft.target_path,
-        operation: draft.operation,
-        section_name: draft.section_name || null,
-        proposed_markdown: draft.proposed_markdown || "",
-        rationale,
-        source_ids: draft.source_ids || [],
-        confidence: draft.confidence || 0.7
-      };
-      const result = await api("/api/wiki/proposals", {
-        method: "POST",
-        body: JSON.stringify({title, rationale, source_ids: draft.source_ids || [], changes: [change], confidence: draft.confidence || 0.7})
-      });
-      reviewState.selectedKind = "wiki_proposal";
-      reviewState.selectedId = result.batch_id;
-      setMessage("Draft proposal created.");
-      await loadView("review");
-    }
-
-    async function absorbPacketIntoFacts(packetId) {
-      packetState.absorbingPacketId = packetId;
-      await loadView("packets");
-      setMessage("Absorbing packet into fact ledger...");
-      let finalMessage = "";
-      try {
-        const result = await api("/api/wiki/proposal-packets/facts", {
-          method: "POST",
-          body: JSON.stringify({packet_id: packetId, group_by: packetState.groupBy, overwrite_existing: false})
-        });
-        curationState.lastResult = result;
-        curationState.selectedQuestionId = "";
-        finalMessage = `Absorbed ${result.candidate_count || 0} candidates into facts.`;
-        packetState.absorbingPacketId = "";
-        await loadView("curation");
-      } catch (error) {
-        packetState.absorbingPacketId = "";
-        await loadView("packets");
-        finalMessage = error.message;
-      }
-      setMessage(finalMessage);
-    }
-
-    function packetPageRow(page) {
-      const selected = page.target_path === packetState.selectedTargetPath ? "ok" : "";
-      return `<tr>
-        <td><button class="row-button ${selected}" type="button" onclick='openPacketTarget(${jsString(page.target_path)})'>${escapeHtml(page.target_path)}</button><div class="muted">${escapeHtml(page.resolution_hint || "")}</div></td>
-        <td><span class="badge ${page.complexity === "conflict" ? "danger" : ""}">${escapeHtml(page.complexity)}</span><br>${countBadges(page.operation_counts)}</td>
-        <td>${page.batch_count} proposals<br>${page.item_count} changes<br>${page.source_count} sources</td>
-        <td>${escapeHtml(page.last_created_at || "")}</td>
-      </tr>`;
-    }
-
-    function packetTargetDetailHtml(page) {
-      return `<section>
-        <div class="toolbar">
-          <h2>${escapeHtml(page.target_path)}</h2>
-          <span class="badge">${escapeHtml(page.topic || "")}</span>
-          <span class="badge">${page.target_exists ? "existing page" : "new/missing page"}</span>
-          ${page.target_exists ? `<button type="button" onclick='openPacketWikiPage(${jsString(page.target_path)})'>Open Page</button>` : ""}
-          ${page.latest_batch_id ? `<button type="button" onclick='openReviewItem("wiki_proposal", ${jsString(page.latest_batch_id)})'>Open Latest Proposal</button>` : ""}
-        </div>
-        <div class="grid">
-          ${metric("Complexity", page.complexity)}
-          ${metric("Proposals", page.batch_count)}
-          ${metric("Changes", page.item_count)}
-          ${metric("Sources", page.source_count)}
-        </div>
-        ${page.conflicts?.length ? `<div class="warn">${escapeHtml(page.conflicts.join("; "))}</div>` : ""}
-        <p>${escapeHtml(page.resolution_hint || "")}</p>
-        <h2>Operation Groups</h2>
-        <table><thead><tr><th>Operation</th><th>Items</th><th>Latest</th><th>Resolution</th></tr></thead>
-        <tbody>${(page.operation_groups || []).map(operationGroupRow).join("") || emptyRow(4)}</tbody></table>
-        <h2>Proposal History</h2>
-        <table><thead><tr><th>Proposal</th><th>Status</th><th>Shape</th><th>Action</th></tr></thead>
-        <tbody>${(page.proposals || []).map(packetProposalRow).join("") || emptyRow(4)}</tbody></table>
-      </section>`;
-    }
-
-    function operationGroupRow(group) {
-      const section = group.section_name ? `<div class="muted">${escapeHtml(group.section_name)}</div>` : "";
-      return `<tr>
-        <td>${escapeHtml(group.operation)}${section}</td>
-        <td>${group.item_count} items<br>${group.old_revision_count || 0} older revisions<br>${group.duplicate_append_count || 0} duplicate appends</td>
-        <td>${escapeHtml(group.latest_created_at || "")}<div class="muted">${escapeHtml(group.latest_title || "")}</div></td>
-        <td>${escapeHtml(group.resolution || "")}</td>
-      </tr>`;
-    }
-
-    function packetProposalRow(proposal) {
-      return `<tr>
-        <td><button class="row-button" type="button" onclick='openReviewItem("wiki_proposal", ${jsString(proposal.id)})'>${escapeHtml(proposal.title)}</button><div class="muted">${escapeHtml(proposal.preview || "")}</div></td>
-        <td>${escapeHtml(proposal.status || "")}<br><span class="badge">${proposal.confidence ?? ""}</span><br>${escapeHtml(proposal.created_at || "")}</td>
-        <td>${proposal.item_count} changes<br>${countBadges(proposal.operation_counts)}</td>
-        <td><button type="button" onclick='openReviewItem("wiki_proposal", ${jsString(proposal.id)})'>Open</button></td>
-      </tr>`;
-    }
-
     async function renderCuration() {
-      const [data, backlog] = await Promise.all([
-        api("/api/wiki/facts"),
-        api(`/api/wiki/proposal-packets?${new URLSearchParams({group_by: curationState.groupBy}).toString()}`)
-      ]);
+      const data = await api("/api/wiki/facts");
       const questions = data.open_questions || [];
       const pages = data.managed_pages || [];
       if (!questions.find(question => question.id === curationState.selectedQuestionId)) {
@@ -2184,7 +1329,6 @@ def ui_shell() -> str:
       const selectedPage = curationState.selectedPagePath
         ? await api(`/api/wiki/facts/page?path=${encodeURIComponent(curationState.selectedPagePath)}`)
         : null;
-      const packets = backlog.packets || [];
       app.innerHTML = `
         <section>
           <div class="toolbar">
@@ -2204,7 +1348,6 @@ def ui_shell() -> str:
             ${metric("Managed Pages", pages.length)}
             ${metric("Conflicted", data.counts?.by_status?.conflicted ?? 0, data.counts?.by_status?.conflicted ? "danger" : "")}
             ${metric("Open Questions", data.counts?.questions_by_status?.open ?? 0, data.counts?.questions_by_status?.open ? "warn" : "ok")}
-            ${metric("Backlog Changes", backlog.totals?.item_count ?? 0, backlog.totals?.item_count ? "warn" : "ok")}
           </div>
           ${curationState.lastResult ? lastCurationResultHtml(curationState.lastResult) : ""}
           <div class="split">
@@ -2223,18 +1366,11 @@ def ui_shell() -> str:
             </div>
             <div>${selectedPage ? curationPageDetailHtml(selectedPage) : `<section><h2>Managed Page</h2><div class="muted">No managed pages yet.</div></section>`}</div>
           </div>
-          <h2>Proposal Backlog Drain</h2>
-          ${curationBacklogHtml(backlog, packets)}
           <h2>Recent Facts</h2>
           ${recentFactsTable(data.recent_facts || [])}
           <h2>Recent Curation Runs</h2>
           ${curationRunsTable(data.recent_runs || [])}
         </section>`;
-      document.getElementById("curation-packet-group")?.addEventListener("change", event => {
-        curationState.groupBy = event.target.value;
-        curationState.absorbingPacketId = "";
-        loadView("curation");
-      });
     }
 
     function lastCurationResultHtml(result) {
@@ -2242,7 +1378,6 @@ def ui_shell() -> str:
       return `<section>
         <div class="toolbar">
           <h2>Last Curation Output</h2>
-          <span class="badge">${escapeHtml(result.packet?.label || "")}</span>
           ${result.migration ? `<span class="badge">${escapeHtml(result.migration)}</span>` : ""}
           ${result.dry_run ? `<span class="badge">dry run</span>` : ""}
           <span class="badge">${result.new_candidate_count ?? result.candidate_count ?? 0} candidates</span>
@@ -2367,7 +1502,7 @@ def ui_shell() -> str:
           <h2>${escapeHtml(page.frontmatter?.title || page.relative_path)}</h2>
           <span class="badge ${page.managed ? "ok" : "warn"}">${page.managed ? "managed" : "not managed"}</span>
           <span class="badge">${page.would_change ? "changes pending" : "current"}</span>
-          <button type="button" onclick='openPacketWikiPage(${jsString(page.relative_path)})'>Open In Wiki</button>
+          <button type="button" onclick='openWikiPage(${jsString(page.relative_path)})'>Open In Wiki</button>
         </div>
         <div class="grid">
           ${metric("Active Facts", page.active_facts?.length || 0)}
@@ -2479,42 +1614,6 @@ def ui_shell() -> str:
       setMessage("Confirmed fact added and managed page refreshed.");
     }
 
-    function curationBacklogHtml(backlog, packets) {
-      return `<section>
-        <div class="toolbar">
-          <select id="curation-packet-group">
-            ${["topic", "day", "priority"].map(value => `<option value="${value}" ${value === curationState.groupBy ? "selected" : ""}>Group by ${value}</option>`).join("")}
-          </select>
-          <button type="button" onclick="loadView('curation')">Refresh Backlog</button>
-        </div>
-        <table><thead><tr><th>Packet</th><th>Scope</th><th>Mix</th><th>Action</th></tr></thead>
-        <tbody>${packets.map(curationBacklogRow).join("") || emptyRow(4)}</tbody></table>
-      </section>`;
-    }
-
-    function curationBacklogRow(packet) {
-      const absorbing = curationState.absorbingPacketId === packet.id;
-      return `<tr>
-        <td>${escapeHtml(packet.label || packet.id)}<div class="muted">${escapeHtml(packet.review_hint || "")}</div></td>
-        <td>${packet.target_count || 0} pages<br>${packet.batch_count || 0} proposals<br>${packet.item_count || 0} changes</td>
-        <td>${countBadges(packet.operation_counts || {})}<br>${countBadges(packet.status_counts || {})}</td>
-        <td><button type="button" onclick='absorbCurationPacket(${jsString(packet.id)})' ${absorbing ? "disabled" : ""}>${absorbing ? "Absorbing..." : "Absorb"}</button></td>
-      </tr>`;
-    }
-
-    async function absorbCurationPacket(packetId) {
-      curationState.absorbingPacketId = packetId;
-      await loadView("curation");
-      const result = await api("/api/wiki/proposal-packets/facts", {
-        method: "POST",
-        body: JSON.stringify({packet_id: packetId, group_by: curationState.groupBy, overwrite_existing: false})
-      });
-      curationState.absorbingPacketId = "";
-      curationState.lastResult = result;
-      await loadView("curation");
-      setMessage(`Absorbed ${result.candidate_count || 0} candidates into facts.`);
-    }
-
     function recentFactsTable(facts) {
       return `<table><thead><tr><th>Status</th><th>Page</th><th>Fact</th><th>Evidence</th></tr></thead>
         <tbody>${facts.map(fact => `<tr>
@@ -2526,152 +1625,13 @@ def ui_shell() -> str:
     }
 
     function curationRunsTable(runs) {
-      return `<table><thead><tr><th>Run</th><th>Packet</th><th>Outcome</th><th>Created</th></tr></thead>
+      return `<table><thead><tr><th>Run</th><th>Source</th><th>Outcome</th><th>Created</th></tr></thead>
         <tbody>${runs.map(run => `<tr>
           <td>${escapeHtml(run.id)}</td>
           <td>${escapeHtml(run.source_packet_id || "")}<div class="muted">${escapeHtml(run.group_by || "")}</div></td>
           <td>${escapeHtml(run.status || "")}<br>${countBadges(run.summary || {})}</td>
           <td>${escapeHtml(run.created_at || "")}</td>
         </tr>`).join("") || emptyRow(4)}</tbody></table>`;
-    }
-
-    async function renderReview() {
-      const data = await api("/api/review-queue");
-      const items = data.items || [];
-      if (!reviewState.selectedId && items[0]) {
-        reviewState.selectedKind = items[0].kind;
-        reviewState.selectedId = items[0].id;
-      }
-      const selected = items.find(item => item.kind === reviewState.selectedKind && item.id === reviewState.selectedId);
-      const detail = selected ? await reviewDetailHtml(selected.kind, selected.id) : `<section><h2>Review Detail</h2><div class="muted">Select an item.</div></section>`;
-      app.innerHTML = `
-        <section>
-          <div class="toolbar"><h2>Review</h2><span class="badge warn">mixed legacy queue</span><button type="button" onclick="loadView('review')">Refresh</button></div>
-          <div class="callout warn">This queue can include proposed memories and legacy wiki proposals. It is not the same as the CoS fact/action/policy path, and legacy wiki proposals are not searched until absorbed into facts or rendered into wiki pages.</div>
-          <div class="split">
-            <div><table><thead><tr><th>Kind</th><th>Item</th><th>Status</th><th>Actions</th></tr></thead>
-            <tbody>${items.map(reviewRow).join("") || emptyRow(4)}</tbody></table></div>
-            <div>${detail}</div>
-          </div>
-        </section>`;
-    }
-
-    function reviewRow(item) {
-      const actions = item.kind === "memory"
-        ? `<div class="actions"><button type="button" onclick='openReviewItem("memory", ${jsString(item.id)})'>Open</button><button type="button" onclick='reviewMemoryAction(${jsString(item.id)}, "approve")'>Approve</button><button type="button" onclick='reviewRejectMemory(${jsString(item.id)})'>Reject</button><button type="button" onclick='reviewMemoryAction(${jsString(item.id)}, "archive")'>Archive</button></div>`
-        : `<div class="actions"><button type="button" onclick='openReviewItem("wiki_proposal", ${jsString(item.id)})'>Open</button><button type="button" onclick='rejectWikiProposal(${jsString(item.id)})'>Reject</button></div>`;
-      return `<tr><td>${escapeHtml(item.kind)}</td><td><button class="row-button" type="button" onclick='openReviewItem(${jsString(item.kind)}, ${jsString(item.id)})'>${escapeHtml(item.title)}</button><div class="muted">${escapeHtml(item.preview)}</div></td><td>${escapeHtml(item.status)}<br><span class="badge">${item.confidence ?? ""}</span><br><span class="muted">${item.source_count} sources</span></td><td>${actions}</td></tr>`;
-    }
-
-    async function openReviewItem(kind, id) {
-      reviewState.selectedKind = kind;
-      reviewState.selectedId = id;
-      reviewState.questions = [];
-      reviewState.answers = [];
-      await loadView("review");
-    }
-
-    async function reviewDetailHtml(kind, id) {
-      if (kind === "memory") return memoryDetailHtml(id);
-      return wikiProposalDetailHtml(id);
-    }
-
-    async function wikiProposalDetailHtml(id) {
-      const proposal = await api(`/api/wiki/proposals/${encodeURIComponent(id)}`);
-      const questions = reviewState.questions.length ? reviewState.questions : ["", "", ""];
-      const answers = reviewState.answers.length ? reviewState.answers : questions.map(() => "");
-      return `<section>
-        <div class="toolbar">
-          <h2>${escapeHtml(proposal.title)}</h2>
-          <span class="badge">${escapeHtml(proposal.status)}</span>
-          <button type="button" onclick='generateWikiQuestions(${jsString(id)})'>Generate questions</button>
-          <button type="button" onclick='rejectWikiProposal(${jsString(id)})'>Reject</button>
-        </div>
-        <div class="grid">
-          ${metric("Author", proposal.author || "")}
-          ${metric("Source", proposal.source || "")}
-          ${metric("Confidence", proposal.confidence ?? "")}
-          ${metric("Created", proposal.created_at || "")}
-        </div>
-        <p>${escapeHtml(proposal.rationale)}</p>
-        <h2>Source Evidence</h2>
-        ${sourceDocsList(proposal.source_documents, proposal.source_ids)}
-        <h2>Changes</h2>
-        ${(proposal.items || []).map(wikiProposalItemHtml).join("")}
-        <h2>Interview</h2>
-        ${interviewFormHtml(questions, answers)}
-        <div class="actions">
-          <button type="button" onclick='recordWikiInterview(${jsString(id)}, "needs_interview")'>Save Interview</button>
-          <button class="primary" type="button" onclick='approveAndApplyWikiProposal(${jsString(id)})'>Approve &amp; Apply</button>
-        </div>
-        ${(proposal.interviews || []).length ? `<h2>Existing Interviews</h2>${jsonBlock(proposal.interviews)}` : ""}
-      </section>`;
-    }
-
-    function wikiProposalItemHtml(item, index) {
-      const before = item.current_page_markdown || item.current_markdown || "";
-      const after = item.would_be_markdown || "";
-      return `<section>
-        <div class="toolbar"><h2>Change ${index + 1}</h2><span class="badge">${escapeHtml(item.operation)}</span><span class="badge">${escapeHtml(item.target_path)}</span></div>
-        ${item.section_name ? `<div class="muted">Section: ${escapeHtml(item.section_name)}</div>` : ""}
-        ${item.preview_error ? `<div class="warn">${escapeHtml(item.preview_error)}</div>` : ""}
-        <p>${escapeHtml(item.rationale || "")}</p>
-        ${sourceDocsList(item.source_documents, item.source_ids)}
-        ${lineDiff(before, after)}
-      </section>`;
-    }
-
-    function interviewFormHtml(questions, answers) {
-      return `<div class="stack">${questions.map((question, index) => `
-        <div>
-          <input class="question-input" value="${escapeHtml(question)}" placeholder="Question ${index + 1}">
-          <textarea class="answer-input" placeholder="Answer ${index + 1}">${escapeHtml(answers[index] || "")}</textarea>
-        </div>`).join("")}</div>`;
-    }
-
-    function readInterviewForm() {
-      const questions = Array.from(document.querySelectorAll(".question-input")).map(input => input.value.trim()).filter(Boolean);
-      const answers = Array.from(document.querySelectorAll(".answer-input")).map(input => input.value.trim());
-      return {questions, answers};
-    }
-
-    async function generateWikiQuestions(id) {
-      const data = await api(`/api/wiki/proposals/${encodeURIComponent(id)}/interview/generate`, {method: "POST", body: JSON.stringify({provider: null})});
-      reviewState.questions = data.questions || [];
-      reviewState.answers = reviewState.questions.map(() => "");
-      await loadView("review");
-    }
-
-    async function recordWikiInterview(id, disposition) {
-      const form = readInterviewForm();
-      await api(`/api/wiki/proposals/${encodeURIComponent(id)}/interview`, {method: "POST", body: JSON.stringify({...form, disposition})});
-      await loadView("review");
-      setMessage("Interview saved.");
-    }
-
-    async function approveAndApplyWikiProposal(id) {
-      const form = readInterviewForm();
-      const result = await api(`/api/wiki/proposals/${encodeURIComponent(id)}/approve-and-apply`, {method: "POST", body: JSON.stringify(form)});
-      if (result.lint?.errors?.length) {
-        setMessage("Apply failed lint.");
-        return;
-      }
-      reviewState.selectedId = "";
-      reviewState.questions = [];
-      reviewState.answers = [];
-      await loadView("review");
-      setMessage("Proposal approved and applied.");
-    }
-
-    async function rejectWikiProposal(id) {
-      const reason = prompt("Reject reason");
-      if (!reason) return;
-      await api(`/api/wiki/proposals/${encodeURIComponent(id)}/reject`, {method: "POST", body: JSON.stringify({reason})});
-      reviewState.selectedId = "";
-      reviewState.questions = [];
-      reviewState.answers = [];
-      await loadView(activeView);
-      setMessage("Wiki proposal rejected.");
     }
 
     async function renderMemory() {
@@ -2740,19 +1700,11 @@ def ui_shell() -> str:
       await loadView(activeView);
     }
 
-    async function reviewMemoryAction(id, action) {
-      await memoryAction(id, action);
-    }
-
     async function rejectMemory(id) {
       const reason = prompt("Reject reason");
       if (reason) {
         await memoryAction(id, "reject", {reason});
       }
-    }
-
-    async function reviewRejectMemory(id) {
-      await rejectMemory(id);
     }
 
     function countBadges(counts) {
@@ -2767,58 +1719,6 @@ def ui_shell() -> str:
       const missing = unresolved.map(sourceId => `<li><strong>${escapeHtml(sourceId)}</strong> <span class="muted">unresolved</span></li>`).join("");
       if (!docs && !missing) return `<div class="muted">No source evidence.</div>`;
       return `<ul class="source-list">${docs}${missing}</ul>`;
-    }
-
-    function extractHeadings(markdown) {
-      const headings = [];
-      for (const match of String(markdown || "").matchAll(/^##\\s+(.+?)\\s*$/gm)) {
-        headings.push(match[1]);
-      }
-      return headings.length ? headings : ["Summary"];
-    }
-
-    function extractSectionBody(markdown, heading) {
-      if (!heading) return "";
-      const escaped = heading.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&");
-      const match = String(markdown || "").match(new RegExp(`^##\\\\s+${escaped}\\\\s*\\\\n([\\\\s\\\\S]*?)(?=^##\\\\s+|$)`, "m"));
-      return match ? match[1].trim() : "";
-    }
-
-    function lineDiff(before, after) {
-      const left = String(before || "").split("\\n");
-      const right = String(after || "").split("\\n");
-      if (left.length * right.length > 40000) {
-        return `<pre class="diff"><div class="del">- ${escapeHtml(left.join("\\n- "))}</div><div class="add">+ ${escapeHtml(right.join("\\n+ "))}</div></pre>`;
-      }
-      const dp = Array.from({length: left.length + 1}, () => Array(right.length + 1).fill(0));
-      for (let i = left.length - 1; i >= 0; i--) {
-        for (let j = right.length - 1; j >= 0; j--) {
-          dp[i][j] = left[i] === right[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
-        }
-      }
-      const lines = [];
-      let i = 0;
-      let j = 0;
-      while (i < left.length && j < right.length) {
-        if (left[i] === right[j]) {
-          lines.push(`<div class="ctx">  ${escapeHtml(left[i])}</div>`);
-          i++;
-          j++;
-        } else if (dp[i + 1][j] >= dp[i][j + 1]) {
-          lines.push(`<div class="del">- ${escapeHtml(left[i])}</div>`);
-          i++;
-        } else {
-          lines.push(`<div class="add">+ ${escapeHtml(right[j])}</div>`);
-          j++;
-        }
-      }
-      while (i < left.length) {
-        lines.push(`<div class="del">- ${escapeHtml(left[i++])}</div>`);
-      }
-      while (j < right.length) {
-        lines.push(`<div class="add">+ ${escapeHtml(right[j++])}</div>`);
-      }
-      return `<pre class="diff">${lines.join("")}</pre>`;
     }
 
     function jsString(value) {
@@ -2862,9 +1762,7 @@ def ui_shell() -> str:
     function title(name) {
       if (name === "memory") return "Memory Review";
       if (name === "wiki") return "Wiki";
-      if (name === "packets") return "Wiki Packets";
       if (name === "curation") return "Chief of Staff";
-      if (name === "review") return "Review";
       return name.charAt(0).toUpperCase() + name.slice(1);
     }
 
