@@ -14,6 +14,10 @@ import yaml
 
 from .audit import audit_memories
 from .automation import index_status
+from .contracts import active_page_contracts, generate_initial_contracts
+from .cos_actions import recent_actions
+from .cos_audit import run_sampled_audit
+from .cos_policy import active_policy_rules, active_policy_version
 from .db import connection
 from .paths import BrainPaths
 from .scheduler.launchd import LaunchdScheduler
@@ -30,7 +34,11 @@ from .wiki import (
 from .wiki_facts import (
     answer_open_question,
     absorb_wiki_packet_into_facts,
+    create_confirmed_page_fact,
+    managed_fact_page_review,
     reconcile_open_fact_questions,
+    regenerate_managed_fact_page,
+    revert_wiki_page_snapshot,
     wiki_fact_dashboard,
 )
 from .wiki_proposals import (
@@ -129,10 +137,20 @@ class BrainUIHandler(BaseHTTPRequestHandler):
                 self.write_json(ui_wiki_page(self.server.paths, query))
             elif path == "/api/wiki/proposal-packets":
                 self.write_json(ui_wiki_proposal_packets(self.server.paths, query))
+            elif path == "/api/wiki/facts/page":
+                self.write_json(ui_wiki_fact_page_review(self.server.paths, query))
             elif path == "/api/wiki/facts":
                 self.write_json(ui_wiki_fact_dashboard(self.server.paths))
             elif path == "/api/wiki/proposals":
                 self.write_json(ui_wiki_proposals(self.server.paths, query))
+            elif path == "/api/cos/policy":
+                self.write_json(ui_cos_policy(self.server.paths))
+            elif path == "/api/cos/actions":
+                self.write_json(ui_cos_actions(self.server.paths, query))
+            elif path == "/api/cos/contracts":
+                self.write_json(ui_cos_contracts(self.server.paths))
+            elif path == "/api/cos/audit":
+                self.write_json(ui_cos_audit_status(self.server.paths))
             elif path.startswith("/api/wiki/proposals/"):
                 batch_id = path.removeprefix("/api/wiki/proposals/").strip("/")
                 self.write_json(ui_wiki_proposal_detail(self.server.paths, batch_id))
@@ -162,6 +180,12 @@ class BrainUIHandler(BaseHTTPRequestHandler):
                 self.dispatch_wiki_question_post(parts)
             elif parts[:2] == ["wiki", "facts"]:
                 self.dispatch_wiki_fact_post(parts)
+            elif parts[:2] == ["cos", "contracts"]:
+                payload = self.read_json_body()
+                self.write_json(ui_generate_cos_contracts(self.server.paths, payload))
+            elif parts[:2] == ["cos", "audit"]:
+                payload = self.read_json_body()
+                self.write_json(ui_run_cos_audit(self.server.paths, payload))
             elif len(parts) == 3 and parts[0] == "memory":
                 _, memory_id, action = parts
                 svc = service(self.server.paths)
@@ -269,6 +293,18 @@ class BrainUIHandler(BaseHTTPRequestHandler):
         if parts == ["wiki", "facts", "migrate-wiki"]:
             payload = self.read_json_body()
             self.write_json(ui_migrate_wiki_facts(self.server.paths, payload))
+            return
+        if parts == ["wiki", "facts", "pages", "regenerate"]:
+            payload = self.read_json_body()
+            self.write_json(ui_regenerate_wiki_fact_page(self.server.paths, payload))
+            return
+        if parts == ["wiki", "facts", "pages", "revert"]:
+            payload = self.read_json_body()
+            self.write_json(ui_revert_wiki_fact_page(self.server.paths, payload))
+            return
+        if parts == ["wiki", "facts", "corrections"]:
+            payload = self.read_json_body()
+            self.write_json(ui_create_wiki_fact_correction(self.server.paths, payload))
             return
         self.write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
@@ -625,6 +661,88 @@ def ui_wiki_fact_dashboard(paths: BrainPaths) -> dict[str, Any]:
     return wiki_fact_dashboard(paths)
 
 
+def ui_cos_policy(paths: BrainPaths) -> dict[str, Any]:
+    service(paths).init_workspace()
+    with connection(paths.sqlite_path) as conn:
+        rules = [dict(row) for row in active_policy_rules(conn)]
+        version = active_policy_version(conn)
+    for rule in rules:
+        rule["match_action_types"] = json_loads(rule.get("match_action_types"), [])
+        rule["match_predicate"] = json_loads(rule.get("match_predicate"), {})
+        rule["auto_revert_signals"] = json_loads(rule.get("auto_revert_signals"), [])
+    return {"version": version, "rules": rules}
+
+
+def ui_cos_actions(paths: BrainPaths, query: dict[str, list[str]]) -> dict[str, Any]:
+    service(paths).init_workspace()
+    limit = int(first(query, "limit") or 50)
+    return {"actions": recent_actions(paths, limit=max(1, min(limit, 200)))}
+
+
+def ui_cos_contracts(paths: BrainPaths) -> dict[str, Any]:
+    service(paths).init_workspace()
+    return {"contracts": active_page_contracts(paths)}
+
+
+def ui_cos_audit_status(paths: BrainPaths) -> dict[str, Any]:
+    service(paths).init_workspace()
+    with connection(paths.sqlite_path) as conn:
+        counts = {
+            str(row["audit_status"]): int(row["count"])
+            for row in conn.execute(
+                """
+                SELECT audit_status, COUNT(*) AS count
+                FROM cos_actions
+                GROUP BY audit_status
+                """
+            )
+        }
+        failures = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT *
+                FROM cos_actions
+                WHERE audit_status = 'sampled_bad'
+                ORDER BY applied_at DESC
+                LIMIT 50
+                """
+            )
+        ]
+    return {"counts": counts, "failures": failures}
+
+
+def ui_generate_cos_contracts(paths: BrainPaths, payload: dict[str, Any]) -> dict[str, Any]:
+    service(paths).init_workspace()
+    return generate_initial_contracts(
+        paths,
+        limit=int(payload["limit"]) if payload.get("limit") is not None else None,
+        apply=bool(payload.get("apply", False)),
+    )
+
+
+def ui_run_cos_audit(paths: BrainPaths, payload: dict[str, Any]) -> dict[str, Any]:
+    service(paths).init_workspace()
+    return run_sampled_audit(
+        paths,
+        limit=int(payload.get("limit") or 25),
+        auto_revert_bad=bool(payload.get("auto_revert_bad", False)),
+    )
+
+
+def ui_wiki_fact_page_review(
+    paths: BrainPaths, query: dict[str, list[str]]
+) -> dict[str, Any]:
+    service(paths).init_workspace()
+    page_hint = first(query, "path")
+    if not page_hint:
+        raise BadRequestError("path is required")
+    try:
+        return managed_fact_page_review(paths, page_hint)
+    except ValueError as exc:
+        raise BadRequestError(str(exc)) from exc
+
+
 def ui_absorb_wiki_packet_facts(
     paths: BrainPaths, payload: dict[str, Any]
 ) -> dict[str, Any]:
@@ -682,6 +800,58 @@ def ui_migrate_wiki_facts(paths: BrainPaths, payload: dict[str, Any]) -> dict[st
             dry_run=bool(payload.get("dry_run", True)),
             overwrite_existing=bool(payload.get("overwrite_existing", False)),
             include_references=bool(payload.get("include_references", False)),
+        )
+    except ValueError as exc:
+        raise BadRequestError(str(exc)) from exc
+
+
+def ui_regenerate_wiki_fact_page(
+    paths: BrainPaths, payload: dict[str, Any]
+) -> dict[str, Any]:
+    service(paths).init_workspace()
+    page_hint = str(payload.get("page_hint") or payload.get("path") or "").strip()
+    if not page_hint:
+        raise BadRequestError("page_hint is required")
+    try:
+        return regenerate_managed_fact_page(
+            paths,
+            page_hint,
+            dry_run=bool(payload.get("dry_run", True)),
+            overwrite_existing=bool(payload.get("overwrite_existing", False)),
+        )
+    except ValueError as exc:
+        raise BadRequestError(str(exc)) from exc
+
+
+def ui_revert_wiki_fact_page(
+    paths: BrainPaths, payload: dict[str, Any]
+) -> dict[str, Any]:
+    service(paths).init_workspace()
+    snapshot_id = str(payload.get("snapshot_id") or "").strip()
+    if not snapshot_id:
+        raise BadRequestError("snapshot_id is required")
+    try:
+        return revert_wiki_page_snapshot(paths, snapshot_id)
+    except ValueError as exc:
+        raise BadRequestError(str(exc)) from exc
+
+
+def ui_create_wiki_fact_correction(
+    paths: BrainPaths, payload: dict[str, Any]
+) -> dict[str, Any]:
+    service(paths).init_workspace()
+    page_hint = str(payload.get("page_hint") or payload.get("path") or "").strip()
+    if not page_hint:
+        raise BadRequestError("page_hint is required")
+    try:
+        return create_confirmed_page_fact(
+            paths,
+            page_hint,
+            str(payload.get("statement") or ""),
+            section_hint=str(payload.get("section_hint") or "Summary"),
+            supersede_fact_ids=string_list(payload.get("supersede_fact_ids")),
+            source_ids=string_list(payload.get("source_ids")),
+            overwrite_existing=bool(payload.get("overwrite_existing", False)),
         )
     except ValueError as exc:
         raise BadRequestError(str(exc)) from exc
@@ -1039,6 +1209,17 @@ def string_list(value: Any) -> list[str]:
     return [text] if text else []
 
 
+def json_loads(value: Any, default: Any) -> Any:
+    if value in (None, ""):
+        return default
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(str(value))
+    except json.JSONDecodeError:
+        return default
+
+
 def object_list_payload(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
@@ -1270,7 +1451,7 @@ def ui_shell() -> str:
     const wikiState = {q: "", type: "", status: "", selectedPath: "", edit: false};
     const reviewState = {selectedKind: "", selectedId: "", questions: [], answers: []};
     const packetState = {groupBy: "topic", selectedPacketId: "", selectedTargetPath: "", briefs: {}, loadingPacketId: "", absorbingPacketId: ""};
-    const curationState = {selectedQuestionId: "", lastResult: null};
+    const curationState = {selectedQuestionId: "", selectedPagePath: "", lastResult: null, groupBy: "topic", absorbingPacketId: ""};
 
     const app = document.getElementById("app");
     const message = document.getElementById("message");
@@ -1855,17 +2036,30 @@ def ui_shell() -> str:
     }
 
     async function renderCuration() {
-      const data = await api("/api/wiki/facts");
+      const [data, backlog] = await Promise.all([
+        api("/api/wiki/facts"),
+        api(`/api/wiki/proposal-packets?${new URLSearchParams({group_by: curationState.groupBy}).toString()}`)
+      ]);
       const questions = data.open_questions || [];
+      const pages = data.managed_pages || [];
       if (!questions.find(question => question.id === curationState.selectedQuestionId)) {
         curationState.selectedQuestionId = questions[0]?.id || "";
       }
+      if (!pages.find(page => page.relative_path === curationState.selectedPagePath)) {
+        curationState.selectedPagePath = pages[0]?.relative_path || "";
+      }
       const selected = questions.find(question => question.id === curationState.selectedQuestionId);
+      const selectedPage = curationState.selectedPagePath
+        ? await api(`/api/wiki/facts/page?path=${encodeURIComponent(curationState.selectedPagePath)}`)
+        : null;
+      const packets = backlog.packets || [];
       app.innerHTML = `
         <section>
           <div class="toolbar">
             <h2>Chief of Staff</h2>
             <button type="button" onclick="loadView('curation')">Refresh</button>
+            <button class="primary" type="button" onclick="regenerateCurationPage(false)" ${selectedPage ? "" : "disabled"}>Regenerate Page</button>
+            <button type="button" onclick="regenerateCurationPage(true)" ${selectedPage ? "" : "disabled"}>Preview Page</button>
             <button type="button" onclick="migrateExistingWikiFacts(true)">Preview Wiki Migration</button>
             <button type="button" onclick="migrateExistingWikiFacts(false)">Backfill Wiki Facts</button>
             <button type="button" onclick="reconcileChiefOfStaffQuestions()">Reconcile Duplicates</button>
@@ -1873,8 +2067,10 @@ def ui_shell() -> str:
           <div class="grid">
             ${metric("Facts", data.counts?.facts ?? 0)}
             ${metric("Active", data.counts?.by_status?.active ?? 0, "ok")}
+            ${metric("Managed Pages", pages.length)}
             ${metric("Conflicted", data.counts?.by_status?.conflicted ?? 0, data.counts?.by_status?.conflicted ? "danger" : "")}
             ${metric("Open Questions", data.counts?.questions_by_status?.open ?? 0, data.counts?.questions_by_status?.open ? "warn" : "ok")}
+            ${metric("Backlog Changes", backlog.totals?.item_count ?? 0, backlog.totals?.item_count ? "warn" : "ok")}
           </div>
           ${curationState.lastResult ? lastCurationResultHtml(curationState.lastResult) : ""}
           <div class="split">
@@ -1885,11 +2081,26 @@ def ui_shell() -> str:
             </div>
             <div>${selected ? curationQuestionDetailHtml(selected) : `<section><h2>Question</h2><div class="muted">No open factual conflicts.</div></section>`}</div>
           </div>
+          <h2>Managed Pages</h2>
+          <div class="split">
+            <div>
+              <table><thead><tr><th>Page</th><th>Facts</th><th>Status</th></tr></thead>
+              <tbody>${pages.map(curationPageRow).join("") || emptyRow(3)}</tbody></table>
+            </div>
+            <div>${selectedPage ? curationPageDetailHtml(selectedPage) : `<section><h2>Managed Page</h2><div class="muted">No managed pages yet.</div></section>`}</div>
+          </div>
+          <h2>Proposal Backlog Drain</h2>
+          ${curationBacklogHtml(backlog, packets)}
           <h2>Recent Facts</h2>
           ${recentFactsTable(data.recent_facts || [])}
           <h2>Recent Curation Runs</h2>
           ${curationRunsTable(data.recent_runs || [])}
         </section>`;
+      document.getElementById("curation-packet-group")?.addEventListener("change", event => {
+        curationState.groupBy = event.target.value;
+        curationState.absorbingPacketId = "";
+        loadView("curation");
+      });
     }
 
     function lastCurationResultHtml(result) {
@@ -1938,11 +2149,17 @@ def ui_shell() -> str:
       await loadView("curation");
     }
 
+    async function openCurationQuestionPage(path) {
+      curationState.selectedPagePath = path;
+      await loadView("curation");
+    }
+
     function curationQuestionDetailHtml(question) {
       return `<section>
         <div class="toolbar">
           <h2>${escapeHtml(question.page_hint || "Question")}</h2>
           <span class="badge">${escapeHtml(question.kind || "")}</span>
+          ${question.page_hint ? `<button type="button" onclick='openCurationQuestionPage(${jsString(question.page_hint)})'>Review Page</button>` : ""}
         </div>
         <p>${escapeHtml(question.question || "")}</p>
         <div class="stack">${(question.options || []).map(option => `
@@ -1994,6 +2211,174 @@ def ui_shell() -> str:
       await loadView("curation");
       const verb = dryRun ? "Previewed" : "Backfilled";
       setMessage(`${verb} ${result.new_candidate_count || 0} new wiki facts from ${result.page_count || 0} pages.`);
+    }
+
+    function curationPageRow(page) {
+      const selected = page.relative_path === curationState.selectedPagePath ? "ok" : "";
+      return `<tr>
+        <td><button class="row-button ${selected}" type="button" onclick='openCurationPage(${jsString(page.relative_path)})'>${escapeHtml(page.title || page.relative_path)}</button><div class="muted">${escapeHtml(page.relative_path)}</div></td>
+        <td>${page.active_fact_count || 0} active<br>${page.open_question_count || 0} open questions</td>
+        <td><span class="badge ${page.managed ? "ok" : "warn"}">${page.managed ? "managed" : "draft only"}</span><br>${escapeHtml(page.status || "")}</td>
+      </tr>`;
+    }
+
+    async function openCurationPage(path) {
+      curationState.selectedPagePath = path;
+      await loadView("curation");
+    }
+
+    function curationPageDetailHtml(page) {
+      return `<section>
+        <div class="toolbar">
+          <h2>${escapeHtml(page.frontmatter?.title || page.relative_path)}</h2>
+          <span class="badge ${page.managed ? "ok" : "warn"}">${page.managed ? "managed" : "not managed"}</span>
+          <span class="badge">${page.would_change ? "changes pending" : "current"}</span>
+          <button type="button" onclick='openPacketWikiPage(${jsString(page.relative_path)})'>Open In Wiki</button>
+        </div>
+        <div class="grid">
+          ${metric("Active Facts", page.active_facts?.length || 0)}
+          ${metric("All Facts", page.facts?.length || 0)}
+          ${metric("Snapshots", page.snapshots?.length || 0)}
+          ${metric("Can Write", page.can_write ? "yes" : "no", page.can_write ? "ok" : "warn")}
+        </div>
+        ${!page.can_write ? `<div class="warn">This page is not managed yet. Regeneration will preview only unless overwrite is explicitly enabled.</div>` : ""}
+        <h2>Current vs Draft</h2>
+        ${serverDiffHtml(page.diff)}
+        <details>
+          <summary>Draft Markdown</summary>
+          <textarea readonly>${escapeHtml(page.draft_markdown || "")}</textarea>
+        </details>
+        <h2>Confirmed Correction</h2>
+        ${curationCorrectionHtml(page)}
+        <h2>Page Facts</h2>
+        ${curationFactsTable(page.facts || [])}
+        <h2>Snapshots</h2>
+        ${curationSnapshotsTable(page.snapshots || [])}
+      </section>`;
+    }
+
+    function curationCorrectionHtml(page) {
+      const activeFacts = (page.facts || []).filter(fact => fact.status === "active");
+      return `<div class="stack">
+        <textarea id="curation-correction" placeholder="State a confirmed fact or correction for this page."></textarea>
+        <div class="toolbar">
+          <select id="curation-correction-section">
+            ${["Summary", "Key Points", "Current State", "Decision", "Definition", "Open Loops", "Source Evidence"].map(section => `<option value="${section}">${section}</option>`).join("")}
+          </select>
+          <label><input id="curation-correction-overwrite" type="checkbox"> overwrite unmanaged page</label>
+        </div>
+        ${activeFacts.length ? `<div class="stack">${activeFacts.map(fact => `
+          <label><input class="supersede-fact" type="checkbox" value="${escapeHtml(fact.id)}"> supersede ${escapeHtml(fact.statement || "")}</label>
+        `).join("")}</div>` : `<div class="muted">No active facts to supersede.</div>`}
+        <div class="actions"><button class="primary" type="button" onclick="submitCurationCorrection()">Add Confirmed Fact</button></div>
+      </div>`;
+    }
+
+    function curationFactsTable(facts) {
+      return `<table><thead><tr><th>Status</th><th>Section</th><th>Fact</th><th>Evidence</th></tr></thead>
+        <tbody>${facts.map(fact => `<tr>
+          <td><span class="badge ${fact.status === "active" ? "ok" : fact.status === "conflicted" ? "danger" : ""}">${escapeHtml(fact.status || "")}</span><br>${fact.confirmed_by_user ? `<span class="badge ok">confirmed</span>` : ""}</td>
+          <td>${escapeHtml(fact.section_hint || "")}</td>
+          <td>${escapeHtml(fact.statement || "")}<div class="muted">${escapeHtml(fact.id || "")}</div></td>
+          <td>${(fact.source_ids || []).length} sources<br><span class="badge">${escapeHtml(fact.confidence ?? "")}</span></td>
+        </tr>`).join("") || emptyRow(4)}</tbody></table>`;
+    }
+
+    function curationSnapshotsTable(snapshots) {
+      return `<table><thead><tr><th>Snapshot</th><th>Reason</th><th>Preview</th><th>Action</th></tr></thead>
+        <tbody>${snapshots.map(snapshot => `<tr>
+          <td>${escapeHtml(snapshot.created_at || "")}<div class="muted">${escapeHtml(snapshot.id || "")}</div></td>
+          <td>${escapeHtml(snapshot.reason || "")}</td>
+          <td><div class="muted">${escapeHtml(snapshot.before_preview || "")}</div><div>${escapeHtml(snapshot.after_preview || "")}</div></td>
+          <td><button type="button" onclick='revertCurationSnapshot(${jsString(snapshot.id)})'>Revert</button></td>
+        </tr>`).join("") || emptyRow(4)}</tbody></table>`;
+    }
+
+    function serverDiffHtml(diff) {
+      const lines = diff?.lines || [];
+      if (!lines.length) return `<pre class="diff"><div class="ctx">No changes.</div></pre>`;
+      return `<pre class="diff">${lines.map(line => {
+        const klass = line.startsWith("+") && !line.startsWith("+++") ? "add" : line.startsWith("-") && !line.startsWith("---") ? "del" : "ctx";
+        return `<div class="${klass}">${escapeHtml(line)}</div>`;
+      }).join("")}${diff.truncated ? `<div class="warn">Diff truncated after ${diff.lines.length} lines.</div>` : ""}</pre>`;
+    }
+
+    async function regenerateCurationPage(dryRun) {
+      if (!curationState.selectedPagePath) return;
+      const result = await api("/api/wiki/facts/pages/regenerate", {
+        method: "POST",
+        body: JSON.stringify({page_hint: curationState.selectedPagePath, dry_run: dryRun, overwrite_existing: false})
+      });
+      curationState.lastResult = result;
+      await loadView("curation");
+      setMessage(dryRun ? "Managed page preview refreshed." : "Managed page regenerated.");
+    }
+
+    async function revertCurationSnapshot(snapshotId) {
+      const result = await api("/api/wiki/facts/pages/revert", {
+        method: "POST",
+        body: JSON.stringify({snapshot_id: snapshotId})
+      });
+      curationState.selectedPagePath = result.review?.relative_path || curationState.selectedPagePath;
+      curationState.lastResult = result;
+      await loadView("curation");
+      setMessage("Managed page reverted to snapshot.");
+    }
+
+    async function submitCurationCorrection() {
+      const statement = document.getElementById("curation-correction").value.trim();
+      const section = document.getElementById("curation-correction-section").value;
+      const overwrite = document.getElementById("curation-correction-overwrite").checked;
+      const supersede = Array.from(document.querySelectorAll(".supersede-fact:checked")).map(input => input.value);
+      const result = await api("/api/wiki/facts/corrections", {
+        method: "POST",
+        body: JSON.stringify({
+          page_hint: curationState.selectedPagePath,
+          statement,
+          section_hint: section,
+          supersede_fact_ids: supersede,
+          overwrite_existing: overwrite
+        })
+      });
+      curationState.lastResult = result;
+      await loadView("curation");
+      setMessage("Confirmed fact added and managed page refreshed.");
+    }
+
+    function curationBacklogHtml(backlog, packets) {
+      return `<section>
+        <div class="toolbar">
+          <select id="curation-packet-group">
+            ${["topic", "day", "priority"].map(value => `<option value="${value}" ${value === curationState.groupBy ? "selected" : ""}>Group by ${value}</option>`).join("")}
+          </select>
+          <button type="button" onclick="loadView('curation')">Refresh Backlog</button>
+        </div>
+        <table><thead><tr><th>Packet</th><th>Scope</th><th>Mix</th><th>Action</th></tr></thead>
+        <tbody>${packets.map(curationBacklogRow).join("") || emptyRow(4)}</tbody></table>
+      </section>`;
+    }
+
+    function curationBacklogRow(packet) {
+      const absorbing = curationState.absorbingPacketId === packet.id;
+      return `<tr>
+        <td>${escapeHtml(packet.label || packet.id)}<div class="muted">${escapeHtml(packet.review_hint || "")}</div></td>
+        <td>${packet.target_count || 0} pages<br>${packet.batch_count || 0} proposals<br>${packet.item_count || 0} changes</td>
+        <td>${countBadges(packet.operation_counts || {})}<br>${countBadges(packet.status_counts || {})}</td>
+        <td><button type="button" onclick='absorbCurationPacket(${jsString(packet.id)})' ${absorbing ? "disabled" : ""}>${absorbing ? "Absorbing..." : "Absorb"}</button></td>
+      </tr>`;
+    }
+
+    async function absorbCurationPacket(packetId) {
+      curationState.absorbingPacketId = packetId;
+      await loadView("curation");
+      const result = await api("/api/wiki/proposal-packets/facts", {
+        method: "POST",
+        body: JSON.stringify({packet_id: packetId, group_by: curationState.groupBy, overwrite_existing: false})
+      });
+      curationState.absorbingPacketId = "";
+      curationState.lastResult = result;
+      await loadView("curation");
+      setMessage(`Absorbed ${result.candidate_count || 0} candidates into facts.`);
     }
 
     function recentFactsTable(facts) {

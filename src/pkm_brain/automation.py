@@ -15,7 +15,10 @@ from typing import Any
 
 from .audit import audit_memories, provenance_check
 from .capture import AgentLogCapture
+from .cos_audit import run_sampled_audit
 from .db import connection, dumps
+from .extraction import extract_recent_documents
+from .gardener import generate_gardener_candidates
 from .indexes import lancedb_stats, optimize_vectors, should_optimize_vectors
 from .llm import CODEX_DEFAULT_MODEL, DEFAULT_LLM_PROVIDER, OPENAI_DEFAULT_MODEL, get_provider
 from .memory_proposals import propose_failure_memories_from_sources, propose_memories_from_lineage
@@ -222,11 +225,20 @@ def run_nightly_maintenance(
             ingest_result = service.ingest()
             summary["ingest"] = ingest_result.__dict__
 
+            summary["cos_extraction_shadow"] = extract_recent_documents(
+                paths, limit=10, shadow=True
+            )
+
             wiki_result = synthesize_wiki(paths, overwrite_generated=True, with_llm=llm_wiki, provider_name=provider)
             summary["wiki_synthesize"] = wiki_result
 
+            summary["cos_gardener_shadow"] = generate_gardener_candidates(
+                paths, shadow=True
+            )
+
             summary["index_status"] = index_status(paths, service)
             summary["index_maintenance"] = run_index_maintenance(paths)
+            summary["cos_audit"] = run_sampled_audit(paths)
             summary["provenance_check"] = provenance_check(paths)
             summary["wiki_lint"] = lint_wiki(paths)
             if with_llm_wiki_proposals:

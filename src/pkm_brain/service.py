@@ -168,6 +168,12 @@ FOUND_CHUNK_SCORE = 24.0
 FOUND_WIKI_SCORE = 24.0
 MEMORY_ACTIVE_SCORE_FLOOR = 1
 MEMORY_CANDIDATE_SCORE_FLOOR = 2
+FACT_SCORE_FLOOR = 12.0
+FACT_TRUTH_CONFIDENCE_FLOOR = 0.5
+FACT_FTS_SCORE_CAP = 12.0
+FACT_CANDIDATE_MULTIPLIER = 4
+FACT_KNEE_DROP = 10.0
+FACT_KNEE_MIN_RANK = 3
 MAX_CHUNKS_PER_DOCUMENT = 2
 MANAGED_WIKI_BOOST = 8.0
 SEMANTIC_WIKI_BOOST = 3.0
@@ -388,7 +394,7 @@ class BrainService:
             lineage_events_deleted = conn.execute(
                 "DELETE FROM context_lineage_events WHERE retrieval_event_id IS NOT NULL"
             ).rowcount
-            conn.execute("DELETE FROM chunk_fts")
+            delete_all_chunk_fts(conn)
             chunks_deleted = conn.execute("DELETE FROM chunks").rowcount
 
             for plan in plans:
@@ -424,19 +430,14 @@ class BrainService:
                             reset_at,
                         ),
                     )
-                    conn.execute(
-                        """
-                        INSERT INTO chunk_fts(chunk_id, title, text, heading_path, project, tags)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            chunk_id,
-                            document["title"],
-                            chunk.text,
-                            chunk.heading_path,
-                            document.get("project") or "",
-                            document.get("tags") or "",
-                        ),
+                    insert_chunk_retrieval_fts(
+                        conn,
+                        chunk_id=chunk_id,
+                        title=document["title"],
+                        text=chunk.text,
+                        heading_path=chunk.heading_path,
+                        project=document.get("project") or "",
+                        tags=document.get("tags") or "",
                     )
                     chunks_created += 1
 
@@ -562,8 +563,7 @@ class BrainService:
                     )
                 ]
                 if old_chunk_ids:
-                    placeholders = ",".join("?" for _ in old_chunk_ids)
-                    conn.execute(f"DELETE FROM chunk_fts WHERE chunk_id IN ({placeholders})", old_chunk_ids)
+                    delete_chunk_retrieval_fts(conn, old_chunk_ids)
                 conn.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
 
                 for chunk in plan["_chunks"]:
@@ -589,12 +589,14 @@ class BrainService:
                             reindexed_at,
                         ),
                     )
-                    conn.execute(
-                        """
-                        INSERT INTO chunk_fts(chunk_id, title, text, heading_path, project, tags)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                        """,
-                        (chunk_id, plan["title"], chunk.text, chunk.heading_path, "", ""),
+                    insert_chunk_retrieval_fts(
+                        conn,
+                        chunk_id=chunk_id,
+                        title=plan["title"],
+                        text=chunk.text,
+                        heading_path=chunk.heading_path,
+                        project="",
+                        tags="",
                     )
                     rewritten_chunks += 1
 
@@ -833,12 +835,14 @@ class BrainService:
                                 ingested_at,
                             ),
                         )
-                        conn.execute(
-                            """
-                            INSERT INTO chunk_fts(chunk_id, title, text, heading_path, project, tags)
-                            VALUES (?, ?, ?, ?, ?, ?)
-                            """,
-                            (chunk_id, title, chunk.text, chunk.heading_path, "", ""),
+                        insert_chunk_retrieval_fts(
+                            conn,
+                            chunk_id=chunk_id,
+                            title=title,
+                            text=chunk.text,
+                            heading_path=chunk.heading_path,
+                            project="",
+                            tags="",
                         )
                         vector_rows.append(
                             {
@@ -969,12 +973,14 @@ class BrainService:
                                 ingested_at,
                             ),
                         )
-                        conn.execute(
-                            """
-                            INSERT INTO chunk_fts(chunk_id, title, text, heading_path, project, tags)
-                            VALUES (?, ?, ?, ?, ?, ?)
-                            """,
-                            (chunk_id, title, chunk.text, chunk.heading_path, "", ""),
+                        insert_chunk_retrieval_fts(
+                            conn,
+                            chunk_id=chunk_id,
+                            title=title,
+                            text=chunk.text,
+                            heading_path=chunk.heading_path,
+                            project="",
+                            tags="",
                         )
                     if source_type == "agent_session_log":
                         record_agent_log_lineage_references(
@@ -1161,7 +1167,12 @@ class BrainService:
         chunk_candidates, fanout_debug = self._fanout_chunk_candidates(query, limit=60)
         lineage_scores = self._lineage_scores_for_chunks(chunk_candidates)
         reranked_chunks = rerank_chunks(query, chunk_candidates, fanout_debug, lineage_scores=lineage_scores)
-        supporting_chunks = select_context_chunks(reranked_chunks, query=query, policy=policy)
+        relevant_facts = self.search_facts(query, limit=min(8, policy.max_chunks))
+        supporting_chunks = select_context_chunks(
+            suppress_chunks_covered_by_facts(reranked_chunks, relevant_facts),
+            query=query,
+            policy=policy,
+        )
         wiki_pages = self.select_wiki_pages(query, supporting_chunks, limit=policy.max_wiki_pages)
         memories = relevant_memories_for_query(
             self.active_memories(project),
@@ -1175,7 +1186,11 @@ class BrainService:
             limit=min(policy.max_memories, 3),
             score_floor=MEMORY_CANDIDATE_SCORE_FLOOR,
         )
-        citation_snapshots = chunk_citation_snapshots(supporting_chunks) + wiki_page_citation_snapshots(wiki_pages)
+        citation_snapshots = (
+            fact_citation_snapshots(relevant_facts)
+            + chunk_citation_snapshots(supporting_chunks)
+            + wiki_page_citation_snapshots(wiki_pages)
+        )
         assessment = retrieval_assessment(supporting_chunks, wiki_pages, memories, candidate_memories)
         event_id = new_id("retrieval")
         retrieval_debug = build_retrieval_debug(
@@ -1210,6 +1225,7 @@ class BrainService:
                 retrieval_event_id=event_id,
                 query=query,
                 supporting_chunks=supporting_chunks,
+                relevant_facts=relevant_facts,
                 wiki_pages=wiki_pages,
                 active_memories=memories,
             )
@@ -1224,6 +1240,7 @@ class BrainService:
             "active_memories": memories,
             "candidate_memories": candidate_memories,
             "relevant_wiki_pages": wiki_pages,
+            "relevant_facts": relevant_facts,
             "supporting_chunks": supporting_chunks,
             "citations": citation_snapshots,
             "citation_snapshots": citation_snapshots,
@@ -1371,10 +1388,32 @@ class BrainService:
         retrieval_event_id: str,
         query: str,
         supporting_chunks: list[dict[str, Any]],
+        relevant_facts: list[dict[str, Any]],
         wiki_pages: list[dict[str, Any]],
         active_memories: list[dict[str, Any]],
     ) -> None:
         created_at = now_iso()
+        for fact in relevant_facts:
+            fact_id = str(fact.get("id") or "")
+            if not fact_id:
+                continue
+            insert_context_lineage_event(
+                conn,
+                event_id=new_id("lineage"),
+                target_type="fact",
+                target_id=fact_id,
+                event_type="exposed",
+                retrieval_event_id=retrieval_event_id,
+                agent_session_id=None,
+                query=query,
+                weight=0.0,
+                metadata={
+                    "page_hint": fact.get("page_hint"),
+                    "status": fact.get("status"),
+                    "conflict_group_id": fact.get("conflict_group_id"),
+                },
+                created_at=created_at,
+            )
         for chunk in supporting_chunks:
             chunk_id = str(chunk.get("chunk_id") or "")
             if not chunk_id:
@@ -1495,6 +1534,99 @@ class BrainService:
             )
         results.sort(key=lambda page: (-page["score"], page["page_type"] == "reference", page["title"]))
         return results[:limit]
+
+    def search_facts(self, query: str, limit: int = 8) -> list[dict[str, Any]]:
+        self.init_workspace()
+        fts_query = build_fts_query(query)
+        if not fts_query:
+            return []
+        with connection(self.paths.sqlite_path) as conn:
+            candidate_limit = max(limit * FACT_CANDIDATE_MULTIPLIER, limit)
+            found = rows(
+                conn,
+                """
+                SELECT target_id AS fact_id, bm25(retrieval_fts) AS score
+                FROM retrieval_fts
+                WHERE retrieval_fts MATCH ?
+                  AND kind = 'fact'
+                ORDER BY score
+                LIMIT ?
+                """,
+                (fts_query, candidate_limit),
+            )
+            fact_ids = [str(row["fact_id"]) for row in found if row["fact_id"]]
+            fts_scores = {str(row["fact_id"]): float(row["score"] or 0.0) for row in found}
+            if not fact_ids:
+                return []
+            placeholders = ",".join("?" for _ in fact_ids)
+            fact_rows = rows(
+                conn,
+                f"""
+                SELECT *
+                FROM facts
+                WHERE id IN ({placeholders})
+                  AND status IN ('active', 'conflicted')
+                  AND COALESCE(truth_confidence, confidence, 0) >= ?
+                """,
+                [*fact_ids, FACT_TRUTH_CONFIDENCE_FLOOR],
+            )
+            facts_by_id = {}
+            for row in fact_rows:
+                fact_id = str(row["id"])
+                fact = row_to_retrieval_fact(
+                    row,
+                    0.0,
+                    fts_score=fts_scores.get(fact_id, 0.0),
+                )
+                scored_fact = score_retrieval_fact_for_query(
+                    fact,
+                    query,
+                    fts_scores.get(fact_id, 0.0),
+                )
+                if scored_fact:
+                    facts_by_id[fact_id] = scored_fact
+            conflict_group_ids = sorted(
+                {
+                    str(fact.get("conflict_group_id") or "")
+                    for fact in facts_by_id.values()
+                    if fact.get("status") == "conflicted" and fact.get("conflict_group_id")
+                }
+            )
+            contested_by_group: dict[str, list[dict[str, Any]]] = {}
+            if conflict_group_ids:
+                group_placeholders = ",".join("?" for _ in conflict_group_ids)
+                for row in conn.execute(
+                    f"""
+                    SELECT *
+                    FROM facts
+                    WHERE conflict_group_id IN ({group_placeholders})
+                      AND status = 'conflicted'
+                      AND COALESCE(truth_confidence, confidence, 0) >= ?
+                    ORDER BY created_at
+                    """,
+                    [*conflict_group_ids, FACT_TRUTH_CONFIDENCE_FLOOR],
+                ):
+                    fact_id = str(row["id"])
+                    fact = row_to_retrieval_fact(
+                        row,
+                        0.0,
+                        fts_score=fts_scores.get(fact_id, 0.0),
+                    )
+                    contested_by_group.setdefault(str(row["conflict_group_id"]), []).append(fact)
+            ordered = [facts_by_id[fact_id] for fact_id in fact_ids if fact_id in facts_by_id]
+            ordered.sort(
+                key=lambda fact: (
+                    -float(fact.get("retrieval_score") or 0.0),
+                    float(fact.get("fts_score") or 0.0),
+                    str(fact.get("id") or ""),
+                )
+            )
+            ordered = dynamic_fact_cut(ordered, limit)
+        for fact in ordered:
+            group_id = str(fact.get("conflict_group_id") or "")
+            if group_id and group_id in contested_by_group:
+                fact["contested_facts"] = contested_by_group[group_id]
+        return ordered
 
     def select_wiki_pages(
         self,
@@ -1842,6 +1974,21 @@ class BrainService:
         if not fts_query:
             return []
         with connection(self.paths.sqlite_path) as conn:
+            if sqlite_table_exists(conn, "retrieval_fts"):
+                found = rows(
+                    conn,
+                    """
+                    SELECT target_id AS chunk_id, bm25(retrieval_fts) AS score
+                    FROM retrieval_fts
+                    WHERE retrieval_fts MATCH ?
+                      AND kind = 'chunk'
+                    ORDER BY score
+                    LIMIT ?
+                    """,
+                    (fts_query, limit),
+                )
+                if found:
+                    return [dict(row) for row in found]
             found = rows(
                 conn,
                 """
@@ -2711,13 +2858,215 @@ def summarize_ranked_chunks(chunks: list[dict[str, Any]], limit: int) -> list[di
 def normalize_lineage_target(target_type: str, target_id: str) -> tuple[str, str]:
     normalized_type = target_type.strip().lower()
     normalized_id = target_id.strip()
-    if normalized_type not in {"memory", "chunk", "document", "wiki_page"}:
-        raise ValueError("target_type must be one of memory, chunk, document, or wiki_page")
+    if normalized_type not in {"memory", "chunk", "document", "wiki_page", "fact"}:
+        raise ValueError("target_type must be one of memory, chunk, document, wiki_page, or fact")
     if normalized_type == "document" and normalized_id.startswith("document:"):
         normalized_id = normalized_id.split(":", 1)[1]
     if not normalized_id:
         raise ValueError("target_id must not be empty")
     return normalized_type, normalized_id
+
+
+def insert_chunk_retrieval_fts(
+    conn: Any,
+    *,
+    chunk_id: str,
+    title: Any,
+    text: Any,
+    heading_path: Any,
+    project: Any,
+    tags: Any,
+) -> None:
+    serialized_tags = tags if isinstance(tags, str) else dumps(tags or [])
+    conn.execute(
+        """
+        INSERT INTO chunk_fts(chunk_id, title, text, heading_path, project, tags)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (chunk_id, title, text, heading_path, project, serialized_tags),
+    )
+    if sqlite_table_exists(conn, "retrieval_fts"):
+        conn.execute(
+            """
+            INSERT INTO retrieval_fts(kind, target_id, title, text, heading_path, project, tags)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("chunk", chunk_id, title, text, heading_path, project, serialized_tags),
+        )
+
+
+def delete_chunk_retrieval_fts(conn: Any, chunk_ids: list[str]) -> None:
+    if not chunk_ids:
+        return
+    placeholders = ",".join("?" for _ in chunk_ids)
+    conn.execute(f"DELETE FROM chunk_fts WHERE chunk_id IN ({placeholders})", chunk_ids)
+    if sqlite_table_exists(conn, "retrieval_fts"):
+        conn.execute(
+            f"DELETE FROM retrieval_fts WHERE kind = 'chunk' AND target_id IN ({placeholders})",
+            chunk_ids,
+        )
+
+
+def delete_all_chunk_fts(conn: Any) -> None:
+    conn.execute("DELETE FROM chunk_fts")
+    if sqlite_table_exists(conn, "retrieval_fts"):
+        conn.execute("DELETE FROM retrieval_fts WHERE kind = 'chunk'")
+
+
+def update_chunk_retrieval_title(conn: Any, document_id: str, title: str) -> None:
+    conn.execute(
+        """
+        UPDATE chunk_fts
+        SET title = ?
+        WHERE chunk_id IN (SELECT id FROM chunks WHERE document_id = ?)
+        """,
+        (title, document_id),
+    )
+    if sqlite_table_exists(conn, "retrieval_fts"):
+        conn.execute(
+            """
+            UPDATE retrieval_fts
+            SET title = ?
+            WHERE kind = 'chunk'
+              AND target_id IN (SELECT id FROM chunks WHERE document_id = ?)
+            """,
+            (title, document_id),
+        )
+
+
+def sqlite_table_exists(conn: Any, table: str) -> bool:
+    return bool(
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'virtual') AND name = ?",
+            (table,),
+        ).fetchone()
+    )
+
+
+def row_to_retrieval_fact(row: Any, score: float, *, fts_score: float | None = None) -> dict[str, Any]:
+    from .wiki_facts import row_to_fact
+
+    fact = row_to_fact(row)
+    fact["type"] = "fact"
+    fact["retrieval_score"] = round(score, 4)
+    if fts_score is not None:
+        fact["fts_score"] = round(fts_score, 4)
+    fact["authoritative"] = fact.get("status") == "active"
+    fact["contested"] = fact.get("status") == "conflicted"
+    return fact
+
+
+def score_retrieval_fact_for_query(
+    fact: dict[str, Any],
+    query: str,
+    fts_score: float,
+) -> dict[str, Any] | None:
+    terms = important_query_terms(query)
+    if not terms:
+        return None
+    specific_terms = specific_query_terms(query)
+    required_specific_hits = required_specific_hit_count(specific_terms)
+    haystack = " ".join(
+        [
+            str(fact.get("statement") or ""),
+            str(fact.get("page_hint") or ""),
+            str(fact.get("section_hint") or ""),
+            str(fact.get("entity_key") or ""),
+            str(fact.get("evidence_quote") or ""),
+            " ".join(str(source_id) for source_id in fact.get("source_ids") or []),
+        ]
+    )
+    matches = terms_in_text(terms, haystack)
+    specific_matches = terms_in_text(specific_terms, haystack)
+    if not matches:
+        return None
+    if required_specific_hits and len(specific_matches) < required_specific_hits:
+        return None
+    if specific_terms and not specific_matches and len(matches) < 2:
+        return None
+
+    confidence = float(fact.get("truth_confidence") or fact.get("confidence") or 0.0)
+    fts_component = min(FACT_FTS_SCORE_CAP, max(0.0, -float(fts_score or 0.0)))
+    score = (
+        fts_component
+        + (4.0 * len(matches))
+        + (3.0 * len(specific_matches))
+        + (2.0 * max(0.0, confidence - FACT_TRUTH_CONFIDENCE_FLOOR))
+    )
+    if score < FACT_SCORE_FLOOR:
+        return None
+
+    output = dict(fact)
+    output["retrieval_score"] = round(score, 4)
+    output["fts_score"] = round(float(fts_score or 0.0), 4)
+    output["matched_query_terms"] = matches
+    output["matched_specific_query_terms"] = specific_matches
+    output["required_specific_hit_count"] = required_specific_hits
+    output["fact_relevance_reasons"] = [
+        f"FTS component {fts_component:.2f}",
+        f"matched {len(matches)}/{len(terms)} important terms",
+    ]
+    if specific_terms:
+        output["fact_relevance_reasons"].append(
+            f"matched {len(specific_matches)}/{len(specific_terms)} specific terms"
+        )
+    return output
+
+
+def dynamic_fact_cut(facts: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    previous_score: float | None = None
+    for fact in facts:
+        score = float(fact.get("retrieval_score") or 0.0)
+        if (
+            previous_score is not None
+            and len(selected) >= FACT_KNEE_MIN_RANK
+            and previous_score - score >= FACT_KNEE_DROP
+        ):
+            break
+        selected.append(fact)
+        previous_score = score
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def suppress_chunks_covered_by_facts(
+    chunks: list[dict[str, Any]], facts: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    covered_chunk_ids = {
+        str(span.get("chunk_id") or "")
+        for fact in facts
+        for span in fact.get("source_spans") or []
+        if isinstance(span, dict) and span.get("chunk_id")
+    }
+    if not covered_chunk_ids:
+        return chunks
+    return [
+        chunk
+        for chunk in chunks
+        if str(chunk.get("chunk_id") or "") not in covered_chunk_ids
+    ]
+
+
+def fact_citation_snapshots(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    snapshots: list[dict[str, Any]] = []
+    for fact in facts:
+        snapshots.append(
+            {
+                "type": "fact",
+                "fact_id": fact.get("id"),
+                "statement": fact.get("statement"),
+                "status": fact.get("status"),
+                "page_hint": fact.get("page_hint"),
+                "source_ids": fact.get("source_ids") or [],
+                "source_spans": fact.get("source_spans") or [],
+                "truth_confidence": fact.get("truth_confidence"),
+                "contested": bool(fact.get("contested")),
+                "conflict_group_id": fact.get("conflict_group_id"),
+            }
+        )
+    return snapshots
 
 
 def insert_context_lineage_event(
@@ -2818,8 +3167,7 @@ def remove_mirror_index_documents(conn: Any, raw_root: Path) -> list[str]:
         )
     ]
     if stale_chunk_ids:
-        chunk_placeholders = ",".join("?" for _ in stale_chunk_ids)
-        conn.execute(f"DELETE FROM chunk_fts WHERE chunk_id IN ({chunk_placeholders})", stale_chunk_ids)
+        delete_chunk_retrieval_fts(conn, stale_chunk_ids)
     conn.execute(f"DELETE FROM documents WHERE id IN ({placeholders})", document_ids)
     return stale_chunk_ids
 
@@ -2837,8 +3185,7 @@ def remove_documents(conn: Any, document_rows: list[dict[str, Any]]) -> Replaced
         )
     ]
     if stale_chunk_ids:
-        chunk_placeholders = ",".join("?" for _ in stale_chunk_ids)
-        conn.execute(f"DELETE FROM chunk_fts WHERE chunk_id IN ({chunk_placeholders})", stale_chunk_ids)
+        delete_chunk_retrieval_fts(conn, stale_chunk_ids)
     conn.execute(f"DELETE FROM documents WHERE id IN ({placeholders})", document_ids)
 
     for row in document_rows:
@@ -2997,14 +3344,7 @@ def refresh_existing_document_metadata(
         """,
         (source_type, title, str(path), origin_node_id, logical_source_key, document_id),
     )
-    conn.execute(
-        """
-        UPDATE chunk_fts
-        SET title = ?
-        WHERE chunk_id IN (SELECT id FROM chunks WHERE document_id = ?)
-        """,
-        (title, document_id),
-    )
+    update_chunk_retrieval_title(conn, document_id, title)
 
 
 def reciprocal_rank_fusion(*rankings: list[str], k: int = 60) -> list[str]:

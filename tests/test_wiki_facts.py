@@ -11,8 +11,12 @@ from pkm_brain.wiki_fact_migration import extract_fact_statements
 from pkm_brain.wiki_facts import (
     archive_orphan_managed_pages,
     compact_statement,
+    create_confirmed_page_fact,
     duplicate_fact_projection_errors,
+    managed_fact_page_review,
     render_managed_page,
+    regenerate_managed_fact_page,
+    revert_wiki_page_snapshot,
     statement_from_change,
 )
 
@@ -234,6 +238,31 @@ def test_managed_page_routes_each_fact_to_one_section() -> None:
     assert "## Summary\n\nThis managed page is maintained from 3 active facts across 1 source." in markdown
 
 
+def test_managed_page_can_include_optional_derived_synthesis_block() -> None:
+    facts = [
+        {
+            "id": "fact_synthesis",
+            "statement": "Derived synthesis must cite fact IDs and remain non-canonical.",
+            "section_hint": "Summary",
+            "source_ids": ["document:doc_synthesis"],
+            "observed_at": "2026-05-30T08:03:04+00:00",
+            "created_at": "2026-05-30T08:03:04+00:00",
+        }
+    ]
+
+    with_synthesis = render_managed_page(
+        "concepts/synthesis.md",
+        facts,
+        synthesis_markdown="- Synthesis from [fact_synthesis].",
+    )
+    canonical_only = render_managed_page("concepts/synthesis.md", facts)
+
+    assert "## Derived Synthesis" in with_synthesis
+    assert "fact_synthesis" in with_synthesis
+    assert "## Derived Synthesis" not in canonical_only
+    assert "Derived synthesis must cite fact IDs" in canonical_only
+
+
 def test_managed_page_suppresses_near_duplicate_facts_across_sections() -> None:
     facts = [
         {
@@ -318,6 +347,7 @@ def test_migration_fact_extraction_cleans_markdown_noise() -> None:
 
 def test_orphan_managed_page_is_archived_without_old_fact_bullets(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
     page = paths.wiki / "concepts" / "stale.md"
     page.parent.mkdir(parents=True, exist_ok=True)
     page.write_text(
@@ -345,8 +375,69 @@ def test_orphan_managed_page_is_archived_without_old_fact_bullets(tmp_path: Path
     archived = archive_orphan_managed_pages(paths, active_page_hints=[])
     markdown = page.read_text(encoding="utf-8")
 
-    assert archived == [{"relative_path": "concepts/stale.md", "path": str(page), "status": "archived"}]
+    assert archived[0]["relative_path"] == "concepts/stale.md"
+    assert archived[0]["path"] == str(page)
+    assert archived[0]["status"] == "archived"
+    assert archived[0]["snapshot_id"].startswith("wikisnap_")
     assert "status: archived" in markdown
     assert "fact_ids: []" in markdown
     assert "The same old fact" not in markdown
     assert duplicate_fact_projection_errors("concepts/stale.md", markdown) == []
+
+
+def test_managed_page_review_correction_snapshots_and_revert(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    with connection(paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO facts(
+              id, statement, entity_key, page_hint, section_hint, source_ids,
+              observed_at, confidence, status, confirmed_by_user, metadata,
+              created_at, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "fact_original",
+                "The managed review page starts with the original fact.",
+                "concepts:managed-review:summary",
+                "concepts/managed-review.md",
+                "Summary",
+                json.dumps(["document:doc_source"]),
+                "2026-06-23T00:00:00+00:00",
+                0.8,
+                "active",
+                0,
+                "{}",
+                "2026-06-23T00:00:00+00:00",
+                None,
+            ),
+        )
+
+    generated = regenerate_managed_fact_page(
+        paths, "concepts/managed-review.md", dry_run=False
+    )
+    page = paths.wiki / "concepts" / "managed-review.md"
+    assert generated["curation"]["pages"][0]["snapshot_id"].startswith("wikisnap_")
+    assert "original fact" in page.read_text(encoding="utf-8")
+
+    corrected = create_confirmed_page_fact(
+        paths,
+        "concepts/managed-review.md",
+        "The managed review page now uses the corrected fact.",
+        supersede_fact_ids=["fact_original"],
+    )
+    assert corrected["fact"]["confirmed_by_user"] is True
+    corrected_markdown = page.read_text(encoding="utf-8")
+    assert "corrected fact" in corrected_markdown
+    assert "original fact" not in corrected_markdown
+
+    review = managed_fact_page_review(paths, "concepts/managed-review.md")
+    correction_snapshot_id = corrected["curation"]["pages"][0]["snapshot_id"]
+    assert correction_snapshot_id in {snapshot["id"] for snapshot in review["snapshots"]}
+    reverted = revert_wiki_page_snapshot(paths, correction_snapshot_id)
+
+    assert reverted["revert_snapshot_id"].startswith("wikisnap_")
+    reverted_markdown = page.read_text(encoding="utf-8")
+    assert "original fact" in reverted_markdown
+    assert "corrected fact" not in reverted_markdown

@@ -7,6 +7,9 @@ from pkm_brain.db import connection, init_db
 from pkm_brain.migrations import run_migrations
 
 
+EXPECTED_MIGRATIONS = list(range(1, 17))
+
+
 def test_fresh_db_applies_registered_migrations(tmp_path: Path) -> None:
     db_path = tmp_path / "brain.sqlite"
 
@@ -36,8 +39,26 @@ def test_fresh_db_applies_registered_migrations(tmp_path: Path) -> None:
         item_columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(wiki_change_items)")
         }
+        snapshot_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(wiki_page_snapshots)")
+        }
+        action_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(cos_actions)")
+        }
+        policy_count = conn.execute("SELECT COUNT(*) FROM cos_policy").fetchone()[0]
+        contract_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(page_contracts)")
+        }
+        synthesis_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(wiki_page_syntheses)")
+        }
+        retrieval_fts_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(retrieval_fts)")
+        }
 
-    assert versions == [1, 2, 3, 4, 5, 6, 7]
+    assert versions == EXPECTED_MIGRATIONS
     assert {
         "id",
         "source_type",
@@ -60,10 +81,43 @@ def test_fresh_db_applies_registered_migrations(tmp_path: Path) -> None:
     )
     assert "citation_snapshots" in retrieval_columns
     assert "cited_chunk_ids" not in retrieval_columns
-    assert {"statement", "entity_key", "status", "metadata"}.issubset(fact_columns)
-    assert {"question", "fact_ids", "options", "status"}.issubset(question_columns)
+    assert {
+        "statement",
+        "entity_key",
+        "status",
+        "metadata",
+        "source_spans",
+        "truth_confidence",
+        "routing_confidence",
+        "extraction_confidence",
+    }.issubset(fact_columns)
+    assert {
+        "question",
+        "fact_ids",
+        "options",
+        "status",
+        "action_id",
+        "recommended_action",
+        "auto_resolve_after",
+    }.issubset(question_columns)
     assert {"managed", "fact_ids"}.issubset(wiki_columns)
     assert "status" in item_columns
+    assert {
+        "page_path",
+        "before_markdown",
+        "after_markdown",
+        "reason",
+        "metadata",
+    }.issubset(snapshot_columns)
+    assert {"action_type", "policy_version", "applied_state_hash"}.issubset(
+        action_columns
+    )
+    assert policy_count >= 1
+    assert {"page_hint", "page_scope", "version", "status"}.issubset(contract_columns)
+    assert {"page_hint", "synthesis_markdown", "fact_hash", "stale"}.issubset(
+        synthesis_columns
+    )
+    assert {"kind", "target_id", "title", "text"}.issubset(retrieval_fts_columns)
 
 
 def test_migrations_rerun_is_noop(tmp_path: Path) -> None:
@@ -77,7 +131,7 @@ def test_migrations_rerun_is_noop(tmp_path: Path) -> None:
             for row in conn.execute("SELECT version FROM schema_migrations")
         ]
 
-    assert versions == [1, 2, 3, 4, 5, 6, 7]
+    assert versions == EXPECTED_MIGRATIONS
 
 
 def test_init_db_migrates_pre_sync_documents_table(tmp_path: Path) -> None:
@@ -126,7 +180,7 @@ def test_init_db_migrates_pre_sync_documents_table(tmp_path: Path) -> None:
         ).fetchone()
         indexes = {row["name"] for row in conn.execute("PRAGMA index_list(documents)")}
 
-    assert versions == [1, 2, 3, 4, 5, 6, 7]
+    assert versions == EXPECTED_MIGRATIONS
     assert row["origin_node_id"] == "<local>"
     assert row["logical_source_key"] == "/tmp/legacy.md"
     assert "idx_documents_origin_logical" in indexes
@@ -201,7 +255,7 @@ def test_documents_sensitivity_column_migration_drops_column_and_preserves_rows(
         "title": "Legacy Sensitive",
         "status": "active",
     }
-    assert versions == [1, 2, 3, 4, 5, 6, 7]
+    assert versions == EXPECTED_MIGRATIONS
 
 
 def test_retrieval_events_migration_drops_legacy_cited_chunk_ids() -> None:
@@ -251,10 +305,133 @@ def test_retrieval_events_migration_drops_legacy_cited_chunk_ids() -> None:
     ]
     count = conn.execute("SELECT COUNT(*) FROM retrieval_events").fetchone()[0]
 
-    assert versions == [1, 2, 3, 4, 5, 6, 7]
+    assert versions == EXPECTED_MIGRATIONS
     assert "citation_snapshots" in columns
     assert "cited_chunk_ids" not in columns
     assert count == 0
+
+
+def test_cos_migrations_backfill_legacy_facts_questions_and_shared_fts() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        CREATE TABLE schema_migrations (
+          version INTEGER PRIMARY KEY,
+          applied_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.executemany(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, '2026-05-20T00:00:00+00:00')",
+        [(version,) for version in range(1, 9)],
+    )
+    conn.execute(
+        """
+        CREATE TABLE facts (
+          id TEXT PRIMARY KEY,
+          statement TEXT NOT NULL,
+          entity_key TEXT NOT NULL,
+          page_hint TEXT,
+          section_hint TEXT,
+          source_ids TEXT NOT NULL DEFAULT '[]',
+          observed_at TEXT,
+          confidence REAL NOT NULL,
+          status TEXT NOT NULL,
+          supersedes_id TEXT,
+          conflict_group_id TEXT,
+          confirmed_by_user INTEGER NOT NULL DEFAULT 0,
+          metadata TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL,
+          last_seen_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO facts(
+          id, statement, entity_key, page_hint, section_hint, source_ids,
+          observed_at, confidence, status, metadata, created_at
+        ) VALUES (
+          'fact_legacy', 'Legacy fact statement', 'concept:test:summary',
+          'concepts/test.md', 'Summary', '["document:doc_legacy"]',
+          '2026-05-20T00:00:00+00:00', 0.7, 'active', '{}',
+          '2026-05-20T00:00:00+00:00'
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE open_questions (
+          id TEXT PRIMARY KEY,
+          kind TEXT NOT NULL,
+          entity_key TEXT,
+          page_hint TEXT,
+          fact_ids TEXT NOT NULL DEFAULT '[]',
+          question TEXT NOT NULL,
+          options TEXT NOT NULL DEFAULT '[]',
+          status TEXT NOT NULL,
+          answer TEXT,
+          context TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL,
+          answered_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO open_questions(
+          id, kind, page_hint, fact_ids, question, status, created_at
+        ) VALUES (
+          'question_legacy', 'conflict', 'concepts/test.md',
+          '["fact_legacy"]', 'Which fact is correct?', 'open',
+          '2026-05-20T00:00:00+00:00'
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE VIRTUAL TABLE chunk_fts USING fts5(
+          chunk_id UNINDEXED,
+          title,
+          text,
+          heading_path,
+          project,
+          tags
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO chunk_fts(chunk_id, title, text, heading_path, project, tags)
+        VALUES ('chunk_legacy', 'Legacy Chunk', 'legacy chunk text', '', '', '[]')
+        """
+    )
+
+    run_migrations(conn)
+
+    fact = conn.execute("SELECT * FROM facts WHERE id = 'fact_legacy'").fetchone()
+    question = conn.execute(
+        "SELECT * FROM open_questions WHERE id = 'question_legacy'"
+    ).fetchone()
+    retrieval_rows = [
+        dict(row)
+        for row in conn.execute(
+            "SELECT kind, target_id, title, text FROM retrieval_fts ORDER BY kind, target_id"
+        )
+    ]
+    versions = [
+        row["version"] for row in conn.execute("SELECT version FROM schema_migrations")
+    ]
+
+    assert versions == EXPECTED_MIGRATIONS
+    assert fact["source_spans"] == "[]"
+    assert fact["extraction_method"] == "legacy"
+    assert fact["truth_confidence"] == 0.7
+    assert question["action_id"] is None
+    assert question["recommended_action"] == "{}"
+    assert {"kind": "chunk", "target_id": "chunk_legacy", "title": "Legacy Chunk", "text": "legacy chunk text"} in retrieval_rows
+    assert {"kind": "fact", "target_id": "fact_legacy", "title": "concepts/test.md", "text": "Legacy fact statement"} in retrieval_rows
 
 
 def test_wiki_change_item_status_migration_defaults_existing_items_to_pending() -> None:
@@ -347,7 +524,7 @@ def test_wiki_change_item_status_migration_defaults_existing_items_to_pending() 
     assert dict(row) == {"id": "item_legacy", "status": "pending"}
     assert "idx_wiki_change_items_status_target" in indexes
     assert "idx_wiki_change_items_batch_status" in indexes
-    assert versions == [1, 2, 3, 4, 5, 6, 7]
+    assert versions == EXPECTED_MIGRATIONS
 
 
 def test_init_db_preflights_legacy_wiki_change_items_before_schema_indexes(
@@ -427,7 +604,7 @@ def test_init_db_preflights_legacy_wiki_change_items_before_schema_indexes(
 
     assert dict(row) == {"id": "item_legacy", "status": "pending"}
     assert "idx_wiki_change_items_status_target" in indexes
-    assert versions == [1, 2, 3, 4, 5, 6, 7]
+    assert versions == EXPECTED_MIGRATIONS
 
 
 def test_failed_migration_rolls_back_that_migration() -> None:

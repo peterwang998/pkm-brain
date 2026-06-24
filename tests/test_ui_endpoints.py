@@ -1402,6 +1402,98 @@ def test_wiki_packet_fact_absorption_creates_direct_conflict_question(
     assert repeat_body["dashboard"]["counts"]["by_status"]["superseded"] == 1
 
 
+def test_chief_of_staff_page_review_correction_and_revert_endpoint(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    svc = BrainService(paths, prefer_model_embeddings=False)
+    svc.init_workspace()
+    insert_document(paths)
+    with connection(paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO facts(
+              id, statement, entity_key, page_hint, section_hint, source_ids,
+              observed_at, confidence, status, confirmed_by_user, metadata,
+              created_at, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "fact_ui_original",
+                "The Chief of Staff endpoint starts with the original fact.",
+                "concepts:test-concept:summary",
+                "concepts/test-concept.md",
+                "Summary",
+                json.dumps(["document:doc_source"]),
+                "2026-06-23T00:00:00+00:00",
+                0.8,
+                "active",
+                0,
+                "{}",
+                "2026-06-23T00:00:00+00:00",
+                None,
+            ),
+        )
+
+    with running_ui(paths) as (host, port, token):
+        preview_status, preview = request_json(
+            host,
+            port,
+            token,
+            "POST",
+            "/api/wiki/facts/pages/regenerate",
+            {"page_hint": "concepts/test-concept.md", "dry_run": True},
+        )
+        apply_status, applied = request_json(
+            host,
+            port,
+            token,
+            "POST",
+            "/api/wiki/facts/pages/regenerate",
+            {"page_hint": "concepts/test-concept.md", "dry_run": False},
+        )
+        review_status, review = request_json(
+            host,
+            port,
+            token,
+            "GET",
+            "/api/wiki/facts/page?path=concepts/test-concept.md",
+        )
+        correction_status, correction = request_json(
+            host,
+            port,
+            token,
+            "POST",
+            "/api/wiki/facts/corrections",
+            {
+                "page_hint": "concepts/test-concept.md",
+                "statement": "The Chief of Staff endpoint now uses the corrected fact.",
+                "supersede_fact_ids": ["fact_ui_original"],
+            },
+        )
+        snapshot_id = correction["curation"]["pages"][0]["snapshot_id"]
+        revert_status, reverted = request_json(
+            host,
+            port,
+            token,
+            "POST",
+            "/api/wiki/facts/pages/revert",
+            {"snapshot_id": snapshot_id},
+        )
+
+    assert preview_status == 200
+    assert "original fact" in preview["review"]["draft_markdown"]
+    assert apply_status == 200
+    assert applied["curation"]["pages"][0]["snapshot_id"].startswith("wikisnap_")
+    assert review_status == 200
+    assert review["snapshots"]
+    assert correction_status == 200
+    assert correction["fact"]["confirmed_by_user"] is True
+    assert "corrected fact" in correction["review"]["current_markdown"]
+    assert revert_status == 200
+    assert "original fact" in reverted["review"]["current_markdown"]
+
+
 def test_wiki_packet_fact_absorption_routes_hightouch_variants_to_canonical_page(
     tmp_path: Path,
 ) -> None:
@@ -1550,3 +1642,25 @@ def test_human_wiki_proposal_endpoint_validates_path_and_uses_review_flow(
     assert apply_status == 200
     assert apply_body["lint"]["errors"] == []
     assert "Human-authored summary." in page.read_text(encoding="utf-8")
+
+
+def test_cos_control_plane_endpoints_require_auth_and_return_state(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    with running_ui(paths) as (host, port, token):
+        unauthorized, _ = request_json(host, port, None, "GET", "/api/cos/policy")
+        policy_status, policy = request_json(host, port, token, "GET", "/api/cos/policy")
+        actions_status, actions = request_json(host, port, token, "GET", "/api/cos/actions")
+        contracts_status, contracts = request_json(host, port, token, "GET", "/api/cos/contracts")
+        audit_status, audit = request_json(host, port, token, "GET", "/api/cos/audit")
+
+    assert unauthorized == 401
+    assert policy_status == 200
+    assert policy["version"] == 1
+    assert policy["rules"]
+    assert actions_status == 200
+    assert actions["actions"] == []
+    assert contracts_status == 200
+    assert contracts["contracts"] == []
+    assert audit_status == 200
+    assert audit["counts"] == {}

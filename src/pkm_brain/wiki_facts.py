@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from difflib import SequenceMatcher
+from difflib import SequenceMatcher, unified_diff
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -28,7 +28,14 @@ FACT_STATUSES = {
     "needs_confirmation",
     "retracted",
 }
-QUESTION_STATUSES = {"open", "answered", "dismissed"}
+QUESTION_STATUSES = {
+    "open",
+    "answered",
+    "dismissed",
+    "needs_human",
+    "auto_resolved",
+    "timeout_resolved",
+}
 REPLACEMENT_OPERATIONS = {"replace_page", "replace_section", "create_page"}
 AUTO_SUPERSEDE_CONFIDENCE = 0.85
 NEAR_DUPLICATE_SEQUENCE_RATIO = 0.88
@@ -529,6 +536,9 @@ def upsert_candidate_facts(
                     """
                     UPDATE facts
                     SET statement = ?, source_ids = ?, observed_at = ?, confidence = ?,
+                        source_spans = ?, evidence_quote = ?, extraction_method = ?,
+                        extractor_model = ?, effective_at = ?, extraction_confidence = ?,
+                        routing_confidence = ?, truth_confidence = ?,
                         metadata = ?,
                         last_seen_at = ?,
                         status = CASE WHEN status = 'superseded' THEN 'superseded' ELSE 'active' END,
@@ -540,6 +550,14 @@ def upsert_candidate_facts(
                         dumps(merged["source_ids"]),
                         merged["observed_at"],
                         merged["confidence"],
+                        dumps(merged["source_spans"]),
+                        merged["evidence_quote"],
+                        merged["extraction_method"],
+                        merged["extractor_model"],
+                        merged["effective_at"],
+                        merged["extraction_confidence"],
+                        merged["routing_confidence"],
+                        merged["truth_confidence"],
                         dumps(merged["metadata"]),
                         timestamp,
                         existing["id"],
@@ -554,8 +572,11 @@ def upsert_candidate_facts(
                 """
                 INSERT INTO facts(
                   id, statement, entity_key, page_hint, section_hint, source_ids,
-                  observed_at, confidence, status, metadata, created_at, last_seen_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  observed_at, confidence, status, source_spans, evidence_quote,
+                  extraction_method, extractor_model, effective_at,
+                  extraction_confidence, routing_confidence, truth_confidence,
+                  metadata, created_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     fact_id,
@@ -567,12 +588,21 @@ def upsert_candidate_facts(
                     candidate["observed_at"],
                     candidate["confidence"],
                     "active",
+                    dumps(candidate.get("source_spans") or []),
+                    candidate.get("evidence_quote"),
+                    str(candidate.get("extraction_method") or "legacy"),
+                    candidate.get("extractor_model"),
+                    candidate.get("effective_at"),
+                    candidate.get("extraction_confidence"),
+                    candidate.get("routing_confidence"),
+                    candidate.get("truth_confidence", candidate["confidence"]),
                     dumps(candidate["metadata"]),
                     timestamp,
                     timestamp,
                 ),
             )
             created_fact_ids.append(fact_id)
+        rebuild_fact_retrieval_index(conn)
     return {
         "created_fact_ids": created_fact_ids,
         "updated_fact_ids": updated_fact_ids,
@@ -623,6 +653,16 @@ def merge_fact_values(
         float(existing.get("confidence") or 0.0),
         float(candidate.get("confidence") or 0.0),
     )
+    truth_confidence = max(
+        float(existing.get("truth_confidence") or existing.get("confidence") or 0.0),
+        float(candidate.get("truth_confidence", candidate.get("confidence")) or 0.0),
+    )
+    extraction_confidence = max_optional_float(
+        existing.get("extraction_confidence"), candidate.get("extraction_confidence")
+    )
+    routing_confidence = max_optional_float(
+        existing.get("routing_confidence"), candidate.get("routing_confidence")
+    )
     observed_at = (
         max(
             str(existing.get("observed_at") or ""),
@@ -653,8 +693,39 @@ def merge_fact_values(
         "source_ids": source_ids,
         "observed_at": observed_at,
         "confidence": confidence,
+        "source_spans": merge_json_lists(
+            existing.get("source_spans") or [], candidate.get("source_spans") or []
+        ),
+        "evidence_quote": candidate.get("evidence_quote")
+        or existing.get("evidence_quote"),
+        "extraction_method": candidate.get("extraction_method")
+        or existing.get("extraction_method")
+        or "legacy",
+        "extractor_model": candidate.get("extractor_model")
+        or existing.get("extractor_model"),
+        "effective_at": candidate.get("effective_at") or existing.get("effective_at"),
+        "extraction_confidence": extraction_confidence,
+        "routing_confidence": routing_confidence,
+        "truth_confidence": truth_confidence,
         "metadata": metadata,
     }
+
+
+def max_optional_float(left: Any, right: Any) -> float | None:
+    values = [float(value) for value in (left, right) if value is not None]
+    return max(values) if values else None
+
+
+def merge_json_lists(left: list[Any], right: list[Any]) -> list[Any]:
+    merged: list[Any] = []
+    seen: set[str] = set()
+    for item in [*left, *right]:
+        key = dumps(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(item)
+    return merged
 
 
 def choose_canonical_statement(
@@ -862,6 +933,7 @@ def resolve_fact_groups(paths: BrainPaths, entity_keys: list[str]) -> dict[str, 
             )
             if question_id:
                 created_question_ids.append(question_id)
+        rebuild_fact_retrieval_index(conn)
     return {
         "auto_merged": auto_merged,
         "auto_superseded": auto_superseded,
@@ -905,6 +977,7 @@ def merge_similar_replacement_facts(
             """
             UPDATE facts
             SET statement = ?, source_ids = ?, observed_at = ?, confidence = ?,
+                truth_confidence = ?,
                 status = 'active', supersedes_id = ?, conflict_group_id = NULL,
                 metadata = ?, last_seen_at = ?
             WHERE id = ?
@@ -913,6 +986,7 @@ def merge_similar_replacement_facts(
                 merged["statement"],
                 dumps(merged["source_ids"]),
                 merged["observed_at"],
+                merged["confidence"],
                 merged["confidence"],
                 merged["supersedes_id"],
                 dumps(merged["metadata"]),
@@ -931,6 +1005,7 @@ def merge_similar_replacement_facts(
                 """,
                 (fact["id"],),
             )
+        rebuild_fact_retrieval_index(conn)
         survivors.append(
             {
                 **keeper,
@@ -1633,6 +1708,313 @@ def curate_all_managed_fact_pages(
     }
 
 
+def managed_fact_page_summaries(paths: BrainPaths) -> list[dict[str, Any]]:
+    fact_counts: dict[str, dict[str, Any]] = {}
+    question_counts: dict[str, int] = {}
+    indexed_pages: dict[str, dict[str, Any]] = {}
+    with connection(paths.sqlite_path) as conn:
+        for row in conn.execute(
+            """
+            SELECT page_hint,
+                   COUNT(*) AS active_count,
+                   MAX(COALESCE(observed_at, created_at)) AS latest_observed_at
+            FROM facts
+            WHERE status = 'active'
+              AND page_hint IS NOT NULL
+              AND page_hint != ''
+            GROUP BY page_hint
+            """
+        ):
+            fact_counts[str(row["page_hint"])] = {
+                "active_fact_count": int(row["active_count"]),
+                "latest_observed_at": row["latest_observed_at"],
+            }
+        for row in conn.execute(
+            """
+            SELECT page_hint, COUNT(*) AS open_count
+            FROM open_questions
+            WHERE status = 'open'
+              AND page_hint IS NOT NULL
+              AND page_hint != ''
+            GROUP BY page_hint
+            """
+        ):
+            question_counts[str(row["page_hint"])] = int(row["open_count"])
+        for row in conn.execute(
+            """
+            SELECT *
+            FROM wiki_pages
+            WHERE managed = 1
+            ORDER BY path
+            """
+        ):
+            relative_path = indexed_page_relative_path(paths, str(row["path"] or ""))
+            if relative_path:
+                indexed_pages[relative_path] = dict(row)
+
+    page_hints = sorted(set(fact_counts) | set(indexed_pages))
+    summaries: list[dict[str, Any]] = []
+    for page_hint in page_hints:
+        target = safe_fact_wiki_path(paths, page_hint)
+        exists = target.exists()
+        current_markdown = (
+            target.read_text(encoding="utf-8", errors="replace") if exists else ""
+        )
+        frontmatter, _body = parse_frontmatter(current_markdown) if current_markdown else ({}, "")
+        indexed = indexed_pages.get(page_hint) or {}
+        active_count = int(fact_counts.get(page_hint, {}).get("active_fact_count") or 0)
+        managed = bool(indexed.get("managed")) or is_managed_page(current_markdown)
+        summaries.append(
+            {
+                "relative_path": page_hint,
+                "title": str(
+                    (frontmatter or {}).get("title")
+                    or indexed.get("title")
+                    or human_title_for_path(page_hint)
+                ),
+                "page_type": str(
+                    (frontmatter or {}).get("page_type")
+                    or indexed.get("page_type")
+                    or page_type_for_path(page_hint, frontmatter)
+                ),
+                "status": str(
+                    (frontmatter or {}).get("status") or indexed.get("status") or ""
+                ),
+                "managed": managed,
+                "exists": exists,
+                "active_fact_count": active_count,
+                "open_question_count": question_counts.get(page_hint, 0),
+                "latest_observed_at": fact_counts.get(page_hint, {}).get(
+                    "latest_observed_at"
+                ),
+            }
+        )
+    return summaries
+
+
+def managed_fact_page_review(paths: BrainPaths, page_hint: str) -> dict[str, Any]:
+    page_hint = canonical_page_hint_for_fact(str(page_hint or "").strip())
+    target = safe_fact_wiki_path(paths, page_hint)
+    current_markdown = (
+        target.read_text(encoding="utf-8", errors="replace") if target.exists() else ""
+    )
+    active_facts = active_facts_by_page(paths, [page_hint]).get(page_hint, [])
+    all_facts = facts_for_page(paths, page_hint)
+    synthesis = active_page_synthesis(paths, page_hint, active_facts)
+    draft_markdown = ""
+    if active_facts:
+        draft_markdown = render_managed_page(
+            page_hint,
+            active_facts,
+            current_markdown,
+            synthesis_markdown=synthesis.get("synthesis_markdown")
+            if synthesis and not synthesis.get("stale_by_hash")
+            else None,
+        )
+    elif current_markdown and is_managed_page(current_markdown):
+        draft_markdown = render_archived_managed_page(page_hint, current_markdown)
+    can_write = (
+        not target.exists() or bool(current_markdown and is_managed_page(current_markdown))
+    )
+    diff = markdown_diff(current_markdown, draft_markdown)
+    frontmatter, _body = parse_frontmatter(current_markdown) if current_markdown else ({}, "")
+    return {
+        "relative_path": page_hint,
+        "path": str(target),
+        "exists": target.exists(),
+        "managed": bool(current_markdown and is_managed_page(current_markdown)),
+        "can_write": can_write,
+        "current_markdown": current_markdown,
+        "draft_markdown": draft_markdown,
+        "diff": diff,
+        "would_change": current_markdown.rstrip() != draft_markdown.rstrip(),
+        "frontmatter": frontmatter or {},
+        "facts": all_facts,
+        "active_facts": active_facts,
+        "open_questions": open_questions_for_page(paths, page_hint),
+        "snapshots": recent_page_snapshots(paths, page_hint),
+        "synthesis": synthesis,
+    }
+
+
+def regenerate_managed_fact_page(
+    paths: BrainPaths,
+    page_hint: str,
+    *,
+    dry_run: bool = True,
+    overwrite_existing: bool = False,
+) -> dict[str, Any]:
+    page_hint = canonical_page_hint_for_fact(str(page_hint or "").strip())
+    if dry_run:
+        return {
+            "dry_run": True,
+            "review": managed_fact_page_review(paths, page_hint),
+            "dashboard": wiki_fact_dashboard(paths),
+        }
+    curation = curate_managed_pages(
+        paths,
+        page_hints=[page_hint],
+        overwrite_existing=overwrite_existing,
+    )
+    return {
+        "dry_run": False,
+        "curation": curation,
+        "review": managed_fact_page_review(paths, page_hint),
+        "dashboard": wiki_fact_dashboard(paths),
+    }
+
+
+def create_confirmed_page_fact(
+    paths: BrainPaths,
+    page_hint: str,
+    statement: str,
+    *,
+    section_hint: str = "Summary",
+    supersede_fact_ids: list[str] | None = None,
+    source_ids: list[str] | None = None,
+    overwrite_existing: bool = False,
+) -> dict[str, Any]:
+    page_hint = canonical_page_hint_for_fact(str(page_hint or "").strip())
+    statement = compact_statement(statement, 1000)
+    if not page_hint:
+        raise ValueError("page_hint is required")
+    if not statement:
+        raise ValueError("statement is required")
+    section_hint = str(section_hint or "Summary").strip() or "Summary"
+    supersede_fact_ids = stable_unique(str(fact_id) for fact_id in supersede_fact_ids or [])
+    timestamp = now_iso()
+    fact_id = new_id("fact")
+    effective_source_ids = stable_unique(
+        [*(source_ids or []), f"manual:chief-of-staff:{timestamp}"]
+    )
+    entity_key = entity_key_for_change(topic_for_path(page_hint), page_hint, section_hint)
+    with connection(paths.sqlite_path) as conn:
+        if supersede_fact_ids:
+            placeholders = ",".join("?" for _ in supersede_fact_ids)
+            found = [
+                str(row["id"])
+                for row in conn.execute(
+                    f"""
+                    SELECT id
+                    FROM facts
+                    WHERE id IN ({placeholders})
+                      AND page_hint = ?
+                      AND status != 'retracted'
+                    """,
+                    (*supersede_fact_ids, page_hint),
+                )
+            ]
+            missing = sorted(set(supersede_fact_ids) - set(found))
+            if missing:
+                raise ValueError(f"supersede facts not found on page: {', '.join(missing)}")
+        conn.execute(
+            """
+            INSERT INTO facts(
+              id, statement, entity_key, page_hint, section_hint, source_ids,
+              observed_at, confidence, status, supersedes_id, confirmed_by_user,
+              source_spans, extraction_method, truth_confidence,
+              metadata, created_at, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                fact_id,
+                statement,
+                entity_key,
+                page_hint,
+                section_hint,
+                dumps(effective_source_ids),
+                timestamp,
+                1.0,
+                "active",
+                supersede_fact_ids[0] if supersede_fact_ids else None,
+                1,
+                dumps([]),
+                "manual",
+                1.0,
+                dumps(
+                    {
+                        "source": "chief_of_staff_correction",
+                        "supersede_fact_ids": supersede_fact_ids,
+                    }
+                ),
+                timestamp,
+                timestamp,
+            ),
+        )
+        for old_fact_id in supersede_fact_ids:
+            conn.execute(
+                """
+                UPDATE facts
+                SET status = 'superseded', conflict_group_id = NULL
+                WHERE id = ?
+                """,
+                (old_fact_id,),
+            )
+        rebuild_fact_retrieval_index(conn)
+    curation = curate_managed_pages(
+        paths,
+        page_hints=[page_hint],
+        overwrite_existing=overwrite_existing,
+    )
+    return {
+        "fact": get_fact(paths, fact_id),
+        "curation": curation,
+        "review": managed_fact_page_review(paths, page_hint),
+        "dashboard": wiki_fact_dashboard(paths),
+    }
+
+
+def revert_wiki_page_snapshot(paths: BrainPaths, snapshot_id: str) -> dict[str, Any]:
+    with connection(paths.sqlite_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM wiki_page_snapshots WHERE id = ?", (snapshot_id,)
+        ).fetchone()
+    if not row:
+        raise ValueError(f"wiki page snapshot not found: {snapshot_id}")
+    snapshot = row_to_page_snapshot(row)
+    page_hint = snapshot["page_path"]
+    target = safe_fact_wiki_path(paths, page_hint)
+    current_markdown = (
+        target.read_text(encoding="utf-8", errors="replace") if target.exists() else None
+    )
+    if snapshot["before_exists"]:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(str(snapshot["before_markdown"] or ""), encoding="utf-8")
+    elif target.exists():
+        target.unlink()
+    lint_result = lint_wiki(paths)
+    page_errors = [
+        error
+        for error in lint_result.get("errors", [])
+        if error.split(":", 1)[0] == page_hint
+    ]
+    if page_errors:
+        if current_markdown is None:
+            if target.exists():
+                target.unlink()
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(current_markdown, encoding="utf-8")
+        lint_wiki(paths)
+        raise ValueError("; ".join(page_errors))
+    revert_snapshot_id = record_wiki_page_snapshot(
+        paths,
+        page_hint,
+        before_markdown=current_markdown,
+        after_markdown=target.read_text(encoding="utf-8", errors="replace")
+        if target.exists()
+        else None,
+        reason="revert_managed_page_snapshot",
+        metadata={"reverted_snapshot_id": snapshot_id},
+    )
+    return {
+        "snapshot": snapshot,
+        "revert_snapshot_id": revert_snapshot_id,
+        "review": managed_fact_page_review(paths, page_hint),
+        "dashboard": wiki_fact_dashboard(paths),
+    }
+
+
 def active_fact_page_hints(paths: BrainPaths) -> list[str]:
     with connection(paths.sqlite_path) as conn:
         return stable_unique(
@@ -1666,8 +2048,21 @@ def archive_orphan_managed_pages(
             continue
         archived_markdown = render_archived_managed_page(relative_path, existing_text)
         path.write_text(archived_markdown.rstrip() + "\n", encoding="utf-8")
+        snapshot_id = record_wiki_page_snapshot(
+            paths,
+            relative_path,
+            before_markdown=existing_text,
+            after_markdown=archived_markdown.rstrip() + "\n",
+            reason="archive_orphan_managed_page",
+            metadata={"active_page_hints": active_page_hints},
+        )
         archived.append(
-            {"relative_path": relative_path, "path": str(path), "status": "archived"}
+            {
+                "relative_path": relative_path,
+                "path": str(path),
+                "status": "archived",
+                "snapshot_id": snapshot_id,
+            }
         )
     return archived
 
@@ -1822,6 +2217,7 @@ def curate_managed_pages(
     facts_by_page = active_facts_by_page(paths, page_hints)
     before_lint = lint_wiki(paths)
     originals: dict[Path, str | None] = {}
+    pending_snapshots: list[dict[str, Any]] = []
     pages: list[dict[str, Any]] = []
     changed_paths: list[str] = []
     for page_hint in page_hints:
@@ -1845,7 +2241,15 @@ def curate_managed_pages(
             if target.exists()
             else ""
         )
-        markdown = render_managed_page(page_hint, facts, existing_text)
+        synthesis = active_page_synthesis(paths, page_hint, facts)
+        markdown = render_managed_page(
+            page_hint,
+            facts,
+            existing_text,
+            synthesis_markdown=synthesis.get("synthesis_markdown")
+            if synthesis and not synthesis.get("stale_by_hash")
+            else None,
+        )
         projection_errors = duplicate_fact_projection_errors(page_hint, markdown)
         can_write = (
             not target.exists() or overwrite_existing or is_managed_page(existing_text)
@@ -1874,6 +2278,16 @@ def curate_managed_pages(
         page_result["written"] = True
         pages.append(page_result)
         changed_paths.append(page_hint)
+        pending_snapshots.append(
+            {
+                "page_hint": page_hint,
+                "before_markdown": originals[target],
+                "after_markdown": markdown.rstrip() + "\n",
+                "reason": "regenerate_managed_fact_page",
+                "metadata": {"fact_ids": page_result["fact_ids"]},
+                "page_result": page_result,
+            }
+        )
 
     lint_result = lint_wiki(paths)
     before_errors = set(before_lint.get("errors") or [])
@@ -1891,6 +2305,16 @@ def curate_managed_pages(
                 page["reason"] = "managed write failed wiki lint"
     else:
         sync_managed_page_index(paths, pages)
+        for snapshot in pending_snapshots:
+            snapshot_id = record_wiki_page_snapshot(
+                paths,
+                snapshot["page_hint"],
+                before_markdown=snapshot["before_markdown"],
+                after_markdown=snapshot["after_markdown"],
+                reason=snapshot["reason"],
+                metadata=snapshot["metadata"],
+            )
+            snapshot["page_result"]["snapshot_id"] = snapshot_id
     return {"pages": pages, "lint": lint_result, "lint_errors": changed_errors}
 
 
@@ -1916,6 +2340,162 @@ def active_facts_by_page(
     return grouped
 
 
+def facts_for_page(paths: BrainPaths, page_hint: str) -> list[dict[str, Any]]:
+    with connection(paths.sqlite_path) as conn:
+        return [
+            row_to_fact(row)
+            for row in conn.execute(
+                """
+                SELECT *
+                FROM facts
+                WHERE page_hint = ?
+                  AND status != 'retracted'
+                ORDER BY
+                  CASE status
+                    WHEN 'active' THEN 0
+                    WHEN 'conflicted' THEN 1
+                    WHEN 'needs_confirmation' THEN 2
+                    WHEN 'superseded' THEN 3
+                    ELSE 4
+                  END,
+                  COALESCE(observed_at, created_at) DESC
+                """,
+                (page_hint,),
+            )
+        ]
+
+
+def get_fact(paths: BrainPaths, fact_id: str) -> dict[str, Any]:
+    with connection(paths.sqlite_path) as conn:
+        row = conn.execute("SELECT * FROM facts WHERE id = ?", (fact_id,)).fetchone()
+    if not row:
+        raise ValueError(f"fact not found: {fact_id}")
+    return row_to_fact(row)
+
+
+def open_questions_for_page(paths: BrainPaths, page_hint: str) -> list[dict[str, Any]]:
+    with connection(paths.sqlite_path) as conn:
+        return [
+            row_to_question(row)
+            for row in conn.execute(
+                """
+                SELECT *
+                FROM open_questions
+                WHERE page_hint = ?
+                  AND status = 'open'
+                ORDER BY created_at DESC
+                """,
+                (page_hint,),
+            )
+        ]
+
+
+def recent_page_snapshots(
+    paths: BrainPaths, page_hint: str, *, limit: int = 20
+) -> list[dict[str, Any]]:
+    with connection(paths.sqlite_path) as conn:
+        return [
+            row_to_page_snapshot(row)
+            for row in conn.execute(
+                """
+                SELECT *
+                FROM wiki_page_snapshots
+                WHERE page_path = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (page_hint, limit),
+            )
+        ]
+
+
+def record_wiki_page_snapshot(
+    paths: BrainPaths,
+    page_hint: str,
+    *,
+    before_markdown: str | None,
+    after_markdown: str | None,
+    reason: str,
+    metadata: dict[str, Any] | None = None,
+) -> str:
+    snapshot_id = new_id("wikisnap")
+    with connection(paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO wiki_page_snapshots(
+              id, page_path, before_markdown, after_markdown, before_exists,
+              after_exists, reason, metadata, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot_id,
+                page_hint,
+                before_markdown,
+                after_markdown,
+                1 if before_markdown is not None else 0,
+                1 if after_markdown is not None else 0,
+                reason,
+                dumps(metadata or {}),
+                now_iso(),
+            ),
+        )
+    return snapshot_id
+
+
+def rebuild_fact_retrieval_index(conn: Any) -> None:
+    if not table_exists(conn, "retrieval_fts"):
+        return
+    conn.execute("DELETE FROM retrieval_fts WHERE kind = 'fact'")
+    conn.execute(
+        """
+        INSERT INTO retrieval_fts(kind, target_id, title, text, heading_path, project, tags)
+        SELECT 'fact', id, COALESCE(page_hint, entity_key), statement,
+               COALESCE(section_hint, ''), '', COALESCE(source_ids, '[]')
+        FROM facts
+        WHERE status IN ('active', 'conflicted', 'needs_confirmation')
+        """
+    )
+
+
+def table_exists(conn: Any, table: str) -> bool:
+    return bool(
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'virtual') AND name = ?",
+            (table,),
+        ).fetchone()
+    )
+
+
+def markdown_diff(before: str, after: str, *, max_lines: int = 500) -> dict[str, Any]:
+    lines = list(
+        unified_diff(
+            before.splitlines(),
+            after.splitlines(),
+            fromfile="current",
+            tofile="draft",
+            lineterm="",
+        )
+    )
+    return {
+        "lines": lines[:max_lines],
+        "line_count": len(lines),
+        "truncated": len(lines) > max_lines,
+    }
+
+
+def indexed_page_relative_path(paths: BrainPaths, value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        try:
+            return candidate.resolve().relative_to(paths.wiki.resolve()).as_posix()
+        except ValueError:
+            return ""
+    return candidate.as_posix()
+
+
 def safe_fact_wiki_path(paths: BrainPaths, relative_path: str) -> Path:
     raw = str(relative_path or "").strip()
     path = Path(raw)
@@ -1935,7 +2515,11 @@ def is_managed_page(markdown: str) -> bool:
 
 
 def render_managed_page(
-    page_hint: str, facts: list[dict[str, Any]], existing_text: str = ""
+    page_hint: str,
+    facts: list[dict[str, Any]],
+    existing_text: str = "",
+    *,
+    synthesis_markdown: str | None = None,
 ) -> str:
     frontmatter, _body = parse_frontmatter(existing_text)
     title = str((frontmatter or {}).get("title") or human_title_for_path(page_hint))
@@ -1963,14 +2547,80 @@ def render_managed_page(
     body = "\n\n".join(
         f"## {heading}\n\n{content}" for heading, content in body_sections.items()
     )
+    synthesis_block = render_synthesis_block(synthesis_markdown)
     return (
         "---\n"
         f"{yaml.safe_dump(metadata, sort_keys=False).strip()}\n"
         "---\n\n"
         f"{CHIEF_OF_STAFF_MARKER}\n\n"
         f"# {title}\n\n"
+        f"{synthesis_block}"
         f"{body}\n"
     )
+
+
+def render_synthesis_block(synthesis_markdown: str | None) -> str:
+    if not synthesis_markdown:
+        return ""
+    return (
+        "## Derived Synthesis\n\n"
+        "_Non-canonical synthesis from active facts only. Canonical claims remain the fact bullets below._\n\n"
+        f"{synthesis_markdown.strip()}\n\n"
+    )
+
+
+def active_page_synthesis(
+    paths: BrainPaths, page_hint: str, facts: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    current_hash = fact_set_hash(facts)
+    with connection(paths.sqlite_path) as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM wiki_page_syntheses
+            WHERE page_hint = ?
+              AND stale = 0
+            ORDER BY generated_at DESC
+            LIMIT 1
+            """,
+            (page_hint,),
+        ).fetchone()
+    if not row:
+        return None
+    synthesis = row_to_synthesis(row)
+    synthesis["current_fact_hash"] = current_hash
+    synthesis["stale_by_hash"] = bool(synthesis.get("fact_hash") and synthesis.get("fact_hash") != current_hash)
+    if synthesis["stale_by_hash"]:
+        return synthesis
+    return synthesis
+
+
+def fact_set_hash(facts: list[dict[str, Any]]) -> str:
+    payload = [
+        {
+            "id": fact.get("id"),
+            "statement": fact.get("statement"),
+            "status": fact.get("status"),
+            "source_ids": fact.get("source_ids") or [],
+            "truth_confidence": fact.get("truth_confidence", fact.get("confidence")),
+        }
+        for fact in sorted(facts, key=lambda item: str(item.get("id") or ""))
+    ]
+    return text_sha256(dumps(payload))
+
+
+def row_to_synthesis(row: Any) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "page_hint": row["page_hint"],
+        "synthesis_markdown": row["synthesis_markdown"],
+        "fact_ids": loads(row["fact_ids"], []),
+        "fact_hash": row["fact_hash"],
+        "model": row["model"],
+        "prompt_version": row["prompt_version"],
+        "generated_at": row["generated_at"],
+        "stale": bool(row["stale"]),
+    }
 
 
 def page_type_for_path(page_hint: str, frontmatter: dict[str, Any] | None) -> str:
@@ -2378,6 +3028,7 @@ def wiki_fact_dashboard(paths: BrainPaths) -> dict[str, Any]:
             "questions_by_status": dict(sorted(question_counts.items())),
         },
         "open_questions": open_questions,
+        "managed_pages": managed_fact_page_summaries(paths),
         "recent_facts": recent_facts,
         "recent_runs": recent_runs,
     }
@@ -2403,6 +3054,14 @@ def row_to_fact(row: Any) -> dict[str, Any]:
         "source_ids": loads(row["source_ids"], []),
         "observed_at": row["observed_at"],
         "confidence": row["confidence"],
+        "source_spans": loads(row_get(row, "source_spans"), []),
+        "evidence_quote": row_get(row, "evidence_quote"),
+        "extraction_method": row_get(row, "extraction_method", "legacy"),
+        "extractor_model": row_get(row, "extractor_model"),
+        "effective_at": row_get(row, "effective_at"),
+        "extraction_confidence": row_get(row, "extraction_confidence"),
+        "routing_confidence": row_get(row, "routing_confidence"),
+        "truth_confidence": row_get(row, "truth_confidence", row["confidence"]),
         "status": row["status"],
         "supersedes_id": row["supersedes_id"],
         "conflict_group_id": row["conflict_group_id"],
@@ -2425,19 +3084,96 @@ def row_to_question(row: Any) -> dict[str, Any]:
         "status": row["status"],
         "answer": loads(row["answer"], None),
         "context": loads(row["context"], {}),
+        "action_id": row_get(row, "action_id"),
+        "recommended_action": loads(row_get(row, "recommended_action"), {}),
+        "auto_resolve_after": row_get(row, "auto_resolve_after"),
+        "risk_tier": row_get(row, "risk_tier"),
+        "resolver": row_get(row, "resolver"),
+        "decided_by": row_get(row, "decided_by"),
         "created_at": row["created_at"],
         "answered_at": row["answered_at"],
     }
 
 
+def row_get(row: Any, key: str, default: Any = None) -> Any:
+    try:
+        if hasattr(row, "keys") and key not in row.keys():
+            return default
+        value = row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+    return default if value is None else value
+
+
 def row_to_curation_run(row: Any) -> dict[str, Any]:
+    summary = loads(row["summary"], {})
     return {
         "id": row["id"],
         "source_packet_id": row["source_packet_id"],
         "group_by": row["group_by"],
         "status": row["status"],
-        "summary": loads(row["summary"], {}),
+        "summary": compact_curation_run_summary(summary),
         "created_at": row["created_at"],
+    }
+
+
+def compact_curation_run_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    output: dict[str, Any] = {}
+    for key in [
+        "candidates",
+        "new_candidates",
+        "facts_created",
+        "facts_updated",
+        "auto_merged",
+        "auto_superseded",
+        "questions_created",
+        "questions_dismissed",
+        "pages_written",
+        "pages_previewed",
+    ]:
+        if key in summary:
+            output[key] = summary[key]
+    packet = summary.get("packet")
+    if isinstance(packet, dict):
+        output["packet_label"] = packet.get("label") or packet.get("id")
+        output["packet_items"] = packet.get("item_count")
+        output["packet_pages"] = packet.get("target_count")
+    absorption = summary.get("proposal_absorption")
+    if isinstance(absorption, dict):
+        output["absorbed_items"] = len(absorption.get("updated_item_ids") or [])
+        output["already_absorbed_items"] = len(
+            absorption.get("already_absorbed_item_ids") or []
+        )
+        output["fully_absorbed_batches"] = len(
+            absorption.get("fully_absorbed_batch_ids") or []
+        )
+        output["partially_absorbed_batches"] = len(
+            absorption.get("partially_absorbed_batch_ids") or []
+        )
+    lint_errors = summary.get("lint_errors") or []
+    projection_errors = summary.get("projection_errors") or []
+    if lint_errors:
+        output["lint_errors"] = len(lint_errors)
+    if projection_errors:
+        output["projection_errors"] = len(projection_errors)
+    return output
+
+
+def row_to_page_snapshot(row: Any) -> dict[str, Any]:
+    before_markdown = row["before_markdown"]
+    after_markdown = row["after_markdown"]
+    return {
+        "id": row["id"],
+        "page_path": row["page_path"],
+        "before_exists": bool(row["before_exists"]),
+        "after_exists": bool(row["after_exists"]),
+        "reason": row["reason"],
+        "metadata": loads(row["metadata"], {}),
+        "created_at": row["created_at"],
+        "before_markdown": before_markdown,
+        "after_markdown": after_markdown,
+        "before_preview": compact_statement(before_markdown or "", 180),
+        "after_preview": compact_statement(after_markdown or "", 180),
     }
 
 

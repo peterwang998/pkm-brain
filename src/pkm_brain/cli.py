@@ -27,6 +27,7 @@ from .automation import (
 )
 from .capture import AgentLogCapture
 from .db import connection, rows
+from .evals import run_eval
 from .llm import provider_status
 from .memory_proposals import propose_failure_memories_from_sources, propose_memories_from_lineage
 from .mcp_server import create_mcp
@@ -67,6 +68,7 @@ wiki_proposals_app = typer.Typer(help="Wiki proposal review commands.")
 memory_app = typer.Typer(help="Typed memory commands.")
 context_app = typer.Typer(help="Context lineage and feedback commands.")
 llm_app = typer.Typer(help="LLM provider commands.")
+eval_app = typer.Typer(help="Chief-of-Staff eval commands.")
 runs_app = typer.Typer(help="Pipeline run commands.")
 provenance_app = typer.Typer(help="Provenance validation commands.")
 capture_app = typer.Typer(help="Capture external sources into the inbox.")
@@ -82,6 +84,7 @@ wiki_app.add_typer(wiki_proposals_app, name="proposals")
 app.add_typer(memory_app, name="memory")
 app.add_typer(context_app, name="context")
 app.add_typer(llm_app, name="llm")
+app.add_typer(eval_app, name="eval")
 app.add_typer(runs_app, name="runs")
 app.add_typer(provenance_app, name="provenance")
 app.add_typer(capture_app, name="capture")
@@ -411,6 +414,23 @@ def retrieve_context(
 ) -> None:
     result = service(home).retrieve_context(task, project=project, budget=budget, mode=mode, debug=debug)
     console.print_json(json.dumps(result))
+
+
+@eval_app.command("run")
+def eval_run(
+    suite: Optional[str] = typer.Option(None, "--suite", help="Eval suite: extraction, routing, topology, conflict, or retrieval."),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    svc = service(home)
+    svc.init_workspace()
+    try:
+        result = run_eval(svc.paths, suite=suite)
+    except ValueError as exc:
+        console.print(str(exc))
+        raise typer.Exit(1)
+    console.print_json(json.dumps(result))
+    if not result["passed"]:
+        raise typer.Exit(1)
 
 
 @context_app.command("feedback")

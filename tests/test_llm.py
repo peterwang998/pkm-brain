@@ -76,3 +76,40 @@ def test_codex_provider_falls_back_on_model_selection_error(monkeypatch: pytest.
     assert provider.complete("return JSON") == '{"ok": true}'
     assert calls == ["missing-model", "gpt-5.4-mini"]
     assert provider.model == "gpt-5.4-mini"
+
+
+def test_complete_json_repairs_malformed_response() -> None:
+    class FakeProvider:
+        name = "fake"
+        model = "fake-model"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def complete(self, prompt: str) -> str:
+            self.calls += 1
+            if self.calls == 1:
+                return "not json"
+            assert "Repair the previous response" in prompt
+            return '{"ok": true}'
+
+    provider = FakeProvider()
+
+    assert llm.complete_json("return ok", llm_provider=provider) == {"ok": True}
+    assert provider.calls == 2
+
+
+def test_role_specific_provider_model_overrides_global(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("PKM_BRAIN_LLM_PROVIDER", "openai")
+    monkeypatch.setenv("PKM_BRAIN_OPENAI_MODEL", "global-model")
+    monkeypatch.setenv("PKM_BRAIN_LLM_CRITIC_PROVIDER", "openai")
+    monkeypatch.setenv("PKM_BRAIN_LLM_CRITIC_MODEL", "critic-model")
+    monkeypatch.setenv("PKM_BRAIN_LLM_CRITIC_MODEL_FALLBACKS", "critic-fallback")
+
+    provider = llm.get_provider(role="critic")
+
+    assert isinstance(provider, OpenAIProvider)
+    assert provider.model == "critic-model"
+    assert provider.models == ["critic-model", "critic-fallback"]
+    assert llm.provider_status(role="critic")["model"] == "critic-model"

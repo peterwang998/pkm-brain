@@ -14,6 +14,7 @@ from pkm_brain.title_utils import MAX_DOCUMENT_TITLE_CHARS, TITLE_TRUNCATION_SUF
 from pkm_brain.util import text_sha256, token_count
 from pkm_brain.wiki import lint_wiki, parse_frontmatter, synthesize_wiki
 from pkm_brain.wiki_compiler import clean_agent_log_preview, select_compiler_sources
+from pkm_brain.wiki_facts import rebuild_fact_retrieval_index
 from pkm_brain.wiki_proposals import apply_wiki_proposal, create_wiki_proposal, inspect_wiki_proposal, latest_documents, record_wiki_interview
 
 
@@ -282,6 +283,47 @@ def test_agent_session_log_sanitizer_preserves_short_tool_arguments() -> None:
     assert "Add focused sanitizer tests" in indexed
     assert "compact tool call explains" in indexed
     assert "[omitted" not in indexed
+
+
+def test_agent_session_log_sanitizer_redacts_retrieval_negative_controls() -> None:
+    indexed = sanitize_agent_session_log(
+        "## User Requests\n\n"
+        "Keep fixed negative controls like ZephyrMart geothermal coffee roasting in Iceland.\n\n"
+        "## Assistant Responses\n\n"
+        "The eval report mentions zephyrmart geothermal coffee roasting in iceland again.\n"
+    )
+
+    assert "ZephyrMart geothermal coffee roasting in Iceland" not in indexed
+    assert "zephyrmart geothermal coffee roasting in iceland" not in indexed
+    assert indexed.count("[omitted retrieval negative-control fixture]") == 2
+    assert "Keep fixed negative controls like" in indexed
+    assert "The eval report mentions" in indexed
+
+
+def test_ingested_agent_session_logs_do_not_index_retrieval_negative_controls(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    log = svc.paths.inbox / "agent_logs" / "codex" / "eval-session.md"
+    log.parent.mkdir(parents=True)
+    log.write_text(
+        "---\n"
+        'source_type: "agent_session_log"\n'
+        'session_id: "eval-session"\n'
+        "---\n\n"
+        "## User Requests\n\n"
+        "Run negative control ZephyrMart geothermal coffee roasting in Iceland.\n",
+        encoding="utf-8",
+    )
+
+    result = svc.ingest()
+
+    assert result.changed == 1
+    with connection(svc.paths.sqlite_path) as conn:
+        document = conn.execute("SELECT raw_path FROM documents").fetchone()
+        indexed_text = conn.execute("SELECT text FROM chunks").fetchone()["text"]
+
+    assert "ZephyrMart geothermal coffee roasting in Iceland" in Path(document["raw_path"]).read_text(encoding="utf-8")
+    assert "ZephyrMart geothermal coffee roasting in Iceland" not in indexed_text
+    assert "[omitted retrieval negative-control fixture]" in indexed_text
 
 
 def test_index_doctor_reports_lancedb_health(tmp_path: Path) -> None:
@@ -1418,6 +1460,8 @@ def test_memory_audit_accepts_failure_pattern_and_rejects_invalid_type(tmp_path:
     svc = service_for(tmp_path)
     svc.init_workspace()
     svc.propose_memory("AgentFailurePatternMemory", "agent:codex", "When tests fail, inspect the failing assertion before editing.", ["agent_session:test"], 0.8)
+    svc.propose_memory("BusinessIdeaMemory", "user:Peter:business_ideas", "A user-scoped business idea.", ["agent_session:test"], 0.8)
+    svc.propose_memory("PersonalLogisticsMemory", "user:Peter:home", "A user-scoped logistics fact.", ["agent_session:test"], 0.8)
     invalid_id = svc.propose_memory("NopeMemory", "global", "Invalid memory type.", ["agent_session:test"], 0.4)
     legacy_type_id = svc.propose_memory(
         "infrastructure",
@@ -1440,6 +1484,26 @@ def test_memory_audit_accepts_failure_pattern_and_rejects_invalid_type(tmp_path:
     assert any(legacy_type_id in error and "invalid memory_type infrastructure" in error for error in audit["errors"])
     assert any(invalid_scope_id in error and "invalid scope user" in error for error in audit["errors"])
     assert not any("AgentFailurePatternMemory" in error for error in audit["errors"])
+    assert not any("BusinessIdeaMemory" in error for error in audit["errors"])
+    assert not any("PersonalLogisticsMemory" in error for error in audit["errors"])
+
+
+def test_memory_audit_warns_for_inactive_legacy_schema(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    archived_id = svc.propose_memory(
+        "FactMemory",
+        "legacy-scope",
+        "Archived legacy memory should not fail nightly maintenance.",
+        ["agent_session:test"],
+        0.4,
+    )
+    svc.archive_memory(archived_id)
+
+    audit = audit_memories(svc.paths)
+
+    assert audit["errors"] == []
+    assert any(archived_id in warning and "invalid scope legacy-scope" in warning for warning in audit["warnings"])
 
 
 def test_memory_review_status_updates(tmp_path: Path) -> None:
@@ -1719,6 +1783,66 @@ def test_wiki_proposal_interview_and_apply_patches_section(tmp_path: Path) -> No
     assert "New source-backed summary." in text
     assert "Old summary." not in text
     assert inspect_wiki_proposal(svc.paths, batch_id)["status"] == "applied"
+
+
+def test_retrieve_context_returns_facts_and_contested_pairs(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    with connection(svc.paths.sqlite_path) as conn:
+        for fact_id, statement, status, group_id, truth_confidence in [
+            ("fact_active", "Fact retrieval marker is authoritative.", "active", None, 0.8),
+            ("fact_old", "Fact retrieval marker is stale.", "superseded", None, 0.8),
+            ("fact_low", "Low confidence fact retrieval marker.", "active", None, 0.2),
+            ("fact_left", "Contested marker is blue.", "conflicted", "factconflict_test", 0.8),
+            ("fact_right", "Contested marker is green.", "conflicted", "factconflict_test", 0.8),
+            ("fact_weak", "Keep the Buy Me a Coffee link as a small About-page item.", "active", None, 0.9),
+        ]:
+            conn.execute(
+                """
+                INSERT INTO facts(
+                  id, statement, entity_key, page_hint, section_hint, source_ids,
+                  observed_at, confidence, status, conflict_group_id, metadata,
+                  created_at, truth_confidence
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    fact_id,
+                    statement,
+                    "concept:test:summary",
+                    "concepts/test.md",
+                    "Summary",
+                    "[]",
+                    "2026-06-23T00:00:00+00:00",
+                    truth_confidence,
+                    status,
+                    group_id,
+                    "{}",
+                    "2026-06-23T00:00:00+00:00",
+                    truth_confidence,
+                ),
+            )
+        rebuild_fact_retrieval_index(conn)
+
+    active_context = svc.retrieve_context("fact retrieval marker")
+    contested_context = svc.retrieve_context("contested marker")
+    negative_context = svc.retrieve_context("ZephyrMart geothermal coffee roasting in Iceland")
+
+    active_ids = {fact["id"] for fact in active_context["relevant_facts"]}
+    assert "fact_active" in active_ids
+    assert "fact_old" not in active_ids
+    assert "fact_low" not in active_ids
+    assert "fact_weak" not in active_ids
+    contested = [
+        fact
+        for fact in contested_context["relevant_facts"]
+        if fact["id"] == "fact_left"
+    ][0]
+    assert contested["contested"] is True
+    assert {fact["id"] for fact in contested["contested_facts"]} == {
+        "fact_left",
+        "fact_right",
+    }
+    assert negative_context["relevant_facts"] == []
 
 
 def test_agent_session_write(tmp_path: Path) -> None:

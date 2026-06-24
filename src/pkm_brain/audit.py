@@ -15,9 +15,12 @@ VALID_MEMORY_TYPES = {
     "OpenLoopMemory",
     "FactMemory",
     "AgentFailurePatternMemory",
+    "BusinessIdeaMemory",
+    "PersonalLogisticsMemory",
 }
 VALID_MEMORY_STATUSES = {"proposed", "active", "superseded", "rejected", "archived"}
-VALID_SCOPE_PREFIXES = ("global", "project:", "repo:", "agent:", "topic:")
+VALID_SCOPE_PREFIXES = ("global", "project:", "repo:", "agent:", "topic:", "user:")
+INACTIVE_MEMORY_STATUSES = {"superseded", "rejected", "archived"}
 
 
 def audit_memories(paths: BrainPaths) -> dict[str, Any]:
@@ -29,17 +32,40 @@ def audit_memories(paths: BrainPaths) -> dict[str, Any]:
             mid = memory["id"]
             memory_type = str(memory["memory_type"])
             scope = str(memory["scope"])
+            status = str(memory["status"])
             if memory_type not in VALID_MEMORY_TYPES:
-                errors.append(f"{mid}: invalid memory_type {memory_type}")
-            if memory["status"] not in VALID_MEMORY_STATUSES:
-                errors.append(f"{mid}: invalid status {memory['status']}")
+                append_memory_schema_issue(
+                    errors,
+                    warnings,
+                    status,
+                    f"{mid}: invalid memory_type {memory_type}",
+                )
+            if status not in VALID_MEMORY_STATUSES:
+                errors.append(f"{mid}: invalid status {status}")
             if not any(scope.startswith(prefix) for prefix in VALID_SCOPE_PREFIXES):
-                errors.append(f"{mid}: invalid scope {scope}")
+                append_memory_schema_issue(
+                    errors,
+                    warnings,
+                    status,
+                    f"{mid}: invalid scope {scope}",
+                )
             if not loads(memory["source_ids"], []):
                 warnings.append(f"{mid}: missing source_ids")
             if memory["confidence"] is None:
                 errors.append(f"{mid}: missing confidence")
     return {"memories": len(memories), "errors": errors, "warnings": warnings}
+
+
+def append_memory_schema_issue(
+    errors: list[str],
+    warnings: list[str],
+    status: str,
+    message: str,
+) -> None:
+    if status in INACTIVE_MEMORY_STATUSES:
+        warnings.append(message)
+        return
+    errors.append(message)
 
 
 def provenance_check(paths: BrainPaths) -> dict[str, Any]:

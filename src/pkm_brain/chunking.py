@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import re
 
 from .util import text_sha256, token_count
@@ -10,6 +11,7 @@ DEFAULT_OVERLAP_TOKENS = 200
 MAX_AGENT_SESSION_BLOCK_CHARS = 3000
 MAX_AGENT_SESSION_LINE_CHARS = 1200
 MAX_AGENT_SESSION_TOOL_DETAIL_LINES = 4
+RETRIEVAL_NEGATIVE_CONTROL_REDACTION = "[omitted retrieval negative-control fixture]"
 
 RETRIEVAL_BLOB_MARKERS = (
     '"active_memories"',
@@ -102,7 +104,7 @@ def sanitize_agent_session_block(block: str) -> str:
     if looks_like_retrieval_blob(stripped):
         return "[omitted retrieved context dump]"
     if looks_like_large_tool_output(stripped):
-        return summarize_large_tool_output(stripped)
+        return redact_retrieval_negative_control_fixtures(summarize_large_tool_output(stripped))
     if looks_like_large_json_blob(stripped):
         return "[omitted large JSON tool result]"
 
@@ -129,10 +131,29 @@ def sanitize_agent_session_block(block: str) -> str:
         ):
             omitted_long_lines += 1
             continue
-        lines.append(line)
+        lines.append(redact_retrieval_negative_control_fixtures(line))
     if omitted_long_lines:
         lines.append(f"[omitted {omitted_long_lines} noisy log line(s)]")
-    return "\n".join(lines).strip()
+    return redact_retrieval_negative_control_fixtures("\n".join(lines).strip())
+
+
+def redact_retrieval_negative_control_fixtures(text: str) -> str:
+    redacted = text
+    for query in retrieval_negative_control_queries():
+        redacted = re.sub(re.escape(query), RETRIEVAL_NEGATIVE_CONTROL_REDACTION, redacted, flags=re.IGNORECASE)
+    return redacted
+
+
+@lru_cache(maxsize=1)
+def retrieval_negative_control_queries() -> tuple[str, ...]:
+    from .retrieval_fixtures import RETRIEVAL_GOLDEN_CASES
+
+    queries = {
+        str(case.get("query") or "").strip()
+        for case in RETRIEVAL_GOLDEN_CASES
+        if case.get("kind") == "negative_control" and case.get("query")
+    }
+    return tuple(sorted(queries, key=len, reverse=True))
 
 
 def summarize_large_tool_output(text: str) -> str:

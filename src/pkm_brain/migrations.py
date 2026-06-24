@@ -247,6 +247,339 @@ def _migration_007_add_wiki_change_item_status(conn: sqlite3.Connection) -> None
     )
 
 
+def _migration_008_create_wiki_page_snapshots(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS wiki_page_snapshots (
+          id TEXT PRIMARY KEY,
+          page_path TEXT NOT NULL,
+          before_markdown TEXT,
+          after_markdown TEXT,
+          before_exists INTEGER NOT NULL DEFAULT 0,
+          after_exists INTEGER NOT NULL DEFAULT 0,
+          reason TEXT NOT NULL,
+          metadata TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_wiki_page_snapshots_page
+        ON wiki_page_snapshots(page_path, created_at)
+        """
+    )
+
+
+def _migration_009_enrich_facts(conn: sqlite3.Connection) -> None:
+    if not _table_exists(conn, "facts"):
+        return
+    _ensure_column(conn, "facts", "source_spans", "TEXT NOT NULL DEFAULT '[]'")
+    _ensure_column(conn, "facts", "evidence_quote", "TEXT")
+    _ensure_column(
+        conn,
+        "facts",
+        "extraction_method",
+        "TEXT NOT NULL DEFAULT 'legacy'",
+    )
+    _ensure_column(conn, "facts", "extractor_model", "TEXT")
+    _ensure_column(conn, "facts", "effective_at", "TEXT")
+    _ensure_column(conn, "facts", "extraction_confidence", "REAL")
+    _ensure_column(conn, "facts", "routing_confidence", "REAL")
+    _ensure_column(conn, "facts", "truth_confidence", "REAL")
+    conn.execute(
+        """
+        UPDATE facts
+        SET truth_confidence = COALESCE(truth_confidence, confidence),
+            extraction_method = COALESCE(NULLIF(extraction_method, ''), 'legacy'),
+            source_spans = COALESCE(NULLIF(source_spans, ''), '[]')
+        WHERE truth_confidence IS NULL
+           OR extraction_method IS NULL
+           OR extraction_method = ''
+           OR source_spans IS NULL
+           OR source_spans = ''
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_facts_truth
+        ON facts(status, truth_confidence)
+        """
+    )
+
+
+def _migration_010_create_cos_actions(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cos_actions (
+          id TEXT PRIMARY KEY,
+          run_id TEXT REFERENCES wiki_curation_runs(id),
+          action_type TEXT NOT NULL,
+          status TEXT NOT NULL,
+          target_fact_ids TEXT NOT NULL DEFAULT '[]',
+          target_page_paths TEXT NOT NULL DEFAULT '[]',
+          target_contract_ids TEXT NOT NULL DEFAULT '[]',
+          action_features TEXT NOT NULL DEFAULT '{}',
+          proposed_by TEXT,
+          critic_by TEXT,
+          critic_decision TEXT,
+          confidence REAL,
+          risk_tier TEXT,
+          policy_id TEXT,
+          policy_version INTEGER,
+          policy_decision TEXT,
+          autonomy_level TEXT,
+          inverse_action_json TEXT NOT NULL DEFAULT '{}',
+          evidence_json TEXT NOT NULL DEFAULT '{}',
+          applied_state_hash TEXT,
+          audit_status TEXT NOT NULL DEFAULT 'unaudited',
+          created_at TEXT NOT NULL,
+          applied_at TEXT,
+          reverted_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_cos_actions_status
+        ON cos_actions(status, created_at)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_cos_actions_run
+        ON cos_actions(run_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_cos_actions_audit
+        ON cos_actions(audit_status, applied_at)
+        """
+    )
+
+
+def _migration_011_create_cos_policy(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cos_policy (
+          id TEXT PRIMARY KEY,
+          version INTEGER NOT NULL,
+          priority INTEGER NOT NULL,
+          match_action_types TEXT NOT NULL DEFAULT '["*"]',
+          match_predicate TEXT NOT NULL DEFAULT '{}',
+          autonomy_level TEXT NOT NULL,
+          critic_required INTEGER NOT NULL DEFAULT 0,
+          timeout_allowed INTEGER NOT NULL DEFAULT 0,
+          timeout_after_seconds INTEGER,
+          audit_sample_rate REAL NOT NULL DEFAULT 0.0,
+          demotion_threshold REAL,
+          auto_revert_signals TEXT NOT NULL DEFAULT '[]',
+          active INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_cos_policy_active
+        ON cos_policy(active, version, priority)
+        """
+    )
+    created_at = now_iso()
+    seed_rows = [
+        (
+            "policy_v1_l0_noop_canonical",
+            1,
+            10,
+            '["canonicalize_page"]',
+            '{"eq":{"deterministic":true},"lte":{"risk_score":0.05},"exists":{"target_page_paths":true}}',
+            "L0",
+            0,
+            0,
+            None,
+            0.05,
+            0.02,
+            '["audit_sampled_bad"]',
+            1,
+            created_at,
+        ),
+        (
+            "policy_v1_l3_truth_resolution",
+            1,
+            20,
+            '["resolve_conflict","fact_supersede"]',
+            '{"eq":{"truth_mutation":true}}',
+            "L3",
+            0,
+            0,
+            None,
+            1.0,
+            None,
+            "[]",
+            1,
+            created_at,
+        ),
+        (
+            "policy_v1_l3_all_writes",
+            1,
+            1000,
+            '["*"]',
+            "{}",
+            "L3",
+            0,
+            0,
+            None,
+            1.0,
+            None,
+            "[]",
+            1,
+            created_at,
+        ),
+    ]
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO cos_policy(
+          id, version, priority, match_action_types, match_predicate, autonomy_level,
+          critic_required, timeout_allowed, timeout_after_seconds, audit_sample_rate,
+          demotion_threshold, auto_revert_signals, active, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        seed_rows,
+    )
+
+
+def _migration_012_create_page_contracts(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS page_contracts (
+          id TEXT PRIMARY KEY,
+          page_hint TEXT NOT NULL,
+          canonical_entity TEXT,
+          page_scope TEXT,
+          retrieval_purpose TEXT,
+          what_belongs_here TEXT,
+          what_does_not_belong_here TEXT,
+          freshness_policy TEXT,
+          related_pages TEXT NOT NULL DEFAULT '[]',
+          version INTEGER NOT NULL DEFAULT 1,
+          status TEXT NOT NULL DEFAULT 'active',
+          created_at TEXT NOT NULL,
+          updated_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_page_contracts_page
+        ON page_contracts(page_hint, status)
+        """
+    )
+
+
+def _migration_013_create_wiki_page_syntheses(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS wiki_page_syntheses (
+          id TEXT PRIMARY KEY,
+          page_hint TEXT NOT NULL,
+          synthesis_markdown TEXT NOT NULL,
+          fact_ids TEXT NOT NULL DEFAULT '[]',
+          fact_hash TEXT,
+          model TEXT,
+          prompt_version TEXT,
+          generated_at TEXT NOT NULL,
+          stale INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_wiki_page_syntheses_page
+        ON wiki_page_syntheses(page_hint, generated_at)
+        """
+    )
+
+
+def _migration_014_extend_open_questions(conn: sqlite3.Connection) -> None:
+    if not _table_exists(conn, "open_questions"):
+        return
+    _ensure_column(conn, "open_questions", "action_id", "TEXT")
+    _ensure_column(
+        conn,
+        "open_questions",
+        "recommended_action",
+        "TEXT NOT NULL DEFAULT '{}'",
+    )
+    _ensure_column(conn, "open_questions", "auto_resolve_after", "TEXT")
+    _ensure_column(conn, "open_questions", "risk_tier", "TEXT")
+    _ensure_column(conn, "open_questions", "resolver", "TEXT")
+    _ensure_column(conn, "open_questions", "decided_by", "TEXT")
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_open_questions_action
+        ON open_questions(action_id)
+        """
+    )
+
+
+def _migration_015_create_shared_retrieval_fts(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE VIRTUAL TABLE IF NOT EXISTS retrieval_fts USING fts5(
+          kind UNINDEXED,
+          target_id UNINDEXED,
+          title,
+          text,
+          heading_path,
+          project,
+          tags
+        )
+        """
+    )
+    conn.execute("DELETE FROM retrieval_fts WHERE kind IN ('chunk', 'fact')")
+    if _table_exists(conn, "chunk_fts"):
+        conn.execute(
+            """
+            INSERT INTO retrieval_fts(kind, target_id, title, text, heading_path, project, tags)
+            SELECT 'chunk', chunk_id, title, text, heading_path, project, tags
+            FROM chunk_fts
+            """
+        )
+    elif _table_exists(conn, "chunks") and _table_exists(conn, "documents"):
+        conn.execute(
+            """
+            INSERT INTO retrieval_fts(kind, target_id, title, text, heading_path, project, tags)
+            SELECT 'chunk', c.id, d.title, c.text, c.heading_path,
+                   COALESCE(d.project, ''), COALESCE(d.tags, '[]')
+            FROM chunks c
+            JOIN documents d ON d.id = c.document_id
+            """
+        )
+    if _table_exists(conn, "facts"):
+        conn.execute(
+            """
+            INSERT INTO retrieval_fts(kind, target_id, title, text, heading_path, project, tags)
+            SELECT 'fact', id, COALESCE(page_hint, entity_key), statement,
+                   COALESCE(section_hint, ''), '', COALESCE(source_ids, '[]')
+            FROM facts
+            WHERE status IN ('active', 'conflicted', 'needs_confirmation')
+            """
+        )
+
+
+def _migration_016_context_lineage_fact_target(conn: sqlite3.Connection) -> None:
+    if not _table_exists(conn, "context_lineage_events"):
+        return
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_context_lineage_fact
+        ON context_lineage_events(target_id, event_type, created_at)
+        WHERE target_type = 'fact'
+        """
+    )
+
+
 MIGRATIONS: list[Migration] = [
     (1, "add_origin_identity", _migration_001_add_origin_identity),
     (2, "create_sync_runs", _migration_002_create_sync_runs),
@@ -259,6 +592,15 @@ MIGRATIONS: list[Migration] = [
     (5, "drop_documents_sensitivity", _migration_005_drop_documents_sensitivity),
     (6, "create_wiki_fact_curation", _migration_006_create_wiki_fact_curation),
     (7, "add_wiki_change_item_status", _migration_007_add_wiki_change_item_status),
+    (8, "create_wiki_page_snapshots", _migration_008_create_wiki_page_snapshots),
+    (9, "enrich_facts", _migration_009_enrich_facts),
+    (10, "create_cos_actions", _migration_010_create_cos_actions),
+    (11, "create_cos_policy", _migration_011_create_cos_policy),
+    (12, "create_page_contracts", _migration_012_create_page_contracts),
+    (13, "create_wiki_page_syntheses", _migration_013_create_wiki_page_syntheses),
+    (14, "extend_open_questions", _migration_014_extend_open_questions),
+    (15, "create_shared_retrieval_fts", _migration_015_create_shared_retrieval_fts),
+    (16, "context_lineage_fact_target", _migration_016_context_lineage_fact_target),
 ]
 
 

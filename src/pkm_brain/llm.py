@@ -8,6 +8,7 @@ import tempfile
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -19,6 +20,7 @@ ANTHROPIC_DEFAULT_MODEL = "claude-sonnet-4-5"
 ANTHROPIC_DEFAULT_FALLBACK_MODELS: tuple[str, ...] = ()
 CODEX_DEFAULT_MODEL = "gpt-5.5"
 CODEX_DEFAULT_FALLBACK_MODELS = ("gpt-5.4", "gpt-5.3-codex", "gpt-5.2", "gpt-5")
+LLM_ROLES = {"extractor", "gardener", "resolver", "critic", "synthesizer", "auditor"}
 
 
 class LLMConfigurationError(RuntimeError):
@@ -229,21 +231,27 @@ class CodexProvider:
             return output
 
 
-def get_provider(provider: str | None = None) -> LLMProvider:
-    selected = selected_provider(provider)
-    if selected == "openai":
-        return OpenAIProvider()
-    if selected == "anthropic":
-        return AnthropicProvider()
-    if selected == "ollama":
-        return OllamaProvider()
-    if selected == "codex":
-        return CodexProvider()
+def get_provider(provider: str | None = None, *, role: str | None = None) -> LLMProvider:
+    selected = selected_provider(provider, role=role)
+    with role_model_environment(selected, role):
+        if selected == "openai":
+            return OpenAIProvider()
+        if selected == "anthropic":
+            return AnthropicProvider()
+        if selected == "ollama":
+            return OllamaProvider()
+        if selected == "codex":
+            return CodexProvider()
     raise LLMConfigurationError("LLM provider must be one of: openai, anthropic, ollama, codex")
 
 
-def provider_status(provider: str | None = None) -> dict[str, Any]:
-    selected = selected_provider(provider)
+def provider_status(provider: str | None = None, *, role: str | None = None) -> dict[str, Any]:
+    selected = selected_provider(provider, role=role)
+    with role_model_environment(selected, role):
+        return _provider_status_for_selected(selected)
+
+
+def _provider_status_for_selected(selected: str) -> dict[str, Any]:
     if selected not in {"openai", "anthropic", "ollama", "codex"}:
         return ProviderStatus(provider=selected or "unset", model=None, configured=False, missing=["valid provider"]).__dict__
     if selected == "openai":
@@ -306,13 +314,96 @@ def provider_status(provider: str | None = None) -> dict[str, Any]:
         configured=not missing,
         missing=missing,
         base_url=os.environ.get("PKM_BRAIN_OLLAMA_BASE_URL", "http://localhost:11434"),
-        fallback_models=models[1:],
-        cost_source="Local Ollama runtime",
-    ).__dict__
+            fallback_models=models[1:],
+            cost_source="Local Ollama runtime",
+        ).__dict__
 
 
-def selected_provider(provider: str | None = None) -> str:
-    return (provider or os.environ.get("PKM_BRAIN_LLM_PROVIDER") or DEFAULT_LLM_PROVIDER).strip().lower()
+def selected_provider(provider: str | None = None, *, role: str | None = None) -> str:
+    role_provider = None
+    if role:
+        role_provider = os.environ.get(role_env(role, "PROVIDER"))
+    return (
+        provider
+        or role_provider
+        or os.environ.get("PKM_BRAIN_LLM_PROVIDER")
+        or DEFAULT_LLM_PROVIDER
+    ).strip().lower()
+
+
+def role_env(role: str, suffix: str) -> str:
+    normalized = role.strip().upper()
+    if normalized.lower() not in LLM_ROLES:
+        raise LLMConfigurationError(f"unknown LLM role: {role}")
+    return f"PKM_BRAIN_LLM_{normalized}_{suffix}"
+
+
+@contextmanager
+def role_model_environment(provider: str, role: str | None) -> Any:
+    if not role:
+        yield
+        return
+    model = os.environ.get(role_env(role, "MODEL"))
+    fallbacks = os.environ.get(role_env(role, "MODEL_FALLBACKS"))
+    env_map = provider_model_env_names(provider)
+    overrides: dict[str, str] = {}
+    if model is not None and env_map.get("model"):
+        overrides[env_map["model"]] = model
+    if fallbacks is not None and env_map.get("fallbacks"):
+        overrides[env_map["fallbacks"]] = fallbacks
+    previous = {key: os.environ.get(key) for key in overrides}
+    try:
+        for key, value in overrides.items():
+            os.environ[key] = value
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def provider_model_env_names(provider: str) -> dict[str, str]:
+    if provider == "openai":
+        return {"model": "PKM_BRAIN_OPENAI_MODEL", "fallbacks": "PKM_BRAIN_OPENAI_MODEL_FALLBACKS"}
+    if provider == "anthropic":
+        return {"model": "PKM_BRAIN_ANTHROPIC_MODEL", "fallbacks": "PKM_BRAIN_ANTHROPIC_MODEL_FALLBACKS"}
+    if provider == "ollama":
+        return {"model": "PKM_BRAIN_OLLAMA_MODEL", "fallbacks": "PKM_BRAIN_OLLAMA_MODEL_FALLBACKS"}
+    if provider == "codex":
+        return {"model": "PKM_BRAIN_CODEX_MODEL", "fallbacks": "PKM_BRAIN_CODEX_MODEL_FALLBACKS"}
+    return {}
+
+
+def complete_json(
+    prompt: str,
+    *,
+    schema: dict[str, Any] | None = None,
+    provider: str | None = None,
+    role: str | None = None,
+    llm_provider: LLMProvider | None = None,
+    max_attempts: int = 2,
+) -> dict[str, Any]:
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+    active_provider = llm_provider or get_provider(provider, role=role)
+    current_prompt = json_prompt(prompt, schema=schema)
+    last_response = ""
+    last_error: Exception | None = None
+    for attempt in range(max_attempts):
+        last_response = active_provider.complete(current_prompt)
+        try:
+            parsed = parse_json_object(last_response)
+            if schema is not None:
+                validate_minimal_schema(parsed, schema)
+            return parsed
+        except (json.JSONDecodeError, ValueError, TypeError) as exc:
+            last_error = exc
+            if attempt == max_attempts - 1:
+                break
+            current_prompt = repair_json_prompt(prompt, last_response, exc, schema=schema)
+    raise LLMProviderError(f"LLM did not return valid JSON after {max_attempts} attempts: {last_error}") from last_error
 
 
 def model_candidates(
@@ -325,6 +416,71 @@ def model_candidates(
     fallback_value = os.environ.get(fallback_env)
     fallback_models = list(default_fallbacks) if fallback_value is None else split_model_list(fallback_value)
     return dedupe_models([primary, *fallback_models])
+
+
+def json_prompt(prompt: str, *, schema: dict[str, Any] | None = None) -> str:
+    schema_text = f"\nRequired JSON shape:\n{json.dumps(schema, sort_keys=True)}\n" if schema else ""
+    return (
+        "Return exactly one valid JSON object. Do not wrap it in Markdown."
+        f"{schema_text}\nPrompt:\n{prompt}"
+    )
+
+
+def repair_json_prompt(
+    original_prompt: str,
+    invalid_response: str,
+    error: Exception,
+    *,
+    schema: dict[str, Any] | None = None,
+) -> str:
+    clipped = invalid_response[:4000]
+    schema_text = f"\nRequired JSON shape:\n{json.dumps(schema, sort_keys=True)}\n" if schema else ""
+    return (
+        "Repair the previous response so it is exactly one valid JSON object. "
+        "Return only the repaired JSON object.\n"
+        f"Parse error: {error}\n"
+        f"{schema_text}"
+        f"Original prompt:\n{original_prompt[:4000]}\n"
+        f"Invalid response:\n{clipped}"
+    )
+
+
+def parse_json_object(response: str) -> dict[str, Any]:
+    text = strip_json_markdown(response.strip())
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = json.loads(extract_json_object_text(text))
+    if not isinstance(parsed, dict):
+        raise ValueError("expected a JSON object")
+    return parsed
+
+
+def strip_json_markdown(text: str) -> str:
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        return "\n".join(lines).strip()
+    return text
+
+
+def extract_json_object_text(text: str) -> str:
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise json.JSONDecodeError("no JSON object found", text, 0)
+    return text[start : end + 1]
+
+
+def validate_minimal_schema(value: dict[str, Any], schema: dict[str, Any]) -> None:
+    required = schema.get("required")
+    if isinstance(required, list):
+        missing = [str(key) for key in required if str(key) not in value]
+        if missing:
+            raise ValueError(f"JSON object missing required keys: {', '.join(missing)}")
 
 
 def split_model_list(value: str) -> list[str]:
