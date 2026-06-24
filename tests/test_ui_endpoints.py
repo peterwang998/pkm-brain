@@ -163,6 +163,29 @@ def test_status_endpoint_returns_service_layer_json(tmp_path: Path) -> None:
     assert surfaces["CoS action ledger"]["searched"] is False
 
 
+def test_status_endpoint_counts_only_reviewable_legacy_packets(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    svc = BrainService(paths, prefer_model_embeddings=False)
+    svc.init_workspace()
+    insert_document(paths)
+    write_concept_page(paths)
+    create_section_proposal(paths)
+    rejected_batch = create_section_proposal(paths)
+    with connection(paths.sqlite_path) as conn:
+        conn.execute(
+            "UPDATE wiki_change_batches SET status = 'rejected' WHERE id = ?",
+            (rejected_batch,),
+        )
+
+    with running_ui(paths) as (host, port, token):
+        status, body = request_json(host, port, token, "GET", "/api/status")
+
+    surfaces = {surface["surface"]: surface for surface in body["retrieval_surfaces"]}
+    assert status == 200
+    assert surfaces["Legacy wiki packets"]["count"] == 1
+    assert surfaces["Legacy wiki packets"]["searched"] is False
+
+
 def test_memory_endpoint_lists_status_filtered_memories(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
     svc = BrainService(paths, prefer_model_embeddings=False)

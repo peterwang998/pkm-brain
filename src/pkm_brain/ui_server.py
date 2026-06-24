@@ -415,11 +415,22 @@ def retrieval_surface_status(paths: BrainPaths) -> list[dict[str, Any]]:
         proposed_memories = scalar_count(
             conn, "SELECT COUNT(*) FROM memories WHERE status = 'proposed'", table="memories"
         )
-        legacy_items = scalar_count(
-            conn,
-            "SELECT COUNT(*) FROM wiki_change_items WHERE status IN ('pending', 'needs_interview', 'proposed')",
-            table="wiki_change_items",
-        )
+        legacy_items = 0
+        if ui_table_exists(conn, "wiki_change_items") and ui_table_exists(
+            conn, "wiki_change_batches"
+        ):
+            review_statuses = tuple(sorted(PENDING_REVIEW_STATUSES))
+            placeholders = ",".join("?" for _ in review_statuses)
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM wiki_change_items i
+                JOIN wiki_change_batches b ON b.id = i.batch_id
+                WHERE b.status IN ({placeholders}) AND i.status = ?
+                """,
+                (*review_statuses, PENDING_ITEM_STATUS),
+            ).fetchone()
+            legacy_items = int(row[0] if row else 0)
         actions = scalar_count(conn, "SELECT COUNT(*) FROM cos_actions", table="cos_actions")
     return [
         {
