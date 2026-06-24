@@ -14,6 +14,7 @@ from .wiki_facts import (
     compact_statement,
     curate_managed_pages,
     entity_key_for_change,
+    find_existing_fact,
     normalized_statement,
     record_curation_run,
     reconcile_open_fact_questions,
@@ -302,18 +303,7 @@ def existing_candidate_count(paths: BrainPaths, candidates: list[dict[str, Any]]
 def candidate_already_exists(paths: BrainPaths, candidate: dict[str, Any]) -> bool:
     normalized = normalized_statement(candidate["statement"])
     with connection(paths.sqlite_path) as conn:
-        for fact in conn.execute(
-            """
-            SELECT statement
-            FROM facts
-            WHERE entity_key = ?
-              AND status != 'retracted'
-            """,
-            (candidate["entity_key"],),
-        ):
-            if normalized_statement(str(fact["statement"] or "")) == normalized:
-                return True
-    return False
+        return bool(find_existing_fact(conn, candidate, normalized))
 
 
 def migration_page_summaries(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
