@@ -9,6 +9,7 @@ from pkm_brain.service import BrainService
 from pkm_brain.wiki_curation_promote import promote_wiki_curation
 from pkm_brain.wiki_fact_migration import extract_fact_statements
 from pkm_brain.wiki_facts import (
+    answer_open_question,
     archive_orphan_managed_pages,
     compact_statement,
     create_confirmed_page_fact,
@@ -16,7 +17,9 @@ from pkm_brain.wiki_facts import (
     managed_fact_page_review,
     render_managed_page,
     regenerate_managed_fact_page,
+    resolve_fact_groups,
     revert_wiki_page_snapshot,
+    upsert_candidate_facts,
 )
 
 
@@ -255,6 +258,39 @@ def test_migration_fact_extraction_cleans_markdown_noise() -> None:
     assert all("#" not in statement for statement in statements)
 
 
+def test_candidate_fact_upsert_records_cos_action(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+
+    result = upsert_candidate_facts(
+        paths,
+        [
+            {
+                "statement": "The migration path records facts through the action ledger.",
+                "entity_key": "concepts:test-ledger:summary",
+                "page_hint": "concepts/test-ledger.md",
+                "section_hint": "Summary",
+                "source_ids": ["document:doc_ledger"],
+                "observed_at": "2026-06-25T00:00:00+00:00",
+                "confidence": 0.82,
+                "metadata": {"migration": "test"},
+            }
+        ],
+    )
+
+    assert len(result["created_fact_ids"]) == 1
+    with connection(paths.sqlite_path) as conn:
+        action = conn.execute(
+            "SELECT * FROM cos_actions WHERE action_type = 'fact_upsert'"
+        ).fetchone()
+        fact_count = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+
+    assert fact_count == 1
+    assert action is not None
+    assert action["status"] == "applied"
+    assert action["proposed_by"] == "wiki_fact_migration"
+
+
 def test_orphan_managed_page_is_archived_without_old_fact_bullets(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
     BrainService(paths).init_workspace()
@@ -289,6 +325,7 @@ def test_orphan_managed_page_is_archived_without_old_fact_bullets(tmp_path: Path
     assert archived[0]["path"] == str(page)
     assert archived[0]["status"] == "archived"
     assert archived[0]["snapshot_id"].startswith("wikisnap_")
+    assert archived[0]["action_id"].startswith("cosact_")
     assert "status: archived" in markdown
     assert "fact_ids: []" in markdown
     assert "The same old fact" not in markdown
@@ -338,6 +375,11 @@ def test_managed_page_review_correction_snapshots_and_revert(tmp_path: Path) -> 
         supersede_fact_ids=["fact_original"],
     )
     assert corrected["fact"]["confirmed_by_user"] is True
+    assert corrected["action"]["action_type"] == "fact_upsert"
+    assert corrected["action"]["status"] == "applied"
+    assert corrected["action"]["target_fact_ids"] == [corrected["fact"]["id"]]
+    assert corrected["supersede_action"]["action_type"] == "fact_supersede"
+    assert corrected["supersede_action"]["status"] == "applied"
     corrected_markdown = page.read_text(encoding="utf-8")
     assert "corrected fact" in corrected_markdown
     assert "original fact" not in corrected_markdown
@@ -348,6 +390,298 @@ def test_managed_page_review_correction_snapshots_and_revert(tmp_path: Path) -> 
     reverted = revert_wiki_page_snapshot(paths, correction_snapshot_id)
 
     assert reverted["revert_snapshot_id"].startswith("wikisnap_")
+    assert reverted["action"]["action_type"] == "revert_page_snapshot"
+    assert reverted["action"]["status"] == "applied"
     reverted_markdown = page.read_text(encoding="utf-8")
     assert "original fact" in reverted_markdown
     assert "corrected fact" not in reverted_markdown
+
+
+def test_resolve_fact_groups_records_display_contested_action(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    with connection(paths.sqlite_path) as conn:
+        for fact_id, statement in [
+            ("fact_conflict_left", "The test service uses Postgres for storage."),
+            ("fact_conflict_right", "The test service uses MongoDB for storage."),
+        ]:
+            conn.execute(
+                """
+                INSERT INTO facts(
+                  id, statement, entity_key, page_hint, section_hint, source_ids,
+                  observed_at, confidence, status, metadata, created_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    fact_id,
+                    statement,
+                    "concepts:test-service:summary",
+                    "concepts/test-service.md",
+                    "Summary",
+                    json.dumps([f"document:{fact_id}"]),
+                    "2026-06-23T00:00:00+00:00",
+                    0.6,
+                    "active",
+                    json.dumps({"operation": "replace_page"}),
+                    "2026-06-23T00:00:00+00:00",
+                    None,
+                ),
+            )
+
+    result = resolve_fact_groups(paths, ["concepts:test-service:summary"])
+
+    assert len(result["created_question_ids"]) == 1
+    with connection(paths.sqlite_path) as conn:
+        action = conn.execute(
+            "SELECT * FROM cos_actions WHERE action_type = 'display_contested'"
+        ).fetchone()
+        question = conn.execute(
+            "SELECT * FROM open_questions WHERE id = ?",
+            (result["created_question_ids"][0],),
+        ).fetchone()
+        statuses = {
+            row["id"]: row["status"]
+            for row in conn.execute(
+                "SELECT id, status FROM facts WHERE id IN ('fact_conflict_left', 'fact_conflict_right')"
+            )
+        }
+
+    assert action is not None
+    assert action["status"] == "applied"
+    assert question["action_id"] == action["id"]
+    assert statuses == {
+        "fact_conflict_left": "conflicted",
+        "fact_conflict_right": "conflicted",
+    }
+
+
+def test_resolver_llm_can_merge_same_claim_replacements(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    insert_replacement_fact(
+        paths,
+        "fact_resolver_left",
+        "AlphaPay retry billing uses Stripe Checkout for renewal invoices.",
+    )
+    insert_replacement_fact(
+        paths,
+        "fact_resolver_right",
+        "AlphaPay payment retry uses Stripe Checkout for renewal invoices.",
+    )
+
+    result = resolve_fact_groups(
+        paths,
+        ["concepts:resolver-test:summary"],
+        llm_provider=FakeResolverProvider("same_claim"),
+    )
+
+    assert result["resolver_judgment_count"] == 1
+    assert result["auto_merged"] == 1
+    with connection(paths.sqlite_path) as conn:
+        action = conn.execute("SELECT * FROM cos_actions WHERE action_type = 'fact_merge'").fetchone()
+        statuses = {
+            row["id"]: row["status"]
+            for row in conn.execute("SELECT id, status FROM facts WHERE id LIKE 'fact_resolver_%'")
+        }
+    assert action["proposed_by"] == "resolver"
+    assert statuses in (
+        {"fact_resolver_left": "active", "fact_resolver_right": "superseded"},
+        {"fact_resolver_left": "superseded", "fact_resolver_right": "active"},
+    )
+
+
+def test_resolver_llm_can_supersede_clear_newer_fact(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    insert_replacement_fact(
+        paths,
+        "fact_resolver_old",
+        "The resolver test SLA is two days.",
+        observed_at="2026-06-24T00:00:00+00:00",
+        confidence=0.8,
+    )
+    insert_replacement_fact(
+        paths,
+        "fact_resolver_new",
+        "The resolver test SLA is three days.",
+        observed_at="2026-06-26T00:00:00+00:00",
+        confidence=0.92,
+    )
+
+    result = resolve_fact_groups(
+        paths,
+        ["concepts:resolver-test:summary"],
+        llm_provider=FakeResolverProvider("clear_supersession", keeper_fact_id="fact_resolver_new"),
+    )
+
+    assert result["auto_superseded"] == 1
+    with connection(paths.sqlite_path) as conn:
+        old = conn.execute("SELECT status FROM facts WHERE id = 'fact_resolver_old'").fetchone()
+        new = conn.execute("SELECT status, supersedes_id FROM facts WHERE id = 'fact_resolver_new'").fetchone()
+    assert old["status"] == "superseded"
+    assert new["status"] == "active"
+    assert new["supersedes_id"] == "fact_resolver_old"
+
+
+def test_resolver_llm_same_claim_cannot_merge_direct_contradiction(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    insert_replacement_fact(
+        paths,
+        "fact_resolver_enabled",
+        "AlphaPay auto-renewal is enabled by default for annual plans.",
+    )
+    insert_replacement_fact(
+        paths,
+        "fact_resolver_disabled",
+        "AlphaPay auto-renewal is not enabled by default for annual plans.",
+    )
+
+    result = resolve_fact_groups(
+        paths,
+        ["concepts:resolver-test:summary"],
+        llm_provider=FakeResolverProvider("same_claim"),
+    )
+
+    assert result["auto_merged"] == 0
+    assert len(result["conflict_group_ids"]) == 1
+    with connection(paths.sqlite_path) as conn:
+        action = conn.execute("SELECT * FROM cos_actions WHERE action_type = 'display_contested'").fetchone()
+        statuses = {
+            row["id"]: row["status"]
+            for row in conn.execute("SELECT id, status FROM facts WHERE id LIKE 'fact_resolver_%'")
+        }
+    assert action["proposed_by"] == "resolver"
+    assert action["risk_tier"] == "high"
+    assert statuses == {
+        "fact_resolver_enabled": "conflicted",
+        "fact_resolver_disabled": "conflicted",
+    }
+
+
+def test_answer_open_question_records_resolution_action(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    with connection(paths.sqlite_path) as conn:
+        for fact_id, statement in [
+            ("fact_answer_keep", "The answer flow should keep this fact."),
+            ("fact_answer_supersede", "The answer flow should supersede this fact."),
+        ]:
+            conn.execute(
+                """
+                INSERT INTO facts(
+                  id, statement, entity_key, page_hint, section_hint, source_ids,
+                  observed_at, confidence, status, conflict_group_id, metadata,
+                  created_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    fact_id,
+                    statement,
+                    "concepts:answer-flow:summary",
+                    "concepts/answer-flow.md",
+                    "Summary",
+                    json.dumps([f"document:{fact_id}"]),
+                    "2026-06-23T00:00:00+00:00",
+                    0.7,
+                    "conflicted",
+                    "factconflict_answer",
+                    "{}",
+                    "2026-06-23T00:00:00+00:00",
+                    None,
+                ),
+            )
+        conn.execute(
+            """
+            INSERT INTO open_questions(
+              id, kind, entity_key, page_hint, fact_ids, question, options,
+              status, context, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "question_answer_flow",
+                "conflict",
+                "concepts:answer-flow:summary",
+                "concepts/answer-flow.md",
+                json.dumps(["fact_answer_keep", "fact_answer_supersede"]),
+                "Which answer-flow fact is current?",
+                "[]",
+                "open",
+                json.dumps({"conflict_group_id": "factconflict_answer"}),
+                "2026-06-23T00:00:00+00:00",
+            ),
+        )
+
+    result = answer_open_question(
+        paths,
+        "question_answer_flow",
+        selected_fact_id="fact_answer_keep",
+        answer="Confirmed by test.",
+    )
+
+    assert result["actions"][0]["action_type"] == "resolve_conflict"
+    assert result["actions"][0]["status"] == "applied"
+    with connection(paths.sqlite_path) as conn:
+        keep = conn.execute("SELECT status, confirmed_by_user FROM facts WHERE id = 'fact_answer_keep'").fetchone()
+        superseded = conn.execute("SELECT status FROM facts WHERE id = 'fact_answer_supersede'").fetchone()
+        question = conn.execute("SELECT status, action_id FROM open_questions WHERE id = 'question_answer_flow'").fetchone()
+
+    assert keep["status"] == "active"
+    assert keep["confirmed_by_user"] == 1
+    assert superseded["status"] == "superseded"
+    assert question["status"] == "answered"
+    assert question["action_id"] == result["actions"][0]["id"]
+
+
+class FakeResolverProvider:
+    name = "fake-resolver"
+    model = "fake-resolver-model"
+
+    def __init__(self, decision: str, *, keeper_fact_id: str | None = None) -> None:
+        self.decision = decision
+        self.keeper_fact_id = keeper_fact_id
+
+    def complete(self, prompt: str) -> str:
+        assert "Resolve this group of source-backed PKM facts" in prompt
+        return json.dumps(
+            {
+                "decision": self.decision,
+                "fact_ids": [],
+                "keeper_fact_id": self.keeper_fact_id,
+                "rationale": "test resolver judgment",
+                "risk_tier": "medium",
+            }
+        )
+
+
+def insert_replacement_fact(
+    paths: BrainPaths,
+    fact_id: str,
+    statement: str,
+    *,
+    observed_at: str = "2026-06-26T00:00:00+00:00",
+    confidence: float = 0.9,
+) -> None:
+    with connection(paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO facts(
+              id, statement, entity_key, page_hint, section_hint, source_ids,
+              observed_at, confidence, status, metadata, created_at, truth_confidence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                fact_id,
+                statement,
+                "concepts:resolver-test:summary",
+                "concepts/resolver-test.md",
+                "Summary",
+                json.dumps([f"document:{fact_id}"]),
+                observed_at,
+                confidence,
+                "active",
+                json.dumps({"operation": "replace_page"}),
+                observed_at,
+                confidence,
+            ),
+        )

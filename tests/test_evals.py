@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from pkm_brain.evals import run_eval
+from pkm_brain.db import connection
 from pkm_brain.paths import BrainPaths
 from pkm_brain.retrieval_fixtures import RETRIEVAL_GOLDEN_CASES
 from pkm_brain.service import BrainService
@@ -63,3 +64,190 @@ def test_retrieval_eval_can_run_directly_on_empty_brain(tmp_path: Path) -> None:
     assert Path(result["report_path"]).name.startswith(
         f"eval-retrieval-v{result['package_version']}-{result['generated_date']}-"
     )
+
+
+def test_topology_eval_uses_real_candidate_fixture_metrics(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+
+    result = run_eval(paths, suite="topology")
+
+    report = result["reports"][0]
+    assert result["passed"] is True
+    assert report["fixture_count"] >= 5
+    assert report["metrics"]["merge_split_f1"] >= report["threshold"]["merge_split_f1"]
+    assert "candidate_generation_smoke" not in report["metrics"]
+    assert report["metrics"]["false_negative_keys"] == []
+
+
+def test_conflict_eval_blocks_opposite_meaning_auto_merge(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+
+    result = run_eval(paths, suite="conflict")
+
+    report = result["reports"][0]
+    cases = {case["id"]: case for case in report["cases"]}
+    opposite = cases["opposite_meaning_high_overlap_not_merge"]
+    assert result["passed"] is True
+    assert report["metrics"]["false_auto_merge_count"] == 0
+    assert report["metrics"]["false_auto_supersede_count"] == 0
+    assert opposite["actual_contradiction"] is True
+    assert opposite["actual_merge"] is False
+
+
+def test_extraction_eval_excludes_legacy_facts_from_span_gate(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    with connection(paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO facts(
+              id, statement, entity_key, page_hint, section_hint, source_ids,
+              observed_at, confidence, status, metadata, created_at, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "fact_no_span",
+                "A fact without spans should fail extraction coverage.",
+                "concept:test:summary",
+                "concepts/test.md",
+                "Summary",
+                "[]",
+                "2026-06-25T00:00:00+00:00",
+                0.8,
+                "active",
+                "{}",
+                "2026-06-25T00:00:00+00:00",
+                None,
+            ),
+        )
+
+    result = run_eval(paths, suite="extraction")
+
+    report = result["reports"][0]
+    assert result["passed"] is True
+    assert report["passed"] is True
+    assert report["fixture_count"] == 0
+    assert report["metrics"]["span_coverage"] == 1.0
+    assert report["metrics"]["eligible_fact_count"] == 0
+    assert report["metrics"]["legacy_excluded_count"] == 1
+
+
+def test_extraction_eval_fails_when_llm_fact_lacks_span_coverage(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    with connection(paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO facts(
+              id, statement, entity_key, page_hint, section_hint, source_ids,
+              source_spans, observed_at, confidence, status, metadata,
+              created_at, last_seen_at, extraction_method
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "fact_llm_no_span",
+                "An LLM extracted fact without spans should fail extraction coverage.",
+                "concept:test:summary",
+                "concepts/test.md",
+                "Summary",
+                "[]",
+                "[]",
+                "2026-06-25T00:00:00+00:00",
+                0.8,
+                "active",
+                "{}",
+                "2026-06-25T00:00:00+00:00",
+                None,
+                "llm",
+            ),
+        )
+
+    result = run_eval(paths, suite="extraction")
+
+    report = result["reports"][0]
+    assert result["passed"] is False
+    assert report["passed"] is False
+    assert report["fixture_count"] == 1
+    assert report["metrics"]["span_coverage"] == 0.0
+
+
+def test_extraction_eval_label_fixture_allows_clean_auto_slice(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    paths.evals.mkdir(parents=True, exist_ok=True)
+    labels_path = paths.evals / "extraction_labels.jsonl"
+    labels_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "id": "clean_routed_fact",
+                        "statement": "The clean fact is routed to a real page.",
+                        "page_hint": "concepts/clean.md",
+                        "expected_page_hint": "concepts/clean.md",
+                        "keep": True,
+                        "supported_by_quote": True,
+                        "route_correct": True,
+                        "auto_eligible": True,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "id": "fallback_review_fact",
+                        "statement": "Fallback-routed facts are valid residue, not clean auto facts.",
+                        "page_hint": "concepts/extracted-facts.md",
+                        "keep": True,
+                        "supported_by_quote": True,
+                        "route_correct": False,
+                        "auto_eligible": False,
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = run_eval(paths, suite="extraction")
+
+    report = result["reports"][0]
+    assert result["passed"] is True
+    assert report["passed"] is True
+    assert report["metrics"]["label_policy"] == "labeled"
+    assert report["metrics"]["label_case_count"] == 2
+    assert report["metrics"]["auto_eligible_count"] == 1
+    assert report["metrics"]["auto_support_precision"] == 1.0
+    assert report["metrics"]["auto_route_accuracy"] == 1.0
+    assert report["metrics"]["fallback_auto_eligible_count"] == 0
+
+
+def test_extraction_eval_label_fixture_blocks_fallback_auto_eligible_fact(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    paths.evals.mkdir(parents=True, exist_ok=True)
+    labels_path = paths.evals / "extraction_labels.jsonl"
+    labels_path.write_text(
+        json.dumps(
+            {
+                "id": "bad_fallback_auto_fact",
+                "statement": "Fallback facts must not be promoted automatically.",
+                "page_hint": "concepts/extracted-facts.md",
+                "keep": True,
+                "supported_by_quote": True,
+                "route_correct": True,
+                "auto_eligible": True,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = run_eval(paths, suite="extraction")
+
+    report = result["reports"][0]
+    assert result["passed"] is False
+    assert report["passed"] is False
+    assert report["metrics"]["fallback_auto_eligible_count"] == 1
+    assert report["metrics"]["fallback_auto_eligible_case_ids"] == ["bad_fallback_auto_fact"]

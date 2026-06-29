@@ -20,6 +20,7 @@ from pkm_brain.db import connection
 from pkm_brain.llm import CODEX_DEFAULT_MODEL, DEFAULT_LLM_PROVIDER, provider_status
 from pkm_brain.paths import BrainPaths
 from pkm_brain.service import BrainService
+from pkm_brain.sync_config import SecondaryConfig, SyncConfig, write_sync_config
 from pkm_brain.title_utils import CODEX_PROVIDER_PROMPT_PREFIX
 
 
@@ -375,6 +376,12 @@ def test_nightly_maintenance_runs_self_healing_tasks(tmp_path: Path) -> None:
     assert result.summary["capture"]["discovered"] == 0
     assert result.summary["ingest"] is not None
     assert result.summary["index_status"]["documents"] == 0
+    assert result.summary["cos_role"]["role"] == "single"
+    assert result.summary["cos_extraction"]["status"] == "skipped"
+    assert result.summary["cos_extraction"]["mode"] == "policy"
+    assert result.summary["cos_gardener"]["status"] == "policy"
+    assert result.summary["cos_gardener"]["mode"] == "policy"
+    assert result.summary["cos_audit"]["mode"] == "stub"
     assert result.summary["provenance_check"]["errors"] == []
     assert result.summary["wiki_lint"]["errors"] == []
     assert result.summary["memory_audit"]["errors"] == []
@@ -383,6 +390,37 @@ def test_nightly_maintenance_runs_self_healing_tasks(tmp_path: Path) -> None:
         row = conn.execute("SELECT * FROM automation_runs WHERE job_name = ?", ("nightly-maintenance",)).fetchone()
     assert row is not None
     assert row["status"] == "success"
+
+
+def test_nightly_maintenance_secondary_skips_cos_mutation_capable_stages(tmp_path: Path) -> None:
+    svc = make_service(tmp_path)
+    write_sync_config(
+        svc.paths,
+        SyncConfig(
+            node_id="secondary-a",
+            role="secondary",
+            brain_home=svc.paths.home,
+            secondary=SecondaryConfig(
+                primary_node_id="primary-a",
+                outbox_path=svc.paths.outbox / "secondary-a",
+            ),
+        ),
+    )
+
+    result = run_nightly_maintenance(
+        svc.paths,
+        codex_state=tmp_path / "missing-codex.sqlite",
+        claude_projects=tmp_path / "missing-claude",
+        opencode_db=tmp_path / "missing-opencode.sqlite",
+        hyprnote_root=tmp_path / "missing-hyprnote",
+    )
+
+    assert result.status == "success"
+    assert result.summary["cos_role"]["role"] == "secondary"
+    assert result.summary["cos_extraction"]["status"] == "skipped"
+    assert result.summary["cos_gardener"]["status"] == "skipped"
+    assert result.summary["cos_audit"]["status"] == "skipped"
+    assert "secondary role skips" in result.summary["cos_audit"]["reason"]
 
 
 def test_automation_run_persistence_caps_error_payloads(tmp_path: Path) -> None:

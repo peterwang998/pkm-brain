@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+from pkm_brain.cos_actions import decide_action, propose_action, record_action_audit
 from pkm_brain.db import connection, dumps
 from pkm_brain.paths import BrainPaths
 from pkm_brain.service import BrainService, memory_export_path
@@ -599,6 +600,8 @@ def test_chief_of_staff_page_review_correction_and_revert_endpoint(
     assert review["snapshots"]
     assert correction_status == 200
     assert correction["fact"]["confirmed_by_user"] is True
+    assert correction["action"]["action_type"] == "fact_upsert"
+    assert correction["action"]["status"] == "applied"
     assert "corrected fact" in correction["review"]["current_markdown"]
     assert revert_status == 200
     assert "original fact" in reverted["review"]["current_markdown"]
@@ -607,10 +610,49 @@ def test_chief_of_staff_page_review_correction_and_revert_endpoint(
 def test_cos_control_plane_endpoints_require_auth_and_return_state(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
     BrainService(paths).init_workspace()
+    auto_action = decide_action(
+        paths,
+        propose_action(
+            paths,
+            "canonicalize_page",
+            action_payload={"page_hint": "concepts/test.md"},
+            action_features={
+                "deterministic": True,
+                "risk_score": 0.01,
+                "risk_tier": "low",
+            },
+            target_page_paths=["concepts/test.md"],
+        )["id"],
+    )
+    record_action_audit(
+        paths,
+        auto_action["id"],
+        "sampled_bad",
+        metadata={"reason": "ui test failure"},
+    )
+    human_action = decide_action(
+        paths,
+        propose_action(
+            paths,
+            "fact_upsert",
+            action_payload={
+                "fact": {
+                    "id": "fact_ui_policy",
+                    "statement": "UI policy gated fact.",
+                    "entity_key": "concepts:test:summary",
+                    "page_hint": "concepts/test.md",
+                    "confidence": 0.6,
+                }
+            },
+            action_features={"truth_mutation": False, "risk_score": 0.4},
+            target_page_paths=["concepts/test.md"],
+        )["id"],
+    )
     with running_ui(paths) as (host, port, token):
         unauthorized, _ = request_json(host, port, None, "GET", "/api/cos/policy")
         policy_status, policy = request_json(host, port, token, "GET", "/api/cos/policy")
         actions_status, actions = request_json(host, port, token, "GET", "/api/cos/actions")
+        review_status, review = request_json(host, port, token, "GET", "/api/cos/review")
         contracts_status, contracts = request_json(host, port, token, "GET", "/api/cos/contracts")
         audit_status, audit = request_json(host, port, token, "GET", "/api/cos/audit")
 
@@ -619,8 +661,19 @@ def test_cos_control_plane_endpoints_require_auth_and_return_state(tmp_path: Pat
     assert policy["version"] == 1
     assert policy["rules"]
     assert actions_status == 200
-    assert actions["actions"] == []
+    assert {action["id"] for action in actions["actions"]} == {
+        auto_action["id"],
+        human_action["id"],
+    }
+    assert review_status == 200
+    assert review["policy_version"] == 1
+    assert review["counts"]["residue"] == 1
+    assert review["residue"][0]["action_id"] == human_action["id"]
+    assert review["recent_auto_applied"][0]["id"] == auto_action["id"]
+    assert review["audit_failures"][0]["id"] == auto_action["id"]
     assert contracts_status == 200
     assert contracts["contracts"] == []
     assert audit_status == 200
-    assert audit["counts"] == {}
+    assert audit["status"] == "ok"
+    assert audit["mode"] == "configured"
+    assert audit["counts"]["sampled_bad"] == 1

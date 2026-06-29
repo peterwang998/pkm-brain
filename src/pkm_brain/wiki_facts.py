@@ -8,7 +8,9 @@ from typing import Any
 
 import yaml
 
+from .cos_actions import apply_action, propose_action
 from .db import connection, dumps, loads, rows
+from .llm import LLMProvider, complete_json, cos_role_provider_configured
 from .paths import BrainPaths
 from .util import new_id, now_iso, slugify, stable_unique, text_sha256
 from .wiki import COMMON_SECTIONS, TYPE_SECTIONS, lint_wiki, parse_frontmatter
@@ -185,6 +187,55 @@ MATERIAL_CONTRAST_GROUPS = [
     {"active", "inactive", "archived", "stale", "superseded"},
     {"yes", "true", "no", "false"},
 ]
+MATERIAL_NUMBER_WORDS = {
+    "zero": "0",
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+    "ten": "10",
+    "eleven": "11",
+    "twelve": "12",
+}
+MATERIAL_NUMBER_UNITS = {
+    "day",
+    "days",
+    "week",
+    "weeks",
+    "month",
+    "months",
+    "quarter",
+    "quarters",
+    "year",
+    "years",
+    "hour",
+    "hours",
+    "minute",
+    "minutes",
+    "dollar",
+    "dollars",
+    "percent",
+    "seat",
+    "seats",
+    "user",
+    "users",
+}
+RESOLVER_SCHEMA = {
+    "type": "object",
+    "required": ["decision", "fact_ids", "rationale"],
+    "properties": {
+        "decision": {"type": "string"},
+        "fact_ids": {"type": "array"},
+        "keeper_fact_id": {"type": "string"},
+        "rationale": {"type": "string"},
+        "risk_tier": {"type": "string"},
+    },
+}
 
 
 def compact_statement(value: Any, limit: int = STATEMENT_COMPACT_LIMIT) -> str:
@@ -298,83 +349,71 @@ def upsert_candidate_facts(
     auto_merged = 0
     timestamp = now_iso()
     entity_keys = stable_unique(candidate["entity_key"] for candidate in candidates)
-    with connection(paths.sqlite_path) as conn:
-        for candidate in candidates:
+    for candidate in candidates:
+        with connection(paths.sqlite_path) as conn:
             normalized = normalized_statement(candidate["statement"])
             existing = find_existing_fact(conn, candidate, normalized)
-            if existing:
-                merged = merge_fact_values(row_to_fact(existing), candidate, timestamp)
-                conn.execute(
-                    """
-                    UPDATE facts
-                    SET statement = ?, source_ids = ?, observed_at = ?, confidence = ?,
-                        source_spans = ?, evidence_quote = ?, extraction_method = ?,
-                        extractor_model = ?, effective_at = ?, extraction_confidence = ?,
-                        routing_confidence = ?, truth_confidence = ?,
-                        metadata = ?,
-                        last_seen_at = ?,
-                        status = CASE WHEN status = 'superseded' THEN 'superseded' ELSE 'active' END,
-                        conflict_group_id = NULL
-                    WHERE id = ?
-                    """,
-                    (
-                        merged["statement"],
-                        dumps(merged["source_ids"]),
-                        merged["observed_at"],
-                        merged["confidence"],
-                        dumps(merged["source_spans"]),
-                        merged["evidence_quote"],
-                        merged["extraction_method"],
-                        merged["extractor_model"],
-                        merged["effective_at"],
-                        merged["extraction_confidence"],
-                        merged["routing_confidence"],
-                        merged["truth_confidence"],
-                        dumps(merged["metadata"]),
-                        timestamp,
-                        existing["id"],
-                    ),
-                )
-                if normalized_statement(str(existing["statement"] or "")) != normalized:
-                    auto_merged += 1
-                updated_fact_ids.append(str(existing["id"]))
-                continue
+            existing_fact = row_to_fact(existing) if existing else None
+        if existing_fact:
+            merged = merge_fact_values(existing_fact, candidate, timestamp)
+            fact_id = str(existing_fact["id"])
+            fact = {
+                **existing_fact,
+                **merged,
+                "id": fact_id,
+                "status": "superseded"
+                if existing_fact.get("status") == "superseded"
+                else "active",
+                "conflict_group_id": None,
+                "last_seen_at": timestamp,
+            }
+            if normalized_statement(str(existing_fact.get("statement") or "")) != normalized:
+                auto_merged += 1
+            updated_fact_ids.append(fact_id)
+        else:
             fact_id = new_id("fact")
-            conn.execute(
-                """
-                INSERT INTO facts(
-                  id, statement, entity_key, page_hint, section_hint, source_ids,
-                  observed_at, confidence, status, source_spans, evidence_quote,
-                  extraction_method, extractor_model, effective_at,
-                  extraction_confidence, routing_confidence, truth_confidence,
-                  metadata, created_at, last_seen_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    fact_id,
-                    candidate["statement"],
-                    candidate["entity_key"],
-                    candidate["page_hint"],
-                    candidate["section_hint"] or None,
-                    dumps(candidate["source_ids"]),
-                    candidate["observed_at"],
-                    candidate["confidence"],
-                    "active",
-                    dumps(candidate.get("source_spans") or []),
-                    candidate.get("evidence_quote"),
-                    str(candidate.get("extraction_method") or "legacy"),
-                    candidate.get("extractor_model"),
-                    candidate.get("effective_at"),
-                    candidate.get("extraction_confidence"),
-                    candidate.get("routing_confidence"),
-                    candidate.get("truth_confidence", candidate["confidence"]),
-                    dumps(candidate["metadata"]),
-                    timestamp,
-                    timestamp,
-                ),
-            )
+            fact = {
+                "id": fact_id,
+                "statement": candidate["statement"],
+                "entity_key": candidate["entity_key"],
+                "page_hint": candidate["page_hint"],
+                "section_hint": candidate["section_hint"] or None,
+                "source_ids": candidate["source_ids"],
+                "observed_at": candidate["observed_at"],
+                "confidence": candidate["confidence"],
+                "status": "active",
+                "source_spans": candidate.get("source_spans") or [],
+                "evidence_quote": candidate.get("evidence_quote"),
+                "extraction_method": str(candidate.get("extraction_method") or "legacy"),
+                "extractor_model": candidate.get("extractor_model"),
+                "effective_at": candidate.get("effective_at"),
+                "extraction_confidence": candidate.get("extraction_confidence"),
+                "routing_confidence": candidate.get("routing_confidence"),
+                "truth_confidence": candidate.get("truth_confidence", candidate["confidence"]),
+                "metadata": candidate["metadata"],
+                "created_at": timestamp,
+                "last_seen_at": timestamp,
+            }
             created_fact_ids.append(fact_id)
-        rebuild_fact_retrieval_index(conn)
+        apply_action(
+            paths,
+            propose_action(
+                paths,
+                "fact_upsert",
+                action_payload={"fact": fact},
+                action_features={
+                    "candidate_signal": "wiki_fact_backfill",
+                    "reversible": True,
+                    "affected_fact_count": 1,
+                    "migration": candidate.get("metadata", {}).get("migration"),
+                },
+                target_fact_ids=[fact_id],
+                target_page_paths=[str(fact.get("page_hint") or "")],
+                proposed_by="wiki_fact_migration",
+                confidence=float(fact.get("truth_confidence") or fact.get("confidence") or 0.0),
+                risk_tier="medium",
+            )["id"],
+        )
     return {
         "created_fact_ids": created_fact_ids,
         "updated_fact_ids": updated_fact_ids,
@@ -552,7 +591,13 @@ def statement_quality_score(statement: str) -> tuple[int, int, int, int]:
     return (-noise_penalty, complete_sentence, useful_tokens, concise_bonus)
 
 
-def resolve_fact_groups(paths: BrainPaths, entity_keys: list[str]) -> dict[str, Any]:
+def resolve_fact_groups(
+    paths: BrainPaths,
+    entity_keys: list[str],
+    *,
+    llm_provider: LLMProvider | None = None,
+    provider: str | None = None,
+) -> dict[str, Any]:
     if not entity_keys:
         return {
             "auto_merged": 0,
@@ -580,157 +625,308 @@ def resolve_fact_groups(paths: BrainPaths, entity_keys: list[str]) -> dict[str, 
 
     auto_superseded = 0
     auto_merged = 0
+    resolver_judgment_count = 0
     created_question_ids: list[str] = []
     conflict_group_ids: list[str] = []
-    with connection(paths.sqlite_path) as conn:
-        for (entity_key, _section), facts in grouped.items():
-            replacement_facts = [
-                fact
-                for fact in facts
-                if str(fact.get("metadata", {}).get("operation") or "")
-                in REPLACEMENT_OPERATIONS
-            ]
-            additive_facts = [fact for fact in facts if fact not in replacement_facts]
-            conflicting_additive_facts = [
-                fact
-                for fact in additive_facts
-                if any(
-                    facts_directly_conflict(fact, replacement)
-                    for replacement in replacement_facts
-                )
-            ]
-            for fact in additive_facts:
-                if fact in conflicting_additive_facts:
-                    continue
-                conn.execute(
-                    "UPDATE facts SET status = 'active', conflict_group_id = NULL WHERE id = ?",
-                    (fact["id"],),
-                )
-            if conflicting_additive_facts:
-                replacement_facts = [*replacement_facts, *conflicting_additive_facts]
-            if len(replacement_facts) <= 1:
-                for fact in replacement_facts:
-                    conn.execute(
-                        "UPDATE facts SET status = 'active', conflict_group_id = NULL WHERE id = ?",
-                        (fact["id"],),
-                    )
-                continue
-
-            replacement_facts, merged_count = merge_similar_replacement_facts(
-                conn, replacement_facts
+    for (entity_key, _section), facts in grouped.items():
+        replacement_facts = [
+            fact
+            for fact in facts
+            if str(fact.get("metadata", {}).get("operation") or "")
+            in REPLACEMENT_OPERATIONS
+        ]
+        additive_facts = [fact for fact in facts if fact not in replacement_facts]
+        conflicting_additive_facts = [
+            fact
+            for fact in additive_facts
+            if any(
+                facts_directly_conflict(fact, replacement)
+                for replacement in replacement_facts
             )
-            auto_merged += merged_count
-            if len(replacement_facts) <= 1:
-                for fact in replacement_facts:
-                    conn.execute(
-                        "UPDATE facts SET status = 'active', conflict_group_id = NULL WHERE id = ?",
-                        (fact["id"],),
-                    )
-                    dismiss_resolved_conflict_questions(
-                        conn, entity_key, fact.get("page_hint")
-                    )
-                continue
-            confirmed_facts = [
-                fact for fact in replacement_facts if fact.get("confirmed_by_user")
-            ]
-            if confirmed_facts:
-                keeper = choose_keeper_fact(confirmed_facts)
-                for fact in replacement_facts:
-                    if fact["id"] == keeper["id"]:
-                        conn.execute(
-                            """
-                            UPDATE facts
-                            SET status = 'active', conflict_group_id = NULL, confirmed_by_user = 1
-                            WHERE id = ?
-                            """,
-                            (fact["id"],),
-                        )
-                    else:
-                        conn.execute(
-                            """
-                            UPDATE facts
-                            SET status = 'superseded', conflict_group_id = NULL
-                            WHERE id = ?
-                            """,
-                            (fact["id"],),
-                        )
-                auto_superseded += len(replacement_facts) - 1
-                dismiss_resolved_conflict_questions(
-                    conn, entity_key, keeper.get("page_hint")
+        ]
+        non_conflicting_additive = [
+            fact for fact in additive_facts if fact not in conflicting_additive_facts
+        ]
+        if non_conflicting_additive:
+            apply_fact_status_action(
+                paths,
+                "fact_supersede",
+                [
+                    {
+                        "fact_id": fact["id"],
+                        "status": "active",
+                        "conflict_group_id": None,
+                    }
+                    for fact in non_conflicting_additive
+                ],
+                proposed_by="resolve_fact_groups",
+                risk_tier="low",
+            )
+        if conflicting_additive_facts:
+            replacement_facts = [*replacement_facts, *conflicting_additive_facts]
+        if len(replacement_facts) <= 1:
+            if replacement_facts:
+                apply_fact_status_action(
+                    paths,
+                    "fact_supersede",
+                    [
+                        {
+                            "fact_id": fact["id"],
+                            "status": "active",
+                            "conflict_group_id": None,
+                        }
+                        for fact in replacement_facts
+                    ],
+                    proposed_by="resolve_fact_groups",
+                    risk_tier="low",
                 )
-                continue
+            continue
 
-            ordered = sorted(replacement_facts, key=fact_recency_key)
-            latest = ordered[-1]
-            if fact_is_auto_winner(latest):
-                older = ordered[:-1]
-                supersedes_id = older[-1]["id"] if older else None
-                conn.execute(
-                    """
-                    UPDATE facts
-                    SET status = 'active', supersedes_id = ?, conflict_group_id = NULL
-                    WHERE id = ?
-                    """,
-                    (supersedes_id, latest["id"]),
+        resolver_enabled = cos_role_provider_configured(paths, "resolver", llm_provider=llm_provider, provider=provider)
+        if resolver_enabled:
+            replacement_facts, merged_count = merge_exact_replacement_facts_with_actions(paths, replacement_facts)
+        else:
+            replacement_facts, merged_count = merge_similar_replacement_facts_with_actions(
+                paths, replacement_facts
+            )
+        auto_merged += merged_count
+        if len(replacement_facts) <= 1:
+            if replacement_facts:
+                apply_fact_status_action(
+                    paths,
+                    "fact_supersede",
+                    [
+                        {
+                            "fact_id": fact["id"],
+                            "status": "active",
+                            "conflict_group_id": None,
+                        }
+                        for fact in replacement_facts
+                    ],
+                    proposed_by="resolve_fact_groups",
+                    risk_tier="low",
                 )
-                for fact in older:
-                    conn.execute(
-                        """
-                        UPDATE facts
-                        SET status = 'superseded', conflict_group_id = NULL
-                        WHERE id = ?
-                        """,
-                        (fact["id"],),
-                    )
-                auto_superseded += len(older)
-                dismiss_resolved_conflict_questions(
-                    conn, entity_key, latest.get("page_hint")
-                )
-                continue
+                dismiss_resolved_conflict_questions_for(
+                    paths, entity_key, replacement_facts[0].get("page_hint")
+            )
+            continue
 
-            conflict_group_id = new_id("factconflict")
-            conflict_group_ids.append(conflict_group_id)
-            fact_ids = [fact["id"] for fact in replacement_facts]
+        if resolver_enabled:
+            result = apply_resolver_judgment(
+                paths,
+                replacement_facts,
+                llm_provider=llm_provider,
+                provider=provider,
+            )
+            resolver_judgment_count += 1
+            auto_merged += int(result.get("auto_merged") or 0)
+            auto_superseded += int(result.get("auto_superseded") or 0)
+            created_question_ids.extend(result.get("created_question_ids") or [])
+            conflict_group_ids.extend(result.get("conflict_group_ids") or [])
+            continue
+
+        confirmed_facts = [
+            fact for fact in replacement_facts if fact.get("confirmed_by_user")
+        ]
+        if confirmed_facts:
+            keeper = choose_keeper_fact(confirmed_facts)
+            updates = []
             for fact in replacement_facts:
-                conn.execute(
-                    """
-                    UPDATE facts
-                    SET status = 'conflicted', conflict_group_id = ?
-                    WHERE id = ?
-                    """,
-                    (conflict_group_id, fact["id"]),
-                )
-            question_id = ensure_open_conflict_question(
-                conn, conflict_group_id, replacement_facts, fact_ids
+                if fact["id"] == keeper["id"]:
+                    updates.append(
+                        {
+                            "fact_id": fact["id"],
+                            "status": "active",
+                            "conflict_group_id": None,
+                            "confirmed_by_user": True,
+                        }
+                    )
+                else:
+                    updates.append(
+                        {
+                            "fact_id": fact["id"],
+                            "status": "superseded",
+                            "conflict_group_id": None,
+                        }
+                    )
+            apply_fact_status_action(
+                paths,
+                "resolve_conflict",
+                updates,
+                proposed_by="resolve_fact_groups",
+                risk_tier="medium",
             )
-            if question_id:
-                created_question_ids.append(question_id)
-        rebuild_fact_retrieval_index(conn)
+            auto_superseded += len(replacement_facts) - 1
+            dismiss_resolved_conflict_questions_for(
+                paths, entity_key, keeper.get("page_hint")
+            )
+            continue
+
+        ordered = sorted(replacement_facts, key=fact_recency_key)
+        latest = ordered[-1]
+        if fact_is_auto_winner(latest):
+            older = ordered[:-1]
+            supersedes_id = older[-1]["id"] if older else None
+            updates = [
+                {
+                    "fact_id": latest["id"],
+                    "status": "active",
+                    "supersedes_id": supersedes_id,
+                    "conflict_group_id": None,
+                },
+                *[
+                    {
+                        "fact_id": fact["id"],
+                        "status": "superseded",
+                        "conflict_group_id": None,
+                    }
+                    for fact in older
+                ],
+            ]
+            apply_fact_status_action(
+                paths,
+                "fact_supersede",
+                updates,
+                proposed_by="resolve_fact_groups",
+                risk_tier="medium",
+            )
+            auto_superseded += len(older)
+            dismiss_resolved_conflict_questions_for(
+                paths, entity_key, latest.get("page_hint")
+            )
+            continue
+
+        conflict_group_id = new_id("factconflict")
+        conflict_group_ids.append(conflict_group_id)
+        fact_ids = [fact["id"] for fact in replacement_facts]
+        action = apply_display_contested_action(
+            paths, conflict_group_id, replacement_facts, fact_ids
+        )
+        created_question_ids.extend(
+            action.get("inverse_action_json", {}).get("delete_question_ids", [])
+        )
     return {
         "auto_merged": auto_merged,
         "auto_superseded": auto_superseded,
+        "resolver_judgment_count": resolver_judgment_count,
         "created_question_ids": created_question_ids,
         "conflict_group_ids": conflict_group_ids,
     }
 
 
-def fact_recency_key(fact: dict[str, Any]) -> tuple[str, str]:
-    return (str(fact.get("observed_at") or ""), str(fact.get("created_at") or ""))
-
-
-def fact_is_auto_winner(fact: dict[str, Any]) -> bool:
-    return float(fact.get("confidence") or 0.0) >= AUTO_SUPERSEDE_CONFIDENCE and bool(
-        fact.get("source_ids")
+def apply_fact_status_action(
+    paths: BrainPaths,
+    action_type: str,
+    updates: list[dict[str, Any]],
+    *,
+    proposed_by: str,
+    risk_tier: str,
+) -> dict[str, Any]:
+    updates = [update for update in updates if update.get("fact_id")]
+    if not updates:
+        raise ValueError("fact status action requires updates")
+    facts = facts_by_id(paths, [str(update["fact_id"]) for update in updates])
+    return apply_action(
+        paths,
+        propose_action(
+            paths,
+            action_type,
+            action_payload={"updates": updates},
+            action_features={
+                "truth_mutation": action_type == "resolve_conflict",
+                "reversible": True,
+                "affected_fact_count": len(updates),
+                "eval_gate": {"suite": "conflict"},
+            },
+            target_fact_ids=[str(update["fact_id"]) for update in updates],
+            target_page_paths=stable_unique(
+                str(fact.get("page_hint") or "")
+                for fact in facts
+                if fact.get("page_hint")
+            ),
+            proposed_by=proposed_by,
+            confidence=1.0 if action_type == "resolve_conflict" else None,
+            risk_tier=risk_tier,
+        )["id"],
     )
 
 
-def merge_similar_replacement_facts(
-    conn: Any, facts: list[dict[str, Any]]
+def apply_display_contested_action(
+    paths: BrainPaths,
+    conflict_group_id: str,
+    facts: list[dict[str, Any]],
+    fact_ids: list[str],
+    *,
+    proposed_by: str = "resolve_fact_groups",
+    risk_tier: str = "medium",
+) -> dict[str, Any]:
+    return apply_action(
+        paths,
+        propose_action(
+            paths,
+            "display_contested",
+            action_payload={
+                "conflict_group_id": conflict_group_id,
+                "fact_ids": fact_ids,
+            },
+                action_features={
+                    "truth_mutation": False,
+                    "display_uncertainty": True,
+                    "reversible": True,
+                    "affected_fact_count": len(fact_ids),
+                    "eval_gate": {"suite": "conflict"},
+                },
+            target_fact_ids=fact_ids,
+            target_page_paths=stable_unique(
+                str(fact.get("page_hint") or "")
+                for fact in facts
+                if fact.get("page_hint")
+            ),
+            proposed_by=proposed_by,
+            risk_tier=risk_tier,
+        )["id"],
+    )
+
+
+def merge_similar_replacement_facts_with_actions(
+    paths: BrainPaths, facts: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], int]:
+    return merge_replacement_facts_with_actions(
+        paths,
+        facts,
+        merge_predicate=facts_should_merge,
+        merge_reason="near_duplicate_replacement",
+        proposed_by="resolve_fact_groups",
+        risk_tier="medium",
+    )
+
+
+def merge_exact_replacement_facts_with_actions(
+    paths: BrainPaths, facts: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], int]:
+    return merge_replacement_facts_with_actions(
+        paths,
+        facts,
+        merge_predicate=facts_are_normalized_exact,
+        merge_reason="exact_duplicate_replacement",
+        proposed_by="resolve_fact_groups",
+        risk_tier="low",
+    )
+
+
+def merge_replacement_facts_with_actions(
+    paths: BrainPaths,
+    facts: list[dict[str, Any]],
+    *,
+    merge_predicate: Any,
+    merge_reason: str,
+    proposed_by: str,
+    risk_tier: str,
 ) -> tuple[list[dict[str, Any]], int]:
     clusters: list[list[dict[str, Any]]] = []
     for fact in sorted(facts, key=fact_recency_key, reverse=True):
         for cluster in clusters:
-            if any(facts_should_merge(fact, candidate) for candidate in cluster):
+            if any(merge_predicate(fact, candidate) for candidate in cluster):
                 cluster.append(fact)
                 break
         else:
@@ -745,55 +941,227 @@ def merge_similar_replacement_facts(
             continue
         keeper = choose_keeper_fact(cluster)
         merged = merge_fact_cluster_values(cluster, keeper, timestamp)
-        conn.execute(
-            """
-            UPDATE facts
-            SET statement = ?, source_ids = ?, observed_at = ?, confidence = ?,
-                truth_confidence = ?,
-                status = 'active', supersedes_id = ?, conflict_group_id = NULL,
-                metadata = ?, last_seen_at = ?
-            WHERE id = ?
-            """,
-            (
-                merged["statement"],
-                dumps(merged["source_ids"]),
-                merged["observed_at"],
-                merged["confidence"],
-                merged["confidence"],
-                merged["supersedes_id"],
-                dumps(merged["metadata"]),
-                timestamp,
-                keeper["id"],
-            ),
+        keeper_fact = {
+            **keeper,
+            "statement": merged["statement"],
+            "source_ids": merged["source_ids"],
+            "observed_at": merged["observed_at"],
+            "confidence": merged["confidence"],
+            "truth_confidence": merged["confidence"],
+            "status": "active",
+            "supersedes_id": merged["supersedes_id"],
+            "conflict_group_id": None,
+            "metadata": merged["metadata"],
+            "last_seen_at": timestamp,
+        }
+        superseded_fact_ids = [fact["id"] for fact in cluster if fact["id"] != keeper["id"]]
+        apply_action(
+            paths,
+            propose_action(
+                paths,
+                "fact_merge",
+                action_payload={
+                    "keeper_fact": keeper_fact,
+                    "superseded_fact_ids": superseded_fact_ids,
+                },
+                action_features={
+                    "truth_mutation": False,
+                    "reversible": True,
+                    "affected_fact_count": len(cluster),
+                    "merge_reason": merge_reason,
+                    "eval_gate": {"suite": "conflict"},
+                },
+                target_fact_ids=[fact["id"] for fact in cluster],
+                target_page_paths=stable_unique(
+                    str(fact.get("page_hint") or "")
+                    for fact in cluster
+                    if fact.get("page_hint")
+                ),
+                proposed_by=proposed_by,
+                confidence=float(merged["confidence"] or 0.0),
+                risk_tier=risk_tier,
+            )["id"],
         )
-        for fact in cluster:
-            if fact["id"] == keeper["id"]:
-                continue
-            conn.execute(
-                """
-                UPDATE facts
-                SET status = 'superseded', conflict_group_id = NULL
-                WHERE id = ?
-                """,
-                (fact["id"],),
-            )
-        rebuild_fact_retrieval_index(conn)
-        survivors.append(
-            {
-                **keeper,
-                "statement": merged["statement"],
-                "source_ids": merged["source_ids"],
-                "observed_at": merged["observed_at"],
-                "confidence": merged["confidence"],
-                "status": "active",
-                "supersedes_id": merged["supersedes_id"],
-                "conflict_group_id": None,
-                "metadata": merged["metadata"],
-                "last_seen_at": timestamp,
-            }
-        )
+        survivors.append(get_fact(paths, keeper["id"]))
         merged_count += len(cluster) - 1
     return sorted(survivors, key=fact_recency_key), merged_count
+
+
+def apply_resolver_judgment(
+    paths: BrainPaths,
+    facts: list[dict[str, Any]],
+    *,
+    llm_provider: LLMProvider | None,
+    provider: str | None,
+) -> dict[str, Any]:
+    parsed = complete_json(
+        resolver_prompt(facts),
+        schema=RESOLVER_SCHEMA,
+        role="resolver",
+        provider=provider,
+        llm_provider=llm_provider,
+        paths=paths,
+    )
+    decision = normalize_resolver_decision(parsed.get("decision"))
+    fact_ids = [str(fact_id) for fact_id in parsed.get("fact_ids") or [] if str(fact_id)]
+    fact_by_id = {str(fact["id"]): fact for fact in facts}
+    selected = [fact_by_id[fact_id] for fact_id in fact_ids if fact_id in fact_by_id]
+    if len(selected) < 2:
+        selected = facts
+    if decision == "same_claim" and not any_fact_pair_conflicts(selected):
+        _survivors, merged_count = merge_replacement_facts_with_actions(
+            paths,
+            selected,
+            merge_predicate=lambda _left, _right: True,
+            merge_reason="resolver_same_claim",
+            proposed_by="resolver",
+            risk_tier=resolver_risk_tier(parsed, default="medium"),
+        )
+        return {"auto_merged": merged_count, "auto_superseded": 0, "created_question_ids": [], "conflict_group_ids": []}
+    if decision == "clear_supersession":
+        keeper_id = str(parsed.get("keeper_fact_id") or "")
+        keeper = fact_by_id.get(keeper_id) or choose_keeper_fact(selected)
+        if resolver_supersession_is_safe(keeper, selected):
+            updates = [
+                {
+                    "fact_id": keeper["id"],
+                    "status": "active",
+                    "supersedes_id": latest_non_keeper_id(selected, keeper),
+                    "conflict_group_id": None,
+                },
+                *[
+                    {
+                        "fact_id": fact["id"],
+                        "status": "superseded",
+                        "conflict_group_id": None,
+                    }
+                    for fact in selected
+                    if fact["id"] != keeper["id"]
+                ],
+            ]
+            apply_fact_status_action(
+                paths,
+                "fact_supersede",
+                updates,
+                proposed_by="resolver",
+                risk_tier=resolver_risk_tier(parsed, default="medium"),
+            )
+            dismiss_resolved_conflict_questions_for(paths, keeper["entity_key"], keeper.get("page_hint"))
+            return {
+                "auto_merged": 0,
+                "auto_superseded": len(selected) - 1,
+                "created_question_ids": [],
+                "conflict_group_ids": [],
+            }
+    conflict_group_id = new_id("factconflict")
+    action = apply_display_contested_action(
+        paths,
+        conflict_group_id,
+        selected,
+        [str(fact["id"]) for fact in selected],
+        proposed_by="resolver",
+        risk_tier="high",
+    )
+    return {
+        "auto_merged": 0,
+        "auto_superseded": 0,
+        "created_question_ids": action.get("inverse_action_json", {}).get("delete_question_ids", []),
+        "conflict_group_ids": [conflict_group_id],
+    }
+
+
+def resolver_prompt(facts: list[dict[str, Any]]) -> str:
+    fact_cards = [
+        {
+            "id": fact.get("id"),
+            "statement": fact.get("statement"),
+            "entity_key": fact.get("entity_key"),
+            "page_hint": fact.get("page_hint"),
+            "section_hint": fact.get("section_hint"),
+            "observed_at": fact.get("observed_at"),
+            "confidence": fact.get("confidence"),
+            "source_ids": fact.get("source_ids") or [],
+            "confirmed_by_user": fact.get("confirmed_by_user"),
+        }
+        for fact in facts
+    ]
+    return (
+        "Resolve this group of source-backed PKM facts. Choose exactly one decision: "
+        "same_claim, clear_supersession, or contradiction. "
+        "same_claim means the facts assert the same truth and can be merged. "
+        "clear_supersession means one fact is clearly newer/current and the others should be superseded; "
+        "provide keeper_fact_id. contradiction means the facts conflict or require external truth. "
+        "Never choose a winner for a genuine contradiction. Return fact_ids, decision, keeper_fact_id when applicable, "
+        "rationale, and risk_tier low/medium/high.\n\n"
+        f"Facts:\n{fact_cards}"
+    )
+
+
+def normalize_resolver_decision(value: Any) -> str:
+    decision = str(value or "").strip().lower()
+    if decision in {"same_claim", "same", "merge", "duplicate"}:
+        return "same_claim"
+    if decision in {"clear_supersession", "supersession", "supersede", "newer_wins"}:
+        return "clear_supersession"
+    return "contradiction"
+
+
+def resolver_risk_tier(parsed: dict[str, Any], *, default: str) -> str:
+    risk_tier = str(parsed.get("risk_tier") or default).strip().lower()
+    return risk_tier if risk_tier in {"low", "medium", "high"} else default
+
+
+def any_fact_pair_conflicts(facts: list[dict[str, Any]]) -> bool:
+    for index, left in enumerate(facts):
+        for right in facts[index + 1 :]:
+            if facts_directly_conflict(left, right):
+                return True
+    return False
+
+
+def resolver_supersession_is_safe(keeper: dict[str, Any], facts: list[dict[str, Any]]) -> bool:
+    if keeper.get("confirmed_by_user"):
+        return True
+    if not fact_is_auto_winner(keeper):
+        return False
+    latest = sorted(facts, key=fact_recency_key)[-1]
+    return str(latest.get("id")) == str(keeper.get("id"))
+
+
+def latest_non_keeper_id(facts: list[dict[str, Any]], keeper: dict[str, Any]) -> str | None:
+    older = [fact for fact in sorted(facts, key=fact_recency_key) if fact["id"] != keeper["id"]]
+    return str(older[-1]["id"]) if older else None
+
+
+def facts_by_id(paths: BrainPaths, fact_ids: list[str]) -> list[dict[str, Any]]:
+    if not fact_ids:
+        return []
+    placeholders = ",".join("?" for _ in fact_ids)
+    with connection(paths.sqlite_path) as conn:
+        return [
+            row_to_fact(row)
+            for row in conn.execute(
+                f"SELECT * FROM facts WHERE id IN ({placeholders})",
+                fact_ids,
+            )
+        ]
+
+
+def dismiss_resolved_conflict_questions_for(
+    paths: BrainPaths, entity_key: str, page_hint: Any
+) -> None:
+    with connection(paths.sqlite_path) as conn:
+        dismiss_resolved_conflict_questions(conn, entity_key, page_hint)
+
+
+def fact_recency_key(fact: dict[str, Any]) -> tuple[str, str]:
+    return (str(fact.get("observed_at") or ""), str(fact.get("created_at") or ""))
+
+
+def fact_is_auto_winner(fact: dict[str, Any]) -> bool:
+    return float(fact.get("confidence") or 0.0) >= AUTO_SUPERSEDE_CONFIDENCE and bool(
+        fact.get("source_ids")
+    )
 
 
 def choose_keeper_fact(facts: list[dict[str, Any]]) -> dict[str, Any]:
@@ -937,6 +1305,12 @@ def facts_should_merge(left: dict[str, Any], right: dict[str, Any]) -> bool:
     if not facts_share_meaningful_sources(left, right):
         return False
     return bool(signals["source_backed_match"] or signals["anchor_match"])
+
+
+def facts_are_normalized_exact(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    left_statement = normalized_statement(str(left.get("statement") or ""))
+    right_statement = normalized_statement(str(right.get("statement") or ""))
+    return bool(left_statement and left_statement == right_statement)
 
 
 def fact_similarity_signals(left: str, right: str) -> dict[str, Any]:
@@ -1150,7 +1524,18 @@ def extracted_material_values(statement: str) -> set[str]:
     lowered = statement.lower()
     for pattern in patterns:
         values.update(re.findall(pattern, lowered))
+    number_words = "|".join(MATERIAL_NUMBER_WORDS)
+    for word, unit in re.findall(rf"\b({number_words})\s+([a-z]+)\b", lowered):
+        if unit in MATERIAL_NUMBER_UNITS:
+            values.add(f"{MATERIAL_NUMBER_WORDS[word]} {canonical_material_unit(unit)}")
     return values
+
+
+def canonical_material_unit(unit: str) -> str:
+    unit = unit.lower()
+    if unit.endswith("s"):
+        return unit[:-1]
+    return unit
 
 
 def ensure_open_conflict_question(
@@ -1158,6 +1543,8 @@ def ensure_open_conflict_question(
     conflict_group_id: str,
     facts: list[dict[str, Any]],
     fact_ids: list[str],
+    *,
+    action_id: str | None = None,
 ) -> str | None:
     first_fact = facts[0]
     existing = conn.execute(
@@ -1178,8 +1565,8 @@ def ensure_open_conflict_question(
         """
         INSERT INTO open_questions(
           id, kind, entity_key, page_hint, fact_ids, question, options,
-          status, context, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          status, context, action_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             question_id,
@@ -1191,6 +1578,7 @@ def ensure_open_conflict_question(
             dumps(question_options_for_facts(facts)),
             "open",
             dumps({"conflict_group_id": conflict_group_id}),
+            action_id,
             now_iso(),
         ),
     )
@@ -1237,77 +1625,137 @@ def answer_open_question(
             raise ValueError(f"question is not open: {question_id}")
         fact_ids = [str(fact_id) for fact_id in question.get("fact_ids") or []]
         page_hint = question.get("page_hint")
-        if selected_fact_id:
-            if selected_fact_id not in fact_ids:
-                raise ValueError("selected_fact_id is not one of the question facts")
-            conn.execute(
-                """
-                UPDATE facts
-                SET status = 'active', confirmed_by_user = 1, conflict_group_id = NULL
-                WHERE id = ?
-                """,
-                (selected_fact_id,),
+    actions: list[dict[str, Any]] = []
+    if selected_fact_id:
+        if selected_fact_id not in fact_ids:
+            raise ValueError("selected_fact_id is not one of the question facts")
+        updates = [
+            {
+                "fact_id": selected_fact_id,
+                "status": "active",
+                "confirmed_by_user": True,
+                "conflict_group_id": None,
+            },
+            *[
+                {
+                    "fact_id": fact_id,
+                    "status": "superseded",
+                    "conflict_group_id": None,
+                }
+                for fact_id in fact_ids
+                if fact_id != selected_fact_id
+            ],
+        ]
+        action = apply_action(
+            paths,
+            propose_action(
+                paths,
+                "resolve_conflict",
+                action_payload={"updates": updates, "question_id": question_id},
+                action_features={
+                    "human_confirmed": True,
+                    "truth_mutation": True,
+                    "reversible": True,
+                    "affected_fact_count": len(updates),
+                },
+                target_fact_ids=fact_ids,
+                target_page_paths=[str(page_hint)] if page_hint else [],
+                proposed_by="question_answer",
+                confidence=1.0,
+                risk_tier="medium",
+            )["id"],
+        )
+        actions.append(action)
+        answer_payload = {
+            "selected_fact_id": selected_fact_id,
+            "answer": answer or "",
+        }
+    else:
+        answer_text = compact_statement(answer or "", 1000)
+        if not answer_text:
+            raise ValueError("answer or selected_fact_id is required")
+        manual_fact_id = new_id("fact")
+        upsert_action = apply_action(
+            paths,
+            propose_action(
+                paths,
+                "fact_upsert",
+                action_payload={
+                    "fact": {
+                        "id": manual_fact_id,
+                        "statement": answer_text,
+                        "entity_key": question.get("entity_key") or f"manual:{question_id}",
+                        "page_hint": page_hint,
+                        "section_hint": "Summary",
+                        "source_ids": [f"manual:question:{question_id}"],
+                        "observed_at": timestamp,
+                        "confidence": 1.0,
+                        "status": "active",
+                        "confirmed_by_user": True,
+                        "metadata": {"question_id": question_id, "answer": answer_text},
+                        "created_at": timestamp,
+                        "last_seen_at": timestamp,
+                    }
+                },
+                action_features={
+                    "human_confirmed": True,
+                    "truth_mutation": True,
+                    "reversible": True,
+                    "affected_fact_count": 1,
+                },
+                target_fact_ids=[manual_fact_id],
+                target_page_paths=[str(page_hint)] if page_hint else [],
+                proposed_by="question_answer",
+                confidence=1.0,
+                risk_tier="medium",
+            )["id"],
+        )
+        actions.append(upsert_action)
+        if fact_ids:
+            supersede_action = apply_action(
+                paths,
+                propose_action(
+                    paths,
+                    "fact_supersede",
+                    action_payload={
+                        "updates": [
+                            {
+                                "fact_id": fact_id,
+                                "status": "superseded",
+                                "conflict_group_id": None,
+                            }
+                            for fact_id in fact_ids
+                        ],
+                        "question_id": question_id,
+                    },
+                    action_features={
+                        "human_confirmed": True,
+                        "truth_mutation": True,
+                        "reversible": True,
+                        "affected_fact_count": len(fact_ids),
+                    },
+                    target_fact_ids=fact_ids,
+                    target_page_paths=[str(page_hint)] if page_hint else [],
+                    proposed_by="question_answer",
+                    confidence=1.0,
+                    risk_tier="medium",
+                )["id"],
             )
-            for fact_id in fact_ids:
-                if fact_id != selected_fact_id:
-                    conn.execute(
-                        """
-                        UPDATE facts
-                        SET status = 'superseded', conflict_group_id = NULL
-                        WHERE id = ?
-                        """,
-                        (fact_id,),
-                    )
-            answer_payload = {
-                "selected_fact_id": selected_fact_id,
-                "answer": answer or "",
-            }
-        else:
-            answer_text = compact_statement(answer or "", 1000)
-            if not answer_text:
-                raise ValueError("answer or selected_fact_id is required")
-            manual_fact_id = new_id("fact")
-            conn.execute(
-                """
-                INSERT INTO facts(
-                  id, statement, entity_key, page_hint, section_hint, source_ids,
-                  observed_at, confidence, status, confirmed_by_user, metadata,
-                  created_at, last_seen_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    manual_fact_id,
-                    answer_text,
-                    question.get("entity_key") or f"manual:{question_id}",
-                    page_hint,
-                    "Summary",
-                    dumps([f"manual:question:{question_id}"]),
-                    timestamp,
-                    1.0,
-                    "active",
-                    1,
-                    dumps({"question_id": question_id, "answer": answer_text}),
-                    timestamp,
-                    timestamp,
-                ),
-            )
-            for fact_id in fact_ids:
-                conn.execute(
-                    """
-                    UPDATE facts
-                    SET status = 'superseded', conflict_group_id = NULL
-                    WHERE id = ?
-                    """,
-                    (fact_id,),
-                )
-            answer_payload = {"selected_fact_id": manual_fact_id, "answer": answer_text}
+            actions.append(supersede_action)
+        answer_payload = {"selected_fact_id": manual_fact_id, "answer": answer_text}
+    with connection(paths.sqlite_path) as conn:
         conn.execute(
             """
             UPDATE open_questions
-            SET status = 'answered', answer = ?, answered_at = ?
+            SET status = 'answered', answer = ?, answered_at = ?, action_id = ?
             WHERE id = ?
             """,
-            (dumps(answer_payload), timestamp, question_id),
+            (
+                dumps(answer_payload),
+                timestamp,
+                actions[-1]["id"] if actions else None,
+                question_id,
+            ),
         )
     curation = curate_managed_pages(
         paths,
@@ -1316,6 +1764,7 @@ def answer_open_question(
     )
     return {
         "question": get_question(paths, question_id),
+        "actions": actions,
         "curation": curation,
         "dashboard": wiki_fact_dashboard(paths),
     }
@@ -1374,8 +1823,8 @@ def reconcile_open_fact_questions(
                 if len(cluster) == 1:
                     survivors.append(cluster[0])
                     continue
-                merged_survivors, merged_count = merge_similar_replacement_facts(
-                    conn, cluster
+                merged_survivors, merged_count = merge_similar_replacement_facts_with_actions(
+                    paths, cluster
                 )
                 survivors.extend(merged_survivors)
                 merged_facts += merged_count
@@ -1411,19 +1860,13 @@ def reconcile_open_fact_questions(
                 question.get("context", {}).get("conflict_group_id")
                 or new_id("factconflict")
             )
-            for fact in survivors:
-                conn.execute(
-                    """
-                    UPDATE facts
-                    SET status = 'conflicted', conflict_group_id = ?
-                    WHERE id = ?
-                    """,
-                    (conflict_group_id, fact["id"]),
-                )
+            action = apply_display_contested_action(
+                paths, conflict_group_id, survivors, survivor_ids
+            )
             conn.execute(
                 """
                 UPDATE open_questions
-                SET fact_ids = ?, options = ?, context = ?
+                SET fact_ids = ?, options = ?, context = ?, action_id = ?
                 WHERE id = ?
                 """,
                 (
@@ -1436,6 +1879,7 @@ def reconcile_open_fact_questions(
                             "reconciled_at": timestamp,
                         }
                     ),
+                    action["id"],
                     question["id"],
                 ),
             )
@@ -1679,50 +2123,64 @@ def create_confirmed_page_fact(
             missing = sorted(set(supersede_fact_ids) - set(found))
             if missing:
                 raise ValueError(f"supersede facts not found on page: {', '.join(missing)}")
-        conn.execute(
-            """
-            INSERT INTO facts(
-              id, statement, entity_key, page_hint, section_hint, source_ids,
-              observed_at, confidence, status, supersedes_id, confirmed_by_user,
-              source_spans, extraction_method, truth_confidence,
-              metadata, created_at, last_seen_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                fact_id,
-                statement,
-                entity_key,
-                page_hint,
-                section_hint,
-                dumps(effective_source_ids),
-                timestamp,
-                1.0,
-                "active",
-                supersede_fact_ids[0] if supersede_fact_ids else None,
-                1,
-                dumps([]),
-                "manual",
-                1.0,
-                dumps(
-                    {
+    action = apply_action(
+        paths,
+        propose_action(
+            paths,
+            "fact_upsert",
+            action_payload={
+                "fact": {
+                    "id": fact_id,
+                    "statement": statement,
+                    "entity_key": entity_key,
+                    "page_hint": page_hint,
+                    "section_hint": section_hint,
+                    "source_ids": effective_source_ids,
+                    "observed_at": timestamp,
+                    "confidence": 1.0,
+                    "status": "active",
+                    "supersedes_id": supersede_fact_ids[0] if supersede_fact_ids else None,
+                    "confirmed_by_user": True,
+                    "source_spans": [],
+                    "extraction_method": "manual",
+                    "truth_confidence": 1.0,
+                    "metadata": {
                         "source": "chief_of_staff_correction",
                         "supersede_fact_ids": supersede_fact_ids,
-                    }
-                ),
-                timestamp,
-                timestamp,
-            ),
+                    },
+                    "created_at": timestamp,
+                    "last_seen_at": timestamp,
+                }
+            },
+            action_features={
+                "human_confirmed": True,
+                "truth_mutation": bool(supersede_fact_ids),
+                "reversible": True,
+                "affected_fact_count": 1 + len(supersede_fact_ids),
+            },
+            target_fact_ids=[fact_id],
+            target_page_paths=[page_hint],
+            proposed_by="chief_of_staff_correction",
+            confidence=1.0,
+            risk_tier="medium" if supersede_fact_ids else "low",
+        )["id"],
+    )
+    supersede_action = None
+    if supersede_fact_ids:
+        supersede_action = apply_fact_status_action(
+            paths,
+            "fact_supersede",
+            [
+                {
+                    "fact_id": old_fact_id,
+                    "status": "superseded",
+                    "conflict_group_id": None,
+                }
+                for old_fact_id in supersede_fact_ids
+            ],
+            proposed_by="chief_of_staff_correction",
+            risk_tier="medium",
         )
-        for old_fact_id in supersede_fact_ids:
-            conn.execute(
-                """
-                UPDATE facts
-                SET status = 'superseded', conflict_group_id = NULL
-                WHERE id = ?
-                """,
-                (old_fact_id,),
-            )
-        rebuild_fact_retrieval_index(conn)
     curation = curate_managed_pages(
         paths,
         page_hints=[page_hint],
@@ -1730,6 +2188,8 @@ def create_confirmed_page_fact(
     )
     return {
         "fact": get_fact(paths, fact_id),
+        "action": action,
+        "supersede_action": supersede_action,
         "curation": curation,
         "review": managed_fact_page_review(paths, page_hint),
         "dashboard": wiki_fact_dashboard(paths),
@@ -1779,9 +2239,31 @@ def revert_wiki_page_snapshot(paths: BrainPaths, snapshot_id: str) -> dict[str, 
         reason="revert_managed_page_snapshot",
         metadata={"reverted_snapshot_id": snapshot_id},
     )
+    action = apply_action(
+        paths,
+        propose_action(
+            paths,
+            "revert_page_snapshot",
+            action_payload={
+                "page_hint": page_hint,
+                "snapshot_id": snapshot_id,
+                "revert_snapshot_id": revert_snapshot_id,
+            },
+            action_features={
+                "deterministic": True,
+                "reversible": False,
+                "projection": True,
+                "affected_page_count": 1,
+            },
+            target_page_paths=[page_hint],
+            proposed_by="page_snapshot_revert",
+            risk_tier="medium",
+        )["id"],
+    )
     return {
         "snapshot": snapshot,
         "revert_snapshot_id": revert_snapshot_id,
+        "action": action,
         "review": managed_fact_page_review(paths, page_hint),
         "dashboard": wiki_fact_dashboard(paths),
     }
@@ -1828,12 +2310,34 @@ def archive_orphan_managed_pages(
             reason="archive_orphan_managed_page",
             metadata={"active_page_hints": active_page_hints},
         )
+        action = apply_action(
+            paths,
+            propose_action(
+                paths,
+                "archive_page",
+                action_payload={
+                    "page_hint": relative_path,
+                    "snapshot_id": snapshot_id,
+                    "reason": "orphan_managed_page",
+                },
+                action_features={
+                    "deterministic": True,
+                    "reversible": False,
+                    "projection": True,
+                    "affected_page_count": 1,
+                },
+                target_page_paths=[relative_path],
+                proposed_by="archive_orphan_managed_pages",
+                risk_tier="low",
+            )["id"],
+        )
         archived.append(
             {
                 "relative_path": relative_path,
                 "path": str(path),
                 "status": "archived",
                 "snapshot_id": snapshot_id,
+                "action_id": action["id"],
             }
         )
     return archived
@@ -1895,36 +2399,51 @@ def canonicalize_fact_routes(paths: BrainPaths) -> dict[str, Any]:
               AND page_hint IS NOT NULL
             """,
         )
-        for row in fact_rows:
-            original_page_hint = str(row["page_hint"] or "")
-            canonical_page_hint = canonical_page_hint_for_fact(original_page_hint)
-            if not canonical_page_hint or canonical_page_hint == original_page_hint:
-                continue
-            section_hint = str(row["section_hint"] or "")
-            canonical_entity_key = entity_key_for_change(
-                topic_for_path(canonical_page_hint), canonical_page_hint, section_hint
-            )
-            metadata = loads(row["metadata"], {})
-            metadata.setdefault("original_page_hint", original_page_hint)
-            metadata.setdefault("original_entity_key", row["entity_key"])
-            metadata["canonical_page_hint"] = canonical_page_hint
-            metadata["canonicalized_at"] = timestamp
-            conn.execute(
-                """
-                UPDATE facts
-                SET page_hint = ?,
-                    entity_key = ?,
-                    metadata = ?
-                WHERE id = ?
-                """,
-                (canonical_page_hint, canonical_entity_key, dumps(metadata), row["id"]),
-            )
-            updated_fact_ids.append(str(row["id"]))
-            affected_entity_keys.append(canonical_entity_key)
-            affected_page_hints.append(canonical_page_hint)
+    for row in fact_rows:
+        original_page_hint = str(row["page_hint"] or "")
+        canonical_page_hint = canonical_page_hint_for_fact(original_page_hint)
+        if not canonical_page_hint or canonical_page_hint == original_page_hint:
+            continue
+        section_hint = str(row["section_hint"] or "")
+        canonical_entity_key = entity_key_for_change(
+            topic_for_path(canonical_page_hint), canonical_page_hint, section_hint
+        )
+        metadata = loads(row["metadata"], {})
+        metadata.setdefault("original_page_hint", original_page_hint)
+        metadata.setdefault("original_entity_key", row["entity_key"])
+        metadata["canonical_page_hint"] = canonical_page_hint
+        metadata["canonicalized_at"] = timestamp
+        apply_action(
+            paths,
+            propose_action(
+                paths,
+                "rehome_fact",
+                action_payload={
+                    "fact_id": str(row["id"]),
+                    "page_hint": canonical_page_hint,
+                    "entity_key": canonical_entity_key,
+                    "section_hint": section_hint or None,
+                    "metadata": metadata,
+                },
+                action_features={
+                    "candidate_signal": "canonicalize_fact_route",
+                    "deterministic": True,
+                    "reversible": True,
+                    "affected_fact_count": 1,
+                },
+                target_fact_ids=[str(row["id"])],
+                target_page_paths=stable_unique([original_page_hint, canonical_page_hint]),
+                proposed_by="canonicalize_fact_routes",
+                risk_tier="low",
+            )["id"],
+        )
+        updated_fact_ids.append(str(row["id"]))
+        affected_entity_keys.append(canonical_entity_key)
+        affected_page_hints.append(canonical_page_hint)
 
-        if updated_fact_ids:
-            changed = set(updated_fact_ids)
+    if updated_fact_ids:
+        changed = set(updated_fact_ids)
+        with connection(paths.sqlite_path) as conn:
             for question in rows(
                 conn,
                 """

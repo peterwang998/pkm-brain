@@ -30,8 +30,8 @@ Indexes are rebuildable derived artifacts.
 
 - Local-first runtime layout: private knowledge lives in `~/brain`, while the source repo stays clean.
 - Hybrid retrieval: SQLite FTS5, LanceDB vectors, reciprocal-rank fusion, source-aware reranking, and bounded context packets.
-- Agent access through MCP tools for search, context retrieval, memory proposals, wiki proposals, and session logging.
-- Review-gated memory and wiki workflows, so agents can propose durable knowledge without silently approving it.
+- Agent access through MCP tools for search, context retrieval, memory proposals, and session logging.
+- Review-gated memory workflows, so agents can propose durable knowledge without silently approving it.
 - Scheduled capture for Codex, Claude Code, OpenCode, and Hyprnote logs, with optional Primary/Secondary sync.
 
 ## Quickstart
@@ -114,7 +114,7 @@ uv run brain ingest
 uv run brain search "sqlite metadata" --debug
 uv run brain inspect chunks <document_id>
 uv run brain wiki lint
-uv run brain wiki synthesize --dry-run
+uv run brain wiki curate-facts
 uv run brain memory audit
 uv run brain memory approve <memory_id>
 uv run brain memory reject <memory_id> --reason "not durable enough"
@@ -134,9 +134,6 @@ The MCP server exposes tools for:
 - `record_context_feedback`
 - `get_memories`
 - `propose_memory`
-- `propose_wiki_update`
-- `list_wiki_proposals`
-- `inspect_wiki_proposal`
 - `write_agent_session`
 - `get_project_context`
 
@@ -175,7 +172,7 @@ mkdir -p ~/.codex/skills
 cp -R ~/pkm-brain/skills/brain-memory ~/.codex/skills/
 ```
 
-After restarting Codex, the skill teaches Codex when to query Brain, when to skip retrieval, how to follow `raw_context` links, and when to create unapproved memory or wiki proposals. The skill does not store private knowledge; it only contains instructions for using the local Brain tools.
+After restarting Codex, the skill teaches Codex when to query Brain, when to skip retrieval, how to follow `raw_context` links, and when to create unapproved memory proposals. The skill does not store private knowledge; it only contains instructions for using the local Brain tools.
 
 ### Claude Code Persistent Memory
 
@@ -364,8 +361,11 @@ This job performs the broader self-healing pass:
 ```text
 capture agents
 ingest inbox
-wiki synthesize with generated overwrite
+chief-of-staff extraction shadow pass
+chief-of-staff gardener shadow pass
 index status
+index maintenance
+chief-of-staff sampled audit (stub unless an auditor provider is configured)
 provenance check
 wiki lint
 memory audit
@@ -379,13 +379,6 @@ cd ~/pkm-brain
 uv run brain launch-agent install-nightly --home ~/brain
 ```
 
-Install it with unapproved Codex wiki proposals enabled:
-
-```bash
-cd ~/pkm-brain
-uv run brain launch-agent install-nightly --home ~/brain --with-llm-wiki-proposals --provider codex
-```
-
 Install it with unreviewed Codex failure-memory proposals enabled:
 
 ```bash
@@ -393,7 +386,7 @@ cd ~/pkm-brain
 uv run brain launch-agent install-nightly --home ~/brain --with-llm-memory-proposals --provider codex
 ```
 
-The same `com.pkm-brain.nightly-maintenance` LaunchAgent is rewritten when rerun with proposal flags; no separate memory proposal LaunchAgent is created. The LaunchAgent stores the provider/model choice and the absolute Codex CLI path. With `--provider codex`, no API key is stored by pkm-brain; Codex CLI uses its own local login.
+The same `com.pkm-brain.nightly-maintenance` LaunchAgent is rewritten when rerun with memory-proposal flags; no separate memory proposal LaunchAgent is created. The LaunchAgent stores the provider/model choice and the absolute Codex CLI path. With `--provider codex`, no API key is stored by pkm-brain; Codex CLI uses its own local login.
 
 Verify it is loaded:
 
@@ -432,7 +425,7 @@ tail -n 40 ~/brain/logs/launchagent.out.log
 tail -n 40 ~/brain/logs/nightly-maintenance.out.log
 ```
 
-The capture LaunchAgent is a deterministic local Python job. The nightly LaunchAgent runs LLM semantic wiki compilation by default through the `codex` provider, so generated wiki pages keep compounding from new sources. Use `--no-llm-wiki` to disable that default. Extra proposal/memory jobs remain controlled by `--with-llm-wiki-proposals` and `--with-llm-memory-proposals`.
+The capture LaunchAgent is a deterministic local Python job. The nightly LaunchAgent captures, ingests, checks indexes/provenance/wiki lint, and records explicit Chief-of-Staff shadow/stub summary fields. Optional failure-memory proposal jobs are controlled by `--with-llm-memory-proposals`.
 
 ### 11. Uninstall scheduled jobs
 
@@ -533,14 +526,17 @@ The nightly job runs:
 
 - agent-log capture
 - inbox ingestion
-- generated wiki synthesis with default LLM semantic compilation
+- Chief-of-Staff extraction shadow pass (`cos_extraction_shadow`)
+- Chief-of-Staff gardener shadow pass (`cos_gardener_shadow`)
 - index status collection
 - conservative LanceDB optimization when index bloat crosses maintenance thresholds
+- Chief-of-Staff sampled audit (`cos_audit`; default stub, configured when an auditor provider is supplied)
 - provenance check
 - wiki lint
 - memory audit
-- optional unapproved wiki proposals when `--with-llm-wiki-proposals` is set
 - optional unreviewed failure-memory proposals when `--with-llm-memory-proposals` is set
+
+Nightly summaries include `cos_role`. Single-machine workspaces and Primary nodes may run shadow CoS stages. Secondary nodes skip mutation-capable CoS stages by default and mark those summaries as `status: skipped`. The audit path is labeled `mode: stub` until an independent auditor provider is configured. With `PKM_BRAIN_LLM_AUDITOR_PROVIDER` or an explicit UI audit provider, sampled applied actions are judged in `mode: configured`.
 
 Install the nightly macOS LaunchAgent:
 
@@ -553,7 +549,7 @@ The nightly LaunchAgent uses an hourly wake-check by default:
 ```text
 com.pkm-brain.nightly-maintenance
 StartInterval = 3600
-command = brain automation nightly --if-due --due-after-hours 20 --provider codex
+command = brain automation nightly --if-due --due-after-hours 20
 ```
 
 This pattern is intentional for laptops. If the machine sleeps through a fixed overnight time, the next hourly check after wake can run maintenance if the last successful run is old enough.
@@ -572,70 +568,45 @@ Nightly logs are written to:
 ~/brain/logs/nightly-maintenance.err.log
 ```
 
-## Wiki Synthesis
+## Wiki Fact Curation
 
-PKM Brain maintains two wiki layers:
+The active wiki maintenance path is the Chief-of-Staff facts/pages workflow. Raw sources remain immutable evidence; extracted facts are the durable knowledge layer; managed wiki pages are deterministic projections from active facts.
 
-- LLM-compiled semantic pages under `~/brain/wiki/projects/`, `concepts/`, `decisions/`, `people/`, `open_loops/`, and `timelines/`
-- source-backed reference pages under `~/brain/wiki/references/<source_type>/`
-
-This follows [Karpathy's LLM Wiki pattern](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f): raw sources remain immutable, while the LLM maintains a persistent, interlinked Markdown wiki that compounds over time. The compiled pages are the intended human-readable wiki. They group evidence across sources, cite document IDs, and link related concepts with Obsidian-style wikilinks. Reference pages are provenance aids for inspecting a single ingested source.
-
-Preview generated pages:
+Preview a one-time migration from existing wiki pages into fact records:
 
 ```bash
-uv run brain wiki synthesize --dry-run
+uv run brain wiki migrate-to-facts --dry-run
 ```
 
-The LLM compiler asks the LLM to select the source documents for each semantic synthesis pass instead of simply taking the latest documents. It sends bounded candidate cards with a soft preference for user-supplied/manual sources, meetings, notes, transcripts, web clips, and working documents. Agent logs remain available when they are directly relevant, such as implementation history, workflow preferences, or failure patterns. Dry-run output includes `llm_compile.source_selection` with candidate counts, selected source IDs, selected/dropped counts by type, selector rationale, and selector warnings.
-
-Create or update generated wiki pages with the default Codex-backed LLM compiler:
+Apply that migration after review:
 
 ```bash
-uv run brain wiki synthesize
+uv run brain wiki migrate-to-facts --apply
 ```
 
-Disable the LLM compiler for a deterministic reference/index/log pass:
+Regenerate managed wiki pages from the active fact ledger:
 
 ```bash
-uv run brain wiki synthesize --no-llm
-uv run brain automation nightly --no-llm-wiki
+uv run brain wiki curate-facts
 ```
 
-Generated semantic pages are written under:
+Allow regeneration to overwrite existing managed pages:
 
-```text
-~/brain/wiki/index.md
-~/brain/wiki/log.md
-~/brain/wiki/projects/
-~/brain/wiki/concepts/
-~/brain/wiki/decisions/
-~/brain/wiki/people/
-~/brain/wiki/open_loops/
-~/brain/wiki/timelines/
+```bash
+uv run brain wiki curate-facts --overwrite-existing
 ```
 
-Generated reference pages are written under:
+Promote resolved curation state from a reviewed fork:
 
-```text
-~/brain/wiki/references/<source_type>/
+```bash
+uv run brain wiki promote-curation --source-home /path/to/forked-brain --dry-run
 ```
 
-The default compiler is LLM-backed and conservative:
+Managed pages are written under `~/brain/wiki/` with generated frontmatter and source/fact IDs. Human-owned pages are not silently overwritten by the agent-facing MCP surface.
 
-- routes through the local `codex` provider unless another provider is specified
-- creates or updates generated semantic pages automatically when confidence is high enough
-- sends low-confidence, human-edited, or otherwise risky page replacements to the wiki proposal workflow
-- cites source document IDs on generated semantic pages
-- uses `[[path/to/page]]` wikilinks for related pages
-- keeps noisy source excerpts in reference pages rather than concept pages
-- skips hand-edited pages that do not contain the generated marker
+## Archived Legacy Wiki Proposal Workflow
 
-## Unapproved Wiki Proposals
-
-Agents and optional nightly LLM jobs can propose wiki changes without directly editing approved Markdown pages.
-
-Proposal state lives in SQLite:
+Earlier versions supported unapproved wiki proposal batches with interview/apply commands. That workflow is retired from active UI, CLI, MCP, and nightly paths. The SQLite tables remain for migration and audit compatibility:
 
 ```text
 wiki_change_batches
@@ -643,50 +614,7 @@ wiki_change_items
 wiki_interviews
 ```
 
-The workflow is:
-
-```text
-agent or nightly LLM proposes a batch
-  -> status: proposed or needs_interview
-  -> human runs an interview/review
-  -> status: approved or rejected
-  -> approved batch patches wiki sections or whole generated pages
-  -> status: applied
-```
-
-List and inspect proposals:
-
-```bash
-uv run brain wiki proposals list
-uv run brain wiki proposals inspect <batch_id>
-```
-
-Interview, reject, or apply:
-
-```bash
-uv run brain wiki interview <batch_id>
-uv run brain wiki proposals reject <batch_id>
-uv run brain wiki apply <batch_id>
-```
-
-Generate proposals from recent sources with an LLM provider:
-
-```bash
-uv run brain wiki propose-from-sources --provider codex
-uv run brain wiki propose-from-sources --provider openai
-uv run brain wiki propose-from-sources --provider anthropic
-uv run brain wiki propose-from-sources --provider ollama
-```
-
-Enable proposal generation during nightly maintenance:
-
-```bash
-uv run brain automation nightly --with-llm-wiki-proposals --provider codex
-```
-
-LLM semantic wiki compilation is already on by default during nightly maintenance. `--with-llm-wiki-proposals` is still available as an extra proposal-only pass; if that flag is set and the provider is not configured, the nightly run fails.
-
-Agents can also create proposals through MCP with `propose_wiki_update`.
+Current source-to-knowledge curation flows through generated semantic wiki pages, reviewed memories, and the chief-of-staff facts/actions/pages architecture. Agents can propose memories through MCP, but they cannot create or apply wiki proposal batches through MCP.
 
 ## Reviewed Failure Memories
 
@@ -736,19 +664,21 @@ This creates only `proposed` memories. Future agents should use `active_memories
 
 ### LLM Provider Configuration
 
-Normal capture, ingest, search, MCP retrieval, and sync do not call an LLM. Wiki semantic compilation is LLM-backed by default, and the provider is also used by commands that generate unapproved proposal drafts, such as:
+Normal capture, ingest, search, MCP retrieval, wiki fact curation, and sync do not call an LLM. The provider is used by commands that generate unreviewed memory proposal drafts, such as:
 
 ```bash
-uv run brain wiki synthesize
-uv run brain automation nightly
 uv run brain memory propose-from-sources
 uv run brain memory propose-from-lineage
-uv run brain wiki propose-from-sources
-uv run brain automation nightly --with-llm-wiki-proposals
 uv run brain automation nightly --with-llm-memory-proposals
 ```
 
 `codex` is the default provider when no provider is specified. That path shells out to the local Codex CLI. If the Codex CLI is signed in with ChatGPT, usage is handled by the ChatGPT/Codex account rather than by an `OPENAI_API_KEY`. The `openai` and `anthropic` providers call paid API endpoints directly; use them only when API billing is intended. `ollama` stays local.
+
+Chief-of-Staff sampled audits stay in `mode: stub` by default. To run configured audits, set a separate auditor provider so the audit role can be independent from proposal generation:
+
+```bash
+export PKM_BRAIN_LLM_AUDITOR_PROVIDER=codex
+```
 
 Check provider configuration without printing secrets:
 
@@ -772,7 +702,7 @@ export PKM_BRAIN_CODEX_CWD=~/pkm-brain
 export PKM_BRAIN_CODEX_TIMEOUT_SECONDS=900
 ```
 
-The Codex provider runs `codex exec` in read-only, non-interactive mode and captures the final message as JSON. It can create unapproved wiki proposal batches, but it cannot directly patch approved wiki Markdown. If the selected model is unavailable to the local Codex account, Brain tries the fallback list in order.
+The Codex provider runs `codex exec` in read-only, non-interactive mode and captures the final message as JSON. It can synthesize generated wiki pages and create unreviewed memory proposals, but it cannot approve memories or mutate human-owned wiki pages through MCP. If the selected model is unavailable to the local Codex account, Brain tries the fallback list in order.
 
 OpenAI-compatible:
 
@@ -875,8 +805,8 @@ Implemented:
 - structured context retrieval
 - wiki schema linting
 - mechanical source-backed wiki reference synthesis
-- unapproved wiki proposal batches with interview/apply workflow
-- Codex CLI, OpenAI-compatible, Anthropic, and Ollama LLM provider adapters for wiki proposals
+- archived legacy `wiki_change_*` tables retained for migration and audit compatibility
+- Codex CLI, OpenAI-compatible, Anthropic, and Ollama LLM provider adapters for memory proposals and configured CoS audits
 - Codex `brain-memory` skill for persistent-memory activation through MCP
 - Claude Code `pkm-brain-memory` plugin for persistent-memory activation through MCP
 - reviewed memory proposal, audit, approve, reject, and archive commands

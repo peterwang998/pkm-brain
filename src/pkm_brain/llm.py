@@ -11,7 +11,12 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+
+import yaml
+
+if TYPE_CHECKING:
+    from .paths import BrainPaths
 
 DEFAULT_LLM_PROVIDER = "codex"
 OPENAI_DEFAULT_MODEL = "gpt-5.5"
@@ -20,7 +25,12 @@ ANTHROPIC_DEFAULT_MODEL = "claude-sonnet-4-5"
 ANTHROPIC_DEFAULT_FALLBACK_MODELS: tuple[str, ...] = ()
 CODEX_DEFAULT_MODEL = "gpt-5.5"
 CODEX_DEFAULT_FALLBACK_MODELS = ("gpt-5.4", "gpt-5.3-codex", "gpt-5.2", "gpt-5")
-LLM_ROLES = {"extractor", "gardener", "resolver", "critic", "synthesizer", "auditor"}
+LLM_ROLE_ORDER = ("extractor", "resolver", "gardener", "synthesizer", "critic", "auditor")
+LLM_ROLES = set(LLM_ROLE_ORDER)
+COS_PROPOSER_ROLES = ("extractor", "resolver", "gardener", "synthesizer")
+COS_REVIEWER_ROLES = ("critic", "auditor")
+COS_LLM_CONFIG_FILENAME = "cos_llm.yaml"
+VALID_PROVIDERS = {"openai", "anthropic", "ollama", "codex"}
 
 
 class LLMConfigurationError(RuntimeError):
@@ -47,7 +57,23 @@ class ProviderStatus:
     missing: list[str]
     base_url: str | None = None
     fallback_models: list[str] | None = None
+    reasoning_effort: str | None = None
     cost_source: str | None = None
+
+
+@dataclass(frozen=True)
+class CosRoleSelection:
+    role: str
+    provider: str | None
+    provider_source: str | None
+    model: str | None = None
+    model_source: str | None = None
+    model_fallbacks: list[str] | None = None
+    fallback_source: str | None = None
+    reasoning_effort: str | None = None
+    reasoning_effort_source: str | None = None
+    base_url: str | None = None
+    base_url_source: str | None = None
 
 
 class OpenAIProvider:
@@ -178,6 +204,9 @@ class CodexProvider:
         self.binary = os.environ.get("PKM_BRAIN_CODEX_BIN") or shutil.which("codex")
         self.cwd = Path(os.environ.get("PKM_BRAIN_CODEX_CWD", Path.cwd())).expanduser()
         self.timeout = int(os.environ.get("PKM_BRAIN_CODEX_TIMEOUT_SECONDS", "900"))
+        self.reasoning_effort = normalized_reasoning_effort(
+            os.environ.get("PKM_BRAIN_CODEX_REASONING_EFFORT")
+        )
         if not self.binary:
             raise LLMConfigurationError("codex executable was not found; install/login to Codex CLI first")
         missing = codex_missing_configuration(self.binary)
@@ -194,6 +223,7 @@ class CodexProvider:
                 self.binary,
                 "--ask-for-approval",
                 "never",
+                *codex_reasoning_effort_args(self.reasoning_effort),
                 "exec",
                 "--sandbox",
                 "read-only",
@@ -252,7 +282,7 @@ def provider_status(provider: str | None = None, *, role: str | None = None) -> 
 
 
 def _provider_status_for_selected(selected: str) -> dict[str, Any]:
-    if selected not in {"openai", "anthropic", "ollama", "codex"}:
+    if selected not in VALID_PROVIDERS:
         return ProviderStatus(provider=selected or "unset", model=None, configured=False, missing=["valid provider"]).__dict__
     if selected == "openai":
         missing = [key for key in ["OPENAI_API_KEY"] if not os.environ.get(key)]
@@ -304,6 +334,9 @@ def _provider_status_for_selected(selected: str) -> dict[str, Any]:
             missing=missing,
             base_url=None,
             fallback_models=models[1:],
+            reasoning_effort=normalized_reasoning_effort(
+                os.environ.get("PKM_BRAIN_CODEX_REASONING_EFFORT")
+            ),
             cost_source="Codex CLI account; uses ChatGPT plan usage when Codex CLI is signed in with ChatGPT",
         ).__dict__
     models = model_candidates("PKM_BRAIN_OLLAMA_MODEL", "", "PKM_BRAIN_OLLAMA_MODEL_FALLBACKS", ())
@@ -314,9 +347,9 @@ def _provider_status_for_selected(selected: str) -> dict[str, Any]:
         configured=not missing,
         missing=missing,
         base_url=os.environ.get("PKM_BRAIN_OLLAMA_BASE_URL", "http://localhost:11434"),
-            fallback_models=models[1:],
-            cost_source="Local Ollama runtime",
-        ).__dict__
+        fallback_models=models[1:],
+        cost_source="Local Ollama runtime",
+    ).__dict__
 
 
 def selected_provider(provider: str | None = None, *, role: str | None = None) -> str:
@@ -331,10 +364,310 @@ def selected_provider(provider: str | None = None, *, role: str | None = None) -
     ).strip().lower()
 
 
-def role_env(role: str, suffix: str) -> str:
-    normalized = role.strip().upper()
-    if normalized.lower() not in LLM_ROLES:
+def cos_llm_config_path(paths: "BrainPaths") -> Path:
+    return paths.config_local / COS_LLM_CONFIG_FILENAME
+
+
+def load_cos_llm_config(paths: "BrainPaths") -> dict[str, Any]:
+    config_path = cos_llm_config_path(paths)
+    if not config_path.exists():
+        return {}
+    try:
+        parsed = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as exc:
+        raise LLMConfigurationError(f"{config_path} is not valid YAML: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise LLMConfigurationError(f"{config_path} must contain a YAML mapping")
+    return parsed
+
+
+def resolve_cos_role_selection(
+    paths: "BrainPaths",
+    role: str,
+    *,
+    provider: str | None = None,
+) -> CosRoleSelection:
+    normalized_role = normalize_llm_role(role)
+    config = load_cos_llm_config(paths)
+    default_config = normalize_cos_llm_role_config(config.get("default"))
+    role_config = cos_role_config_from_mapping(config, normalized_role)
+    provider_choice = first_configured_value(
+        (provider, "argument"),
+        (os.environ.get(role_env(normalized_role, "PROVIDER")), f"env:{role_env(normalized_role, 'PROVIDER')}"),
+        (role_config.get("provider"), f"config:roles.{normalized_role}.provider"),
+        (os.environ.get("PKM_BRAIN_LLM_PROVIDER"), "env:PKM_BRAIN_LLM_PROVIDER"),
+        (default_config.get("provider"), "config:default.provider"),
+    )
+    model_choice = first_configured_value(
+        (os.environ.get(role_env(normalized_role, "MODEL")), f"env:{role_env(normalized_role, 'MODEL')}"),
+        (role_config.get("model"), f"config:roles.{normalized_role}.model"),
+        (default_config.get("model"), "config:default.model"),
+    )
+    fallback_choice = first_model_fallbacks_value(
+        (os.environ.get(role_env(normalized_role, "MODEL_FALLBACKS")), f"env:{role_env(normalized_role, 'MODEL_FALLBACKS')}"),
+        (role_config.get("model_fallbacks"), f"config:roles.{normalized_role}.model_fallbacks"),
+        (default_config.get("model_fallbacks"), "config:default.model_fallbacks"),
+    )
+    effort_choice = first_configured_value(
+        (os.environ.get(role_env(normalized_role, "REASONING_EFFORT")), f"env:{role_env(normalized_role, 'REASONING_EFFORT')}"),
+        (role_config.get("reasoning_effort"), f"config:roles.{normalized_role}.reasoning_effort"),
+        (default_config.get("reasoning_effort"), "config:default.reasoning_effort"),
+    )
+    base_url_choice = first_configured_value(
+        (os.environ.get(role_env(normalized_role, "BASE_URL")), f"env:{role_env(normalized_role, 'BASE_URL')}"),
+        (role_config.get("base_url"), f"config:roles.{normalized_role}.base_url"),
+        (default_config.get("base_url"), "config:default.base_url"),
+    )
+    provider_name = normalize_provider_name(provider_choice[0]) if provider_choice[0] is not None else None
+    return CosRoleSelection(
+        role=normalized_role,
+        provider=provider_name,
+        provider_source=provider_choice[1],
+        model=str(model_choice[0]).strip() if model_choice[0] is not None else None,
+        model_source=model_choice[1],
+        model_fallbacks=fallback_choice[0],
+        fallback_source=fallback_choice[1],
+        reasoning_effort=normalized_reasoning_effort(effort_choice[0]),
+        reasoning_effort_source=effort_choice[1],
+        base_url=str(base_url_choice[0]).strip() if base_url_choice[0] is not None else None,
+        base_url_source=base_url_choice[1],
+    )
+
+
+def cos_role_config_from_mapping(config: dict[str, Any], role: str) -> dict[str, Any]:
+    roles = config.get("roles")
+    role_config: dict[str, Any] = {}
+    if isinstance(roles, dict):
+        role_config.update(normalize_cos_llm_role_config(roles.get(role)))
+    role_config.update(normalize_cos_llm_role_config(config.get(role)))
+    return role_config
+
+
+def normalize_cos_llm_role_config(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    output: dict[str, Any] = {}
+    for key in ("provider", "model", "model_fallbacks", "base_url", "reasoning_effort"):
+        if key in value and value[key] is not None:
+            output[key] = value[key]
+    if "fallback_models" in value and "model_fallbacks" not in output:
+        output["model_fallbacks"] = value["fallback_models"]
+    return output
+
+
+def first_configured_value(*candidates: tuple[Any, str]) -> tuple[Any | None, str | None]:
+    for value, source in candidates:
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        return value, source
+    return None, None
+
+
+def first_model_fallbacks_value(*candidates: tuple[Any, str]) -> tuple[list[str] | None, str | None]:
+    for value, source in candidates:
+        parsed = parse_model_fallbacks_value(value)
+        if parsed is not None:
+            return parsed, source
+    return None, None
+
+
+def parse_model_fallbacks_value(value: Any) -> list[str] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        parsed = split_model_list(value)
+        return parsed if parsed else None
+    if isinstance(value, list):
+        parsed = [str(item).strip() for item in value if str(item).strip()]
+        return parsed if parsed else None
+    return None
+
+
+def normalize_provider_name(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    return normalized or None
+
+
+def normalized_reasoning_effort(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if not normalized:
+        return None
+    allowed = {"minimal", "low", "medium", "high", "xhigh"}
+    if normalized not in allowed:
+        raise LLMConfigurationError(
+            f"reasoning_effort must be one of: {', '.join(sorted(allowed))}"
+        )
+    return normalized
+
+
+def codex_reasoning_effort_args(reasoning_effort: str | None) -> list[str]:
+    if not reasoning_effort:
+        return []
+    return ["-c", f'model_reasoning_effort="{reasoning_effort}"']
+
+
+def normalize_llm_role(role: str) -> str:
+    normalized = role.strip().lower()
+    if normalized not in LLM_ROLES:
         raise LLMConfigurationError(f"unknown LLM role: {role}")
+    return normalized
+
+
+@contextmanager
+def cos_role_provider_environment(selection: CosRoleSelection) -> Any:
+    if selection.provider is None:
+        yield
+        return
+    env_map = provider_model_env_names(selection.provider)
+    overrides: dict[str, str] = {}
+    if selection.model is not None and env_map.get("model"):
+        overrides[env_map["model"]] = selection.model
+    if selection.model_fallbacks is not None and env_map.get("fallbacks"):
+        overrides[env_map["fallbacks"]] = ",".join(selection.model_fallbacks)
+    if selection.reasoning_effort is not None and env_map.get("reasoning_effort"):
+        overrides[env_map["reasoning_effort"]] = selection.reasoning_effort
+    if selection.base_url is not None and env_map.get("base_url"):
+        overrides[env_map["base_url"]] = selection.base_url
+    previous = {key: os.environ.get(key) for key in overrides}
+    try:
+        for key, value in overrides.items():
+            os.environ[key] = value
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def cos_role_provider_configured(
+    paths: "BrainPaths",
+    role: str,
+    *,
+    llm_provider: LLMProvider | None = None,
+    provider: str | None = None,
+) -> bool:
+    if llm_provider is not None:
+        return True
+    return resolve_cos_role_selection(paths, role, provider=provider).provider is not None
+
+
+def get_cos_role_provider(
+    paths: "BrainPaths",
+    role: str,
+    *,
+    provider: str | None = None,
+    llm_provider: LLMProvider | None = None,
+) -> LLMProvider | None:
+    if llm_provider is not None:
+        return llm_provider
+    selection = resolve_cos_role_selection(paths, role, provider=provider)
+    if selection.provider is None:
+        return None
+    with cos_role_provider_environment(selection):
+        return get_provider(selection.provider, role=role)
+
+
+def cos_provider_status(paths: "BrainPaths") -> dict[str, Any]:
+    role_rows = [cos_role_provider_status(paths, role) for role in LLM_ROLE_ORDER]
+    warnings = cos_provider_separation_warnings(role_rows)
+    return {
+        "config_path": str(cos_llm_config_path(paths)),
+        "config_exists": cos_llm_config_path(paths).exists(),
+        "roles": role_rows,
+        "warnings": warnings,
+        "errors": [],
+    }
+
+
+def cos_role_provider_status(paths: "BrainPaths", role: str) -> dict[str, Any]:
+    selection = resolve_cos_role_selection(paths, role)
+    if selection.provider is None:
+        return {
+            "role": selection.role,
+            "role_configured": False,
+            "configured": False,
+            "provider": None,
+            "provider_source": None,
+            "model": None,
+            "base_url": None,
+            "fallback_models": [],
+            "reasoning_effort": None,
+            "missing": [],
+            "cost_source": None,
+            "warnings": [],
+        }
+    with cos_role_provider_environment(selection):
+        status = _provider_status_for_selected(selection.provider)
+    return {
+        "role": selection.role,
+        "role_configured": True,
+        "configured": bool(status.get("configured")),
+        "provider": status.get("provider"),
+        "provider_source": selection.provider_source,
+        "model": status.get("model"),
+        "model_source": selection.model_source,
+        "base_url": status.get("base_url"),
+        "base_url_source": selection.base_url_source,
+        "fallback_models": status.get("fallback_models") or [],
+        "fallback_source": selection.fallback_source,
+        "reasoning_effort": status.get("reasoning_effort"),
+        "reasoning_effort_source": selection.reasoning_effort_source,
+        "missing": status.get("missing") or [],
+        "cost_source": status.get("cost_source"),
+        "warnings": [],
+    }
+
+
+def cos_provider_separation_warnings(role_rows: list[dict[str, Any]]) -> list[str]:
+    by_role = {str(row["role"]): row for row in role_rows}
+    warnings: list[str] = []
+    for reviewer in COS_REVIEWER_ROLES:
+        reviewer_row = by_role.get(reviewer)
+        if not row_has_provider_model(reviewer_row):
+            continue
+        for proposer in COS_PROPOSER_ROLES:
+            proposer_row = by_role.get(proposer)
+            if not row_has_provider_model(proposer_row):
+                continue
+            if same_provider_model(reviewer_row, proposer_row):
+                warnings.append(
+                    f"{reviewer} uses the same provider/model as {proposer}; "
+                    "separation of duties is not independent"
+                )
+    critic = by_role.get("critic")
+    auditor = by_role.get("auditor")
+    if row_has_provider_model(critic) and row_has_provider_model(auditor) and same_provider_model(critic, auditor):
+        warnings.append("critic and auditor use the same provider/model; audit independence is reduced")
+    for warning in warnings:
+        for row in role_rows:
+            if str(row["role"]) in warning:
+                row.setdefault("warnings", []).append(warning)
+    return warnings
+
+
+def row_has_provider_model(row: dict[str, Any] | None) -> bool:
+    return bool(row and row.get("role_configured") and row.get("provider") and row.get("model"))
+
+
+def same_provider_model(left: dict[str, Any] | None, right: dict[str, Any] | None) -> bool:
+    return bool(
+        left
+        and right
+        and left.get("provider") == right.get("provider")
+        and left.get("model") == right.get("model")
+    )
+
+
+def role_env(role: str, suffix: str) -> str:
+    normalized = normalize_llm_role(role).upper()
     return f"PKM_BRAIN_LLM_{normalized}_{suffix}"
 
 
@@ -345,12 +678,20 @@ def role_model_environment(provider: str, role: str | None) -> Any:
         return
     model = os.environ.get(role_env(role, "MODEL"))
     fallbacks = os.environ.get(role_env(role, "MODEL_FALLBACKS"))
+    reasoning_effort = os.environ.get(role_env(role, "REASONING_EFFORT"))
+    base_url = os.environ.get(role_env(role, "BASE_URL"))
     env_map = provider_model_env_names(provider)
     overrides: dict[str, str] = {}
     if model is not None and env_map.get("model"):
         overrides[env_map["model"]] = model
     if fallbacks is not None and env_map.get("fallbacks"):
         overrides[env_map["fallbacks"]] = fallbacks
+    if reasoning_effort is not None and env_map.get("reasoning_effort"):
+        normalized_effort = normalized_reasoning_effort(reasoning_effort)
+        if normalized_effort:
+            overrides[env_map["reasoning_effort"]] = normalized_effort
+    if base_url is not None and env_map.get("base_url"):
+        overrides[env_map["base_url"]] = base_url
     previous = {key: os.environ.get(key) for key in overrides}
     try:
         for key, value in overrides.items():
@@ -366,13 +707,29 @@ def role_model_environment(provider: str, role: str | None) -> Any:
 
 def provider_model_env_names(provider: str) -> dict[str, str]:
     if provider == "openai":
-        return {"model": "PKM_BRAIN_OPENAI_MODEL", "fallbacks": "PKM_BRAIN_OPENAI_MODEL_FALLBACKS"}
+        return {
+            "model": "PKM_BRAIN_OPENAI_MODEL",
+            "fallbacks": "PKM_BRAIN_OPENAI_MODEL_FALLBACKS",
+            "base_url": "PKM_BRAIN_OPENAI_BASE_URL",
+        }
     if provider == "anthropic":
-        return {"model": "PKM_BRAIN_ANTHROPIC_MODEL", "fallbacks": "PKM_BRAIN_ANTHROPIC_MODEL_FALLBACKS"}
+        return {
+            "model": "PKM_BRAIN_ANTHROPIC_MODEL",
+            "fallbacks": "PKM_BRAIN_ANTHROPIC_MODEL_FALLBACKS",
+            "base_url": "PKM_BRAIN_ANTHROPIC_BASE_URL",
+        }
     if provider == "ollama":
-        return {"model": "PKM_BRAIN_OLLAMA_MODEL", "fallbacks": "PKM_BRAIN_OLLAMA_MODEL_FALLBACKS"}
+        return {
+            "model": "PKM_BRAIN_OLLAMA_MODEL",
+            "fallbacks": "PKM_BRAIN_OLLAMA_MODEL_FALLBACKS",
+            "base_url": "PKM_BRAIN_OLLAMA_BASE_URL",
+        }
     if provider == "codex":
-        return {"model": "PKM_BRAIN_CODEX_MODEL", "fallbacks": "PKM_BRAIN_CODEX_MODEL_FALLBACKS"}
+        return {
+            "model": "PKM_BRAIN_CODEX_MODEL",
+            "fallbacks": "PKM_BRAIN_CODEX_MODEL_FALLBACKS",
+            "reasoning_effort": "PKM_BRAIN_CODEX_REASONING_EFFORT",
+        }
     return {}
 
 
@@ -383,11 +740,23 @@ def complete_json(
     provider: str | None = None,
     role: str | None = None,
     llm_provider: LLMProvider | None = None,
+    paths: "BrainPaths | None" = None,
     max_attempts: int = 2,
 ) -> dict[str, Any]:
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1")
-    active_provider = llm_provider or get_provider(provider, role=role)
+    if llm_provider is not None:
+        active_provider = llm_provider
+    elif role is not None:
+        if paths is None:
+            from .paths import BrainPaths
+
+            paths = BrainPaths.from_value(None)
+        active_provider = get_cos_role_provider(paths, role, provider=provider)
+        if active_provider is None:
+            raise LLMConfigurationError(f"No CoS LLM provider configured for role: {role}")
+    else:
+        active_provider = get_provider(provider, role=role)
     current_prompt = json_prompt(prompt, schema=schema)
     last_response = ""
     last_error: Exception | None = None

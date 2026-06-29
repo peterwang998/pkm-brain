@@ -22,13 +22,15 @@ from .automation import (
     uninstall_launch_agent,
     uninstall_nightly_launch_agent,
     run_agent_log_ingest,
+    run_cos_once,
     run_nightly_maintenance,
     run_secondary_tick,
 )
 from .capture import AgentLogCapture
 from .db import connection, rows
 from .evals import run_eval
-from .llm import provider_status
+from .cos_policy import promote_policy_for_autonomy
+from .llm import cos_provider_status, provider_status
 from .memory_proposals import propose_failure_memories_from_sources, propose_memories_from_lineage
 from .mcp_server import create_mcp
 from .paths import BrainPaths
@@ -58,6 +60,7 @@ wiki_app = typer.Typer(help="Wiki commands.")
 memory_app = typer.Typer(help="Typed memory commands.")
 context_app = typer.Typer(help="Context lineage and feedback commands.")
 llm_app = typer.Typer(help="LLM provider commands.")
+cos_app = typer.Typer(help="Chief-of-Staff commands.")
 eval_app = typer.Typer(help="Chief-of-Staff eval commands.")
 runs_app = typer.Typer(help="Pipeline run commands.")
 provenance_app = typer.Typer(help="Provenance validation commands.")
@@ -73,6 +76,7 @@ app.add_typer(wiki_app, name="wiki")
 app.add_typer(memory_app, name="memory")
 app.add_typer(context_app, name="context")
 app.add_typer(llm_app, name="llm")
+app.add_typer(cos_app, name="cos")
 app.add_typer(eval_app, name="eval")
 app.add_typer(runs_app, name="runs")
 app.add_typer(provenance_app, name="provenance")
@@ -622,6 +626,79 @@ def llm_doctor(provider: Optional[str] = typer.Option(None)) -> None:
     console.print_json(json.dumps(provider_status(provider)))
 
 
+@cos_app.command("providers")
+def cos_providers(
+    home: Optional[Path] = typer.Option(None, help="Brain home directory."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable provider status."),
+) -> None:
+    result = cos_provider_status(BrainPaths.from_value(home))
+    if json_output:
+        console.print_json(json.dumps(result))
+        return
+    table = Table(title="CoS LLM Providers")
+    table.add_column("Role")
+    table.add_column("Provider")
+    table.add_column("Model")
+    table.add_column("Effort")
+    table.add_column("Ready")
+    table.add_column("Source")
+    table.add_column("Missing")
+    for row in result["roles"]:
+        table.add_row(
+            str(row["role"]),
+            str(row.get("provider") or "unconfigured"),
+            str(row.get("model") or ""),
+            str(row.get("reasoning_effort") or ""),
+            "yes" if row.get("configured") else "no",
+            str(row.get("provider_source") or ""),
+            ", ".join(row.get("missing") or []),
+        )
+    console.print(f"Config: {result['config_path']} ({'present' if result['config_exists'] else 'absent'})")
+    console.print(table)
+    if result["warnings"]:
+        console.print("Warnings:")
+        for warning in result["warnings"]:
+            console.print(f"- {warning}")
+
+
+@cos_app.command("promote-policy")
+def cos_promote_policy(
+    reason: str = typer.Option("activate chief-of-staff low/medium autonomy", "--reason"),
+    large_topology_fact_threshold: int = typer.Option(8, "--large-topology-fact-threshold"),
+    yes: bool = typer.Option(False, "--yes", help="Confirm policy promotion non-interactively."),
+    home: Optional[Path] = typer.Option(None, help="Brain home directory."),
+) -> None:
+    if not yes:
+        typer.confirm("Create a new active CoS autonomy policy version?", abort=True)
+    paths = BrainPaths.from_value(home)
+    BrainService(paths).init_workspace()
+    with connection(paths.sqlite_path) as conn:
+        version = promote_policy_for_autonomy(
+            conn,
+            reason=reason,
+            large_topology_fact_threshold=large_topology_fact_threshold,
+        )
+    console.print_json(
+        json.dumps(
+            {
+                "status": "ok",
+                "policy_version": version,
+                "large_topology_fact_threshold": large_topology_fact_threshold,
+            }
+        )
+    )
+
+
+@cos_app.command("run")
+def cos_run(
+    llm_wiki: bool = typer.Option(True, "--llm-wiki/--no-llm-wiki"),
+    home: Optional[Path] = typer.Option(None, help="Brain home directory."),
+) -> None:
+    paths = BrainPaths.from_value(home)
+    result = run_cos_once(paths, llm_wiki=llm_wiki)
+    console.print_json(json.dumps(result))
+
+
 @memory_app.command("propose")
 def memory_propose(
     memory_type: str,
@@ -1142,7 +1219,11 @@ def automation_nightly(
     include_hyprnote: bool = typer.Option(False, "--include-hyprnote", help="Include Hyprnote when --agent all is used."),
     hyprnote_root: Optional[Path] = typer.Option(None, help="Hyprnote root directory."),
     with_llm_memory_proposals: bool = typer.Option(False, "--with-llm-memory-proposals"),
-    llm_wiki: bool = typer.Option(True, "--llm-wiki/--no-llm-wiki"),
+    llm_wiki: bool = typer.Option(
+        True,
+        "--llm-wiki/--no-llm-wiki",
+        help="Enable shadow CoS wiki synthesis when a synthesizer provider is configured.",
+    ),
     provider: Optional[str] = typer.Option(None),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
@@ -1266,7 +1347,11 @@ def launch_agent_install_nightly(
     interval: int = typer.Option(3600, help="Wake-check interval in seconds."),
     due_after_hours: int = typer.Option(20, help="Minimum hours between successful nightly runs."),
     with_llm_memory_proposals: bool = typer.Option(False, "--with-llm-memory-proposals"),
-    llm_wiki: bool = typer.Option(True, "--llm-wiki/--no-llm-wiki"),
+    llm_wiki: bool = typer.Option(
+        True,
+        "--llm-wiki/--no-llm-wiki",
+        help="Enable shadow CoS wiki synthesis when a synthesizer provider is configured.",
+    ),
     provider: Optional[str] = typer.Option(None, help="LLM provider for proposals: codex, openai, anthropic, or ollama."),
     dry_run: bool = typer.Option(False, "--dry-run"),
     home: Optional[Path] = typer.Option(None),
@@ -1303,7 +1388,11 @@ def launch_agent_render_nightly(
     interval: int = typer.Option(3600),
     due_after_hours: int = typer.Option(20),
     with_llm_memory_proposals: bool = typer.Option(False, "--with-llm-memory-proposals"),
-    llm_wiki: bool = typer.Option(True, "--llm-wiki/--no-llm-wiki"),
+    llm_wiki: bool = typer.Option(
+        True,
+        "--llm-wiki/--no-llm-wiki",
+        help="Enable shadow CoS wiki synthesis when a synthesizer provider is configured.",
+    ),
     provider: Optional[str] = typer.Option(None, help="LLM provider for proposals: codex, openai, anthropic, or ollama."),
     home: Optional[Path] = typer.Option(None),
 ) -> None:

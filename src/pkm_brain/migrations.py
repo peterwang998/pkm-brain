@@ -580,6 +580,32 @@ def _migration_016_context_lineage_fact_target(conn: sqlite3.Connection) -> None
     )
 
 
+def _migration_017_create_cos_stage_watermarks(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cos_stage_watermarks (
+          id TEXT PRIMARY KEY,
+          stage TEXT NOT NULL,
+          document_id TEXT NOT NULL,
+          content_hash TEXT NOT NULL,
+          model TEXT,
+          prompt_version TEXT NOT NULL,
+          status TEXT NOT NULL,
+          run_id TEXT,
+          processed_at TEXT NOT NULL,
+          metadata TEXT NOT NULL DEFAULT '{}',
+          UNIQUE(stage, document_id, content_hash, model, prompt_version)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_cos_stage_watermarks_stage_doc
+        ON cos_stage_watermarks(stage, document_id, status)
+        """
+    )
+
+
 MIGRATIONS: list[Migration] = [
     (1, "add_origin_identity", _migration_001_add_origin_identity),
     (2, "create_sync_runs", _migration_002_create_sync_runs),
@@ -601,6 +627,7 @@ MIGRATIONS: list[Migration] = [
     (14, "extend_open_questions", _migration_014_extend_open_questions),
     (15, "create_shared_retrieval_fts", _migration_015_create_shared_retrieval_fts),
     (16, "context_lineage_fact_target", _migration_016_context_lineage_fact_target),
+    (17, "create_cos_stage_watermarks", _migration_017_create_cos_stage_watermarks),
 ]
 
 

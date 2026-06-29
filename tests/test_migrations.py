@@ -7,7 +7,7 @@ from pkm_brain.db import connection, init_db
 from pkm_brain.migrations import run_migrations
 
 
-EXPECTED_MIGRATIONS = list(range(1, 17))
+EXPECTED_MIGRATIONS = list(range(1, 18))
 
 
 def test_fresh_db_applies_registered_migrations(tmp_path: Path) -> None:
@@ -56,6 +56,10 @@ def test_fresh_db_applies_registered_migrations(tmp_path: Path) -> None:
         }
         retrieval_fts_columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(retrieval_fts)")
+        }
+        watermark_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(cos_stage_watermarks)")
         }
 
     assert versions == EXPECTED_MIGRATIONS
@@ -118,6 +122,9 @@ def test_fresh_db_applies_registered_migrations(tmp_path: Path) -> None:
         synthesis_columns
     )
     assert {"kind", "target_id", "title", "text"}.issubset(retrieval_fts_columns)
+    assert {"stage", "document_id", "content_hash", "model", "prompt_version", "status"}.issubset(
+        watermark_columns
+    )
 
 
 def test_migrations_rerun_is_noop(tmp_path: Path) -> None:

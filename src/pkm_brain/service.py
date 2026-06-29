@@ -165,6 +165,7 @@ CONTEXT_CHUNK_SCORE_FLOOR = 12.0
 WIKI_PAGE_SCORE_FLOOR = 12.0
 FOUND_CHUNK_SCORE = 24.0
 FOUND_WIKI_SCORE = 24.0
+FOUND_FACT_SCORE = 18.0
 MEMORY_ACTIVE_SCORE_FLOOR = 1
 MEMORY_CANDIDATE_SCORE_FLOOR = 2
 FACT_SCORE_FLOOR = 12.0
@@ -173,6 +174,31 @@ FACT_FTS_SCORE_CAP = 12.0
 FACT_CANDIDATE_MULTIPLIER = 4
 FACT_KNEE_DROP = 10.0
 FACT_KNEE_MIN_RANK = 3
+NEGATIVE_CONTROL_CONTEXT_MARKERS = (
+    "negative control",
+    "negative-control",
+    "fake topic",
+    "fake topics",
+    "absent topic",
+    "absent topics",
+    "likely absent",
+    "should not be in brain",
+    "no_strong_match",
+)
+NEGATIVE_CONTROL_QUERY_TERMS = {
+    "absent",
+    "control",
+    "controls",
+    "eval",
+    "evaluation",
+    "fake",
+    "fixture",
+    "fixtures",
+    "negative",
+    "retrieval",
+    "topic",
+    "topics",
+}
 MAX_CHUNKS_PER_DOCUMENT = 2
 MANAGED_WIKI_BOOST = 8.0
 SEMANTIC_WIKI_BOOST = 3.0
@@ -1190,7 +1216,13 @@ class BrainService:
             + chunk_citation_snapshots(supporting_chunks)
             + wiki_page_citation_snapshots(wiki_pages)
         )
-        assessment = retrieval_assessment(supporting_chunks, wiki_pages, memories, candidate_memories)
+        assessment = retrieval_assessment(
+            supporting_chunks,
+            wiki_pages,
+            memories,
+            candidate_memories,
+            relevant_facts,
+        )
         event_id = new_id("retrieval")
         retrieval_debug = build_retrieval_debug(
             query,
@@ -2285,6 +2317,9 @@ def rerank_chunks(
             reasons.append(f"source_type {source_type} ({source_weight:+g})")
 
         noise_reasons = chunk_noise_reasons(candidate)
+        if retrieval_negative_control_fixture_mention(text_lower, terms, local_specific_hits):
+            noise_reasons.append("retrieval negative-control fixture")
+            noise_reasons = dedupe_preserve_order(noise_reasons)
         if noise_reasons:
             if agent_query:
                 penalty = 2.0
@@ -2452,27 +2487,39 @@ def retrieval_assessment(
     wiki_pages: list[dict[str, Any]],
     active_memories: list[dict[str, Any]],
     candidate_memories: list[dict[str, Any]],
+    relevant_facts: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    relevant_facts = relevant_facts or []
     top_chunk_score = max((float(row.get("retrieval_score") or 0.0) for row in chunks), default=0.0)
     top_wiki_score = max((float(row.get("score") or 0.0) for row in wiki_pages), default=0.0)
+    top_fact_score = max((float(row.get("retrieval_score") or 0.0) for row in relevant_facts), default=0.0)
     top_active_memory_score = max((int(row.get("memory_relevance_score") or 0) for row in active_memories), default=0)
     top_candidate_memory_score = max((int(row.get("memory_relevance_score") or 0) for row in candidate_memories), default=0)
-    signal = max(top_chunk_score, top_wiki_score, float(top_active_memory_score * 8), float(top_candidate_memory_score * 6))
+    signal = max(
+        top_chunk_score,
+        top_wiki_score,
+        top_fact_score,
+        float(top_active_memory_score * 8),
+        float(top_candidate_memory_score * 6),
+    )
     reasons = [
         f"top chunk score {top_chunk_score:.1f}",
         f"top wiki score {top_wiki_score:.1f}",
+        f"top fact score {top_fact_score:.1f} across {len(relevant_facts)} relevant facts",
         f"top active memory hits {top_active_memory_score}",
         f"top candidate memory hits {top_candidate_memory_score}",
     ]
     if (
         top_chunk_score >= FOUND_CHUNK_SCORE
         or top_wiki_score >= FOUND_WIKI_SCORE
+        or top_fact_score >= FOUND_FACT_SCORE
         or top_active_memory_score >= 2
     ):
         verdict = "found"
     elif (
         top_chunk_score >= CONTEXT_CHUNK_SCORE_FLOOR
         or top_wiki_score >= WIKI_PAGE_SCORE_FLOOR
+        or top_fact_score >= FACT_SCORE_FLOOR
         or top_active_memory_score >= MEMORY_ACTIVE_SCORE_FLOOR
         or top_candidate_memory_score >= MEMORY_CANDIDATE_SCORE_FLOOR
     ):
@@ -2665,6 +2712,19 @@ def chunk_noise_reasons(chunk: dict[str, Any]) -> list[str]:
     if "transcript" in heading or text_lower.startswith("## transcript"):
         reasons.append("raw transcript chunk")
     return dedupe_preserve_order(reasons)
+
+
+def retrieval_negative_control_fixture_mention(
+    text_lower: str, terms: list[str], local_specific_hits: list[str]
+) -> bool:
+    if not terms:
+        return False
+    if set(terms) & NEGATIVE_CONTROL_QUERY_TERMS:
+        return False
+    if not any(marker in text_lower for marker in NEGATIVE_CONTROL_CONTEXT_MARKERS):
+        return False
+    required_hits = max(3, len(terms) if len(terms) <= 4 else len(terms) - 1)
+    return len(set(local_specific_hits)) >= required_hits
 
 
 def recency_score(chunk: dict[str, Any]) -> tuple[float, str]:

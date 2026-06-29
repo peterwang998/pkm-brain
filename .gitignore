@@ -18,6 +18,7 @@ brain/
 data/
 indexes/
 logs/
+local-backups/
 
 # Tool caches
 .pytest_cache/

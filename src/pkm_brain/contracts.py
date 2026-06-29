@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from .cos_actions import apply_action, propose_action
@@ -7,6 +8,46 @@ from .db import connection, dumps, loads
 from .paths import BrainPaths
 from .util import new_id, now_iso
 from .wiki_facts import human_title_for_path, managed_fact_page_summaries
+
+
+CONTRACT_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_/-]{2,}")
+CONTRACT_STOP_TOKENS = {
+    "about",
+    "active",
+    "and",
+    "atomic",
+    "backed",
+    "better",
+    "canonical",
+    "contract",
+    "does",
+    "doesn",
+    "draft",
+    "entity",
+    "fact",
+    "facts",
+    "for",
+    "from",
+    "governed",
+    "here",
+    "include",
+    "maintained",
+    "managed",
+    "not",
+    "page",
+    "policy",
+    "routed",
+    "source",
+    "stale",
+    "summary",
+    "synthesis",
+    "that",
+    "the",
+    "this",
+    "uncited",
+    "using",
+    "what",
+}
 
 
 def active_page_contracts(paths: BrainPaths) -> list[dict[str, Any]]:
@@ -114,7 +155,70 @@ def validate_fact_against_contract(
             "reason": "fact page_hint does not match contract page_hint",
             "recommended_action": "rehome_fact_or_edit_contract",
         }
-    return {"valid": True, "reason": "page_hint matches active contract"}
+    fact_tokens = contract_signal_tokens(
+        fact.get("statement"),
+        fact.get("entity_key"),
+        fact.get("section_hint"),
+    )
+    belongs_tokens = contract_signal_tokens(
+        contract.get("canonical_entity"),
+        contract.get("page_scope"),
+        contract.get("retrieval_purpose"),
+        contract.get("what_belongs_here"),
+        contract.get("related_pages"),
+    )
+    excluded_tokens = contract_signal_tokens(contract.get("what_does_not_belong_here"))
+    belongs_overlap = sorted(fact_tokens & belongs_tokens)
+    excluded_overlap = sorted(fact_tokens & excluded_tokens)
+    score = token_overlap_score(fact_tokens, belongs_tokens)
+    if len(excluded_overlap) >= 2 and score < 0.35:
+        return {
+            "valid": False,
+            "reason": "fact content overlaps contract exclusions",
+            "recommended_action": "rehome_fact_or_edit_contract",
+            "contract_scope_score": round(score, 4),
+            "matched_contract_terms": belongs_overlap,
+            "matched_excluded_terms": excluded_overlap,
+        }
+    if len(belongs_tokens) >= 2 and not belongs_overlap:
+        return {
+            "valid": False,
+            "reason": "fact content does not match contract scope",
+            "recommended_action": "rehome_fact_or_edit_contract",
+            "contract_scope_score": 0.0,
+            "matched_contract_terms": [],
+            "matched_excluded_terms": excluded_overlap,
+        }
+    return {
+        "valid": True,
+        "reason": "fact matches active contract",
+        "contract_scope_score": round(score, 4),
+        "matched_contract_terms": belongs_overlap,
+        "matched_excluded_terms": excluded_overlap,
+    }
+
+
+def contract_signal_tokens(*values: Any) -> set[str]:
+    tokens: set[str] = set()
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple, set)):
+            text = " ".join(str(item) for item in value)
+        else:
+            text = str(value)
+        normalized = text.lower().replace("_", " ").replace("/", " ").replace("-", " ")
+        for token in CONTRACT_TOKEN_RE.findall(normalized):
+            if token in CONTRACT_STOP_TOKENS:
+                continue
+            tokens.add(token)
+    return tokens
+
+
+def token_overlap_score(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / min(len(left), len(right))
 
 
 def row_to_contract(row: Any) -> dict[str, Any]:

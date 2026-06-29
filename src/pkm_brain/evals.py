@@ -7,14 +7,18 @@ import re
 from typing import Any
 
 from .db import connection
+from .gardener import deterministic_topology_candidates, tokenize_signal
 from .paths import BrainPaths
 from .retrieval_fixtures import RETRIEVAL_GOLDEN_CASES
 from .service import BrainService
 from .util import new_id, now_iso
+from .wiki_facts import fact_is_auto_winner, fact_similarity_signals, facts_should_merge
 
 
 EVAL_SUITES = {"extraction", "routing", "topology", "conflict", "retrieval"}
 VERDICT_VALUES = {"no_strong_match": 0.0, "partial": 0.5, "found": 1.0}
+EXTRACTION_LABELS_FILENAME = "extraction_labels.jsonl"
+EXTRACTION_FALLBACK_PAGE_HINTS = {"concepts/extracted-facts.md"}
 
 
 def run_eval(
@@ -83,24 +87,184 @@ def run_eval_suite(paths: BrainPaths, suite: str) -> dict[str, Any]:
 
 def extraction_eval(paths: BrainPaths) -> dict[str, Any]:
     with connection(paths.sqlite_path) as conn:
-        total = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+        total_facts = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+        total = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM facts
+            WHERE COALESCE(extraction_method, 'legacy') != 'legacy'
+            """
+        ).fetchone()[0]
         with_spans = conn.execute(
             """
             SELECT COUNT(*)
             FROM facts
-            WHERE source_spans IS NOT NULL
+            WHERE COALESCE(extraction_method, 'legacy') != 'legacy'
+              AND source_spans IS NOT NULL
               AND source_spans != ''
               AND source_spans != '[]'
             """
         ).fetchone()[0]
-    precision = 1.0 if total == 0 else with_spans / total
+    label_cases = load_extraction_label_cases(paths)
+    label_metrics, label_reports, label_passed = evaluate_extraction_label_cases(label_cases)
+    threshold = {
+        "span_coverage": 0.8,
+        "auto_support_precision": 1.0,
+        "auto_route_accuracy": 1.0,
+        "fallback_auto_eligible_count": 0,
+        "unsupported_auto_eligible_count": 0,
+        "route_mismatch_auto_eligible_count": 0,
+        "min_auto_eligible_count": 1,
+    }
+    legacy_excluded = total_facts - total
+    if total_facts == 0 and not label_cases:
+        return suite_report(
+            "extraction",
+            fixture_count=0,
+            metrics={
+                "skipped": True,
+                "reason": "no facts to evaluate",
+                **label_metrics,
+            },
+            passed=True,
+            threshold=threshold,
+        )
+    span_coverage = with_spans / total if total else 1.0
+    span_passed = span_coverage >= threshold["span_coverage"]
+    metrics = {
+        "span_coverage": span_coverage,
+        "eligible_fact_count": total,
+        "legacy_excluded_count": legacy_excluded,
+        **label_metrics,
+    }
+    if total == 0:
+        metrics["policy"] = "legacy facts are excluded from extraction span coverage"
     return suite_report(
         "extraction",
-        fixture_count=total,
-        metrics={"span_coverage": precision},
-        passed=precision >= 0.0,
-        threshold={"span_coverage": 0.8},
+        fixture_count=max(total, len(label_cases)),
+        metrics=metrics,
+        passed=span_passed and (label_passed if label_cases else True),
+        threshold=threshold,
+        cases=label_reports if label_cases else None,
     )
+
+
+def load_extraction_label_cases(paths: BrainPaths) -> list[dict[str, Any]]:
+    label_path = paths.evals / EXTRACTION_LABELS_FILENAME
+    if not label_path.exists():
+        return []
+    cases: list[dict[str, Any]] = []
+    for line_number, raw_line in enumerate(label_path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parsed = json.loads(line)
+        if not isinstance(parsed, dict):
+            raise ValueError(f"{label_path}:{line_number} must be a JSON object")
+        parsed.setdefault("id", f"line_{line_number}")
+        cases.append(parsed)
+    return cases
+
+
+def evaluate_extraction_label_cases(
+    cases: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]], bool]:
+    if not cases:
+        return {
+            "label_policy": "unlabeled",
+            "label_case_count": 0,
+            "label_file": f"evals/{EXTRACTION_LABELS_FILENAME}",
+        }, [], False
+    reports = [evaluate_extraction_label_case(case) for case in cases]
+    auto_reports = [report for report in reports if report["auto_eligible"]]
+    keep_reports = [report for report in reports if report["keep"]]
+    unsupported_auto = [report["id"] for report in auto_reports if not report["supported_by_quote"]]
+    route_mismatch_auto = [report["id"] for report in auto_reports if not report["route_correct"]]
+    fallback_auto = [report["id"] for report in auto_reports if report["fallback_route"]]
+    metrics = {
+        "label_policy": "labeled",
+        "label_file": f"evals/{EXTRACTION_LABELS_FILENAME}",
+        "label_case_count": len(reports),
+        "keep_count": len(keep_reports),
+        "auto_eligible_count": len(auto_reports),
+        "keep_precision": round(ratio(len(keep_reports), len(reports)), 3),
+        "auto_support_precision": round(
+            ratio(
+                len([report for report in auto_reports if report["supported_by_quote"]]),
+                len(auto_reports),
+            ),
+            3,
+        ),
+        "auto_route_accuracy": round(
+            ratio(
+                len([report for report in auto_reports if report["route_correct"]]),
+                len(auto_reports),
+            ),
+            3,
+        ),
+        "fallback_auto_eligible_count": len(fallback_auto),
+        "fallback_auto_eligible_case_ids": fallback_auto,
+        "unsupported_auto_eligible_count": len(unsupported_auto),
+        "unsupported_auto_eligible_case_ids": unsupported_auto,
+        "route_mismatch_auto_eligible_count": len(route_mismatch_auto),
+        "route_mismatch_auto_eligible_case_ids": route_mismatch_auto,
+    }
+    passed = (
+        len(auto_reports) > 0
+        and not unsupported_auto
+        and not route_mismatch_auto
+        and not fallback_auto
+    )
+    return metrics, reports, passed
+
+
+def evaluate_extraction_label_case(case: dict[str, Any]) -> dict[str, Any]:
+    page_hint = canonical_label_page_hint(case.get("page_hint"))
+    expected_page_hint = canonical_label_page_hint(case.get("expected_page_hint"))
+    fallback_route = page_hint in EXTRACTION_FALLBACK_PAGE_HINTS
+    keep = label_bool(case, "keep", default=label_bool(case, "expected_keep", default=True))
+    supported_by_quote = label_bool(case, "supported_by_quote", default=keep)
+    if expected_page_hint:
+        route_correct = page_hint == expected_page_hint
+    else:
+        route_correct = label_bool(case, "route_correct", default=keep and not fallback_route)
+    auto_eligible = label_bool(
+        case,
+        "auto_eligible",
+        default=label_bool(
+            case,
+            "expected_auto_eligible",
+            default=keep and supported_by_quote and route_correct and not fallback_route,
+        ),
+    )
+    return {
+        "id": str(case.get("id") or ""),
+        "statement": str(case.get("statement") or "")[:240],
+        "page_hint": page_hint,
+        "expected_page_hint": expected_page_hint,
+        "keep": keep,
+        "supported_by_quote": supported_by_quote,
+        "route_correct": route_correct,
+        "fallback_route": fallback_route,
+        "auto_eligible": auto_eligible,
+        "issue_label": str(case.get("issue_label") or ""),
+    }
+
+
+def label_bool(case: dict[str, Any], key: str, *, default: bool) -> bool:
+    if key not in case:
+        return default
+    value = case.get(key)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "keep", "pass"}
+
+
+def canonical_label_page_hint(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    return raw if raw.endswith(".md") else f"{raw}.md"
 
 
 def routing_eval(paths: BrainPaths) -> dict[str, Any]:
@@ -116,33 +280,200 @@ def routing_eval(paths: BrainPaths) -> dict[str, Any]:
               AND entity_key != ''
             """
         ).fetchone()[0]
-    accuracy = 1.0 if total == 0 else routed / total
+    threshold = {"routing_coverage": 0.85}
+    if total == 0:
+        return suite_report(
+            "routing",
+            fixture_count=0,
+            metrics={"skipped": True, "reason": "no facts to evaluate"},
+            passed=True,
+            threshold=threshold,
+        )
+    accuracy = routed / total
     return suite_report(
         "routing",
         fixture_count=total,
         metrics={"routing_coverage": accuracy},
-        passed=accuracy >= 0.0,
-        threshold={"routing_coverage": 0.85},
+        passed=accuracy >= threshold["routing_coverage"],
+        threshold=threshold,
     )
 
 
 def topology_eval(paths: BrainPaths) -> dict[str, Any]:
-    with connection(paths.sqlite_path) as conn:
-        pages = conn.execute(
-            """
-            SELECT COUNT(DISTINCT page_hint)
-            FROM facts
-            WHERE page_hint IS NOT NULL
-              AND page_hint != ''
-            """
-        ).fetchone()[0]
+    pages, contracts, expected = topology_fixture()
+    candidates = deterministic_topology_candidates(pages, contracts)
+    actual = {str(candidate.get("candidate_key") or "") for candidate in candidates}
+    expected_keys = set(expected)
+    true_positive = actual & expected_keys
+    false_positive = actual - expected_keys
+    false_negative = expected_keys - actual
+    precision = len(true_positive) / len(actual) if actual else 1.0
+    recall = len(true_positive) / len(expected_keys) if expected_keys else 1.0
+    f1 = (
+        (2 * precision * recall) / (precision + recall)
+        if precision + recall
+        else 0.0
+    )
+    threshold = {"merge_split_f1": 0.75, "candidate_precision": 0.8}
     return suite_report(
         "topology",
-        fixture_count=pages,
-        metrics={"candidate_generation_smoke": 1.0},
-        passed=True,
-        threshold={"merge_split_f1": 0.75},
+        fixture_count=len(expected_keys),
+        metrics={
+            "candidate_precision": round(precision, 3),
+            "candidate_recall": round(recall, 3),
+            "merge_split_f1": round(f1, 3),
+            "candidate_generation_count": len(actual),
+            "true_positive_count": len(true_positive),
+            "false_positive_keys": sorted(false_positive),
+            "false_negative_keys": sorted(false_negative),
+        },
+        passed=f1 >= threshold["merge_split_f1"]
+        and precision >= threshold["candidate_precision"],
+        threshold=threshold,
     )
+
+
+def topology_fixture() -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], set[str]]:
+    pages = [
+        topology_page(
+            "concepts/alpha-payment.md",
+            [
+                {
+                    "id": "fact_alpha_left",
+                    "statement": "AlphaPay payment retry uses Stripe Checkout for renewal invoices.",
+                    "entity_key": "product:alphapay:billing",
+                    "section_hint": "Summary",
+                    "source_ids": ["document:alpha-billing"],
+                },
+                {
+                    "id": "fact_alpha_left_second",
+                    "statement": "AlphaPay billing recovery follows the same renewal invoice runbook.",
+                    "entity_key": "product:alphapay:billing",
+                    "section_hint": "Summary",
+                    "source_ids": ["document:alpha-billing"],
+                },
+            ],
+        ),
+        topology_page(
+            "concepts/alpha-payments.md",
+            [
+                {
+                    "id": "fact_alpha_right",
+                    "statement": "AlphaPay payment retry uses Stripe Checkout for renewal invoices.",
+                    "entity_key": "product:alphapay:billing",
+                    "section_hint": "Summary",
+                    "source_ids": ["document:alpha-billing"],
+                },
+                {
+                    "id": "fact_alpha_right_second",
+                    "statement": "AlphaPay billing recovery follows the same renewal invoice runbook.",
+                    "entity_key": "product:alphapay:billing",
+                    "section_hint": "Summary",
+                    "source_ids": ["document:alpha-billing"],
+                },
+            ],
+        ),
+        topology_page(
+            "concepts/patio-ev-outlet.md",
+            [
+                {
+                    "id": "fact_ev_single",
+                    "statement": "The Tesla wall connector permit belongs with the home EV charging project.",
+                    "entity_key": "project:home-ev-charging:electrical",
+                    "section_hint": "Electrical",
+                    "source_ids": ["document:ev-plan"],
+                }
+            ],
+        ),
+        topology_page(
+            "projects/home-ev-charging.md",
+            [
+                {
+                    "id": "fact_ev_destination_a",
+                    "statement": "Home EV charging work includes the Tesla wall connector permit.",
+                    "entity_key": "project:home-ev-charging:electrical",
+                    "section_hint": "Electrical",
+                    "source_ids": ["document:ev-plan"],
+                },
+                {
+                    "id": "fact_ev_destination_b",
+                    "statement": "Home EV charging has a panel-load review before installation.",
+                    "entity_key": "project:home-ev-charging:electrical",
+                    "section_hint": "Risks",
+                    "source_ids": ["document:ev-load"],
+                },
+            ],
+        ),
+        topology_page(
+            "projects/sprawling-platform.md",
+            [
+                {
+                    "id": f"fact_sprawl_{index}",
+                    "statement": f"Sprawling platform {section.lower()} item needs a narrower home.",
+                    "entity_key": "project:sprawling-platform:summary",
+                    "section_hint": section,
+                    "source_ids": [f"document:sprawl-{index}"],
+                }
+                for index, section in enumerate(
+                    ["Pricing", "Technical", "Customers", "Risks", "Roadmap"]
+                )
+            ],
+        ),
+    ]
+    contracts = {
+        "projects/home-ev-charging.md": {
+            "id": "contract_ev",
+            "page_hint": "projects/home-ev-charging.md",
+            "canonical_entity": "Home EV Charging",
+            "page_scope": "Facts about Home EV Charging.",
+            "retrieval_purpose": "Answer questions about Home EV Charging.",
+            "what_belongs_here": "Tesla wall connector, EV charging, electrical panel, and permit facts.",
+            "what_does_not_belong_here": "Mango orchard irrigation sensor facts.",
+            "related_pages": [],
+        }
+    }
+    expected = {
+        "page_merge:concepts/alpha-payment.md,concepts/alpha-payments.md:",
+        "edit_contract:concepts/alpha-payment.md:",
+        "edit_contract:concepts/alpha-payments.md:",
+        "rehome_fact:concepts/patio-ev-outlet.md,projects/home-ev-charging.md:fact_ev_single",
+        "page_split:projects/sprawling-platform.md:",
+        "edit_contract:projects/sprawling-platform.md:",
+    }
+    return pages, contracts, expected
+
+
+def topology_page(page_hint: str, facts: list[dict[str, Any]]) -> dict[str, Any]:
+    section_counts: dict[str, int] = {}
+    entity_keys: set[str] = set()
+    source_ids: set[str] = set()
+    fact_tokens: set[str] = set()
+    for fact in facts:
+        section = str(fact.get("section_hint") or "Summary")
+        section_counts[section] = section_counts.get(section, 0) + 1
+        entity_keys.add(str(fact.get("entity_key") or ""))
+        source_ids.update(str(source_id) for source_id in fact.get("source_ids") or [])
+        fact_tokens.update(
+            tokenize_signal(
+                fact.get("statement"),
+                fact.get("entity_key"),
+                fact.get("section_hint"),
+                fact.get("source_ids"),
+            )
+        )
+    return {
+        "relative_path": page_hint,
+        "title": Path(page_hint).stem.replace("-", " ").title(),
+        "active_fact_count": len(facts),
+        "facts": facts,
+        "fact_ids": [str(fact["id"]) for fact in facts],
+        "fact_statements": [str(fact["statement"]) for fact in facts],
+        "entity_keys": sorted(entity_keys),
+        "source_ids": sorted(source_ids),
+        "section_counts": section_counts,
+        "fact_tokens": sorted(fact_tokens),
+        "page_tokens": sorted(tokenize_signal(page_hint)),
+    }
 
 
 def conflict_eval(paths: BrainPaths) -> dict[str, Any]:
@@ -160,13 +491,195 @@ def conflict_eval(paths: BrainPaths) -> dict[str, Any]:
               AND answer != ''
             """
         ).fetchone()[0]
+    fixture_cases = conflict_fixture_cases()
+    case_reports = [evaluate_conflict_fixture_case(case) for case in fixture_cases]
+    contradiction_cases = [
+        case for case in case_reports if case["expected_contradiction"]
+    ]
+    predicted_contradictions = [
+        case for case in case_reports if case["actual_contradiction"]
+    ]
+    contradiction_true_positive = [
+        case
+        for case in case_reports
+        if case["expected_contradiction"] and case["actual_contradiction"]
+    ]
+    expected_merges = [case for case in case_reports if case["expected_merge"]]
+    actual_merges = [case for case in case_reports if case["actual_merge"]]
+    merge_true_positive = [
+        case for case in case_reports if case["expected_merge"] and case["actual_merge"]
+    ]
+    expected_auto_supersede = [
+        case for case in case_reports if case["expected_auto_supersede"]
+    ]
+    actual_auto_supersede = [
+        case for case in case_reports if case["actual_auto_supersede"]
+    ]
+    auto_supersede_true_positive = [
+        case
+        for case in case_reports
+        if case["expected_auto_supersede"] and case["actual_auto_supersede"]
+    ]
+    false_auto_merge = [
+        case["id"]
+        for case in case_reports
+        if case["actual_merge"] and not case["expected_merge"]
+    ]
+    false_auto_supersede = [
+        case["id"]
+        for case in case_reports
+        if case["actual_auto_supersede"] and not case["expected_auto_supersede"]
+    ]
+    contradiction_recall = ratio(len(contradiction_true_positive), len(contradiction_cases))
+    contradiction_precision = ratio(len(contradiction_true_positive), len(predicted_contradictions))
+    merge_recall = ratio(len(merge_true_positive), len(expected_merges))
+    merge_precision = ratio(len(merge_true_positive), len(actual_merges))
+    auto_supersede_recall = ratio(len(auto_supersede_true_positive), len(expected_auto_supersede))
+    auto_supersede_precision = ratio(len(auto_supersede_true_positive), len(actual_auto_supersede))
+    threshold = {
+        "false_truth_resolutions": 0,
+        "false_auto_merge_count": 0,
+        "false_auto_supersede_count": 0,
+        "contradiction_recall": 1.0,
+        "merge_precision": 1.0,
+        "auto_supersede_precision": 1.0,
+    }
+    metrics = {
+        "false_truth_resolutions": timeout_winners,
+        "conflicted_fact_count": conflicted,
+        "fixture_case_count": len(case_reports),
+        "contradiction_precision": round(contradiction_precision, 3),
+        "contradiction_recall": round(contradiction_recall, 3),
+        "merge_precision": round(merge_precision, 3),
+        "merge_recall": round(merge_recall, 3),
+        "auto_supersede_precision": round(auto_supersede_precision, 3),
+        "auto_supersede_recall": round(auto_supersede_recall, 3),
+        "false_auto_merge_count": len(false_auto_merge),
+        "false_auto_merge_case_ids": false_auto_merge,
+        "false_auto_supersede_count": len(false_auto_supersede),
+        "false_auto_supersede_case_ids": false_auto_supersede,
+    }
+    passed = (
+        timeout_winners == 0
+        and not false_auto_merge
+        and not false_auto_supersede
+        and contradiction_recall >= threshold["contradiction_recall"]
+        and merge_precision >= threshold["merge_precision"]
+        and auto_supersede_precision >= threshold["auto_supersede_precision"]
+    )
     return suite_report(
         "conflict",
-        fixture_count=conflicted,
-        metrics={"false_truth_resolutions": timeout_winners},
-        passed=timeout_winners == 0,
-        threshold={"false_truth_resolutions": 0},
+        fixture_count=len(case_reports),
+        metrics=metrics,
+        passed=passed,
+        threshold=threshold,
+        cases=case_reports,
     )
+
+
+def conflict_fixture_cases() -> list[dict[str, Any]]:
+    return [
+        {
+            "id": "near_duplicate_replacement_merges",
+            "left": "AlphaPay retry billing uses Stripe Checkout for renewal invoices.",
+            "right": "AlphaPay payment retry uses Stripe Checkout for renewal invoices.",
+            "expected_merge": True,
+            "expected_contradiction": False,
+            "newer_fact": conflict_fact(
+                "fact_newer_duplicate",
+                "AlphaPay payment retry uses Stripe Checkout for renewal invoices.",
+                confidence=0.86,
+            ),
+            "expected_auto_supersede": True,
+        },
+        {
+            "id": "opposite_meaning_high_overlap_not_merge",
+            "left": "AlphaPay auto-renewal is enabled by default for annual plans.",
+            "right": "AlphaPay auto-renewal is not enabled by default for annual plans.",
+            "expected_merge": False,
+            "expected_contradiction": True,
+            "newer_fact": conflict_fact(
+                "fact_low_confidence_opposite",
+                "AlphaPay auto-renewal is not enabled by default for annual plans.",
+                confidence=0.61,
+            ),
+            "expected_auto_supersede": False,
+        },
+        {
+            "id": "material_value_contradiction_not_merge",
+            "left": "The CloudZero monthly budget cap is 500 dollars.",
+            "right": "The CloudZero monthly budget cap is 750 dollars.",
+            "expected_merge": False,
+            "expected_contradiction": True,
+            "newer_fact": conflict_fact(
+                "fact_value_change",
+                "The CloudZero monthly budget cap is 750 dollars.",
+                confidence=0.91,
+            ),
+            "expected_auto_supersede": True,
+        },
+        {
+            "id": "unsourced_change_not_auto_supersede",
+            "left": "The review queue SLA is two days.",
+            "right": "The review queue SLA is three days.",
+            "expected_merge": False,
+            "expected_contradiction": True,
+            "newer_fact": conflict_fact(
+                "fact_unsourced_change",
+                "The review queue SLA is three days.",
+                confidence=0.95,
+                source_ids=[],
+            ),
+            "expected_auto_supersede": False,
+        },
+    ]
+
+
+def conflict_fact(
+    fact_id: str,
+    statement: str,
+    *,
+    confidence: float,
+    source_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "id": fact_id,
+        "statement": statement,
+        "entity_key": "concepts:conflict-eval:summary",
+        "page_hint": "concepts/conflict-eval.md",
+        "section_hint": "Summary",
+        "source_ids": ["document:conflict-eval"] if source_ids is None else source_ids,
+        "confidence": confidence,
+        "observed_at": "2026-06-26T00:00:00+00:00",
+        "metadata": {"operation": "replace_page"},
+    }
+
+
+def evaluate_conflict_fixture_case(case: dict[str, Any]) -> dict[str, Any]:
+    left_fact = conflict_fact("fact_left", str(case["left"]), confidence=0.8)
+    right_fact = conflict_fact("fact_right", str(case["right"]), confidence=0.8)
+    signals = fact_similarity_signals(str(case["left"]), str(case["right"]))
+    actual_merge = facts_should_merge(left_fact, right_fact)
+    actual_auto_supersede = fact_is_auto_winner(case["newer_fact"])
+    return {
+        "id": case["id"],
+        "expected_merge": bool(case["expected_merge"]),
+        "actual_merge": actual_merge,
+        "expected_contradiction": bool(case["expected_contradiction"]),
+        "actual_contradiction": bool(signals["contradiction"]),
+        "expected_auto_supersede": bool(case["expected_auto_supersede"]),
+        "actual_auto_supersede": actual_auto_supersede,
+        "sequence_ratio": round(float(signals["sequence_ratio"]), 3),
+        "token_overlap": round(float(signals["token_overlap"]), 3),
+        "token_jaccard": round(float(signals["token_jaccard"]), 3),
+        "anchor_coverage": round(float(signals["anchor_coverage"]), 3),
+    }
+
+
+def ratio(numerator: int, denominator: int) -> float:
+    if denominator == 0:
+        return 1.0
+    return numerator / denominator
 
 
 def retrieval_eval(paths: BrainPaths) -> dict[str, Any]:
@@ -188,7 +701,9 @@ def retrieval_eval(paths: BrainPaths) -> dict[str, Any]:
                 "negative_control_fact_leak_count": 0,
                 "negative_control_pass_rate": 0.9,
                 "verdict_accuracy": 0.7,
+                "source_hit_rate": 0.8,
                 "fact_precision": 0.5,
+                "confidence_ece_max": 0.1,
                 "noise_rate_max": 0.5,
             },
         )
@@ -289,14 +804,18 @@ def retrieval_eval(paths: BrainPaths) -> dict[str, Any]:
         "negative_control_fact_leak_count": 0,
         "negative_control_pass_rate": 0.9,
         "verdict_accuracy": 0.7,
+        "source_hit_rate": 0.8,
         "fact_precision": 0.5,
+        "confidence_ece_max": 0.1,
         "noise_rate_max": 0.5,
     }
     passed = (
         negative_fact_leaks == 0
         and negative_control_pass_rate >= threshold["negative_control_pass_rate"]
         and verdict_accuracy >= threshold["verdict_accuracy"]
+        and source_hit_rate >= threshold["source_hit_rate"]
         and fact_precision >= threshold["fact_precision"]
+        and calibration_error <= threshold["confidence_ece_max"]
         and noise_rate <= threshold["noise_rate_max"]
     )
     return suite_report(

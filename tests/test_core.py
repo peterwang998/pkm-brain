@@ -9,7 +9,12 @@ from pkm_brain.db import connection
 from pkm_brain.indexes import lancedb_stats, table_names, upsert_vectors
 from pkm_brain.memory_proposals import propose_failure_memories_from_sources, propose_memories_from_lineage
 from pkm_brain.paths import BrainPaths
-from pkm_brain.service import BrainService
+from pkm_brain.service import (
+    BrainService,
+    rerank_chunks,
+    retrieval_policy,
+    select_context_chunks,
+)
 from pkm_brain.title_utils import MAX_DOCUMENT_TITLE_CHARS, TITLE_TRUNCATION_SUFFIX
 from pkm_brain.util import text_sha256, token_count
 from pkm_brain.wiki import lint_wiki, parse_frontmatter
@@ -809,6 +814,41 @@ def test_retrieve_context_returns_no_strong_match_for_absent_topic(tmp_path: Pat
     assert search["relevant_wiki_pages"] == []
 
 
+def test_reranking_suppresses_indexed_negative_control_fixture_mentions() -> None:
+    query = "mango orchard irrigation sensors in Fresno"
+    chunks = [
+        {
+            "chunk_id": "chunk_negative_fixture",
+            "document_id": "doc_negative_fixture",
+            "chunk_index": 0,
+            "title": "Retrieval calibration notes",
+            "source_type": "agent_session_log",
+            "text": (
+                "Use mango orchard irrigation sensors in Fresno as a negative control. "
+                "This fake topic should stay absent and return no_strong_match."
+            ),
+            "heading_path": "",
+            "token_count": 24,
+            "document_created_at": "2026-06-24T00:00:00+00:00",
+            "document_ingested_at": "2026-06-24T00:00:00+00:00",
+        }
+    ]
+
+    reranked = rerank_chunks(
+        query,
+        chunks,
+        {
+            "lexical": [{"chunk_id": "chunk_negative_fixture"}],
+            "vector": [{"chunk_id": "chunk_negative_fixture"}],
+        },
+    )
+    selected = select_context_chunks(reranked, query=query, policy=retrieval_policy("default"))
+
+    assert selected == []
+    assert reranked[0]["suppressed"] is True
+    assert "retrieval negative-control fixture" in reranked[0]["suppress_reasons"]
+
+
 def test_retrieve_context_prefers_managed_pages_and_ignores_agent_title_drag(tmp_path: Path) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()
@@ -878,6 +918,86 @@ def test_retrieve_context_prefers_managed_pages_and_ignores_agent_title_drag(tmp
     assert all(chunk["source_type"] != "agent_session_log" for chunk in context["supporting_chunks"])
     assert search["retrieval_verdict"] == "found"
     assert search["relevant_wiki_pages"][0]["relative_path"] == "projects/ai-childrens-song-localization-business.md"
+
+
+def test_retrieve_context_fact_lifecycle_suppresses_superseded_and_surfaces_contested_pairs(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    observed_at = "2026-06-26T00:00:00+00:00"
+    facts = [
+        (
+            "fact_lifecycle_active",
+            "The Helios roadmap target is alpha readiness.",
+            "active",
+            None,
+            None,
+        ),
+        (
+            "fact_lifecycle_superseded",
+            "The Helios roadmap target was prototype readiness.",
+            "superseded",
+            "fact_lifecycle_active",
+            None,
+        ),
+        (
+            "fact_lifecycle_conflict_left",
+            "The Helios roadmap launch date is July 1.",
+            "conflicted",
+            None,
+            "factconflict_helios_launch",
+        ),
+        (
+            "fact_lifecycle_conflict_right",
+            "The Helios roadmap launch date is August 1.",
+            "conflicted",
+            None,
+            "factconflict_helios_launch",
+        ),
+    ]
+    with connection(svc.paths.sqlite_path) as conn:
+        for fact_id, statement, status, supersedes_id, conflict_group_id in facts:
+            conn.execute(
+                """
+                INSERT INTO facts(
+                  id, statement, entity_key, page_hint, section_hint, source_ids,
+                  observed_at, confidence, truth_confidence, status, supersedes_id,
+                  conflict_group_id, metadata, created_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    fact_id,
+                    statement,
+                    "projects:helios-roadmap:summary",
+                    "projects/helios-roadmap.md",
+                    "Summary",
+                    json.dumps(["document:doc_helios"]),
+                    observed_at,
+                    0.91,
+                    0.91,
+                    status,
+                    supersedes_id,
+                    conflict_group_id,
+                    "{}",
+                    observed_at,
+                    observed_at,
+                ),
+            )
+        rebuild_fact_retrieval_index(conn)
+
+    context = svc.retrieve_context("Helios roadmap launch target", mode="compact")
+    facts_by_id = {fact["id"]: fact for fact in context["relevant_facts"]}
+
+    assert "fact_lifecycle_active" in facts_by_id
+    assert facts_by_id["fact_lifecycle_active"]["authoritative"] is True
+    assert "fact_lifecycle_superseded" not in facts_by_id
+    contested = facts_by_id["fact_lifecycle_conflict_left"]
+    assert contested["authoritative"] is False
+    assert contested["contested"] is True
+    assert {
+        fact["id"] for fact in contested["contested_facts"]
+    } == {"fact_lifecycle_conflict_left", "fact_lifecycle_conflict_right"}
 
 
 def test_retrieve_context_compacts_noisy_agent_logs_with_hard_budget(tmp_path: Path) -> None:
@@ -1442,6 +1562,8 @@ def test_retrieve_context_returns_facts_and_contested_pairs(tmp_path: Path) -> N
     backfill_positive_context = svc.retrieve_context("optum fertility insurance")
 
     active_ids = {fact["id"] for fact in active_context["relevant_facts"]}
+    assert active_context["retrieval_verdict"] == "found"
+    assert any("top fact score" in reason for reason in active_context["retrieval_reasons"])
     assert "fact_active" in active_ids
     assert "fact_old" not in active_ids
     assert "fact_low" not in active_ids

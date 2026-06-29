@@ -154,7 +154,7 @@ ALTER TABLE open_questions ADD COLUMN decided_by TEXT;           -- human|llm_cr
 Status gains `needs_human|auto_resolved|timeout_resolved`. Rows created only for L3 residue, always referencing an action.
 
 ### 015 — fact indexes
-- `facts_fts` (FTS5) **or** shared FTS with `kind='fact'` — **OPEN (for codex)**; recommend shared FTS with `kind` to reuse fusion code.
+- Shared `retrieval_fts` rows with `kind='fact'` index facts for lexical retrieval and reuse the same fusion path as chunks.
 - Generalize `indexes.py` from single `TABLE_NAME="chunks"` to multi-collection; add LanceDB `facts` table: `{fact_id, vector, statement, page_hint, status, truth_confidence}`. Rebuildable.
 
 ### 016 — lineage at fact grain
@@ -169,14 +169,22 @@ Status gains `needs_human|auto_resolved|timeout_resolved`. Rows created only for
 - **Role mapping**: `extractor`, `gardener`, `resolver`, `critic`, `synthesizer`, `auditor`. Critic must be configurable to a *different* provider/model/prompt than the proposer (separation of duties).
 - Shared **candidate-card builder** (compact cleaned previews) reused by extraction/gardener/synthesis/audit.
 
-### 5.2 Extraction (`extraction.py`) — new
-Select recent/changed docs → build source cards with spans → `extractor` emits atomic facts (statement, source_spans, evidence_quote, page_hint, section_hint, entity_key candidate, effective_at?, 3 confidences) → validate every candidate has provenance spans → emit `fact_upsert` **actions**. Shadow first. Replaces `propose_from_sources` and (eventually) `compile_semantic_wiki` as the source→knowledge path.
+### 5.2 Extraction (`extraction.py`) — active, gated
+Select recent/changed docs that pass source-type policy → partition each document into full-coverage chunk windows → send one source window plus lightweight routing hints to `extractor` → `extractor` emits atomic facts with `statement`, `chunk_id`, exact `evidence_quote`, `page_hint`, `section_hint`, `entity_key` candidate, `effective_at?`, and three confidences → deterministic validation locates the quote in the cited chunk and derives `source_spans` → emit `fact_upsert` **actions**. Shadow first. Replaces `propose_from_sources` and (eventually) `compile_semantic_wiki` as the source→knowledge path.
+
+Payload/harness contract: `docs/extraction-payload-spec.md`. The extractor does not receive the existing fact table. It is bulk within one window, but validation and retry are per fact. `agent_session_log` is skipped by default unless extraction config opts it in.
 
 ### 5.3 Action engine (`cos_actions.py`) — new (universal write path)
 `propose_action`, `decide_action`, `apply_action`, `revert_action`, `record_action_audit`. **All** mutations route here: fact upsert/merge/supersede, conflict display, page rehome/merge/split/rename/canonicalize/archive, contract edit, synthesis regen.
 - `apply_action`: perform deterministic mutation → re-run `resolve_fact_groups` + `curate_managed_pages` for affected pages → snapshot pages → enqueue targeted reindex of affected `fact_ids` + page embeddings → store `applied_state_hash` → set status/`applied_at`.
 - **Guarded revert:** store the target state hash at apply time and the inverse ledger state; `revert_action` refuses (and escalates) if target state has drifted since apply, else applies `inverse_action_json` at the **ledger** layer (restore routing/status per fact), then re-projects + reindexes. Markdown snapshot is secondary.
 - Inverse example (`rehome_fact`/`page_merge`): `{"restore_fact_routing":[{"fact_id","old_page_hint","old_entity_key","old_section_hint"}]}`.
+
+Current action-boundary rule:
+- Ledger mutations must be represented as `cos_actions`: fact upsert, fact merge/supersede, conflict display/resolution, manual correction, fact rehome, contract edit, page topology changes, page archive, and derived synthesis creation/staling.
+- One-time wiki-fact imports, reconciliation, canonical fact rerouting, and manual corrections are not exceptions: they propose/apply `fact_upsert`, `fact_merge`, `fact_supersede`, `display_contested`, or `rehome_fact` actions before durable fact rows change.
+- Deterministic projections are not independently trusted facts: managed page rendering, fact retrieval reindexing, citation snapshots, and derived page/index rebuilds. They should run after applied ledger actions and remain rebuildable from the ledger.
+- `cos_actions.ACTION_TYPE_SPECS` is the implementation support map. Implemented action types apply or revert with an inverse payload; declared-but-unimplemented action types fail explicitly instead of falling through.
 
 ### 5.4 Policy engine (`cos_policy.py`) — new
 Load active version → evaluate ordered rules over `action_features` (first match) → record `policy_id/version/decision/autonomy_level` on the action → route to {auto-apply | critic-then-apply | escalate | block}. Enforce **eval gates** (a rule can't promote past its eval threshold). Auto-demotion creates a new policy version. Declarative — no hard-coded `merge_two_singletons` action variants; use features.
@@ -195,6 +203,7 @@ Canonical body: deterministic active facts, stable section order, `fact_ids`/`so
 
 ### 5.9 Retrieval (`service.py`, `indexes.py`) — extend
 Engine unchanged (FTS5 + LanceDB + RRF + rerank + source weighting + bounded packet). Add:
+- This section is complemented by `docs/chief-of-staff-retrieval-contract.md` and `docs/chief-of-staff-retrieval-tuning.md`, which define verdict/calibration behavior and current tuning notes.
 - Facts in the candidate stream; return facts directly when best **only after** a fact-specific relevance gate. Fact retrieval is dynamic 0..N, never fixed top-k leakage.
 - Fact ranking normalizes raw FTS/vector/reranker signals onto a comparable positive relevance score and applies a calibrated `FACT_SCORE_FLOOR`; raw SQLite BM25 values are not compared directly with chunk/page scores.
 - Return only active facts as authoritative. Conflicted facts may return only as contested pairs. Exclude inactive, superseded, and low-`truth_confidence` facts from authoritative retrieval.
@@ -206,15 +215,15 @@ Engine unchanged (FTS5 + LanceDB + RRF + rerank + source weighting + bounded pac
 - Record fact-level lineage; useful feedback can raise `truth_confidence`/propose `confirmed_by_user`.
 
 ### 5.10 Audit/control loop (`cos_audit.py`) — new
-Nightly: sample auto-applied actions per `audit_sample_rate` (random + risk-weighted); `auditor`/`critic` score → `sampled_ok|sampled_bad`; if a rule exceeds `demotion_threshold` create a demoted policy version; on bad feedback/contradiction attempt guarded revert.
+Nightly/UI: sample applied actions per `audit_sample_rate` (risk-weighted with stable sampling); `auditor`/`critic` score → `sampled_ok|sampled_bad`. Stub mode records missing audits when no auditor provider is configured. Configured mode records auditor metadata and demotes only when the audited bad-rate for a policy group exceeds that rule's `demotion_threshold`; on configured bad feedback, guarded revert may be requested explicitly.
 
 ### 5.11 UI (`ui_server.py`) — extend
 Show: current policy version + rules; recent/auto-applied actions; audit failures; human residue; page contracts; fact provenance/spans; contested facts; synthesis status. Hide/deprecate legacy packet review as the primary workflow.
 
 ---
 
-## 6. Eval harness (`evals/`, `brain eval`) — build first
-Suites + metrics: **extraction** (P/R + span correctness), **routing** (accuracy vs contracts), **topology** (merge/split F1), **conflict** (precision; hard sub-metric: **zero false truth-resolutions**), and **retrieval** (golden historical queries + negative controls; verdict accuracy, provenance-aware source-hit, fact precision, confidence calibration/ECE, noise rate, and negative-control pass). CLI `brain eval run [--suite ...]`. Gates policy promotion (recorded as a version bump); retrieval thresholds ratchet upward as fixtures are curated.
+## 6. Eval harness (`evals.py`, `retrieval_fixtures.py`, `brain eval`) — build first
+Suites + metrics: **extraction** (span coverage for non-legacy extracted facts), **routing** (coverage vs page/entity assignment), **topology** (golden deterministic merge/rehome/split/contract candidate precision/recall/F1), **conflict** (precision; hard sub-metric: **zero false truth-resolutions**), and **retrieval** (golden historical queries + negative controls; verdict accuracy, provenance-aware source-hit, fact precision, confidence calibration/ECE, noise rate, and negative-control pass). CLI `brain eval run [--suite ...]`. Gates policy promotion (recorded as a version bump); retrieval thresholds ratchet upward as fixtures are curated.
 
 Retrieval negative controls are fixed golden fixtures, but their synthetic absent-topic strings are eval artifacts, not knowledge. Agent-session indexing must redact those exact strings from captured logs/reports so discussing or running the eval cannot turn a negative control into future evidence.
 
@@ -253,8 +262,8 @@ Retrieval negative controls are fixed golden fixtures, but their synthetic absen
 
 ---
 
-## 9. Open question for codex
-Facts FTS: shared FTS table with `kind='fact'` (recommended — reuses fusion/rerank) vs separate `facts_fts`? Decide in Phase 8.
+## 9. Resolved implementation decision
+Facts FTS uses the shared retrieval table with `kind='fact'`, implemented in migrations 015/016 and reused by fusion/rerank. There is no separate active `facts_fts` table.
 
 ## 10. Key code touchpoints
-`migrations.py` (009–016; max=8) · NEW `cos_actions.py`/`cos_policy.py`/`extraction.py`/`contracts.py`/`gardener.py`/`cos_audit.py` · `llm.py` (`complete_json`+roles, :32) · `indexes.py` (multi-collection, :12) · `service.py` (fact retrieval/dedup; `MANAGED_WIKI_BOOST` :1577; `retrieve_context` ~:1165) · `wiki_facts.py` (route mutators through actions; `resolve_fact_groups` :712, `render_managed_page` :2396, `revert_wiki_page_snapshot` :1878) · `automation.py` (nightly stages, :139) · `ui_server.py` · `evals/`+`cli.py`.
+`migrations.py` (009–016; max=16) · NEW `cos_actions.py`/`cos_policy.py`/`extraction.py`/`contracts.py`/`gardener.py`/`cos_audit.py` · `llm.py` (`complete_json`+roles, :32) · `indexes.py` (multi-collection, :12) · `service.py` (fact retrieval/dedup; `MANAGED_WIKI_BOOST`; `retrieve_context`) · `wiki_facts.py` (route mutators through actions; `resolve_fact_groups`, `render_managed_page`, `revert_wiki_page_snapshot`) · `automation.py` (nightly stages) · `ui_server.py` · `evals.py` + `retrieval_fixtures.py` + `cli.py`.

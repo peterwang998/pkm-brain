@@ -1,5 +1,7 @@
 # Chief-of-Staff Retrieval Contract
 
+Status: companion contract for `docs/chief-of-staff-spec.md` section 5.9. Current tuning details live in `docs/chief-of-staff-retrieval-tuning.md`.
+
 ## Problem
 
 The chief-of-staff fact compiler can now produce managed wiki pages from source-backed facts, but retrieval still behaves like a raw RAG packet builder. In forked-data tests against `/Users/Peter/brain-forks/wiki-review-llm-coach`, known topics such as Hightouch and CloudZero were found, but absent topics still returned normal-looking packets of unrelated chunks and pages.

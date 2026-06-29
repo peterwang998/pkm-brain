@@ -6,6 +6,8 @@ Status: Draft for human review
 
 Last updated: 2026-05-25
 
+Current status note (2026-06-25): this v0.1 spec is historical/foundational. The Chief-of-Staff facts/actions/pages architecture in `docs/chief-of-staff-spec.md` supersedes legacy wiki proposal workflow sections. `wiki_change_*` tables remain archived compatibility/audit data; active UI, CLI, MCP, and nightly paths no longer create, apply, absorb, or search wiki proposal batches.
+
 ## 1. Purpose
 
 Build a local-first personal knowledge management system that serves two roles:
@@ -351,7 +353,7 @@ context_lineage_events(
 
 `target_type` is one of `memory`, `chunk`, `document`, or `wiki_page`. `event_type` is one of `exposed`, `explicit_useful`, `explicit_not_useful`, `agent_referenced_id`, or `memory_proposed_from_lineage`. Lineage data is advisory, auditable, and rebuildable; approved memories remain the durable trust boundary.
 
-Minimum wiki proposal schema:
+Archived legacy wiki proposal schema:
 
 ```sql
 wiki_change_batches(
@@ -536,27 +538,27 @@ brain automation nightly --if-due --due-after-hours 20
 
 The nightly job should use an hourly due-check instead of only `StartCalendarInterval`. This makes it laptop-friendly: if the machine sleeps through the intended overnight window, the next hourly check after wake can run maintenance when the last successful run is older than the threshold.
 
-Nightly maintenance should run these tasks:
+Current nightly maintenance runs these tasks:
 
 ```text
 1. capture agents
 2. ingest inbox
-3. synthesize generated wiki pages with generated-page overwrite
-4. collect index status
-5. run provenance check
-6. run wiki lint
-7. run memory audit
-8. record automation run summary
+3. run Chief-of-Staff extraction/gardener shadow stages
+4. collect index status and run conservative index maintenance
+5. run Chief-of-Staff sampled audit (stub unless an auditor provider is configured)
+6. run provenance check
+7. run wiki lint
+8. run memory audit
+9. record automation run summary
 ```
 
-Wiki synthesis calls the default LLM provider by default so the semantic wiki compounds from new sources, while capture, ingest, status checks, provenance, lint, and memory audit remain local Python pipeline operations. The default provider should be the Codex CLI adapter so users with a local Codex subscription do not need to configure a separate API key for normal wiki maintenance. Operators may disable LLM semantic compilation with `--no-llm-wiki`.
+Nightly does not currently run a wiki synthesis command. The `--llm-wiki/--no-llm-wiki` automation option is retained as a compatibility flag for existing LaunchAgents. Current wiki maintenance is fact-ledger driven through `brain wiki migrate-to-facts`, `brain wiki curate-facts`, and `brain wiki promote-curation`.
 
 Automation run persistence must keep normal status summaries useful but cap fields named `error`, `errors`, `stderr`, or `traceback` before writing `automation_runs`. Failed provider calls must not persist full LLM prompts, full stderr streams, or retrieved context dumps inline; compacted error text should include enough prefix/suffix detail plus a digest to correlate with logs.
 
-Optional nightly LLM proposal stages remain separate from direct generated-page maintenance:
+Optional nightly LLM memory proposal stages remain separate from direct generated-page maintenance:
 
 ```text
-brain automation nightly --with-llm-wiki-proposals --provider <provider>
 brain automation nightly --with-llm-memory-proposals --provider <provider>
 ```
 
@@ -950,6 +952,8 @@ The index is content-oriented, not chronological. Chronological activity belongs
 
 ### 11.4 Synthesis Workflow
 
+Current status note: this section is historical target architecture. The active implementation does not expose `brain wiki synthesize`; current wiki maintenance uses the Chief-of-Staff fact/page curation commands.
+
 The wiki compiler should process sources in this order:
 
 ```text
@@ -974,45 +978,28 @@ Generated semantic page maintenance may directly create or update pages only whe
 4. The update can preserve the required frontmatter and page sections.
 ```
 
-If the target page exists without the generated marker, the compiler must skip direct overwrite and create a proposal instead. Lower-confidence or riskier changes should also become proposals.
+If the target page exists without the generated marker, the compiler must skip direct overwrite and leave the page for human/chief-of-staff review. Lower-confidence or riskier changes should not silently mutate human-owned pages.
 
-LLM-written proposal maintenance uses a two-state workflow:
+Legacy note: older versions used LLM-written wiki proposal batches with interview/apply commands. That path has been superseded by the Chief-of-Staff facts/actions/pages model and is no longer an active UI, CLI, MCP, or nightly workflow. The old `wiki_change_*` tables remain only as archived compatibility/audit data.
 
-```text
-Unapproved state
-  Agents and optional nightly LLM jobs may create wiki proposal batches.
-  These proposals live in SQLite and do not mutate approved Markdown files.
-
-Approved state
-  A human review/interview approves a proposal batch.
-  Approved batches patch wiki Markdown files section-by-section.
-```
-
-Agents and nightly jobs may propose changes, but they must not directly write approved wiki pages. This keeps the workflow close to the LLM Wiki pattern while preserving reviewability and rollback.
-
-This restriction applies to proposal batches and hand-edited pages. It does not prohibit the default semantic compiler from maintaining machine-generated pages that are clearly marked as generated and source-cited.
-
-Required proposal entrypoints:
+Current memory proposal entrypoints:
 
 ```text
-MCP propose_wiki_update(...)
-brain wiki propose-from-sources --provider <codex|openai|anthropic|ollama>
-brain automation nightly --with-llm-wiki-proposals --provider <provider>
 brain memory propose-from-sources --provider <codex|openai|anthropic|ollama>
+brain memory propose-from-lineage --provider <codex|openai|anthropic|ollama>
 brain automation nightly --with-llm-memory-proposals --provider <provider>
 ```
 
-Required review/apply entrypoints:
+Memory review entrypoints:
 
 ```text
-brain wiki proposals list
-brain wiki proposals inspect <batch_id>
-brain wiki interview <batch_id>
-brain wiki proposals reject <batch_id>
-brain wiki apply <batch_id>
+brain memory list --status proposed
+brain memory inspect <memory_id>
+brain memory approve <memory_id>
+brain memory reject <memory_id>
 ```
 
-The system must support Codex CLI, OpenAI-compatible, Anthropic, and Ollama provider adapters. The Codex adapter should use `codex exec` in read-only, non-interactive mode so pkm-brain can use the user's local Codex login instead of a separate API key. Provider configuration must be inspectable with `brain llm doctor` without printing secrets. If nightly LLM proposals are explicitly enabled and provider configuration is missing, the nightly run must fail.
+The system must support Codex CLI, OpenAI-compatible, Anthropic, and Ollama provider adapters. The Codex adapter should use `codex exec` in read-only, non-interactive mode so pkm-brain can use the user's local Codex login instead of a separate API key. Provider configuration must be inspectable with `brain llm doctor` without printing secrets. If nightly LLM memory proposals are explicitly enabled and provider configuration is missing, the nightly run must fail.
 
 ### 11.5 Retrieval Role
 
@@ -1337,14 +1324,11 @@ retrieve_context(task, project)
 record_context_feedback(target_type, target_id, useful, note)
 get_memories(scope, memory_type, status)
 propose_memory(memory_type, scope, content, sources, confidence)
-propose_wiki_update(title, rationale, source_ids, changes, confidence)
-list_wiki_proposals(status)
-inspect_wiki_proposal(batch_id)
 write_agent_session(summary, files_touched, commands_run, outcome, unresolved_issues)
 get_project_context(project)
 ```
 
-`retrieve_context` must return `active_memories` and `candidate_memories` as separate fields. `get_memories` may support status filtering, but memory approval must remain a local human action through the CLI or local Web UI. Memory and wiki *approval* tools are intentionally not exposed over MCP; agents may only propose. The CLI exposes additional retrieval knobs (`--budget`, `--mode`, `--debug`) that are not surfaced on MCP to keep agent calls compact.
+`retrieve_context` must return `active_memories` and `candidate_memories` as separate fields. `get_memories` may support status filtering, but memory approval must remain a local human action through the CLI or local Web UI. Memory approval tools and wiki mutation tools are intentionally not exposed over MCP; agents may only propose memories. The CLI exposes additional retrieval knobs (`--budget`, `--mode`, `--debug`) that are not surfaced on MCP to keep agent calls compact.
 
 Optional HTTP endpoints:
 
@@ -1855,13 +1839,13 @@ Workspace, ingestion, retrieval:
 
 Wiki, memory, agent interface:
 
-- `brain wiki synthesize` with deterministic reference-page maintenance and LLM-guided semantic compilation (Codex CLI / OpenAI-compatible / Anthropic / Ollama).
-- Wiki proposal batches with the `proposed → needs_interview → approved → applied` workflow.
+- `brain wiki migrate-to-facts`, `brain wiki curate-facts`, and `brain wiki promote-curation` for Chief-of-Staff fact/page curation.
+- Chief-of-Staff fact/page curation with archived legacy `wiki_change_*` compatibility tables.
 - `brain wiki lint` and `brain provenance check`.
 - Memory propose / list / inspect / approve / reject / archive / audit / export-all / import.
 - `AgentFailurePatternMemory` proposal synthesis from agent logs and lineage-driven proposal synthesis with independent-evidence thresholds.
 - `record_context_feedback` (CLI + MCP) and exposure-aware lineage scoring.
-- MCP server with `search_knowledge`, `retrieve_context`, `record_context_feedback`, `get_memories`, `propose_memory`, `propose_wiki_update`, `list_wiki_proposals`, `inspect_wiki_proposal`, `write_agent_session`, `get_project_context`.
+- MCP server with `search_knowledge`, `retrieve_context`, `record_context_feedback`, `get_memories`, `propose_memory`, `write_agent_session`, `get_project_context`.
 
 Operability:
 
@@ -1869,7 +1853,7 @@ Operability:
 - `brain ui` loopback Web UI with token auth and pages for status, setup, sync, jobs, logs, and memory review (stdlib `http.server`).
 - `brain doctor`, `brain inspect document|chunks`, `brain index status|doctor|optimize|rebuild-vectors`, `brain db reindex-chunks`, `brain runs list|inspect`.
 - `brain capture agents` for Codex, Claude Code, OpenCode, and opt-in Hyprnote.
-- `brain automation nightly --if-due` with optional `--with-llm-wiki-proposals` and `--with-llm-memory-proposals`.
+- `brain automation nightly --if-due` with optional `--with-llm-memory-proposals`.
 - Automation run storage caps nested error/stderr/traceback payloads to avoid persisting full prompts or provider failure streams in SQLite.
 - macOS LaunchAgent install/render/status for the frequent capture job and the nightly maintenance job.
 - Primary/Secondary sync: config model, role init, peer add, SSH host-key pinning, rsync transport, outbox export, staged pull/push with manifest verification, `sync_runs` log, `brain sync status|conflicts|acceptance|mirror-hash|rebuild-mirror-index`.

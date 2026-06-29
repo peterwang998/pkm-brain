@@ -14,8 +14,8 @@ import yaml
 from .audit import audit_memories
 from .automation import index_status
 from .contracts import active_page_contracts, generate_initial_contracts
-from .cos_actions import recent_actions
-from .cos_audit import run_sampled_audit
+from .cos_actions import recent_actions, row_to_action
+from .cos_audit import COS_AUDIT_CONFIGURED_NOTE, COS_AUDIT_STUB_NOTE, run_sampled_audit
 from .cos_policy import active_policy_rules, active_policy_version
 from .db import connection
 from .paths import BrainPaths
@@ -37,6 +37,7 @@ from .wiki_facts import (
     reconcile_open_fact_questions,
     regenerate_managed_fact_page,
     revert_wiki_page_snapshot,
+    row_to_question,
     wiki_fact_dashboard,
 )
 
@@ -124,6 +125,8 @@ class BrainUIHandler(BaseHTTPRequestHandler):
                 self.write_json(ui_cos_policy(self.server.paths))
             elif path == "/api/cos/actions":
                 self.write_json(ui_cos_actions(self.server.paths, query))
+            elif path == "/api/cos/review":
+                self.write_json(ui_cos_review(self.server.paths))
             elif path == "/api/cos/contracts":
                 self.write_json(ui_cos_contracts(self.server.paths))
             elif path == "/api/cos/audit":
@@ -587,6 +590,85 @@ def ui_cos_actions(paths: BrainPaths, query: dict[str, list[str]]) -> dict[str, 
     return {"actions": recent_actions(paths, limit=max(1, min(limit, 200)))}
 
 
+def ui_cos_review(paths: BrainPaths) -> dict[str, Any]:
+    service(paths).init_workspace()
+    with connection(paths.sqlite_path) as conn:
+        policy_version = active_policy_version(conn)
+        residue = [
+            row_to_question(row)
+            for row in conn.execute(
+                """
+                SELECT *
+                FROM open_questions
+                WHERE status IN ('open', 'needs_human')
+                ORDER BY
+                  CASE risk_tier WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
+                  created_at DESC
+                LIMIT 50
+                """
+            )
+        ]
+        recent_auto_applied = [
+            row_to_action(row)
+            for row in conn.execute(
+                """
+                SELECT *
+                FROM cos_actions
+                WHERE status IN ('auto_applied', 'applied')
+                ORDER BY COALESCE(applied_at, created_at) DESC
+                LIMIT 25
+                """
+            )
+        ]
+        audit_failures = [
+            row_to_action(row)
+            for row in conn.execute(
+                """
+                SELECT *
+                FROM cos_actions
+                WHERE audit_status = 'sampled_bad' OR status = 'failed'
+                ORDER BY COALESCE(applied_at, created_at) DESC
+                LIMIT 25
+                """
+            )
+        ]
+        residue_by_kind = {
+            str(row["kind"]): int(row["count"])
+            for row in conn.execute(
+                """
+                SELECT kind, COUNT(*) AS count
+                FROM open_questions
+                WHERE status IN ('open', 'needs_human')
+                GROUP BY kind
+                """
+            )
+        }
+        residue_by_status = {
+            str(row["status"]): int(row["count"])
+            for row in conn.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM open_questions
+                WHERE status IN ('open', 'needs_human')
+                GROUP BY status
+                """
+            )
+        }
+    return {
+        "policy_version": policy_version,
+        "counts": {
+            "residue": len(residue),
+            "recent_auto_applied": len(recent_auto_applied),
+            "audit_failures": len(audit_failures),
+            "residue_by_kind": dict(sorted(residue_by_kind.items())),
+            "residue_by_status": dict(sorted(residue_by_status.items())),
+        },
+        "residue": residue,
+        "recent_auto_applied": recent_auto_applied,
+        "audit_failures": audit_failures,
+    }
+
+
 def ui_cos_contracts(paths: BrainPaths) -> dict[str, Any]:
     service(paths).init_workspace()
     return {"contracts": active_page_contracts(paths)}
@@ -617,7 +699,14 @@ def ui_cos_audit_status(paths: BrainPaths) -> dict[str, Any]:
                 """
             )
         ]
-    return {"counts": counts, "failures": failures}
+    has_configured_audits = bool(counts.get("sampled_ok") or counts.get("sampled_bad"))
+    return {
+        "status": "ok" if has_configured_audits else "stub",
+        "mode": "configured" if has_configured_audits else "stub",
+        "note": COS_AUDIT_CONFIGURED_NOTE if has_configured_audits else COS_AUDIT_STUB_NOTE,
+        "counts": counts,
+        "failures": failures,
+    }
 
 
 def ui_generate_cos_contracts(paths: BrainPaths, payload: dict[str, Any]) -> dict[str, Any]:
@@ -635,6 +724,7 @@ def ui_run_cos_audit(paths: BrainPaths, payload: dict[str, Any]) -> dict[str, An
         paths,
         limit=int(payload.get("limit") or 25),
         auto_revert_bad=bool(payload.get("auto_revert_bad", False)),
+        provider=str(payload["provider"]) if payload.get("provider") else None,
     )
 
 
@@ -1316,7 +1406,10 @@ def ui_shell() -> str:
     }
 
     async function renderCuration() {
-      const data = await api("/api/wiki/facts");
+      const [data, review] = await Promise.all([
+        api("/api/wiki/facts"),
+        api("/api/cos/review")
+      ]);
       const questions = data.open_questions || [];
       const pages = data.managed_pages || [];
       if (!questions.find(question => question.id === curationState.selectedQuestionId)) {
@@ -1348,7 +1441,11 @@ def ui_shell() -> str:
             ${metric("Managed Pages", pages.length)}
             ${metric("Conflicted", data.counts?.by_status?.conflicted ?? 0, data.counts?.by_status?.conflicted ? "danger" : "")}
             ${metric("Open Questions", data.counts?.questions_by_status?.open ?? 0, data.counts?.questions_by_status?.open ? "warn" : "ok")}
+            ${metric("Policy", review.policy_version ?? "")}
+            ${metric("Human Residue", review.counts?.residue ?? 0, review.counts?.residue ? "warn" : "ok")}
+            ${metric("Audit Failures", review.counts?.audit_failures ?? 0, review.counts?.audit_failures ? "danger" : "ok")}
           </div>
+          ${cosReviewHtml(review)}
           ${curationState.lastResult ? lastCurationResultHtml(curationState.lastResult) : ""}
           <div class="split">
             <div>
@@ -1371,6 +1468,58 @@ def ui_shell() -> str:
           <h2>Recent Curation Runs</h2>
           ${curationRunsTable(data.recent_runs || [])}
         </section>`;
+    }
+
+    function cosReviewHtml(review) {
+      return `<div class="split">
+        <section>
+          <div class="toolbar">
+            <h2>Human Residue</h2>
+            <span class="badge">${review.counts?.residue ?? 0}</span>
+          </div>
+          ${cosResidueTable(review.residue || [])}
+        </section>
+        <section>
+          <div class="toolbar">
+            <h2>Action Health</h2>
+            <span class="badge">${review.recent_auto_applied?.length || 0} recent</span>
+            <span class="badge ${review.audit_failures?.length ? "danger" : "ok"}">${review.audit_failures?.length || 0} audit failures</span>
+          </div>
+          <h2>Recent Auto/Applied</h2>
+          ${cosActionsTable(review.recent_auto_applied || [])}
+          <h2>Audit Failures</h2>
+          ${cosActionsTable(review.audit_failures || [])}
+        </section>
+      </div>`;
+    }
+
+    function cosResidueTable(residue) {
+      return `<table><thead><tr><th>Kind</th><th>Question</th><th>Risk</th></tr></thead>
+        <tbody>${residue.map(question => `<tr>
+          <td><span class="badge ${question.kind === "conflict" ? "danger" : ""}">${escapeHtml(question.kind || "")}</span><br>${escapeHtml(question.status || "")}</td>
+          <td>${escapeHtml(question.question || "")}<div class="muted">${escapeHtml(question.page_hint || question.action_id || "")}</div></td>
+          <td>${escapeHtml(question.risk_tier || "")}<br>${escapeHtml(question.auto_resolve_after || "")}</td>
+        </tr>`).join("") || emptyRow(3)}</tbody></table>`;
+    }
+
+    function cosActionsTable(actions) {
+      return `<table><thead><tr><th>Action</th><th>Status</th><th>Targets</th></tr></thead>
+        <tbody>${actions.map(action => `<tr>
+          <td>${escapeHtml(action.action_type || "")}<div class="muted">${escapeHtml(action.id || "")}</div></td>
+          <td><span class="badge ${action.audit_status === "sampled_bad" ? "danger" : action.status === "auto_applied" || action.status === "applied" ? "ok" : ""}">${escapeHtml(action.status || "")}</span><br>${escapeHtml(action.audit_status || "")}</td>
+          <td>${escapeHtml(actionTargets(action))}<div class="muted">${escapeHtml(action.applied_at || action.created_at || "")}</div></td>
+        </tr>`).join("") || emptyRow(3)}</tbody></table>`;
+    }
+
+    function actionTargets(action) {
+      const pageTargets = action.target_page_paths || [];
+      const factTargets = action.target_fact_ids || [];
+      const contractTargets = action.target_contract_ids || [];
+      const parts = [];
+      if (pageTargets.length) parts.push(pageTargets.slice(0, 2).join(", "));
+      if (factTargets.length) parts.push(`${factTargets.length} facts`);
+      if (contractTargets.length) parts.push(`${contractTargets.length} contracts`);
+      return parts.join(" / ");
     }
 
     function lastCurationResultHtml(result) {

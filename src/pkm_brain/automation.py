@@ -24,6 +24,8 @@ from .llm import CODEX_DEFAULT_MODEL, DEFAULT_LLM_PROVIDER, OPENAI_DEFAULT_MODEL
 from .memory_proposals import propose_failure_memories_from_sources, propose_memories_from_lineage
 from .paths import BrainPaths
 from .service import BrainService
+from .sync_config import load_sync_config
+from .synthesizer import generate_page_syntheses
 from .util import new_id, now_iso
 from .wiki import lint_wiki
 
@@ -34,6 +36,26 @@ NIGHTLY_JOB_NAME = "nightly-maintenance"
 MAX_STORED_ERROR_CHARS = 4000
 MAX_STORED_ERROR_LIST_ITEMS = 20
 ERROR_FIELD_NAMES = {"error", "errors", "stderr", "traceback"}
+COS_SECONDARY_SKIP_REASON = "secondary role skips CoS mutation-capable stages by default"
+TRUTH_RESIDUE_KINDS = {"conflict"}
+TRUTH_ACTION_TYPES = {
+    "display_contested",
+    "fact_merge",
+    "fact_supersede",
+    "fact_upsert",
+    "resolve_conflict",
+}
+TIMEOUT_TO_UNCERTAINTY_ACTION_TYPES = {
+    "archive_page",
+    "canonicalize_page",
+    "edit_contract",
+    "page_merge",
+    "page_split",
+    "rehome_fact",
+    "rename_page",
+    "revert_page_snapshot",
+    "synthesize_page",
+}
 
 
 @dataclass(frozen=True)
@@ -209,6 +231,7 @@ def run_nightly_maintenance(
         status = "success"
         error: str | None = None
         try:
+            cos_role = cos_role_status(paths)
             capture_result = AgentLogCapture(
                 paths,
                 codex_state=codex_state,
@@ -222,17 +245,21 @@ def run_nightly_maintenance(
             ingest_result = service.ingest()
             summary["ingest"] = ingest_result.__dict__
 
-            summary["cos_extraction_shadow"] = extract_recent_documents(
-                paths, limit=10, shadow=True
-            )
+            summary["cos_role"] = cos_role
 
-            summary["cos_gardener_shadow"] = generate_gardener_candidates(
-                paths, shadow=True
-            )
+            summary["cos_extraction"] = run_cos_extraction(paths, cos_role, run_id=run_id)
+            summary["cos_extraction_shadow"] = summary["cos_extraction"]
+
+            summary["cos_gardener"] = run_cos_gardener(paths, cos_role)
+            summary["cos_gardener_shadow"] = summary["cos_gardener"]
+
+            summary["cos_synthesis"] = run_cos_synthesis(paths, cos_role, enabled=llm_wiki)
+            summary["cos_synthesis_shadow"] = summary["cos_synthesis"]
 
             summary["index_status"] = index_status(paths, service)
             summary["index_maintenance"] = run_index_maintenance(paths)
-            summary["cos_audit"] = run_sampled_audit(paths)
+            summary["cos_timeout_sweep"] = run_cos_timeout_sweep(paths)
+            summary["cos_audit"] = run_cos_audit(paths, cos_role)
             summary["provenance_check"] = provenance_check(paths)
             summary["wiki_lint"] = lint_wiki(paths)
             if with_llm_memory_proposals:
@@ -267,6 +294,217 @@ def run_nightly_maintenance(
             summary=summary,
             error=error,
         )
+
+
+def cos_role_status(paths: BrainPaths) -> dict[str, Any]:
+    try:
+        config = load_sync_config(paths)
+    except FileNotFoundError:
+        return {
+            "role": "single",
+            "configured": False,
+            "can_run_mutation_capable_stages": True,
+            "reason": "sync config absent; preserving single-machine behavior",
+        }
+    except Exception as exc:
+        return {
+            "role": "unknown",
+            "configured": True,
+            "can_run_mutation_capable_stages": False,
+            "reason": f"sync config invalid: {exc}",
+        }
+    can_run = config.role == "primary"
+    return {
+        "role": config.role,
+        "node_id": config.node_id,
+        "configured": True,
+        "can_run_mutation_capable_stages": can_run,
+        "reason": (
+            "primary role may run shadow CoS stages"
+            if can_run
+            else COS_SECONDARY_SKIP_REASON
+        ),
+    }
+
+
+def cos_stage_skipped(stage: str, role_status: dict[str, Any], *, mode: str) -> dict[str, Any]:
+    return {
+        "stage": stage,
+        "status": "skipped",
+        "mode": mode,
+        "role": role_status.get("role"),
+        "reason": role_status.get("reason") or COS_SECONDARY_SKIP_REASON,
+    }
+
+
+def run_cos_extraction(paths: BrainPaths, role_status: dict[str, Any], *, run_id: str | None = None) -> dict[str, Any]:
+    if not role_status.get("can_run_mutation_capable_stages"):
+        return cos_stage_skipped("cos_extraction", role_status, mode="policy")
+    result = extract_recent_documents(paths, limit=10, shadow=False, run_id=run_id)
+    status = "skipped" if result.get("status") == "skipped" else "policy"
+    return {
+        **result,
+        "stage": "cos_extraction",
+        "status": status,
+        "mode": "policy",
+        "role": role_status.get("role"),
+        "note": "Policy-driven extraction; proposed actions pass through cos_actions policy.",
+    }
+
+
+def run_cos_gardener(paths: BrainPaths, role_status: dict[str, Any]) -> dict[str, Any]:
+    if not role_status.get("can_run_mutation_capable_stages"):
+        return cos_stage_skipped("cos_gardener", role_status, mode="policy")
+    result = generate_gardener_candidates(paths, shadow=False)
+    return {
+        **result,
+        "stage": "cos_gardener",
+        "status": "policy",
+        "mode": "policy",
+        "role": role_status.get("role"),
+        "note": "Policy-driven gardener; proposed actions pass through cos_actions policy.",
+    }
+
+
+def run_cos_synthesis(paths: BrainPaths, role_status: dict[str, Any], *, enabled: bool) -> dict[str, Any]:
+    if not enabled:
+        return {
+            "stage": "cos_synthesis",
+            "status": "skipped",
+            "mode": "policy",
+            "role": role_status.get("role"),
+            "reason": "LLM wiki synthesis disabled by --no-llm-wiki",
+        }
+    if not role_status.get("can_run_mutation_capable_stages"):
+        return cos_stage_skipped("cos_synthesis", role_status, mode="policy")
+    result = generate_page_syntheses(paths, shadow=False)
+    status = "skipped" if result.get("status") == "skipped" else "policy"
+    return {
+        **result,
+        "stage": "cos_synthesis",
+        "status": status,
+        "mode": "policy",
+        "role": role_status.get("role"),
+        "note": "Policy-driven synthesis; proposed actions pass through cos_actions policy.",
+    }
+
+
+def run_cos_once(paths: BrainPaths, *, llm_wiki: bool = True) -> dict[str, Any]:
+    service = BrainService(paths)
+    service.init_workspace()
+    run_id = new_id("cosrun")
+    role_status = cos_role_status(paths)
+    return {
+        "run_id": run_id,
+        "cos_role": role_status,
+        "cos_extraction": run_cos_extraction(paths, role_status, run_id=run_id),
+        "cos_gardener": run_cos_gardener(paths, role_status),
+        "cos_synthesis": run_cos_synthesis(paths, role_status, enabled=llm_wiki),
+        "cos_timeout_sweep": run_cos_timeout_sweep(paths),
+        "cos_audit": run_cos_audit(paths, role_status),
+    }
+
+
+def run_cos_timeout_sweep(paths: BrainPaths, *, now: str | None = None, limit: int = 100) -> dict[str, Any]:
+    service = BrainService(paths)
+    service.init_workspace()
+    sweep_at = now or now_iso()
+    resolved: list[dict[str, Any]] = []
+    skipped_truth: list[dict[str, Any]] = []
+    skipped_ineligible: list[dict[str, Any]] = []
+    with connection(paths.sqlite_path) as conn:
+        candidates = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT *
+                FROM open_questions
+                WHERE status IN ('open', 'needs_human')
+                  AND auto_resolve_after IS NOT NULL
+                  AND auto_resolve_after <= ?
+                ORDER BY auto_resolve_after ASC, created_at ASC
+                LIMIT ?
+                """,
+                (sweep_at, max(1, limit)),
+            )
+        ]
+        for question in candidates:
+            action_type = residue_action_type(question)
+            summary = {
+                "id": question["id"],
+                "kind": question["kind"],
+                "action_id": question.get("action_id"),
+                "action_type": action_type,
+            }
+            if str(question["kind"]) in TRUTH_RESIDUE_KINDS or action_type in TRUTH_ACTION_TYPES:
+                skipped_truth.append(summary)
+                continue
+            if action_type and action_type not in TIMEOUT_TO_UNCERTAINTY_ACTION_TYPES:
+                skipped_ineligible.append(summary)
+                continue
+            answer = {
+                "resolution": "uncertainty",
+                "reason": "human review timeout elapsed without applying an action",
+                "action_type": action_type,
+            }
+            conn.execute(
+                """
+                UPDATE open_questions
+                SET status = 'timeout_resolved',
+                    answer = ?,
+                    decided_by = 'timeout_uncertainty',
+                    answered_at = ?
+                WHERE id = ?
+                """,
+                (dumps(answer), sweep_at, question["id"]),
+            )
+            action_id = question.get("action_id")
+            if action_id:
+                conn.execute(
+                    """
+                    UPDATE cos_actions
+                    SET status = 'timed_out'
+                    WHERE id = ? AND status = 'needs_human'
+                    """,
+                    (action_id,),
+                )
+            resolved.append(summary)
+    return {
+        "stage": "cos_timeout_sweep",
+        "status": "ok",
+        "checked": len(candidates),
+        "resolved_count": len(resolved),
+        "skipped_truth_count": len(skipped_truth),
+        "skipped_ineligible_count": len(skipped_ineligible),
+        "resolved": resolved,
+        "skipped_truth": skipped_truth,
+        "skipped_ineligible": skipped_ineligible,
+    }
+
+
+def residue_action_type(question: dict[str, Any]) -> str | None:
+    for field in ("recommended_action", "context"):
+        value = question.get(field)
+        if not value:
+            continue
+        try:
+            parsed = json.loads(str(value))
+        except json.JSONDecodeError:
+            parsed = {}
+        if isinstance(parsed, dict) and parsed.get("action_type"):
+            return str(parsed["action_type"])
+    return None
+
+
+def run_cos_audit(paths: BrainPaths, role_status: dict[str, Any]) -> dict[str, Any]:
+    if not role_status.get("can_run_mutation_capable_stages"):
+        return cos_stage_skipped("cos_audit", role_status, mode="stub")
+    result = run_sampled_audit(paths)
+    return {
+        **result,
+        "stage": "cos_audit",
+        "role": role_status.get("role"),
+    }
 
 
 def index_status(paths: BrainPaths, service: BrainService | None = None) -> dict[str, Any]:
@@ -470,8 +708,8 @@ def render_nightly_launch_agent(
         args.append("--with-llm-memory-proposals")
     if not llm_wiki:
         args.append("--no-llm-wiki")
-    llm_provider = provider or (DEFAULT_LLM_PROVIDER if llm_wiki or with_llm_memory_proposals else None)
-    if llm_wiki or with_llm_memory_proposals:
+    llm_provider = provider or (DEFAULT_LLM_PROVIDER if with_llm_memory_proposals else None)
+    if with_llm_memory_proposals:
         if llm_provider:
             args.extend(["--provider", llm_provider])
     command = f"cd {shlex.quote(str(repo_path))} && {shlex.join(args)}"
@@ -484,7 +722,7 @@ def render_nightly_launch_agent(
         "StandardErrorPath": str(brain_home / "logs" / "nightly-maintenance.err.log"),
         "WorkingDirectory": str(repo_path),
     }
-    if llm_wiki or with_llm_memory_proposals:
+    if with_llm_memory_proposals:
         environment = {}
         if llm_provider:
             environment["PKM_BRAIN_LLM_PROVIDER"] = llm_provider
