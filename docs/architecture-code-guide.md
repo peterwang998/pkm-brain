@@ -36,9 +36,9 @@ The most important mental model: raw sources are evidence, facts are the canonic
 
 ## Major TODOs
 
-- Productize semantic embeddings. The code has a latent `SentenceTransformerProvider`, but normal CLI/UI/MCP/automation paths default to hash embeddings or explicitly disable model embeddings. This needs a real config/env/CLI route, provider/model metadata, an explicit rebuild path for existing LanceDB rows, non-silent fallback behavior, and consistent provider selection during both ingest and search.
+- Productize semantic embeddings. The code has a latent `SentenceTransformerProvider` (now behind the optional `embeddings` extra), but normal CLI/UI/MCP/automation paths default to hash embeddings or explicitly disable model embeddings. This needs a real config/env/CLI route, index provenance stamping, an explicit rebuild path for existing LanceDB rows, non-silent fallback behavior, and consistent provider selection during both ingest and search. Plan: `docs/embeddings-productization-spec.md`.
 - Tighten deterministic fact resolution. Mutation mechanics should stay deterministic, but semantic decisions such as lexical near-duplicate merging or recency-implies-truth should route to exact-match/source-only rules, residue, critic, LLM, or human review instead of silent auto-merge.
-- Expose `open_questions` through MCP retrieval or remove the always-empty packet field. UI/wiki/policy flows use the table heavily, but `retrieve_context()` currently returns an empty list.
+- Keep `open_questions` retrieval useful and bounded. UI/wiki/policy flows use the table heavily, and `retrieve_context()` now returns query-relevant unresolved residue, but this should keep improving with ranking/review-surface work.
 - Keep the entity/gardener autonomy boundary honest. The code now has entity identity, merge/split actions, and decomposed gardener judgment, but policy promotion should stay tied to the eval/report gates described in the active specs.
 
 ## Detailed Breakdown From Raw Primitives Up
