@@ -135,7 +135,7 @@ Existing dedupe path (`service.py` ingest) currently keys on `content_hash` and 
 | `tests/test_migrations.py`    | Fresh DB applies all migrations; rerun is a no-op; `schema_migrations` records each version; partial failure rolls back that migration. |
 | `tests/test_origin_identity.py` | Local ingest stamps `origin_node_id=<local>`; two ingests with same `source_path` but different `origin_node_id` produce two rows; latest-snapshot retention preserves both; re-ingest of same `(origin, source_path)` updates one row. |
 | `tests/test_memory_export.py` | `approve` writes `memory/<scope>/<id>.md`; `export-all` is idempotent (byte-identical second run); `import --from` upserts; missing-source memory refused without `--allow-missing-sources`. |
-| `tests/test_config_split.py`  | Fresh `brain init` creates `config/local/` and `config/shared/`; legacy `config/config.yaml` is read with deprecation warning; new writes target `config/local/`. |
+| `tests/test_config_split.py`  | Fresh `brain init` creates `config/local/` and `config/shared/`; local config writes target `config/local/config.yaml`. The old legacy read shim has been removed. |
 | `tests/test_sync_config.py`   | Valid primary/secondary configs round-trip; missing `role` raises; duplicate peer `node_id` raises; mirror path covering forbidden dirs raises; secondary outbox without `node_id` raises. |
 | `tests/test_sync_doctor.py`   | Doctor passes on init'd primary and secondary workspaces; flags missing fields; `--json` output has stable schema. |
 | `tests/test_service_json.py`  | Every service `as_dict()` is `json.dumps`-able. |

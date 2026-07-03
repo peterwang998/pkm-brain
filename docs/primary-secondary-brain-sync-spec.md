@@ -865,7 +865,7 @@ Currently implemented in code:
 - MCP memory proposal and memory retrieval with status filtering.
 - macOS LaunchAgent installation, status, rendering, and uninstall for local capture and nightly maintenance.
 - Nightly maintenance with optional wiki proposals and optional failure-memory proposals.
-- `config/shared/` and `config/local/` split, with a deprecation shim for legacy `config/config.yaml`.
+- `config/shared/` and `config/local/` split; local config reads/writes use `config/local/config.yaml`.
 - `sync_config.py` and `config/sync.yaml` role validation.
 - Primary/Secondary role initialization.
 - SSH peer validation and host-key pinning.
