@@ -82,6 +82,7 @@ V1 uses:
 - SQLite FTS5 lexical search
 - LanceDB vector index under `~/brain/indexes/lancedb`
 - deterministic local hash embeddings by default, so the tool works offline
+- optional local `sentence-transformers` embeddings via `uv sync --extra embeddings`
 - Markdown/plain-text ingestion
 - chunking with provenance
 - CLI commands for search, inspection, wiki linting, memory audit, and run inspection
