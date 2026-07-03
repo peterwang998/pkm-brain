@@ -1362,16 +1362,6 @@ ROUTING_STOP_TOKENS = {
 }
 
 
-def load_extraction_routing_hints(
-    paths: BrainPaths, *, limit: int, query_text: str | None = None
-) -> list[dict[str, Any]]:
-    return ranked_extraction_routing_hints(
-        load_extraction_routing_hint_pool(paths),
-        query_text or "",
-        limit=limit,
-    )
-
-
 def normalize_extraction_page_hint(page_hint: str) -> str:
     normalized = canonical_page_hint_for_fact(str(page_hint or "").strip())
     while normalized.startswith("wiki/"):
@@ -2089,26 +2079,6 @@ def statement_faithfulness_reasons(
             + ", ".join(unsupported_numbers)
         )
     return reasons
-
-
-def unsupported_statement_entities(
-    statement: str,
-    evidence_text: str,
-    entity_mentions: list[dict[str, Any]],
-) -> list[str]:
-    normalized_statement = compact_surface_key(statement)
-    normalized_evidence = compact_surface_key(evidence_text)
-    unsupported: list[str] = []
-    for mention in entity_mentions:
-        if mention.get("mention_kind") != "named":
-            continue
-        surface = str(mention.get("surface") or "").strip()
-        if not surface:
-            continue
-        key = compact_surface_key(surface)
-        if key and key in normalized_statement and key not in normalized_evidence:
-            unsupported.append(surface)
-    return stable_unique_strings(unsupported)
 
 
 def compact_surface_key(value: str) -> str:

@@ -682,26 +682,6 @@ def fact_with_entity_links(
     return {**fact, "entity_id": entity_id}, links
 
 
-def fact_with_primary_entity(
-    conn: Any,
-    fact: dict[str, Any],
-    existing: Any | None,
-) -> tuple[dict[str, Any], EntityResolution | None]:
-    fact, links = fact_with_entity_links(conn, fact, existing)
-    if not links:
-        return fact, None
-    primary = next((link for link in links if link.get("is_primary")), links[0])
-    return (
-        fact,
-        EntityResolution(
-            entity_id=str(primary["entity_id"]),
-            resolution_method=str(primary.get("resolution_method") or "exact"),
-            mention_text=str(primary.get("mention_text") or ""),
-            name=str(primary.get("mention_text") or ""),
-        ),
-    )
-
-
 def fact_entity_mentions(fact: dict[str, Any]) -> list[dict[str, Any]]:
     raw_mentions = fact.get("entity_mentions")
     if raw_mentions is None:

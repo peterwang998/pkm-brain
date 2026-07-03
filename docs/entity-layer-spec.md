@@ -219,7 +219,7 @@ Do **not** fold this back into entity identity (re-conflating them is the origin
 **R3 — Legacy page consolidation (so targets are clean).** The 2026-07-01 gardener found **1,035 `page_merge` candidates** — the legacy wiki is full of near-duplicate pages, which *also* degrades routing (dup targets muddy the hint set). Consolidate via the page/entity gardener, but as a **one-time supervised migration** (large-topology → human), not nightly autonomy. **If the from-source regeneration (`docs/cos-regeneration-tasklist.md`) is done, R3 is largely moot** — the managed pages are wiped and rebuilt clean, so there is no legacy sprawl left to consolidate.
 
 - Together these address the run's 127 fallbacks + the legacy dup backlog.
-- Build on existing helpers: `load_extraction_routing_hint_pool` / `ranked_extraction_routing_hints` / `load_extraction_routing_hints`, `canonicalize_fact_routes` (`wiki_facts.py:2386`), `route_facts_to_sections` (`wiki_facts.py:2959`), `DEFAULT_FALLBACK_PAGE_HINTS` (`extraction.py:54`).
+- Build on existing helpers: `load_extraction_routing_hint_pool` / `ranked_extraction_routing_hints`, `canonicalize_fact_routes` (`wiki_facts.py`), `route_facts_to_sections` (`wiki_facts.py`), `DEFAULT_FALLBACK_PAGE_HINTS` (`extraction.py`).
 
 ---
 

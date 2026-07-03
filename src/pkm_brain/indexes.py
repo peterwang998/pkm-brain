@@ -10,15 +10,10 @@ from .embeddings import EmbeddingProvider
 
 
 TABLE_NAME = "chunks"
-FACT_TABLE_NAME = "facts"
 
 
 def upsert_vectors(db_path: Path, rows: list[dict[str, Any]]) -> int:
     return upsert_table_vectors(db_path, TABLE_NAME, "chunk_id", rows)
-
-
-def upsert_fact_vectors(db_path: Path, rows: list[dict[str, Any]]) -> int:
-    return upsert_table_vectors(db_path, FACT_TABLE_NAME, "fact_id", rows)
 
 
 def upsert_table_vectors(
@@ -50,10 +45,6 @@ def delete_vectors(db_path: Path, chunk_ids: list[str]) -> int:
     return delete_table_vectors(db_path, TABLE_NAME, "chunk_id", chunk_ids)
 
 
-def delete_fact_vectors(db_path: Path, fact_ids: list[str]) -> int:
-    return delete_table_vectors(db_path, FACT_TABLE_NAME, "fact_id", fact_ids)
-
-
 def delete_table_vectors(
     db_path: Path, table_name: str, id_column: str, target_ids: list[str]
 ) -> int:
@@ -69,12 +60,6 @@ def delete_table_vectors(
 
 def search_vectors(db_path: Path, provider: EmbeddingProvider, query: str, limit: int) -> list[dict[str, Any]]:
     return search_table_vectors(db_path, provider, query, limit, table_name=TABLE_NAME)
-
-
-def search_fact_vectors(
-    db_path: Path, provider: EmbeddingProvider, query: str, limit: int
-) -> list[dict[str, Any]]:
-    return search_table_vectors(db_path, provider, query, limit, table_name=FACT_TABLE_NAME)
 
 
 def search_table_vectors(

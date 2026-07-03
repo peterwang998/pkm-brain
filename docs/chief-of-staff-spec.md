@@ -155,7 +155,7 @@ Status gains `needs_human|auto_resolved|timeout_resolved`. Rows created only for
 
 ### 015 — fact indexes
 - Shared `retrieval_fts` rows with `kind='fact'` index facts for lexical retrieval and reuse the same fusion path as chunks.
-- Generalize `indexes.py` from single `TABLE_NAME="chunks"` to multi-collection; add LanceDB `facts` table: `{fact_id, vector, statement, page_hint, status, truth_confidence}`. Rebuildable.
+- Fact retrieval is FTS-only until semantic embeddings are productized. LanceDB remains a rebuildable chunk-vector index; do not add a dormant fact-vector table backed by hash embeddings.
 
 ### 016 — lineage at fact grain
 - Allow `context_lineage_events.target_type='fact'`; record exposure/usefulness per fact.
@@ -211,7 +211,7 @@ Deterministic candidate generation (near-dup page_hints; embedding-similar pages
 Canonical body: deterministic active facts, stable section order, `fact_ids`/`source_ids` in frontmatter. Synthesis block: `synthesizer` from active facts only, cites fact IDs, stored in `wiki_page_syntheses`, inserted as a clearly-labeled derived block, down-weighted in retrieval, never source evidence. Regenerate when `fact_hash`/`prompt_version` changes.
 
 ### 5.9 Retrieval (`service.py`, `indexes.py`) — extend
-Engine unchanged (FTS5 + LanceDB + RRF + rerank + source weighting + bounded packet). Add:
+Engine unchanged (FTS5 + LanceDB chunk vectors + RRF + rerank + source weighting + bounded packet). Facts enter the candidate stream through shared FTS until embeddings are productized. Add:
 - This section is complemented by `docs/chief-of-staff-retrieval-contract.md` and `docs/chief-of-staff-retrieval-tuning-plan.md`, which define verdict/calibration behavior and current tuning notes.
 - Facts in the candidate stream; return facts directly when best **only after** a fact-specific relevance gate. Fact retrieval is dynamic 0..N, never fixed top-k leakage.
 - Fact ranking normalizes raw FTS/vector/reranker signals onto a comparable positive relevance score and applies a calibrated `FACT_SCORE_FLOOR`; raw SQLite BM25 values are not compared directly with chunk/page scores.

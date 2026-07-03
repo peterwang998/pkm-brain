@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from difflib import SequenceMatcher, unified_diff
 import re
-from collections import Counter, defaultdict
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -16,21 +16,6 @@ from .util import new_id, now_iso, slugify, stable_unique, text_sha256
 from .wiki import COMMON_SECTIONS, TYPE_SECTIONS, lint_wiki, parse_frontmatter
 
 
-FACT_STATUSES = {
-    "active",
-    "superseded",
-    "conflicted",
-    "needs_confirmation",
-    "retracted",
-}
-QUESTION_STATUSES = {
-    "open",
-    "answered",
-    "dismissed",
-    "needs_human",
-    "auto_resolved",
-    "timeout_resolved",
-}
 REPLACEMENT_OPERATIONS = {"replace_page", "replace_section", "create_page"}
 AUTO_SUPERSEDE_CONFIDENCE = 0.85
 NEAR_DUPLICATE_SEQUENCE_RATIO = 0.88
@@ -272,23 +257,6 @@ def clean_markdown_heading_line(line: str) -> str:
     if len(without_marker) <= 100 and not re.search(r"[.!?]", without_marker):
         return ""
     return without_marker
-
-
-def section_body(markdown: str, section_name: str) -> str:
-    match = re.search(
-        rf"^##\s+{re.escape(section_name)}\s*\n(.*?)(?=^##\s+|\Z)",
-        markdown,
-        flags=re.MULTILINE | re.DOTALL,
-    )
-    return match.group(1).strip() if match else ""
-
-
-def default_section_for_operation(operation: str) -> str:
-    if operation == "create_page":
-        return "Summary"
-    if operation == "replace_page":
-        return "Summary"
-    return ""
 
 
 def topic_for_path(target_path: str) -> str:
@@ -1338,10 +1306,6 @@ def dismiss_resolved_conflict_questions(
                     question["id"],
                 ),
             )
-
-
-def facts_are_largely_same(left: str, right: str) -> bool:
-    return fact_similarity_signals(left, right)["largely_same"]
 
 
 def facts_should_merge(left: dict[str, Any], right: dict[str, Any]) -> bool:
@@ -3299,20 +3263,6 @@ def record_curation_run(
     return run_id
 
 
-def update_curation_run_summary(
-    paths: BrainPaths, run_id: str, summary: dict[str, Any]
-) -> None:
-    with connection(paths.sqlite_path) as conn:
-        conn.execute(
-            """
-            UPDATE wiki_curation_runs
-            SET summary = ?
-            WHERE id = ?
-            """,
-            (dumps(summary), run_id),
-        )
-
-
 def wiki_fact_dashboard(paths: BrainPaths) -> dict[str, Any]:
     with connection(paths.sqlite_path) as conn:
         status_counts = {
@@ -3517,7 +3467,3 @@ def row_to_page_snapshot(row: Any) -> dict[str, Any]:
         "before_preview": compact_statement(before_markdown or "", 180),
         "after_preview": compact_statement(after_markdown or "", 180),
     }
-
-
-def fact_status_summary(facts: list[dict[str, Any]]) -> dict[str, int]:
-    return dict(Counter(str(fact.get("status") or "") for fact in facts))
