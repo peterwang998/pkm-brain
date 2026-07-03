@@ -1,7 +1,7 @@
 # Embeddings Productization — Hash → Sentence-Transformers
 
 **Status:** implemented through Phase 4; Phase 5 eval-gated real-brain flip remains pending
-**Last verified:** 2026-07-03 against implementation commit `9f4cd6c`
+**Last verified:** 2026-07-03 against implementation commit `9fd9c2f`
 **Goal:** make real semantic embeddings a configurable, provenance-stamped retrieval component with a safe rebuild path, making `SentenceTransformerProvider` usable while keeping the deterministic offline hash provider available and never mixing vector spaces.
 
 This is the "embeddings productization" workstream referenced by `docs/architecture-code-guide.md` (Major TODOs) and by the Caveats section of `docs/entity-layer-spec.md`.
