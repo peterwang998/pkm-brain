@@ -41,9 +41,9 @@ Proposed Action → Policy → Apply → Audit → Revert/Demote if needed
 
 ## 3. Current code baseline (gap)
 
-**Built:** evidence layer (`service.py`/`indexes.py`); enriched `facts`; `open_questions`, `wiki_curation_runs`, `wiki_page_snapshots`; `cos_actions`; versioned `cos_policy`; `page_contracts`; `wiki_page_syntheses`; shared retrieval FTS; fact lineage target validation; `upsert_candidate_facts`, `resolve_fact_groups`, `curate_managed_pages`/`render_managed_page`; correction/revert; role-aware JSON LLM calls; fact/chunk/wiki retrieval with eval fixtures; UI views for facts/actions/policy/contracts/audit. Legacy `wiki_change_*` tables remain as archived audit/migration compatibility data, but UI/CLI/MCP/nightly no longer create, apply, absorb, or search legacy wiki proposals. Migration max = **16**.
+**Built:** evidence layer (`service.py`/`indexes.py`); enriched `facts`; `open_questions`, `wiki_curation_runs`, `wiki_page_snapshots`; `cos_actions`; versioned `cos_policy`; `page_contracts`; `wiki_page_syntheses`; shared retrieval FTS; fact lineage target validation; extraction stage watermarks; entity identity and fact-entity links; `upsert_candidate_facts`, `resolve_fact_groups`, `curate_managed_pages`/`render_managed_page`; correction/revert; role-aware JSON LLM calls; fact/chunk/wiki retrieval with eval fixtures; UI views for facts/actions/policy/contracts/audit; reversible page topology actions; reversible entity merge/split actions; nightly extraction/gardener/synthesis/timeout/audit stages. Legacy `wiki_change_*` tables remain as archived audit/migration compatibility data, but UI/CLI/MCP/nightly no longer create, apply, absorb, or search legacy wiki proposals. Migration max = **19**.
 
-**Not built:** fully eval-gated autonomous topology writes beyond conservative policy, production LLM extraction beyond shadow/gated modes, and a physical table-drop migration for archived `wiki_change_*` history.
+**Not built:** broad policy promotion beyond the narrow evaluated slices, productized semantic embeddings, MCP exposure of `open_questions`, and a physical table-drop migration for archived `wiki_change_*` history.
 
 ---
 
@@ -91,7 +91,7 @@ CREATE INDEX IF NOT EXISTS idx_cos_actions_status ON cos_actions(status, created
 CREATE INDEX IF NOT EXISTS idx_cos_actions_run ON cos_actions(run_id);
 CREATE INDEX IF NOT EXISTS idx_cos_actions_audit ON cos_actions(audit_status, applied_at);
 ```
-**Action types:** `fact_upsert`, `fact_merge`, `fact_supersede`, `resolve_conflict`, `display_contested`, `page_merge`, `page_split`, `rehome_fact`, `rename_page`, `canonicalize_page`, `archive_page`, `edit_contract`, `synthesize_page`.
+**Action types:** `fact_upsert`, `fact_merge`, `fact_supersede`, `resolve_conflict`, `display_contested`, `page_merge`, `page_split`, `rehome_fact`, `rename_page`, `canonicalize_page`, `archive_page`, `edit_contract`, `synthesize_page`, `entity_merge`, `entity_split`.
 
 ### 011 — `cos_policy` (versioned ordered rules)
 ```sql
@@ -160,6 +160,15 @@ Status gains `needs_human|auto_resolved|timeout_resolved`. Rows created only for
 ### 016 — lineage at fact grain
 - Allow `context_lineage_events.target_type='fact'`; record exposure/usefulness per fact.
 
+### 017 — CoS stage watermarks
+- Track extraction/synthesis/gardener stage input hashes by document/page/model/prompt so nightly runs can skip unchanged work and avoid duplicate actions.
+
+### 018 — entity identity
+- Extend `entities`, create `fact_entities`, add `facts.entity_id`, and maintain resolved entity links as a derived-but-queryable layer over facts.
+
+### 019 — fact entity mention kind
+- Add `fact_entities.mention_kind` so the entity layer can distinguish named referents from generic/concept/deictic mentions and gate entity creation.
+
 ---
 
 ## 5. Components
@@ -203,7 +212,7 @@ Canonical body: deterministic active facts, stable section order, `fact_ids`/`so
 
 ### 5.9 Retrieval (`service.py`, `indexes.py`) — extend
 Engine unchanged (FTS5 + LanceDB + RRF + rerank + source weighting + bounded packet). Add:
-- This section is complemented by `docs/chief-of-staff-retrieval-contract.md` and `docs/chief-of-staff-retrieval-tuning.md`, which define verdict/calibration behavior and current tuning notes.
+- This section is complemented by `docs/chief-of-staff-retrieval-contract.md` and `docs/chief-of-staff-retrieval-tuning-plan.md`, which define verdict/calibration behavior and current tuning notes.
 - Facts in the candidate stream; return facts directly when best **only after** a fact-specific relevance gate. Fact retrieval is dynamic 0..N, never fixed top-k leakage.
 - Fact ranking normalizes raw FTS/vector/reranker signals onto a comparable positive relevance score and applies a calibrated `FACT_SCORE_FLOOR`; raw SQLite BM25 values are not compared directly with chunk/page scores.
 - Return only active facts as authoritative. Conflicted facts may return only as contested pairs. Exclude inactive, superseded, and low-`truth_confidence` facts from authoritative retrieval.
@@ -266,4 +275,4 @@ Retrieval negative controls are fixed golden fixtures, but their synthetic absen
 Facts FTS uses the shared retrieval table with `kind='fact'`, implemented in migrations 015/016 and reused by fusion/rerank. There is no separate active `facts_fts` table.
 
 ## 10. Key code touchpoints
-`migrations.py` (009–016; max=16) · NEW `cos_actions.py`/`cos_policy.py`/`extraction.py`/`contracts.py`/`gardener.py`/`cos_audit.py` · `llm.py` (`complete_json`+roles, :32) · `indexes.py` (multi-collection, :12) · `service.py` (fact retrieval/dedup; `MANAGED_WIKI_BOOST`; `retrieve_context`) · `wiki_facts.py` (route mutators through actions; `resolve_fact_groups`, `render_managed_page`, `revert_wiki_page_snapshot`) · `automation.py` (nightly stages) · `ui_server.py` · `evals.py` + `retrieval_fixtures.py` + `cli.py`.
+`migrations.py` (009–019; max=19) · `cos_actions.py`/`cos_policy.py`/`extraction.py`/`contracts.py`/`gardener.py`/`synthesizer.py`/`cos_audit.py` · `entities.py` · `llm.py` (`complete_json`+roles) · `indexes.py` · `service.py` (fact retrieval/dedup; `MANAGED_WIKI_BOOST`; `retrieve_context`) · `wiki_facts.py` (route mutators through actions; `resolve_fact_groups`, `render_managed_page`, `revert_wiki_page_snapshot`) · `automation.py` (nightly stages) · `ui_server.py` · `evals.py` + `retrieval_fixtures.py` + `cli.py`.

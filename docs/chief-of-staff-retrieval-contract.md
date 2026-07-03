@@ -1,6 +1,6 @@
 # Chief-of-Staff Retrieval Contract
 
-Status: companion contract for `docs/chief-of-staff-spec.md` section 5.9. Current tuning details live in `docs/chief-of-staff-retrieval-tuning.md`.
+Status: companion contract for `docs/chief-of-staff-spec.md` section 5.9. Historical tuning details live in `docs/chief-of-staff-retrieval-tuning-plan.md`.
 
 ## Problem
 

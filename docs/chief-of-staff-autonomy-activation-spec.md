@@ -1,7 +1,7 @@
 # Chief-of-Staff — Autonomy Activation Spec
 
-**Status:** spec for Codex
-**Last verified:** 2026-06-25 against working tree atop `73b1e90` (working tree dirty; commit first, then stamp per `docs/cos-determinism-and-doc-conventions.md` §3)
+**Status:** historical activation plan; largely executed and superseded by `docs/chief-of-staff-spec.md`, `docs/extraction-payload-spec.md`, `docs/entity-layer-spec.md`, and `docs/cos-regeneration-tasklist.md`
+**Last verified:** 2026-07-03 against commit `604e3f1`
 **Goal:** turn the existing shadow substrate into an autonomous Chief of Staff that curates facts from ingested sources, flags hard conflicts for humans, authors wikis, performs low/medium-risk topology maintenance autonomously, and stops large topology changes for human review.
 
 ## 0. Decisions locked (from review, 2026-06-25)
@@ -13,7 +13,7 @@
 
 ## 1. Current state (recap)
 
-Substrate ~80% built (ledger, versioned policy, guarded revert, real eval gates, auditor, role taxonomy, honest shadow labeling). Live autonomy ~15–20%: extractor/gardener/auditor wired but shadow/provider-gated; `resolver`, `synthesizer`, `critic` **declared but unwired**; topology `page_merge`/`page_split`/`rename_page` **apply unimplemented**; nothing promoted past L3. See `docs/architecture-code-guide.md` and `docs/audit-remediation-status-2026-06-25.md`.
+As of 2026-07-03, this recap is historical. The action ledger, policy engine, guarded revert, role taxonomy, extractor, gardener, synthesizer, auditor stub/config path, page topology actions, entity merge/split actions, and nightly extraction/gardener/synthesis/timeout/audit stages are wired. Remaining live ceilings are tracked in the active specs: productized embeddings, resolver/critic promotion depth, MCP `open_questions` exposure, cleanup of archived legacy tables, and regeneration prerequisites.
 
 ## 2. Target operating model
 

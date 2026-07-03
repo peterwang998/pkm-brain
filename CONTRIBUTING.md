@@ -18,6 +18,13 @@ uv run ruff check .
 - Prefer deterministic behavior for core capture, ingest, search, retrieval, and sync paths.
 - Keep LLM-backed behavior explicit and review-gated where it can alter durable knowledge.
 
+## Docs Conventions
+
+- Living architecture/spec docs should state their status and include `**Last verified:** <date> against commit <hash>` when they make current-state claims.
+- Historical plans should be marked historical near the top and should point to the current living spec that supersedes them.
+- Current-state sections should describe the code that exists now. Future work belongs in explicit TODO, build-plan, or historical-plan sections.
+- When code behavior changes, update the nearest living spec in the same change or record why no doc update is needed.
+
 ## Pull Requests
 
 Before opening a pull request, run:

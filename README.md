@@ -363,8 +363,10 @@ capture agents
 ingest inbox
 chief-of-staff extraction shadow pass
 chief-of-staff gardener shadow pass
+chief-of-staff synthesis stage when LLM wiki synthesis is enabled
 index status
 index maintenance
+chief-of-staff timeout sweep for stale human residue
 chief-of-staff sampled audit (stub unless an auditor provider is configured)
 provenance check
 wiki lint
@@ -425,7 +427,7 @@ tail -n 40 ~/brain/logs/launchagent.out.log
 tail -n 40 ~/brain/logs/nightly-maintenance.out.log
 ```
 
-The capture LaunchAgent is a deterministic local Python job. The nightly LaunchAgent captures, ingests, checks indexes/provenance/wiki lint, and records explicit Chief-of-Staff shadow/stub summary fields. Optional failure-memory proposal jobs are controlled by `--with-llm-memory-proposals`.
+The capture LaunchAgent is a deterministic local Python job. The nightly LaunchAgent captures, ingests, runs Chief-of-Staff extraction/gardener/synthesis/timeout/audit stages, checks indexes/provenance/wiki lint, and records explicit stage summaries. Optional failure-memory proposal jobs are controlled by `--with-llm-memory-proposals`.
 
 ### 11. Uninstall scheduled jobs
 
@@ -528,8 +530,10 @@ The nightly job runs:
 - inbox ingestion
 - Chief-of-Staff extraction shadow pass (`cos_extraction_shadow`)
 - Chief-of-Staff gardener shadow pass (`cos_gardener_shadow`)
+- Chief-of-Staff synthesis stage (`cos_synthesis`; skipped unless LLM wiki synthesis is enabled)
 - index status collection
 - conservative LanceDB optimization when index bloat crosses maintenance thresholds
+- Chief-of-Staff timeout sweep (`cos_timeout_sweep`)
 - Chief-of-Staff sampled audit (`cos_audit`; default stub, configured when an auditor provider is supplied)
 - provenance check
 - wiki lint
@@ -804,7 +808,8 @@ Implemented:
 - reciprocal-rank fusion for hybrid retrieval
 - structured context retrieval
 - wiki schema linting
-- mechanical source-backed wiki reference synthesis
+- source-backed fact curation and managed wiki rendering
+- optional derived page synthesis through the Chief-of-Staff synthesizer role
 - archived legacy `wiki_change_*` tables retained for migration and audit compatibility
 - Codex CLI, OpenAI-compatible, Anthropic, and Ollama LLM provider adapters for memory proposals and configured CoS audits
 - Codex `brain-memory` skill for persistent-memory activation through MCP

@@ -24,10 +24,10 @@
 
 ## Phase 0 — Safety / rollback (do first; blocks everything)
 
-- [ ] **T0.1 — Commit the autonomy implementation in logical groups.** The entire activation (≈14 modules + new `synthesizer.py`) is uncommitted on a 2-day-old base. Group e.g.: per-role provider config; resolver+extraction spans; synthesizer; topology apply; policy/risk-tiering; nightly dispatch; evals; docs. Verify `uv run pytest -q` (260) and `uv run ruff check .` green before/after.
-  - *Acceptance:* clean working tree; `git log` shows the autonomy commits; tag a baseline (e.g. `cos-autonomy-impl`).
-- [ ] **T0.2 — Stamp all `docs/` per the doc convention** now that a commit exists (`docs/cos-determinism-and-doc-conventions.md` §3): `**Last verified:** <date> against commit <hash>`. Add the "Docs conventions" section to `CONTRIBUTING.md`.
-  - *Acceptance:* every `docs/` file carries a stamp; convention recorded.
+- [x] **T0.1 — Commit the autonomy implementation in logical groups.** Checkpoint commits landed on 2026-07-03: `0fe315d` for entity/extraction/gardener implementation and tests; `604e3f1` for active extraction/entity/regeneration specs. Re-run `uv run pytest -q` and `uv run ruff check .` after later cleanup diffs.
+  - *Acceptance:* clean checkpoint exists; `git log` shows the autonomy commits.
+- [ ] **T0.2 — Stamp all `docs/` per the doc convention** now that a commit exists (`docs/cos-determinism-and-doc-conventions.md` §3): `**Last verified:** <date> against commit <hash>`.
+  - *Acceptance:* active docs carry stamps; `CONTRIBUTING.md` records the convention. Older historical docs can be stamped opportunistically as they are touched.
 
 ## Phase 1 — Validate the new path on a sample (it has never run)
 

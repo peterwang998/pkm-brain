@@ -1,6 +1,7 @@
 # Chief-of-Staff Retrieval Tuning Plan
 
-**Status:** improvement plan for consult with Codex
+**Status:** historical improvement plan; retrieval contract/current behavior now live in `docs/chief-of-staff-spec.md` and `docs/chief-of-staff-retrieval-contract.md`
+**Last verified:** 2026-07-03 against commit `604e3f1`
 **Trigger:** Codex implemented `docs/chief-of-staff-spec.md`; a retrieval quality check (20 sampled historical queries + 3 negative controls, seed 20260624) showed good recall but specific spec misses.
 **Date:** 2026-06-24
 

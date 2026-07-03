@@ -1820,6 +1820,8 @@ V1 should prioritize simple local observability over a full evaluation platform.
 
 Audit date: 2026-05-25.
 
+Historical note, 2026-07-03: this section is retained as a point-in-time V1 audit. The current implementation status for facts/actions/pages, extraction, entity identity, gardener, synthesis, and regeneration now lives in `docs/chief-of-staff-spec.md`, `docs/architecture-code-guide.md`, `docs/extraction-payload-spec.md`, `docs/entity-layer-spec.md`, and `docs/cos-regeneration-tasklist.md`.
+
 This spec is the target design for a single-user local-first PKM/agent-memory system. The codebase implements most of the V1 surface; some sections (Forgetting, Tension audit, retrieval-quality polish) are partially or not yet implemented. This section lists the current state so the spec stays honest about what ships today.
 
 ### 21.1 Implemented
@@ -1876,7 +1878,7 @@ Operability:
 - **`brain ui service install/status/uninstall`** for running the Web UI as a managed service.
 - **Non-macOS schedulers.** systemd user timers and cron adapters intentionally raise a clear not-yet-implemented error.
 - **Structured `agent_sessions` import from Secondary** and **Secondary read-only MCP mode** (also called out in the sync spec).
-- **`entities` and `relations` tables.** Present in the schema but no writer/reader uses them; entity extraction during enrichment is not implemented.
+- **`relations` table.** Present in the schema but no writer/reader uses it. Entity identity and fact-entity links are now implemented in the Chief-of-Staff/entity layer; typed relation edges remain deferred.
 
 ### 21.4 Spec Drift Notes
 
