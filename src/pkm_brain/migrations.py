@@ -606,6 +606,80 @@ def _migration_017_create_cos_stage_watermarks(conn: sqlite3.Connection) -> None
     )
 
 
+def _migration_018_entity_identity(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS entities (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          entity_type TEXT,
+          aliases TEXT NOT NULL DEFAULT '[]',
+          status TEXT NOT NULL DEFAULT 'active',
+          merged_into TEXT,
+          description TEXT,
+          source_ids TEXT NOT NULL DEFAULT '[]',
+          created_at TEXT NOT NULL
+        )
+        """
+    )
+    _ensure_column(conn, "entities", "aliases", "TEXT NOT NULL DEFAULT '[]'")
+    _ensure_column(conn, "entities", "status", "TEXT NOT NULL DEFAULT 'active'")
+    _ensure_column(conn, "entities", "merged_into", "TEXT")
+    _ensure_column(conn, "entities", "description", "TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_status ON entities(status)")
+    if not _table_exists(conn, "facts"):
+        return
+    _ensure_column(conn, "facts", "entity_id", "TEXT")
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_facts_entity_id_status
+        ON facts(entity_id, status, observed_at)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fact_entities (
+          id TEXT PRIMARY KEY,
+          fact_id TEXT NOT NULL REFERENCES facts(id) ON DELETE CASCADE,
+          entity_id TEXT NOT NULL REFERENCES entities(id),
+          is_primary INTEGER NOT NULL DEFAULT 0,
+          mention_text TEXT,
+          mention_span TEXT,
+          mention_kind TEXT,
+          resolution_method TEXT,
+          confidence REAL,
+          created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_fact_entities_fact
+        ON fact_entities(fact_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_fact_entities_entity
+        ON fact_entities(entity_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_fact_entities_primary
+        ON fact_entities(fact_id)
+        WHERE is_primary = 1
+        """
+    )
+
+
+def _migration_019_fact_entity_mention_kind(conn: sqlite3.Connection) -> None:
+    if not _table_exists(conn, "fact_entities"):
+        return
+    _ensure_column(conn, "fact_entities", "mention_kind", "TEXT")
+
+
 MIGRATIONS: list[Migration] = [
     (1, "add_origin_identity", _migration_001_add_origin_identity),
     (2, "create_sync_runs", _migration_002_create_sync_runs),
@@ -628,6 +702,8 @@ MIGRATIONS: list[Migration] = [
     (15, "create_shared_retrieval_fts", _migration_015_create_shared_retrieval_fts),
     (16, "context_lineage_fact_target", _migration_016_context_lineage_fact_target),
     (17, "create_cos_stage_watermarks", _migration_017_create_cos_stage_watermarks),
+    (18, "entity_identity", _migration_018_entity_identity),
+    (19, "fact_entity_mention_kind", _migration_019_fact_entity_mention_kind),
 ]
 
 

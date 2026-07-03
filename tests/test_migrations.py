@@ -7,7 +7,7 @@ from pkm_brain.db import connection, init_db
 from pkm_brain.migrations import run_migrations
 
 
-EXPECTED_MIGRATIONS = list(range(1, 18))
+EXPECTED_MIGRATIONS = list(range(1, 20))
 
 
 def test_fresh_db_applies_registered_migrations(tmp_path: Path) -> None:
@@ -30,6 +30,12 @@ def test_fresh_db_applies_registered_migrations(tmp_path: Path) -> None:
             row["name"] for row in conn.execute("PRAGMA table_info(retrieval_events)")
         }
         fact_columns = {row["name"] for row in conn.execute("PRAGMA table_info(facts)")}
+        entity_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(entities)")
+        }
+        fact_entity_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(fact_entities)")
+        }
         question_columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(open_questions)")
         }
@@ -88,6 +94,7 @@ def test_fresh_db_applies_registered_migrations(tmp_path: Path) -> None:
     assert {
         "statement",
         "entity_key",
+        "entity_id",
         "status",
         "metadata",
         "source_spans",
@@ -95,6 +102,19 @@ def test_fresh_db_applies_registered_migrations(tmp_path: Path) -> None:
         "routing_confidence",
         "extraction_confidence",
     }.issubset(fact_columns)
+    assert {"aliases", "status", "merged_into", "description"}.issubset(
+        entity_columns
+    )
+    assert {
+        "fact_id",
+        "entity_id",
+        "is_primary",
+        "mention_text",
+        "mention_span",
+        "mention_kind",
+        "resolution_method",
+        "confidence",
+    }.issubset(fact_entity_columns)
     assert {
         "question",
         "fact_ids",
@@ -611,6 +631,129 @@ def test_init_db_preflights_legacy_wiki_change_items_before_schema_indexes(
 
     assert dict(row) == {"id": "item_legacy", "status": "pending"}
     assert "idx_wiki_change_items_status_target" in indexes
+    assert versions == EXPECTED_MIGRATIONS
+
+
+def test_init_db_preflights_legacy_entities_before_schema_indexes(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "brain.sqlite"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE entities (
+              id TEXT PRIMARY KEY,
+              name TEXT NOT NULL,
+              entity_type TEXT,
+              source_ids TEXT NOT NULL DEFAULT '[]',
+              created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO entities(id, name, entity_type, source_ids, created_at)
+            VALUES ('entity_legacy', 'Legacy Entity', NULL, '[]', '2026-06-01T00:00:00+00:00')
+            """
+        )
+
+    init_db(db_path)
+
+    with connection(db_path) as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(entities)")}
+        row = conn.execute(
+            """
+            SELECT id, aliases, status, merged_into, description
+            FROM entities
+            WHERE id = 'entity_legacy'
+            """
+        ).fetchone()
+        indexes = {row["name"] for row in conn.execute("PRAGMA index_list(entities)")}
+        versions = [
+            row["version"]
+            for row in conn.execute("SELECT version FROM schema_migrations")
+        ]
+
+    assert {"aliases", "status", "merged_into", "description"} <= columns
+    assert dict(row) == {
+        "id": "entity_legacy",
+        "aliases": "[]",
+        "status": "active",
+        "merged_into": None,
+        "description": None,
+    }
+    assert "idx_entities_status" in indexes
+    assert versions == EXPECTED_MIGRATIONS
+
+
+def test_migration_adds_mention_kind_to_existing_fact_entities_table() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        CREATE TABLE schema_migrations (
+          version INTEGER PRIMARY KEY,
+          applied_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.executemany(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, '2026-06-29T00:00:00+00:00')",
+        [(version,) for version in range(1, 19)],
+    )
+    conn.execute(
+        """
+        CREATE TABLE facts (
+          id TEXT PRIMARY KEY,
+          statement TEXT NOT NULL,
+          entity_key TEXT NOT NULL,
+          source_ids TEXT NOT NULL DEFAULT '[]',
+          confidence REAL NOT NULL,
+          status TEXT NOT NULL,
+          metadata TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE entities (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          entity_type TEXT,
+          aliases TEXT NOT NULL DEFAULT '[]',
+          status TEXT NOT NULL DEFAULT 'active',
+          source_ids TEXT NOT NULL DEFAULT '[]',
+          created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE fact_entities (
+          id TEXT PRIMARY KEY,
+          fact_id TEXT NOT NULL REFERENCES facts(id) ON DELETE CASCADE,
+          entity_id TEXT NOT NULL REFERENCES entities(id),
+          is_primary INTEGER NOT NULL DEFAULT 0,
+          mention_text TEXT,
+          mention_span TEXT,
+          resolution_method TEXT,
+          confidence REAL,
+          created_at TEXT NOT NULL
+        )
+        """
+    )
+
+    run_migrations(conn)
+
+    columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(fact_entities)")
+    }
+    versions = [
+        row["version"] for row in conn.execute("SELECT version FROM schema_migrations")
+    ]
+
+    assert "mention_kind" in columns
     assert versions == EXPECTED_MIGRATIONS
 
 

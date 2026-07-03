@@ -10,7 +10,7 @@ from .util import new_id, now_iso
 
 
 AUTONOMY_ORDER = {"L0": 0, "L1": 1, "L2": 2, "L3": 3}
-TOPOLOGY_ACTION_TYPES = {"page_merge", "page_split", "rename_page"}
+TOPOLOGY_ACTION_TYPES = {"page_merge", "page_split", "rename_page", "entity_merge", "entity_split"}
 LOW_AUTONOMY_ACTION_TYPES = {
     "fact_merge",
     "fact_supersede",
@@ -293,8 +293,11 @@ def classify_action_risk(
         large = (
             bool(features.get("large_topology"))
             or bool(features.get("cross_entity_merge"))
+            or bool(features.get("cross_type_merge"))
+            or bool(features.get("type_mismatch"))
             or affected_fact_count >= large_topology_fact_threshold
             or affected_page_count >= large_topology_fact_threshold
+            or int_or_zero(features.get("merged_entity_count")) >= large_topology_fact_threshold
         )
         if large:
             return "high"
@@ -433,7 +436,10 @@ def autonomy_policy_rows(
                     {"eq": {"large_topology": True}},
                     {"gte": {"affected_fact_count": large_topology_fact_threshold}},
                     {"gte": {"affected_page_count": large_topology_fact_threshold}},
+                    {"gte": {"merged_entity_count": large_topology_fact_threshold}},
                     {"eq": {"cross_entity_merge": True}},
+                    {"eq": {"cross_type_merge": True}},
+                    {"eq": {"type_mismatch": True}},
                 ]
             },
             "L3",

@@ -7,7 +7,23 @@ from typing import Any
 
 from .cos_policy import PolicyDecision, classify_action_risk, evaluate_policy
 from .db import connection, dumps, loads
-from .llm import LLMProvider, complete_json, cos_role_provider_configured, get_cos_role_provider
+from .entities import (
+    DEFAULT_ADMIT_KINDS,
+    EntityResolution,
+    normalize_admit_kinds,
+    normalize_entity_name,
+    normalize_entity_type,
+    normalize_mention_kind,
+    replace_fact_entity_links,
+    resolve_entity,
+)
+from .llm import (
+    LLMProvider,
+    complete_json,
+    cos_role_provider_configured,
+    get_cos_role_provider,
+    load_cos_llm_config,
+)
 from .paths import BrainPaths
 from .util import new_id, now_iso
 
@@ -75,6 +91,26 @@ ACTION_TYPE_SPECS: dict[str, dict[str, Any]] = {
         "implemented": True,
         "inverse_keys": ["restore_facts", "delete_question_ids"],
         "projection": "rebuild_fact_retrieval_index; open question residue references this action",
+    },
+    "entity_merge": {
+        "class": "ledger_mutation",
+        "implemented": True,
+        "inverse_keys": [
+            "restore_entities",
+            "restore_fact_entity_links",
+            "restore_fact_entity_denorms",
+        ],
+        "projection": "rebuild_fact_retrieval_index; affected entity-scoped facts must be reprojected",
+    },
+    "entity_split": {
+        "class": "ledger_mutation",
+        "implemented": True,
+        "inverse_keys": [
+            "restore_entities",
+            "restore_fact_entity_links",
+            "restore_fact_entity_denorms",
+        ],
+        "projection": "rebuild_fact_retrieval_index; restores prior entity topology links",
     },
     "page_merge": {
         "class": "ledger_mutation",
@@ -335,7 +371,7 @@ def apply_action(
         target_page_paths = list(action.get("target_page_paths") or [])
 
         if action["action_type"] == "fact_upsert":
-            fact_id, inverse = apply_fact_upsert(conn, payload)
+            fact_id, inverse = apply_fact_upsert(conn, payload, paths=paths)
             target_fact_ids = stable_unique([*target_fact_ids, fact_id])
         elif action["action_type"] in {"fact_supersede", "resolve_conflict"}:
             fact_ids, inverse = apply_fact_updates(conn, payload)
@@ -345,6 +381,12 @@ def apply_action(
             target_fact_ids = stable_unique([*target_fact_ids, *fact_ids])
         elif action["action_type"] == "display_contested":
             fact_ids, inverse = apply_display_contested(conn, payload, action_id)
+            target_fact_ids = stable_unique([*target_fact_ids, *fact_ids])
+        elif action["action_type"] == "entity_merge":
+            fact_ids, inverse = apply_entity_merge(conn, payload)
+            target_fact_ids = stable_unique([*target_fact_ids, *fact_ids])
+        elif action["action_type"] == "entity_split":
+            fact_ids, inverse = apply_entity_split(conn, payload)
             target_fact_ids = stable_unique([*target_fact_ids, *fact_ids])
         elif action["action_type"] == "rehome_fact":
             fact_id, inverse = apply_rehome_fact(conn, payload)
@@ -512,7 +554,12 @@ def mark_action_residue(
     return get_action(paths, action_id)
 
 
-def apply_fact_upsert(conn: Any, payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+def apply_fact_upsert(
+    conn: Any,
+    payload: dict[str, Any],
+    *,
+    paths: BrainPaths | None = None,
+) -> tuple[str, dict[str, Any]]:
     from .wiki_facts import rebuild_fact_retrieval_index, row_to_fact
 
     fact = payload.get("fact") if isinstance(payload.get("fact"), dict) else payload
@@ -523,13 +570,14 @@ def apply_fact_upsert(conn: Any, payload: dict[str, Any]) -> tuple[str, dict[str
         if existing
         else {"delete_fact_ids": [fact_id]}
     )
+    fact, entity_links = fact_with_entity_links(conn, fact, existing, paths=paths)
     values = fact_values(fact, fact_id, existing)
     if existing:
-        update_values = (*values[1:13], values[14], *values[15:], fact_id)
+        update_values = (*values[1:14], values[15], *values[16:], fact_id)
         conn.execute(
             """
             UPDATE facts
-            SET statement = ?, entity_key = ?, page_hint = ?, section_hint = ?,
+            SET statement = ?, entity_key = ?, entity_id = ?, page_hint = ?, section_hint = ?,
                 source_ids = ?, observed_at = ?, confidence = ?, status = ?,
                 supersedes_id = ?, conflict_group_id = ?, confirmed_by_user = ?,
                 metadata = ?, last_seen_at = ?, source_spans = ?,
@@ -544,17 +592,267 @@ def apply_fact_upsert(conn: Any, payload: dict[str, Any]) -> tuple[str, dict[str
         conn.execute(
             """
             INSERT INTO facts(
-              id, statement, entity_key, page_hint, section_hint, source_ids,
+              id, statement, entity_key, entity_id, page_hint, section_hint, source_ids,
               observed_at, confidence, status, supersedes_id, conflict_group_id,
               confirmed_by_user, metadata, created_at, last_seen_at, source_spans,
               evidence_quote, extraction_method, extractor_model, effective_at,
               extraction_confidence, routing_confidence, truth_confidence
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             values,
         )
+    replace_fact_entity_links(conn, fact_id=fact_id, links=entity_links)
     rebuild_fact_retrieval_index(conn)
     return fact_id, inverse
+
+
+def fact_with_entity_links(
+    conn: Any,
+    fact: dict[str, Any],
+    existing: Any | None,
+    *,
+    paths: BrainPaths | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    existing_get = existing_value_getter(existing)
+    mentions = fact_entity_mentions(fact)
+    primary_mention = first_primary_entity_mention(mentions)
+    admit_kinds = entity_admit_kinds(paths)
+    entity_id = str(fact.get("entity_id") or existing_get("entity_id", "") or "").strip()
+    links: list[dict[str, Any]] = []
+    if entity_id and entity_exists(conn, entity_id):
+        links.append(
+            entity_link_from_existing(
+                entity_id,
+                primary_mention,
+                fact,
+                is_primary=True,
+            )
+        )
+    else:
+        mention_text = (
+            str(primary_mention.get("surface") or "").strip()
+            if primary_mention
+            else primary_entity_mention(fact)
+        )
+        if not mention_text:
+            return fact, []
+        primary_resolution = resolve_entity(
+            conn,
+            mention_text,
+            type_hint=primary_mention.get("entity_type") if primary_mention else fact.get("entity_type"),
+            source_ids=source_ids_from_fact(fact),
+            create=True,
+            mention_kind=primary_mention.get("mention_kind") if primary_mention else "named",
+            admit_kinds=admit_kinds,
+            paths=paths,
+            context=entity_resolution_context(fact),
+        )
+        if primary_resolution is not None:
+            entity_id = primary_resolution.entity_id
+            links.append(
+                entity_link_from_resolution(
+                    primary_resolution,
+                    primary_mention,
+                    fact,
+                    is_primary=True,
+                )
+            )
+    for mention in mentions:
+        if mention.get("is_primary"):
+            continue
+        resolution = resolve_entity(
+            conn,
+            str(mention.get("surface") or ""),
+            type_hint=mention.get("entity_type"),
+            source_ids=source_ids_from_fact(fact),
+            create=True,
+            mention_kind=mention.get("mention_kind"),
+            admit_kinds=admit_kinds,
+            paths=paths,
+            context=entity_resolution_context(fact),
+        )
+        if resolution is None:
+            continue
+        links.append(entity_link_from_resolution(resolution, mention, fact, is_primary=False))
+    if not entity_id and links:
+        links[0]["is_primary"] = True
+        entity_id = str(links[0]["entity_id"])
+    if not entity_id:
+        return fact, links
+    return {**fact, "entity_id": entity_id}, links
+
+
+def fact_with_primary_entity(
+    conn: Any,
+    fact: dict[str, Any],
+    existing: Any | None,
+) -> tuple[dict[str, Any], EntityResolution | None]:
+    fact, links = fact_with_entity_links(conn, fact, existing)
+    if not links:
+        return fact, None
+    primary = next((link for link in links if link.get("is_primary")), links[0])
+    return (
+        fact,
+        EntityResolution(
+            entity_id=str(primary["entity_id"]),
+            resolution_method=str(primary.get("resolution_method") or "exact"),
+            mention_text=str(primary.get("mention_text") or ""),
+            name=str(primary.get("mention_text") or ""),
+        ),
+    )
+
+
+def fact_entity_mentions(fact: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_mentions = fact.get("entity_mentions")
+    if raw_mentions is None:
+        metadata = fact.get("metadata")
+        if isinstance(metadata, str):
+            metadata = loads(metadata, {})
+        if isinstance(metadata, dict):
+            raw_mentions = metadata.get("model_entity_mentions")
+    mentions = normalize_fact_entity_mentions(raw_mentions)
+    if mentions:
+        return mentions
+    primary = primary_entity_mention(fact)
+    if not primary:
+        return []
+    return [
+        {
+            "surface": primary,
+            "entity_type": normalize_entity_type(fact.get("entity_type")),
+            "is_primary": True,
+            "mention_span": None,
+            "mention_kind": "named",
+            "confidence": optional_float(fact.get("truth_confidence") or fact.get("confidence")),
+        }
+    ]
+
+
+def normalize_fact_entity_mentions(raw_mentions: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_mentions, list):
+        return []
+    mentions: list[dict[str, Any]] = []
+    primary_seen = False
+    for raw in raw_mentions:
+        if not isinstance(raw, dict):
+            continue
+        surface = str(
+            raw.get("surface")
+            or raw.get("mention")
+            or raw.get("name")
+            or raw.get("entity_key")
+            or ""
+        ).strip()
+        if not surface:
+            continue
+        entity_type = normalize_entity_type(raw.get("entity_type") or raw.get("type"))
+        mention_kind = normalize_mention_kind(raw.get("mention_kind") or raw.get("kind"))
+        is_primary = bool(raw.get("is_primary")) and not primary_seen
+        if is_primary:
+            primary_seen = True
+        mentions.append(
+            {
+                "surface": surface,
+                "entity_type": entity_type,
+                "is_primary": is_primary,
+                "mention_span": raw.get("mention_span") if isinstance(raw.get("mention_span"), dict) else None,
+                "mention_kind": mention_kind,
+                "confidence": optional_float(raw.get("confidence")),
+            }
+        )
+    if mentions and not any(mention["is_primary"] for mention in mentions):
+        mentions[0]["is_primary"] = True
+    return mentions
+
+
+def first_primary_entity_mention(mentions: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not mentions:
+        return None
+    return next((mention for mention in mentions if mention.get("is_primary")), mentions[0])
+
+
+def entity_link_from_existing(
+    entity_id: str,
+    mention: dict[str, Any] | None,
+    fact: dict[str, Any],
+    *,
+    is_primary: bool,
+) -> dict[str, Any]:
+    return {
+        "entity_id": entity_id,
+        "is_primary": is_primary,
+        "mention_text": str((mention or {}).get("surface") or primary_entity_mention(fact) or ""),
+        "mention_span": (mention or {}).get("mention_span"),
+        "mention_kind": (mention or {}).get("mention_kind"),
+        "resolution_method": "exact",
+        "confidence": (mention or {}).get("confidence")
+        or optional_float(fact.get("truth_confidence") or fact.get("confidence")),
+    }
+
+
+def entity_link_from_resolution(
+    resolution: EntityResolution,
+    mention: dict[str, Any] | None,
+    fact: dict[str, Any],
+    *,
+    is_primary: bool,
+) -> dict[str, Any]:
+    return {
+        "entity_id": resolution.entity_id,
+        "is_primary": is_primary,
+        "mention_text": resolution.mention_text,
+        "mention_span": (mention or {}).get("mention_span"),
+        "mention_kind": (mention or {}).get("mention_kind"),
+        "resolution_method": resolution.resolution_method,
+        "confidence": (mention or {}).get("confidence")
+        or optional_float(fact.get("truth_confidence") or fact.get("confidence")),
+    }
+
+
+def entity_admit_kinds(paths: BrainPaths | None) -> set[str]:
+    if paths is None:
+        return set(DEFAULT_ADMIT_KINDS)
+    raw_config = load_cos_llm_config(paths).get("entity")
+    if not isinstance(raw_config, dict):
+        return set(DEFAULT_ADMIT_KINDS)
+    return normalize_admit_kinds(raw_config.get("admit_kinds"))
+
+
+def entity_resolution_context(fact: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "statement": fact.get("statement"),
+        "page_hint": fact.get("page_hint"),
+        "section_hint": fact.get("section_hint"),
+        "evidence_quote": fact.get("evidence_quote"),
+    }
+
+
+def primary_entity_mention(fact: dict[str, Any]) -> str | None:
+    metadata = fact.get("metadata")
+    if isinstance(metadata, str):
+        metadata = loads(metadata, {})
+    if isinstance(metadata, dict):
+        model_entity_key = str(metadata.get("model_entity_key") or "").strip()
+        if model_entity_key:
+            return model_entity_key
+    for key in ("entity_mention", "entity_name"):
+        value = str(fact.get(key) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def source_ids_from_fact(fact: dict[str, Any]) -> list[str]:
+    source_ids = fact.get("source_ids")
+    if isinstance(source_ids, str):
+        return [str(item) for item in loads(source_ids, []) if str(item or "").strip()]
+    if isinstance(source_ids, list):
+        return [str(item) for item in source_ids if str(item or "").strip()]
+    return []
+
+
+def entity_exists(conn: Any, entity_id: str) -> bool:
+    return conn.execute("SELECT 1 FROM entities WHERE id = ?", (entity_id,)).fetchone() is not None
 
 
 def fact_values(fact: dict[str, Any], fact_id: str, existing: Any | None) -> tuple[Any, ...]:
@@ -565,6 +863,7 @@ def fact_values(fact: dict[str, Any], fact_id: str, existing: Any | None) -> tup
         fact_id,
         str(fact.get("statement", existing_get("statement", ""))),
         str(fact.get("entity_key", existing_get("entity_key", "manual:fact"))),
+        fact.get("entity_id", existing_get("entity_id")),
         fact.get("page_hint", existing_get("page_hint")),
         fact.get("section_hint", existing_get("section_hint")),
         dumps(fact.get("source_ids", loads(existing_get("source_ids"), []))),
@@ -586,6 +885,15 @@ def fact_values(fact: dict[str, Any], fact_id: str, existing: Any | None) -> tup
         fact.get("routing_confidence", existing_get("routing_confidence")),
         fact.get("truth_confidence", existing_get("truth_confidence", confidence)),
     )
+
+
+def optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def apply_rehome_fact(conn: Any, payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -737,6 +1045,401 @@ def apply_display_contested(
     if question_id:
         inverse["delete_question_ids"] = [question_id]
     return fact_ids, inverse
+
+
+def apply_entity_merge(conn: Any, payload: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
+    from .wiki_facts import rebuild_fact_retrieval_index
+
+    canonical_id = str(
+        payload.get("canonical_entity_id")
+        or payload.get("target_entity_id")
+        or payload.get("destination_entity_id")
+        or ""
+    ).strip()
+    source_ids = entity_merge_source_ids(payload, canonical_id)
+    if not canonical_id or not source_ids:
+        raise ValueError("entity_merge requires canonical_entity_id and merged_entity_ids")
+    entity_ids = stable_unique([canonical_id, *source_ids])
+    entity_rows = entity_rows_by_id(conn, entity_ids)
+    missing = [entity_id for entity_id in entity_ids if entity_id not in entity_rows]
+    if missing:
+        raise ValueError(f"entity_merge entity not found: {', '.join(missing)}")
+    canonical = entity_rows[canonical_id]
+    require_active_entity(canonical, role="canonical")
+    for source_id in source_ids:
+        require_active_entity(entity_rows[source_id], role="merged")
+    guard_entity_merge_types(canonical, [entity_rows[source_id] for source_id in source_ids])
+
+    link_rows = fact_entity_rows_for_entity_ids(conn, source_ids)
+    denorm_rows = fact_denorm_rows_for_entity_ids(conn, source_ids)
+    affected_fact_ids = stable_unique(
+        [
+            *[str(row["fact_id"]) for row in link_rows],
+            *[str(row["id"]) for row in denorm_rows],
+        ]
+    )
+    inverse = {
+        "restore_entities": [dict(entity_rows[entity_id]) for entity_id in entity_ids],
+        "restore_fact_entity_links": [dict(row) for row in link_rows],
+        "restore_fact_entity_denorms": [
+            {"fact_id": str(row["id"]), "entity_id": row["entity_id"]} for row in denorm_rows
+        ],
+    }
+
+    placeholders = ",".join("?" for _ in source_ids)
+    conn.execute(
+        f"UPDATE fact_entities SET entity_id = ? WHERE entity_id IN ({placeholders})",
+        [canonical_id, *source_ids],
+    )
+    conn.execute(
+        f"""
+        UPDATE facts
+        SET entity_id = ?
+        WHERE entity_id IN ({placeholders})
+        """,
+        [canonical_id, *source_ids],
+    )
+    canonical_updates = merged_canonical_entity_updates(
+        canonical,
+        [entity_rows[source_id] for source_id in source_ids],
+    )
+    conn.execute(
+        "UPDATE entities SET aliases = ?, source_ids = ?, entity_type = ? WHERE id = ?",
+        (
+            canonical_updates["aliases"],
+            canonical_updates["source_ids"],
+            canonical_updates["entity_type"],
+            canonical_id,
+        ),
+    )
+    conn.execute(
+        f"""
+        UPDATE entities
+        SET status = 'merged', merged_into = ?
+        WHERE id IN ({placeholders})
+        """,
+        [canonical_id, *source_ids],
+    )
+    rebuild_fact_retrieval_index(conn)
+    return affected_fact_ids, inverse
+
+
+def apply_entity_split(conn: Any, payload: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
+    restore_payload = entity_split_restore_payload(payload)
+    if not entity_restore_payload_has_content(restore_payload):
+        raise ValueError("entity_split requires merge_inverse or restore_* payload")
+    inverse = capture_entity_restore_state(conn, restore_payload)
+    affected_fact_ids = restore_entity_merge_inverse(conn, restore_payload)
+    return affected_fact_ids, inverse
+
+
+def entity_merge_source_ids(payload: dict[str, Any], canonical_id: str) -> list[str]:
+    raw = (
+        payload.get("merged_entity_ids")
+        or payload.get("source_entity_ids")
+        or payload.get("entity_ids")
+        or []
+    )
+    if not isinstance(raw, list):
+        raw = [raw]
+    return stable_unique(
+        [str(item).strip() for item in raw if str(item or "").strip() and str(item).strip() != canonical_id]
+    )
+
+
+def entity_rows_by_id(conn: Any, entity_ids: list[str]) -> dict[str, Any]:
+    entity_ids = stable_unique(entity_ids)
+    if not entity_ids:
+        return {}
+    placeholders = ",".join("?" for _ in entity_ids)
+    return {
+        str(row["id"]): row
+        for row in conn.execute(
+            f"SELECT * FROM entities WHERE id IN ({placeholders})",
+            entity_ids,
+        )
+    }
+
+
+def require_active_entity(row: Any, *, role: str) -> None:
+    status = str(row["status"] or "active")
+    if status != "active":
+        raise ValueError(f"entity_merge {role} entity is not active: {row['id']}")
+
+
+def guard_entity_merge_types(canonical: Any, source_rows: list[Any]) -> None:
+    canonical_type = normalize_entity_type(canonical["entity_type"])
+    for source in source_rows:
+        source_type = normalize_entity_type(source["entity_type"])
+        if canonical_type and source_type and canonical_type != source_type:
+            raise ValueError(
+                "entity_merge type mismatch: "
+                f"{canonical['id']} is {canonical_type}, {source['id']} is {source_type}"
+            )
+
+
+def fact_entity_rows_for_entity_ids(conn: Any, entity_ids: list[str]) -> list[Any]:
+    entity_ids = stable_unique(entity_ids)
+    if not entity_ids:
+        return []
+    placeholders = ",".join("?" for _ in entity_ids)
+    return list(
+        conn.execute(
+            f"""
+            SELECT *
+            FROM fact_entities
+            WHERE entity_id IN ({placeholders})
+            ORDER BY fact_id, is_primary DESC, id
+            """,
+            entity_ids,
+        )
+    )
+
+
+def fact_entity_rows_for_link_ids(conn: Any, link_ids: list[str]) -> list[Any]:
+    link_ids = stable_unique(link_ids)
+    if not link_ids:
+        return []
+    placeholders = ",".join("?" for _ in link_ids)
+    return list(
+        conn.execute(
+            f"""
+            SELECT *
+            FROM fact_entities
+            WHERE id IN ({placeholders})
+            ORDER BY fact_id, is_primary DESC, id
+            """,
+            link_ids,
+        )
+    )
+
+
+def fact_denorm_rows_for_entity_ids(conn: Any, entity_ids: list[str]) -> list[Any]:
+    entity_ids = stable_unique(entity_ids)
+    if not entity_ids:
+        return []
+    placeholders = ",".join("?" for _ in entity_ids)
+    return list(
+        conn.execute(
+            f"""
+            SELECT id, entity_id
+            FROM facts
+            WHERE entity_id IN ({placeholders})
+            ORDER BY id
+            """,
+            entity_ids,
+        )
+    )
+
+
+def fact_denorm_rows_for_fact_ids(conn: Any, fact_ids: list[str]) -> list[Any]:
+    fact_ids = stable_unique(fact_ids)
+    if not fact_ids:
+        return []
+    placeholders = ",".join("?" for _ in fact_ids)
+    return list(
+        conn.execute(
+            f"""
+            SELECT id, entity_id
+            FROM facts
+            WHERE id IN ({placeholders})
+            ORDER BY id
+            """,
+            fact_ids,
+        )
+    )
+
+
+def merged_canonical_entity_updates(canonical: Any, source_rows: list[Any]) -> dict[str, Any]:
+    aliases = [str(item) for item in loads(canonical["aliases"], []) if str(item or "").strip()]
+    alias_norms = {normalize_entity_name(alias) for alias in aliases}
+    canonical_norm = normalize_entity_name(canonical["name"])
+    for source in source_rows:
+        for candidate in [source["name"], *loads(source["aliases"], [])]:
+            text = str(candidate or "").strip()
+            normalized = normalize_entity_name(text)
+            if not text or not normalized or normalized in {canonical_norm, *alias_norms}:
+                continue
+            aliases.append(text)
+            alias_norms.add(normalized)
+    source_ids = stable_unique(
+        [
+            *[str(item) for item in loads(canonical["source_ids"], []) if str(item or "").strip()],
+            *[
+                str(item)
+                for source in source_rows
+                for item in loads(source["source_ids"], [])
+                if str(item or "").strip()
+            ],
+        ]
+    )
+    entity_type = normalize_entity_type(canonical["entity_type"]) or next(
+        (
+            normalize_entity_type(source["entity_type"])
+            for source in source_rows
+            if normalize_entity_type(source["entity_type"])
+        ),
+        None,
+    )
+    return {
+        "aliases": dumps(aliases),
+        "source_ids": dumps(source_ids),
+        "entity_type": entity_type,
+    }
+
+
+def entity_split_restore_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    for key in ("merge_inverse", "inverse_action_json", "inverse"):
+        candidate = payload.get(key)
+        if isinstance(candidate, dict):
+            return candidate
+    return payload
+
+
+def entity_restore_payload_has_content(payload: dict[str, Any]) -> bool:
+    return any(
+        payload.get(key)
+        for key in (
+            "restore_entities",
+            "restore_fact_entity_links",
+            "restore_fact_entity_denorms",
+        )
+    )
+
+
+def capture_entity_restore_state(conn: Any, restore_payload: dict[str, Any]) -> dict[str, Any]:
+    entity_ids = [
+        str(row.get("id") or "")
+        for row in restore_payload.get("restore_entities") or []
+        if isinstance(row, dict) and row.get("id")
+    ]
+    link_ids = [
+        str(row.get("id") or "")
+        for row in restore_payload.get("restore_fact_entity_links") or []
+        if isinstance(row, dict) and row.get("id")
+    ]
+    fact_ids = [
+        str(row.get("fact_id") or "")
+        for row in restore_payload.get("restore_fact_entity_denorms") or []
+        if isinstance(row, dict) and row.get("fact_id")
+    ]
+    return {
+        "restore_entities": [dict(row) for row in entity_rows_by_id(conn, entity_ids).values()],
+        "restore_fact_entity_links": [dict(row) for row in fact_entity_rows_for_link_ids(conn, link_ids)],
+        "restore_fact_entity_denorms": [
+            {"fact_id": str(row["id"]), "entity_id": row["entity_id"]}
+            for row in fact_denorm_rows_for_fact_ids(conn, fact_ids)
+        ],
+    }
+
+
+def restore_entity_merge_inverse(conn: Any, inverse: dict[str, Any]) -> list[str]:
+    from .wiki_facts import rebuild_fact_retrieval_index
+
+    entity_rows = [row for row in inverse.get("restore_entities") or [] if isinstance(row, dict)]
+    link_rows = [
+        row for row in inverse.get("restore_fact_entity_links") or [] if isinstance(row, dict)
+    ]
+    denorm_rows = [
+        row for row in inverse.get("restore_fact_entity_denorms") or [] if isinstance(row, dict)
+    ]
+    for row in entity_rows:
+        restore_entity_row(conn, row)
+    for row in link_rows:
+        restore_fact_entity_link(conn, row)
+    affected_fact_ids: list[str] = []
+    for row in denorm_rows:
+        fact_id = str(row.get("fact_id") or "")
+        if not fact_id:
+            continue
+        conn.execute(
+            "UPDATE facts SET entity_id = ? WHERE id = ?",
+            (row.get("entity_id"), fact_id),
+        )
+        affected_fact_ids.append(fact_id)
+    affected_fact_ids = stable_unique(
+        [
+            *affected_fact_ids,
+            *[str(row.get("fact_id") or "") for row in link_rows],
+        ]
+    )
+    rebuild_fact_retrieval_index(conn)
+    return affected_fact_ids
+
+
+def restore_entity_row(conn: Any, row: dict[str, Any]) -> None:
+    entity_id = str(row.get("id") or "")
+    if not entity_id:
+        return
+    existing = conn.execute("SELECT 1 FROM entities WHERE id = ?", (entity_id,)).fetchone()
+    values = (
+        row.get("name") or "Unknown Entity",
+        normalize_entity_type(row.get("entity_type")),
+        row.get("aliases") if row.get("aliases") is not None else "[]",
+        row.get("status") or "active",
+        row.get("merged_into"),
+        row.get("description"),
+        row.get("source_ids") if row.get("source_ids") is not None else "[]",
+        row.get("created_at") or now_iso(),
+    )
+    if existing:
+        conn.execute(
+            """
+            UPDATE entities
+            SET name = ?, entity_type = ?, aliases = ?, status = ?,
+                merged_into = ?, description = ?, source_ids = ?, created_at = ?
+            WHERE id = ?
+            """,
+            (*values, entity_id),
+        )
+        return
+    conn.execute(
+        """
+        INSERT INTO entities(
+          id, name, entity_type, aliases, status, merged_into, description, source_ids, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (entity_id, *values),
+    )
+
+
+def restore_fact_entity_link(conn: Any, row: dict[str, Any]) -> None:
+    link_id = str(row.get("id") or "")
+    if not link_id:
+        return
+    existing = conn.execute("SELECT 1 FROM fact_entities WHERE id = ?", (link_id,)).fetchone()
+    values = (
+        row.get("fact_id"),
+        row.get("entity_id"),
+        1 if row.get("is_primary") else 0,
+        row.get("mention_text"),
+        row.get("mention_span"),
+        row.get("mention_kind"),
+        row.get("resolution_method"),
+        row.get("confidence"),
+        row.get("created_at") or now_iso(),
+    )
+    if existing:
+        conn.execute(
+            """
+            UPDATE fact_entities
+            SET fact_id = ?, entity_id = ?, is_primary = ?, mention_text = ?,
+                mention_span = ?, mention_kind = ?, resolution_method = ?,
+                confidence = ?, created_at = ?
+            WHERE id = ?
+            """,
+            (*values, link_id),
+        )
+        return
+    conn.execute(
+        """
+        INSERT INTO fact_entities(
+          id, fact_id, entity_id, is_primary, mention_text, mention_span,
+          mention_kind, resolution_method, confidence, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (link_id, *values),
+    )
 
 
 def apply_edit_contract(conn: Any, payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -1219,6 +1922,8 @@ def apply_inverse(conn: Any, inverse: dict[str, Any]) -> None:
         restore_contract(conn, dict(contract))
     for synthesis in inverse.get("restore_syntheses") or []:
         restore_synthesis(conn, dict(synthesis))
+    if entity_restore_payload_has_content(inverse):
+        restore_entity_merge_inverse(conn, inverse)
     for path_restore in inverse.get("restore_wiki_page_paths") or []:
         conn.execute(
             "UPDATE wiki_pages SET path = ? WHERE path = ?",
@@ -1291,7 +1996,13 @@ def target_state_hash(
     target_contract_ids: list[str],
     target_page_paths: list[str],
 ) -> str:
-    state: dict[str, Any] = {"facts": [], "contracts": [], "syntheses": []}
+    state: dict[str, Any] = {
+        "facts": [],
+        "fact_entities": [],
+        "entities": [],
+        "contracts": [],
+        "syntheses": [],
+    }
     if target_fact_ids:
         placeholders = ",".join("?" for _ in target_fact_ids)
         state["facts"] = [
@@ -1301,6 +2012,39 @@ def target_state_hash(
                 target_fact_ids,
             )
         ]
+        state["fact_entities"] = [
+            dict(row)
+            for row in conn.execute(
+                f"""
+                SELECT *
+                FROM fact_entities
+                WHERE fact_id IN ({placeholders})
+                ORDER BY fact_id, is_primary DESC, id
+                """,
+                target_fact_ids,
+            )
+        ]
+        entity_ids = stable_unique(
+            [
+                str(fact.get("entity_id") or "")
+                for fact in state["facts"]
+                if fact.get("entity_id")
+            ]
+            + [
+                str(link.get("entity_id") or "")
+                for link in state["fact_entities"]
+                if link.get("entity_id")
+            ]
+        )
+        if entity_ids:
+            entity_placeholders = ",".join("?" for _ in entity_ids)
+            state["entities"] = [
+                dict(row)
+                for row in conn.execute(
+                    f"SELECT * FROM entities WHERE id IN ({entity_placeholders}) ORDER BY id",
+                    entity_ids,
+                )
+            ]
     if target_contract_ids:
         placeholders = ",".join("?" for _ in target_contract_ids)
         state["contracts"] = [

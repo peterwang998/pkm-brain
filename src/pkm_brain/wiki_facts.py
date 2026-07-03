@@ -429,29 +429,53 @@ def normalized_statement(statement: str) -> str:
 def find_existing_fact(
     conn: Any, candidate: dict[str, Any], normalized: str
 ) -> Any | None:
-    for row in conn.execute(
-        """
-        SELECT *
-        FROM facts
-        WHERE entity_key = ? AND status != 'retracted'
-        ORDER BY
-          CASE status
-            WHEN 'active' THEN 0
-            WHEN 'conflicted' THEN 1
-            WHEN 'needs_confirmation' THEN 2
-            WHEN 'superseded' THEN 3
-            ELSE 4
-          END,
-          confirmed_by_user DESC,
-          created_at DESC
-        """,
-        (candidate["entity_key"],),
-    ):
+    entity_id = str(candidate.get("entity_id") or "").strip()
+    if entity_id:
+        query = """
+            SELECT *
+            FROM facts
+            WHERE (entity_id = ? OR (entity_id IS NULL AND entity_key = ?))
+              AND status != 'retracted'
+            ORDER BY
+              CASE status
+                WHEN 'active' THEN 0
+                WHEN 'conflicted' THEN 1
+                WHEN 'needs_confirmation' THEN 2
+                WHEN 'superseded' THEN 3
+                ELSE 4
+              END,
+              confirmed_by_user DESC,
+              created_at DESC
+            """
+        params = (entity_id, candidate["entity_key"])
+    else:
+        query = """
+            SELECT *
+            FROM facts
+            WHERE entity_key = ? AND status != 'retracted'
+            ORDER BY
+              CASE status
+                WHEN 'active' THEN 0
+                WHEN 'conflicted' THEN 1
+                WHEN 'needs_confirmation' THEN 2
+                WHEN 'superseded' THEN 3
+                ELSE 4
+              END,
+              confirmed_by_user DESC,
+              created_at DESC
+            """
+        params = (candidate["entity_key"],)
+    for row in conn.execute(query, params):
         if normalized_statement(str(row["statement"] or "")) == normalized:
             return row
         if facts_should_merge(row_to_fact(row), candidate):
             return row
     return None
+
+
+def fact_identity_group_key(fact: dict[str, Any]) -> str:
+    entity_id = str(fact.get("entity_id") or "").strip()
+    return f"entity_id:{entity_id}" if entity_id else f"entity_key:{fact.get('entity_key')}"
 
 
 def merge_fact_values(
@@ -607,28 +631,54 @@ def resolve_fact_groups(
         }
     placeholders = ",".join("?" for _ in entity_keys)
     with connection(paths.sqlite_path) as conn:
-        fact_rows = rows(
+        seed_rows = rows(
             conn,
             f"""
             SELECT *
             FROM facts
             WHERE entity_key IN ({placeholders})
               AND status IN ('active', 'conflicted', 'needs_confirmation')
-            ORDER BY entity_key, section_hint, observed_at, created_at
+            ORDER BY entity_key, observed_at, created_at
             """,
             entity_keys,
         )
-    grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+        seed_entity_ids = stable_unique(
+            [
+                str(row_get(row, "entity_id") or "")
+                for row in seed_rows
+                if str(row_get(row, "entity_id") or "").strip()
+            ]
+        )
+        if seed_entity_ids:
+            entity_placeholders = ",".join("?" for _ in seed_entity_ids)
+            fact_rows = rows(
+                conn,
+                f"""
+                SELECT *
+                FROM facts
+                WHERE (
+                    entity_id IN ({entity_placeholders})
+                    OR (entity_id IS NULL AND entity_key IN ({placeholders}))
+                )
+                  AND status IN ('active', 'conflicted', 'needs_confirmation')
+                ORDER BY COALESCE(entity_id, entity_key), observed_at, created_at
+                """,
+                [*seed_entity_ids, *entity_keys],
+            )
+        else:
+            fact_rows = seed_rows
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in fact_rows:
         fact = row_to_fact(row)
-        grouped[(fact["entity_key"], str(fact.get("section_hint") or ""))].append(fact)
+        grouped[fact_identity_group_key(fact)].append(fact)
 
     auto_superseded = 0
     auto_merged = 0
     resolver_judgment_count = 0
     created_question_ids: list[str] = []
     conflict_group_ids: list[str] = []
-    for (entity_key, _section), facts in grouped.items():
+    for identity_key, facts in grouped.items():
+        entity_key = str(facts[0].get("entity_key") or identity_key)
         replacement_facts = [
             fact
             for fact in facts
@@ -3340,6 +3390,7 @@ def row_to_fact(row: Any) -> dict[str, Any]:
         "id": row["id"],
         "statement": row["statement"],
         "entity_key": row["entity_key"],
+        "entity_id": row_get(row, "entity_id"),
         "page_hint": row["page_hint"],
         "section_hint": row["section_hint"],
         "source_ids": loads(row["source_ids"], []),

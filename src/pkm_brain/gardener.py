@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import re
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
@@ -9,7 +11,14 @@ from typing import Any
 from .contracts import active_page_contracts, validate_fact_against_contract
 from .cos_actions import propose_action
 from .db import connection, loads
-from .llm import LLMProvider, complete_json, cos_role_provider_configured
+from .entities import normalize_entity_name, normalize_entity_type
+from .llm import (
+    LLMConfigurationError,
+    LLMProvider,
+    complete_json,
+    cos_role_provider_configured,
+    get_cos_role_provider,
+)
 from .paths import BrainPaths
 from .wiki_facts import managed_fact_page_summaries
 
@@ -18,10 +27,14 @@ MERGE_PATH_SIMILARITY_FLOOR = 0.86
 MERGE_EVIDENCE_OVERLAP_FLOOR = 0.25
 MERGE_EVIDENCE_ONLY_PATH_FLOOR = 0.60
 MERGE_STRONG_EVIDENCE_OVERLAP_FLOOR = 0.45
+ENTITY_NAME_SIMILARITY_FLOOR = 0.88
 PAGE_SPLIT_FACT_FLOOR = 5
 PAGE_SPLIT_SECTION_FLOOR = 3
 REHOME_DESTINATION_SCORE_FLOOR = 0.35
 SUPPRESSED_GARDENER_STATUSES = ("failed", "reverted", "rejected", "dismissed")
+DEFAULT_GARDENER_JUDGMENT_CANDIDATE_LIMIT = 100
+DEFAULT_GARDENER_JUDGMENT_WORKERS = 4
+DEFAULT_GARDENER_JUDGMENT_TIMEOUT_SECONDS = 120
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_/-]{2,}")
 STOP_TOKENS = {
     "about",
@@ -81,16 +94,34 @@ def generate_gardener_candidates(
     suppressed_keys = recent_suppressed_candidate_keys(paths)
     candidates = deterministic_topology_candidates(
         pages, contracts, suppressed_candidate_keys=suppressed_keys
-    )[:max_candidates]
+    )
+    candidates.extend(
+        deterministic_entity_candidates(paths, suppressed_candidate_keys=suppressed_keys)
+    )
+    candidates.sort(key=candidate_sort_key)
+    deterministic_candidate_count = len(candidates)
+    judgment_limit = max(max_candidates, gardener_judgment_candidate_limit())
+    judgment_candidates = candidates[:judgment_limit]
     llm_result = apply_gardener_judgment(
-        candidates,
+        judgment_candidates,
         pages,
         contracts,
         paths=paths,
         llm_provider=llm_provider,
         provider=provider,
     )
-    candidates = llm_result["candidates"][:max_candidates]
+    judged_candidates = llm_result["candidates"]
+    candidates = judged_candidates[:max_candidates]
+    truncated_kept_candidates = judged_candidates[max_candidates:]
+    llm_summary = dict(llm_result["summary"])
+    llm_summary["truncated_kept_candidate_count"] = len(truncated_kept_candidates)
+    llm_summary["truncated_kept_candidates"] = [
+        gardener_candidate_audit_card(
+            candidate,
+            judgment=candidate.get("llm_judgment") if isinstance(candidate.get("llm_judgment"), dict) else None,
+        )
+        for candidate in truncated_kept_candidates
+    ]
     actions: list[dict[str, Any]] = []
     if not shadow:
         for candidate in candidates:
@@ -99,8 +130,10 @@ def generate_gardener_candidates(
         "status": "ok",
         "shadow": shadow,
         "candidate_count": len(candidates),
+        "deterministic_candidate_count": deterministic_candidate_count,
+        "judgment_candidate_count": len(judgment_candidates),
         "suppressed_candidate_count": len(suppressed_keys),
-        "llm_judgment": llm_result["summary"],
+        "llm_judgment": llm_summary,
         "candidates": candidates,
         "actions": actions,
     }
@@ -152,11 +185,307 @@ def deterministic_topology_candidates(
     return candidates
 
 
+def deterministic_entity_candidates(
+    paths: BrainPaths,
+    *,
+    suppressed_candidate_keys: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    suppressed_candidate_keys = suppressed_candidate_keys or set()
+    entities = load_entity_gardener_evidence(paths)
+    candidates: list[dict[str, Any]] = []
+    for index, left in enumerate(entities):
+        for right in entities[index + 1 :]:
+            append_candidate(
+                candidates,
+                entity_merge_candidate(left, right),
+                suppressed_candidate_keys,
+            )
+    candidates.sort(key=candidate_sort_key)
+    return candidates
+
+
+def load_entity_gardener_evidence(paths: BrainPaths) -> list[dict[str, Any]]:
+    with connection(paths.sqlite_path) as conn:
+        entity_rows = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT *
+                FROM entities
+                WHERE COALESCE(status, 'active') = 'active'
+                ORDER BY created_at, id
+                """
+            )
+        ]
+        if not entity_rows:
+            return []
+        entity_ids = [str(row["id"]) for row in entity_rows]
+        placeholders = ",".join("?" for _ in entity_ids)
+        links = list(
+            conn.execute(
+                f"""
+                SELECT fe.entity_id, fe.fact_id, fe.is_primary, fe.mention_text,
+                       f.statement, f.page_hint, f.source_ids, f.status
+                FROM fact_entities fe
+                LEFT JOIN facts f ON f.id = fe.fact_id
+                WHERE fe.entity_id IN ({placeholders})
+                ORDER BY fe.entity_id, fe.is_primary DESC, fe.fact_id
+                """,
+                entity_ids,
+            )
+        )
+    evidence: dict[str, dict[str, Any]] = {
+        str(row["id"]): {
+            **row,
+            "aliases_list": [
+                str(alias)
+                for alias in loads(row.get("aliases"), [])
+                if str(alias or "").strip()
+            ],
+            "source_ids_list": [
+                str(source_id)
+                for source_id in loads(row.get("source_ids"), [])
+                if str(source_id or "").strip()
+            ],
+            "fact_ids": set(),
+            "active_fact_ids": set(),
+            "primary_fact_ids": set(),
+            "page_hints": set(),
+            "mention_texts": set(),
+            "fact_tokens": set(),
+            "source_ids": set(),
+        }
+        for row in entity_rows
+    }
+    for link in links:
+        entity_id = str(link["entity_id"])
+        bucket = evidence.get(entity_id)
+        if bucket is None:
+            continue
+        fact_id = str(link["fact_id"] or "")
+        if fact_id:
+            bucket["fact_ids"].add(fact_id)
+        if link["is_primary"] and fact_id:
+            bucket["primary_fact_ids"].add(fact_id)
+        mention_text = str(link["mention_text"] or "").strip()
+        if mention_text:
+            bucket["mention_texts"].add(mention_text)
+        source_ids = loads(link["source_ids"], []) if link["source_ids"] else []
+        if not isinstance(source_ids, list):
+            source_ids = []
+        bucket["source_ids"].update(str(source_id) for source_id in source_ids if source_id)
+        if link["status"] == "active":
+            if fact_id:
+                bucket["active_fact_ids"].add(fact_id)
+            if link["page_hint"]:
+                bucket["page_hints"].add(str(link["page_hint"]))
+            bucket["fact_tokens"].update(
+                tokenize_signal(
+                    link["statement"],
+                    link["page_hint"],
+                    source_ids,
+                    mention_text,
+                )
+            )
+    for item in evidence.values():
+        item["source_ids"].update(item["source_ids_list"])
+    output: list[dict[str, Any]] = []
+    for item in evidence.values():
+        names = [str(item["name"]), *item["aliases_list"], *sorted(item["mention_texts"])]
+        item["name_keys"] = sorted({normalize_entity_name(name) for name in names if name})
+        item["compact_keys"] = sorted({compact_entity_key(name) for name in names if name})
+        item["fact_ids"] = sorted(item["fact_ids"])
+        item["active_fact_ids"] = sorted(item["active_fact_ids"])
+        item["primary_fact_ids"] = sorted(item["primary_fact_ids"])
+        item["page_hints"] = sorted(item["page_hints"])
+        item["source_ids"] = sorted(item["source_ids"])
+        item["mention_texts"] = sorted(item["mention_texts"])
+        item["fact_tokens"] = sorted(item["fact_tokens"])
+        item["entity_type"] = normalize_entity_type(item.get("entity_type"))
+        output.append(item)
+    return output
+
+
+def entity_merge_candidate(
+    left: dict[str, Any],
+    right: dict[str, Any],
+) -> dict[str, Any] | None:
+    left_type = normalize_entity_type(left.get("entity_type"))
+    right_type = normalize_entity_type(right.get("entity_type"))
+    if left_type and right_type and left_type != right_type:
+        return None
+    if not (left.get("fact_ids") or right.get("fact_ids")):
+        return None
+
+    signal = entity_merge_signal(left, right)
+    if signal is None:
+        return None
+    canonical, merged = choose_canonical_entity(left, right)
+    merged_fact_ids = [str(fact_id) for fact_id in merged.get("fact_ids") or [] if fact_id]
+    all_fact_ids = stable_unique(
+        [
+            *[str(fact_id) for fact_id in canonical.get("fact_ids") or [] if fact_id],
+            *merged_fact_ids,
+        ]
+    )
+    page_hints = stable_unique(
+        [
+            *[str(path) for path in canonical.get("page_hints") or [] if path],
+            *[str(path) for path in merged.get("page_hints") or [] if path],
+        ]
+    )
+    affected_fact_count = len(all_fact_ids)
+    large_topology = affected_fact_count >= 8
+    risk_tier = "high" if large_topology else signal["risk_tier"]
+    entity_ids = [str(canonical["id"]), str(merged["id"])]
+    return {
+        "action_type": "entity_merge",
+        "entity_ids": entity_ids,
+        "canonical_entity_id": str(canonical["id"]),
+        "merged_entity_ids": [str(merged["id"])],
+        "entity_names": {
+            str(canonical["id"]): str(canonical["name"]),
+            str(merged["id"]): str(merged["name"]),
+        },
+        "entity_types": {
+            str(canonical["id"]): normalize_entity_type(canonical.get("entity_type")),
+            str(merged["id"]): normalize_entity_type(merged.get("entity_type")),
+        },
+        "fact_ids": all_fact_ids,
+        "page_hints": page_hints,
+        "candidate_key": entity_candidate_key("entity_merge", entity_ids),
+        "score": signal["score"],
+        "similarity": signal["similarity"],
+        "reason": signal["reason"],
+        "merge_signal": signal["merge_signal"],
+        "affected_fact_count": affected_fact_count,
+        "merged_entity_count": 2,
+        "large_topology": large_topology,
+        "cross_entity_merge": False,
+        "cross_type_merge": False,
+        "type_mismatch": False,
+        "risk_tier": risk_tier,
+    }
+
+
+def entity_merge_signal(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any] | None:
+    left_name_keys = set(left.get("name_keys") or [])
+    right_name_keys = set(right.get("name_keys") or [])
+    left_compact = set(left.get("compact_keys") or [])
+    right_compact = set(right.get("compact_keys") or [])
+    similarity = max_entity_name_similarity(left_name_keys, right_name_keys)
+    shared_sources = set(left.get("source_ids") or []) & set(right.get("source_ids") or [])
+    fact_overlap = token_containment(
+        set(left.get("fact_tokens") or []),
+        set(right.get("fact_tokens") or []),
+    )
+    if left_name_keys & right_name_keys:
+        return {
+            "score": 0.98,
+            "similarity": round(max(similarity, 0.98), 4),
+            "merge_signal": "same_normalized_name_or_alias",
+            "reason": "entities share a normalized name or alias",
+            "risk_tier": "low",
+        }
+    compact_overlap = {key for key in left_compact & right_compact if key}
+    if compact_overlap:
+        return {
+            "score": 0.94,
+            "similarity": round(max(similarity, 0.94), 4),
+            "merge_signal": "same_compact_name_or_alias",
+            "reason": "entity names differ only by spacing or punctuation",
+            "risk_tier": "low",
+        }
+    if entity_name_containment(left_name_keys, right_name_keys):
+        score = round(min(0.9, max(0.72, similarity, 0.62 + (0.2 * fact_overlap))), 4)
+        return {
+            "score": score,
+            "similarity": round(similarity, 4),
+            "merge_signal": "name_containment",
+            "reason": "one entity name contains the other",
+            "risk_tier": "medium",
+        }
+    if similarity >= ENTITY_NAME_SIMILARITY_FLOOR and (shared_sources or fact_overlap >= 0.2):
+        score = round(min(0.9, max(similarity, 0.65 + (0.25 * fact_overlap))), 4)
+        return {
+            "score": score,
+            "similarity": round(similarity, 4),
+            "merge_signal": "near_name_with_evidence_overlap",
+            "reason": "similar entity names share source or fact-token evidence",
+            "risk_tier": "medium",
+        }
+    return None
+
+
+def choose_canonical_entity(
+    left: dict[str, Any],
+    right: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    ordered = sorted(
+        [left, right],
+        key=lambda row: (
+            -len(row.get("primary_fact_ids") or []),
+            -len(row.get("fact_ids") or []),
+            len(str(row.get("name") or "")),
+            str(row.get("name") or "").casefold(),
+            str(row.get("id") or ""),
+        ),
+    )
+    return ordered[0], ordered[1]
+
+
+def max_entity_name_similarity(left_keys: set[str], right_keys: set[str]) -> float:
+    best = 0.0
+    for left in left_keys:
+        for right in right_keys:
+            if not left or not right:
+                continue
+            best = max(best, SequenceMatcher(None, left, right).ratio())
+    return best
+
+
+def entity_name_containment(left_keys: set[str], right_keys: set[str]) -> bool:
+    for left in left_keys:
+        left_tokens = set(left.split())
+        if not left_tokens:
+            continue
+        for right in right_keys:
+            right_tokens = set(right.split())
+            if not right_tokens or left_tokens == right_tokens:
+                continue
+            if left_tokens < right_tokens or right_tokens < left_tokens:
+                return True
+    return False
+
+
+def compact_entity_key(value: Any) -> str:
+    return re.sub(r"[^0-9a-z]+", "", normalize_entity_name(value))
+
+
 def propose_gardener_action(paths: BrainPaths, candidate: dict[str, Any]) -> dict[str, Any]:
     action_type = str(candidate["action_type"])
     contract = candidate.get("contract") if isinstance(candidate.get("contract"), dict) else None
-    target_fact_ids = [str(candidate["fact_id"])] if candidate.get("fact_id") else []
+    target_fact_ids = (
+        [str(fact_id) for fact_id in candidate.get("fact_ids") or [] if fact_id]
+        or ([str(candidate["fact_id"])] if candidate.get("fact_id") else [])
+    )
     target_contract_ids = [str(contract["id"])] if contract and contract.get("id") else []
+    action_features = {
+        "candidate_key": candidate.get("candidate_key"),
+        "candidate_signal": candidate.get("reason"),
+        "score": candidate.get("score"),
+        "similarity": candidate.get("similarity"),
+        "affected_fact_count": int(candidate.get("affected_fact_count") or len(target_fact_ids)),
+        "affected_page_count": len(candidate.get("page_hints") or []),
+        "merged_entity_count": candidate.get("merged_entity_count"),
+        "large_topology": candidate.get("large_topology"),
+        "cross_entity_merge": candidate.get("cross_entity_merge"),
+        "cross_type_merge": candidate.get("cross_type_merge"),
+        "type_mismatch": candidate.get("type_mismatch"),
+        "reversible": True,
+    }
+    if action_type != "entity_merge":
+        action_features["eval_gate"] = {"suite": "topology", "passed": False}
     return propose_action(
         paths,
         action_type,
@@ -166,15 +495,7 @@ def propose_gardener_action(paths: BrainPaths, candidate: dict[str, Any]) -> dic
         }
         if candidate.get("llm_judgment")
         else None,
-        action_features={
-            "candidate_key": candidate.get("candidate_key"),
-            "candidate_signal": candidate.get("reason"),
-            "score": candidate.get("score"),
-            "similarity": candidate.get("similarity"),
-            "affected_page_count": len(candidate.get("page_hints") or []),
-            "reversible": True,
-            "eval_gate": {"suite": "topology", "passed": False},
-        },
+        action_features=action_features,
         target_fact_ids=target_fact_ids,
         target_page_paths=[str(path) for path in candidate.get("page_hints") or []],
         target_contract_ids=target_contract_ids,
@@ -214,29 +535,50 @@ def apply_gardener_judgment(
                 "reason": None if not candidates else "No CoS LLM provider configured for gardener role",
             },
         }
-    parsed = complete_json(
-        gardener_judgment_prompt(candidates, pages, contracts),
-        schema=GARDENER_JUDGMENT_SCHEMA,
-        provider=provider,
-        role="gardener",
-        llm_provider=llm_provider,
+
+    timeout_seconds = gardener_judgment_timeout_seconds()
+    worker_count = gardener_judgment_worker_count(len(candidates), shared_provider=llm_provider is not None)
+    prepared_jobs = prepare_gardener_judgment_jobs(
+        candidates,
         paths=paths,
+        llm_provider=llm_provider,
+        provider=provider,
+        timeout_seconds=timeout_seconds,
+        worker_count=worker_count,
     )
-    judgments = {
-        str(item.get("candidate_key") or ""): item
-        for item in parsed.get("judgments") or []
-        if isinstance(item, dict) and item.get("candidate_key")
-    }
+    results = run_gardener_judgment_jobs(
+        prepared_jobs,
+        pages,
+        contracts,
+        worker_count=worker_count,
+    )
     kept: list[dict[str, Any]] = []
     dropped = 0
-    for candidate in candidates:
-        key = str(candidate.get("candidate_key") or "")
-        judgment = normalize_gardener_judgment(judgments.get(key))
+    dropped_candidates: list[dict[str, Any]] = []
+    judgment_count = 0
+    needs_review_count = 0
+    error_count = 0
+    timeout_count = 0
+    effort_counts: Counter[str] = Counter()
+    for result in results:
+        candidate = result["candidate"]
+        effort_counts[str(result.get("reasoning_effort") or "unknown")] += 1
+        if result.get("error") is not None:
+            error = result["error"]
+            error_count += 1
+            if "timed out" in str(error).lower() or "timeout" in type(error).__name__.lower():
+                timeout_count += 1
+            kept.append(gardener_candidate_needs_review(candidate, error))
+            needs_review_count += 1
+            continue
+        judgment = normalize_gardener_judgment(result.get("judgment"))
         if judgment is None:
             kept.append(candidate)
             continue
+        judgment_count += 1
         if judgment["decision"] == "drop":
             dropped += 1
+            dropped_candidates.append(gardener_candidate_audit_card(candidate, judgment=judgment))
             continue
         row = dict(candidate)
         row["llm_judgment"] = judgment
@@ -253,10 +595,303 @@ def apply_gardener_judgment(
         "candidates": kept,
         "summary": {
             "enabled": True,
-            "judgment_count": len(judgments),
+            "mode": "per_candidate",
+            "candidate_input_count": len(candidates),
+            "judgment_count": judgment_count,
             "dropped_candidate_count": dropped,
+            "dropped": dropped_candidates,
+            "needs_review_count": needs_review_count,
+            "error_count": error_count,
+            "timeout_count": timeout_count,
+            "worker_count": worker_count,
+            "timeout_seconds": timeout_seconds,
+            "effort_counts": dict(sorted(effort_counts.items())),
         },
     }
+
+
+def prepare_gardener_judgment_jobs(
+    candidates: list[dict[str, Any]],
+    *,
+    paths: BrainPaths | None,
+    llm_provider: LLMProvider | None,
+    provider: str | None,
+    timeout_seconds: int,
+    worker_count: int,
+) -> list[dict[str, Any]]:
+    grouped: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    for index, candidate in enumerate(candidates):
+        effort = gardener_candidate_reasoning_effort(candidate)
+        grouped.setdefault(effort, []).append((index, candidate))
+    jobs: list[dict[str, Any]] = []
+    for effort in sorted(grouped, key=gardener_reasoning_effort_sort_key):
+        items = grouped[effort]
+        buckets: list[list[tuple[int, dict[str, Any]]]] = [
+            [] for _ in range(max(1, min(worker_count, len(items))))
+        ]
+        for offset, item in enumerate(items):
+            buckets[offset % len(buckets)].append(item)
+        for bucket in buckets:
+            try:
+                active_provider = gardener_candidate_provider(
+                    paths=paths,
+                    llm_provider=llm_provider,
+                    provider=provider,
+                    timeout_seconds=timeout_seconds,
+                    reasoning_effort=effort,
+                )
+                jobs.append(
+                    {
+                        "items": bucket,
+                        "provider": active_provider,
+                        "error": None,
+                        "reasoning_effort": effort,
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001 - per-candidate failure must not abort the run.
+                jobs.append(
+                    {
+                        "items": bucket,
+                        "provider": None,
+                        "error": exc,
+                        "reasoning_effort": effort,
+                    }
+                )
+    return jobs
+
+
+def gardener_candidate_provider(
+    *,
+    paths: BrainPaths | None,
+    llm_provider: LLMProvider | None,
+    provider: str | None,
+    timeout_seconds: int,
+    reasoning_effort: str,
+) -> LLMProvider:
+    if llm_provider is not None:
+        return llm_provider
+    active_paths = paths or BrainPaths.from_value(None)
+    active_provider = get_cos_role_provider(active_paths, "gardener", provider=provider)
+    if active_provider is None:
+        raise LLMConfigurationError("No CoS LLM provider configured for role: gardener")
+    if hasattr(active_provider, "timeout"):
+        setattr(active_provider, "timeout", timeout_seconds)
+    if hasattr(active_provider, "reasoning_effort"):
+        setattr(active_provider, "reasoning_effort", reasoning_effort)
+    return active_provider
+
+
+def run_gardener_judgment_jobs(
+    jobs: list[dict[str, Any]],
+    pages: list[dict[str, Any]],
+    contracts: dict[str, dict[str, Any]],
+    *,
+    worker_count: int,
+) -> list[dict[str, Any]]:
+    indexed_results: list[tuple[int, dict[str, Any]]] = []
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = {
+            executor.submit(
+                run_gardener_judgment_job,
+                job,
+                pages,
+                contracts,
+            ): index
+            for index, job in enumerate(jobs)
+        }
+        for future in as_completed(futures):
+            job = jobs[futures[future]]
+            try:
+                indexed_results.extend(future.result())
+            except Exception as exc:  # noqa: BLE001 - one worker failure should become review residue.
+                for index, candidate in job["items"]:
+                    indexed_results.append(
+                        (
+                            index,
+                            {
+                                "candidate": candidate,
+                                "judgment": None,
+                                "error": exc,
+                                "reasoning_effort": job.get("reasoning_effort"),
+                            },
+                        )
+                    )
+    return [result for _, result in sorted(indexed_results, key=lambda item: item[0])]
+
+
+def run_gardener_judgment_job(
+    job: dict[str, Any],
+    pages: list[dict[str, Any]],
+    contracts: dict[str, dict[str, Any]],
+) -> list[tuple[int, dict[str, Any]]]:
+    return [
+        (
+            index,
+            judge_gardener_candidate(
+                candidate,
+                pages,
+                contracts,
+                job.get("provider"),
+                job.get("error"),
+                str(job.get("reasoning_effort") or "unknown"),
+            ),
+        )
+        for index, candidate in job["items"]
+    ]
+
+
+def judge_gardener_candidate(
+    candidate: dict[str, Any],
+    pages: list[dict[str, Any]],
+    contracts: dict[str, dict[str, Any]],
+    provider: LLMProvider | None,
+    provider_error: Exception | None,
+    reasoning_effort: str,
+) -> dict[str, Any]:
+    if provider_error is not None:
+        return {
+            "candidate": candidate,
+            "judgment": None,
+            "error": provider_error,
+            "reasoning_effort": reasoning_effort,
+        }
+    try:
+        parsed = complete_json(
+            gardener_judgment_prompt([candidate], pages, contracts, fact_statement_limit=3),
+            schema=GARDENER_JUDGMENT_SCHEMA,
+            llm_provider=provider,
+            max_attempts=1,
+        )
+    except Exception as exc:  # noqa: BLE001 - one bad candidate should become review residue.
+        return {
+            "candidate": candidate,
+            "judgment": None,
+            "error": exc,
+            "reasoning_effort": reasoning_effort,
+        }
+    key = str(candidate.get("candidate_key") or "")
+    judgments = {
+        str(item.get("candidate_key") or ""): item
+        for item in parsed.get("judgments") or []
+        if isinstance(item, dict) and item.get("candidate_key")
+    }
+    return {
+        "candidate": candidate,
+        "judgment": judgments.get(key),
+        "error": None,
+        "reasoning_effort": reasoning_effort,
+    }
+
+
+def gardener_candidate_reasoning_effort(candidate: dict[str, Any]) -> str:
+    if bool(candidate.get("large_topology")) or bool(candidate.get("cross_entity_merge")):
+        return "xhigh"
+    if bool(candidate.get("cross_type_merge")) or bool(candidate.get("type_mismatch")):
+        return "xhigh"
+    merge_signal = str(candidate.get("merge_signal") or "")
+    if merge_signal in {"name_containment", "near_name_with_evidence_overlap"}:
+        return "xhigh"
+    if str(candidate.get("risk_tier") or "").lower() == "high":
+        return "xhigh"
+    if str(candidate.get("risk_tier") or "").lower() == "medium":
+        return "medium"
+    return "low"
+
+
+def gardener_reasoning_effort_sort_key(effort: str) -> int:
+    order = {"minimal": 0, "low": 1, "medium": 2, "high": 3, "xhigh": 4}
+    return order.get(effort, 99)
+
+
+def gardener_candidate_needs_review(candidate: dict[str, Any], error: Exception) -> dict[str, Any]:
+    row = dict(candidate)
+    row["risk_tier"] = "high"
+    row["needs_review"] = True
+    row["gardener_review_status"] = "llm_judgment_failed"
+    row["llm_judgment"] = {
+        "candidate_key": str(candidate.get("candidate_key") or ""),
+        "decision": "keep",
+        "rationale": (
+            "Gardener LLM judgment failed for this candidate; preserve it for human review "
+            f"instead of aborting the run. Error: {summarize_gardener_error(error)}"
+        ),
+        "risk_tier": "high",
+        "needs_review": True,
+        "error_type": type(error).__name__,
+    }
+    return row
+
+
+def gardener_candidate_audit_card(
+    candidate: dict[str, Any],
+    *,
+    judgment: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    card: dict[str, Any] = {
+        "candidate_key": candidate.get("candidate_key"),
+        "action_type": candidate.get("action_type"),
+        "risk_tier": candidate.get("risk_tier"),
+        "score": candidate.get("score"),
+        "similarity": candidate.get("similarity"),
+        "page_hints": candidate.get("page_hints"),
+        "source_page_hint": candidate.get("source_page_hint"),
+        "destination_page_hint": candidate.get("destination_page_hint"),
+        "fact_id": candidate.get("fact_id"),
+        "entity_ids": candidate.get("entity_ids"),
+        "canonical_entity_id": candidate.get("canonical_entity_id"),
+        "merged_entity_ids": candidate.get("merged_entity_ids"),
+        "entity_names": candidate.get("entity_names"),
+        "entity_types": candidate.get("entity_types"),
+        "merge_signal": candidate.get("merge_signal"),
+        "reason": candidate.get("reason"),
+    }
+    if judgment is not None:
+        card["llm_judgment"] = judgment
+    return {
+        key: value
+        for key, value in card.items()
+        if value not in (None, "", [], {})
+    }
+
+
+def summarize_gardener_error(error: Exception) -> str:
+    detail = str(error).strip() or type(error).__name__
+    return detail[:300]
+
+
+def gardener_judgment_candidate_limit() -> int:
+    return configured_positive_int(
+        "PKM_BRAIN_GARDENER_JUDGMENT_CANDIDATES",
+        DEFAULT_GARDENER_JUDGMENT_CANDIDATE_LIMIT,
+    )
+
+
+def gardener_judgment_worker_count(candidate_count: int, *, shared_provider: bool) -> int:
+    if candidate_count <= 1 or shared_provider:
+        return 1
+    configured = configured_positive_int(
+        "PKM_BRAIN_GARDENER_JUDGMENT_WORKERS",
+        DEFAULT_GARDENER_JUDGMENT_WORKERS,
+    )
+    return max(1, min(candidate_count, configured))
+
+
+def gardener_judgment_timeout_seconds() -> int:
+    return configured_positive_int(
+        "PKM_BRAIN_GARDENER_JUDGMENT_TIMEOUT_SECONDS",
+        DEFAULT_GARDENER_JUDGMENT_TIMEOUT_SECONDS,
+    )
+
+
+def configured_positive_int(name: str, default: int) -> int:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
 
 
 def normalize_gardener_judgment(judgment: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -285,6 +920,8 @@ def gardener_judgment_prompt(
     candidates: list[dict[str, Any]],
     pages: list[dict[str, Any]],
     contracts: dict[str, dict[str, Any]],
+    *,
+    fact_statement_limit: int = 5,
 ) -> str:
     candidate_cards = [
         {
@@ -298,6 +935,11 @@ def gardener_judgment_prompt(
             "contract_check": candidate.get("contract_check"),
             "contract_validation": candidate.get("contract_validation"),
             "contract_violations": candidate.get("contract_violations"),
+            "entity_ids": candidate.get("entity_ids"),
+            "canonical_entity_id": candidate.get("canonical_entity_id"),
+            "merged_entity_ids": candidate.get("merged_entity_ids"),
+            "entity_names": candidate.get("entity_names"),
+            "entity_types": candidate.get("entity_types"),
         }
         for candidate in candidates
     ]
@@ -308,7 +950,7 @@ def gardener_judgment_prompt(
             "active_fact_count": page.get("active_fact_count"),
             "entity_keys": page.get("entity_keys"),
             "section_counts": page.get("section_counts"),
-            "fact_statements": list(page.get("fact_statements") or [])[:5],
+            "fact_statements": list(page.get("fact_statements") or [])[:fact_statement_limit],
         }
         for page in pages
         if page.get("relative_path") in {
@@ -316,6 +958,21 @@ def gardener_judgment_prompt(
             for candidate in candidates
             for page_hint in candidate.get("page_hints") or []
         }
+    ]
+    entity_cards = [
+        {
+            "candidate_key": candidate.get("candidate_key"),
+            "canonical_entity_id": candidate.get("canonical_entity_id"),
+            "merged_entity_ids": candidate.get("merged_entity_ids"),
+            "entity_names": candidate.get("entity_names"),
+            "entity_types": candidate.get("entity_types"),
+            "fact_ids": candidate.get("fact_ids"),
+            "page_hints": candidate.get("page_hints"),
+            "reason": candidate.get("reason"),
+            "score": candidate.get("score"),
+        }
+        for candidate in candidates
+        if candidate.get("action_type") == "entity_merge"
     ]
     contract_cards = [
         {
@@ -334,10 +991,11 @@ def gardener_judgment_prompt(
     ]
     return (
         "Review deterministic PKM Brain gardener candidates. "
-        "You may only keep or drop existing candidate_key values; do not invent new candidates, page_hints, or fact_ids. "
+        "Candidates may be page topology changes or entity merges. "
+        "You may only keep or drop existing candidate_key values; do not invent new candidates, page_hints, fact_ids, or entity_ids. "
         "Drop candidates that violate contracts, merge unrelated scopes, or lack enough evidence. "
         "Return JSON judgments with candidate_key, decision keep/drop, rationale, optional score_adjustment, optional risk_tier.\n\n"
-        f"Candidates:\n{candidate_cards}\n\nPages:\n{page_cards}\n\nContracts:\n{contract_cards}"
+        f"Candidates:\n{candidate_cards}\n\nPages:\n{page_cards}\n\nEntities:\n{entity_cards}\n\nContracts:\n{contract_cards}"
     )
 
 
@@ -673,6 +1331,13 @@ def proposed_contract_revision_for_page(
 
 def gardener_action_payload(candidate: dict[str, Any]) -> dict[str, Any]:
     action_type = str(candidate.get("action_type") or "")
+    if action_type == "entity_merge":
+        return {
+            "canonical_entity_id": candidate.get("canonical_entity_id"),
+            "merged_entity_ids": candidate.get("merged_entity_ids") or [],
+            "reason": candidate.get("reason"),
+            "candidate_key": candidate.get("candidate_key"),
+        }
     if action_type == "rehome_fact":
         return {
             "fact_id": candidate.get("fact_id"),
@@ -697,6 +1362,7 @@ def append_candidate(
 
 def candidate_sort_key(candidate: dict[str, Any]) -> tuple[float, int, str]:
     action_priority = {
+        "entity_merge": 0,
         "page_merge": 0,
         "rehome_fact": 1,
         "page_split": 2,
@@ -705,7 +1371,8 @@ def candidate_sort_key(candidate: dict[str, Any]) -> tuple[float, int, str]:
     return (
         -float(candidate.get("score") or candidate.get("similarity") or 0.0),
         action_priority.get(str(candidate.get("action_type") or ""), 99),
-        ",".join(str(path) for path in candidate.get("page_hints") or []),
+        ",".join(str(path) for path in candidate.get("page_hints") or [])
+        or ",".join(str(entity_id) for entity_id in candidate.get("entity_ids") or []),
     )
 
 
@@ -715,6 +1382,11 @@ def candidate_key(
     pages = ",".join(sorted(str(path) for path in page_hints if path))
     facts = ",".join(sorted(str(fact_id) for fact_id in fact_ids or [] if fact_id))
     return f"{action_type}:{pages}:{facts}"
+
+
+def entity_candidate_key(action_type: str, entity_ids: list[str]) -> str:
+    entities = ",".join(sorted(str(entity_id) for entity_id in entity_ids if entity_id))
+    return f"{action_type}:entities:{entities}"
 
 
 def first_page_fact(page: dict[str, Any]) -> dict[str, Any] | None:
@@ -794,7 +1466,7 @@ def recent_suppressed_candidate_keys(paths: BrainPaths) -> set[str]:
             f"""
             SELECT action_features, evidence_json
             FROM cos_actions
-            WHERE proposed_by = 'gardener'
+            WHERE proposed_by IN ('gardener', 'gardener_llm')
               AND status IN ({placeholders})
             ORDER BY created_at DESC
             LIMIT 200
@@ -834,6 +1506,17 @@ def token_containment(left: set[str], right: set[str]) -> float:
     if not left or not right:
         return 0.0
     return len(left & right) / min(len(left), len(right))
+
+
+def stable_unique(values: list[str]) -> list[str]:
+    output: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not value or value in seen:
+            continue
+        output.append(value)
+        seen.add(value)
+    return output
 
 
 def stable_page_slug(page_hint: str) -> str:
