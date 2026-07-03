@@ -75,6 +75,10 @@ class BrainPaths:
         return self.indexes / "lancedb"
 
     @property
+    def embedding_provider_stamp_path(self) -> Path:
+        return self.lancedb_path / "embedding_provider.json"
+
+    @property
     def config_file(self) -> Path:
         return self.config_local / "config.yaml"
 

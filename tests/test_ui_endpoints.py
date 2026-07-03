@@ -140,7 +140,7 @@ def test_status_endpoint_returns_service_layer_json(tmp_path: Path) -> None:
 
 def test_legacy_wiki_proposal_endpoints_are_retired(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
-    BrainService(paths, prefer_model_embeddings=False).init_workspace()
+    BrainService(paths).init_workspace()
 
     with running_ui(paths) as (host, port, token):
         checks = [
@@ -157,7 +157,7 @@ def test_legacy_wiki_proposal_endpoints_are_retired(tmp_path: Path) -> None:
 
 def test_memory_endpoint_lists_status_filtered_memories(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
-    svc = BrainService(paths, prefer_model_embeddings=False)
+    svc = BrainService(paths)
     memory_id = svc.propose_memory(
         "FactMemory", "global", "Use the local UI for review.", ["manual:test"], 0.9
     )
@@ -174,7 +174,7 @@ def test_memory_endpoint_lists_status_filtered_memories(tmp_path: Path) -> None:
 
 def test_memory_approve_endpoint_writes_same_export_as_cli_path(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
-    svc = BrainService(paths, prefer_model_embeddings=False)
+    svc = BrainService(paths)
     memory_id = svc.propose_memory(
         "FactMemory", "global", "Approve from the UI.", ["manual:test"], 0.95
     )
@@ -191,7 +191,7 @@ def test_memory_approve_endpoint_writes_same_export_as_cli_path(tmp_path: Path) 
 
 def test_memory_detail_joins_document_source_evidence(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
-    svc = BrainService(paths, prefer_model_embeddings=False)
+    svc = BrainService(paths)
     svc.init_workspace()
     insert_document(paths)
     memory_id = svc.propose_memory(
@@ -222,7 +222,7 @@ def test_wiki_pages_endpoint_requires_auth_and_returns_indexed_pages(
     tmp_path: Path,
 ) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
-    svc = BrainService(paths, prefer_model_embeddings=False)
+    svc = BrainService(paths)
     svc.init_workspace()
     insert_document(paths)
     write_concept_page(paths, generated=True)
@@ -250,7 +250,7 @@ def test_wiki_pages_endpoint_requires_auth_and_returns_indexed_pages(
 
 def test_wiki_page_endpoint_validates_path_and_joins_sources(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
-    svc = BrainService(paths, prefer_model_embeddings=False)
+    svc = BrainService(paths)
     svc.init_workspace()
     insert_document(paths)
     write_concept_page(paths, generated=True)
@@ -324,7 +324,7 @@ def test_wiki_fact_reconcile_dismisses_stale_duplicate_cloudzero_question(
     tmp_path: Path,
 ) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
-    svc = BrainService(paths, prefer_model_embeddings=False)
+    svc = BrainService(paths)
     svc.init_workspace()
     insert_document(paths)
     write_concept_page(paths, generated=True)
@@ -441,7 +441,7 @@ def test_wiki_fact_migration_backfills_existing_wiki(
     tmp_path: Path,
 ) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
-    svc = BrainService(paths, prefer_model_embeddings=False)
+    svc = BrainService(paths)
     svc.init_workspace()
     insert_document(paths)
     page = paths.wiki / "concepts" / "test-concept.md"
@@ -517,7 +517,7 @@ def test_chief_of_staff_page_review_correction_and_revert_endpoint(
     tmp_path: Path,
 ) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
-    svc = BrainService(paths, prefer_model_embeddings=False)
+    svc = BrainService(paths)
     svc.init_workspace()
     insert_document(paths)
     with connection(paths.sqlite_path) as conn:

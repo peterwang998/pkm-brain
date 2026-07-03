@@ -16,7 +16,7 @@ def check_statuses(report: dict[str, object]) -> dict[str, str]:
 
 def test_acceptance_report_blocks_without_sync_config(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
-    BrainService(paths, prefer_model_embeddings=False).init_workspace()
+    BrainService(paths).init_workspace()
 
     report = run_acceptance_report(paths, test_connection_now=False)
 

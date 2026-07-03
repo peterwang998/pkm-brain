@@ -12,7 +12,7 @@ from pkm_brain.wiki_facts import active_facts_by_page, active_page_synthesis
 
 
 def service_for(tmp_path: Path) -> BrainService:
-    return BrainService(BrainPaths.from_value(tmp_path / "brain"), prefer_model_embeddings=False)
+    return BrainService(BrainPaths.from_value(tmp_path / "brain"))
 
 
 def insert_fact(

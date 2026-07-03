@@ -5,7 +5,7 @@ import json
 import re
 import shutil
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -14,9 +14,17 @@ import yaml
 
 from .chunking import DEFAULT_OVERLAP_TOKENS, DEFAULT_TARGET_TOKENS, chunk_text, prepare_text_for_indexing, sanitize_agent_session_log
 from .db import connection, dumps, init_db, loads, rows
-from .embeddings import get_embedding_provider
+from .embeddings import (
+    EmbeddingProviderUnavailable,
+    HASH_PROVIDER,
+    load_embedding_config,
+    passage_embedding_text,
+    resolve_embedding_provider,
+)
 from .indexes import (
+    VectorIndexUnavailable,
     delete_vectors,
+    embedding_stamp_report,
     lancedb_stats,
     optimize_vectors,
     search_vectors,
@@ -39,9 +47,17 @@ class IngestResult:
     embeddings_created: int
     errors: list[str]
     documents_replaced: int = 0
+    vector_writes: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
+
+
+def chunk_row_id(row: Any) -> str:
+    keys = row.keys()
+    if "id" in keys:
+        return str(row["id"])
+    return str(row["chunk_id"])
 
 
 GENERIC_CONTEXT_TERMS = {
@@ -240,9 +256,10 @@ class RetrievalPolicy:
 
 
 class BrainService:
-    def __init__(self, paths: BrainPaths, prefer_model_embeddings: bool = False) -> None:
+    def __init__(self, paths: BrainPaths) -> None:
         self.paths = paths
-        self.embedding_provider = get_embedding_provider(prefer_model_embeddings)
+        self.embedding_config = load_embedding_config(paths)
+        self.embedding_provider = resolve_embedding_provider(self.embedding_config)
 
     def init_workspace(self) -> None:
         for directory in self.paths.directories():
@@ -250,26 +267,58 @@ class BrainService:
         init_db(self.paths.sqlite_path)
         if not self.paths.config_file.exists():
             self.paths.config_file.write_text(
-                "brain_home: ~/brain\nembedding_model: BAAI/bge-small-en-v1.5\n",
+                "embedding:\n"
+                "  provider: hash\n"
+                "  model: BAAI/bge-small-en-v1.5\n"
+                "  query_instruction: \"\"\n",
                 encoding="utf-8",
             )
         if not self.paths.golden_queries_file.exists():
             self.paths.golden_queries_file.write_text("[]\n", encoding="utf-8")
 
     def doctor(self) -> dict[str, Any]:
+        embedding_status = self.embedding_provider.status(check_available=True)
         return {
             "home": str(self.paths.home),
             "directories": {path.name: path.exists() for path in self.paths.directories()},
             "sqlite": self.paths.sqlite_path.exists(),
             "lancedb": self.paths.lancedb_path.exists(),
             "embedding_provider": self.embedding_provider.name,
+            "embedding": embedding_status,
         }
+
+    def download_embedding_model(self) -> dict[str, Any]:
+        provider = resolve_embedding_provider(self.embedding_config, cache_only=False)
+        if provider.provider != "sentence-transformer":
+            return {
+                "status": "skipped",
+                "reason": "configured embedding provider is not sentence-transformer",
+                "embedding": provider.status(check_available=False),
+            }
+        try:
+            provider.embed(["health check"])
+        except EmbeddingProviderUnavailable as exc:
+            embedding = provider.status(check_available=False)
+            embedding["available"] = False
+            embedding["reason"] = str(exc)
+            return {
+                "status": "failed",
+                "reason": str(exc),
+                "embedding": embedding,
+            }
+        return {"status": "ok", "embedding": provider.status(check_available=False)}
 
     def index_doctor(self) -> dict[str, Any]:
         self.init_workspace()
         with connection(self.paths.sqlite_path) as conn:
             sqlite_chunk_ids = {row["id"] for row in conn.execute("SELECT id FROM chunks")}
         stats = lancedb_stats(self.paths.lancedb_path)
+        stamp_report = embedding_stamp_report(
+            self.paths.lancedb_path,
+            self.embedding_provider,
+            table_exists=bool(stats["table_exists"]),
+        )
+        embedding_status = self.embedding_provider.status(check_available=True)
         try:
             lancedb_chunk_ids = vector_chunk_ids(self.paths.lancedb_path)
             vector_error = None
@@ -284,6 +333,12 @@ class BrainService:
         if vector_error:
             status = "rebuild_recommended"
             reasons.append(f"could not enumerate LanceDB vectors: {vector_error}")
+        if not embedding_status["available"]:
+            status = "rebuild_recommended"
+            reasons.append(f"embedding provider unavailable: {embedding_status['reason']}")
+        if stamp_report.get("reason"):
+            status = "rebuild_recommended"
+            reasons.append(str(stamp_report["reason"]))
         if sqlite_chunk_ids and not stats["table_exists"]:
             status = "rebuild_recommended"
             reasons.append("SQLite has chunks but LanceDB table is missing")
@@ -299,6 +354,8 @@ class BrainService:
             "reasons": reasons,
             "sqlite_chunks": len(sqlite_chunk_ids),
             "lancedb": stats,
+            "embedding": embedding_status,
+            "embedding_stamp": stamp_report,
             "missing_vector_count": len(missing_vectors),
             "stale_vector_count": len(stale_vectors),
             "missing_vector_sample": missing_vectors[:20],
@@ -309,33 +366,84 @@ class BrainService:
         self.init_workspace()
         return optimize_vectors(self.paths.lancedb_path, cleanup_older_than_days=cleanup_older_than_days)
 
-    def rebuild_vector_index(self, delete_backup: bool = False, batch_size: int = 128) -> dict[str, Any]:
+    def _vector_rows_for_chunks(self, chunk_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not chunk_rows:
+            return []
+        texts = [
+            str(row["text"])
+            if self.embedding_provider.provider == HASH_PROVIDER
+            else passage_embedding_text(str(row["text"]), str(row["heading_path"] if "heading_path" in row.keys() else ""))
+            for row in chunk_rows
+        ]
+        vectors = self.embedding_provider.embed(texts)
+        return [
+            {
+                "chunk_id": chunk_row_id(row),
+                "document_id": row["document_id"],
+                "text": row["text"],
+                "vector": vector,
+            }
+            for row, vector in zip(chunk_rows, vectors)
+        ]
+
+    def rebuild_vector_index(
+        self,
+        delete_backup: bool = False,
+        batch_size: int = 128,
+        missing_only: bool = False,
+    ) -> dict[str, Any]:
         self.init_workspace()
         before = lancedb_stats(self.paths.lancedb_path)
+        embedding_status = self.embedding_provider.status(check_available=True)
         with connection(self.paths.sqlite_path) as conn:
-            chunk_rows = rows(conn, "SELECT id, document_id, text FROM chunks ORDER BY document_id, chunk_index")
+            chunk_rows = rows(
+                conn,
+                "SELECT id, document_id, text, heading_path FROM chunks ORDER BY document_id, chunk_index",
+            )
+
+        if not embedding_status["available"]:
+            return {
+                "status": "skipped",
+                "reason": f"embedding provider unavailable: {embedding_status['reason']}",
+                "sqlite_chunks": len(chunk_rows),
+                "vectors_written": 0,
+                "before": before,
+                "after": lancedb_stats(self.paths.lancedb_path),
+                "embedding": embedding_status,
+            }
+
+        if missing_only:
+            try:
+                existing_ids = vector_chunk_ids(self.paths.lancedb_path)
+                target_rows = [row for row in chunk_rows if row["id"] not in existing_ids]
+            except Exception as exc:
+                return {
+                    "status": "failed",
+                    "error": str(exc),
+                    "sqlite_chunks": len(chunk_rows),
+                    "vectors_written": 0,
+                    "before": before,
+                    "after": lancedb_stats(self.paths.lancedb_path),
+                    "embedding": embedding_status,
+                }
+        else:
+            target_rows = chunk_rows
 
         backup_path = None
         failed_path = None
-        if self.paths.lancedb_path.exists():
+        if not missing_only and self.paths.lancedb_path.exists():
             backup_path = unique_backup_path(self.paths.indexes, "lancedb.backup")
             shutil.move(str(self.paths.lancedb_path), str(backup_path))
 
         try:
             embedded = 0
-            for offset in range(0, len(chunk_rows), batch_size):
-                batch = chunk_rows[offset : offset + batch_size]
-                vectors = self.embedding_provider.embed([row["text"] for row in batch])
-                vector_rows = [
-                    {
-                        "chunk_id": row["id"],
-                        "document_id": row["document_id"],
-                        "text": row["text"],
-                        "vector": vector,
-                    }
-                    for row, vector in zip(batch, vectors)
-                ]
-                embedded += upsert_vectors(self.paths.lancedb_path, vector_rows)
+            for offset in range(0, len(target_rows), batch_size):
+                batch = target_rows[offset : offset + batch_size]
+                embedded += upsert_vectors(
+                    self.paths.lancedb_path,
+                    self._vector_rows_for_chunks(batch),
+                    self.embedding_provider,
+                )
             after = lancedb_stats(self.paths.lancedb_path)
             if int(after["rows"]) != len(chunk_rows):
                 raise RuntimeError(f"rebuilt LanceDB row count {after['rows']} did not match SQLite chunks {len(chunk_rows)}")
@@ -350,14 +458,16 @@ class BrainService:
                 "vectors_written": embedded,
                 "before": before,
                 "after": after,
+                "embedding": embedding_status,
+                "missing_only": missing_only,
                 "backup_path": str(backup_path) if backup_path else None,
                 "backup_retained": backup_retained,
             }
         except Exception as exc:
-            if self.paths.lancedb_path.exists():
+            if not missing_only and self.paths.lancedb_path.exists():
                 failed_path = unique_backup_path(self.paths.indexes, "lancedb.failed")
                 shutil.move(str(self.paths.lancedb_path), str(failed_path))
-            if backup_path and backup_path.exists():
+            if not missing_only and backup_path and backup_path.exists():
                 shutil.move(str(backup_path), str(self.paths.lancedb_path))
             return {
                 "status": "failed",
@@ -365,6 +475,8 @@ class BrainService:
                 "sqlite_chunks": len(chunk_rows),
                 "before": before,
                 "after": lancedb_stats(self.paths.lancedb_path),
+                "embedding": embedding_status,
+                "missing_only": missing_only,
                 "backup_path": str(backup_path) if backup_path else None,
                 "failed_path": str(failed_path) if failed_path else None,
             }
@@ -473,7 +585,18 @@ class BrainService:
                 self.paths.lancedb_path.unlink()
         vector_rebuild = self.rebuild_vector_index(delete_backup=True)
         doctor = self.index_doctor()
-        status = "ok" if vector_rebuild["status"] == "ok" and doctor["status"] in {"ok", "optimize_recommended"} else "failed"
+        vector_rebuild_skipped = vector_rebuild["status"] == "skipped" and "embedding provider unavailable" in str(
+            vector_rebuild.get("reason") or ""
+        )
+        status = (
+            "ok"
+            if (
+                vector_rebuild["status"] == "ok"
+                and doctor["status"] in {"ok", "optimize_recommended"}
+            )
+            or vector_rebuild_skipped
+            else "failed"
+        )
         return {
             "status": status,
             "documents": len(document_rows),
@@ -741,7 +864,7 @@ class BrainService:
         skipped = 0
         chunks_created = 0
         documents_replaced = 0
-        vector_rows: list[dict[str, Any]] = []
+        vector_source_rows: list[dict[str, Any]] = []
         stale_vector_chunk_ids: list[str] = []
 
         if dry_run:
@@ -869,12 +992,12 @@ class BrainService:
                             project="",
                             tags="",
                         )
-                        vector_rows.append(
+                        vector_source_rows.append(
                             {
                                 "chunk_id": chunk_id,
                                 "document_id": document_id,
                                 "text": chunk.text,
-                                "vector": self.embedding_provider.embed([chunk.text])[0],
+                                "heading_path": chunk.heading_path,
                             }
                         )
                     if source_type == "agent_session_log":
@@ -893,7 +1016,19 @@ class BrainService:
                     else:
                         errors.append(f"{path}: {exc}")
             delete_vectors(self.paths.lancedb_path, stale_vector_chunk_ids)
-            embeddings_created = upsert_vectors(self.paths.lancedb_path, vector_rows)
+            embeddings_created = 0
+            vector_writes = {"status": "ok", "reason": None, "attempted": len(vector_source_rows)}
+            try:
+                vector_rows = self._vector_rows_for_chunks(vector_source_rows)
+                embeddings_created = upsert_vectors(self.paths.lancedb_path, vector_rows, self.embedding_provider)
+                vector_writes["written"] = embeddings_created
+            except (EmbeddingProviderUnavailable, VectorIndexUnavailable) as exc:
+                vector_writes = {
+                    "status": "skipped",
+                    "reason": str(exc),
+                    "attempted": len(vector_source_rows),
+                    "written": 0,
+                }
             conn.execute(
                 """
                 UPDATE ingestion_runs
@@ -913,7 +1048,17 @@ class BrainService:
                 ),
             )
 
-        return IngestResult(run_id, len(candidates), changed, skipped, chunks_created, embeddings_created, errors, documents_replaced)
+        return IngestResult(
+            run_id,
+            len(candidates),
+            changed,
+            skipped,
+            chunks_created,
+            embeddings_created,
+            errors,
+            documents_replaced,
+            vector_writes,
+        )
 
     def rebuild_mirror_index(self) -> dict[str, Any]:
         self.init_workspace()
@@ -1022,7 +1167,7 @@ class BrainService:
 
         vector_rebuild = self.rebuild_vector_index(delete_backup=True)
         embeddings_created = int(vector_rebuild.get("vectors_written") or 0) if vector_rebuild["status"] == "ok" else 0
-        if vector_rebuild["status"] != "ok":
+        if vector_rebuild["status"] not in {"ok", "skipped"}:
             errors.append(str(vector_rebuild.get("error") or "vector rebuild failed"))
 
         with connection(self.paths.sqlite_path) as conn:
@@ -1147,6 +1292,8 @@ class BrainService:
         ]
         assessment = retrieval_assessment(selected, wiki_pages, [], [])
         search_debug["assessment"] = assessment
+        if fanout_debug.get("vector_unavailable_reason"):
+            assessment["reasons"].append(f"vector_search unavailable: {fanout_debug['vector_unavailable_reason']}")
         event_id = new_id("retrieval")
         with connection(self.paths.sqlite_path) as conn:
             conn.execute(
@@ -1234,6 +1381,8 @@ class BrainService:
             debug=debug,
         )
         retrieval_debug["assessment"] = assessment
+        if fanout_debug.get("vector_unavailable_reason"):
+            assessment["reasons"].append(f"vector_search unavailable: {fanout_debug['vector_unavailable_reason']}")
         with connection(self.paths.sqlite_path) as conn:
             conn.execute(
                 """
@@ -1550,7 +1699,12 @@ class BrainService:
 
     def _fanout_chunk_candidates(self, query: str, limit: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         lexical = self._search_fts(query, limit)
-        vector = search_vectors(self.paths.lancedb_path, self.embedding_provider, query, limit)
+        vector_unavailable_reason = None
+        try:
+            vector = search_vectors(self.paths.lancedb_path, self.embedding_provider, query, limit)
+        except (EmbeddingProviderUnavailable, VectorIndexUnavailable) as exc:
+            vector = []
+            vector_unavailable_reason = str(exc)
         vector_debug = [
             {
                 "chunk_id": row.get("chunk_id"),
@@ -1567,6 +1721,7 @@ class BrainService:
         return self._chunks_by_ids(candidate_ids), {
             "lexical": lexical,
             "vector": vector_debug,
+            "vector_unavailable_reason": vector_unavailable_reason,
             "fused": fused_ids,
             "candidate_ids": candidate_ids,
         }

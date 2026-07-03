@@ -8,7 +8,7 @@ from pkm_brain.service import BrainService
 
 def test_sync_doctor_passes_for_primary_workspace(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
-    BrainService(paths, prefer_model_embeddings=False).init_workspace()
+    BrainService(paths).init_workspace()
     paths.sync_config_file.write_text(
         f"""
 node_id: primary-laptop
@@ -19,7 +19,7 @@ peers: []
         encoding="utf-8",
     )
 
-    result = BrainService(paths, prefer_model_embeddings=False).sync_doctor()
+    result = BrainService(paths).sync_doctor()
 
     assert result["role"] == "primary"
     assert result["node_id"] == "primary-laptop"
@@ -29,7 +29,7 @@ peers: []
 
 def test_sync_doctor_passes_for_secondary_workspace(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
-    BrainService(paths, prefer_model_embeddings=False).init_workspace()
+    BrainService(paths).init_workspace()
     paths.sync_config_file.write_text(
         f"""
 node_id: secondary-desktop
@@ -44,7 +44,7 @@ outbox:
         encoding="utf-8",
     )
 
-    result = BrainService(paths, prefer_model_embeddings=False).sync_doctor()
+    result = BrainService(paths).sync_doctor()
 
     assert result["role"] == "secondary"
     assert result["node_id"] == "secondary-desktop"
@@ -53,9 +53,9 @@ outbox:
 
 def test_sync_doctor_flags_missing_config(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
-    BrainService(paths, prefer_model_embeddings=False).init_workspace()
+    BrainService(paths).init_workspace()
 
-    result = BrainService(paths, prefer_model_embeddings=False).sync_doctor()
+    result = BrainService(paths).sync_doctor()
 
     assert result["ready"] is False
     assert any(check["name"] == "sync_config_exists" and check["status"] == "fail" for check in result["checks"])

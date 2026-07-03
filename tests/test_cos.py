@@ -36,7 +36,7 @@ from pkm_brain.service import BrainService
 
 def service_for(tmp_path: Path) -> BrainService:
     return BrainService(
-        BrainPaths.from_value(tmp_path / "brain"), prefer_model_embeddings=False
+        BrainPaths.from_value(tmp_path / "brain")
     )
 
 

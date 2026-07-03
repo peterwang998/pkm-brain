@@ -917,7 +917,7 @@ def ui_logs(paths: BrainPaths) -> dict[str, Any]:
 
 
 def service(paths: BrainPaths) -> BrainService:
-    return BrainService(paths, prefer_model_embeddings=False)
+    return BrainService(paths)
 
 
 def safe_call(fn: Any) -> dict[str, Any]:

@@ -14,7 +14,7 @@ from pkm_brain.wiki_facts import resolve_fact_groups
 
 
 def service_for(tmp_path: Path) -> BrainService:
-    return BrainService(BrainPaths.from_value(tmp_path / "brain"), prefer_model_embeddings=False)
+    return BrainService(BrainPaths.from_value(tmp_path / "brain"))
 
 
 def test_entity_normalization_collapses_case_and_format_variants(tmp_path: Path) -> None:

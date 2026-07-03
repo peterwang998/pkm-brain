@@ -10,7 +10,7 @@ from pkm_brain.service import BrainService
 
 def test_external_ingest_quarantines_failed_file_and_continues(tmp_path: Path, monkeypatch) -> None:
     paths = BrainPaths.from_value(tmp_path / "primary")
-    svc = BrainService(paths, prefer_model_embeddings=False)
+    svc = BrainService(paths)
     svc.init_workspace()
     external = paths.inbox / "external" / "secondary"
     good = external / "notes" / "good.md"
@@ -43,7 +43,7 @@ def test_external_ingest_quarantines_failed_file_and_continues(tmp_path: Path, m
 
 def test_retry_quarantine_restores_and_reingests_files(tmp_path: Path, monkeypatch) -> None:
     paths = BrainPaths.from_value(tmp_path / "primary")
-    svc = BrainService(paths, prefer_model_embeddings=False)
+    svc = BrainService(paths)
     svc.init_workspace()
     external = paths.inbox / "external" / "secondary"
     bad = external / "notes" / "bad.md"

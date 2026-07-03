@@ -6,6 +6,7 @@ from pathlib import Path
 from pkm_brain.audit import audit_memories, provenance_check
 from pkm_brain.chunking import chunk_text, sanitize_agent_session_log
 from pkm_brain.db import connection
+from pkm_brain.embeddings import EmbeddingProviderUnavailable, SentenceTransformerProvider
 from pkm_brain.indexes import lancedb_stats, table_names, upsert_vectors
 from pkm_brain.memory_proposals import propose_failure_memories_from_sources, propose_memories_from_lineage
 from pkm_brain.paths import BrainPaths
@@ -22,7 +23,7 @@ from pkm_brain.wiki_facts import rebuild_fact_retrieval_index
 
 
 def service_for(tmp_path: Path) -> BrainService:
-    return BrainService(BrainPaths.from_value(tmp_path / "brain"), prefer_model_embeddings=False)
+    return BrainService(BrainPaths.from_value(tmp_path / "brain"))
 
 
 def test_init_workspace_creates_directories_and_db(tmp_path: Path) -> None:
@@ -383,6 +384,53 @@ def test_index_doctor_reports_lancedb_health(tmp_path: Path) -> None:
     assert result["stale_vector_count"] == 0
 
 
+def test_search_reports_vector_stamp_mismatch_and_uses_fts(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "sqlite-decision.md"
+    note.write_text("# SQLite Decision\n\nSQLite stores metadata and chunks.\n", encoding="utf-8")
+    svc.ingest()
+    svc.paths.embedding_provider_stamp_path.write_text(
+        '{"provider": "sentence-transformer", "model": "BAAI/bge-small-en-v1.5", "dim": 384}\n',
+        encoding="utf-8",
+    )
+
+    result = svc.search("SQLite metadata", limit=3)
+    doctor = svc.index_doctor()
+
+    assert result["results"]
+    assert any("vector_search unavailable" in reason for reason in result["retrieval_reasons"])
+    assert doctor["status"] == "rebuild_recommended"
+    assert doctor["embedding_stamp"]["matches"] is False
+
+
+def test_configured_model_provider_skips_vector_writes_without_hash_fallback(tmp_path: Path, monkeypatch) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    paths.config_local.mkdir(parents=True)
+    paths.config_file.write_text(
+        "embedding:\n  provider: sentence-transformer\n  model: BAAI/bge-small-en-v1.5\n",
+        encoding="utf-8",
+    )
+    svc = BrainService(paths)
+    svc.init_workspace()
+
+    def fail_embed(self, texts):
+        raise EmbeddingProviderUnavailable("model unavailable for test")
+
+    monkeypatch.setattr(SentenceTransformerProvider, "embed", fail_embed)
+    note = svc.paths.inbox / "model-unavailable.md"
+    note.write_text("# Model Unavailable\n\nFTS should still index this document.\n", encoding="utf-8")
+
+    result = svc.ingest()
+
+    assert result.errors == []
+    assert result.changed == 1
+    assert result.embeddings_created == 0
+    assert result.vector_writes["status"] == "skipped"
+    assert svc.embedding_provider.provider == "sentence-transformer"
+    assert svc.search("FTS index document", limit=3)["results"]
+
+
 def test_rebuild_vector_index_from_sqlite_chunks(tmp_path: Path) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()
@@ -486,6 +534,7 @@ def test_reindex_chunks_rewrites_existing_oversized_document(tmp_path: Path) -> 
                 "vector": svc.embedding_provider.embed([text])[0],
             }
         ],
+        svc.embedding_provider,
     )
 
     dry_run = svc.reindex_chunks(dry_run=True, target_tokens=1000, overlap_tokens=200)
@@ -590,6 +639,7 @@ def test_reset_retrieval_index_preserves_documents_and_rebuilds_artifacts(tmp_pa
                 "vector": svc.embedding_provider.embed(["stale vector"])[0],
             }
         ],
+        svc.embedding_provider,
     )
 
     result = svc.reset_retrieval_index()

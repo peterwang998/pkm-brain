@@ -8,7 +8,7 @@ from pkm_brain.service import BrainService
 
 
 def service_for(path: Path) -> BrainService:
-    return BrainService(BrainPaths.from_value(path), prefer_model_embeddings=False)
+    return BrainService(BrainPaths.from_value(path))
 
 
 def test_approve_writes_memory_export_and_export_all_is_idempotent(tmp_path: Path) -> None:

@@ -133,7 +133,7 @@ def run_secondary_tick(
     hyprnote_root: Path | None = None,
     include_hyprnote: bool = False,
 ) -> SecondaryTickResult:
-    service = BrainService(paths, prefer_model_embeddings=False)
+    service = BrainService(paths)
     service.init_workspace()
     lock_path = paths.logs / "secondary-tick.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -524,6 +524,7 @@ def index_status(paths: BrainPaths, service: BrainService | None = None) -> dict
         "lancedb_exists": lancedb_exists,
         "lancedb": lancedb,
         "embedding_provider": service.embedding_provider.name,
+        "embedding": service.embedding_provider.status(check_available=False),
         "last_run": dict(run) if run else None,
     }
 

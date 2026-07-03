@@ -25,7 +25,7 @@ from pkm_brain.title_utils import CODEX_PROVIDER_PROMPT_PREFIX
 
 
 def make_service(tmp_path: Path) -> BrainService:
-    svc = BrainService(BrainPaths.from_value(tmp_path / "brain"), prefer_model_embeddings=False)
+    svc = BrainService(BrainPaths.from_value(tmp_path / "brain"))
     svc.init_workspace()
     return svc
 

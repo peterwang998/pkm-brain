@@ -67,7 +67,7 @@ def run_acceptance_report(
     retrieval_phrase: str | None = None,
     transport: Transport | None = None,
 ) -> dict[str, Any]:
-    service = BrainService(paths, prefer_model_embeddings=False)
+    service = BrainService(paths)
     service.init_workspace()
     checks: list[AcceptanceCheck] = []
     report: dict[str, Any] = {

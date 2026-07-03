@@ -60,6 +60,7 @@ wiki_app = typer.Typer(help="Wiki commands.")
 memory_app = typer.Typer(help="Typed memory commands.")
 context_app = typer.Typer(help="Context lineage and feedback commands.")
 llm_app = typer.Typer(help="LLM provider commands.")
+embeddings_app = typer.Typer(help="Embedding provider commands.")
 cos_app = typer.Typer(help="Chief-of-Staff commands.")
 eval_app = typer.Typer(help="Chief-of-Staff eval commands.")
 runs_app = typer.Typer(help="Pipeline run commands.")
@@ -76,6 +77,7 @@ app.add_typer(wiki_app, name="wiki")
 app.add_typer(memory_app, name="memory")
 app.add_typer(context_app, name="context")
 app.add_typer(llm_app, name="llm")
+app.add_typer(embeddings_app, name="embeddings")
 app.add_typer(cos_app, name="cos")
 app.add_typer(eval_app, name="eval")
 app.add_typer(runs_app, name="runs")
@@ -368,7 +370,12 @@ def doctor(home: Optional[Path] = typer.Option(None), json_output: bool = typer.
     table.add_row("home", "ok", status["home"])
     table.add_row("sqlite", "ok" if status["sqlite"] else "missing", str(status["sqlite"]))
     table.add_row("lancedb", "ok" if status["lancedb"] else "missing", str(status["lancedb"]))
-    table.add_row("embedding_provider", "ok", status["embedding_provider"])
+    embedding = status["embedding"]
+    table.add_row(
+        "embedding_provider",
+        "ok" if embedding["available"] else "unavailable",
+        status["embedding_provider"] if embedding["available"] else f"{status['embedding_provider']} ({embedding['reason']})",
+    )
     for name, exists in status["directories"].items():
         table.add_row(f"directory:{name}", "ok" if exists else "missing", str(exists))
     console.print(table)
@@ -501,11 +508,26 @@ def index_optimize(
 @index_app.command("rebuild-vectors")
 def index_rebuild_vectors(
     delete_backup: bool = typer.Option(False, "--delete-backup", help="Delete the previous LanceDB backup after verification succeeds."),
+    missing_only: bool = typer.Option(False, "--missing-only", help="Only write vectors missing from LanceDB."),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
-    result = service(home).rebuild_vector_index(delete_backup=delete_backup)
+    result = service(home).rebuild_vector_index(delete_backup=delete_backup, missing_only=missing_only)
     console.print_json(json.dumps(result))
     if result["status"] != "ok":
+        raise typer.Exit(1)
+
+
+@embeddings_app.command("status")
+def embeddings_status(home: Optional[Path] = typer.Option(None)) -> None:
+    svc = service(home)
+    console.print_json(json.dumps(svc.embedding_provider.status(check_available=True)))
+
+
+@embeddings_app.command("download")
+def embeddings_download(home: Optional[Path] = typer.Option(None)) -> None:
+    result = service(home).download_embedding_model()
+    console.print_json(json.dumps(result))
+    if result["status"] == "failed":
         raise typer.Exit(1)
 
 
@@ -855,7 +877,7 @@ def sync_doctor(
     home: Optional[Path] = typer.Option(None),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    svc = BrainService(BrainPaths.from_value(home), prefer_model_embeddings=False)
+    svc = BrainService(BrainPaths.from_value(home))
     result = svc.sync_doctor()
     if json_output:
         console.print_json(json.dumps(result))

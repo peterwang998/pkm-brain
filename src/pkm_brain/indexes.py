@@ -1,28 +1,39 @@
 from __future__ import annotations
 
-from datetime import timedelta
+import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import lancedb
 
-from .embeddings import EmbeddingProvider
+from .embeddings import EmbeddingProvider, HASH_MODEL, HASH_PROVIDER
 
 
 TABLE_NAME = "chunks"
+STAMP_FILE = "embedding_provider.json"
 
 
-def upsert_vectors(db_path: Path, rows: list[dict[str, Any]]) -> int:
-    return upsert_table_vectors(db_path, TABLE_NAME, "chunk_id", rows)
+class VectorIndexUnavailable(RuntimeError):
+    pass
+
+
+def upsert_vectors(db_path: Path, rows: list[dict[str, Any]], provider: EmbeddingProvider) -> int:
+    return upsert_table_vectors(db_path, TABLE_NAME, "chunk_id", rows, provider)
 
 
 def upsert_table_vectors(
-    db_path: Path, table_name: str, id_column: str, rows: list[dict[str, Any]]
+    db_path: Path,
+    table_name: str,
+    id_column: str,
+    rows: list[dict[str, Any]],
+    provider: EmbeddingProvider,
 ) -> int:
     if not rows:
         return 0
     db_path.mkdir(parents=True, exist_ok=True)
     db = lancedb.connect(str(db_path))
+    ensure_embedding_stamp(db_path, provider, table_exists=table_name in table_names(db), write_if_missing=True)
     if table_name in table_names(db):
         table = db.open_table(table_name)
         try:
@@ -76,12 +87,109 @@ def search_table_vectors(
     if table_name not in table_names(db):
         return []
     table = db.open_table(table_name)
-    vector = provider.embed([query])[0]
+    ensure_embedding_stamp(db_path, provider, table_exists=True, write_if_missing=True)
+    vector = provider.embed_queries([query])[0]
     try:
         results = table.search(vector).limit(limit).to_list()
     except Exception:
         return []
     return [dict(row) for row in results]
+
+
+def embedding_stamp_path(db_path: Path) -> Path:
+    return db_path / STAMP_FILE
+
+
+def read_embedding_stamp(db_path: Path) -> dict[str, Any] | None:
+    path = embedding_stamp_path(db_path)
+    if not path.exists():
+        return None
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(loaded, dict):
+        return None
+    return loaded
+
+
+def write_embedding_stamp(db_path: Path, provider: EmbeddingProvider) -> dict[str, Any]:
+    db_path.mkdir(parents=True, exist_ok=True)
+    stamp = provider.stamp()
+    stamp["built_at"] = datetime.now(timezone.utc).isoformat()
+    path = embedding_stamp_path(db_path)
+    tmp_path = path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(stamp, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    tmp_path.replace(path)
+    return stamp
+
+
+def legacy_hash_stamp() -> dict[str, Any]:
+    return {"provider": HASH_PROVIDER, "model": HASH_MODEL, "dim": 384}
+
+
+def stamps_match(left: dict[str, Any] | None, right: dict[str, Any] | None) -> bool:
+    if not left or not right:
+        return False
+    return all(str(left.get(key)) == str(right.get(key)) for key in ("provider", "model", "dim"))
+
+
+def ensure_embedding_stamp(
+    db_path: Path,
+    provider: EmbeddingProvider,
+    *,
+    table_exists: bool,
+    write_if_missing: bool,
+) -> dict[str, Any] | None:
+    active = provider.stamp()
+    stamp = read_embedding_stamp(db_path)
+    if not table_exists:
+        if write_if_missing:
+            return write_embedding_stamp(db_path, provider)
+        return stamp
+    if stamp is None:
+        if table_exists:
+            stamp = legacy_hash_stamp()
+            if write_if_missing:
+                db_path.mkdir(parents=True, exist_ok=True)
+                path = embedding_stamp_path(db_path)
+                path.write_text(
+                    json.dumps({**stamp, "grandfathered": True}, sort_keys=True, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+
+    if not stamps_match(stamp, active):
+        raise VectorIndexUnavailable(
+            "LanceDB embedding provider mismatch: "
+            f"index={stamp.get('provider')}:{stamp.get('model')} dim={stamp.get('dim')} "
+            f"configured={active.get('provider')}:{active.get('model')} dim={active.get('dim')}; "
+            "run `brain index rebuild-vectors`"
+        )
+    return stamp
+
+
+def embedding_stamp_report(db_path: Path, provider: EmbeddingProvider, *, table_exists: bool) -> dict[str, Any]:
+    active = provider.stamp()
+    stamp = read_embedding_stamp(db_path)
+    grandfathered = False
+    if stamp is None and table_exists:
+        stamp = legacy_hash_stamp()
+        grandfathered = True
+    matches = not table_exists or stamp is None or stamps_match(stamp, active)
+    reason = None
+    if table_exists and stamp is not None and not matches:
+        reason = (
+            "LanceDB embedding provider mismatch: "
+            f"index={stamp.get('provider')}:{stamp.get('model')} dim={stamp.get('dim')} "
+            f"configured={active.get('provider')}:{active.get('model')} dim={active.get('dim')}"
+        )
+    return {
+        "configured": active,
+        "stamp": stamp,
+        "matches": matches,
+        "grandfathered_hash": grandfathered,
+        "reason": reason,
+    }
 
 
 def table_names(db: Any) -> list[str]:
@@ -101,6 +209,7 @@ def lancedb_stats(db_path: Path) -> dict[str, Any]:
         "path": str(db_path),
         "exists": db_path.exists(),
         "table_exists": False,
+        "embedding_stamp": read_embedding_stamp(db_path),
         "rows": 0,
         "versions": 0,
         "data_files": count_files(data_path),
