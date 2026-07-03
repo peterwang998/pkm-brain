@@ -72,6 +72,61 @@ def test_ingest_markdown_chunks_and_searches(tmp_path: Path) -> None:
     assert context["citation_snapshots"][0]["type"] == "chunk"
 
 
+def test_retrieve_context_returns_query_relevant_open_questions(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    with connection(svc.paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO open_questions(
+              id, kind, entity_key, page_hint, fact_ids, question, options, status,
+              context, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "question_cloudzero",
+                "conflict",
+                "concepts:cloudzero-dashboard-sharing-interview:summary",
+                "concepts/cloudzero-dashboard-sharing-interview.md",
+                json.dumps(["fact_left", "fact_right"]),
+                "What is currently true for CloudZero dashboard sharing?",
+                "[]",
+                "open",
+                json.dumps({"conflict_group_id": "factconflict_cloudzero"}),
+                "2026-05-30T10:03:04+00:00",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO open_questions(
+              id, kind, entity_key, page_hint, fact_ids, question, options, status,
+              context, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "question_unrelated",
+                "conflict",
+                "concepts:unrelated:summary",
+                "concepts/unrelated.md",
+                "[]",
+                "Which unrelated accounting policy is current?",
+                "[]",
+                "open",
+                "{}",
+                "2026-05-30T10:04:04+00:00",
+            ),
+        )
+
+    context = svc.retrieve_context("CloudZero dashboard sharing status")
+
+    assert [question["id"] for question in context["open_questions"]] == [
+        "question_cloudzero"
+    ]
+    question = context["open_questions"][0]
+    assert question["fact_ids"] == ["fact_left", "fact_right"]
+    assert "cloudzero" in question["matched_query_terms"]
+
+
 def test_ingest_bounds_frontmatter_title_without_dropping_body(tmp_path: Path) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()

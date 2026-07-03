@@ -1211,6 +1211,7 @@ class BrainService:
             limit=min(policy.max_memories, 3),
             score_floor=MEMORY_CANDIDATE_SCORE_FLOOR,
         )
+        open_questions = self.relevant_open_questions(query, limit=5)
         citation_snapshots = (
             fact_citation_snapshots(relevant_facts)
             + chunk_citation_snapshots(supporting_chunks)
@@ -1275,7 +1276,7 @@ class BrainService:
             "supporting_chunks": supporting_chunks,
             "citations": citation_snapshots,
             "citation_snapshots": citation_snapshots,
-            "open_questions": [],
+            "open_questions": open_questions,
             "omitted_due_to_budget": [
                 {
                     "chunk_id": row.get("chunk_id"),
@@ -1300,6 +1301,56 @@ class BrainService:
             }
             result["retrieval_debug"] = retrieval_debug
         return result
+
+    def relevant_open_questions(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        terms = important_query_terms(query)
+        specific_terms = specific_query_terms(query)
+        if not terms or limit <= 0:
+            return []
+        with connection(self.paths.sqlite_path) as conn:
+            candidates = rows(
+                conn,
+                """
+                SELECT *
+                FROM open_questions
+                WHERE status IN ('open', 'needs_human')
+                ORDER BY created_at DESC
+                LIMIT 100
+                """,
+            )
+        scored: list[dict[str, Any]] = []
+        for row in candidates:
+            question = open_question_row_to_context(row)
+            haystack = " ".join(
+                [
+                    str(question.get("kind") or ""),
+                    str(question.get("entity_key") or ""),
+                    str(question.get("page_hint") or ""),
+                    str(question.get("question") or ""),
+                    json.dumps(question.get("context") or {}, sort_keys=True),
+                    json.dumps(question.get("recommended_action") or {}, sort_keys=True),
+                    " ".join(str(fact_id) for fact_id in question.get("fact_ids") or []),
+                ]
+            )
+            matches = terms_in_text(terms, haystack)
+            specific_matches = terms_in_text(specific_terms, haystack)
+            if not matches:
+                continue
+            score = len(matches) + len(specific_matches)
+            if specific_terms and not specific_matches and score < 2:
+                continue
+            question["question_relevance_score"] = score
+            question["matched_query_terms"] = matches
+            question["matched_specific_query_terms"] = specific_matches
+            scored.append(question)
+        scored.sort(
+            key=lambda item: (
+                -int(item.get("question_relevance_score") or 0),
+                _descending_text_sort_key(str(item.get("created_at") or "")),
+                str(item.get("id") or ""),
+            )
+        )
+        return scored[:limit]
 
     def record_context_feedback(
         self,
@@ -3104,6 +3155,43 @@ def suppress_chunks_covered_by_facts(
         for chunk in chunks
         if str(chunk.get("chunk_id") or "") not in covered_chunk_ids
     ]
+
+
+def open_question_row_to_context(row: Any) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "kind": row["kind"],
+        "entity_key": row["entity_key"],
+        "page_hint": row["page_hint"],
+        "fact_ids": loads(row["fact_ids"], []),
+        "question": row["question"],
+        "options": loads(row["options"], []),
+        "status": row["status"],
+        "answer": loads(row["answer"], None),
+        "context": loads(row["context"], {}),
+        "action_id": row_value(row, "action_id"),
+        "recommended_action": loads(row_value(row, "recommended_action"), {}),
+        "auto_resolve_after": row_value(row, "auto_resolve_after"),
+        "risk_tier": row_value(row, "risk_tier"),
+        "resolver": row_value(row, "resolver"),
+        "decided_by": row_value(row, "decided_by"),
+        "created_at": row["created_at"],
+        "answered_at": row["answered_at"],
+    }
+
+
+def row_value(row: Any, key: str, default: Any = None) -> Any:
+    try:
+        if hasattr(row, "keys") and key not in row.keys():
+            return default
+        value = row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+    return default if value is None else value
+
+
+def _descending_text_sort_key(value: str) -> tuple[int, ...]:
+    return tuple(-ord(char) for char in value)
 
 
 def fact_citation_snapshots(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
