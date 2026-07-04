@@ -1,7 +1,7 @@
 # Embeddings Productization — Hash → Sentence-Transformers
 
-**Status:** implemented through Phase 4; Phase 5 eval-gated real-brain flip remains pending
-**Last verified:** 2026-07-03 against implementation commit `9fd9c2f`
+**Status:** implemented through Phase 4; Phase 5 paraphrase eval probes are seeded; eval-gated real-brain flip remains pending
+**Last verified:** 2026-07-04 against the sentence-transformer shadow home `/private/tmp/pkm-brain-st-sample.mtHKpl`
 **Goal:** make real semantic embeddings a configurable, provenance-stamped retrieval component with a safe rebuild path, making `SentenceTransformerProvider` usable while keeping the deterministic offline hash provider available and never mixing vector spaces.
 
 This is the "embeddings productization" workstream referenced by `docs/architecture-code-guide.md` (Major TODOs) and by the Caveats section of `docs/entity-layer-spec.md`.
@@ -104,10 +104,12 @@ First model use normally triggers a Hugging Face download (~130 MB). Scheduled p
 
 ### Phase 5 — Eval gate + real-brain flip (go/no-go) ⏳
 - Copy the brain home (tasklist temp-home pattern), rebuild the copy with `sentence-transformer`, run `brain eval run --suite retrieval` against both homes; record the side-by-side (verdict accuracy, source-hit, calibration/ECE, noise rate, negative-control pass).
-- Add 3–5 paraphrase golden cases to `retrieval_fixtures.py` first so semantic gain is measurable.
+- Add 3–5 paraphrase golden cases to `retrieval_fixtures.py` first so semantic gain is measurable. Seeded cases are `paraphrase-058` through `paraphrase-062`; they use real current Brain docs where lexical fanout misses but sentence-transformer vector fanout should retrieve the source.
 - On green: flip `~/brain` config, `brain embeddings download`, full rebuild with verified backup, then monitor doctor + nightly index status. Default in code stays `hash`; the flip is a config change on this machine.
 
 *Acceptance:* recorded eval comparison with negative controls at 100%; the real brain runs stamped model vectors; `uv run pytest -q` and `ruff` stay green throughout.
+
+**2026-07-04 shadow result:** default hash home passed retrieval with `negative_control_pass_rate=1.0`, `source_hit_rate=0.825`, and semantic-probe vector hits `1/5` (`0/5` lexical). The sentence-transformer shadow home passed retrieval with `negative_control_pass_rate=1.0`, `source_hit_rate=0.877`, and semantic-probe vector hits `5/5` (`0/5` lexical). Reports: `/Users/Peter/brain/reports/evals/eval-retrieval-v0.1.0-2026-07-04-eval_1b3c0c180c9a4bfb.json` and `/private/tmp/pkm-brain-st-sample.mtHKpl/reports/evals/eval-retrieval-v0.1.0-2026-07-04-eval_aec79fca06e7406e.json`.
 
 ### Unblocked afterwards (separate workstreams, not planned here)
 Fact vectors as a second stamped collection (re-designed, not resurrected from `5251d08`); semantic routing-hint ranking (entity spec R1); gardener embedding-similarity candidates; entity-resolution embedding tier.

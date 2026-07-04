@@ -19,6 +19,7 @@ def test_retrieval_fixture_base_is_stratified() -> None:
     assert kinds["historical_session_query"] >= 30
     assert kinds["source_document_query"] >= 10
     assert kinds["fact_query"] >= 10
+    assert kinds["paraphrase_query"] >= 3
     assert kinds["negative_control"] >= 15
 
 

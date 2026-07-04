@@ -719,6 +719,11 @@ def retrieval_eval(paths: BrainPaths) -> dict[str, Any]:
     negative_fact_leaks = 0
     noisy_chunks = 0
     total_chunks = 0
+    semantic_probe_count = 0
+    semantic_probe_lexical_hits = 0
+    semantic_probe_vector_hits = 0
+    semantic_probe_vector_gain_ids: list[str] = []
+    semantic_probe_vector_hit_ids: list[str] = []
     case_count_by_kind: dict[str, int] = {}
     verdict_matches_by_kind: dict[str, int] = {}
     calibration_rows: list[tuple[float, float]] = []
@@ -755,6 +760,27 @@ def retrieval_eval(paths: BrainPaths) -> dict[str, Any]:
             negative_control_passes += int(negative_pass)
             negative_fact_leaks += int(bool(facts))
 
+        semantic_expected_sources = set(case.get("expected_vector_source_ids") or [])
+        semantic_lexical_source_hit = None
+        semantic_vector_source_hit = None
+        semantic_lexical_rank = None
+        semantic_vector_rank = None
+        if semantic_expected_sources:
+            fanout = (result.get("retrieval_debug") or {}).get("fanout") or {}
+            lexical_rows = fanout.get("lexical") or []
+            vector_rows = fanout.get("vector") or []
+            semantic_lexical_rank = first_fanout_source_rank(lexical_rows, semantic_expected_sources)
+            semantic_vector_rank = first_fanout_source_rank(vector_rows, semantic_expected_sources)
+            semantic_lexical_source_hit = semantic_lexical_rank is not None
+            semantic_vector_source_hit = semantic_vector_rank is not None
+            semantic_probe_count += 1
+            semantic_probe_lexical_hits += int(semantic_lexical_source_hit)
+            semantic_probe_vector_hits += int(semantic_vector_source_hit)
+            if semantic_vector_source_hit:
+                semantic_probe_vector_hit_ids.append(str(case["id"]))
+            if semantic_vector_source_hit and not semantic_lexical_source_hit:
+                semantic_probe_vector_gain_ids.append(str(case["id"]))
+
         confidence = float(result.get("retrieval_confidence") or 0.0)
         calibration_rows.append((confidence, VERDICT_VALUES.get(expected_verdict, 0.0)))
         case_reports.append(
@@ -772,6 +798,11 @@ def retrieval_eval(paths: BrainPaths) -> dict[str, Any]:
                 "relevant_facts": fact_relevant_count,
                 "chunks": len(chunks),
                 "noisy_chunks": noisy_count,
+                "semantic_expected_source_ids": sorted(semantic_expected_sources),
+                "semantic_lexical_source_hit": semantic_lexical_source_hit,
+                "semantic_vector_source_hit": semantic_vector_source_hit,
+                "semantic_lexical_rank": semantic_lexical_rank,
+                "semantic_vector_rank": semantic_vector_rank,
                 "retrieval_event_id": result.get("retrieval_event_id"),
             }
         )
@@ -794,6 +825,17 @@ def retrieval_eval(paths: BrainPaths) -> dict[str, Any]:
         "negative_control_pass_rate": round(negative_control_pass_rate, 3),
         "negative_control_fact_leak_count": negative_fact_leaks,
         "fixture_count": fixture_count,
+        "embedding_provider": svc.embedding_provider.provider,
+        "semantic_probe_count": semantic_probe_count,
+        "semantic_probe_lexical_source_hit_rate": round(
+            ratio(semantic_probe_lexical_hits, semantic_probe_count), 3
+        ),
+        "semantic_probe_vector_source_hit_rate": round(
+            ratio(semantic_probe_vector_hits, semantic_probe_count), 3
+        ),
+        "semantic_probe_vector_gain_count": len(semantic_probe_vector_gain_ids),
+        "semantic_probe_vector_hit_case_ids": semantic_probe_vector_hit_ids,
+        "semantic_probe_vector_gain_case_ids": semantic_probe_vector_gain_ids,
         "case_count_by_kind": dict(sorted(case_count_by_kind.items())),
         "verdict_accuracy_by_kind": {
             kind: round(verdict_matches_by_kind.get(kind, 0) / count, 3)
@@ -826,6 +868,14 @@ def retrieval_eval(paths: BrainPaths) -> dict[str, Any]:
         threshold=threshold,
         cases=case_reports,
     )
+
+
+def first_fanout_source_rank(rows: list[dict[str, Any]], expected_sources: set[str]) -> int | None:
+    for rank, row in enumerate(rows, start=1):
+        document_id = str(row.get("document_id") or "")
+        if document_id and f"document:{document_id}" in expected_sources:
+            return rank
+    return None
 
 
 def retrieval_result_source_ids(paths: BrainPaths, result: dict[str, Any]) -> set[str]:
