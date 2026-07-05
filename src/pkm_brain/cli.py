@@ -34,6 +34,7 @@ from .llm import cos_provider_status, provider_status
 from .memory_proposals import propose_failure_memories_from_sources, propose_memories_from_lineage
 from .mcp_server import create_mcp
 from .paths import BrainPaths
+from .regeneration import backup_runtime_brain, export_human_state, rebuild_facts_from_sources
 from .service import BrainService
 from .setup_wizard import run_setup_plan
 from .sync_acceptance import run_acceptance_report
@@ -718,6 +719,46 @@ def cos_run(
 ) -> None:
     paths = BrainPaths.from_value(home)
     result = run_cos_once(paths, llm_wiki=llm_wiki)
+    console.print_json(json.dumps(result))
+
+
+@cos_app.command("export-human-state")
+def cos_export_human_state(
+    output_dir: Optional[Path] = typer.Option(None, "--output-dir", help="Directory for human_state.json."),
+    home: Optional[Path] = typer.Option(None, help="Brain home directory."),
+) -> None:
+    result = export_human_state(BrainPaths.from_value(home), output_dir=output_dir)
+    console.print_json(json.dumps(result))
+
+
+@cos_app.command("backup-runtime")
+def cos_backup_runtime(
+    output_dir: Optional[Path] = typer.Option(None, "--output-dir", help="Directory for db/wiki backup."),
+    home: Optional[Path] = typer.Option(None, help="Brain home directory."),
+) -> None:
+    result = backup_runtime_brain(BrainPaths.from_value(home), output_dir=output_dir)
+    console.print_json(json.dumps(result))
+
+
+@cos_app.command("rebuild-facts")
+def cos_rebuild_facts(
+    from_sources: bool = typer.Option(False, "--from-sources", help="Plan a rebuild from active source documents."),
+    dry_run: bool = typer.Option(True, "--dry-run/--apply", help="Preview by default; --apply is intentionally blocked for now."),
+    source_type: Optional[list[str]] = typer.Option(None, "--source-type", help="Restrict to a source_type; may be repeated."),
+    limit: Optional[int] = typer.Option(None, "--limit", min=1, help="Maximum source documents to include."),
+    home: Optional[Path] = typer.Option(None, help="Brain home directory."),
+) -> None:
+    try:
+        result = rebuild_facts_from_sources(
+            BrainPaths.from_value(home),
+            from_sources=from_sources,
+            dry_run=dry_run,
+            source_types=source_type or [],
+            limit=limit,
+        )
+    except ValueError as exc:
+        console.print(str(exc))
+        raise typer.Exit(1)
     console.print_json(json.dumps(result))
 
 

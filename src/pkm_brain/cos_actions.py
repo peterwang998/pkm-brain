@@ -172,7 +172,24 @@ def propose_action(
     features.setdefault("target_contract_ids", target_contract_ids or [])
     resolved_risk_tier = classify_action_risk(action_type, features, explicit_risk_tier=risk_tier)
     features.setdefault("risk_tier", resolved_risk_tier)
+    created_at = now_iso()
     with connection(paths.sqlite_path) as conn:
+        if run_id:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO wiki_curation_runs(
+                  id, source_packet_id, group_by, status, summary, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    None,
+                    "cos_action",
+                    "running",
+                    dumps({"created_by": "propose_action"}),
+                    created_at,
+                ),
+            )
         conn.execute(
             """
             INSERT INTO cos_actions(
@@ -194,7 +211,7 @@ def propose_action(
                 confidence,
                 resolved_risk_tier,
                 dumps(evidence_json),
-                now_iso(),
+                created_at,
             ),
         )
     if decide:
