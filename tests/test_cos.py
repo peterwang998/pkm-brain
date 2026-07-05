@@ -148,6 +148,20 @@ def test_policy_promotion_matches_low_medium_and_large_topology(tmp_path: Path) 
             "entity_merge",
             {"risk_tier": "medium", "affected_fact_count": 3, "merged_entity_count": 2},
         )
+        entity_high_certainty = evaluate_policy(
+            conn,
+            "entity_merge",
+            {
+                "risk_tier": "low",
+                "merge_signal": "same_compact_name_or_alias",
+                "affected_fact_count": 23,
+                "merged_entity_count": 2,
+                "large_topology": True,
+                "cross_entity_merge": False,
+                "cross_type_merge": False,
+                "type_mismatch": False,
+            },
+        )
         large = evaluate_policy(
             conn,
             "page_merge",
@@ -165,6 +179,8 @@ def test_policy_promotion_matches_low_medium_and_large_topology(tmp_path: Path) 
     assert medium.autonomy_level == "L2"
     assert medium.audit_sample_rate == 1.0
     assert entity_medium.autonomy_level == "L2"
+    assert entity_high_certainty.autonomy_level == "L1"
+    assert entity_high_certainty.critic_required is False
     assert large.autonomy_level == "L3"
     assert entity_large.autonomy_level == "L3"
 
@@ -188,6 +204,23 @@ def test_action_risk_classification_large_topology_overrides_medium() -> None:
             large_topology_fact_threshold=8,
         )
         == "high"
+    )
+    assert (
+        classify_action_risk(
+            "entity_merge",
+            {
+                "affected_fact_count": 23,
+                "merged_entity_count": 2,
+                "large_topology": True,
+                "merge_signal": "same_compact_name_or_alias",
+                "cross_entity_merge": False,
+                "cross_type_merge": False,
+                "type_mismatch": False,
+            },
+            explicit_risk_tier="low",
+            large_topology_fact_threshold=8,
+        )
+        == "low"
     )
     assert (
         classify_action_risk(

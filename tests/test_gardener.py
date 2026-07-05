@@ -8,7 +8,9 @@ from pkm_brain.db import connection
 from pkm_brain.contracts import insert_contract_direct
 from pkm_brain.gardener import (
     apply_gardener_judgment,
+    entity_merge_candidate,
     generate_gardener_candidates,
+    gardener_candidate_reasoning_effort,
     propose_gardener_action,
 )
 from pkm_brain.paths import BrainPaths
@@ -104,6 +106,42 @@ def insert_entity(
             "2026-06-24T00:00:00+00:00",
         ),
     )
+
+
+def test_high_certainty_entity_merge_stays_low_risk_despite_many_facts() -> None:
+    left = {
+        "id": "entity_hightouch",
+        "name": "Hightouch",
+        "entity_type": "organization",
+        "name_keys": ["hightouch"],
+        "compact_keys": ["hightouch"],
+        "fact_ids": [f"fact_hightouch_{index}" for index in range(20)],
+        "primary_fact_ids": [f"fact_hightouch_{index}" for index in range(20)],
+        "page_hints": ["companies/hightouch.md"],
+        "source_ids": ["document:hightouch"],
+        "fact_tokens": ["warehouse", "native", "activation"],
+    }
+    right = {
+        "id": "entity_high_touch",
+        "name": "High Touch",
+        "entity_type": "organization",
+        "name_keys": ["high touch"],
+        "compact_keys": ["hightouch"],
+        "fact_ids": ["fact_high_touch"],
+        "primary_fact_ids": ["fact_high_touch"],
+        "page_hints": ["companies/high-touch.md"],
+        "source_ids": ["document:hightouch"],
+        "fact_tokens": ["warehouse", "native", "activation"],
+    }
+
+    candidate = entity_merge_candidate(left, right)
+
+    assert candidate is not None
+    assert candidate["merge_signal"] == "same_compact_name_or_alias"
+    assert candidate["large_topology"] is True
+    assert candidate["affected_fact_count"] == 21
+    assert candidate["risk_tier"] == "low"
+    assert gardener_candidate_reasoning_effort(candidate) == "low"
 
 
 def link_fact_to_entity(

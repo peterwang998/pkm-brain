@@ -28,6 +28,10 @@ MERGE_EVIDENCE_OVERLAP_FLOOR = 0.25
 MERGE_EVIDENCE_ONLY_PATH_FLOOR = 0.60
 MERGE_STRONG_EVIDENCE_OVERLAP_FLOOR = 0.45
 ENTITY_NAME_SIMILARITY_FLOOR = 0.88
+HIGH_CERTAINTY_ENTITY_MERGE_SIGNALS = {
+    "same_normalized_name_or_alias",
+    "same_compact_name_or_alias",
+}
 PAGE_SPLIT_FACT_FLOOR = 5
 PAGE_SPLIT_SECTION_FLOOR = 3
 REHOME_DESTINATION_SCORE_FLOOR = 0.35
@@ -336,7 +340,11 @@ def entity_merge_candidate(
     )
     affected_fact_count = len(all_fact_ids)
     large_topology = affected_fact_count >= 8
-    risk_tier = "high" if large_topology else signal["risk_tier"]
+    risk_tier = (
+        signal["risk_tier"]
+        if signal["merge_signal"] in HIGH_CERTAINTY_ENTITY_MERGE_SIGNALS
+        else "high" if large_topology else signal["risk_tier"]
+    )
     entity_ids = [str(canonical["id"]), str(merged["id"])]
     return {
         "action_type": "entity_merge",
@@ -784,11 +792,13 @@ def judge_gardener_candidate(
 
 
 def gardener_candidate_reasoning_effort(candidate: dict[str, Any]) -> str:
+    merge_signal = str(candidate.get("merge_signal") or "")
+    if merge_signal in HIGH_CERTAINTY_ENTITY_MERGE_SIGNALS and str(candidate.get("risk_tier") or "").lower() == "low":
+        return "low"
     if bool(candidate.get("large_topology")) or bool(candidate.get("cross_entity_merge")):
         return "xhigh"
     if bool(candidate.get("cross_type_merge")) or bool(candidate.get("type_mismatch")):
         return "xhigh"
-    merge_signal = str(candidate.get("merge_signal") or "")
     if merge_signal in {"name_containment", "near_name_with_evidence_overlap"}:
         return "xhigh"
     if str(candidate.get("risk_tier") or "").lower() == "high":

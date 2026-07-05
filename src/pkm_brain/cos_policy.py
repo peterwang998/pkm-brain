@@ -11,6 +11,10 @@ from .util import new_id, now_iso
 
 AUTONOMY_ORDER = {"L0": 0, "L1": 1, "L2": 2, "L3": 3}
 TOPOLOGY_ACTION_TYPES = {"page_merge", "page_split", "rename_page", "entity_merge", "entity_split"}
+HIGH_CERTAINTY_ENTITY_MERGE_SIGNALS = {
+    "same_normalized_name_or_alias",
+    "same_compact_name_or_alias",
+}
 LOW_AUTONOMY_ACTION_TYPES = {
     "fact_merge",
     "fact_supersede",
@@ -289,6 +293,10 @@ def classify_action_risk(
         if bool(features.get("clean_fact_upsert")) and features.get("fact_upsert_resolution") == "new_clean_fact":
             return "medium"
         return "high"
+    if action_type == "entity_merge" and high_certainty_entity_merge(features):
+        if explicit == "high" or bool(features.get("truth_contradiction")):
+            return "high"
+        return explicit or "low"
     if action_type in TOPOLOGY_ACTION_TYPES:
         large = (
             bool(features.get("large_topology"))
@@ -325,6 +333,17 @@ def classify_action_risk(
     if action_type in MEDIUM_AUTONOMY_ACTION_TYPES:
         return "medium"
     return "high"
+
+
+def high_certainty_entity_merge(features: dict[str, Any]) -> bool:
+    merge_signal = str(features.get("merge_signal") or "")
+    if merge_signal not in HIGH_CERTAINTY_ENTITY_MERGE_SIGNALS:
+        return False
+    return not (
+        bool(features.get("cross_entity_merge"))
+        or bool(features.get("cross_type_merge"))
+        or bool(features.get("type_mismatch"))
+    )
 
 
 def normalize_risk_tier(value: str | None) -> str | None:
@@ -429,7 +448,7 @@ def autonomy_policy_rows(
         policy_row(
             version,
             "large_topology_l3",
-            10,
+            15,
             sorted(TOPOLOGY_ACTION_TYPES),
             {
                 "any": [
@@ -445,6 +464,33 @@ def autonomy_policy_rows(
             "L3",
             False,
             1.0,
+            created_at,
+        ),
+        policy_row(
+            version,
+            "entity_merge_high_certainty_l1",
+            10,
+            ["entity_merge"],
+            {
+                "all": [
+                    {
+                        "eq": {
+                            "risk_tier": "low",
+                            "cross_entity_merge": False,
+                            "cross_type_merge": False,
+                            "type_mismatch": False,
+                        }
+                    },
+                    {
+                        "in": {
+                            "merge_signal": sorted(HIGH_CERTAINTY_ENTITY_MERGE_SIGNALS)
+                        }
+                    },
+                ]
+            },
+            "L1",
+            False,
+            0.25,
             created_at,
         ),
         policy_row(
