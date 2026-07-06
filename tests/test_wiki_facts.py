@@ -10,6 +10,7 @@ from pkm_brain.wiki_curation_promote import promote_wiki_curation
 from pkm_brain.wiki_fact_migration import extract_fact_statements
 from pkm_brain.wiki_facts import (
     answer_open_question,
+    apply_fact_status_action,
     archive_orphan_managed_pages,
     compact_statement,
     create_confirmed_page_fact,
@@ -453,6 +454,58 @@ def test_resolve_fact_groups_records_display_contested_action(tmp_path: Path) ->
         "fact_conflict_left": "conflicted",
         "fact_conflict_right": "conflicted",
     }
+
+
+def test_fact_status_action_skips_exact_noop_updates(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    with connection(paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO facts(
+              id, statement, entity_key, page_hint, section_hint, source_ids,
+              observed_at, confidence, status, supersedes_id, conflict_group_id,
+              confirmed_by_user, metadata, created_at, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "fact_already_active",
+                "The already-active fact should not create a resolver action.",
+                "concepts:test-service:summary",
+                "concepts/test-service.md",
+                "Summary",
+                json.dumps(["document:fact_already_active"]),
+                "2026-06-23T00:00:00+00:00",
+                0.8,
+                "active",
+                None,
+                None,
+                0,
+                "{}",
+                "2026-06-23T00:00:00+00:00",
+                None,
+            ),
+        )
+
+    result = apply_fact_status_action(
+        paths,
+        "fact_supersede",
+        [
+            {
+                "fact_id": "fact_already_active",
+                "status": "active",
+                "conflict_group_id": None,
+            }
+        ],
+        proposed_by="resolve_fact_groups",
+        risk_tier="low",
+    )
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "no_fact_status_changes"
+    with connection(paths.sqlite_path) as conn:
+        action_count = conn.execute("SELECT COUNT(*) FROM cos_actions").fetchone()[0]
+    assert action_count == 0
 
 
 def test_resolver_llm_can_merge_same_claim_replacements(tmp_path: Path) -> None:

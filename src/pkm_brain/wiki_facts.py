@@ -844,6 +844,22 @@ def apply_fact_status_action(
     if not updates:
         raise ValueError("fact status action requires updates")
     facts = facts_by_id(paths, [str(update["fact_id"]) for update in updates])
+    facts_by_id_map = {str(fact["id"]): fact for fact in facts}
+    updates = [
+        update
+        for update in updates
+        if not fact_status_update_is_noop(facts_by_id_map.get(str(update["fact_id"])), update)
+    ]
+    if not updates:
+        return {
+            "id": None,
+            "action_type": action_type,
+            "status": "skipped",
+            "skipped": True,
+            "reason": "no_fact_status_changes",
+            "target_fact_ids": [],
+        }
+    facts = [facts_by_id_map[str(update["fact_id"])] for update in updates if str(update["fact_id"]) in facts_by_id_map]
     return apply_action(
         paths,
         propose_action(
@@ -867,6 +883,21 @@ def apply_fact_status_action(
             risk_tier=risk_tier,
         )["id"],
     )
+
+
+def fact_status_update_is_noop(fact: dict[str, Any] | None, update: dict[str, Any]) -> bool:
+    if fact is None:
+        return False
+    if "status" in update and str(update.get("status") or "") != str(fact.get("status") or ""):
+        return False
+    for key in ("supersedes_id", "conflict_group_id"):
+        if key in update and (update.get(key) or None) != (fact.get(key) or None):
+            return False
+    if "confirmed_by_user" in update and bool(update.get("confirmed_by_user")) != bool(
+        fact.get("confirmed_by_user")
+    ):
+        return False
+    return True
 
 
 def apply_display_contested_action(
