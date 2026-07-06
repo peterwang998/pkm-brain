@@ -34,6 +34,7 @@ from pkm_brain.extraction import (
     extraction_prompt,
     extract_recent_documents,
     record_critic_block_rate_anomalies,
+    reclaim_unrouted_facts,
     validate_extracted_facts,
     validate_extracted_facts_with_report,
 )
@@ -2561,6 +2562,77 @@ def test_critic_block_rate_anomaly_creates_one_document_residue(
     assert residues[0]["status"] == "needs_human"
     assert "3/4 extracted facts" in residues[0]["question"]
     assert json.loads(residues[0]["context"])["document_id"] == "doc_blocked"
+
+
+def test_reclaim_unrouted_facts_dry_run_routes_against_current_page_pool(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    with connection(svc.paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO wiki_pages(
+              id, title, page_type, status, path, source_ids, related, tags,
+              created_at, updated_at, managed, fact_ids
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "page_sierra",
+                "Sierra",
+                "organization",
+                "active",
+                str(svc.paths.wiki / "companies/sierra.md"),
+                "[]",
+                "[]",
+                "[]",
+                "2026-07-06T00:00:00+00:00",
+                "2026-07-06T00:00:00+00:00",
+                1,
+                "[]",
+            ),
+        )
+    action = propose_action(
+        svc.paths,
+        "fact_upsert",
+        action_payload={
+            "fact": {
+                "statement": "Sierra builds agent customer-service software.",
+                "entity_key": "concepts:concepts-extracted-facts:summary",
+                "page_hint": "concepts/extracted-facts.md",
+                "section_hint": "Summary",
+                "source_ids": ["chunk:chunk_test"],
+                "source_spans": [{"chunk_id": "chunk_test", "start": 0, "end": 40}],
+                "evidence_quote": "Sierra builds agent customer-service software.",
+                "confidence": 0.5,
+                "truth_confidence": 0.5,
+                "metadata": {
+                    "routing": {
+                        "original_page_hint": "concepts/extracted-facts.md",
+                        "normalized_page_hint": "concepts/extracted-facts.md",
+                        "route_destination_valid": False,
+                        "route_resolution": "held_for_routing_review",
+                        "route_review_reason": "fallback_page",
+                    }
+                },
+            }
+        },
+        target_page_paths=["concepts/extracted-facts.md"],
+        proposed_by="test",
+        decide=False,
+    )
+    mark_action_residue(
+        svc.paths,
+        action["id"],
+        kind="unrouted_fact",
+        reason="Extractor routed the candidate to the fallback page.",
+    )
+
+    result = reclaim_unrouted_facts(svc.paths, dry_run=True)
+
+    assert result["reclaimable"] == 1
+    assert result["preview"][0]["old_action_id"] == action["id"]
+    assert result["preview"][0]["new_page_hint"] == "companies/sierra.md"
 
 
 def test_missing_critic_provider_blocks_required_critic_auto_apply(

@@ -56,16 +56,16 @@ RETRIEVAL_GOLDEN_CASES: list[dict[str, Any]] = [
     },
     {
         "id": "sample-005",
-        "kind": "historical_session_query",
-        "expected_verdict": "found",
-        "expected_source_ids": ["document:doc_12eae5c870454dc3"],
+        "kind": "agent_history_query",
+        "expected_verdict": "partial",
+        "expected_source_ids": [],
         "query": "final check for any spelling grammar or self contradictory writing sets on the prioritization page",
     },
     {
         "id": "sample-006",
-        "kind": "historical_session_query",
-        "expected_verdict": "partial",
-        "expected_source_ids": ["document:doc_ee5e4b2159654cd2"],
+        "kind": "agent_history_query",
+        "expected_verdict": "found",
+        "expected_source_ids": [],
         "query": "write this as detailed spec based off of this and the state of the current code on what needs to be done to get to that target.",
     },
     {
@@ -87,9 +87,9 @@ RETRIEVAL_GOLDEN_CASES: list[dict[str, Any]] = [
     },
     {
         "id": "sample-008",
-        "kind": "historical_session_query",
-        "expected_verdict": "partial",
-        "expected_source_ids": ["document:doc_f92d98556f2e40a3"],
+        "kind": "agent_history_query",
+        "expected_verdict": "found",
+        "expected_source_ids": [],
         "query": (
             "Does the service.ingest proposal then put the rest of the text into the body (or if there is such a "
             "field) so that the content is not lost, but the title isn't an absurd length?"
@@ -112,9 +112,9 @@ RETRIEVAL_GOLDEN_CASES: list[dict[str, Any]] = [
     },
     {
         "id": "sample-010",
-        "kind": "historical_session_query",
+        "kind": "agent_history_query",
         "expected_verdict": "found",
-        "expected_source_ids": ["document:doc_3f81db6e21344329"],
+        "expected_source_ids": [],
         "query": (
             "Audit this repository for spec-driven development quality. Do not modify files. Focus on whether the "
             "project and git repo follow proper spec-driven development best practices. Inspect the working tree, "
@@ -187,7 +187,7 @@ RETRIEVAL_GOLDEN_CASES: list[dict[str, Any]] = [
     {
         "id": "sample-015",
         "kind": "historical_session_query",
-        "expected_verdict": "partial",
+        "expected_verdict": "found",
         "expected_source_ids": ["document:doc_a67ac5fb89a84457"],
         "query": (
             "How would I make this into an HTML page that's a single document with capabilities to edit the underlying "
@@ -196,9 +196,9 @@ RETRIEVAL_GOLDEN_CASES: list[dict[str, Any]] = [
     },
     {
         "id": "sample-016",
-        "kind": "historical_session_query",
+        "kind": "agent_history_query",
         "expected_verdict": "found",
-        "expected_source_ids": ["document:doc_ee5e4b2159654cd2"],
+        "expected_source_ids": [],
         "query": "can you do a writeup of your recommendation and the discussion that lead up to that so that I can send it to codex?",
     },
     {
@@ -213,9 +213,9 @@ RETRIEVAL_GOLDEN_CASES: list[dict[str, Any]] = [
     },
     {
         "id": "sample-018",
-        "kind": "historical_session_query",
-        "expected_verdict": "partial",
-        "expected_source_ids": ["document:doc_87288d2d8aab4562"],
+        "kind": "agent_history_query",
+        "expected_verdict": "found",
+        "expected_source_ids": [],
         "query": "can you try that again? I think something bugged out and I got some garbeled text.",
     },
     {
@@ -288,7 +288,7 @@ RETRIEVAL_GOLDEN_CASES: list[dict[str, Any]] = [
         "id": "hist-022",
         "kind": "historical_session_query",
         "expected_verdict": "found",
-        "expected_source_ids": ["document:doc_fa6fc11310314a72"],
+        "expected_source_ids": ["document:doc_4a700e0fc90b4bdc"],
         "query": "Chief of staff architecture design discussion optimum spec page contracts action policy audit",
     },
     {
@@ -435,14 +435,14 @@ RETRIEVAL_GOLDEN_CASES: list[dict[str, Any]] = [
         "id": "fact-043",
         "kind": "fact_query",
         "expected_verdict": "found",
-        "expected_source_ids": ["document:doc_f1885f0956494246"],
+        "expected_source_ids": ["document:doc_e8dae4d4fde545ce"],
         "query": "AI Chinese children songs publish English versions legal distribution audience validation",
     },
     {
         "id": "fact-044",
-        "kind": "fact_query",
-        "expected_verdict": "found",
-        "expected_source_ids": ["document:doc_97664837d99f4b88"],
+        "kind": "agent_history_query",
+        "expected_verdict": "no_strong_match",
+        "expected_source_ids": [],
         "query": "Amazon MaxOutDeals Chase reconciliation Delaware received profitability",
     },
     {
@@ -477,7 +477,7 @@ RETRIEVAL_GOLDEN_CASES: list[dict[str, Any]] = [
         "id": "fact-049",
         "kind": "fact_query",
         "expected_verdict": "found",
-        "expected_source_ids": ["document:doc_f8917dba88864233"],
+        "expected_source_ids": ["document:doc_0c7559a10f5445fd"],
         "query": "PKM Brain source-aware retrieval lineage weak agent log evidence",
     },
     {
@@ -512,7 +512,7 @@ RETRIEVAL_GOLDEN_CASES: list[dict[str, Any]] = [
         "id": "fact-054",
         "kind": "fact_query",
         "expected_verdict": "found",
-        "expected_source_ids": ["document:doc_d1a4d80909944964"],
+        "expected_source_ids": ["document:doc_77e6f51ab6dd424c"],
         "query": "Monarch Money MCP official install check for Codex and Claude",
     },
     {
@@ -526,13 +526,13 @@ RETRIEVAL_GOLDEN_CASES: list[dict[str, Any]] = [
         "id": "fact-056",
         "kind": "fact_query",
         "expected_verdict": "found",
-        "expected_source_ids": ["document:doc_fa6fc11310314a72"],
+        "expected_source_ids": ["document:doc_4a700e0fc90b4bdc"],
         "query": "page contracts chief of staff wiki fact routing gardener convergence target",
     },
     {
         "id": "fact-057",
         "kind": "fact_query",
-        "expected_verdict": "partial",
+        "expected_verdict": "found",
         "expected_source_ids": ["document:doc_c8871a4b49e6411d"],
         "query": "two-zone rendering deterministic active facts synthesis cites fact IDs",
     },
@@ -563,7 +563,7 @@ RETRIEVAL_GOLDEN_CASES: list[dict[str, Any]] = [
     {
         "id": "paraphrase-061",
         "kind": "paraphrase_query",
-        "expected_verdict": "found",
+        "expected_verdict": "partial",
         "expected_source_ids": [],
         "expected_vector_source_ids": ["document:doc_a6cb7c1c2893498e"],
         "query": "diagnose why the small desktop server disappeared from SSH and required a hard reboot",

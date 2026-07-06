@@ -132,6 +132,17 @@ def provenance_check(paths: BrainPaths) -> dict[str, Any]:
                         errors.append(f"retrieval {event['id']} wiki_page snapshot {index} is malformed")
                     if not isinstance(snapshot.get("source_ids", []), list):
                         errors.append(f"retrieval {event['id']} wiki_page snapshot {index} has non-list source_ids")
+                elif snapshot_type == "fact":
+                    required = ["fact_id", "statement"]
+                    missing = [key for key in required if not snapshot.get(key)]
+                    if missing:
+                        errors.append(
+                            f"retrieval {event['id']} fact snapshot {index} missing {', '.join(missing)}"
+                        )
+                    if not isinstance(snapshot.get("source_ids", []), list):
+                        errors.append(f"retrieval {event['id']} fact snapshot {index} has non-list source_ids")
+                    if not isinstance(snapshot.get("source_spans", []), list):
+                        errors.append(f"retrieval {event['id']} fact snapshot {index} has non-list source_spans")
                 else:
                     errors.append(f"retrieval {event['id']} snapshot {index} has unknown type {snapshot_type!r}")
     return {"errors": errors, "warnings": warnings}

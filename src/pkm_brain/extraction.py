@@ -1143,6 +1143,328 @@ def candidate_route_metadata(candidate: dict[str, Any]) -> dict[str, Any]:
     return routing if isinstance(routing, dict) else {}
 
 
+def fact_route_reclaim_query(candidate: dict[str, Any]) -> str:
+    metadata = candidate.get("metadata") if isinstance(candidate.get("metadata"), dict) else {}
+    mention_surfaces = []
+    for mention in metadata.get("model_entity_mentions") or candidate.get("entity_mentions") or []:
+        if isinstance(mention, dict) and mention.get("surface"):
+            mention_surfaces.append(str(mention["surface"]))
+    return "\n".join(
+        part
+        for part in (
+            str(candidate.get("statement") or ""),
+            str(candidate.get("entity_key") or ""),
+            str(candidate.get("entity_mention") or ""),
+            str(metadata.get("model_entity_key") or ""),
+            " ".join(mention_surfaces),
+            str(candidate.get("section_hint") or ""),
+            str(candidate.get("evidence_quote") or ""),
+        )
+        if part.strip()
+    )
+
+
+RECLAIM_ROUTE_EXTRA_STOP_TOKENS = {
+    "agent",
+    "agents",
+    "analytics",
+    "business",
+    "customer",
+    "customers",
+    "data",
+    "delivery",
+    "enterprise",
+    "market",
+    "management",
+    "model",
+    "models",
+    "native",
+    "platform",
+    "product",
+    "products",
+    "proposition",
+    "role",
+    "service",
+    "services",
+    "strategy",
+    "value",
+    "vision",
+    "workflow",
+    "workflows",
+}
+
+
+def reclaim_route_tokens(value: str) -> set[str]:
+    return routing_signal_tokens(value) - RECLAIM_ROUTE_EXTRA_STOP_TOKENS
+
+
+def score_reclaim_route(query_text: str, hint: dict[str, Any]) -> dict[str, Any]:
+    query_tokens = reclaim_route_tokens(query_text)
+    hint_tokens = reclaim_route_tokens(routing_hint_text(hint))
+    overlap = sorted(query_tokens & hint_tokens)
+    phrase_bonus = routing_phrase_bonus(query_text, hint)
+    source_bonus = 1.0 if hint.get("_routing_source") == "page_contract" else 0.0
+    score = source_bonus + phrase_bonus
+    if overlap:
+        score += float(len(overlap) * 5)
+        score += float(len(overlap)) / max(1.0, float(len(hint_tokens)))
+    return {
+        "page_hint": str(hint.get("page_hint") or ""),
+        "score": round(score, 4),
+        "overlap": overlap,
+        "phrase_bonus": round(phrase_bonus, 4),
+        "source": hint.get("_routing_source"),
+    }
+
+
+def select_reclaim_route(
+    candidate: dict[str, Any],
+    route_targets: dict[str, dict[str, Any]],
+    *,
+    min_score: float,
+    min_overlap: int,
+) -> dict[str, Any] | None:
+    original_page_hint = normalize_extraction_page_hint(str(candidate.get("page_hint") or ""))
+    if original_page_hint and original_page_hint not in DEFAULT_FALLBACK_PAGE_HINTS:
+        resolved_page_hint, routing = resolve_extraction_page_hint(original_page_hint, route_targets)
+        if (
+            routing.get("route_destination_valid") is not False
+            and resolved_page_hint not in DEFAULT_FALLBACK_PAGE_HINTS
+            and routing.get("route_resolution") != "new_canonical_page"
+        ):
+            return {
+                "page_hint": resolved_page_hint,
+                "score": None,
+                "overlap": [],
+                "phrase_bonus": None,
+                "source": "original_page_hint",
+            }
+
+    query_text = fact_route_reclaim_query(candidate)
+    best: dict[str, Any] | None = None
+    for hint in route_targets.values():
+        page_hint = normalize_extraction_page_hint(str(hint.get("page_hint") or ""))
+        if not page_hint or page_hint in DEFAULT_FALLBACK_PAGE_HINTS:
+            continue
+        scored = score_reclaim_route(query_text, hint)
+        overlap_count = len(scored["overlap"])
+        if overlap_count < min_overlap:
+            if float(scored["phrase_bonus"] or 0.0) <= 0.0:
+                continue
+            namespace = page_hint.split("/", 1)[0]
+            if namespace not in {"companies", "people"}:
+                continue
+        if float(scored["score"]) < min_score:
+            continue
+        if best is None or (float(scored["score"]), page_hint) > (
+            float(best["score"]),
+            str(best["page_hint"]),
+        ):
+            best = scored
+    return best
+
+
+def reroute_unrouted_candidate(
+    candidate: dict[str, Any],
+    route_targets: dict[str, dict[str, Any]],
+    *,
+    min_score: float,
+    min_overlap: int,
+) -> dict[str, Any] | None:
+    selected = select_reclaim_route(
+        candidate,
+        route_targets,
+        min_score=min_score,
+        min_overlap=min_overlap,
+    )
+    if selected is None:
+        return None
+    routed = json.loads(json.dumps(candidate))
+    original_page_hint = normalize_extraction_page_hint(str(candidate.get("page_hint") or ""))
+    page_hint, routing = resolve_extraction_page_hint(str(selected["page_hint"]), route_targets)
+    if routing.get("route_destination_valid") is False or page_hint in DEFAULT_FALLBACK_PAGE_HINTS:
+        return None
+    routed["page_hint"] = page_hint
+    section_hint = str(routed.get("section_hint") or "")
+    routed["entity_key"] = entity_key_for_change(
+        topic_for_path(page_hint), page_hint, section_hint
+    )
+    metadata = routed.get("metadata") if isinstance(routed.get("metadata"), dict) else {}
+    metadata = dict(metadata)
+    metadata["routing"] = {
+        **routing,
+        "reclaimed_from_page_hint": original_page_hint,
+        "reclaim_route_score": selected.get("score"),
+        "reclaim_route_overlap": selected.get("overlap") or [],
+        "reclaim_route_source": selected.get("source"),
+    }
+    routed["metadata"] = metadata
+    return routed
+
+
+def reclaim_unrouted_facts(
+    paths: BrainPaths,
+    *,
+    dry_run: bool = True,
+    limit: int | None = None,
+    min_score: float = 8.0,
+    min_overlap: int = 2,
+    critic_review: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    route_targets = load_extraction_route_targets(paths)
+    limit_clause = "LIMIT ?" if limit is not None else ""
+    params: tuple[Any, ...] = (limit,) if limit is not None else ()
+    with connection(paths.sqlite_path) as conn:
+        question_rows = rows(
+            conn,
+            f"""
+            SELECT *
+            FROM open_questions
+            WHERE kind = 'unrouted_fact'
+              AND status IN ('open', 'needs_human')
+            ORDER BY created_at, id
+            {limit_clause}
+            """,
+            params,
+        )
+    reclaimable: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for question in question_rows:
+        action_id = str(question["action_id"] or "")
+        if not action_id:
+            skipped.append({"question_id": question["id"], "reason": "missing_action_id"})
+            continue
+        try:
+            action = get_action(paths, action_id)
+        except ValueError:
+            skipped.append({"question_id": question["id"], "action_id": action_id, "reason": "missing_action"})
+            continue
+        payload = (action.get("evidence_json") or {}).get("payload") or {}
+        candidate = payload.get("fact") if isinstance(payload, dict) else None
+        if not isinstance(candidate, dict):
+            skipped.append({"question_id": question["id"], "action_id": action_id, "reason": "missing_fact_payload"})
+            continue
+        rerouted = reroute_unrouted_candidate(
+            candidate,
+            route_targets,
+            min_score=min_score,
+            min_overlap=min_overlap,
+        )
+        if rerouted is None:
+            skipped.append(
+                {
+                    "question_id": question["id"],
+                    "action_id": action_id,
+                    "reason": "no_confident_route",
+                    "statement": str(candidate.get("statement") or "")[:180],
+                    "page_hint": candidate.get("page_hint"),
+                }
+            )
+            continue
+        routing = candidate_route_metadata(rerouted)
+        reclaimable.append(
+            {
+                "question_id": question["id"],
+                "old_action_id": action_id,
+                "old_evidence_json": action.get("evidence_json") or {},
+                "candidate": rerouted,
+                "old_page_hint": candidate.get("page_hint"),
+                "new_page_hint": rerouted.get("page_hint"),
+                "route_score": routing.get("reclaim_route_score"),
+                "route_overlap": routing.get("reclaim_route_overlap") or [],
+                "statement": str(rerouted.get("statement") or "")[:220],
+            }
+        )
+    preview = [
+        {
+            key: value
+            for key, value in item.items()
+            if key not in {"candidate", "old_evidence_json"}
+        }
+        for item in reclaimable
+    ]
+    if dry_run or not reclaimable:
+        return {
+            "status": "dry_run" if dry_run else "ok",
+            "inspected": len(question_rows),
+            "reclaimable": len(reclaimable),
+            "skipped": len(skipped),
+            "preview": preview[:25],
+            "skipped_examples": skipped[:25],
+        }
+
+    review = critic_review or {
+        **default_critic_review_config(),
+        "disagreement_mode": "reject",
+    }
+    actions = propose_policy_gated_candidates(
+        paths,
+        [item["candidate"] for item in reclaimable],
+        run_id=None,
+        critic_review=review,
+    )
+    timestamp = now_iso()
+    resolved = 0
+    with connection(paths.sqlite_path) as conn:
+        for item, new_action in zip(reclaimable, actions):
+            answer = {
+                "reason": "unrouted fact reclaimed against full route pool",
+                "old_action_id": item["old_action_id"],
+                "new_action_id": new_action["id"],
+                "new_action_status": new_action["status"],
+                "new_page_hint": item["new_page_hint"],
+                "route_score": item["route_score"],
+                "route_overlap": item["route_overlap"],
+            }
+            conn.execute(
+                """
+                UPDATE open_questions
+                SET status = 'auto_resolved',
+                    answer = ?,
+                    answered_at = ?,
+                    decided_by = ?
+                WHERE id = ?
+                """,
+                (dumps(answer), timestamp, "reclaim_unrouted_facts", item["question_id"]),
+            )
+            old_row = conn.execute(
+                "SELECT * FROM cos_actions WHERE id = ?", (item["old_action_id"],)
+            ).fetchone()
+            if old_row is not None:
+                evidence = dict(item.get("old_evidence_json") or {})
+                evidence["reclaimed_by_action_id"] = new_action["id"]
+                evidence["reclaim_answer"] = answer
+                conn.execute(
+                    """
+                    UPDATE cos_actions
+                    SET status = 'rejected',
+                        policy_decision = COALESCE(policy_decision, 'reclaimed_unrouted'),
+                        evidence_json = ?
+                    WHERE id = ?
+                    """,
+                    (dumps(evidence), item["old_action_id"]),
+                )
+            resolved += 1
+    return {
+        "status": "ok",
+        "inspected": len(question_rows),
+        "reclaimable": len(reclaimable),
+        "resolved": resolved,
+        "skipped": len(skipped),
+        "actions": [
+            {
+                "id": action["id"],
+                "status": action["status"],
+                "critic_decision": action.get("critic_decision"),
+                "audit_status": action.get("audit_status"),
+            }
+            for action in actions
+        ],
+        "preview": preview[:25],
+        "skipped_examples": skipped[:25],
+    }
+
+
 def resolver_precheck_conflict_reason(
     paths: BrainPaths, candidate: dict[str, Any]
 ) -> str | None:
@@ -1827,34 +2149,55 @@ ROUTING_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_/-]{1,}")
 ROUTING_STOP_TOKENS = {
     "about",
     "after",
+    "and",
     "answer",
     "answers",
     "before",
     "brain",
+    "candidate",
+    "career",
+    "companies",
     "company",
     "concept",
+    "concepts",
     "decision",
+    "decisions",
     "details",
     "example",
     "facts",
+    "for",
+    "from",
     "here",
+    "idea",
+    "ideas",
     "into",
+    "loops",
     "markdown",
     "notes",
     "open",
+    "open_loops",
     "page",
     "pages",
+    "participant",
+    "people",
     "project",
+    "projects",
     "questions",
     "reference",
     "related",
+    "said",
+    "says",
+    "speaker",
     "summary",
     "target",
     "test",
     "that",
+    "them",
     "their",
     "there",
+    "they",
     "this",
+    "using",
     "what",
     "when",
     "where",

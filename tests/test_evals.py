@@ -16,7 +16,9 @@ def test_retrieval_fixture_base_is_stratified() -> None:
         kinds[case["kind"]] = kinds.get(case["kind"], 0) + 1
 
     assert len(RETRIEVAL_GOLDEN_CASES) >= 70
-    assert kinds["historical_session_query"] >= 30
+    assert kinds["historical_session_query"] >= 20
+    assert kinds["agent_history_query"] >= 6
+    assert kinds["historical_session_query"] + kinds["agent_history_query"] >= 30
     assert kinds["source_document_query"] >= 10
     assert kinds["fact_query"] >= 10
     assert kinds["paraphrase_query"] >= 3

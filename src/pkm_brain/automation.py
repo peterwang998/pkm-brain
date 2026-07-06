@@ -723,8 +723,8 @@ def render_nightly_launch_agent(
         "StandardErrorPath": str(brain_home / "logs" / "nightly-maintenance.err.log"),
         "WorkingDirectory": str(repo_path),
     }
+    environment = {}
     if with_llm_memory_proposals:
-        environment = {}
         if llm_provider:
             environment["PKM_BRAIN_LLM_PROVIDER"] = llm_provider
         if llm_provider == "openai":
@@ -739,8 +739,13 @@ def render_nightly_launch_agent(
             if codex_bin:
                 environment["PKM_BRAIN_CODEX_BIN"] = codex_bin
             environment["PKM_BRAIN_CODEX_CWD"] = str(repo_path)
-        if environment:
-            plist["EnvironmentVariables"] = environment
+    if llm_wiki:
+        codex_bin = os.environ.get("PKM_BRAIN_CODEX_BIN") or shutil.which("codex")
+        if codex_bin:
+            environment.setdefault("PKM_BRAIN_CODEX_BIN", codex_bin)
+            environment.setdefault("PKM_BRAIN_CODEX_CWD", str(repo_path))
+    if environment:
+        plist["EnvironmentVariables"] = environment
     return plist
 
 

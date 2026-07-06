@@ -29,6 +29,7 @@ from .automation import (
 from .capture import AgentLogCapture
 from .db import connection, rows
 from .evals import run_eval
+from .extraction import critic_review_config, reclaim_unrouted_facts
 from .cos_policy import promote_policy_for_autonomy
 from .llm import cos_provider_status, provider_status
 from .memory_proposals import propose_failure_memories_from_sources, propose_memories_from_lineage
@@ -763,6 +764,36 @@ def cos_rebuild_facts(
     except ValueError as exc:
         console.print(str(exc))
         raise typer.Exit(1)
+    console.print_json(json.dumps(result))
+
+
+@cos_app.command("reclaim-unrouted")
+def cos_reclaim_unrouted(
+    dry_run: bool = typer.Option(True, "--dry-run/--apply", help="Preview by default; --apply writes replacement actions and resolves reclaimed residue."),
+    limit: Optional[int] = typer.Option(None, "--limit", min=1, help="Maximum unrouted residue questions to inspect."),
+    min_score: float = typer.Option(8.0, "--min-score", help="Minimum deterministic route score required to reclaim."),
+    min_overlap: int = typer.Option(2, "--min-overlap", min=1, help="Minimum route-token overlap unless the page phrase is an exact substring."),
+    critic_disagreement_mode: str = typer.Option("reject", "--critic-disagreement-mode", help="How critic disagreement is handled for reclaimed fact_upsert actions."),
+    critic_workers: Optional[int] = typer.Option(None, "--critic-workers", min=1, help="Parallel critic workers for apply mode."),
+    critic_timeout_seconds: Optional[int] = typer.Option(None, "--critic-timeout-seconds", min=1, help="Per-fact critic timeout for apply mode."),
+    home: Optional[Path] = typer.Option(None, help="Brain home directory."),
+) -> None:
+    paths = BrainPaths.from_value(home)
+    BrainService(paths).init_workspace()
+    review = critic_review_config(
+        {},
+        disagreement_mode=critic_disagreement_mode,
+        max_workers=critic_workers,
+        timeout_seconds=critic_timeout_seconds,
+    )
+    result = reclaim_unrouted_facts(
+        paths,
+        dry_run=dry_run,
+        limit=limit,
+        min_score=min_score,
+        min_overlap=min_overlap,
+        critic_review=review,
+    )
     console.print_json(json.dumps(result))
 
 

@@ -7,6 +7,7 @@ from pkm_brain.audit import audit_memories, provenance_check
 from pkm_brain.chunking import chunk_text, sanitize_agent_session_log
 from pkm_brain.db import connection
 from pkm_brain.embeddings import EmbeddingProviderUnavailable, SentenceTransformerProvider
+from pkm_brain.evals import retrieval_result_source_ids
 from pkm_brain.indexes import lancedb_stats, table_names, upsert_vectors
 from pkm_brain.memory_proposals import propose_failure_memories_from_sources, propose_memories_from_lineage
 from pkm_brain.paths import BrainPaths
@@ -599,6 +600,64 @@ def test_provenance_check_allows_snapshot_drift_and_flags_malformed_snapshots(tm
     audit = provenance_check(svc.paths)
 
     assert any("malformed citation_snapshots" in error for error in audit["errors"])
+
+
+def test_provenance_check_accepts_fact_citation_snapshots(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+
+    with connection(svc.paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO retrieval_events(
+              id, query, timestamp, caller, returned_chunk_ids, selected_chunk_ids, citation_snapshots, debug
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "retrieval_fact_snapshot",
+                "fact citation",
+                "2026-07-06T00:00:00+00:00",
+                "test",
+                "[]",
+                "[]",
+                json.dumps(
+                    [
+                        {
+                            "type": "fact",
+                            "fact_id": "fact_snapshot_only",
+                            "statement": "Snapshot-backed fact citations remain valid after live rows change.",
+                            "source_ids": ["chunk:chunk_snapshot"],
+                            "source_spans": [{"chunk_id": "chunk_snapshot", "start": 0, "end": 20}],
+                        }
+                    ]
+                ),
+                "{}",
+            ),
+        )
+
+    assert provenance_check(svc.paths)["errors"] == []
+
+
+def test_retrieval_result_source_ids_maps_chunk_source_ids_to_documents(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "chunk-source-map.md"
+    note.write_text("# Chunk Source Map\n\nchunk source map marker.\n", encoding="utf-8")
+    svc.ingest()
+
+    with connection(svc.paths.sqlite_path) as conn:
+        chunk = conn.execute("SELECT id, document_id FROM chunks LIMIT 1").fetchone()
+
+    source_ids = retrieval_result_source_ids(
+        svc.paths,
+        {
+            "relevant_wiki_pages": [
+                {"source_ids": [f"chunk:{chunk['id']}"]},
+            ]
+        },
+    )
+
+    assert f"document:{chunk['document_id']}" in source_ids
 
 
 def test_reset_retrieval_index_preserves_documents_and_rebuilds_artifacts(tmp_path: Path) -> None:

@@ -664,6 +664,25 @@ def test_nightly_launch_agent_plist_render_uses_codex_as_default_llm_provider(mo
     assert decoded["EnvironmentVariables"]["PKM_BRAIN_CODEX_BIN"] == "/opt/homebrew/bin/codex"
 
 
+def test_nightly_launch_agent_plist_render_sets_codex_bin_for_wiki_synthesis(monkeypatch) -> None:
+    monkeypatch.setenv("PKM_BRAIN_CODEX_BIN", "/opt/homebrew/bin/codex")
+    repo_path = Path.home() / "pkm-brain"
+    brain_home = Path.home() / "brain"
+    plist = render_nightly_launch_agent(
+        repo_path=repo_path,
+        brain_home=brain_home,
+        uv_path=Path("/opt/homebrew/bin/uv"),
+        interval=3600,
+        due_after_hours=20,
+    )
+    decoded = plistlib.loads(plistlib.dumps(plist))
+
+    assert "--with-llm-memory-proposals" not in decoded["ProgramArguments"][-1]
+    assert "PKM_BRAIN_LLM_PROVIDER" not in decoded["EnvironmentVariables"]
+    assert decoded["EnvironmentVariables"]["PKM_BRAIN_CODEX_BIN"] == "/opt/homebrew/bin/codex"
+    assert decoded["EnvironmentVariables"]["PKM_BRAIN_CODEX_CWD"] == str(repo_path)
+
+
 def test_nightly_launch_agent_plist_render_with_codex_memory_proposals(monkeypatch) -> None:
     monkeypatch.setenv("PKM_BRAIN_CODEX_BIN", "/opt/homebrew/bin/codex")
     repo_path = Path.home() / "pkm-brain"

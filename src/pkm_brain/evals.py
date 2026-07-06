@@ -881,6 +881,17 @@ def first_fanout_source_rank(rows: list[dict[str, Any]], expected_sources: set[s
 def retrieval_result_source_ids(paths: BrainPaths, result: dict[str, Any]) -> set[str]:
     source_ids: set[str] = set()
     chunk_ids: set[str] = set()
+
+    def add_source_id(value: Any) -> None:
+        source_id = str(value or "")
+        if not source_id:
+            return
+        source_ids.add(source_id)
+        if source_id.startswith("chunk:"):
+            chunk_id = source_id.split(":", 1)[1]
+            if chunk_id:
+                chunk_ids.add(chunk_id)
+
     for chunk in result.get("supporting_chunks") or result.get("results") or []:
         document_id = str(chunk.get("document_id") or "")
         if document_id:
@@ -889,9 +900,11 @@ def retrieval_result_source_ids(paths: BrainPaths, result: dict[str, Any]) -> se
         if chunk_id:
             chunk_ids.add(chunk_id)
     for page in result.get("relevant_wiki_pages") or []:
-        source_ids.update(str(item) for item in page.get("source_ids") or [] if item)
+        for item in page.get("source_ids") or []:
+            add_source_id(item)
     for fact in result.get("relevant_facts") or []:
-        source_ids.update(str(item) for item in fact.get("source_ids") or [] if item)
+        for item in fact.get("source_ids") or []:
+            add_source_id(item)
         for span in fact.get("source_spans") or []:
             if isinstance(span, dict) and span.get("chunk_id"):
                 chunk_ids.add(str(span["chunk_id"]))
@@ -901,7 +914,8 @@ def retrieval_result_source_ids(paths: BrainPaths, result: dict[str, Any]) -> se
         document_id = str(snapshot.get("document_id") or "")
         if document_id:
             source_ids.add(f"document:{document_id}")
-        source_ids.update(str(item) for item in snapshot.get("source_ids") or [] if item)
+        for item in snapshot.get("source_ids") or []:
+            add_source_id(item)
         for span in snapshot.get("source_spans") or []:
             if isinstance(span, dict) and span.get("chunk_id"):
                 chunk_ids.add(str(span["chunk_id"]))
