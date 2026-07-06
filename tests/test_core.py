@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from pkm_brain.audit import audit_memories, provenance_check
 from pkm_brain.chunking import chunk_text, sanitize_agent_session_log
 from pkm_brain.db import connection
@@ -1395,7 +1397,21 @@ def test_memory_audit_warns_on_missing_source(tmp_path: Path) -> None:
     assert any(memory_id in warning for warning in audit["warnings"])
 
 
-def test_memory_audit_accepts_failure_pattern_and_rejects_invalid_type(tmp_path: Path) -> None:
+def test_propose_memory_rejects_invalid_scope(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+
+    with pytest.raises(ValueError, match="invalid memory scope"):
+        svc.propose_memory(
+            "AgentFailurePatternMemory",
+            "pkm-brain",
+            "Malformed bare project scope should not be inserted.",
+            ["agent_session:test"],
+            0.8,
+        )
+
+
+def test_memory_audit_accepts_failure_pattern_and_warns_for_proposed_schema_issues(tmp_path: Path) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()
     svc.propose_memory("AgentFailurePatternMemory", "agent:codex", "When tests fail, inspect the failing assertion before editing.", ["agent_session:test"], 0.8)
@@ -1409,35 +1425,103 @@ def test_memory_audit_accepts_failure_pattern_and_rejects_invalid_type(tmp_path:
         ["agent_session:test"],
         0.4,
     )
-    invalid_scope_id = svc.propose_memory(
-        "FactMemory",
-        "user",
-        "Legacy user scope must be migrated before audit.",
-        ["agent_session:test"],
-        0.4,
-    )
+    invalid_scope_id = "mem_invalid_proposed_scope"
+    with connection(svc.paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO memories(
+              id, memory_type, scope, content, confidence, source_ids,
+              status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                invalid_scope_id,
+                "FactMemory",
+                "user",
+                "Legacy user scope must be migrated before audit.",
+                0.4,
+                json.dumps(["agent_session:test"]),
+                "proposed",
+                "2026-05-20T00:00:00+00:00",
+                "2026-05-20T00:00:00+00:00",
+            ),
+        )
 
     audit = audit_memories(svc.paths)
 
-    assert any(invalid_id in error and "invalid memory_type" in error for error in audit["errors"])
-    assert any(legacy_type_id in error and "invalid memory_type infrastructure" in error for error in audit["errors"])
-    assert any(invalid_scope_id in error and "invalid scope user" in error for error in audit["errors"])
+    assert audit["errors"] == []
+    assert any(invalid_id in warning and "invalid memory_type" in warning for warning in audit["warnings"])
+    assert any(legacy_type_id in warning and "invalid memory_type infrastructure" in warning for warning in audit["warnings"])
+    assert any(invalid_scope_id in warning and "invalid scope user" in warning for warning in audit["warnings"])
     assert not any("AgentFailurePatternMemory" in error for error in audit["errors"])
     assert not any("BusinessIdeaMemory" in error for error in audit["errors"])
     assert not any("PersonalLogisticsMemory" in error for error in audit["errors"])
 
 
-def test_memory_audit_warns_for_inactive_legacy_schema(tmp_path: Path) -> None:
+def test_memory_audit_errors_for_active_schema_issues(tmp_path: Path) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()
-    archived_id = svc.propose_memory(
-        "FactMemory",
-        "legacy-scope",
-        "Archived legacy memory should not fail nightly maintenance.",
+    invalid_type_id = svc.propose_memory(
+        "NopeMemory",
+        "global",
+        "Active invalid type should fail audit.",
         ["agent_session:test"],
         0.4,
     )
-    svc.archive_memory(archived_id)
+    svc.approve_memory(invalid_type_id)
+    invalid_scope_id = "mem_invalid_active_scope"
+    with connection(svc.paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO memories(
+              id, memory_type, scope, content, confidence, source_ids,
+              status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                invalid_scope_id,
+                "FactMemory",
+                "legacy-scope",
+                "Active invalid scope should fail audit.",
+                0.4,
+                json.dumps(["agent_session:test"]),
+                "active",
+                "2026-05-20T00:00:00+00:00",
+                "2026-05-20T00:00:00+00:00",
+            ),
+        )
+
+    audit = audit_memories(svc.paths)
+
+    assert any(invalid_type_id in error and "invalid memory_type" in error for error in audit["errors"])
+    assert any(invalid_scope_id in error and "invalid scope legacy-scope" in error for error in audit["errors"])
+
+
+def test_memory_audit_warns_for_inactive_legacy_schema(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    archived_id = "mem_archived_legacy_scope"
+    with connection(svc.paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO memories(
+              id, memory_type, scope, content, confidence, source_ids,
+              status, created_at, updated_at, reviewed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                archived_id,
+                "FactMemory",
+                "legacy-scope",
+                "Archived legacy memory should not fail nightly maintenance.",
+                0.4,
+                json.dumps(["agent_session:test"]),
+                "archived",
+                "2026-05-20T00:00:00+00:00",
+                "2026-05-20T00:00:00+00:00",
+                "2026-05-20T00:00:00+00:00",
+            ),
+        )
 
     audit = audit_memories(svc.paths)
 
@@ -1515,6 +1599,9 @@ def test_failure_memory_proposals_dedupe_existing_active_and_create_proposed(tmp
                 '{"memories": ['
                 '{"content": "When tests fail, inspect the failing assertion before editing.", "scope": "agent:codex", '
                 f'"source_ids": ["agent_session:{session_id}"], "confidence": 0.8}},'
+                '{"content": "During rebuild work, use a valid project scope rather than a bare project slug.", '
+                '"scope": "pkm-brain", '
+                f'"source_ids": ["agent_session:{session_id}"], "confidence": 0.82}},'
                 '{"content": "When pytest fails after retrieval edits, inspect the failing assertion and selected context before changing ranking code.", '
                 '"scope": "agent:codex", '
                 f'"source_ids": ["agent_session:{session_id}"], "confidence": 0.82}}'
@@ -1526,6 +1613,7 @@ def test_failure_memory_proposals_dedupe_existing_active_and_create_proposed(tmp
     result = propose_failure_memories_from_sources(svc.paths, provider_name="fake")
 
     assert result["created_count"] == 1
+    assert any("invalid memory scope" in item["reason"] for item in result["skipped"])
     assert len(result["skipped_duplicates"]) == 1
     created = svc.get_memory(result["memory_ids"][0])
     assert created["memory_type"] == "AgentFailurePatternMemory"

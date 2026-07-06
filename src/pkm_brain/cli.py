@@ -806,7 +806,11 @@ def memory_propose(
     confidence: float = typer.Option(0.8),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
-    memory_id = service(home).propose_memory(memory_type, scope, content, source, confidence)
+    try:
+        memory_id = service(home).propose_memory(memory_type, scope, content, source, confidence)
+    except ValueError as exc:
+        console.print(str(exc))
+        raise typer.Exit(1)
     console.print_json(json.dumps({"memory_id": memory_id, "status": "proposed"}))
 
 

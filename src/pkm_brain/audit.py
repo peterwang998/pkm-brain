@@ -19,8 +19,16 @@ VALID_MEMORY_TYPES = {
     "PersonalLogisticsMemory",
 }
 VALID_MEMORY_STATUSES = {"proposed", "active", "superseded", "rejected", "archived"}
-VALID_SCOPE_PREFIXES = ("global", "project:", "repo:", "agent:", "topic:", "user:")
+VALID_EXACT_MEMORY_SCOPES = {"global"}
+VALID_SCOPE_PREFIXES = ("project:", "repo:", "agent:", "topic:", "user:")
 INACTIVE_MEMORY_STATUSES = {"superseded", "rejected", "archived"}
+
+
+def valid_memory_scope(scope: str) -> bool:
+    value = scope.strip()
+    if value in VALID_EXACT_MEMORY_SCOPES:
+        return True
+    return any(value.startswith(prefix) and len(value) > len(prefix) for prefix in VALID_SCOPE_PREFIXES)
 
 
 def audit_memories(paths: BrainPaths) -> dict[str, Any]:
@@ -42,7 +50,7 @@ def audit_memories(paths: BrainPaths) -> dict[str, Any]:
                 )
             if status not in VALID_MEMORY_STATUSES:
                 errors.append(f"{mid}: invalid status {status}")
-            if not any(scope.startswith(prefix) for prefix in VALID_SCOPE_PREFIXES):
+            if not valid_memory_scope(scope):
                 append_memory_schema_issue(
                     errors,
                     warnings,
@@ -62,7 +70,7 @@ def append_memory_schema_issue(
     status: str,
     message: str,
 ) -> None:
-    if status in INACTIVE_MEMORY_STATUSES:
+    if status == "proposed" or status in INACTIVE_MEMORY_STATUSES:
         warnings.append(message)
         return
     errors.append(message)

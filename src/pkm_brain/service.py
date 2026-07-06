@@ -12,6 +12,7 @@ from typing import Any
 
 import yaml
 
+from .audit import valid_memory_scope
 from .chunking import DEFAULT_OVERLAP_TOKENS, DEFAULT_TARGET_TOKENS, chunk_text, prepare_text_for_indexing, sanitize_agent_session_log
 from .db import connection, dumps, init_db, loads, rows
 from .embeddings import (
@@ -2027,6 +2028,13 @@ class BrainService:
         confidence: float,
     ) -> str:
         self.init_workspace()
+        normalized_scope = scope.strip()
+        if not valid_memory_scope(normalized_scope):
+            raise ValueError(
+                "invalid memory scope "
+                f"{scope!r}; expected 'global' or a non-empty scope prefixed by "
+                "project:, repo:, agent:, topic:, or user:"
+            )
         memory_id = new_id("mem")
         timestamp = now_iso()
         with connection(self.paths.sqlite_path) as conn:
@@ -2035,7 +2043,7 @@ class BrainService:
                 INSERT INTO memories(id, memory_type, scope, content, confidence, source_ids, status, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (memory_id, memory_type, scope, content, confidence, dumps(sources), "proposed", timestamp, timestamp),
+                (memory_id, memory_type, normalized_scope, content, confidence, dumps(sources), "proposed", timestamp, timestamp),
             )
         return memory_id
 
