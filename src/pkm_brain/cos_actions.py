@@ -2064,6 +2064,7 @@ def create_action_residue(
     conn: Any, action: dict[str, Any], kind: str, question: str
 ) -> str:
     question_id = new_id("question")
+    fields = action_residue_question_fields(conn, action, kind, question)
     conn.execute(
         """
         INSERT INTO open_questions(
@@ -2074,20 +2075,153 @@ def create_action_residue(
         (
             question_id,
             kind,
-            None,
-            (action.get("target_page_paths") or [None])[0],
-            dumps(action.get("target_fact_ids") or []),
-            question,
-            dumps([]),
+            fields["entity_key"],
+            fields["page_hint"],
+            dumps(fields["fact_ids"]),
+            fields["question"],
+            dumps(fields["options"]),
             "needs_human",
-            dumps({"action_id": action["id"], "action_type": action["action_type"]}),
+            dumps(fields["context"]),
             action["id"],
-            dumps({"action_type": action["action_type"], "payload": action_payload(action)}),
+            dumps(fields["recommended_action"]),
             action.get("risk_tier"),
             now_iso(),
         ),
     )
     return question_id
+
+
+def refresh_action_residue_question(
+    conn: Any,
+    action: dict[str, Any],
+    question_id: str,
+    *,
+    kind: str,
+    reason: str,
+) -> None:
+    fields = action_residue_question_fields(conn, action, kind, reason)
+    conn.execute(
+        """
+        UPDATE open_questions
+        SET entity_key = ?, page_hint = ?, fact_ids = ?, question = ?,
+            options = ?, context = ?, recommended_action = ?, risk_tier = ?,
+            action_id = ?
+        WHERE id = ?
+        """,
+        (
+            fields["entity_key"],
+            fields["page_hint"],
+            dumps(fields["fact_ids"]),
+            fields["question"],
+            dumps(fields["options"]),
+            dumps(fields["context"]),
+            dumps(fields["recommended_action"]),
+            action.get("risk_tier"),
+            action["id"],
+            question_id,
+        ),
+    )
+
+
+def action_residue_question_fields(
+    conn: Any, action: dict[str, Any], kind: str, question: str
+) -> dict[str, Any]:
+    base = {
+        "entity_key": None,
+        "page_hint": (action.get("target_page_paths") or [None])[0],
+        "fact_ids": action.get("target_fact_ids") or [],
+        "question": question,
+        "options": [],
+        "context": {"action_id": action["id"], "action_type": action["action_type"]},
+        "recommended_action": {
+            "action_type": action["action_type"],
+            "payload": action_payload(action),
+        },
+    }
+    if kind != "fact_conflict_review":
+        return base
+    conflict_fields = fact_conflict_review_question_fields(conn, action, question)
+    return conflict_fields or base
+
+
+def fact_conflict_review_question_fields(
+    conn: Any, action: dict[str, Any], question: str
+) -> dict[str, Any] | None:
+    from .wiki_facts import compact_statement, question_options_for_facts, row_to_fact
+
+    payload = action_payload(action)
+    candidate = payload.get("fact") if isinstance(payload.get("fact"), dict) else {}
+    counterpart_fact_ids = stable_unique(
+        [
+            *[str(item) for item in action.get("target_fact_ids") or [] if item],
+            *[
+                str(item)
+                for item in (
+                    (action.get("evidence_json") or {})
+                    .get("resolver_precheck", {})
+                    .get("counterpart_fact_ids", [])
+                )
+                if item
+            ],
+        ]
+    )
+    if not candidate or not counterpart_fact_ids:
+        return None
+    placeholders = ",".join("?" for _ in counterpart_fact_ids)
+    counterpart_facts = [
+        row_to_fact(row)
+        for row in conn.execute(
+            f"SELECT * FROM facts WHERE id IN ({placeholders}) ORDER BY observed_at DESC, created_at DESC",
+            counterpart_fact_ids,
+        )
+    ]
+    if not counterpart_facts:
+        return None
+    candidate_option = {
+        "option_type": "candidate_fact",
+        "action_id": action["id"],
+        "label": f"Candidate: {compact_statement(candidate.get('statement'), 140)}",
+        "statement": candidate.get("statement"),
+        "confidence": candidate.get("confidence")
+        or candidate.get("truth_confidence")
+        or action.get("confidence"),
+        "observed_at": candidate.get("observed_at"),
+        "source_ids": candidate.get("source_ids") or [],
+        "source_spans": candidate.get("source_spans") or [],
+        "evidence_quote": candidate.get("evidence_quote"),
+        "page_hint": candidate.get("page_hint"),
+    }
+    existing_options = [
+        {**option, "option_type": "existing_fact"}
+        for option in question_options_for_facts(counterpart_facts)
+    ]
+    first_fact = counterpart_facts[0]
+    resolver_precheck = (action.get("evidence_json") or {}).get("resolver_precheck", {})
+    return {
+        "entity_key": candidate.get("entity_key") or first_fact.get("entity_key"),
+        "page_hint": candidate.get("page_hint")
+        or (action.get("target_page_paths") or [None])[0]
+        or first_fact.get("page_hint"),
+        "fact_ids": counterpart_fact_ids,
+        "question": (
+            f"{question} Review the candidate fact against the existing fact(s) "
+            "before applying or rewriting it."
+        ),
+        "options": [candidate_option, *existing_options],
+        "context": {
+            "action_id": action["id"],
+            "action_type": action["action_type"],
+            "candidate_action_id": action["id"],
+            "counterpart_fact_ids": counterpart_fact_ids,
+            "resolver_precheck": resolver_precheck,
+        },
+        "recommended_action": {
+            "action_type": action["action_type"],
+            "payload": payload,
+            "review_required": "conflict_precheck",
+            "counterpart_fact_ids": counterpart_fact_ids,
+        },
+    }
 
 
 def target_state_hash(

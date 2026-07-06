@@ -1585,9 +1585,10 @@ def ui_shell() -> str:
             <div class="toolbar">
               <span class="badge">${escapeHtml(option.observed_at || "undated")}</span>
               <span class="badge">${escapeHtml(option.confidence ?? "")}</span>
-              <button class="primary" type="button" onclick='answerWikiQuestion(${jsString(question.id)}, ${jsString(option.fact_id)}, "")'>Use This Fact</button>
+              ${option.fact_id ? `<button class="primary" type="button" onclick='answerWikiQuestion(${jsString(question.id)}, ${jsString(option.fact_id)}, "")'>Use This Fact</button>` : `<span class="badge">${escapeHtml(option.option_type || "candidate")}</span>`}
             </div>
             <p>${escapeHtml(option.statement || "")}</p>
+            ${option.evidence_quote ? `<blockquote>${escapeHtml(option.evidence_quote)}</blockquote>` : ""}
             ${option.source_ids?.length ? `<div class="muted">Sources: ${escapeHtml(option.source_ids.join(", "))}</div>` : ""}
           </section>`).join("")}</div>
         <h2>Different Answer</h2>

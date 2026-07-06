@@ -14,6 +14,7 @@ from pkm_brain.cos_actions import (
     critic_prompt,
     decide_action,
     get_action,
+    mark_action_residue,
     propose_action,
     revert_action,
 )
@@ -25,7 +26,9 @@ from pkm_brain.cos_policy import (
     promote_policy_for_autonomy,
 )
 from pkm_brain.db import connection
+from pkm_brain.entities import resolve_entity
 from pkm_brain.extraction import (
+    backfill_fact_conflict_review_questions,
     decide_policy_actions,
     evidence_units_for_text,
     extraction_prompt,
@@ -1707,6 +1710,179 @@ def test_extraction_default_path_sends_fallback_route_to_unrouted_residue(
     assert "fallback page" in residue["question"]
 
 
+def test_extraction_conflict_precheck_residue_includes_counterpart_options(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    insert_test_wiki_page(
+        svc.paths,
+        "page_alphapay",
+        str(svc.paths.wiki / "concepts/alphapay.md"),
+        title="AlphaPay",
+        page_type="concept",
+        managed=True,
+    )
+    with connection(svc.paths.sqlite_path) as conn:
+        resolution = resolve_entity(conn, "AlphaPay", type_hint="product")
+        assert resolution is not None
+        conn.execute(
+            """
+            INSERT INTO facts(
+              id, statement, entity_key, entity_id, page_hint, section_hint,
+              source_ids, observed_at, confidence, status, metadata, created_at,
+              truth_confidence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "fact_alphapay_enabled",
+                "AlphaPay auto-renewal is enabled by default for annual plans.",
+                "concepts:alphapay:summary",
+                resolution.entity_id,
+                "concepts/alphapay.md",
+                "Summary",
+                json.dumps(["document:alphapay-old"]),
+                "2026-06-26T00:00:00+00:00",
+                0.9,
+                "active",
+                "{}",
+                "2026-06-26T00:00:00+00:00",
+                0.9,
+            ),
+        )
+    marker = "AlphaPay auto-renewal is not enabled by default for annual plans."
+    note = svc.paths.inbox / "source.md"
+    note.write_text(f"# Source\n\n{marker}", encoding="utf-8")
+    svc.ingest()
+    provider = MarkerExtractorProvider(
+        marker=marker,
+        statement=marker,
+        page_hint="concepts/alphapay.md",
+        entity_mentions=[
+            {
+                "surface": "AlphaPay",
+                "type": "product",
+                "mention_kind": "named",
+                "is_primary": True,
+            }
+        ],
+    )
+
+    result = extract_recent_documents(svc.paths, shadow=False, llm_provider=provider)
+
+    assert result["status"] == "ok"
+    assert result["actions"][0]["status"] == "needs_human"
+    assert result["actions"][0]["target_fact_ids"] == ["fact_alphapay_enabled"]
+    resolver_precheck = result["actions"][0]["evidence_json"]["resolver_precheck"]
+    assert resolver_precheck["counterpart_fact_ids"] == ["fact_alphapay_enabled"]
+    with connection(svc.paths.sqlite_path) as conn:
+        question = conn.execute(
+            "SELECT * FROM open_questions WHERE action_id = ?",
+            (result["actions"][0]["id"],),
+        ).fetchone()
+    assert question["kind"] == "fact_conflict_review"
+    assert json.loads(question["fact_ids"]) == ["fact_alphapay_enabled"]
+    options = json.loads(question["options"])
+    assert [option["option_type"] for option in options] == [
+        "candidate_fact",
+        "existing_fact",
+    ]
+    assert options[0]["statement"] == marker
+    assert options[0]["evidence_quote"] == marker
+    assert options[1]["fact_id"] == "fact_alphapay_enabled"
+    assert "Review the candidate fact" in question["question"]
+
+
+def test_backfill_fact_conflict_review_questions_repairs_thin_residue(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    with connection(svc.paths.sqlite_path) as conn:
+        resolution = resolve_entity(conn, "AlphaPay", type_hint="product")
+        assert resolution is not None
+        conn.execute(
+            """
+            INSERT INTO facts(
+              id, statement, entity_key, entity_id, page_hint, section_hint,
+              source_ids, observed_at, confidence, status, metadata, created_at,
+              truth_confidence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "fact_alphapay_enabled",
+                "AlphaPay auto-renewal is enabled by default for annual plans.",
+                "concepts:alphapay:summary",
+                resolution.entity_id,
+                "concepts/alphapay.md",
+                "Summary",
+                json.dumps(["document:alphapay-old"]),
+                "2026-06-26T00:00:00+00:00",
+                0.9,
+                "active",
+                "{}",
+                "2026-06-26T00:00:00+00:00",
+                0.9,
+            ),
+        )
+    candidate = {
+        "statement": "AlphaPay auto-renewal is not enabled by default for annual plans.",
+        "entity_key": "concepts:alphapay:summary",
+        "entity_mention": "AlphaPay",
+        "entity_type": "product",
+        "page_hint": "concepts/alphapay.md",
+        "section_hint": "Summary",
+        "source_ids": ["chunk:alphapay-new"],
+        "source_spans": [{"chunk_id": "chunk_alphapay_new", "start": 0, "end": 70}],
+        "evidence_quote": "AlphaPay auto-renewal is not enabled by default for annual plans.",
+        "confidence": 0.95,
+        "truth_confidence": 0.95,
+    }
+    action = propose_action(
+        svc.paths,
+        "fact_upsert",
+        action_payload={"fact": candidate},
+        target_page_paths=["concepts/alphapay.md"],
+        proposed_by="extractor",
+        decide=False,
+    )
+    mark_action_residue(
+        svc.paths,
+        action["id"],
+        kind="fact_conflict_review",
+        reason="Candidate appears to contradict an existing nearby fact.",
+        policy_decision="earned_residue",
+    )
+    with connection(svc.paths.sqlite_path) as conn:
+        before = conn.execute(
+            "SELECT fact_ids, options FROM open_questions WHERE action_id = ?",
+            (action["id"],),
+        ).fetchone()
+    assert json.loads(before["fact_ids"]) == []
+    assert json.loads(before["options"]) == []
+
+    result = backfill_fact_conflict_review_questions(svc.paths)
+
+    assert result["updated"] == 1
+    with connection(svc.paths.sqlite_path) as conn:
+        question = conn.execute(
+            "SELECT fact_ids, options FROM open_questions WHERE action_id = ?",
+            (action["id"],),
+        ).fetchone()
+        updated_action = conn.execute(
+            "SELECT target_fact_ids, evidence_json FROM cos_actions WHERE id = ?",
+            (action["id"],),
+        ).fetchone()
+    assert json.loads(question["fact_ids"]) == ["fact_alphapay_enabled"]
+    assert json.loads(updated_action["target_fact_ids"]) == ["fact_alphapay_enabled"]
+    assert json.loads(updated_action["evidence_json"])["resolver_precheck"][
+        "counterpart_fact_ids"
+    ] == ["fact_alphapay_enabled"]
+    options = json.loads(question["options"])
+    assert options[0]["option_type"] == "candidate_fact"
+    assert options[1]["fact_id"] == "fact_alphapay_enabled"
+
+
 def test_extraction_promoted_clean_fact_requires_labeled_eval_gate(
     tmp_path: Path,
 ) -> None:
@@ -2641,10 +2817,12 @@ class MarkerExtractorProvider:
         marker: str,
         statement: str,
         page_hint: str = "concepts/extracted-facts.md",
+        entity_mentions: list[dict[str, object]] | None = None,
     ) -> None:
         self.marker = marker
         self.statement = statement
         self.page_hint = page_hint
+        self.entity_mentions = entity_mentions
         self.calls = 0
         self.prompts: list[str] = []
 
@@ -2675,6 +2853,11 @@ class MarkerExtractorProvider:
                                 "extraction_confidence": 0.99,
                                 "routing_confidence": 0.8,
                                 "truth_confidence": 0.95,
+                                **(
+                                    {"entity_mentions": self.entity_mentions}
+                                    if self.entity_mentions is not None
+                                    else {}
+                                ),
                             }
                         ]
                     }

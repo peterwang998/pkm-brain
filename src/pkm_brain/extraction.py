@@ -11,9 +11,11 @@ from typing import Any
 from .cos_actions import (
     apply_action,
     decide_action,
+    get_action,
     mark_action_residue,
     mark_simple_autonomy_applied,
     propose_action,
+    refresh_action_residue_question,
 )
 from .db import connection, dumps, rows
 from .entities import (
@@ -857,6 +859,9 @@ def propose_policy_gated_candidates(
             proposed_by="extractor",
             confidence=candidate.get("truth_confidence"),
             risk_tier=None,
+            evidence=decision.get("evidence")
+            if isinstance(decision.get("evidence"), dict)
+            else None,
             decide=False,
         )
         if decision["decision"] == "residue":
@@ -1059,9 +1064,14 @@ def earned_fact_decision(
             "target_fact_ids": [duplicate["id"]],
             "fact": merge_candidate_into_existing_fact(duplicate, candidate),
         }
-    conflict_reason = resolver_precheck_conflict_reason(paths, candidate)
-    if conflict_reason:
-        return simple_residue_decision("fact_conflict_review", conflict_reason)
+    conflict = resolver_precheck_conflict(paths, candidate)
+    if conflict:
+        return simple_residue_decision(
+            "fact_conflict_review",
+            str(conflict["reason"]),
+            target_fact_ids=conflict["counterpart_fact_ids"],
+            evidence={"resolver_precheck": conflict},
+        )
     return {
         "decision": "apply",
         "reason": "Unit-backed, routed candidate with no resolver precheck conflict signal.",
@@ -1087,7 +1097,7 @@ def earned_fact_action_features(
         and decision.get("fact_upsert_resolution")
         in {"new_clean_fact", "exact_duplicate_source_union"}
     )
-    return {
+    features = {
         "candidate_signal": "source_extraction",
         "clean_fact_upsert": clean,
         "fact_upsert_resolution": decision.get("fact_upsert_resolution"),
@@ -1109,6 +1119,11 @@ def earned_fact_action_features(
         "truth_confidence": candidate.get("truth_confidence"),
         "eval_gate": {"suite": "extraction", "requires_labels": True},
     }
+    if decision.get("residue_kind") == "fact_conflict_review":
+        features["resolver_precheck_counterpart_fact_ids"] = (
+            decision.get("target_fact_ids") or []
+        )
+    return features
 
 
 def candidate_route_metadata(candidate: dict[str, Any]) -> dict[str, Any]:
@@ -1122,6 +1137,13 @@ def candidate_route_metadata(candidate: dict[str, Any]) -> dict[str, Any]:
 def resolver_precheck_conflict_reason(
     paths: BrainPaths, candidate: dict[str, Any]
 ) -> str | None:
+    conflict = resolver_precheck_conflict(paths, candidate)
+    return str(conflict["reason"]) if conflict else None
+
+
+def resolver_precheck_conflict(
+    paths: BrainPaths, candidate: dict[str, Any]
+) -> dict[str, Any] | None:
     statement = str(candidate.get("statement") or "")
     entity_id = str(candidate.get("entity_id") or "").strip()
     mention = str(
@@ -1152,13 +1174,106 @@ def resolver_precheck_conflict_reason(
             """,
             (entity_id,),
         )
+    conflicted_fact_ids: list[str] = []
+    directly_conflicting_fact_ids: list[str] = []
     for row in fact_rows:
         fact = row_to_fact(row)
         if fact.get("status") == "conflicted":
-            return "Nearby facts are already contested; review this candidate with the existing conflict."
+            conflicted_fact_ids.append(str(fact["id"]))
+            continue
         if facts_directly_conflict(fact, {"statement": statement}):
-            return "Candidate appears to contradict an existing nearby fact."
+            directly_conflicting_fact_ids.append(str(fact["id"]))
+    if directly_conflicting_fact_ids:
+        return {
+            "reason": "Candidate appears to contradict an existing nearby fact.",
+            "counterpart_fact_ids": directly_conflicting_fact_ids[:5],
+            "entity_id": entity_id,
+            "entity_mention": mention,
+            "precheck": "direct_conflict",
+        }
+    if conflicted_fact_ids:
+        return {
+            "reason": "Nearby facts are already contested; review this candidate with the existing conflict.",
+            "counterpart_fact_ids": conflicted_fact_ids[:5],
+            "entity_id": entity_id,
+            "entity_mention": mention,
+            "precheck": "existing_contested_facts",
+        }
     return None
+
+
+def backfill_fact_conflict_review_questions(paths: BrainPaths) -> dict[str, Any]:
+    """Repair pre-fix extraction conflict questions so reviewers can see both sides."""
+    with connection(paths.sqlite_path) as conn:
+        questions = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT *
+                FROM open_questions
+                WHERE kind = 'fact_conflict_review'
+                  AND status IN ('open', 'needs_human')
+                ORDER BY created_at
+                """
+            )
+        ]
+    inspected = 0
+    updated = 0
+    skipped: list[dict[str, str]] = []
+    for question in questions:
+        inspected += 1
+        action_id = str(question.get("action_id") or "")
+        if not action_id:
+            skipped.append({"question_id": question["id"], "reason": "missing_action_id"})
+            continue
+        try:
+            action = get_action(paths, action_id)
+        except ValueError:
+            skipped.append({"question_id": question["id"], "reason": "missing_action"})
+            continue
+        evidence = dict(action.get("evidence_json") or {})
+        candidate = ((evidence.get("payload") or {}).get("fact") or {})
+        if not isinstance(candidate, dict) or not candidate:
+            skipped.append({"question_id": question["id"], "reason": "missing_candidate"})
+            continue
+        conflict = resolver_precheck_conflict(paths, candidate)
+        if not conflict:
+            skipped.append({"question_id": question["id"], "reason": "no_counterpart_found"})
+            continue
+        counterpart_fact_ids = [str(item) for item in conflict["counterpart_fact_ids"]]
+        evidence["resolver_precheck"] = conflict
+        features = dict(action.get("action_features") or {})
+        features["resolver_precheck_counterpart_fact_ids"] = counterpart_fact_ids
+        with connection(paths.sqlite_path) as conn:
+            conn.execute(
+                """
+                UPDATE cos_actions
+                SET target_fact_ids = ?, evidence_json = ?, action_features = ?
+                WHERE id = ?
+                """,
+                (
+                    dumps(counterpart_fact_ids),
+                    dumps(evidence),
+                    dumps(features),
+                    action_id,
+                ),
+            )
+        refreshed = get_action(paths, action_id)
+        with connection(paths.sqlite_path) as conn:
+            refresh_action_residue_question(
+                conn,
+                refreshed,
+                str(question["id"]),
+                kind="fact_conflict_review",
+                reason=str(conflict["reason"]),
+            )
+        updated += 1
+    return {
+        "status": "ok",
+        "inspected": inspected,
+        "updated": updated,
+        "skipped": skipped,
+    }
 
 
 def apply_simple_autonomy_candidates(
@@ -1260,13 +1375,20 @@ def simple_fact_decision(
     }
 
 
-def simple_residue_decision(kind: str, reason: str) -> dict[str, Any]:
+def simple_residue_decision(
+    kind: str,
+    reason: str,
+    *,
+    target_fact_ids: list[str] | None = None,
+    evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     return {
         "decision": "residue",
         "residue_kind": kind,
         "reason": reason,
         "risk_tier": "high",
-        "target_fact_ids": [],
+        "target_fact_ids": target_fact_ids or [],
+        **({"evidence": evidence} if evidence else {}),
     }
 
 
