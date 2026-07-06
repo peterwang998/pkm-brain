@@ -11,6 +11,7 @@ from pkm_brain.automation import run_cos_timeout_sweep
 from pkm_brain.cos_actions import (
     ACTION_TYPE_SPECS,
     apply_action,
+    critic_prompt,
     decide_action,
     get_action,
     propose_action,
@@ -18,6 +19,7 @@ from pkm_brain.cos_actions import (
 )
 from pkm_brain.cos_audit import run_sampled_audit
 from pkm_brain.cos_policy import (
+    PolicyDecision,
     classify_action_risk,
     evaluate_policy,
     promote_policy_for_autonomy,
@@ -1557,6 +1559,41 @@ def test_extraction_drops_non_claim_classes_and_marks_extracted_empty(
     assert metadata["validation"]["dropped_count"] == 1
 
 
+def test_extraction_drops_placeholder_absence_facts_even_if_mislabeled(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "source.md"
+    note.write_text(
+        '# Source\n\n## Summary\n\nNo summary was captured for the meeting titled "Family time".',
+        encoding="utf-8",
+    )
+    svc.ingest()
+    with connection(svc.paths.sqlite_path) as conn:
+        chunk = conn.execute("SELECT id, text FROM chunks LIMIT 1").fetchone()
+
+    report = validate_extracted_facts_with_report(
+        svc.paths,
+        [
+            {
+                "statement": 'No summary was captured for the meeting titled "Family time".',
+                "chunk_id": chunk["id"],
+                "evidence_unit_ids": evidence_unit_ids_containing(
+                    chunk["text"], "No summary"
+                ),
+                "claim_class": "factual_update",
+            }
+        ],
+        extractor_model="fake-extractor-model",
+    )
+
+    assert report["candidates"] == []
+    assert report["rejected_count"] == 0
+    assert report["dropped_count"] == 1
+    assert report["dropped"][0]["reason"] == "low_value_placeholder_fact"
+
+
 def test_extraction_empty_normalized_content_skips_cosmetic_reexports(
     tmp_path: Path,
 ) -> None:
@@ -2136,6 +2173,11 @@ def test_critic_llm_agreement_allows_l1_auto_apply(tmp_path: Path) -> None:
     assert decided["autonomy_level"] == "L1"
     assert decided["critic_by"] == "fake:fake-critic-model"
     assert decided["critic_decision"] == "agree"
+    assert decided["evidence_json"]["critic_review"] == {
+        "critic_by": "fake:fake-critic-model",
+        "decision": "agree",
+        "rationale": "test critic judgment",
+    }
 
 
 def test_critic_llm_disagreement_blocks_l2_apply(tmp_path: Path) -> None:
@@ -2198,9 +2240,47 @@ class FakeCriticProvider:
 
     def complete(self, prompt: str) -> str:
         assert "Review this Chief-of-Staff action" in prompt
+        assert "directly entailed by the cited evidence" in prompt
+        assert "should be human-reviewed" not in prompt
         return json.dumps(
             {"decision": self.decision, "rationale": "test critic judgment"}
         )
+
+
+def test_critic_prompt_for_fact_upsert_is_narrow_entailment_review() -> None:
+    prompt = critic_prompt(
+        {
+            "id": "cosact_test",
+            "action_type": "fact_upsert",
+            "risk_tier": "medium",
+            "confidence": 0.9,
+            "action_features": {"clean_fact_upsert": True},
+            "target_fact_ids": [],
+            "target_page_paths": [],
+            "target_contract_ids": [],
+            "evidence_json": {
+                "payload": {
+                    "fact": {
+                        "statement": "Unity Catalog governs tables.",
+                        "evidence_quote": "Unity Catalog governs tables.",
+                    }
+                }
+            },
+            "proposed_by": "test",
+        },
+        PolicyDecision(
+            policy_id="policy_test",
+            policy_version=1,
+            policy_decision="matched",
+            autonomy_level="L2",
+            critic_required=True,
+            reason="test policy",
+        ),
+    )
+
+    assert "directly entailed by the cited evidence" in prompt
+    assert "even if the fact is mundane" in prompt
+    assert "should be human-reviewed" not in prompt
 
 
 def first_evidence_ref_from_prompt(

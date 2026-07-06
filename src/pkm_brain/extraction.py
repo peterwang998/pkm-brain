@@ -129,6 +129,12 @@ LOW_INFORMATION_LINE_PATTERNS = (
         re.IGNORECASE,
     ),
 )
+LOW_VALUE_FACT_STATEMENT_PATTERNS = (
+    re.compile(
+        r"^no\s+(summary|memo|transcript)\s+was\s+captured(?:\s+for\b.*)?\.?$",
+        re.IGNORECASE,
+    ),
+)
 
 
 def extract_recent_documents(
@@ -1840,6 +1846,16 @@ def validate_extracted_facts_with_report(
                 }
             )
             continue
+        if low_value_fact_statement(statement):
+            dropped.append(
+                {
+                    "index": index,
+                    "statement": clip_text(statement),
+                    "claim_class": claim_class,
+                    "reason": "low_value_placeholder_fact",
+                }
+            )
+            continue
         reasons.extend(evidence_ref_errors)
         if reasons:
             rejections.append(
@@ -2883,6 +2899,11 @@ def normalized_extraction_content(chunks: list[dict[str, Any]]) -> str:
 
 def low_information_line(line: str) -> bool:
     return any(pattern.match(line) for pattern in LOW_INFORMATION_LINE_PATTERNS)
+
+
+def low_value_fact_statement(statement: str) -> bool:
+    normalized = re.sub(r"\s+", " ", statement.strip())
+    return any(pattern.match(normalized) for pattern in LOW_VALUE_FACT_STATEMENT_PATTERNS)
 
 
 def elapsed_ms(started: float) -> float:

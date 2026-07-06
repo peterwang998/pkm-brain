@@ -294,6 +294,8 @@ Examples from the audit:
 
 **Change:** the extractor prompt must require direct entailment for every part of the statement, keep claims atomic, and preserve negation/uncertainty. Do not add titles, roles, active-process status, customer/investor impact, locations, or causal explanations unless the cited units say them. If cited units support only one side of a combined claim, emit only the supported side.
 
+**2026-07-06 v4 critic follow-up:** critic-gated samples got applied-fact audit quality to 0 sampled bad, but blocked-fact rationales show remaining extractor drift. The durable failures are: dropping hedges ("appears to", "I think", "should still be roughly"), turning a speaker's description into an unqualified world fact, attributing a statement to Peter when the cited evidence does not identify the speaker, abstracting a concrete quote into a broader category ("Iceberg tables across vendors" → "storage interoperability"), and carrying an entity from wider context into a cited span that does not establish it. Future extractor prompt/model changes should target these before trying to weaken the critic.
+
 This is prompt hardening, not a brittle deterministic semantic gate. Numeric faithfulness remains deterministic; broader entailment stays with the extractor plus post-hoc auditor until a labeled semantic-support eval exists.
 
 ### H2 — Throughput

@@ -243,13 +243,15 @@ def decide_action(
         )
         critic_by = review["critic_by"]
         critic_decision = review["decision"]
+        action["evidence_json"] = evidence_with_critic_review(action, review)
     with connection(paths.sqlite_path) as conn:
         conn.execute(
             """
             UPDATE cos_actions
             SET policy_id = ?, policy_version = ?, policy_decision = ?,
                 autonomy_level = ?, critic_by = COALESCE(?, critic_by),
-                critic_decision = COALESCE(?, critic_decision)
+                critic_decision = COALESCE(?, critic_decision),
+                evidence_json = ?
             WHERE id = ?
             """,
             (
@@ -259,6 +261,7 @@ def decide_action(
                 decision.autonomy_level,
                 critic_by,
                 critic_decision,
+                dumps(action.get("evidence_json") or {}),
                 action_id,
             ),
         )
@@ -331,9 +334,13 @@ def critic_prompt(action: dict[str, Any], decision: PolicyDecision) -> str:
     }
     return (
         "Review this Chief-of-Staff action before autonomous application. "
-        "Return decision 'agree' only if the action is supported by its payload, targets, policy, "
-        "and risk features. Return 'disagree' if it is unsafe, unsupported, too broad, or should be human-reviewed. "
-        "Do not rewrite the action.\n\n"
+        "For fact_upsert actions, answer only the narrow support question: is the proposed statement "
+        "directly entailed by the cited evidence in the payload, with negation, uncertainty, entity, "
+        "quantity, and attribution preserved? Return decision 'agree' when the statement is directly "
+        "supported, even if the fact is mundane or you would not have written it yourself. Return "
+        "'disagree' only when the statement is unsupported, over-broad, misattributed, contradicts "
+        "the cited evidence, or lacks enough evidence to verify. For non-fact actions, require the "
+        "payload, targets, policy, and risk features to support safe application. Do not rewrite the action.\n\n"
         f"Action:\n{action_card}\n\nPolicy:\n{policy_card}"
     )
 
@@ -354,6 +361,18 @@ def critic_provider_label(provider: LLMProvider | None) -> str:
     if model:
         return f"{provider.name}:{model}"
     return str(provider.name)
+
+
+def evidence_with_critic_review(
+    action: dict[str, Any], review: dict[str, str]
+) -> dict[str, Any]:
+    evidence = dict(action.get("evidence_json") or {})
+    evidence["critic_review"] = {
+        "critic_by": review.get("critic_by"),
+        "decision": review.get("decision"),
+        "rationale": review.get("rationale") or "",
+    }
+    return evidence
 
 
 def apply_action(
