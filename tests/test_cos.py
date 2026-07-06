@@ -25,6 +25,7 @@ from pkm_brain.cos_policy import (
 from pkm_brain.db import connection
 from pkm_brain.extraction import (
     evidence_units_for_text,
+    extraction_prompt,
     extract_recent_documents,
     validate_extracted_facts,
     validate_extracted_facts_with_report,
@@ -46,6 +47,20 @@ def evidence_unit_ids_containing(text: str, needle: str) -> list[str]:
         for unit in evidence_units_for_text(text)
         if needle in unit["text"]
     ]
+
+
+def test_extraction_prompt_requires_direct_entailment_for_clean_facts() -> None:
+    prompt = extraction_prompt(
+        {
+            "document": {"id": "doc_test", "source_type": "hyprnote_meeting"},
+            "window": {"chunks": []},
+            "routing_hints": [],
+        }
+    )
+
+    assert "Every part of the statement must be directly entailed" in prompt
+    assert "do not join it with an unsupported inference" in prompt
+    assert "Preserve uncertainty and negation" in prompt
 
 
 def test_policy_first_match_and_truth_defaults_to_l3(tmp_path: Path) -> None:

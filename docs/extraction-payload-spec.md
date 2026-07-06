@@ -282,6 +282,20 @@ Grounded in `/private/tmp/pkm-real-model-gardener-20260701-225036` (gpt-5.4-mini
 
 **Acceptance (H1b):** citing >K units yields an accepted fact with the first-K/length-bounded span and no retry; `B2B` / `zero to one` no longer trip the number gate; a statement entity supported elsewhere in the window is accepted; a genuine quantity mismatch (60 vs 67) still rejects.
 
+### H1c — Direct-entailment prompt hardening from the 2026-07-05 audit
+
+Grounded in temp sample `/private/tmp/pkm-autonomy-sample-KeeMSM`: policy v3 auto-applied 34 L2 fact-upserts from 5 real sources, then the configured auditor marked 4/20 audited actions bad. The failures were not provenance failures; every bad fact had unit-derived source spans. The pattern was **over-composition**: the statement included a supported clause plus an unsupported extra implication.
+
+Examples from the audit:
+- quote supported "ultra-technical, concierge-style customer support" but the statement added "combined with solution delivery";
+- quote supported a positive view of Brett Taylor's resume but the statement added CEO status plus enterprise-customer/investor credibility;
+- quote discussed confusion about remote/SF/NY arrangements but the statement collapsed that ambiguity into a clean location fact;
+- quote supported a Google ML/AI on-site but the statement turned a non-continuing Cursor round into an active application.
+
+**Change:** the extractor prompt must require direct entailment for every part of the statement, keep claims atomic, and preserve negation/uncertainty. Do not add titles, roles, active-process status, customer/investor impact, locations, or causal explanations unless the cited units say them. If cited units support only one side of a combined claim, emit only the supported side.
+
+This is prompt hardening, not a brittle deterministic semantic gate. Numeric faithfulness remains deterministic; broader entailment stays with the extractor plus post-hoc auditor until a labeled semantic-support eval exists.
+
 ### H2 — Throughput
 
 Validation is 2.35 s; **all cost is LLM completion** (~88 s/call). On a reasoning model (gpt-5.4, medium effort, ~46K-char/~12K-token prompt) that time is **likely inference-dominated, not subprocess overhead** — so tune model work first.
