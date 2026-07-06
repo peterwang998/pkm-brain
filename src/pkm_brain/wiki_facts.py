@@ -1427,9 +1427,21 @@ def facts_share_meaningful_sources(left: dict[str, Any], right: dict[str, Any]) 
 
 
 def facts_directly_conflict(left: dict[str, Any], right: dict[str, Any]) -> bool:
-    return has_material_contradiction_cues(
-        str(left.get("statement") or "").lower(),
-        str(right.get("statement") or "").lower(),
+    left_statement = str(left.get("statement") or "").lower()
+    right_statement = str(right.get("statement") or "").lower()
+    if not has_material_contradiction_cues(left_statement, right_statement):
+        return False
+    left_tokens = set(fact_tokens(left_statement))
+    right_tokens = set(fact_tokens(right_statement))
+    if not left_tokens or not right_tokens:
+        return False
+    shared_anchors = fact_anchor_tokens(left_tokens) & fact_anchor_tokens(right_tokens)
+    token_overlap = len(left_tokens & right_tokens) / min(
+        len(left_tokens), len(right_tokens)
+    )
+    token_jaccard = len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+    return len(shared_anchors) >= 2 or (
+        len(shared_anchors) >= 1 and token_overlap >= 0.35 and token_jaccard >= 0.18
     )
 
 

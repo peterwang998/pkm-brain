@@ -15,6 +15,7 @@ from pkm_brain.wiki_facts import (
     compact_statement,
     create_confirmed_page_fact,
     duplicate_fact_projection_errors,
+    facts_directly_conflict,
     managed_fact_page_review,
     render_managed_page,
     regenerate_managed_fact_page,
@@ -22,6 +23,44 @@ from pkm_brain.wiki_facts import (
     revert_wiki_page_snapshot,
     upsert_candidate_facts,
 )
+
+
+def test_facts_directly_conflict_requires_shared_topic() -> None:
+    assert facts_directly_conflict(
+        {"statement": "AlphaPay auto-renewal is enabled by default for annual plans."},
+        {
+            "statement": (
+                "AlphaPay auto-renewal is not enabled by default for annual plans."
+            )
+        },
+    )
+    assert not facts_directly_conflict(
+        {
+            "statement": (
+                "Before Catch, Peter was at Elation for six and a half years."
+            )
+        },
+        {
+            "statement": (
+                "After the V2 redesign, engagement for the sample data exploration "
+                "feature improved to about 10%."
+            )
+        },
+    )
+    assert not facts_directly_conflict(
+        {
+            "statement": (
+                "The interviewer said Hightouch starts pulling data from the warehouse "
+                "to Meta immediately after a sync is finalized."
+            )
+        },
+        {
+            "statement": (
+                "Josh said Hightouch is targeting roughly doubling the business this "
+                "year after reaching the $100M ARR milestone."
+            )
+        },
+    )
 
 
 def test_promote_wiki_curation_promotes_fact_state(tmp_path: Path) -> None:

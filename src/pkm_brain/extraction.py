@@ -63,6 +63,15 @@ EXTRACTION_SCHEMA = {
         }
     },
 }
+CONFLICT_PRECHECK_SCHEMA = {
+    "type": "object",
+    "required": ["decision", "rationale"],
+    "properties": {
+        "decision": {"type": "string", "enum": ["conflict", "no_conflict"]},
+        "counterpart_fact_ids": {"type": "array", "items": {"type": "string"}},
+        "rationale": {"type": "string"},
+    },
+}
 EXTRACTION_PROMPT_VERSION = "extractor-evidence-units-v5"
 EXTRACTION_STAGE = "extractor"
 EXTRACTION_VALIDATION_ATTEMPTS = 2
@@ -1184,12 +1193,33 @@ def resolver_precheck_conflict(
         if facts_directly_conflict(fact, {"statement": statement}):
             directly_conflicting_fact_ids.append(str(fact["id"]))
     if directly_conflicting_fact_ids:
+        counterpart_facts = [
+            fact
+            for fact in (row_to_fact(row) for row in fact_rows)
+            if str(fact["id"]) in directly_conflicting_fact_ids
+        ]
+        judgment = resolver_precheck_conflict_judgment(
+            paths,
+            candidate,
+            counterpart_facts[:5],
+        )
+        if judgment.get("decision") == "no_conflict":
+            return None
+        selected_fact_ids = [
+            fact_id
+            for fact_id in judgment.get("counterpart_fact_ids", [])
+            if fact_id in directly_conflicting_fact_ids
+        ]
         return {
-            "reason": "Candidate appears to contradict an existing nearby fact.",
-            "counterpart_fact_ids": directly_conflicting_fact_ids[:5],
+            "reason": (
+                "Resolver precheck says candidate may contradict existing nearby fact(s)."
+            ),
+            "counterpart_fact_ids": selected_fact_ids
+            or directly_conflicting_fact_ids[:5],
             "entity_id": entity_id,
             "entity_mention": mention,
             "precheck": "direct_conflict",
+            "resolver_judgment": judgment,
         }
     if conflicted_fact_ids:
         return {
@@ -1200,6 +1230,92 @@ def resolver_precheck_conflict(
             "precheck": "existing_contested_facts",
         }
     return None
+
+
+def resolver_precheck_conflict_judgment(
+    paths: BrainPaths,
+    candidate: dict[str, Any],
+    counterpart_facts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not counterpart_facts:
+        return {
+            "decision": "no_conflict",
+            "counterpart_fact_ids": [],
+            "rationale": "No counterpart facts were supplied.",
+        }
+    counterpart_fact_ids = [str(fact["id"]) for fact in counterpart_facts]
+    if not cos_role_provider_configured(paths, "resolver"):
+        return {
+            "decision": "conflict",
+            "counterpart_fact_ids": counterpart_fact_ids,
+            "rationale": "Resolver role is not configured; failing closed to review.",
+        }
+    try:
+        parsed = complete_json(
+            conflict_precheck_prompt(candidate, counterpart_facts),
+            schema=CONFLICT_PRECHECK_SCHEMA,
+            role="resolver",
+            paths=paths,
+        )
+    except Exception as exc:
+        return {
+            "decision": "conflict",
+            "counterpart_fact_ids": counterpart_fact_ids,
+            "rationale": f"Resolver precheck failed; failing closed to review: {exc}",
+        }
+    decision = str(parsed.get("decision") or "").strip().lower()
+    if decision not in {"conflict", "no_conflict"}:
+        decision = "conflict"
+    selected_ids = [
+        str(fact_id)
+        for fact_id in parsed.get("counterpart_fact_ids") or []
+        if str(fact_id) in counterpart_fact_ids
+    ]
+    return {
+        "decision": decision,
+        "counterpart_fact_ids": selected_ids or counterpart_fact_ids,
+        "rationale": str(parsed.get("rationale") or "")[:1000],
+    }
+
+
+def conflict_precheck_prompt(
+    candidate: dict[str, Any], counterpart_facts: list[dict[str, Any]]
+) -> str:
+    candidate_card = {
+        "statement": candidate.get("statement"),
+        "entity_key": candidate.get("entity_key"),
+        "entity_id": candidate.get("entity_id"),
+        "page_hint": candidate.get("page_hint"),
+        "section_hint": candidate.get("section_hint"),
+        "evidence_quote": candidate.get("evidence_quote"),
+        "source_ids": candidate.get("source_ids") or [],
+    }
+    counterpart_cards = [
+        {
+            "id": fact.get("id"),
+            "statement": fact.get("statement"),
+            "entity_key": fact.get("entity_key"),
+            "entity_id": fact.get("entity_id"),
+            "page_hint": fact.get("page_hint"),
+            "section_hint": fact.get("section_hint"),
+            "evidence_quote": fact.get("evidence_quote"),
+            "source_ids": fact.get("source_ids") or [],
+            "status": fact.get("status"),
+        }
+        for fact in counterpart_facts
+    ]
+    return (
+        "Judge whether a proposed PKM fact genuinely contradicts existing facts. "
+        "Return decision 'conflict' only when the candidate and at least one existing fact "
+        "cannot both be true under the same entity, topic, time, and scope, or when resolving "
+        "them would require external truth. Return 'no_conflict' for unrelated facts, "
+        "complementary facts, different attributes of the same entity, same-topic facts that "
+        "can both be true, or lexical cue matches caused only by words like before/after, "
+        "not, rather than, high/low, or different numbers. Do not judge whether the candidate "
+        "is source-supported; the critic handles evidence support separately. If conflict, "
+        "include the existing counterpart_fact_ids that conflict.\n\n"
+        f"Candidate:\n{candidate_card}\n\nExisting facts:\n{counterpart_cards}"
+    )
 
 
 def backfill_fact_conflict_review_questions(paths: BrainPaths) -> dict[str, Any]:
