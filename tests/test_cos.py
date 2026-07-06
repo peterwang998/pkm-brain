@@ -158,6 +158,18 @@ def test_policy_promotion_matches_low_medium_and_large_topology(tmp_path: Path) 
             "page_merge",
             {"risk_tier": "medium", "affected_fact_count": 3},
         )
+        clean_fact = evaluate_policy(
+            conn,
+            "fact_upsert",
+            {
+                "risk_tier": "medium",
+                "clean_fact_upsert": True,
+                "fact_upsert_resolution": "new_clean_fact",
+                "quote_backed": True,
+                "fallback_route": False,
+                "resolver_precheck": "passed",
+            },
+        )
         entity_medium = evaluate_policy(
             conn,
             "entity_merge",
@@ -193,6 +205,8 @@ def test_policy_promotion_matches_low_medium_and_large_topology(tmp_path: Path) 
     assert low.critic_required is True
     assert medium.autonomy_level == "L2"
     assert medium.audit_sample_rate == 1.0
+    assert clean_fact.autonomy_level == "L2"
+    assert clean_fact.critic_required is True
     assert entity_medium.autonomy_level == "L2"
     assert entity_high_certainty.autonomy_level == "L1"
     assert entity_high_certainty.critic_required is False
@@ -1680,7 +1694,7 @@ def test_extraction_promoted_clean_fact_requires_labeled_eval_gate(
         assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 0
 
 
-def test_extraction_promoted_clean_fact_applies_with_labeled_eval_report(
+def test_extraction_promoted_clean_fact_requires_critic_after_labeled_eval_report(
     tmp_path: Path,
 ) -> None:
     svc = service_for(tmp_path)
@@ -1705,17 +1719,18 @@ def test_extraction_promoted_clean_fact_applies_with_labeled_eval_report(
     result = extract_recent_documents(svc.paths, shadow=False, llm_provider=provider)
 
     assert result["status"] == "ok"
-    assert result["actions"][0]["status"] == "applied"
+    assert result["actions"][0]["status"] == "needs_human"
     assert result["actions"][0]["policy_decision"] == "matched"
     assert result["actions"][0]["autonomy_level"] == "L2"
+    assert result["actions"][0]["critic_decision"] == "unavailable"
     with connection(svc.paths.sqlite_path) as conn:
-        fact = conn.execute("SELECT statement, page_hint FROM facts").fetchone()
-        residue_count = conn.execute(
-            "SELECT COUNT(*) FROM open_questions WHERE status = 'needs_human'"
-        ).fetchone()[0]
-    assert fact["statement"] == "Earned autonomy marker is present."
-    assert fact["page_hint"] == "concepts/earned-autonomy.md"
-    assert residue_count == 0
+        assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 0
+        residue = conn.execute(
+            "SELECT kind, question FROM open_questions WHERE action_id = ?",
+            (result["actions"][0]["id"],),
+        ).fetchone()
+    assert residue["kind"] == "policy_escalation"
+    assert "critic did not agree" in residue["question"]
 
 
 def test_extraction_simple_autonomy_auto_applies_clean_routed_fact(

@@ -538,7 +538,7 @@ def autonomy_policy_rows(
                 }
             },
             "L2",
-            False,
+            True,
             1.0,
             created_at,
         ),
