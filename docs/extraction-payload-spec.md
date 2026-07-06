@@ -296,6 +296,8 @@ Examples from the audit:
 
 **2026-07-06 v4 critic follow-up:** critic-gated samples got applied-fact audit quality to 0 sampled bad, but blocked-fact rationales show remaining extractor drift. The durable failures are: dropping hedges ("appears to", "I think", "should still be roughly"), turning a speaker's description into an unqualified world fact, attributing a statement to Peter when the cited evidence does not identify the speaker, abstracting a concrete quote into a broader category ("Iceberg tables across vendors" → "storage interoperability"), and carrying an entity from wider context into a cited span that does not establish it. Future extractor prompt/model changes should target these before trying to weaken the critic.
 
+**2026-07-06 stronger-extractor check:** rerunning the same high-yield two-document sample with `PKM_BRAIN_LLM_EXTRACTOR_MODEL=gpt-5.4` in `/private/tmp/pkm-extractor-full-vrmkHI` produced 65 candidates, 38 critic-agreed applied facts, 14 critic-blocked facts, and 13 unrouted residues in 182s. The comparable mini run produced 41 fact actions, 20 applied facts, 18 critic-blocked facts, and 3 residues. Use `gpt-5.4` for rebuild/canary extraction when recall matters; keep the standing nightly config on `gpt-5.4-mini` unless a slower default is explicitly acceptable.
+
 This is prompt hardening, not a brittle deterministic semantic gate. Numeric faithfulness remains deterministic; broader entailment stays with the extractor plus post-hoc auditor until a labeled semantic-support eval exists.
 
 ### H2 — Throughput

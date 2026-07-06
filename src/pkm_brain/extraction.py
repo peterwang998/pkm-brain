@@ -70,6 +70,9 @@ DEFAULT_EXTRACTION_WINDOW_CHUNKS = 6
 DEFAULT_EXTRACTION_WINDOW_OVERLAP_CHUNKS = 1
 DEFAULT_EXTRACTION_MAX_WORKERS = 1
 MAX_EXTRACTION_MAX_WORKERS = 16
+DEFAULT_CRITIC_REVIEW_MAX_WORKERS = 4
+DEFAULT_CRITIC_REVIEW_TIMEOUT_SECONDS = 300
+DEFAULT_CRITIC_BLOCK_RATE_ANOMALY_THRESHOLD = 0.8
 DEFAULT_ROUTING_HINT_LIMIT = 80
 ROUTING_HINT_POOL_LIMIT = 2000
 DEFAULT_SKIPPED_SOURCE_TYPES = {"agent_session_log"}
@@ -147,6 +150,9 @@ def extract_recent_documents(
     changed_only: bool = True,
     run_id: str | None = None,
     max_workers: int | None = None,
+    critic_disagreement_mode: str | None = None,
+    critic_max_workers: int | None = None,
+    critic_timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
     run_started = time.perf_counter()
     if not cos_role_provider_configured(
@@ -169,6 +175,12 @@ def extract_recent_documents(
     extraction_config = load_extraction_config(paths)
     worker_count = normalize_extraction_max_workers(
         max_workers if max_workers is not None else extraction_config.get("max_workers")
+    )
+    critic_review = critic_review_config(
+        extraction_config,
+        disagreement_mode=critic_disagreement_mode,
+        max_workers=critic_max_workers,
+        timeout_seconds=critic_timeout_seconds,
     )
     documents = recent_source_cards(
         paths,
@@ -246,7 +258,12 @@ def extract_recent_documents(
                 simple_autonomy=simple_autonomy,
             )
         else:
-            actions = propose_policy_gated_candidates(paths, candidates, run_id=run_id)
+            actions = propose_policy_gated_candidates(
+                paths,
+                candidates,
+                run_id=run_id,
+                critic_review=critic_review,
+            )
         apply_duration_ms = elapsed_ms(apply_started)
     timing = extraction_run_timing(
         run_started,
@@ -631,6 +648,7 @@ def load_extraction_config(paths: BrainPaths) -> dict[str, Any]:
         raw.get("parallelism") if isinstance(raw.get("parallelism"), dict) else {}
     )
     simple_autonomy = normalize_simple_autonomy_config(raw.get("simple_autonomy"))
+    critic_review = normalize_critic_review_config(raw.get("critic_review"))
     max_chunks = max(
         1, int(window.get("max_chunks") or DEFAULT_EXTRACTION_WINDOW_CHUNKS)
     )
@@ -654,6 +672,7 @@ def load_extraction_config(paths: BrainPaths) -> dict[str, Any]:
             or DEFAULT_EXTRACTION_MAX_WORKERS
         ),
         "simple_autonomy": simple_autonomy,
+        "critic_review": critic_review,
     }
 
 
@@ -695,6 +714,76 @@ def normalize_extraction_max_workers(value: Any) -> int:
     return min(MAX_EXTRACTION_MAX_WORKERS, max(1, parsed))
 
 
+def normalize_critic_review_config(value: Any) -> dict[str, Any]:
+    raw = value if isinstance(value, dict) else {}
+    return {
+        "max_workers": normalize_extraction_max_workers(
+            raw.get("max_workers")
+            or raw.get("workers")
+            or DEFAULT_CRITIC_REVIEW_MAX_WORKERS
+        ),
+        "timeout_seconds": normalize_positive_int(
+            raw.get("timeout_seconds"), DEFAULT_CRITIC_REVIEW_TIMEOUT_SECONDS
+        ),
+        "disagreement_mode": normalize_critic_disagreement_mode(
+            raw.get("disagreement_mode")
+        ),
+        "block_rate_anomaly_threshold": normalize_threshold(
+            raw.get("block_rate_anomaly_threshold"),
+            DEFAULT_CRITIC_BLOCK_RATE_ANOMALY_THRESHOLD,
+        ),
+    }
+
+
+def default_critic_review_config() -> dict[str, Any]:
+    return normalize_critic_review_config({})
+
+
+def critic_review_config(
+    config: dict[str, Any],
+    *,
+    disagreement_mode: str | None,
+    max_workers: int | None,
+    timeout_seconds: int | None,
+) -> dict[str, Any]:
+    review = dict(config.get("critic_review") or default_critic_review_config())
+    if disagreement_mode is not None:
+        review["disagreement_mode"] = normalize_critic_disagreement_mode(
+            disagreement_mode
+        )
+    if max_workers is not None:
+        review["max_workers"] = normalize_extraction_max_workers(max_workers)
+    if timeout_seconds is not None:
+        review["timeout_seconds"] = normalize_positive_int(
+            timeout_seconds, DEFAULT_CRITIC_REVIEW_TIMEOUT_SECONDS
+        )
+    return review
+
+
+def normalize_critic_disagreement_mode(value: Any) -> str:
+    mode = str(value or "needs_human").strip().lower().replace("-", "_")
+    return mode if mode in {"needs_human", "reject"} else "needs_human"
+
+
+def normalize_positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(1, parsed)
+
+
+def normalize_threshold(value: Any, default: float) -> float | None:
+    if value is None:
+        return default
+    parsed = optional_float(value)
+    if parsed is None:
+        return default
+    if parsed <= 0:
+        return None
+    return min(1.0, parsed)
+
+
 def normalize_simple_autonomy_config(value: Any) -> dict[str, Any]:
     raw = value if isinstance(value, dict) else {}
     fallback_page_hints = raw.get("fallback_page_hints")
@@ -728,8 +817,11 @@ def propose_policy_gated_candidates(
     candidates: list[dict[str, Any]],
     *,
     run_id: str | None,
+    critic_review: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     actions: list[dict[str, Any]] = []
+    pending_decisions: list[tuple[int, str]] = []
+    review = critic_review or default_critic_review_config()
     for candidate in candidates:
         decision = earned_fact_decision(paths, candidate)
         action_fact = (
@@ -761,8 +853,155 @@ def propose_policy_gated_candidates(
                 )
             )
             continue
-        actions.append(decide_action(paths, action["id"]))
+        pending_decisions.append((len(actions), action["id"]))
+        actions.append(action)
+    if pending_decisions:
+        decided = decide_policy_actions(
+            paths,
+            [action_id for _, action_id in pending_decisions],
+            critic_review=review,
+        )
+        for (index, _action_id), decided_action in zip(pending_decisions, decided):
+            actions[index] = decided_action
+    if review.get("block_rate_anomaly_threshold") is not None:
+        record_critic_block_rate_anomalies(paths, actions, critic_review=review)
     return actions
+
+
+def decide_policy_actions(
+    paths: BrainPaths,
+    action_ids: list[str],
+    *,
+    critic_review: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not action_ids:
+        return []
+    max_workers = min(
+        normalize_extraction_max_workers(critic_review.get("max_workers")),
+        len(action_ids),
+    )
+    kwargs = {
+        "critic_timeout_seconds": critic_review.get("timeout_seconds"),
+        "critic_disagreement_mode": str(
+            critic_review.get("disagreement_mode") or "needs_human"
+        ),
+    }
+    if max_workers <= 1:
+        return [decide_action(paths, action_id, **kwargs) for action_id in action_ids]
+    results: dict[int, dict[str, Any]] = {}
+    with ThreadPoolExecutor(
+        max_workers=max_workers, thread_name_prefix="brain-critic"
+    ) as executor:
+        futures = {
+            executor.submit(decide_action, paths, action_id, **kwargs): index
+            for index, action_id in enumerate(action_ids)
+        }
+        for future in as_completed(futures):
+            results[futures[future]] = future.result()
+    return [results[index] for index in range(len(action_ids))]
+
+
+def record_critic_block_rate_anomalies(
+    paths: BrainPaths,
+    actions: list[dict[str, Any]],
+    *,
+    critic_review: dict[str, Any],
+) -> None:
+    threshold = critic_review.get("block_rate_anomaly_threshold")
+    if threshold is None:
+        return
+    try:
+        parsed_threshold = float(threshold)
+    except (TypeError, ValueError):
+        parsed_threshold = DEFAULT_CRITIC_BLOCK_RATE_ANOMALY_THRESHOLD
+    per_doc: dict[str, dict[str, Any]] = {}
+    for action in actions:
+        if action.get("action_type") != "fact_upsert":
+            continue
+        critic_decision = action.get("critic_decision")
+        if critic_decision is None:
+            continue
+        fact = (action.get("evidence_json") or {}).get("payload", {}).get("fact", {})
+        metadata = fact.get("metadata") if isinstance(fact, dict) else {}
+        document_id = str((metadata or {}).get("document_id") or "").strip()
+        if not document_id:
+            continue
+        bucket = per_doc.setdefault(
+            document_id,
+            {
+                "reviewed": 0,
+                "blocked": 0,
+                "action_ids": [],
+                "blocked_action_ids": [],
+            },
+        )
+        bucket["reviewed"] += 1
+        bucket["action_ids"].append(action["id"])
+        if critic_decision != "agree":
+            bucket["blocked"] += 1
+            bucket["blocked_action_ids"].append(action["id"])
+    with connection(paths.sqlite_path) as conn:
+        for document_id, bucket in per_doc.items():
+            reviewed = int(bucket["reviewed"])
+            blocked = int(bucket["blocked"])
+            if reviewed < 3:
+                continue
+            block_rate = blocked / reviewed if reviewed else 0.0
+            if block_rate < parsed_threshold:
+                continue
+            existing = conn.execute(
+                """
+                SELECT 1
+                FROM open_questions
+                WHERE kind = 'document_extraction_anomaly'
+                  AND status IN ('open', 'needs_human')
+                  AND json_extract(context, '$.document_id') = ?
+                LIMIT 1
+                """,
+                (document_id,),
+            ).fetchone()
+            if existing is not None:
+                continue
+            doc = conn.execute(
+                "SELECT title, source_type FROM documents WHERE id = ?",
+                (document_id,),
+            ).fetchone()
+            title = str(doc["title"] if doc else document_id)
+            question_id = new_id("question")
+            conn.execute(
+                """
+                INSERT INTO open_questions(
+                  id, kind, entity_key, page_hint, fact_ids, question, options,
+                  status, context, recommended_action, risk_tier, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    question_id,
+                    "document_extraction_anomaly",
+                    None,
+                    None,
+                    dumps([]),
+                    (
+                        f"Critic blocked {blocked}/{reviewed} extracted facts "
+                        f"({block_rate:.0%}) for source document '{title}'. "
+                        "Review extractor quality for this document before trusting its yield."
+                    ),
+                    dumps([]),
+                    "needs_human",
+                    dumps(
+                        {
+                            "document_id": document_id,
+                            "title": title,
+                            "reviewed_action_ids": bucket["action_ids"],
+                            "blocked_action_ids": bucket["blocked_action_ids"],
+                            "block_rate": block_rate,
+                        }
+                    ),
+                    dumps({"action_type": "review_document_extraction"}),
+                    "medium",
+                    now_iso(),
+                ),
+            )
 
 
 def earned_fact_decision(

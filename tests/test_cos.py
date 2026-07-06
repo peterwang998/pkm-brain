@@ -26,13 +26,15 @@ from pkm_brain.cos_policy import (
 )
 from pkm_brain.db import connection
 from pkm_brain.extraction import (
+    decide_policy_actions,
     evidence_units_for_text,
     extraction_prompt,
     extract_recent_documents,
+    record_critic_block_rate_anomalies,
     validate_extracted_facts,
     validate_extracted_facts_with_report,
 )
-from pkm_brain.llm import role_env
+from pkm_brain.llm import LLMProviderError, role_env
 from pkm_brain.paths import BrainPaths
 from pkm_brain.service import BrainService
 
@@ -2205,6 +2207,186 @@ def test_critic_llm_disagreement_blocks_l2_apply(tmp_path: Path) -> None:
     assert decided["critic_decision"] == "disagree"
 
 
+def test_critic_disagreement_can_reject_without_human_residue(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    insert_critic_policy(
+        svc.paths, "policy_test_l2_critic_reject", "L2", "needs_l2_critic"
+    )
+    action = propose_action(
+        svc.paths,
+        "canonicalize_page",
+        action_payload={"page_hint": "concepts/test.md"},
+        action_features={"needs_l2_critic": True},
+        target_page_paths=["concepts/test.md"],
+    )
+
+    decided = decide_action(
+        svc.paths,
+        action["id"],
+        critic_llm_provider=FakeCriticProvider("disagree"),
+        critic_disagreement_mode="reject",
+    )
+
+    assert decided["status"] == "rejected"
+    assert decided["autonomy_level"] == "L2"
+    assert decided["critic_decision"] == "disagree"
+    assert decided["evidence_json"]["rejection"]["reason"] == "critic did not agree"
+    assert decided["evidence_json"]["critic_review"]["decision"] == "disagree"
+    with connection(svc.paths.sqlite_path) as conn:
+        residue_count = conn.execute(
+            "SELECT COUNT(*) FROM open_questions WHERE action_id = ?",
+            (action["id"],),
+        ).fetchone()[0]
+    assert residue_count == 0
+
+
+def test_critic_timeout_rejects_in_rebuild_mode(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    insert_critic_policy(
+        svc.paths, "policy_test_l2_critic_timeout", "L2", "needs_l2_critic"
+    )
+    action = propose_action(
+        svc.paths,
+        "canonicalize_page",
+        action_payload={"page_hint": "concepts/test.md"},
+        action_features={"needs_l2_critic": True},
+        target_page_paths=["concepts/test.md"],
+    )
+
+    decided = decide_action(
+        svc.paths,
+        action["id"],
+        critic_llm_provider=FailingCriticProvider(),
+        critic_timeout_seconds=1,
+        critic_disagreement_mode="reject",
+    )
+
+    assert decided["status"] == "rejected"
+    assert decided["critic_decision"] == "unavailable"
+    assert "timed out" in decided["evidence_json"]["critic_review"]["rationale"]
+    assert decided["evidence_json"]["rejection"]["reason"] == "critic did not agree"
+    with connection(svc.paths.sqlite_path) as conn:
+        residue_count = conn.execute(
+            "SELECT COUNT(*) FROM open_questions WHERE action_id = ?",
+            (action["id"],),
+        ).fetchone()[0]
+    assert residue_count == 0
+
+
+def test_decide_policy_actions_parallel_preserves_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    calls: list[str] = []
+
+    def fake_decide_action(paths: BrainPaths, action_id: str, **kwargs: object) -> dict[str, object]:
+        assert paths == svc.paths
+        assert kwargs["critic_disagreement_mode"] == "reject"
+        time.sleep(0.05)
+        calls.append(action_id)
+        return {"id": action_id}
+
+    monkeypatch.setattr("pkm_brain.extraction.decide_action", fake_decide_action)
+
+    started = time.perf_counter()
+    decided = decide_policy_actions(
+        svc.paths,
+        ["action_1", "action_2", "action_3", "action_4"],
+        critic_review={
+            "max_workers": 4,
+            "timeout_seconds": 1,
+            "disagreement_mode": "reject",
+        },
+    )
+
+    assert time.perf_counter() - started < 0.15
+    assert [action["id"] for action in decided] == [
+        "action_1",
+        "action_2",
+        "action_3",
+        "action_4",
+    ]
+    assert sorted(calls) == ["action_1", "action_2", "action_3", "action_4"]
+
+
+def test_critic_block_rate_anomaly_creates_one_document_residue(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    with connection(svc.paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO documents(
+              id, source_type, title, source_path, raw_path, content_hash,
+              created_at, ingested_at, tags, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "doc_blocked",
+                "hyprnote_meeting",
+                "Blocked extraction doc",
+                "raw/blocked.md",
+                "raw/blocked.md",
+                "hash_blocked",
+                "2026-06-25T00:00:00+00:00",
+                "2026-06-25T00:00:00+00:00",
+                "[]",
+                "active",
+            ),
+        )
+    actions = []
+    for index, critic_decision in enumerate(["disagree", "disagree", "disagree", "agree"]):
+        action = propose_action(
+            svc.paths,
+            "fact_upsert",
+            action_payload={
+                "fact": {
+                    "id": f"fact_blocked_{index}",
+                    "statement": f"Blocked fact {index}.",
+                    "page_hint": "concepts/test.md",
+                    "metadata": {"document_id": "doc_blocked"},
+                    "confidence": 0.9,
+                }
+            },
+        )
+        with connection(svc.paths.sqlite_path) as conn:
+            conn.execute(
+                "UPDATE cos_actions SET critic_decision = ? WHERE id = ?",
+                (critic_decision, action["id"]),
+            )
+        actions.append(get_action(svc.paths, action["id"]))
+
+    record_critic_block_rate_anomalies(
+        svc.paths,
+        actions,
+        critic_review={"block_rate_anomaly_threshold": 0.75},
+    )
+    record_critic_block_rate_anomalies(
+        svc.paths,
+        actions,
+        critic_review={"block_rate_anomaly_threshold": 0.75},
+    )
+
+    with connection(svc.paths.sqlite_path) as conn:
+        residues = list(
+            conn.execute(
+                """
+                SELECT *
+                FROM open_questions
+                WHERE kind = 'document_extraction_anomaly'
+                """
+            )
+        )
+    assert len(residues) == 1
+    assert residues[0]["status"] == "needs_human"
+    assert "3/4 extracted facts" in residues[0]["question"]
+    assert json.loads(residues[0]["context"])["document_id"] == "doc_blocked"
+
+
 def test_missing_critic_provider_blocks_required_critic_auto_apply(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2245,6 +2427,17 @@ class FakeCriticProvider:
         return json.dumps(
             {"decision": self.decision, "rationale": "test critic judgment"}
         )
+
+
+class FailingCriticProvider:
+    name = "fake"
+    model = "fake-critic-model"
+    timeout = 30
+
+    def complete(self, prompt: str) -> str:
+        assert "Review this Chief-of-Staff action" in prompt
+        assert self.timeout == 1
+        raise LLMProviderError("Codex timed out after 1 seconds")
 
 
 def test_critic_prompt_for_fact_upsert_is_narrow_entailment_review() -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from threading import Lock
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,7 @@ from .entities import (
     resolve_entity,
 )
 from .llm import (
+    LLMProviderError,
     LLMProvider,
     complete_json,
     cos_role_provider_configured,
@@ -29,6 +31,8 @@ from .util import new_id, now_iso
 
 
 APPLIED_STATUSES = {"applied", "auto_applied"}
+CRITIC_DISAGREEMENT_MODES = {"needs_human", "reject"}
+_COS_ROLE_PROVIDER_LOCK = Lock()
 CRITIC_SCHEMA = {
     "type": "object",
     "required": ["decision", "rationale"],
@@ -227,7 +231,13 @@ def decide_action(
     critic_decision: str | None = None,
     critic_llm_provider: LLMProvider | None = None,
     critic_provider: str | None = None,
+    critic_timeout_seconds: int | None = None,
+    critic_disagreement_mode: str = "needs_human",
 ) -> dict[str, Any]:
+    if critic_disagreement_mode not in CRITIC_DISAGREEMENT_MODES:
+        raise ValueError(
+            f"critic_disagreement_mode must be one of {sorted(CRITIC_DISAGREEMENT_MODES)}"
+        )
     with connection(paths.sqlite_path) as conn:
         action = load_action(conn, action_id)
         decision = evaluate_policy(
@@ -240,6 +250,7 @@ def decide_action(
             decision,
             llm_provider=critic_llm_provider,
             provider=critic_provider,
+            timeout_seconds=critic_timeout_seconds,
         )
         critic_by = review["critic_by"]
         critic_decision = review["decision"]
@@ -269,12 +280,16 @@ def decide_action(
         return apply_action(paths, action_id, applied_status="auto_applied")
     if decision.autonomy_level == "L1":
         if decision.critic_required and critic_decision != "agree":
-            mark_needs_human(paths, action_id, decision, "critic did not agree")
+            handle_critic_disagreement(
+                paths, action_id, decision, critic_disagreement_mode
+            )
             return get_action(paths, action_id)
         return apply_action(paths, action_id, applied_status="auto_applied")
     if decision.autonomy_level == "L2":
         if decision.critic_required and critic_decision != "agree":
-            mark_needs_human(paths, action_id, decision, "critic did not agree")
+            handle_critic_disagreement(
+                paths, action_id, decision, critic_disagreement_mode
+            )
             return get_action(paths, action_id)
         return apply_action(paths, action_id, applied_status="applied")
     mark_needs_human(paths, action_id, decision, decision.reason or "requires human decision")
@@ -288,6 +303,7 @@ def critic_review(
     *,
     llm_provider: LLMProvider | None = None,
     provider: str | None = None,
+    timeout_seconds: int | None = None,
 ) -> dict[str, str]:
     if not cos_role_provider_configured(paths, "critic", llm_provider=llm_provider, provider=provider):
         return {
@@ -295,15 +311,38 @@ def critic_review(
             "decision": "unavailable",
             "rationale": "No CoS LLM provider configured for critic role",
         }
-    active_provider = get_cos_role_provider(paths, "critic", provider=provider, llm_provider=llm_provider)
-    parsed = complete_json(
-        critic_prompt(action, decision),
-        schema=CRITIC_SCHEMA,
-        role="critic",
-        provider=provider,
-        llm_provider=active_provider,
-        paths=paths,
-    )
+    if llm_provider is not None:
+        active_provider = llm_provider
+    else:
+        with _COS_ROLE_PROVIDER_LOCK:
+            active_provider = get_cos_role_provider(paths, "critic", provider=provider)
+    if active_provider is None:
+        return {
+            "critic_by": "critic:unconfigured",
+            "decision": "unavailable",
+            "rationale": "No CoS LLM provider configured for critic role",
+        }
+    previous_timeout = getattr(active_provider, "timeout", None)
+    if timeout_seconds is not None and timeout_seconds > 0 and hasattr(active_provider, "timeout"):
+        setattr(active_provider, "timeout", int(timeout_seconds))
+    try:
+        parsed = complete_json(
+            critic_prompt(action, decision),
+            schema=CRITIC_SCHEMA,
+            role="critic",
+            provider=provider,
+            llm_provider=active_provider,
+            paths=paths,
+        )
+    except LLMProviderError as exc:
+        return {
+            "critic_by": critic_provider_label(active_provider),
+            "decision": "unavailable",
+            "rationale": str(exc)[:1000],
+        }
+    finally:
+        if previous_timeout is not None and hasattr(active_provider, "timeout"):
+            setattr(active_provider, "timeout", previous_timeout)
     return {
         "critic_by": critic_provider_label(active_provider),
         "decision": normalize_critic_decision(parsed.get("decision")),
@@ -373,6 +412,18 @@ def evidence_with_critic_review(
         "rationale": review.get("rationale") or "",
     }
     return evidence
+
+
+def handle_critic_disagreement(
+    paths: BrainPaths,
+    action_id: str,
+    decision: PolicyDecision,
+    critic_disagreement_mode: str,
+) -> None:
+    if critic_disagreement_mode == "reject":
+        reject_action(paths, action_id, decision, "critic did not agree")
+        return
+    mark_needs_human(paths, action_id, decision, "critic did not agree")
 
 
 def apply_action(
@@ -586,6 +637,40 @@ def mark_action_residue(
             WHERE id = ?
             """,
             (policy_decision, autonomy_level, action_id),
+        )
+    return get_action(paths, action_id)
+
+
+def reject_action(
+    paths: BrainPaths, action_id: str, decision: PolicyDecision, reason: str
+) -> dict[str, Any]:
+    rejected_at = now_iso()
+    with connection(paths.sqlite_path) as conn:
+        action = load_action(conn, action_id)
+        evidence = dict(action.get("evidence_json") or {})
+        evidence["rejection"] = {
+            "reason": reason,
+            "rejected_at": rejected_at,
+            "policy_id": decision.policy_id,
+            "policy_version": decision.policy_version,
+            "policy_decision": decision.policy_decision,
+            "autonomy_level": decision.autonomy_level,
+        }
+        conn.execute(
+            """
+            UPDATE cos_actions
+            SET status = 'rejected', policy_id = ?, policy_version = ?,
+                policy_decision = ?, autonomy_level = ?, evidence_json = ?
+            WHERE id = ?
+            """,
+            (
+                decision.policy_id,
+                decision.policy_version,
+                decision.policy_decision,
+                decision.autonomy_level,
+                dumps(evidence),
+                action_id,
+            ),
         )
     return get_action(paths, action_id)
 
