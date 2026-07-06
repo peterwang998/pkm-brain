@@ -743,9 +743,11 @@ def cos_backup_runtime(
 @cos_app.command("rebuild-facts")
 def cos_rebuild_facts(
     from_sources: bool = typer.Option(False, "--from-sources", help="Plan a rebuild from active source documents."),
-    dry_run: bool = typer.Option(True, "--dry-run/--apply", help="Preview by default; --apply is intentionally blocked for now."),
+    dry_run: bool = typer.Option(True, "--dry-run/--apply", help="Preview by default; --apply executes the from-source rebuild."),
     source_type: Optional[list[str]] = typer.Option(None, "--source-type", help="Restrict to a source_type; may be repeated."),
     limit: Optional[int] = typer.Option(None, "--limit", min=1, help="Maximum source documents to include."),
+    offset: int = typer.Option(0, "--offset", min=0, help="Skip this many selected source documents for tranche continuation."),
+    reset: Optional[bool] = typer.Option(None, "--reset/--continue-run", help="Archive existing derived state before apply. Defaults to reset only when offset is 0."),
     home: Optional[Path] = typer.Option(None, help="Brain home directory."),
 ) -> None:
     try:
@@ -755,6 +757,8 @@ def cos_rebuild_facts(
             dry_run=dry_run,
             source_types=source_type or [],
             limit=limit,
+            offset=offset,
+            reset=reset,
         )
     except ValueError as exc:
         console.print(str(exc))

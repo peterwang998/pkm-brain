@@ -144,6 +144,7 @@ def extract_recent_documents(
     paths: BrainPaths,
     *,
     limit: int = 10,
+    offset: int = 0,
     shadow: bool = True,
     llm_provider: LLMProvider | None = None,
     provider: str | None = None,
@@ -153,6 +154,7 @@ def extract_recent_documents(
     critic_disagreement_mode: str | None = None,
     critic_max_workers: int | None = None,
     critic_timeout_seconds: int | None = None,
+    source_types: list[str] | None = None,
 ) -> dict[str, Any]:
     run_started = time.perf_counter()
     if not cos_role_provider_configured(
@@ -182,14 +184,29 @@ def extract_recent_documents(
         max_workers=critic_max_workers,
         timeout_seconds=critic_timeout_seconds,
     )
+    source_type_filter = {str(item).strip() for item in source_types or [] if str(item).strip()}
+    selection_limit = (
+        max(1, limit)
+        if offset <= 0 and not source_type_filter
+        else 10_000_000
+    )
     documents = recent_source_cards(
         paths,
-        limit=limit,
+        limit=selection_limit,
         changed_only=changed_only,
         extractor_model=extractor_model,
         prompt_version=EXTRACTION_PROMPT_VERSION,
         extraction_config=extraction_config,
     )
+    if source_type_filter:
+        documents = [
+            document
+            for document in documents
+            if str(document.get("source_type") or "") in source_type_filter
+        ]
+    if offset > 0:
+        documents = documents[offset:]
+    documents = documents[: max(0, limit)]
     selection_duration_ms = elapsed_ms(selection_started)
     if not documents:
         timing = extraction_run_timing(
