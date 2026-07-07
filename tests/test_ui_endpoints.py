@@ -119,6 +119,74 @@ def write_concept_page(paths: BrainPaths, *, generated: bool = False) -> Path:
     return page
 
 
+def review_fact_payload(fact_id: str = "fact_review") -> dict[str, object]:
+    return {
+        "id": fact_id,
+        "statement": "The review workflow should show enough evidence to make a decision.",
+        "entity_key": "concepts:review-workflow:summary",
+        "page_hint": "concepts/review-workflow.md",
+        "section_hint": "Summary",
+        "source_ids": ["manual:test"],
+        "observed_at": "2026-07-06T10:00:00+00:00",
+        "confidence": 0.91,
+        "status": "active",
+        "metadata": {"test": True},
+        "source_spans": [
+            {
+                "source_id": "manual:test",
+                "start_char": 0,
+                "end_char": 72,
+                "quote": "The review workflow should show enough evidence to make a decision.",
+            }
+        ],
+        "evidence_quote": "The review workflow should show enough evidence to make a decision.",
+        "extraction_method": "test",
+    }
+
+
+def insert_review_question_for_action(
+    paths: BrainPaths, *, question_id: str, action_id: str, fact: dict[str, object]
+) -> None:
+    with connection(paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO open_questions(
+              id, kind, entity_key, page_hint, fact_ids, question, options, status,
+              context, action_id, recommended_action, risk_tier, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                question_id,
+                "fact_conflict_review",
+                fact["entity_key"],
+                fact["page_hint"],
+                dumps(["fact_existing"]),
+                "Candidate appears to contradict an existing nearby fact.",
+                dumps(
+                    [
+                        {
+                            "option_type": "candidate_fact",
+                            "action_id": action_id,
+                            **fact,
+                        },
+                        {
+                            "option_type": "existing_fact",
+                            "fact_id": "fact_existing",
+                            "statement": "The old review workflow did not show enough evidence.",
+                            "source_ids": ["manual:existing"],
+                        },
+                    ]
+                ),
+                "needs_human",
+                dumps({"action_id": action_id, "counterpart_fact_ids": ["fact_existing"]}),
+                action_id,
+                dumps({"action_type": "fact_upsert", "payload": {"fact": fact}}),
+                "medium",
+                "2026-07-06T10:01:00+00:00",
+            ),
+        )
+
+
 def test_status_endpoint_returns_service_layer_json(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
 
@@ -136,6 +204,113 @@ def test_status_endpoint_returns_service_layer_json(tmp_path: Path) -> None:
     assert surfaces["Memories"]["searched"] is True
     assert "Legacy wiki packets" not in surfaces
     assert surfaces["CoS action ledger"]["searched"] is False
+
+
+def test_cos_review_apply_action_endpoint_applies_linked_action(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    fact = review_fact_payload()
+    action = propose_action(
+        paths,
+        "fact_upsert",
+        action_payload={"fact": fact},
+        action_features={"truth_mutation": True, "reversible": True},
+        target_fact_ids=[str(fact["id"])],
+        target_page_paths=[str(fact["page_hint"])],
+        proposed_by="test",
+        risk_tier="medium",
+    )
+    with connection(paths.sqlite_path) as conn:
+        conn.execute(
+            "UPDATE cos_actions SET status = 'needs_human' WHERE id = ?",
+            (action["id"],),
+        )
+    insert_review_question_for_action(
+        paths,
+        question_id="question_review_apply",
+        action_id=action["id"],
+        fact=fact,
+    )
+
+    with running_ui(paths) as (host, port, token):
+        status, body = request_json(
+            host,
+            port,
+            token,
+            "POST",
+            "/api/cos/questions/question_review_apply/apply-action",
+            {"note": "looks supported"},
+        )
+
+    assert status == 200
+    assert body["question"]["status"] == "answered"
+    assert body["question"]["answer"]["decision"] == "apply_action"
+    assert body["action"]["status"] == "applied"
+    with connection(paths.sqlite_path) as conn:
+        fact_row = conn.execute(
+            "SELECT statement, status FROM facts WHERE id = ?", (fact["id"],)
+        ).fetchone()
+        question_row = conn.execute(
+            "SELECT status, decided_by FROM open_questions WHERE id = ?",
+            ("question_review_apply",),
+        ).fetchone()
+    assert fact_row["statement"] == fact["statement"]
+    assert fact_row["status"] == "active"
+    assert question_row["status"] == "answered"
+    assert question_row["decided_by"] == "human"
+
+
+def test_cos_review_dismiss_endpoint_rejects_linked_action(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    fact = review_fact_payload("fact_rejected")
+    action = propose_action(
+        paths,
+        "fact_upsert",
+        action_payload={"fact": fact},
+        action_features={"truth_mutation": True, "reversible": True},
+        target_fact_ids=[str(fact["id"])],
+        target_page_paths=[str(fact["page_hint"])],
+        proposed_by="test",
+        risk_tier="medium",
+    )
+    insert_review_question_for_action(
+        paths,
+        question_id="question_review_reject",
+        action_id=action["id"],
+        fact=fact,
+    )
+
+    with running_ui(paths) as (host, port, token):
+        status, body = request_json(
+            host,
+            port,
+            token,
+            "POST",
+            "/api/cos/questions/question_review_reject/dismiss",
+            {"reason": "not supported by quote"},
+        )
+
+    assert status == 200
+    assert body["question"]["status"] == "dismissed"
+    assert body["question"]["answer"]["decision"] == "dismiss"
+    assert body["action"]["status"] == "rejected"
+    assert body["action"]["evidence_json"]["human_review"]["reason"] == "not supported by quote"
+    with connection(paths.sqlite_path) as conn:
+        fact_count = conn.execute(
+            "SELECT COUNT(*) FROM facts WHERE id = ?", (fact["id"],)
+        ).fetchone()[0]
+        question_row = conn.execute(
+            "SELECT status, decided_by FROM open_questions WHERE id = ?",
+            ("question_review_reject",),
+        ).fetchone()
+    assert fact_count == 0
+    assert question_row["status"] == "dismissed"
+    assert question_row["decided_by"] == "human"
 
 
 def test_legacy_wiki_proposal_endpoints_are_retired(tmp_path: Path) -> None:

@@ -14,14 +14,15 @@ import yaml
 from .audit import audit_memories
 from .automation import index_status
 from .contracts import active_page_contracts, generate_initial_contracts
-from .cos_actions import recent_actions, row_to_action
+from .cos_actions import apply_action, load_action, recent_actions, row_to_action
 from .cos_audit import COS_AUDIT_CONFIGURED_NOTE, COS_AUDIT_STUB_NOTE, run_sampled_audit
 from .cos_policy import active_policy_rules, active_policy_version
-from .db import connection
+from .db import connection, dumps
 from .paths import BrainPaths
 from .scheduler.launchd import LaunchdScheduler
 from .service import BrainService
 from .setup_wizard import build_setup_plan
+from .util import now_iso
 from .wiki_fact_migration import migrate_existing_wiki_to_facts
 from .wiki import (
     ALLOWED_PAGE_TYPES,
@@ -126,7 +127,7 @@ class BrainUIHandler(BaseHTTPRequestHandler):
             elif path == "/api/cos/actions":
                 self.write_json(ui_cos_actions(self.server.paths, query))
             elif path == "/api/cos/review":
-                self.write_json(ui_cos_review(self.server.paths))
+                self.write_json(ui_cos_review(self.server.paths, query))
             elif path == "/api/cos/contracts":
                 self.write_json(ui_cos_contracts(self.server.paths))
             elif path == "/api/cos/audit":
@@ -151,6 +152,8 @@ class BrainUIHandler(BaseHTTPRequestHandler):
                 self.dispatch_wiki_question_post(parts)
             elif parts[:2] == ["wiki", "facts"]:
                 self.dispatch_wiki_fact_post(parts)
+            elif parts[:2] == ["cos", "questions"]:
+                self.dispatch_cos_question_post(parts)
             elif parts[:2] == ["cos", "contracts"]:
                 payload = self.read_json_body()
                 self.write_json(ui_generate_cos_contracts(self.server.paths, payload))
@@ -203,6 +206,19 @@ class BrainUIHandler(BaseHTTPRequestHandler):
             self.write_json(
                 ui_answer_wiki_question(self.server.paths, parts[2], payload)
             )
+            return
+        self.write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
+
+    def dispatch_cos_question_post(self, parts: list[str]) -> None:
+        if len(parts) == 4 and parts[3] == "apply-action":
+            payload = self.read_json_body()
+            self.write_json(
+                ui_apply_cos_question_action(self.server.paths, parts[2], payload)
+            )
+            return
+        if len(parts) == 4 and parts[3] == "dismiss":
+            payload = self.read_json_body()
+            self.write_json(ui_dismiss_cos_question(self.server.paths, parts[2], payload))
             return
         self.write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
@@ -590,22 +606,39 @@ def ui_cos_actions(paths: BrainPaths, query: dict[str, list[str]]) -> dict[str, 
     return {"actions": recent_actions(paths, limit=max(1, min(limit, 200)))}
 
 
-def ui_cos_review(paths: BrainPaths) -> dict[str, Any]:
+def ui_cos_review(
+    paths: BrainPaths, query: dict[str, list[str]] | None = None
+) -> dict[str, Any]:
     service(paths).init_workspace()
+    kind_filter = first(query or {}, "kind")
+    residue_where = "status IN ('open', 'needs_human')"
+    residue_params: list[Any] = []
+    if kind_filter:
+        residue_where = f"{residue_where} AND kind = ?"
+        residue_params.append(kind_filter)
     with connection(paths.sqlite_path) as conn:
         policy_version = active_policy_version(conn)
         residue = [
             row_to_question(row)
             for row in conn.execute(
-                """
+                f"""
                 SELECT *
                 FROM open_questions
-                WHERE status IN ('open', 'needs_human')
+                WHERE {residue_where}
                 ORDER BY
+                  CASE kind
+                    WHEN 'fact_conflict_review' THEN 0
+                    WHEN 'conflict' THEN 1
+                    WHEN 'unrouted_fact' THEN 2
+                    WHEN 'document_extraction_anomaly' THEN 3
+                    WHEN 'policy_escalation' THEN 4
+                    ELSE 5
+                  END,
                   CASE risk_tier WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
                   created_at DESC
-                LIMIT 50
-                """
+                LIMIT 200
+                """,
+                residue_params,
             )
         ]
         recent_auto_applied = [
@@ -656,8 +689,9 @@ def ui_cos_review(paths: BrainPaths) -> dict[str, Any]:
         }
     return {
         "policy_version": policy_version,
+        "selected_kind": kind_filter,
         "counts": {
-            "residue": len(residue),
+            "residue": sum(residue_by_kind.values()),
             "recent_auto_applied": len(recent_auto_applied),
             "audit_failures": len(audit_failures),
             "residue_by_kind": dict(sorted(residue_by_kind.items())),
@@ -755,6 +789,135 @@ def ui_answer_wiki_question(
         )
     except ValueError as exc:
         raise BadRequestError(str(exc)) from exc
+
+
+def ui_apply_cos_question_action(
+    paths: BrainPaths, question_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    service(paths).init_workspace()
+    question = review_question_for_decision(paths, question_id)
+    action_id = str(question.get("action_id") or "").strip()
+    if not action_id:
+        raise BadRequestError(f"review question has no linked action: {question_id}")
+    action = apply_action(paths, action_id)
+    answer_payload = {
+        "decision": "apply_action",
+        "action_id": action_id,
+        "note": optional_str(payload.get("note")) or "",
+    }
+    mark_review_question_decided(
+        paths,
+        question_id,
+        status="answered",
+        answer=answer_payload,
+        action_id=action_id,
+    )
+    return {
+        "question": get_review_question(paths, question_id),
+        "action": action,
+        "review": ui_cos_review(paths, review_query_for_question(question)),
+        "dashboard": wiki_fact_dashboard(paths),
+    }
+
+
+def ui_dismiss_cos_question(
+    paths: BrainPaths, question_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    service(paths).init_workspace()
+    question = review_question_for_decision(paths, question_id)
+    action_id = str(question.get("action_id") or "").strip()
+    reason = optional_str(payload.get("reason")) or "human rejected review item"
+    action: dict[str, Any] | None = None
+    if action_id:
+        action = reject_linked_review_action(paths, action_id, reason)
+    answer_payload = {
+        "decision": "dismiss",
+        "action_id": action_id,
+        "reason": reason,
+    }
+    mark_review_question_decided(
+        paths,
+        question_id,
+        status="dismissed",
+        answer=answer_payload,
+        action_id=action_id or None,
+    )
+    return {
+        "question": get_review_question(paths, question_id),
+        "action": action,
+        "review": ui_cos_review(paths, review_query_for_question(question)),
+        "dashboard": wiki_fact_dashboard(paths),
+    }
+
+
+def review_question_for_decision(paths: BrainPaths, question_id: str) -> dict[str, Any]:
+    question = get_review_question(paths, question_id)
+    if question["status"] not in {"open", "needs_human"}:
+        raise BadRequestError(f"review question is already closed: {question_id}")
+    return question
+
+
+def review_query_for_question(question: dict[str, Any]) -> dict[str, list[str]]:
+    kind = str(question.get("kind") or "").strip()
+    return {"kind": [kind]} if kind else {}
+
+
+def get_review_question(paths: BrainPaths, question_id: str) -> dict[str, Any]:
+    with connection(paths.sqlite_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM open_questions WHERE id = ?", (question_id,)
+        ).fetchone()
+    if not row:
+        raise NotFoundError(f"review question not found: {question_id}")
+    return row_to_question(row)
+
+
+def mark_review_question_decided(
+    paths: BrainPaths,
+    question_id: str,
+    *,
+    status: str,
+    answer: dict[str, Any],
+    action_id: str | None,
+) -> None:
+    with connection(paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            UPDATE open_questions
+            SET status = ?, answer = ?, answered_at = ?, action_id = COALESCE(?, action_id),
+                decided_by = 'human'
+            WHERE id = ?
+            """,
+            (status, dumps(answer), now_iso(), action_id, question_id),
+        )
+
+
+def reject_linked_review_action(
+    paths: BrainPaths, action_id: str, reason: str
+) -> dict[str, Any]:
+    timestamp = now_iso()
+    with connection(paths.sqlite_path) as conn:
+        action = load_action(conn, action_id)
+        if action["status"] in {"applied", "auto_applied", "reverted"}:
+            raise BadRequestError(
+                f"linked action is already {action['status']}: {action_id}"
+            )
+        evidence = dict(action.get("evidence_json") or {})
+        evidence["human_review"] = {
+            "decision": "reject",
+            "reason": reason,
+            "decided_at": timestamp,
+        }
+        conn.execute(
+            """
+            UPDATE cos_actions
+            SET status = 'rejected', evidence_json = ?
+            WHERE id = ?
+            """,
+            (dumps(evidence), action_id),
+        )
+    with connection(paths.sqlite_path) as conn:
+        return load_action(conn, action_id)
 
 
 def ui_reconcile_wiki_facts(
@@ -1110,6 +1273,26 @@ def ui_shell() -> str:
     .warn { color: var(--warn); }
     .danger { color: var(--danger); }
     .actions { display: flex; flex-wrap: wrap; gap: .35rem; }
+    .queue-filters { display: flex; flex-wrap: wrap; gap: .35rem; margin-bottom: .75rem; }
+    .queue-filters button[aria-pressed="true"] {
+      background: #d8f0ec;
+      border-color: #98c9c1;
+      color: #063f3a;
+    }
+    .fact-card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: .75rem;
+      background: #fbfdff;
+    }
+    .fact-card + .fact-card { margin-top: .6rem; }
+    blockquote {
+      margin: .55rem 0;
+      padding: .55rem .7rem;
+      border-left: 3px solid var(--line);
+      background: #f4f8fb;
+      color: #253242;
+    }
     .callout {
       margin: .75rem 0;
       padding: .65rem .75rem;
@@ -1179,7 +1362,7 @@ def ui_shell() -> str:
     let memoryStatus = "proposed";
     let selectedMemoryId = "";
     const wikiState = {q: "", type: "", status: "", selectedPath: ""};
-    const curationState = {selectedQuestionId: "", selectedPagePath: "", lastResult: null};
+    const curationState = {selectedQuestionId: "", selectedPagePath: "", selectedReviewKind: "fact_conflict_review", lastResult: null};
 
     const app = document.getElementById("app");
     const message = document.getElementById("message");
@@ -1406,19 +1589,28 @@ def ui_shell() -> str:
     }
 
     async function renderCuration() {
+      const reviewParams = new URLSearchParams();
+      if (curationState.selectedReviewKind) reviewParams.set("kind", curationState.selectedReviewKind);
       const [data, review] = await Promise.all([
         api("/api/wiki/facts"),
-        api("/api/cos/review")
+        api(`/api/cos/review?${reviewParams.toString()}`)
       ]);
-      const questions = data.open_questions || [];
+      const allQuestions = review.residue?.length ? review.residue : (data.open_questions || []);
       const pages = data.managed_pages || [];
+      const residueByKind = review.counts?.residue_by_kind || {};
+      if (curationState.selectedReviewKind && !residueByKind[curationState.selectedReviewKind]) {
+        curationState.selectedReviewKind = "";
+      }
+      const questions = curationState.selectedReviewKind
+        ? allQuestions.filter(question => question.kind === curationState.selectedReviewKind)
+        : allQuestions;
       if (!questions.find(question => question.id === curationState.selectedQuestionId)) {
         curationState.selectedQuestionId = questions[0]?.id || "";
       }
       if (!pages.find(page => page.relative_path === curationState.selectedPagePath)) {
         curationState.selectedPagePath = pages[0]?.relative_path || "";
       }
-      const selected = questions.find(question => question.id === curationState.selectedQuestionId);
+      const selected = allQuestions.find(question => question.id === curationState.selectedQuestionId);
       const selectedPage = curationState.selectedPagePath
         ? await api(`/api/wiki/facts/page?path=${encodeURIComponent(curationState.selectedPagePath)}`)
         : null;
@@ -1446,16 +1638,19 @@ def ui_shell() -> str:
             ${metric("Human Residue", review.counts?.residue ?? 0, review.counts?.residue ? "warn" : "ok")}
             ${metric("Audit Failures", review.counts?.audit_failures ?? 0, review.counts?.audit_failures ? "danger" : "ok")}
           </div>
-          ${cosReviewHtml(review)}
           ${curationState.lastResult ? lastCurationResultHtml(curationState.lastResult) : ""}
           <div class="split">
             <div>
-              <h2>Review Questions</h2>
-              <table><thead><tr><th>Question</th><th>Facts</th><th>Created</th></tr></thead>
-              <tbody>${questions.map(curationQuestionRow).join("") || emptyRow(3)}</tbody></table>
+              <div class="toolbar">
+                <h2>Review Queue</h2>
+                <span class="badge">${review.counts?.residue ?? 0} total</span>
+              </div>
+              ${reviewQueueFilters(residueByKind)}
+              ${cosResidueTable(questions)}
             </div>
-            <div>${selected ? curationQuestionDetailHtml(selected) : `<section><h2>Question</h2><div class="muted">No open factual conflicts.</div></section>`}</div>
+            <div>${selected ? curationQuestionDetailHtml(selected) : `<section><h2>Review Item</h2><div class="muted">No review items in this queue.</div></section>`}</div>
           </div>
+          ${cosReviewHtml(review)}
           <h2>Managed Pages</h2>
           <div class="split">
             <div>
@@ -1472,15 +1667,7 @@ def ui_shell() -> str:
     }
 
     function cosReviewHtml(review) {
-      return `<div class="split">
-        <section>
-          <div class="toolbar">
-            <h2>Human Residue</h2>
-            <span class="badge">${review.counts?.residue ?? 0}</span>
-          </div>
-          ${cosResidueTable(review.residue || [])}
-        </section>
-        <section>
+      return `<section>
           <div class="toolbar">
             <h2>Action Health</h2>
             <span class="badge">${review.recent_auto_applied?.length || 0} recent</span>
@@ -1490,17 +1677,64 @@ def ui_shell() -> str:
           ${cosActionsTable(review.recent_auto_applied || [])}
           <h2>Audit Failures</h2>
           ${cosActionsTable(review.audit_failures || [])}
-        </section>
-      </div>`;
+        </section>`;
+    }
+
+    function reviewQueueFilters(counts) {
+      const entries = Object.entries(counts || {}).sort((left, right) => reviewKindOrder(left[0]) - reviewKindOrder(right[0]));
+      const total = entries.reduce((sum, entry) => sum + Number(entry[1] || 0), 0);
+      const buttons = [["", "All", total], ...entries.map(([kind, count]) => [kind, reviewKindLabel(kind), count])];
+      return `<div class="queue-filters">${buttons.map(([kind, label, count]) => `
+        <button type="button" aria-pressed="${curationState.selectedReviewKind === kind ? "true" : "false"}" onclick='setReviewKind(${jsString(kind)})'>${escapeHtml(label)} <span class="badge">${escapeHtml(count)}</span></button>
+      `).join("")}</div>`;
     }
 
     function cosResidueTable(residue) {
-      return `<table><thead><tr><th>Kind</th><th>Question</th><th>Risk</th></tr></thead>
+      return `<table><thead><tr><th>Kind</th><th>Review Item</th><th>Evidence</th></tr></thead>
         <tbody>${residue.map(question => `<tr>
-          <td><span class="badge ${question.kind === "conflict" ? "danger" : ""}">${escapeHtml(question.kind || "")}</span><br>${escapeHtml(question.status || "")}</td>
-          <td>${escapeHtml(question.question || "")}<div class="muted">${escapeHtml(question.page_hint || question.action_id || "")}</div></td>
-          <td>${escapeHtml(question.risk_tier || "")}<br>${escapeHtml(question.auto_resolve_after || "")}</td>
+          <td><span class="badge ${question.kind === "conflict" || question.kind === "fact_conflict_review" ? "danger" : ""}">${escapeHtml(reviewKindLabel(question.kind || ""))}</span><br>${escapeHtml(question.status || "")}</td>
+          <td><button class="row-button ${question.id === curationState.selectedQuestionId ? "ok" : ""}" type="button" onclick='openCurationQuestion(${jsString(question.id)})'>${escapeHtml(question.question || "")}</button><div class="muted">${escapeHtml(question.page_hint || question.entity_key || question.action_id || "")}</div></td>
+          <td>${questionEvidenceSummary(question)}<div class="muted">${escapeHtml(question.created_at || "")}</div></td>
         </tr>`).join("") || emptyRow(3)}</tbody></table>`;
+    }
+
+    function setReviewKind(kind) {
+      curationState.selectedReviewKind = kind;
+      curationState.selectedQuestionId = "";
+      loadView("curation");
+    }
+
+    function reviewKindOrder(kind) {
+      const order = {
+        fact_conflict_review: 0,
+        conflict: 1,
+        unrouted_fact: 2,
+        document_extraction_anomaly: 3,
+        policy_escalation: 4
+      };
+      return order[kind] ?? 99;
+    }
+
+    function reviewKindLabel(kind) {
+      const labels = {
+        fact_conflict_review: "Conflict Reviews",
+        conflict: "Fact Conflicts",
+        unrouted_fact: "Unrouted Facts",
+        document_extraction_anomaly: "Extraction Anomalies",
+        policy_escalation: "Policy Escalations"
+      };
+      return labels[kind] || kind || "Review";
+    }
+
+    function questionEvidenceSummary(question) {
+      const candidate = questionCandidateFact(question);
+      const existing = (question.options || []).filter(option => option.option_type === "existing_fact");
+      const parts = [];
+      if (candidate?.evidence_quote) parts.push("quote");
+      if (candidate?.source_ids?.length) parts.push(`${candidate.source_ids.length} source${candidate.source_ids.length === 1 ? "" : "s"}`);
+      if (existing.length) parts.push(`${existing.length} counterpart${existing.length === 1 ? "" : "s"}`);
+      if (question.action_id) parts.push("action");
+      return parts.length ? parts.map(part => `<span class="badge">${escapeHtml(part)}</span>`).join(" ") : `<span class="muted">No structured evidence</span>`;
     }
 
     function cosActionsTable(actions) {
@@ -1574,28 +1808,115 @@ def ui_shell() -> str:
     }
 
     function curationQuestionDetailHtml(question) {
+      const candidate = questionCandidateFact(question);
+      const existing = (question.options || []).filter(option => option.option_type === "existing_fact");
+      const otherOptions = (question.options || []).filter(option => option.option_type !== "existing_fact" && option.option_type !== "candidate_fact");
       return `<section>
         <div class="toolbar">
-          <h2>${escapeHtml(question.page_hint || "Question")}</h2>
-          <span class="badge">${escapeHtml(question.kind || "")}</span>
+          <h2>${escapeHtml(reviewKindLabel(question.kind || ""))}</h2>
+          <span class="badge">${escapeHtml(question.status || "")}</span>
+          ${question.risk_tier ? `<span class="badge">${escapeHtml(question.risk_tier)} risk</span>` : ""}
           ${question.page_hint ? `<button type="button" onclick='openCurationQuestionPage(${jsString(question.page_hint)})'>Review Page</button>` : ""}
         </div>
+        <div class="grid">
+          ${metric("Page", question.page_hint || "")}
+          ${metric("Entity", question.entity_key || "")}
+          ${metric("Action", question.action_id || "")}
+          ${metric("Created", question.created_at || "")}
+        </div>
         <p>${escapeHtml(question.question || "")}</p>
-        <div class="stack">${(question.options || []).map(option => `
-          <section>
-            <div class="toolbar">
-              <span class="badge">${escapeHtml(option.observed_at || "undated")}</span>
-              <span class="badge">${escapeHtml(option.confidence ?? "")}</span>
-              ${option.fact_id ? `<button class="primary" type="button" onclick='answerWikiQuestion(${jsString(question.id)}, ${jsString(option.fact_id)}, "")'>Use This Fact</button>` : `<span class="badge">${escapeHtml(option.option_type || "candidate")}</span>`}
-            </div>
-            <p>${escapeHtml(option.statement || "")}</p>
-            ${option.evidence_quote ? `<blockquote>${escapeHtml(option.evidence_quote)}</blockquote>` : ""}
-            ${option.source_ids?.length ? `<div class="muted">Sources: ${escapeHtml(option.source_ids.join(", "))}</div>` : ""}
-          </section>`).join("")}</div>
-        <h2>Different Answer</h2>
-        <textarea id="curation-answer" placeholder="State the fact that should be treated as current."></textarea>
-        <div class="actions"><button type="button" onclick='answerWikiQuestion(${jsString(question.id)}, "", document.getElementById("curation-answer").value.trim())'>Save Answer</button></div>
+        ${reviewDecisionControls(question)}
+        ${candidate ? `<h2>Candidate Fact</h2>${factOptionHtml(candidate, {role: "candidate"})}` : ""}
+        ${existing.length ? `<h2>Existing Counterpart Facts</h2><div class="stack">${existing.map(option => factOptionHtml(option, {role: "existing", questionId: question.id, allowConflictAnswer: question.kind === "conflict"})).join("")}</div>` : ""}
+        ${otherOptions.length ? `<h2>Other Options</h2><div class="stack">${otherOptions.map(option => factOptionHtml(option, {role: "option", questionId: question.id, allowConflictAnswer: question.kind === "conflict"})).join("")}</div>` : ""}
+        ${legacyConflictAnswerHtml(question)}
+        ${recommendedActionHtml(question)}
       </section>`;
+    }
+
+    function questionCandidateFact(question) {
+      const candidateOption = (question.options || []).find(option => option.option_type === "candidate_fact");
+      if (candidateOption) return candidateOption;
+      const payloadFact = question.recommended_action?.payload?.fact;
+      if (payloadFact && typeof payloadFact === "object") {
+        return {...payloadFact, option_type: "candidate_fact"};
+      }
+      return null;
+    }
+
+    function reviewDecisionControls(question) {
+      const noteBox = `<textarea id="review-decision-note" placeholder="Optional decision note."></textarea>`;
+      if (question.action_id) {
+        const applyLabel = question.kind === "fact_conflict_review"
+          ? "Accept Candidate Fact"
+          : question.kind === "unrouted_fact"
+            ? "Apply Anyway"
+            : "Apply Linked Action";
+        const rejectLabel = question.kind === "fact_conflict_review"
+          ? "Reject Candidate"
+          : "Reject Linked Action";
+        return `<div class="callout">
+          <strong>Human decision:</strong> this review item is backed by a reversible CoS action.
+          ${noteBox}
+          <div class="actions">
+            <button class="primary" type="button" onclick='applyCosQuestionAction(${jsString(question.id)}, document.getElementById("review-decision-note").value.trim())'>${escapeHtml(applyLabel)}</button>
+            <button type="button" onclick='dismissCosQuestion(${jsString(question.id)}, document.getElementById("review-decision-note").value.trim())'>${escapeHtml(rejectLabel)}</button>
+          </div>
+        </div>`;
+      }
+      if (question.kind === "conflict") return "";
+      return `<div class="callout warn">
+        <strong>No linked action:</strong> dismiss this review item after reading the evidence.
+        ${noteBox}
+        <div class="actions"><button type="button" onclick='dismissCosQuestion(${jsString(question.id)}, document.getElementById("review-decision-note").value.trim())'>Dismiss Review Item</button></div>
+      </div>`;
+    }
+
+    function legacyConflictAnswerHtml(question) {
+      if (question.kind !== "conflict") return "";
+      return `<h2>Different Answer</h2>
+        <textarea id="curation-answer" placeholder="State the fact that should be treated as current."></textarea>
+        <div class="actions"><button type="button" onclick='answerWikiQuestion(${jsString(question.id)}, "", document.getElementById("curation-answer").value.trim())'>Save Answer</button></div>`;
+    }
+
+    function factOptionHtml(option, config = {}) {
+      const allowConflictAnswer = config.allowConflictAnswer && option.fact_id;
+      return `<div class="fact-card">
+        <div class="toolbar">
+          <span class="badge">${escapeHtml(config.role || option.option_type || "fact")}</span>
+          ${option.fact_id ? `<span class="badge">${escapeHtml(option.fact_id)}</span>` : ""}
+          <span class="badge">${escapeHtml(option.observed_at || "undated")}</span>
+          <span class="badge">${escapeHtml(option.confidence ?? "")}</span>
+          ${allowConflictAnswer ? `<button class="primary" type="button" onclick='answerWikiQuestion(${jsString(config.questionId)}, ${jsString(option.fact_id)}, "")'>Use This Fact</button>` : ""}
+        </div>
+        <p>${escapeHtml(option.statement || "")}</p>
+        ${option.evidence_quote ? `<blockquote>${escapeHtml(option.evidence_quote)}</blockquote>` : ""}
+        ${option.page_hint ? `<div class="muted">Page: ${escapeHtml(option.page_hint)}</div>` : ""}
+        ${option.source_ids?.length ? `<div class="muted">Sources: ${escapeHtml(option.source_ids.join(", "))}</div>` : ""}
+        ${sourceSpansHtml(option.source_spans || [])}
+      </div>`;
+    }
+
+    function sourceSpansHtml(spans) {
+      if (!spans.length) return "";
+      const rows = spans.map(span => {
+        const source = span.source_id || span.document_id || "";
+        const offsets = span.start_char !== undefined || span.end_char !== undefined
+          ? `${span.start_char ?? ""}-${span.end_char ?? ""}`
+          : "";
+        const quote = span.quote || span.text || "";
+        return `<li><strong>${escapeHtml(source)}</strong> <span class="muted">${escapeHtml(offsets)}</span>${quote ? `<br>${escapeHtml(quote)}` : ""}</li>`;
+      }).join("");
+      return `<details><summary>Source spans</summary><ul class="source-list">${rows}</ul></details>`;
+    }
+
+    function recommendedActionHtml(question) {
+      const action = question.recommended_action || {};
+      if (!action.action_type) return "";
+      return `<details>
+        <summary>Linked action payload</summary>
+        ${jsonBlock({action_id: question.action_id, recommended_action: action, context: question.context || {}})}
+      </details>`;
     }
 
     async function answerWikiQuestion(questionId, selectedFactId, answer) {
@@ -1608,6 +1929,28 @@ def ui_shell() -> str:
       curationState.lastResult = null;
       await loadView("curation");
       setMessage("Question answered and affected managed page refreshed.");
+    }
+
+    async function applyCosQuestionAction(questionId, note) {
+      await api(`/api/cos/questions/${encodeURIComponent(questionId)}/apply-action`, {
+        method: "POST",
+        body: JSON.stringify({note})
+      });
+      curationState.selectedQuestionId = "";
+      curationState.lastResult = null;
+      await loadView("curation");
+      setMessage("Review action applied.");
+    }
+
+    async function dismissCosQuestion(questionId, reason) {
+      await api(`/api/cos/questions/${encodeURIComponent(questionId)}/dismiss`, {
+        method: "POST",
+        body: JSON.stringify({reason})
+      });
+      curationState.selectedQuestionId = "";
+      curationState.lastResult = null;
+      await loadView("curation");
+      setMessage("Review item closed.");
     }
 
     async function reconcileChiefOfStaffQuestions() {

@@ -3338,8 +3338,18 @@ def wiki_fact_dashboard(paths: BrainPaths) -> dict[str, Any]:
                 SELECT *
                 FROM open_questions
                 WHERE status IN ('open', 'needs_human')
-                ORDER BY created_at DESC
-                LIMIT 50
+                ORDER BY
+                  CASE kind
+                    WHEN 'fact_conflict_review' THEN 0
+                    WHEN 'conflict' THEN 1
+                    WHEN 'unrouted_fact' THEN 2
+                    WHEN 'document_extraction_anomaly' THEN 3
+                    WHEN 'policy_escalation' THEN 4
+                    ELSE 5
+                  END,
+                  CASE risk_tier WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
+                  created_at DESC
+                LIMIT 200
                 """
             )
         ]
