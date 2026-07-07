@@ -40,6 +40,7 @@ The most important mental model: raw sources are evidence, facts are the canonic
 - Tighten deterministic fact resolution. Mutation mechanics should stay deterministic, but semantic decisions such as lexical near-duplicate merging or recency-implies-truth should route to exact-match/source-only rules, residue, critic, LLM, or human review instead of silent auto-merge.
 - Keep `open_questions` retrieval useful and bounded. UI/wiki/policy flows use the table heavily, and `retrieve_context()` now returns query-relevant unresolved residue, but this should keep improving with ranking/review-surface work.
 - Keep the entity/gardener autonomy boundary honest. The code now has entity identity, merge/split actions, and decomposed gardener judgment, but policy promotion should stay tied to the eval/report gates described in the active specs.
+- Bound retrieval telemetry and bring email in as evidence. Phase 0 retention/housekeeping is implemented; email capture/extraction remains planned. Plan and sequencing: `docs/email-ingestion-spec.md`.
 
 ## Detailed Breakdown From Raw Primitives Up
 

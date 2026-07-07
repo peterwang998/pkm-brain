@@ -502,9 +502,19 @@ def index_doctor(home: Optional[Path] = typer.Option(None)) -> None:
 @index_app.command("optimize")
 def index_optimize(
     cleanup_older_than_days: int = typer.Option(1, "--cleanup-older-than-days", help="Delete LanceDB versions older than this many days."),
+    fts: bool = typer.Option(False, "--fts", help="Also run FTS5 optimize merges for chunk and retrieval FTS tables."),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
-    console.print_json(json.dumps(service(home).optimize_indexes(cleanup_older_than_days=cleanup_older_than_days)))
+    svc = service(home)
+    if not fts:
+        console.print_json(json.dumps(svc.optimize_indexes(cleanup_older_than_days=cleanup_older_than_days)))
+        return
+    result = {
+        "status": "ok",
+        "vectors": svc.optimize_indexes(cleanup_older_than_days=cleanup_older_than_days),
+        "fts": svc.optimize_fts_indexes(),
+    }
+    console.print_json(json.dumps(result))
 
 
 @index_app.command("rebuild-vectors")
@@ -568,6 +578,31 @@ def db_reindex_chunks(
     console.print_json(json.dumps(result))
     if result["status"] == "failed":
         raise typer.Exit(1)
+
+
+@db_app.command("compact-retrieval-events")
+def db_compact_retrieval_events(
+    older_than_days: int = typer.Option(90, "--older-than-days", help="Clear retrieval event payloads older than this many days."),
+    automation_summary_older_than_days: int = typer.Option(
+        180,
+        "--automation-summary-older-than-days",
+        help="Clear automation run summaries older than this many days.",
+    ),
+    dry_run: bool = typer.Option(True, "--dry-run/--apply", help="Preview by default; pass --apply to write compaction changes."),
+    vacuum: bool = typer.Option(False, "--vacuum", help="After --apply, run SQLite VACUUM to return free pages to disk."),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    try:
+        result = service(home).compact_retrieval_events(
+            older_than_days=older_than_days,
+            automation_summary_older_than_days=automation_summary_older_than_days,
+            dry_run=dry_run,
+            vacuum=vacuum,
+        )
+    except ValueError as exc:
+        console.print(str(exc))
+        raise typer.Exit(1)
+    console.print_json(json.dumps(result))
 
 
 @wiki_app.command("lint")

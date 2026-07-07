@@ -466,6 +466,94 @@ def test_optimize_indexes_is_safe_when_lancedb_exists(tmp_path: Path) -> None:
     assert result["after"]["rows"] == result["before"]["rows"]
 
 
+def test_optimize_fts_indexes_runs_for_chunk_and_retrieval_tables(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "fts-maintenance.md"
+    note.write_text("# FTS Maintenance\n\nSQLite FTS optimize compacts retrieval tables.\n", encoding="utf-8")
+    svc.ingest()
+
+    result = svc.optimize_fts_indexes()
+
+    assert result["status"] == "ok"
+    assert set(result["optimized_tables"]) == {"chunk_fts", "retrieval_fts"}
+    assert result["errors"] == []
+
+
+def test_compact_retrieval_events_strips_old_payloads_and_preserves_lineage(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    backup = svc.paths.db_dir / "brain-2026-05-01.bak.gz"
+    backup.write_bytes(b"old backup")
+    old_timestamp = "2026-01-01T00:00:00+00:00"
+    recent_timestamp = "2026-07-01T00:00:00+00:00"
+    old_snapshots = json.dumps([{"type": "chunk", "chunk_id": "chunk_old", "text": "heavy copied text"}])
+    old_debug = json.dumps({"fanout": ["chunk_old"], "details": "heavy debug"})
+
+    with connection(svc.paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO retrieval_events(
+              id, query, timestamp, caller, returned_chunk_ids, selected_chunk_ids, citation_snapshots, debug
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("retrieval_old", "old query", old_timestamp, "test", '["chunk_old"]', '["chunk_old"]', old_snapshots, old_debug),
+        )
+        conn.execute(
+            """
+            INSERT INTO retrieval_events(
+              id, query, timestamp, caller, returned_chunk_ids, selected_chunk_ids, citation_snapshots, debug
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("retrieval_recent", "recent query", recent_timestamp, "test", '["chunk_recent"]', '["chunk_recent"]', old_snapshots, old_debug),
+        )
+        conn.execute(
+            """
+            INSERT INTO context_lineage_events(
+              id, target_type, target_id, event_type, retrieval_event_id, agent_session_id,
+              query, weight, metadata, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("lineage_old", "chunk", "chunk_old", "exposed", "retrieval_old", None, "old query", 0.0, "{}", old_timestamp),
+        )
+        conn.execute(
+            """
+            INSERT INTO automation_runs(id, job_name, started_at, finished_at, status, summary, error)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("automation_old", "nightly-maintenance", old_timestamp, old_timestamp, "success", json.dumps({"large": "summary"}), None),
+        )
+
+    dry_run = svc.compact_retrieval_events(older_than_days=30, automation_summary_older_than_days=30)
+    assert dry_run["status"] == "dry_run"
+    assert dry_run["retrieval_events"]["eligible_rows"] == 1
+    assert dry_run["automation_runs"]["eligible_rows"] == 1
+    assert dry_run["total_payload_bytes_reclaimable"] > 0
+    assert dry_run["stale_db_backups"]["count"] == 1
+
+    applied = svc.compact_retrieval_events(
+        older_than_days=30,
+        automation_summary_older_than_days=30,
+        dry_run=False,
+    )
+    assert applied["status"] == "ok"
+
+    with connection(svc.paths.sqlite_path) as conn:
+        old = conn.execute("SELECT * FROM retrieval_events WHERE id = ?", ("retrieval_old",)).fetchone()
+        recent = conn.execute("SELECT * FROM retrieval_events WHERE id = ?", ("retrieval_recent",)).fetchone()
+        lineage = conn.execute("SELECT * FROM context_lineage_events WHERE retrieval_event_id = ?", ("retrieval_old",)).fetchone()
+        automation = conn.execute("SELECT summary FROM automation_runs WHERE id = ?", ("automation_old",)).fetchone()
+
+    assert old["citation_snapshots"] == "[]"
+    assert old["debug"] == "{}"
+    assert old["returned_chunk_ids"] == '["chunk_old"]'
+    assert old["selected_chunk_ids"] == '["chunk_old"]'
+    assert recent["citation_snapshots"] == old_snapshots
+    assert recent["debug"] == old_debug
+    assert lineage is not None
+    assert automation["summary"] == "{}"
+
+
 def test_reindex_chunks_rewrites_existing_oversized_document(tmp_path: Path) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()

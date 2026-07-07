@@ -6,7 +6,7 @@ import re
 import shutil
 import traceback
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +28,7 @@ from .indexes import (
     embedding_stamp_report,
     lancedb_stats,
     optimize_vectors,
+    path_size,
     search_vectors,
     should_optimize_vectors,
     upsert_vectors,
@@ -366,6 +367,147 @@ class BrainService:
     def optimize_indexes(self, cleanup_older_than_days: int = 1) -> dict[str, Any]:
         self.init_workspace()
         return optimize_vectors(self.paths.lancedb_path, cleanup_older_than_days=cleanup_older_than_days)
+
+    def optimize_fts_indexes(self) -> dict[str, Any]:
+        self.init_workspace()
+        before = sqlite_storage_report(self.paths.sqlite_path)
+        optimized: list[str] = []
+        with connection(self.paths.sqlite_path) as conn:
+            for table in ("chunk_fts", "retrieval_fts"):
+                if not sqlite_table_exists(conn, table):
+                    continue
+                conn.execute(f"INSERT INTO {table}({table}) VALUES ('optimize')")
+                optimized.append(table)
+        after = sqlite_storage_report(self.paths.sqlite_path)
+        return {
+            "status": "ok" if optimized else "skipped",
+            "optimized_tables": optimized,
+            "before": before,
+            "after": after,
+            "bytes_freed": max(0, int(before["sqlite_related_bytes"]) - int(after["sqlite_related_bytes"])),
+            "errors": [],
+        }
+
+    def compact_retrieval_events(
+        self,
+        older_than_days: int = 90,
+        *,
+        automation_summary_older_than_days: int = 180,
+        dry_run: bool = True,
+        vacuum: bool = False,
+    ) -> dict[str, Any]:
+        if older_than_days < 0:
+            raise ValueError("--older-than-days must be >= 0")
+        if automation_summary_older_than_days < 0:
+            raise ValueError("--automation-summary-older-than-days must be >= 0")
+        self.init_workspace()
+        retrieval_cutoff = retention_cutoff_iso(older_than_days)
+        automation_cutoff = retention_cutoff_iso(automation_summary_older_than_days)
+        before = sqlite_storage_report(self.paths.sqlite_path)
+        with connection(self.paths.sqlite_path) as conn:
+            retrieval_rows = rows(
+                conn,
+                """
+                SELECT id, citation_snapshots, debug
+                FROM retrieval_events
+                WHERE timestamp < ?
+                  AND (citation_snapshots != '[]' OR debug != '{}')
+                ORDER BY timestamp
+                """,
+                (retrieval_cutoff,),
+            )
+            automation_rows = rows(
+                conn,
+                """
+                SELECT id, summary
+                FROM automation_runs
+                WHERE COALESCE(finished_at, started_at) < ?
+                  AND summary != '{}'
+                ORDER BY COALESCE(finished_at, started_at)
+                """,
+                (automation_cutoff,),
+            )
+            retrieval_reclaimable = sum(
+                max(0, len(str(row["citation_snapshots"] or "")) - len("[]"))
+                + max(0, len(str(row["debug"] or "")) - len("{}"))
+                for row in retrieval_rows
+            )
+            automation_reclaimable = sum(max(0, len(str(row["summary"] or "")) - len("{}")) for row in automation_rows)
+            if not dry_run:
+                conn.execute(
+                    """
+                    UPDATE retrieval_events
+                    SET citation_snapshots = '[]',
+                        debug = '{}'
+                    WHERE timestamp < ?
+                      AND (citation_snapshots != '[]' OR debug != '{}')
+                    """,
+                    (retrieval_cutoff,),
+                )
+                conn.execute(
+                    """
+                    UPDATE automation_runs
+                    SET summary = '{}'
+                    WHERE COALESCE(finished_at, started_at) < ?
+                      AND summary != '{}'
+                    """,
+                    (automation_cutoff,),
+                )
+        vacuum_result: dict[str, Any] | None = None
+        if vacuum and not dry_run:
+            vacuum_before = sqlite_storage_report(self.paths.sqlite_path)
+            with connection(self.paths.sqlite_path) as conn:
+                conn.execute("VACUUM")
+            vacuum_after = sqlite_storage_report(self.paths.sqlite_path)
+            vacuum_result = {
+                "before": vacuum_before,
+                "after": vacuum_after,
+                "bytes_freed": max(
+                    0,
+                    int(vacuum_before["sqlite_related_bytes"]) - int(vacuum_after["sqlite_related_bytes"]),
+                ),
+            }
+        after = sqlite_storage_report(self.paths.sqlite_path)
+        return {
+            "status": "dry_run" if dry_run else "ok",
+            "dry_run": dry_run,
+            "retrieval_cutoff": retrieval_cutoff,
+            "automation_summary_cutoff": automation_cutoff,
+            "retrieval_events": {
+                "eligible_rows": len(retrieval_rows),
+                "payload_bytes_reclaimable": retrieval_reclaimable,
+                "sample_ids": [str(row["id"]) for row in retrieval_rows[:10]],
+            },
+            "automation_runs": {
+                "eligible_rows": len(automation_rows),
+                "summary_bytes_reclaimable": automation_reclaimable,
+                "sample_ids": [str(row["id"]) for row in automation_rows[:10]],
+            },
+            "total_payload_bytes_reclaimable": retrieval_reclaimable + automation_reclaimable,
+            "before": before,
+            "after": after,
+            "vacuum": vacuum_result,
+            "stale_db_backups": self.stale_db_backup_report(),
+            "errors": [],
+        }
+
+    def stale_db_backup_report(self) -> dict[str, Any]:
+        backups = sorted(self.paths.db_dir.glob("*.bak.gz")) if self.paths.db_dir.exists() else []
+        files = [
+            {
+                "path": str(path),
+                "bytes": path_size(path),
+                "modified_at": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(),
+            }
+            for path in backups
+        ]
+        return {
+            "status": "human_review_required" if files else "ok",
+            "count": len(files),
+            "total_bytes": sum(int(item["bytes"]) for item in files),
+            "files": files[:20],
+            "note": "Flag only; pkm-brain does not delete db/*.bak.gz backups automatically.",
+        }
 
     def _vector_rows_for_chunks(self, chunk_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not chunk_rows:
@@ -3192,6 +3334,41 @@ def sqlite_table_exists(conn: Any, table: str) -> bool:
             (table,),
         ).fetchone()
     )
+
+
+def retention_cutoff_iso(older_than_days: int) -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
+
+
+def sqlite_storage_report(sqlite_path: Path) -> dict[str, Any]:
+    related_paths = [sqlite_path, sqlite_path.with_name(f"{sqlite_path.name}-wal"), sqlite_path.with_name(f"{sqlite_path.name}-shm")]
+    report: dict[str, Any] = {
+        "sqlite_path": str(sqlite_path),
+        "sqlite_related_bytes": sum(path_size(path) for path in related_paths),
+        "files": {path.name: path_size(path) for path in related_paths if path.exists()},
+        "page_size": None,
+        "page_count": None,
+        "freelist_count": None,
+        "freelist_bytes": None,
+    }
+    if not sqlite_path.exists():
+        return report
+    try:
+        with connection(sqlite_path) as conn:
+            page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+            page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+            freelist_count = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+        report.update(
+            {
+                "page_size": page_size,
+                "page_count": page_count,
+                "freelist_count": freelist_count,
+                "freelist_bytes": page_size * freelist_count,
+            }
+        )
+    except Exception as exc:
+        report["error"] = str(exc)
+    return report
 
 
 def row_to_retrieval_fact(row: Any, score: float, *, fts_score: float | None = None) -> dict[str, Any]:

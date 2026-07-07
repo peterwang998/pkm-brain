@@ -257,6 +257,7 @@ def run_nightly_maintenance(
             summary["cos_synthesis_shadow"] = summary["cos_synthesis"]
 
             summary["index_status"] = index_status(paths, service)
+            summary["telemetry_retention"] = service.compact_retrieval_events(dry_run=False)
             summary["index_maintenance"] = run_index_maintenance(paths)
             summary["cos_timeout_sweep"] = run_cos_timeout_sweep(paths)
             summary["cos_audit"] = run_cos_audit(paths, cos_role)
@@ -270,6 +271,7 @@ def run_nightly_maintenance(
             errors = (
                 summary["capture"].get("errors", [])
                 + summary["ingest"].get("errors", [])
+                + summary["telemetry_retention"].get("errors", [])
                 + summary["index_maintenance"].get("errors", [])
                 + summary["provenance_check"].get("errors", [])
                 + summary["wiki_lint"].get("errors", [])
@@ -531,11 +533,23 @@ def index_status(paths: BrainPaths, service: BrainService | None = None) -> dict
 
 def run_index_maintenance(paths: BrainPaths) -> dict[str, Any]:
     try:
+        fts_result = BrainService(paths).optimize_fts_indexes()
         before = lancedb_stats(paths.lancedb_path)
         if not should_optimize_vectors(before):
-            return {"status": "skipped", "reason": "below LanceDB optimization thresholds", "before": before, "errors": []}
-        result = optimize_vectors(paths.lancedb_path, cleanup_older_than_days=1)
-        return {**result, "errors": []}
+            vector_result = {
+                "status": "skipped",
+                "reason": "below LanceDB optimization thresholds",
+                "before": before,
+                "errors": [],
+            }
+        else:
+            vector_result = optimize_vectors(paths.lancedb_path, cleanup_older_than_days=1)
+        return {
+            "status": "ok" if vector_result.get("status") == "ok" or fts_result.get("status") == "ok" else "skipped",
+            "vectors": vector_result,
+            "fts": fts_result,
+            "errors": [],
+        }
     except Exception as exc:
         return {"status": "failed", "error": str(exc), "errors": [str(exc)]}
 

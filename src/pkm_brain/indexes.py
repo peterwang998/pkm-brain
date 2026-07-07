@@ -285,7 +285,7 @@ def should_optimize_vectors(
     stats: dict[str, Any],
     version_threshold: int = 250,
     data_file_threshold: int = 100,
-    retained_bytes_threshold: int = 512 * 1024 * 1024,
+    retained_bytes_threshold: int = 256 * 1024 * 1024,
 ) -> bool:
     return (
         bool(stats.get("table_exists"))
