@@ -1422,6 +1422,7 @@ def ui_shell() -> str:
       const selectedPage = curationState.selectedPagePath
         ? await api(`/api/wiki/facts/page?path=${encodeURIComponent(curationState.selectedPagePath)}`)
         : null;
+      const reviewQuestionCount = (data.counts?.questions_by_status?.open ?? 0) + (data.counts?.questions_by_status?.needs_human ?? 0);
       app.innerHTML = `
         <section>
           <div class="toolbar">
@@ -1440,7 +1441,7 @@ def ui_shell() -> str:
             ${metric("Active", data.counts?.by_status?.active ?? 0, "ok")}
             ${metric("Managed Pages", pages.length)}
             ${metric("Conflicted", data.counts?.by_status?.conflicted ?? 0, data.counts?.by_status?.conflicted ? "danger" : "")}
-            ${metric("Open Questions", data.counts?.questions_by_status?.open ?? 0, data.counts?.questions_by_status?.open ? "warn" : "ok")}
+            ${metric("Review Questions", reviewQuestionCount, reviewQuestionCount ? "warn" : "ok")}
             ${metric("Policy", review.policy_version ?? "")}
             ${metric("Human Residue", review.counts?.residue ?? 0, review.counts?.residue ? "warn" : "ok")}
             ${metric("Audit Failures", review.counts?.audit_failures ?? 0, review.counts?.audit_failures ? "danger" : "ok")}
@@ -1449,7 +1450,7 @@ def ui_shell() -> str:
           ${curationState.lastResult ? lastCurationResultHtml(curationState.lastResult) : ""}
           <div class="split">
             <div>
-              <h2>Open Questions</h2>
+              <h2>Review Questions</h2>
               <table><thead><tr><th>Question</th><th>Facts</th><th>Created</th></tr></thead>
               <tbody>${questions.map(curationQuestionRow).join("") || emptyRow(3)}</tbody></table>
             </div>
@@ -1556,7 +1557,7 @@ def ui_shell() -> str:
     function curationQuestionRow(question) {
       const selected = question.id === curationState.selectedQuestionId ? "ok" : "";
       return `<tr>
-        <td><button class="row-button ${selected}" type="button" onclick='openCurationQuestion(${jsString(question.id)})'>${escapeHtml(question.question)}</button><div class="muted">${escapeHtml(question.page_hint || question.entity_key || "")}</div></td>
+        <td><button class="row-button ${selected}" type="button" onclick='openCurationQuestion(${jsString(question.id)})'>${escapeHtml(question.question)}</button><div class="muted">${escapeHtml(question.status || "")} · ${escapeHtml(question.page_hint || question.entity_key || "")}</div></td>
         <td>${(question.fact_ids || []).length}</td>
         <td>${escapeHtml(question.created_at || "")}</td>
       </tr>`;

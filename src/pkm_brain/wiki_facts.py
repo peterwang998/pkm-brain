@@ -3337,7 +3337,7 @@ def wiki_fact_dashboard(paths: BrainPaths) -> dict[str, Any]:
                 """
                 SELECT *
                 FROM open_questions
-                WHERE status = 'open'
+                WHERE status IN ('open', 'needs_human')
                 ORDER BY created_at DESC
                 LIMIT 50
                 """

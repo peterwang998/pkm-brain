@@ -22,6 +22,7 @@ from pkm_brain.wiki_facts import (
     resolve_fact_groups,
     revert_wiki_page_snapshot,
     upsert_candidate_facts,
+    wiki_fact_dashboard,
 )
 
 
@@ -61,6 +62,39 @@ def test_facts_directly_conflict_requires_shared_topic() -> None:
             )
         },
     )
+
+
+def test_wiki_fact_dashboard_surfaces_needs_human_questions(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    with connection(paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO open_questions(
+              id, kind, entity_key, page_hint, fact_ids, question, options,
+              status, context, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "question_review",
+                "fact_conflict_review",
+                "companies:sierra",
+                "companies/sierra.md",
+                json.dumps(["fact_candidate", "fact_existing"]),
+                "Candidate appears to contradict an existing nearby fact.",
+                "[]",
+                "needs_human",
+                "{}",
+                "2026-07-07T00:00:00+00:00",
+            ),
+        )
+
+    dashboard = wiki_fact_dashboard(paths)
+
+    assert dashboard["counts"]["questions_by_status"]["needs_human"] == 1
+    assert [question["id"] for question in dashboard["open_questions"]] == [
+        "question_review"
+    ]
 
 
 def test_promote_wiki_curation_promotes_fact_state(tmp_path: Path) -> None:
