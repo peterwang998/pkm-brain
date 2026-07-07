@@ -23,7 +23,6 @@ from .scheduler.launchd import LaunchdScheduler
 from .service import BrainService
 from .setup_wizard import build_setup_plan
 from .util import now_iso
-from .wiki_fact_migration import migrate_existing_wiki_to_facts
 from .wiki import (
     ALLOWED_PAGE_TYPES,
     ALLOWED_STATUSES,
@@ -226,10 +225,6 @@ class BrainUIHandler(BaseHTTPRequestHandler):
         if parts == ["wiki", "facts", "reconcile"]:
             payload = self.read_json_body()
             self.write_json(ui_reconcile_wiki_facts(self.server.paths, payload))
-            return
-        if parts == ["wiki", "facts", "migrate-wiki"]:
-            payload = self.read_json_body()
-            self.write_json(ui_migrate_wiki_facts(self.server.paths, payload))
             return
         if parts == ["wiki", "facts", "pages", "regenerate"]:
             payload = self.read_json_body()
@@ -933,19 +928,6 @@ def ui_reconcile_wiki_facts(
         raise BadRequestError(str(exc)) from exc
 
 
-def ui_migrate_wiki_facts(paths: BrainPaths, payload: dict[str, Any]) -> dict[str, Any]:
-    service(paths).init_workspace()
-    try:
-        return migrate_existing_wiki_to_facts(
-            paths,
-            dry_run=bool(payload.get("dry_run", True)),
-            overwrite_existing=bool(payload.get("overwrite_existing", False)),
-            include_references=bool(payload.get("include_references", False)),
-        )
-    except ValueError as exc:
-        raise BadRequestError(str(exc)) from exc
-
-
 def ui_regenerate_wiki_fact_page(
     paths: BrainPaths, payload: dict[str, Any]
 ) -> dict[str, Any]:
@@ -1623,9 +1605,6 @@ def ui_shell() -> str:
             <button type="button" onclick="loadView('curation')">Refresh</button>
             <button class="primary" type="button" onclick="regenerateCurationPage(false)" ${selectedPage ? "" : "disabled"}>Regenerate Page</button>
             <button type="button" onclick="regenerateCurationPage(true)" ${selectedPage ? "" : "disabled"}>Preview Page</button>
-            <button type="button" onclick="migrateExistingWikiFacts(true)">Preview Wiki Migration</button>
-            <button type="button" onclick="migrateExistingWikiFacts(false)">Backfill Wiki Facts</button>
-            <button type="button" onclick="reconcileChiefOfStaffQuestions()">Reconcile Duplicates</button>
           </div>
           <div class="callout">This is the active fact/page curation path. Retrieval can return searchable active facts directly, and managed wiki pages are regenerated projections of those facts.</div>
           <div class="grid">
@@ -1762,7 +1741,6 @@ def ui_shell() -> str:
       return `<section>
         <div class="toolbar">
           <h2>Last Curation Output</h2>
-          ${result.migration ? `<span class="badge">${escapeHtml(result.migration)}</span>` : ""}
           ${result.dry_run ? `<span class="badge">dry run</span>` : ""}
           <span class="badge">${result.new_candidate_count ?? result.candidate_count ?? 0} candidates</span>
           <span class="badge">${result.skipped_existing || 0} skipped</span>
@@ -1786,15 +1764,6 @@ def ui_shell() -> str:
         </div>
         <textarea readonly>${escapeHtml(page.markdown || "")}</textarea>
       </section>`;
-    }
-
-    function curationQuestionRow(question) {
-      const selected = question.id === curationState.selectedQuestionId ? "ok" : "";
-      return `<tr>
-        <td><button class="row-button ${selected}" type="button" onclick='openCurationQuestion(${jsString(question.id)})'>${escapeHtml(question.question)}</button><div class="muted">${escapeHtml(question.status || "")} · ${escapeHtml(question.page_hint || question.entity_key || "")}</div></td>
-        <td>${(question.fact_ids || []).length}</td>
-        <td>${escapeHtml(question.created_at || "")}</td>
-      </tr>`;
     }
 
     async function openCurationQuestion(id) {
@@ -1825,11 +1794,10 @@ def ui_shell() -> str:
           ${metric("Created", question.created_at || "")}
         </div>
         <p>${escapeHtml(question.question || "")}</p>
-        ${reviewDecisionControls(question)}
         ${candidate ? `<h2>Candidate Fact</h2>${factOptionHtml(candidate, {role: "candidate"})}` : ""}
         ${existing.length ? `<h2>Existing Counterpart Facts</h2><div class="stack">${existing.map(option => factOptionHtml(option, {role: "existing", questionId: question.id, allowConflictAnswer: question.kind === "conflict"})).join("")}</div>` : ""}
         ${otherOptions.length ? `<h2>Other Options</h2><div class="stack">${otherOptions.map(option => factOptionHtml(option, {role: "option", questionId: question.id, allowConflictAnswer: question.kind === "conflict"})).join("")}</div>` : ""}
-        ${legacyConflictAnswerHtml(question)}
+        ${question.action_id ? reviewDecisionControls(question) : conflictAnswerHtml(question)}
         ${recommendedActionHtml(question)}
       </section>`;
     }
@@ -1872,7 +1840,7 @@ def ui_shell() -> str:
       </div>`;
     }
 
-    function legacyConflictAnswerHtml(question) {
+    function conflictAnswerHtml(question) {
       if (question.kind !== "conflict") return "";
       return `<h2>Different Answer</h2>
         <textarea id="curation-answer" placeholder="State the fact that should be treated as current."></textarea>
@@ -1887,13 +1855,13 @@ def ui_shell() -> str:
           ${option.fact_id ? `<span class="badge">${escapeHtml(option.fact_id)}</span>` : ""}
           <span class="badge">${escapeHtml(option.observed_at || "undated")}</span>
           <span class="badge">${escapeHtml(option.confidence ?? "")}</span>
-          ${allowConflictAnswer ? `<button class="primary" type="button" onclick='answerWikiQuestion(${jsString(config.questionId)}, ${jsString(option.fact_id)}, "")'>Use This Fact</button>` : ""}
         </div>
         <p>${escapeHtml(option.statement || "")}</p>
         ${option.evidence_quote ? `<blockquote>${escapeHtml(option.evidence_quote)}</blockquote>` : ""}
         ${option.page_hint ? `<div class="muted">Page: ${escapeHtml(option.page_hint)}</div>` : ""}
         ${option.source_ids?.length ? `<div class="muted">Sources: ${escapeHtml(option.source_ids.join(", "))}</div>` : ""}
         ${sourceSpansHtml(option.source_spans || [])}
+        ${allowConflictAnswer ? `<div class="actions"><button class="primary" type="button" onclick='answerWikiQuestion(${jsString(config.questionId)}, ${jsString(option.fact_id)}, "")'>Use This Fact</button></div>` : ""}
       </div>`;
     }
 
@@ -1951,29 +1919,6 @@ def ui_shell() -> str:
       curationState.lastResult = null;
       await loadView("curation");
       setMessage("Review item closed.");
-    }
-
-    async function reconcileChiefOfStaffQuestions() {
-      const result = await api("/api/wiki/facts/reconcile", {
-        method: "POST",
-        body: JSON.stringify({overwrite_existing: false})
-      });
-      curationState.selectedQuestionId = "";
-      curationState.lastResult = null;
-      await loadView("curation");
-      setMessage(`Merged ${result.merged_facts || 0} duplicate facts; dismissed ${result.dismissed_question_ids?.length || 0} questions.`);
-    }
-
-    async function migrateExistingWikiFacts(dryRun) {
-      const result = await api("/api/wiki/facts/migrate-wiki", {
-        method: "POST",
-        body: JSON.stringify({dry_run: dryRun, overwrite_existing: false})
-      });
-      curationState.selectedQuestionId = "";
-      curationState.lastResult = result;
-      await loadView("curation");
-      const verb = dryRun ? "Previewed" : "Backfilled";
-      setMessage(`${verb} ${result.new_candidate_count || 0} new wiki facts from ${result.page_count || 0} pages.`);
     }
 
     function curationPageRow(page) {

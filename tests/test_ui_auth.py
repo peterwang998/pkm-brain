@@ -71,8 +71,8 @@ def test_ui_shell_renders_token_driven_browser_pages(tmp_path: Path) -> None:
     assert 'recordWikiInterview(${jsString(id)}, "approved")' not in body
     assert "generatePacketBrief" not in body
     assert "absorbPacketIntoFacts" not in body
-    assert "reconcileChiefOfStaffQuestions" in body
-    assert "migrateExistingWikiFacts" in body
+    assert "reconcileChiefOfStaffQuestions" not in body
+    assert "migrateExistingWikiFacts" not in body
 
 
 def test_ui_rejects_missing_token(tmp_path: Path) -> None:

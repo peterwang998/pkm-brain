@@ -325,9 +325,10 @@ def test_legacy_wiki_proposal_endpoints_are_retired(tmp_path: Path) -> None:
             request_json(host, port, token, "GET", "/api/review-queue"),
             request_json(host, port, token, "POST", "/api/wiki/proposals", {}),
             request_json(host, port, token, "POST", "/api/wiki/proposal-packets/facts", {}),
+            request_json(host, port, token, "POST", "/api/wiki/facts/migrate-wiki", {}),
         ]
 
-    assert [status for status, _body in checks] == [404, 404, 404, 404, 404, 404]
+    assert [status for status, _body in checks] == [404, 404, 404, 404, 404, 404, 404]
 
 
 def test_memory_endpoint_lists_status_filtered_memories(tmp_path: Path) -> None:
@@ -610,82 +611,6 @@ def test_wiki_fact_reconcile_dismisses_stale_duplicate_cloudzero_question(
     assert body["dashboard"]["counts"]["by_status"]["active"] == 1
     assert body["dashboard"]["counts"]["by_status"]["superseded"] == 1
     assert body["dashboard"]["counts"]["questions_by_status"]["dismissed"] == 1
-
-
-def test_wiki_fact_migration_backfills_existing_wiki(
-    tmp_path: Path,
-) -> None:
-    paths = BrainPaths.from_value(tmp_path / "brain")
-    svc = BrainService(paths)
-    svc.init_workspace()
-    insert_document(paths)
-    page = paths.wiki / "concepts" / "test-concept.md"
-    page.parent.mkdir(parents=True, exist_ok=True)
-    page.write_text(
-        "---\n"
-        "title: Test Concept\n"
-        "page_type: concept\n"
-        "id: concept-test\n"
-        "status: active\n"
-        "created_at: 2026-05-24\n"
-        "updated_at: 2026-05-25\n"
-        "source_ids:\n"
-        "  - document:doc_source\n"
-        "related: []\n"
-        "tags: []\n"
-        "---\n\n"
-        "# Test Concept\n\n"
-        "## Summary\n\nThe Sierra final interview is scheduled for Monday.\n\n"
-        "## Key Points\n\n- CloudZero dashboard sharing needs role-aware collaboration.\n\n"
-        "## Definition\n\nNone.\n\n"
-        "## Why It Matters\n\nNone.\n\n"
-        "## How It Works\n\nNone.\n\n"
-        "## Related Decisions\n\n- None.\n\n"
-        "## Source Evidence\n\n- document:doc_source\n\n"
-        "## Related Pages\n\n- None.\n\n"
-        "## Open Questions\n\n- None.\n",
-        encoding="utf-8",
-    )
-
-    with running_ui(paths) as (host, port, token):
-        preview_status, preview = request_json(
-            host,
-            port,
-            token,
-            "POST",
-            "/api/wiki/facts/migrate-wiki",
-            {"dry_run": True},
-        )
-        apply_status, applied = request_json(
-            host,
-            port,
-            token,
-            "POST",
-            "/api/wiki/facts/migrate-wiki",
-            {"dry_run": False},
-        )
-        rerun_status, rerun = request_json(
-            host,
-            port,
-            token,
-            "POST",
-            "/api/wiki/facts/migrate-wiki",
-            {"dry_run": False},
-        )
-
-    assert preview_status == 200
-    assert preview["dry_run"] is True
-    assert preview["candidate_count"] == 2
-    assert preview["new_candidate_count"] == 2
-    assert apply_status == 200
-    assert applied["dry_run"] is False
-    assert len(applied["created_fact_ids"]) == 2
-    assert applied["dashboard"]["counts"]["by_status"]["active"] == 2
-    assert applied["curation"]["pages"][0]["written"] is False
-    assert "not managed" in applied["curation"]["pages"][0]["reason"]
-    assert rerun_status == 200
-    assert rerun["new_candidate_count"] == 0
-    assert rerun["created_fact_ids"] == []
 
 
 def test_chief_of_staff_page_review_correction_and_revert_endpoint(
