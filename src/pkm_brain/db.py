@@ -102,15 +102,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_fact_entities_primary
 ON fact_entities(fact_id)
 WHERE is_primary = 1;
 
-CREATE TABLE IF NOT EXISTS relations (
-  id TEXT PRIMARY KEY,
-  subject_id TEXT NOT NULL,
-  predicate TEXT NOT NULL,
-  object_id TEXT NOT NULL,
-  source_ids TEXT NOT NULL DEFAULT '[]',
-  created_at TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS memories (
   id TEXT PRIMARY KEY,
   memory_type TEXT NOT NULL,
@@ -142,6 +133,8 @@ CREATE TABLE IF NOT EXISTS wiki_pages (
   updated_at TEXT
 );
 
+-- Archived compatibility tables for pre-CoS wiki proposal history. New code
+-- reads/writes facts, actions, entities, and managed wiki pages instead.
 CREATE TABLE IF NOT EXISTS wiki_change_batches (
   id TEXT PRIMARY KEY,
   title TEXT NOT NULL,
@@ -180,6 +173,7 @@ ON wiki_change_items(batch_id);
 CREATE INDEX IF NOT EXISTS idx_wiki_change_items_status_target
 ON wiki_change_items(status, target_path);
 
+-- Archived compatibility table for pre-CoS wiki review interviews.
 CREATE TABLE IF NOT EXISTS wiki_interviews (
   id TEXT PRIMARY KEY,
   batch_id TEXT NOT NULL REFERENCES wiki_change_batches(id) ON DELETE CASCADE,

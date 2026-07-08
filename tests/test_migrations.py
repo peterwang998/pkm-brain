@@ -67,8 +67,13 @@ def test_fresh_db_applies_registered_migrations(tmp_path: Path) -> None:
             row["name"]
             for row in conn.execute("PRAGMA table_info(cos_stage_watermarks)")
         }
+        tables = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
 
     assert versions == EXPECTED_MIGRATIONS
+    assert "relations" not in tables
     assert {
         "id",
         "source_type",
