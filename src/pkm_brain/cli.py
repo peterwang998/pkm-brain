@@ -537,9 +537,12 @@ def index_rebuild_vectors(
 
 
 @embeddings_app.command("status")
-def embeddings_status(home: Optional[Path] = typer.Option(None)) -> None:
+def embeddings_status(
+    home: Optional[Path] = typer.Option(None),
+    check: bool = typer.Option(False, "--check", help="Load the configured embedding model to verify availability."),
+) -> None:
     svc = service(home)
-    console.print_json(json.dumps(svc.embedding_provider.status(check_available=True)))
+    console.print_json(json.dumps(svc.embedding_provider.status(check_available=check)))
 
 
 @embeddings_app.command("download")

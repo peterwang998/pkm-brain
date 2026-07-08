@@ -435,6 +435,40 @@ def test_configured_model_provider_skips_vector_writes_without_hash_fallback(tmp
     assert svc.search("FTS index document", limit=3)["results"]
 
 
+def test_status_doctors_do_not_load_configured_embedding_model(tmp_path: Path, monkeypatch) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    paths.config_local.mkdir(parents=True)
+    paths.config_file.write_text(
+        "embedding:\n  provider: sentence-transformer\n  model: BAAI/bge-small-en-v1.5\n",
+        encoding="utf-8",
+    )
+    svc = BrainService(paths)
+    calls: list[bool] = []
+
+    def capture_status(self, check_available: bool = False):
+        calls.append(check_available)
+        if check_available:
+            raise AssertionError("status-only checks must not load the embedding model")
+        return {
+            "configured": self.provider,
+            "model": self.model_name,
+            "dim": self.dim,
+            "available": True,
+            "reason": None,
+            "name": self.name,
+            "availability_checked": check_available,
+        }
+
+    monkeypatch.setattr(SentenceTransformerProvider, "status", capture_status)
+
+    doctor = svc.doctor()
+    index_doctor = svc.index_doctor()
+
+    assert doctor["embedding"]["availability_checked"] is False
+    assert index_doctor["embedding"]["availability_checked"] is False
+    assert calls == [False, False]
+
+
 def test_rebuild_vector_index_from_sqlite_chunks(tmp_path: Path) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()

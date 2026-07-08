@@ -311,7 +311,7 @@ class BrainService:
             self.paths.golden_queries_file.write_text("[]\n", encoding="utf-8")
 
     def doctor(self) -> dict[str, Any]:
-        embedding_status = self.embedding_provider.status(check_available=True)
+        embedding_status = self.embedding_provider.status(check_available=False)
         return {
             "home": str(self.paths.home),
             "directories": {path.name: path.exists() for path in self.paths.directories()},
@@ -417,7 +417,7 @@ class BrainService:
             self.embedding_provider,
             table_exists=bool(stats["table_exists"]),
         )
-        embedding_status = self.embedding_provider.status(check_available=True)
+        embedding_status = self.embedding_provider.status(check_available=False)
         try:
             lancedb_chunk_ids = vector_chunk_ids(self.paths.lancedb_path)
             vector_error = None

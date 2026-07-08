@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import math
 import os
 import re
@@ -76,6 +77,8 @@ class SentenceTransformerProvider(EmbeddingProvider):
 
     @cached_property
     def model(self):
+        os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         try:
             from sentence_transformers import SentenceTransformer
         except ImportError as exc:
@@ -109,6 +112,9 @@ class SentenceTransformerProvider(EmbeddingProvider):
             except EmbeddingProviderUnavailable as exc:
                 available = False
                 reason = str(exc)
+        elif importlib.util.find_spec("sentence_transformers") is None:
+            available = False
+            reason = "sentence-transformers extra is not installed; run `uv sync --extra embeddings`"
         return {
             "configured": self.provider,
             "model": self.model_name,
@@ -118,6 +124,7 @@ class SentenceTransformerProvider(EmbeddingProvider):
             "name": self.name,
             "cache_only": self.cache_only,
             "query_instruction": self.query_instruction,
+            "availability_checked": check_available,
         }
 
 
