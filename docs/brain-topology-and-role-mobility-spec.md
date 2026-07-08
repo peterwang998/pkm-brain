@@ -1,7 +1,7 @@
 # Brain Topology & Role Mobility — Spec
 
 **Status:** design spec for Codex — extends `docs/primary-secondary-brain-sync-spec.md` (which stays authoritative for the V1 single-primary/single-secondary transport) and companions `docs/macos-app-spec.md` (§3.2, §10.1, §11 carry the app-side hooks)
-**Last verified:** 2026-07-07 against commit `82871cb` plus the working-tree app spec; code claims verified in `sync_config.py`, `sync_rsync.py`, `sync_transfer.py`, `capture.py`, `paths.py`, `service.py`
+**Last verified:** 2026-07-08 against commit `03a2adf` for the M3 three-home multi-child acceptance; earlier code claims verified in `sync_config.py`, `sync_rsync.py`, `sync_transfer.py`, `capture.py`, `paths.py`, `service.py`
 **Author:** Claude, from Peter's questions (multi-child, primary migration/demotion, work-vs-personal isolation)
 
 Scope: three extensions to the topology model, in dependency order —
