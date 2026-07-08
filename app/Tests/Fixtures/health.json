@@ -1,0 +1,11 @@
+{
+  "home": "/tmp/brain",
+  "host": "127.0.0.1",
+  "ok": true,
+  "pid": 123,
+  "port": 54321,
+  "schema_version": 20,
+  "started_at": "2026-07-08T08:00:00+00:00",
+  "version": "0.1.0"
+}
+

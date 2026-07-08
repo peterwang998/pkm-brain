@@ -1,0 +1,43 @@
+name: PKM Brain
+options:
+  deploymentTarget:
+    macOS: "15.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+targets:
+  PKMBrainKit:
+    type: framework
+    platform: macOS
+    sources:
+      - Sources/Kit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.pkm-brain.kit
+        GENERATE_INFOPLIST_FILE: YES
+  PKM Brain:
+    type: application
+    platform: macOS
+    sources:
+      - Sources/App
+      - Sources/Views
+    resources:
+      - Resources
+    dependencies:
+      - target: PKMBrainKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.pkm-brain.app
+        PRODUCT_NAME: PKM Brain
+        INFOPLIST_FILE: Sources/App/Info.plist
+        CODE_SIGN_STYLE: Automatic
+  PKMBrainKitTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - Tests
+    resources:
+      - Tests/Fixtures
+    dependencies:
+      - target: PKMBrainKit

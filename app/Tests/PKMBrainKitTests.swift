@@ -1,0 +1,113 @@
+import Foundation
+import Darwin
+import Testing
+@testable import PKMBrainKit
+
+@Suite("PKMBrainKit decoding")
+struct PKMBrainKitTests {
+    @Test("health fixture decodes")
+    func healthFixtureDecodes() throws {
+        let health: DaemonHealth = try decodeFixture("health")
+
+        #expect(health.ok)
+        #expect(health.port == 54321)
+        #expect(health.schema_version == 20)
+    }
+
+    @Test("digest fixture decodes")
+    func digestFixtureDecodes() throws {
+        let digest: Digest = try decodeFixture("digest")
+
+        #expect(digest.pulse.count == 2)
+        #expect(digest.queue_counts.total == 8)
+        #expect(digest.facts_by_page.first?.page_hint == "projects/pkm-brain.md")
+        #expect(digest.latest_run?.status == "success")
+    }
+
+    @Test("scheduler fixture decodes")
+    func schedulerFixtureDecodes() throws {
+        let scheduler: SchedulerState = try decodeFixture("scheduler")
+
+        #expect(scheduler.jobs.map(\.id).contains("capture_tick"))
+        #expect(scheduler.jobs.first?.cadence_s == 600)
+    }
+
+    @Test("handshake builds loopback base URL")
+    func handshakeBaseURL() throws {
+        let handshake = DaemonHandshake(
+            pid: 123,
+            port: 9876,
+            token: "token",
+            version: "0.1.0",
+            home: "/tmp/brain",
+            started_at: "2026-07-08T08:00:00+00:00",
+            host: nil
+        )
+
+        #expect(handshake.baseURL.absoluteString == "http://127.0.0.1:9876")
+    }
+
+    @MainActor
+    @Test("supervisor restarts a killed daemon and shuts it down")
+    func supervisorRestartsKilledDaemon() async throws {
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PKMBrainKitTests-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: tempRoot)
+        }
+        let appSupport = tempRoot.appendingPathComponent("AppSupport", isDirectory: true)
+        let home = tempRoot.appendingPathComponent("Brain", isDirectory: true)
+        let brain = appSupport.appendingPathComponent("runtime/current/bin/brain")
+        try FileManager.default.createDirectory(
+            at: brain.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let fakeDaemon = try #require(Bundle.module.url(forResource: "fake_brain_daemon", withExtension: "py"))
+        let launcher = """
+        #!/bin/zsh
+        exec /usr/bin/python3 "\(fakeDaemon.path)" "$@"
+        """
+        try launcher.write(to: brain, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: brain.path)
+
+        let provisioner = RuntimeProvisioner(appSupportURL: appSupport)
+        let supervisor = DaemonSupervisor(provisioner: provisioner, expectedDaemonVersion: "0.1.0")
+        await supervisor.start(homeURL: home)
+        let firstPID = try #require(supervisor.handshake?.pid)
+        #expect(isAlive(firstPID))
+
+        kill(pid_t(firstPID), SIGKILL)
+        try await waitUntil(timeoutSeconds: 12) {
+            guard let pid = supervisor.handshake?.pid else {
+                return false
+            }
+            return pid != firstPID && isAlive(pid)
+        }
+        let secondPID = try #require(supervisor.handshake?.pid)
+        await supervisor.stop()
+        try await waitUntil(timeoutSeconds: 4) {
+            !isAlive(secondPID)
+        }
+    }
+
+    private func decodeFixture<T: Decodable>(_ name: String) throws -> T {
+        let url = try #require(Bundle.module.url(forResource: name, withExtension: "json"))
+        let data = try Data(contentsOf: url)
+        return try JSONDecoder().decode(T.self, from: data)
+    }
+
+    private func isAlive(_ pid: Int) -> Bool {
+        kill(pid_t(pid), 0) == 0 || errno == EPERM
+    }
+
+    private func waitUntil(timeoutSeconds: TimeInterval, condition: @MainActor @escaping () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            if await condition() {
+                return
+            }
+            try await Task.sleep(nanoseconds: 200_000_000)
+        }
+        Issue.record("Timed out waiting for condition")
+    }
+}
