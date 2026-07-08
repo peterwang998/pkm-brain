@@ -35,6 +35,7 @@ from .llm import cos_provider_status, provider_status
 from .memory_proposals import propose_failure_memories_from_sources, propose_memories_from_lineage
 from .mcp_server import create_mcp
 from .paths import BrainPaths
+from .queue_summary import review_queue_summary
 from .regeneration import backup_runtime_brain, export_human_state, rebuild_facts_from_sources
 from .service import BrainService
 from .setup_wizard import run_setup_plan
@@ -766,6 +767,13 @@ def cos_run(
     paths = BrainPaths.from_value(home)
     result = run_cos_once(paths, llm_wiki=llm_wiki)
     console.print_json(json.dumps(result))
+
+
+@cos_app.command("queue-summary")
+def cos_queue_summary(home: Optional[Path] = typer.Option(None, help="Brain home directory.")) -> None:
+    paths = BrainPaths.from_value(home)
+    BrainService(paths).init_workspace()
+    console.print_json(json.dumps(review_queue_summary(paths)))
 
 
 @cos_app.command("export-human-state")

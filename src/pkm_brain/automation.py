@@ -23,6 +23,7 @@ from .indexes import lancedb_stats, optimize_vectors, should_optimize_vectors
 from .llm import CODEX_DEFAULT_MODEL, DEFAULT_LLM_PROVIDER, OPENAI_DEFAULT_MODEL, get_provider
 from .memory_proposals import propose_failure_memories_from_sources, propose_memories_from_lineage
 from .paths import BrainPaths
+from .queue_summary import review_queue_summary
 from .service import BrainService
 from .sync_config import load_sync_config
 from .synthesizer import generate_page_syntheses
@@ -274,6 +275,7 @@ def run_nightly_maintenance(
             summary["index_maintenance"] = run_index_maintenance(paths)
             summary["cos_timeout_sweep"] = run_cos_timeout_sweep(paths)
             summary["cos_audit"] = run_cos_audit(paths, cos_role)
+            summary["queue_summary"] = review_queue_summary(paths)
             summary["provenance_check"] = provenance_check(paths)
             summary["wiki_lint"] = lint_wiki(paths)
             if with_llm_memory_proposals:
