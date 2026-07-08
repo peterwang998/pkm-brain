@@ -865,18 +865,30 @@ def test_lancedb_table_names_accepts_result_objects() -> None:
     assert table_names(DB()) == ["chunks"]
 
 
-def test_duplicate_ingest_skips_unchanged_content(tmp_path: Path) -> None:
+def test_duplicate_ingest_skips_unchanged_content_without_rehashing(tmp_path: Path, monkeypatch) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()
     note = svc.paths.inbox / "same.md"
     note.write_text("# Same\n\nRepeatable content.\n", encoding="utf-8")
 
     first = svc.ingest()
+
+    def fail_hash(_path: Path) -> str:
+        raise AssertionError("unchanged source should skip hashing")
+
+    monkeypatch.setattr("pkm_brain.service.file_sha256", fail_hash)
     second = svc.ingest()
 
     assert first.changed == 1
     assert second.changed == 0
     assert second.skipped == 1
+    with connection(svc.paths.sqlite_path) as conn:
+        document = conn.execute(
+            "SELECT source_mtime_ns, source_size FROM documents WHERE source_path = ?",
+            (str(note),),
+        ).fetchone()
+    assert document["source_mtime_ns"] == note.stat().st_mtime_ns
+    assert document["source_size"] == note.stat().st_size
 
 
 def test_agent_session_log_reingest_replaces_previous_snapshot(tmp_path: Path) -> None:

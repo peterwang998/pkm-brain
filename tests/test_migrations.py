@@ -7,7 +7,7 @@ from pkm_brain.db import connection, init_db
 from pkm_brain.migrations import run_migrations
 
 
-EXPECTED_MIGRATIONS = list(range(1, 20))
+EXPECTED_MIGRATIONS = list(range(1, 21))
 
 
 def test_fresh_db_applies_registered_migrations(tmp_path: Path) -> None:
@@ -78,6 +78,8 @@ def test_fresh_db_applies_registered_migrations(tmp_path: Path) -> None:
         "content_hash",
         "origin_node_id",
         "logical_source_key",
+        "source_mtime_ns",
+        "source_size",
         "created_at",
         "ingested_at",
         "project",

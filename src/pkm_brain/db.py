@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS documents (
   content_hash TEXT NOT NULL,
   origin_node_id TEXT,
   logical_source_key TEXT,
+  source_mtime_ns INTEGER,
+  source_size INTEGER,
   created_at TEXT NOT NULL,
   ingested_at TEXT NOT NULL,
   project TEXT,

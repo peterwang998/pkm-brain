@@ -1121,13 +1121,13 @@ class BrainService:
                     if not source_type:
                         skipped += 1
                         continue
-                    content_hash = file_sha256(path)
-                    text = path.read_text(encoding="utf-8", errors="replace")
-                    title = document_title_for_text(text, path)
+                    stat = path.stat()
+                    source_mtime_ns = int(stat.st_mtime_ns)
+                    source_size = int(stat.st_size)
                     origin, logical_source_key = self._origin_identity_for_path(path, origin_node_id)
                     existing = conn.execute(
                         """
-                        SELECT id, source_type, title, content_hash, raw_path
+                        SELECT id, source_type, title, content_hash, raw_path, source_mtime_ns, source_size
                         FROM documents
                         WHERE origin_node_id = ? AND logical_source_key = ?
                         ORDER BY ingested_at DESC
@@ -1135,6 +1135,36 @@ class BrainService:
                         """,
                         (origin, logical_source_key),
                     ).fetchone()
+                    if existing and existing_document_matches_source_stats(
+                        existing,
+                        source_mtime_ns=source_mtime_ns,
+                        source_size=source_size,
+                    ):
+                        if source_type == "agent_session_log":
+                            replaced = remove_superseded_agent_session_snapshots(
+                                conn,
+                                path,
+                                origin_node_id=origin,
+                                keep_document_id=existing["id"],
+                            )
+                            stale_vector_chunk_ids.extend(replaced.chunk_ids)
+                            documents_replaced += replaced.documents
+                        refresh_existing_document_metadata(
+                            conn,
+                            existing["id"],
+                            source_type,
+                            str(existing["title"]),
+                            path,
+                            origin,
+                            logical_source_key,
+                            source_mtime_ns=source_mtime_ns,
+                            source_size=source_size,
+                        )
+                        skipped += 1
+                        continue
+                    content_hash = file_sha256(path)
+                    text = path.read_text(encoding="utf-8", errors="replace")
+                    title = document_title_for_text(text, path)
                     if existing:
                         if existing["content_hash"] == content_hash:
                             if source_type == "agent_session_log":
@@ -1154,6 +1184,8 @@ class BrainService:
                                 path,
                                 origin,
                                 logical_source_key,
+                                source_mtime_ns=source_mtime_ns,
+                                source_size=source_size,
                             )
                             skipped += 1
                             continue
@@ -1178,9 +1210,9 @@ class BrainService:
                         """
                         INSERT INTO documents(
                           id, source_type, title, source_path, raw_path, content_hash,
-                          origin_node_id, logical_source_key, created_at, ingested_at,
-                          project, tags, version, status
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                          origin_node_id, logical_source_key, source_mtime_ns, source_size,
+                          created_at, ingested_at, project, tags, version, status
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             document_id,
@@ -1191,6 +1223,8 @@ class BrainService:
                             content_hash,
                             origin,
                             logical_source_key,
+                            source_mtime_ns,
+                            source_size,
                             ingested_at,
                             ingested_at,
                             None,
@@ -4130,16 +4164,43 @@ def refresh_existing_document_metadata(
     path: Path,
     origin_node_id: str,
     logical_source_key: str,
+    *,
+    source_mtime_ns: int | None = None,
+    source_size: int | None = None,
 ) -> None:
     conn.execute(
         """
         UPDATE documents
-        SET source_type = ?, title = ?, source_path = ?, origin_node_id = ?, logical_source_key = ?
+        SET source_type = ?, title = ?, source_path = ?, origin_node_id = ?, logical_source_key = ?,
+            source_mtime_ns = ?, source_size = ?
         WHERE id = ?
         """,
-        (source_type, title, str(path), origin_node_id, logical_source_key, document_id),
+        (
+            source_type,
+            title,
+            str(path),
+            origin_node_id,
+            logical_source_key,
+            source_mtime_ns,
+            source_size,
+            document_id,
+        ),
     )
     update_chunk_retrieval_title(conn, document_id, title)
+
+
+def existing_document_matches_source_stats(
+    document: Any,
+    *,
+    source_mtime_ns: int,
+    source_size: int,
+) -> bool:
+    return (
+        document["source_mtime_ns"] is not None
+        and document["source_size"] is not None
+        and int(document["source_mtime_ns"]) == source_mtime_ns
+        and int(document["source_size"]) == source_size
+    )
 
 
 def reciprocal_rank_fusion(*rankings: list[str], k: int = 60) -> list[str]:

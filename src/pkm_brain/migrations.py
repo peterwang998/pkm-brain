@@ -680,6 +680,13 @@ def _migration_019_fact_entity_mention_kind(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "fact_entities", "mention_kind", "TEXT")
 
 
+def _migration_020_document_source_stats(conn: sqlite3.Connection) -> None:
+    if not _table_exists(conn, "documents"):
+        return
+    _ensure_column(conn, "documents", "source_mtime_ns", "INTEGER")
+    _ensure_column(conn, "documents", "source_size", "INTEGER")
+
+
 MIGRATIONS: list[Migration] = [
     (1, "add_origin_identity", _migration_001_add_origin_identity),
     (2, "create_sync_runs", _migration_002_create_sync_runs),
@@ -704,6 +711,7 @@ MIGRATIONS: list[Migration] = [
     (17, "create_cos_stage_watermarks", _migration_017_create_cos_stage_watermarks),
     (18, "entity_identity", _migration_018_entity_identity),
     (19, "fact_entity_mention_kind", _migration_019_fact_entity_mention_kind),
+    (20, "document_source_stats", _migration_020_document_source_stats),
 ]
 
 
