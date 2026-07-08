@@ -62,6 +62,30 @@ def chunk_row_id(row: Any) -> str:
     return str(row["chunk_id"])
 
 
+def automation_run_summary(row: Any | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return {
+        "id": row["id"],
+        "started_at": row["started_at"],
+        "finished_at": row["finished_at"],
+        "status": row["status"],
+        "error": row["error"],
+    }
+
+
+def parse_doctor_timestamp(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 GENERIC_CONTEXT_TERMS = {
     "about",
     "answer",
@@ -295,6 +319,71 @@ class BrainService:
             "lancedb": self.paths.lancedb_path.exists(),
             "embedding_provider": self.embedding_provider.name,
             "embedding": embedding_status,
+            "nightly": self.nightly_doctor(),
+        }
+
+    def nightly_doctor(self, due_after_hours: int = 20, slack_hours: int = 4) -> dict[str, Any]:
+        if not self.paths.sqlite_path.exists():
+            return {
+                "job_name": "nightly-maintenance",
+                "status": "unknown",
+                "due_after_hours": due_after_hours,
+                "slack_hours": slack_hours,
+                "last_success": None,
+                "last_failure": None,
+                "last_success_age_hours": None,
+                "warning": "SQLite database is missing",
+            }
+        with connection(self.paths.sqlite_path) as conn:
+            last_success = conn.execute(
+                """
+                SELECT id, started_at, finished_at, status, error
+                FROM automation_runs
+                WHERE job_name = 'nightly-maintenance'
+                  AND status = 'success'
+                  AND finished_at IS NOT NULL
+                ORDER BY finished_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            last_failure = conn.execute(
+                """
+                SELECT id, started_at, finished_at, status, error
+                FROM automation_runs
+                WHERE job_name = 'nightly-maintenance'
+                  AND status = 'failed'
+                ORDER BY COALESCE(finished_at, started_at) DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        success = automation_run_summary(last_success)
+        failure = automation_run_summary(last_failure)
+        age_hours = None
+        warning = None
+        status = "ok"
+        if success and success.get("finished_at"):
+            finished_at = parse_doctor_timestamp(str(success["finished_at"]))
+            if finished_at:
+                now = datetime.now(finished_at.tzinfo or timezone.utc)
+                age_hours = round((now - finished_at).total_seconds() / 3600, 2)
+                if age_hours > due_after_hours + slack_hours:
+                    status = "warning"
+                    warning = (
+                        f"last successful nightly run was {age_hours:.1f}h ago; "
+                        f"threshold is {due_after_hours + slack_hours}h"
+                    )
+        else:
+            status = "warning"
+            warning = "no successful nightly run recorded"
+        return {
+            "job_name": "nightly-maintenance",
+            "status": status,
+            "due_after_hours": due_after_hours,
+            "slack_hours": slack_hours,
+            "last_success": success,
+            "last_failure": failure,
+            "last_success_age_hours": age_hours,
+            "warning": warning,
         }
 
     def download_embedding_model(self) -> dict[str, Any]:

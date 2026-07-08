@@ -38,6 +38,19 @@ MAX_STORED_ERROR_LIST_ITEMS = 20
 ERROR_FIELD_NAMES = {"error", "errors", "stderr", "traceback"}
 COS_SECONDARY_SKIP_REASON = "secondary role skips CoS mutation-capable stages by default"
 TRUTH_RESIDUE_KINDS = {"conflict"}
+NIGHTLY_AUTOMATION_FLAGS = {
+    "--agent",
+    "--due-after-hours",
+    "--help",
+    "--home",
+    "--hyprnote-root",
+    "--if-due",
+    "--include-hyprnote",
+    "--llm-wiki",
+    "--no-llm-wiki",
+    "--provider",
+    "--with-llm-memory-proposals",
+}
 TRUTH_ACTION_TYPES = {
     "display_contested",
     "fact_merge",
@@ -267,6 +280,11 @@ def run_nightly_maintenance(
                 summary["memory_proposals"] = propose_failure_memories_from_sources(paths, provider_name=provider)
                 summary["lineage_memory_proposals"] = propose_memories_from_lineage(paths, provider_name=provider)
             summary["memory_audit"] = audit_memories(paths)
+            if summary["memory_audit"].get("errors"):
+                summary["memory_audit"]["nightly_severity"] = "warning"
+                summary["memory_audit"].setdefault("warnings", []).append(
+                    "memory audit errors are warning-tier for nightly; run `brain memory audit` for details"
+                )
 
             errors = (
                 summary["capture"].get("errors", [])
@@ -275,7 +293,6 @@ def run_nightly_maintenance(
                 + summary["index_maintenance"].get("errors", [])
                 + summary["provenance_check"].get("errors", [])
                 + summary["wiki_lint"].get("errors", [])
-                + summary["memory_audit"].get("errors", [])
             )
             if errors:
                 status = "failed"
@@ -868,7 +885,69 @@ def nightly_launch_agent_status() -> dict[str, Any]:
         "plist_exists": path.exists(),
         "loaded": proc.returncode == 0,
         "launchctl_output": proc.stdout if proc.returncode == 0 else proc.stderr,
+        "plist_validation": validate_nightly_launch_agent_plist(path),
     }
+
+
+def validate_nightly_launch_agent_plist(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {
+            "status": "missing",
+            "valid": False,
+            "unknown_flags": [],
+            "warnings": ["plist does not exist"],
+        }
+    try:
+        plist = plistlib.loads(path.read_bytes())
+    except Exception as exc:
+        return {
+            "status": "invalid",
+            "valid": False,
+            "unknown_flags": [],
+            "warnings": [f"could not parse plist: {exc}"],
+        }
+    args = plist.get("ProgramArguments")
+    if not isinstance(args, list) or not args:
+        return {
+            "status": "invalid",
+            "valid": False,
+            "unknown_flags": [],
+            "warnings": ["ProgramArguments is missing or empty"],
+        }
+    command = str(args[-1])
+    tokens = shlex.split(command)
+    nightly_index = find_nightly_command_index(tokens)
+    if nightly_index is None:
+        return {
+            "status": "invalid",
+            "valid": False,
+            "unknown_flags": [],
+            "warnings": ["ProgramArguments does not contain `brain automation nightly`"],
+            "command": command,
+        }
+    command_tokens = tokens[nightly_index + 3 :]
+    unknown_flags = sorted(
+        {
+            token.split("=", 1)[0]
+            for token in command_tokens
+            if token.startswith("--") and token.split("=", 1)[0] not in NIGHTLY_AUTOMATION_FLAGS
+        }
+    )
+    warnings = [f"unknown nightly flag: {flag}" for flag in unknown_flags]
+    return {
+        "status": "ok" if not unknown_flags else "warning",
+        "valid": not unknown_flags,
+        "unknown_flags": unknown_flags,
+        "warnings": warnings,
+        "command": command,
+    }
+
+
+def find_nightly_command_index(tokens: list[str]) -> int | None:
+    for index in range(0, max(0, len(tokens) - 2)):
+        if tokens[index : index + 3] == ["brain", "automation", "nightly"]:
+            return index
+    return None
 
 
 def as_jsonable(result: AutomationResult | NightlyMaintenanceResult | SecondaryTickResult) -> dict[str, Any]:

@@ -14,6 +14,7 @@ from pkm_brain.automation import (
     render_nightly_launch_agent,
     run_agent_log_ingest,
     run_nightly_maintenance,
+    validate_nightly_launch_agent_plist,
 )
 from pkm_brain.capture import AgentLogCapture, redact_text
 from pkm_brain.db import connection
@@ -394,6 +395,46 @@ def test_nightly_maintenance_runs_self_healing_tasks(tmp_path: Path) -> None:
     assert row["status"] == "success"
 
 
+def test_nightly_memory_audit_errors_are_warning_tier(tmp_path: Path) -> None:
+    svc = make_service(tmp_path)
+    with connection(svc.paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO memories(
+              id, memory_type, scope, content, confidence, source_ids,
+              status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "mem_invalid_active_scope",
+                "FactMemory",
+                "legacy-scope",
+                "Active invalid scope remains visible but should not fail nightly.",
+                0.8,
+                json.dumps(["agent_session:test"]),
+                "active",
+                "2026-05-20T00:00:00+00:00",
+                "2026-05-20T00:00:00+00:00",
+            ),
+        )
+
+    result = run_nightly_maintenance(
+        svc.paths,
+        codex_state=tmp_path / "missing-codex.sqlite",
+        claude_projects=tmp_path / "missing-claude",
+        opencode_db=tmp_path / "missing-opencode.sqlite",
+        hyprnote_root=tmp_path / "missing-hyprnote",
+    )
+
+    assert result.status == "success"
+    assert result.summary["memory_audit"]["errors"]
+    assert result.summary["memory_audit"]["nightly_severity"] == "warning"
+    with connection(svc.paths.sqlite_path) as conn:
+        row = conn.execute("SELECT status, error FROM automation_runs WHERE id = ?", (result.run_id,)).fetchone()
+    assert row["status"] == "success"
+    assert row["error"] is None
+
+
 def test_nightly_maintenance_secondary_skips_cos_mutation_capable_stages(tmp_path: Path) -> None:
     svc = make_service(tmp_path)
     write_sync_config(
@@ -466,6 +507,24 @@ def test_nightly_maintenance_skips_when_not_due(tmp_path: Path) -> None:
     assert second.skipped is True
     assert second.status == "skipped"
     assert second.run_id is None
+
+
+def test_doctor_reports_last_nightly_success_age(tmp_path: Path) -> None:
+    svc = make_service(tmp_path)
+    record_automation_start(svc.paths, "automation_recent_success", "nightly-maintenance", "2026-05-20T00:00:00+00:00")
+    record_automation_finish(
+        svc.paths,
+        "automation_recent_success",
+        "success",
+        "2026-05-20T00:10:00+00:00",
+        {},
+        None,
+    )
+
+    status = svc.doctor()
+
+    assert status["nightly"]["last_success"]["id"] == "automation_recent_success"
+    assert status["nightly"]["last_success_age_hours"] is not None
 
 
 def test_nightly_memory_proposals_fail_without_configured_default_provider(tmp_path: Path, monkeypatch) -> None:
@@ -627,6 +686,26 @@ def test_nightly_launch_agent_plist_render() -> None:
     assert decoded["StartInterval"] == 3600
     assert "brain automation nightly --if-due --due-after-hours 20" in decoded["ProgramArguments"][-1]
     assert decoded["StandardOutPath"].endswith("nightly-maintenance.out.log")
+
+
+def test_nightly_launch_agent_plist_validation_flags_stale_options(tmp_path: Path) -> None:
+    plist_path = tmp_path / "com.pkm-brain.nightly-maintenance.plist"
+    plist = {
+        "Label": "com.pkm-brain.nightly-maintenance",
+        "ProgramArguments": [
+            "/bin/zsh",
+            "-lc",
+            "cd /Users/Peter/pkm-brain && /opt/homebrew/bin/uv run brain automation nightly "
+            "--if-due --due-after-hours 20 --with-llm-wiki-proposals --home /Users/Peter/brain",
+        ],
+    }
+    plist_path.write_bytes(plistlib.dumps(plist))
+
+    validation = validate_nightly_launch_agent_plist(plist_path)
+
+    assert validation["status"] == "warning"
+    assert validation["valid"] is False
+    assert validation["unknown_flags"] == ["--with-llm-wiki-proposals"]
 
 
 def test_nightly_launch_agent_plist_render_quotes_paths_with_spaces(tmp_path: Path) -> None:

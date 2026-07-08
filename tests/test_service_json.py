@@ -35,3 +35,5 @@ peers: []
     json.dumps(sync_doctor)
     json.dumps(memories)
     json.dumps(capture)
+    assert doctor["nightly"]["status"] == "warning"
+    assert doctor["nightly"]["warning"] == "no successful nightly run recorded"

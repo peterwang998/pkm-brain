@@ -372,6 +372,13 @@ def doctor(home: Optional[Path] = typer.Option(None), json_output: bool = typer.
     table.add_row("home", "ok", status["home"])
     table.add_row("sqlite", "ok" if status["sqlite"] else "missing", str(status["sqlite"]))
     table.add_row("lancedb", "ok" if status["lancedb"] else "missing", str(status["lancedb"]))
+    nightly = status.get("nightly") or {}
+    nightly_detail = nightly.get("warning") or (
+        f"last success {nightly.get('last_success_age_hours')}h ago"
+        if nightly.get("last_success_age_hours") is not None
+        else "no status"
+    )
+    table.add_row("nightly", str(nightly.get("status") or "unknown"), str(nightly_detail))
     embedding = status["embedding"]
     table.add_row(
         "embedding_provider",
