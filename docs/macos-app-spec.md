@@ -1,7 +1,7 @@
 # PKM Brain.app — macOS Application Spec
 
 **Status:** implementation spec for Codex — design decisions in §0 are fixed (locked with Peter, 2026-07-07); implementation choices within them are Codex's
-**Last verified:** 2026-07-07 against commit `82871cb` (clean tree; UI v2 landed in `b337049`)
+**Last verified:** 2026-07-08 against implementation commits `d82c264` (M0), `ad62b81` (M1), `8c6f518` (M2 base), and `281e5e2` (M0-M2 audit hardening); UI v2 landed in `b337049`
 **Author:** Claude, from Peter's decisions
 **Design authority carried over:** `docs/brain-ui-v2-spec.md` §2–3 (information architecture, view content contracts, queue keyboard model) remains the UX source of truth. This spec re-targets those decisions from web to native SwiftUI and adds the app shell, scheduler, connectors, packaging, and migration. `docs/project-audit-2026-07-07.md` items 21–24 are unaffected.
 **Companion:** `docs/brain-topology-and-role-mobility-spec.md` — multi-child topology, primary promotion/demotion/handover, and multi-profile isolation (work vs personal brains on one Mac). This spec carries the app-side hooks (§3.2 per-peer jobs, §10.1, §11); the topology spec carries the protocols and prerequisites.
@@ -120,7 +120,7 @@ Controls: pause (until timestamp, persisted to `config/local/scheduler.yaml` so 
 - `POST /api/shutdown` (token-authed; supervisor use).
 - Existing surface the native app consumes as-is — GET: `status, setup, sync/status, sync/conflicts, jobs/status, logs, memory, memory/{id}, digest, queue, search, entities, entities/{id}, wiki/pages, wiki/page, wiki/facts, wiki/facts/page, cos/policy, cos/actions, cos/review, cos/contracts, cos/audit, ops/runs`; POST: `retrieve, queue/undo, queue/{id}/decision, entities/merge, actions/{id}/revert, wiki/facts/{id}/confirm|flag, wiki/page, wiki/questions/*, cos/questions/*, cos/contracts/*, cos/audit/*, memory/{id}/approve|reject|archive`.
 - **No SSE/WebSocket in v1.** The app polls: `/api/health` every 5s (supervisor), `/api/scheduler` + `/api/digest` every 30s or on window focus. Loopback polling is free; keep the stdlib server simple.
-- Web UI: `--serve-web` re-enables static `ui_static/` serving for debugging; default off once M2 ships.
+- Web UI: `--serve-web` serves the static `ui_static/` app; default off once M2 ships, but the web UI is **maintained, not retired** — it is the platform-portability fallback (§0 decision 1). Endpoint changes must keep it working (it shares the endpoint test suite; six-view manual pass required at M6 and on any endpoint-shape change).
 
 ### 3.4 Tests (pytest, temp homes)
 
@@ -377,9 +377,15 @@ Loopback-only daemon; per-boot token in a `0600` file; no analytics/telemetry eg
 - **M3 — Migration + MCP proxy.** §10 assistant (states A/B/C), LaunchAgent retirement + rollback script, shims, `brain-mcp` with auto-launch and read-only fallback (+ `read_only` no-event-write mode in service). *Accept:* full State-A migration on Peter's machine passes the 8-point checklist; label detection unit-tested against fixture plists for **both role sets** (incl. `capture-secondary`); §10.1 acceptance run as a **three-home simulation** (one primary, two children: both outboxes ingest under distinct origins, push fan-out leaves both mirrors fresh, pausing one child's `sync:<peer>` job doesn't perturb the other; the real secondary Mac migrates after the primary is stable); force-quit app → Codex `retrieve_context` still answers (read-only) and `propose_memory` fails with the actionable error; rollback script restores launchd operation.
 - **M4 — Queue.** Native centerpiece per v2 §3.2 contract + §4.3 mechanics; notifications. *Accept:* 20-item mixed queue triaged keyboard-only; decisions land in ledger/questions/memories tables (verify via API against ground truth); undo within window; conflict side-by-side renders both facts' evidence.
 - **M5 — Wiki + Entities.** Native renderer w/ escape+fixture tests, provenance popovers (confirm/flag round-trip), contract rail, snapshot diffs; entity index/detail/merge-propose. *Accept:* the databricks page reads as a document; popover shows verbatim quote + opens source; merge proposal appears as a policy-gated action.
-- **M6 — Ask + Ops + Connectors UI + Embeddings manager + retirement.** §4.3 Ask/Ops; §5.5 cards; §6 stamped indexes incl. live index migration + flip flow; ⌘K + `?`; web UI off by default; deprecation notes; docs updated (README gains an "Install the app" path; this spec re-stamped). *Accept:* negative-control query visibly shows `no_strong_match`; flip to a second model on a temp home → eval comparison shown → rollback is instant; stamped-index migration leaves `brain index doctor` clean on the live brain; the fixture connector proves §5.6 (“new connector = one Python module”).
+- **M6 — Ask + Ops + Connectors UI + Embeddings manager + web-UI fallback hardening.** §4.3 Ask/Ops; §5.5 cards; §6 stamped indexes incl. live index migration + flip flow; ⌘K + `?`; web UI confirmed **kept** behind `--serve-web` as the maintained platform-portability fallback (off by default, never deleted in this plan); docs updated (README gains an "Install the app" path; this spec re-stamped). *Accept:* negative-control query visibly shows `no_strong_match`; flip to a second model on a temp home → eval comparison shown → rollback is instant; stamped-index migration leaves `brain index doctor` clean on the live brain; the fixture connector proves §5.6 (“new connector = one Python module”); web UI six-view manual pass on a seeded home behind `--serve-web` is green.
 
 Sequencing note: M0–M1 are pure Python and can start immediately; M2 depends on M0; M3 is the switch point that changes Peter's machine — everything before it must not disturb the running launchd setup.
+
+### 14.1 Verification record
+
+- **2026-07-08 M0-M2 audit hardening (`281e5e2`):** added the missing nightly-parity test, run-now-while-paused coverage, per-peer sync cadence override, CLI `brain --version`, supervisor replacement of adopted mismatched daemons, runtime `brain --version` smoke-gating, explicit ad-hoc signing in `scripts/build-app.sh`, and a headless M2 acceptance harness.
+- **2026-07-08 gates:** `uv run ruff check .` passed; `uv run pytest -q` passed with 377 tests; `swift test --package-path app` passed with 6 tests.
+- **2026-07-08 M2 clean-machine simulation:** `scripts/m2-clean-machine-acceptance.sh` passed using a fresh temp `$HOME`; it provisioned the app runtime from bundled resources, installed Python 3.13.12 and 68 locked dependencies, launched the daemon, verified Today digest content against `/api/digest`, killed daemon pid `41519`, observed supervisor restart to pid `41526`, and stopped with no supervised daemon left running. Reported result: `runtime_phase=Ready`, `version=0.1.0`, `digest_queue_total=0`, app bundle `/Users/Peter/pkm-brain/app/DerivedData/Build/Products/Release/PKM Brain.app`.
 
 ## 15. Hard rules (inherit all standing invariants)
 
