@@ -66,7 +66,13 @@ Use MCP `write_agent_session` at the end of substantial work when the session pr
 
 ## CLI Fallback
 
-If MCP is unavailable, use the local CLI from the pkm-brain repo:
+If MCP is unavailable after the macOS app migration, prefer the app-managed shim:
+
+```bash
+~/Library/Application\ Support/PKM\ Brain/bin/brain retrieve-context --task "<task>" --mode default --home ~/brain
+```
+
+For development checkouts before migration, use the local CLI from the pkm-brain repo:
 
 ```bash
 uv run brain retrieve-context --task "<task>" --mode default --home ~/brain

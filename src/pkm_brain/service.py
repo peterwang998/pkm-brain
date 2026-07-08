@@ -289,11 +289,29 @@ class RetrievalPolicy:
     include_full_text: bool = False
 
 
+class ReadOnlyModeError(RuntimeError):
+    pass
+
+
 class BrainService:
-    def __init__(self, paths: BrainPaths) -> None:
+    def __init__(self, paths: BrainPaths, *, read_only: bool = False) -> None:
         self.paths = paths
+        self.read_only = read_only
         self.embedding_config = load_embedding_config(paths)
         self.embedding_provider = resolve_embedding_provider(self.embedding_config)
+
+    def _ensure_workspace(self) -> None:
+        if self.read_only:
+            if not self.paths.sqlite_path.exists():
+                raise ReadOnlyModeError(f"brain database is not available for read-only access: {self.paths.sqlite_path}")
+            return
+        self.init_workspace()
+
+    def _ensure_writable(self) -> None:
+        if self.read_only:
+            raise ReadOnlyModeError(
+                "PKM Brain app is not available; write declined. Launch the app and retry."
+            )
 
     def init_workspace(self) -> None:
         for directory in self.paths.directories():
@@ -1546,7 +1564,7 @@ class BrainService:
         return True
 
     def search(self, query: str, limit: int = 10, debug: bool = False, caller: str = "cli") -> dict[str, Any]:
-        self.init_workspace()
+        self._ensure_workspace()
         fanout_limit = max(60, limit * 6)
         chunk_candidates, fanout_debug = self._fanout_chunk_candidates(query, limit=fanout_limit)
         lineage_scores = self._lineage_scores_for_chunks(chunk_candidates)
@@ -1568,25 +1586,27 @@ class BrainService:
         search_debug["assessment"] = assessment
         if fanout_debug.get("vector_unavailable_reason"):
             assessment["reasons"].append(f"vector_search unavailable: {fanout_debug['vector_unavailable_reason']}")
-        event_id = new_id("retrieval")
-        with connection(self.paths.sqlite_path) as conn:
-            conn.execute(
-                """
-                INSERT INTO retrieval_events(
-                  id, query, timestamp, caller, returned_chunk_ids, selected_chunk_ids, citation_snapshots, debug
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event_id,
-                    query,
-                    now_iso(),
-                    caller,
-                    dumps(fanout_debug["candidate_ids"]),
-                    dumps(selected_ids),
-                    dumps(citation_snapshots if debug else slim_citation_snapshots(citation_snapshots)),
-                    dumps(search_debug) if debug else "{}",
-                ),
-            )
+        event_id = None
+        if not self.read_only:
+            event_id = new_id("retrieval")
+            with connection(self.paths.sqlite_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO retrieval_events(
+                      id, query, timestamp, caller, returned_chunk_ids, selected_chunk_ids, citation_snapshots, debug
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event_id,
+                        query,
+                        now_iso(),
+                        caller,
+                        dumps(fanout_debug["candidate_ids"]),
+                        dumps(selected_ids),
+                        dumps(citation_snapshots if debug else slim_citation_snapshots(citation_snapshots)),
+                        dumps(search_debug) if debug else "{}",
+                    ),
+                )
         return {
             "event_id": event_id,
             "query": query,
@@ -1607,6 +1627,7 @@ class BrainService:
         mode: str = DEFAULT_RETRIEVAL_MODE,
         debug: bool = False,
     ) -> dict[str, Any]:
+        self._ensure_workspace()
         policy = retrieval_policy(mode, budget)
         query = f"{project or ''} {task}".strip()
         chunk_candidates, fanout_debug = self._fanout_chunk_candidates(query, limit=60)
@@ -1644,7 +1665,7 @@ class BrainService:
             candidate_memories,
             relevant_facts,
         )
-        event_id = new_id("retrieval")
+        event_id = None
         retrieval_debug = build_retrieval_debug(
             query,
             fanout_debug,
@@ -1656,33 +1677,35 @@ class BrainService:
         retrieval_debug["assessment"] = assessment
         if fanout_debug.get("vector_unavailable_reason"):
             assessment["reasons"].append(f"vector_search unavailable: {fanout_debug['vector_unavailable_reason']}")
-        with connection(self.paths.sqlite_path) as conn:
-            conn.execute(
-                """
-                INSERT INTO retrieval_events(
-                  id, query, timestamp, caller, returned_chunk_ids, selected_chunk_ids, citation_snapshots, debug
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event_id,
-                    query,
-                    now_iso(),
-                    "retrieve_context",
-                    dumps(fanout_debug["fused"]),
-                    dumps([row["chunk_id"] for row in supporting_chunks]),
-                    dumps(citation_snapshots if debug else slim_citation_snapshots(citation_snapshots)),
-                    dumps(retrieval_debug) if debug else "{}",
-                ),
-            )
-            self._record_retrieval_exposures(
-                conn,
-                retrieval_event_id=event_id,
-                query=query,
-                supporting_chunks=supporting_chunks,
-                relevant_facts=relevant_facts,
-                wiki_pages=wiki_pages,
-                active_memories=memories,
-            )
+        if not self.read_only:
+            event_id = new_id("retrieval")
+            with connection(self.paths.sqlite_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO retrieval_events(
+                      id, query, timestamp, caller, returned_chunk_ids, selected_chunk_ids, citation_snapshots, debug
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event_id,
+                        query,
+                        now_iso(),
+                        "retrieve_context",
+                        dumps(fanout_debug["fused"]),
+                        dumps([row["chunk_id"] for row in supporting_chunks]),
+                        dumps(citation_snapshots if debug else slim_citation_snapshots(citation_snapshots)),
+                        dumps(retrieval_debug) if debug else "{}",
+                    ),
+                )
+                self._record_retrieval_exposures(
+                    conn,
+                    retrieval_event_id=event_id,
+                    query=query,
+                    supporting_chunks=supporting_chunks,
+                    relevant_facts=relevant_facts,
+                    wiki_pages=wiki_pages,
+                    active_memories=memories,
+                )
         result = {
             "task": task,
             "project": project,
@@ -1782,6 +1805,7 @@ class BrainService:
         useful: bool,
         note: str | None = None,
     ) -> dict[str, Any]:
+        self._ensure_writable()
         self.init_workspace()
         normalized_type, normalized_id = normalize_lineage_target(target_type, target_id)
         event_type = "explicit_useful" if useful else "explicit_not_useful"
@@ -2265,7 +2289,7 @@ class BrainService:
         memory_type: str | None = None,
         project: str | None = None,
     ) -> list[dict[str, Any]]:
-        self.init_workspace()
+        self._ensure_workspace()
         with connection(self.paths.sqlite_path) as conn:
             query = "SELECT * FROM memories WHERE 1=1"
             params: list[Any] = []
@@ -2285,7 +2309,7 @@ class BrainService:
             return [row_to_memory(row) for row in conn.execute(query, params)]
 
     def get_memory(self, memory_id: str) -> dict[str, Any]:
-        self.init_workspace()
+        self._ensure_workspace()
         with connection(self.paths.sqlite_path) as conn:
             row = conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
         if not row:
@@ -2300,6 +2324,7 @@ class BrainService:
         sources: list[str],
         confidence: float,
     ) -> str:
+        self._ensure_writable()
         self.init_workspace()
         normalized_scope = scope.strip()
         if not valid_memory_scope(normalized_scope):
@@ -2445,6 +2470,7 @@ class BrainService:
         outcome: str,
         unresolved_issues: list[str],
     ) -> str:
+        self._ensure_writable()
         self.init_workspace()
         session_id = new_id("session")
         with connection(self.paths.sqlite_path) as conn:

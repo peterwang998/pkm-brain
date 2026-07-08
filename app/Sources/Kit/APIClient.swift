@@ -49,6 +49,18 @@ public final class BrainAPIClient: Sendable {
         try await post("/api/shutdown", payload: EmptyPayload())
     }
 
+    public func migrationPlan() async throws -> MigrationPlan {
+        try await get("/api/migration")
+    }
+
+    public func installMigrationShims() async throws -> [String: JSONValue] {
+        try await post("/api/migration/shims", payload: EmptyPayload())
+    }
+
+    public func dryRunLaunchAgentRetirement() async throws -> [String: JSONValue] {
+        try await post("/api/migration/launch-agents/retire", payload: ["dry_run": true])
+    }
+
     public func get<T: Decodable>(_ path: String) async throws -> T {
         var request = URLRequest(url: url(for: path))
         request.httpMethod = "GET"

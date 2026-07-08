@@ -95,7 +95,13 @@ public final class DaemonSupervisor: ObservableObject {
         status = .starting
         let process = Process()
         process.executableURL = brain
-        var arguments = ["daemon", "--home", homeURL.path]
+        var arguments = [
+            "daemon",
+            "--home",
+            homeURL.path,
+            "--parent-pid",
+            String(ProcessInfo.processInfo.processIdentifier),
+        ]
         if serveWeb {
             arguments.append("--serve-web")
         }

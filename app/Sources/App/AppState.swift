@@ -33,6 +33,8 @@ final class AppState: ObservableObject {
     @Published var loginItemEnabled = false
     @Published var serveWeb = false
     @Published var homePath: String
+    @Published var migrationPlan: MigrationPlan?
+    @Published var migrationActionMessage: String?
 
     let provisioner: RuntimeProvisioner
     let daemon: DaemonSupervisor
@@ -79,7 +81,19 @@ final class AppState: ObservableObject {
         }
         didStart = true
         await daemon.start(homeURL: homeURL, serveWeb: serveWeb)
+        await refreshMigrationPlan()
         await refreshDigest()
+    }
+
+    func refreshMigrationPlan() async {
+        guard let client = daemon.apiClient else {
+            return
+        }
+        do {
+            migrationPlan = try await client.migrationPlan()
+        } catch {
+            lastError = String(describing: error)
+        }
     }
 
     func refreshDigest() async {
@@ -105,6 +119,31 @@ final class AppState: ObservableObject {
 
     func resumeScheduler() async {
         await daemon.resume()
+    }
+
+    func installMigrationShims() async {
+        guard let client = daemon.apiClient else {
+            return
+        }
+        do {
+            _ = try await client.installMigrationShims()
+            migrationActionMessage = "Shims installed"
+            await refreshMigrationPlan()
+        } catch {
+            lastError = String(describing: error)
+        }
+    }
+
+    func dryRunLaunchAgentRetirement() async {
+        guard let client = daemon.apiClient else {
+            return
+        }
+        do {
+            _ = try await client.dryRunLaunchAgentRetirement()
+            migrationActionMessage = "LaunchAgent retirement dry run complete"
+        } catch {
+            lastError = String(describing: error)
+        }
     }
 
     func shutdown() async {

@@ -41,6 +41,13 @@ from .gardener import (
     deterministic_entity_candidates,
     propose_gardener_action,
 )
+from .app_migration import (
+    build_migration_plan,
+    create_runtime_backup,
+    install_runtime_shims,
+    retire_launch_agents,
+)
+from .mcp_tools import MCP_TOOL_NAMES, call_mcp_tool
 from .paths import BrainPaths
 from .scheduler.launchd import LaunchdScheduler
 from .service import BrainService, row_to_memory
@@ -149,6 +156,8 @@ class BrainUIHandler(BaseHTTPRequestHandler):
             elif path.startswith("/api/connectors/"):
                 connector_id = path.removeprefix("/api/connectors/").strip("/")
                 self.write_json(get_connector(self.server.paths, connector_id))
+            elif path == "/api/migration":
+                self.write_json(ui_migration_plan(self.server.paths, query))
             elif path == "/api/status":
                 self.write_json(ui_status(self.server.paths))
             elif path == "/api/setup":
@@ -215,6 +224,18 @@ class BrainUIHandler(BaseHTTPRequestHandler):
             parts = [part for part in path.removeprefix("/api/").split("/") if part]
             if parts == ["shutdown"]:
                 self.write_json(ui_shutdown(self.server))
+            elif len(parts) == 2 and parts[0] == "mcp":
+                payload = self.read_json_body()
+                self.write_json(ui_mcp_tool(self.server.paths, parts[1], payload))
+            elif parts == ["migration", "backup"]:
+                payload = self.read_json_body()
+                self.write_json(ui_migration_backup(self.server.paths, payload))
+            elif parts == ["migration", "shims"]:
+                payload = self.read_json_body()
+                self.write_json(ui_migration_shims(payload))
+            elif parts == ["migration", "launch-agents", "retire"]:
+                payload = self.read_json_body()
+                self.write_json(ui_migration_retire_launch_agents(payload))
             elif parts == ["scheduler", "run"]:
                 payload = self.read_json_body()
                 self.write_json(ui_scheduler_run(self.server, payload))
@@ -526,6 +547,49 @@ def ui_shutdown(server: BrainUIServer) -> dict[str, Any]:
         raise BadRequestError("shutdown is only available for brain daemon")
     threading.Thread(target=server.shutdown, name="brain-daemon-shutdown", daemon=True).start()
     return {"ok": True, "shutting_down": True}
+
+
+def ui_mcp_tool(paths: BrainPaths, tool_name: str, payload: dict[str, Any]) -> dict[str, Any] | list[Any]:
+    if tool_name not in MCP_TOOL_NAMES:
+        raise NotFoundError(f"unknown MCP tool: {tool_name}")
+    result = call_mcp_tool(service(paths), tool_name, payload)
+    if isinstance(result, (dict, list)):
+        return result
+    return {"result": result}
+
+
+def ui_migration_plan(paths: BrainPaths, query: dict[str, list[str]]) -> dict[str, Any]:
+    return build_migration_plan(
+        paths,
+        app_support_dir=path_from_query(query, "app_support_dir"),
+        launch_agents_dir=path_from_query(query, "launch_agents_dir"),
+    )
+
+
+def ui_migration_backup(paths: BrainPaths, payload: dict[str, Any]) -> dict[str, Any]:
+    return create_runtime_backup(paths, app_support_dir=path_from_payload(payload, "app_support_dir"))
+
+
+def ui_migration_shims(payload: dict[str, Any]) -> dict[str, Any]:
+    return install_runtime_shims(app_support_dir=path_from_payload(payload, "app_support_dir"))
+
+
+def ui_migration_retire_launch_agents(payload: dict[str, Any]) -> dict[str, Any]:
+    return retire_launch_agents(
+        app_support_dir=path_from_payload(payload, "app_support_dir"),
+        launch_agents_dir=path_from_payload(payload, "launch_agents_dir"),
+        dry_run=bool(payload.get("dry_run", True)),
+    )
+
+
+def path_from_payload(payload: dict[str, Any], key: str) -> Path | None:
+    value = payload.get(key)
+    return Path(str(value)).expanduser() if value else None
+
+
+def path_from_query(query: dict[str, list[str]], key: str) -> Path | None:
+    values = query.get(key) or []
+    return Path(values[0]).expanduser() if values else None
 
 
 def package_version() -> str:

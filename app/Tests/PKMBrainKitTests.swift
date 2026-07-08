@@ -32,6 +32,15 @@ struct PKMBrainKitTests {
         #expect(scheduler.jobs.first?.cadence_s == 600)
     }
 
+    @Test("migration fixture decodes")
+    func migrationFixtureDecodes() throws {
+        let plan: MigrationPlan = try decodeFixture("migration")
+
+        #expect(plan.needsMigration)
+        #expect(plan.detected_launch_agents.map(\.label).contains("com.pkm-brain.capture-secondary"))
+        #expect(plan.steps.map(\.id).contains("cli_shims"))
+    }
+
     @Test("handshake builds loopback base URL")
     func handshakeBaseURL() throws {
         let handshake = DaemonHandshake(

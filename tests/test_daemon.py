@@ -18,6 +18,7 @@ from pkm_brain.daemon import (
     SchedulerJob,
     SerialJobScheduler,
     daemon_handshake_path,
+    parent_process_missing,
     scheduler_config_path,
 )
 from pkm_brain.automation import run_nightly_maintenance
@@ -305,6 +306,19 @@ def test_daemon_nightly_summary_matches_automation_shape(tmp_path: Path) -> None
     assert row is not None
     daemon_summary = json.loads(row["summary"])
     assert summary_shape(daemon_summary) == summary_shape(direct_result.summary)
+
+
+def test_parent_process_missing_checks_ppid_and_liveness(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("pkm_brain.daemon.os.getppid", lambda: 123)
+    monkeypatch.setattr("pkm_brain.daemon.process_alive", lambda pid: True)
+    assert parent_process_missing(123) is False
+
+    monkeypatch.setattr("pkm_brain.daemon.os.getppid", lambda: 1)
+    assert parent_process_missing(123) is True
+
+    monkeypatch.setattr("pkm_brain.daemon.os.getppid", lambda: 123)
+    monkeypatch.setattr("pkm_brain.daemon.process_alive", lambda pid: False)
+    assert parent_process_missing(123) is True
 
 
 def disable_all_connectors(paths: BrainPaths) -> None:

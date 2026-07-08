@@ -90,6 +90,37 @@ public struct Digest: Codable, Equatable, Sendable {
     public let raw: [String: JSONValue]?
 }
 
+public struct MigrationPlan: Codable, Equatable, Sendable {
+    public let state: String
+    public let home: String
+    public let home_exists: Bool
+    public let app_support: String
+    public let launch_agents_dir: String
+    public let detected_launch_agents: [DetectedLaunchAgent]
+    public let rollback_script: String
+    public let shim_dir: String
+    public let steps: [MigrationStep]
+
+    public var needsMigration: Bool {
+        state == "migrate"
+    }
+}
+
+public struct DetectedLaunchAgent: Codable, Equatable, Identifiable, Sendable {
+    public let label: String
+    public let plist_path: String
+    public let role_set: String
+    public let start_interval: Int?
+
+    public var id: String { label }
+}
+
+public struct MigrationStep: Codable, Equatable, Identifiable, Sendable {
+    public let id: String
+    public let label: String
+    public let required: Bool
+}
+
 public enum DaemonStatus: Equatable, Sendable {
     case idle
     case provisioning(String)
@@ -115,4 +146,3 @@ public enum DaemonStatus: Equatable, Sendable {
         }
     }
 }
-

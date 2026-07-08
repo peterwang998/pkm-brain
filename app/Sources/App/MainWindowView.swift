@@ -13,24 +13,27 @@ struct MainWindowView: View {
             }
             .navigationSplitViewColumnWidth(min: 180, ideal: 200)
         } detail: {
-            Group {
-                switch appState.selectedDestination {
-                case .today:
-                    TodayView()
-                case .queue:
-                    PlaceholderView(title: "Queue", systemImage: "tray.full")
-                case .wiki:
-                    PlaceholderView(title: "Wiki", systemImage: "doc.text")
-                case .entities:
-                    PlaceholderView(title: "Entities", systemImage: "person.2")
-                case .ask:
-                    PlaceholderView(title: "Ask", systemImage: "text.magnifyingglass")
-                case .ops:
-                    OpsPreviewView()
+            VStack(spacing: 0) {
+                MigrationAssistantView()
+                Group {
+                    switch appState.selectedDestination {
+                    case .today:
+                        TodayView()
+                    case .queue:
+                        PlaceholderView(title: "Queue", systemImage: "tray.full")
+                    case .wiki:
+                        PlaceholderView(title: "Wiki", systemImage: "doc.text")
+                    case .entities:
+                        PlaceholderView(title: "Entities", systemImage: "person.2")
+                    case .ask:
+                        PlaceholderView(title: "Ask", systemImage: "text.magnifyingglass")
+                    case .ops:
+                        OpsPreviewView()
+                    }
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .frame(minWidth: 760, minHeight: 520)
         }
     }
 }
-

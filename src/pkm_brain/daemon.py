@@ -374,6 +374,7 @@ class BrainDaemon:
     paths: BrainPaths
     port: int = 0
     serve_web: bool = False
+    parent_pid: int | None = None
     scheduler_tick_seconds: float = DEFAULT_SCHEDULER_TICK_SECONDS
     start_scheduler: bool = True
     host: str = "127.0.0.1"
@@ -385,6 +386,8 @@ class BrainDaemon:
         self.server: BrainUIServer | None = None
         self.scheduler: SerialJobScheduler | None = None
         self._lock_file: Any | None = None
+        self._parent_monitor_stop = threading.Event()
+        self._parent_monitor_thread: threading.Thread | None = None
 
     def start(self) -> None:
         BrainService(self.paths).init_workspace()
@@ -413,6 +416,7 @@ class BrainDaemon:
         }
         atomic_write_private_json(daemon_handshake_path(self.paths), payload)
         self._log({"event": "daemon_started", "port": int(actual_port), "serve_web": self.serve_web})
+        self._start_parent_monitor()
         if self.start_scheduler:
             self.scheduler.start()
 
@@ -425,6 +429,9 @@ class BrainDaemon:
             self.close()
 
     def close(self) -> None:
+        self._parent_monitor_stop.set()
+        if self._parent_monitor_thread and self._parent_monitor_thread is not threading.current_thread():
+            self._parent_monitor_thread.join(timeout=1)
         if self.scheduler:
             self.scheduler.stop()
         if self.server:
@@ -462,8 +469,31 @@ class BrainDaemon:
         if payload.get("pid") in {None, os.getpid()}:
             path.unlink(missing_ok=True)
 
+    def _start_parent_monitor(self) -> None:
+        if not self.parent_pid or self.parent_pid <= 1:
+            return
+        self._parent_monitor_thread = threading.Thread(
+            target=self._parent_monitor_loop,
+            name="brain-daemon-parent-monitor",
+            daemon=True,
+        )
+        self._parent_monitor_thread.start()
+
+    def _parent_monitor_loop(self) -> None:
+        assert self.parent_pid is not None
+        while not self._parent_monitor_stop.wait(1.0):
+            if parent_process_missing(self.parent_pid):
+                self._log({"event": "daemon_parent_missing", "parent_pid": self.parent_pid})
+                if self.server:
+                    self.server.shutdown()
+                return
+
     def _log(self, payload: dict[str, Any]) -> None:
         self.paths.logs.mkdir(parents=True, exist_ok=True)
         row = {"at": now_iso(), **payload}
         with (self.paths.logs / "daemon.log").open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def parent_process_missing(parent_pid: int) -> bool:
+    return os.getppid() != parent_pid or not process_alive(parent_pid)

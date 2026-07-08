@@ -119,7 +119,13 @@ The MCP server exposes a compact agent-facing surface:
 - `record_context_feedback(target_type, target_id, useful, note)`
 - `write_agent_session(summary, files_touched, commands_run, outcome, unresolved_issues)`
 
-Run it with:
+After the macOS app migration, register agents against the app-managed shim:
+
+```bash
+~/Library/Application\ Support/PKM\ Brain/bin/brain-mcp --home ~/brain
+```
+
+For repo development, run the direct DB server with:
 
 ```bash
 uv run brain mcp --home ~/brain

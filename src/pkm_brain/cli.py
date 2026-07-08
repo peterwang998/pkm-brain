@@ -26,6 +26,12 @@ from .automation import (
     run_nightly_maintenance,
     run_secondary_tick,
 )
+from .app_migration import (
+    build_migration_plan,
+    create_runtime_backup,
+    install_runtime_shims,
+    retire_launch_agents,
+)
 from .daemon import BrainDaemon, daemon_handshake_path, package_version
 from .connectors import (
     connector_ids_for_agent,
@@ -80,6 +86,7 @@ launch_agent_app = typer.Typer(help="macOS LaunchAgent commands.")
 sync_app = typer.Typer(help="Primary/Secondary sync commands.")
 scheduler_app = typer.Typer(help="Logical scheduler commands.")
 maintenance_app = typer.Typer(help="Runtime maintenance commands.")
+app_migration_app = typer.Typer(help="macOS app migration commands.")
 app.add_typer(inspect_app, name="inspect")
 app.add_typer(index_app, name="index")
 app.add_typer(db_app, name="db")
@@ -98,6 +105,7 @@ app.add_typer(launch_agent_app, name="launch-agent")
 app.add_typer(sync_app, name="sync")
 app.add_typer(scheduler_app, name="scheduler")
 app.add_typer(maintenance_app, name="maintenance")
+app.add_typer(app_migration_app, name="app-migration")
 console = Console()
 
 
@@ -108,6 +116,14 @@ def main(
     if version:
         console.print(package_version())
         raise typer.Exit()
+
+
+@launch_agent_app.callback()
+def launch_agent_deprecation() -> None:
+    Console(stderr=True).print(
+        "brain launch-agent is retained for rollback/dev use; migrated installs should use PKM Brain.app scheduling.",
+        style="yellow",
+    )
 
 
 def service(home: Optional[Path] = None) -> BrainService:
@@ -275,10 +291,11 @@ def ui_startup_lines(host: str, port: int, token: str) -> list[str]:
 def daemon(
     port: int = typer.Option(0, "--port", help="Loopback port; 0 chooses an ephemeral port."),
     serve_web: bool = typer.Option(False, "--serve-web", help="Serve the static browser UI in addition to JSON API."),
+    parent_pid: Optional[int] = typer.Option(None, "--parent-pid", help="Exit when this supervising parent PID disappears."),
     home: Optional[Path] = typer.Option(None, help="Brain home directory."),
 ) -> None:
     paths = BrainPaths.from_value(home)
-    runtime = BrainDaemon(paths, port=port, serve_web=serve_web)
+    runtime = BrainDaemon(paths, port=port, serve_web=serve_web, parent_pid=parent_pid)
     try:
         runtime.start()
     except RuntimeError as exc:
@@ -1379,7 +1396,61 @@ def sync_acceptance(
 
 @app.command()
 def mcp(home: Optional[Path] = typer.Option(None)) -> None:
+    paths = BrainPaths.from_value(home)
+    if daemon_handshake_path(paths).exists():
+        Console(stderr=True).print(
+            "brain mcp is the development direct-DB server; migrated agents should use the brain-mcp shim.",
+            style="yellow",
+        )
     create_mcp(str(home) if home else None).run()
+
+
+@app_migration_app.command("plan")
+def app_migration_plan(
+    home: Optional[Path] = typer.Option(None),
+    app_support_dir: Optional[Path] = typer.Option(None, "--app-support-dir"),
+    launch_agents_dir: Optional[Path] = typer.Option(None, "--launch-agents-dir"),
+) -> None:
+    result = build_migration_plan(
+        BrainPaths.from_value(home),
+        app_support_dir=app_support_dir,
+        launch_agents_dir=launch_agents_dir,
+    )
+    console.print_json(json.dumps(result))
+
+
+@app_migration_app.command("backup-runtime")
+def app_migration_backup_runtime(
+    home: Optional[Path] = typer.Option(None),
+    app_support_dir: Optional[Path] = typer.Option(None, "--app-support-dir"),
+) -> None:
+    result = create_runtime_backup(
+        BrainPaths.from_value(home),
+        app_support_dir=app_support_dir,
+    )
+    console.print_json(json.dumps(result))
+
+
+@app_migration_app.command("install-shims")
+def app_migration_install_shims(
+    app_support_dir: Optional[Path] = typer.Option(None, "--app-support-dir"),
+) -> None:
+    result = install_runtime_shims(app_support_dir=app_support_dir)
+    console.print_json(json.dumps(result))
+
+
+@app_migration_app.command("retire-launch-agents")
+def app_migration_retire_launch_agents(
+    app_support_dir: Optional[Path] = typer.Option(None, "--app-support-dir"),
+    launch_agents_dir: Optional[Path] = typer.Option(None, "--launch-agents-dir"),
+    commit: bool = typer.Option(False, "--commit", help="Actually bootout and move detected legacy plists."),
+) -> None:
+    result = retire_launch_agents(
+        app_support_dir=app_support_dir,
+        launch_agents_dir=launch_agents_dir,
+        dry_run=not commit,
+    )
+    console.print_json(json.dumps(result))
 
 
 @capture_app.command("agents")

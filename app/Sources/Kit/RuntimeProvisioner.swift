@@ -90,8 +90,10 @@ public final class RuntimeProvisioner: ObservableObject {
         }
         let requirementsData = try Data(contentsOf: requirements)
         let lockHash = SHA256.hash(data: requirementsData).map { String(format: "%02x", $0) }.joined().prefix(8)
+        let wheelData = try Data(contentsOf: wheel)
+        let wheelHash = SHA256.hash(data: wheelData).map { String(format: "%02x", $0) }.joined().prefix(8)
         let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
-        let id = "\(version)-\(lockHash)"
+        let id = "\(version)-\(lockHash)-\(wheelHash)"
         let python = try String(contentsOf: pythonVersion, encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return BundledRuntimeSeed(
