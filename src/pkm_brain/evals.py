@@ -908,7 +908,7 @@ def retrieval_result_source_ids(paths: BrainPaths, result: dict[str, Any]) -> se
         for span in fact.get("source_spans") or []:
             if isinstance(span, dict) and span.get("chunk_id"):
                 chunk_ids.add(str(span["chunk_id"]))
-    for snapshot in result.get("citation_snapshots") or result.get("citations") or []:
+    for snapshot in result.get("citation_snapshots") or []:
         if not isinstance(snapshot, dict):
             continue
         document_id = str(snapshot.get("document_id") or "")

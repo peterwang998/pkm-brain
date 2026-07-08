@@ -178,6 +178,14 @@ RECENCY_MAX_BOOST = 2.0
 RECENCY_HALF_LIFE_DAYS = 30.0
 LINEAGE_HALF_LIFE_DAYS = 90.0
 LINEAGE_MAX_ABS_BOOST = 2.0
+CONTEXT_PACKET_MAX_BYTES = {
+    "compact": 16_000,
+    "default": 32_000,
+    "broad": 48_000,
+    "inspect": 96_000,
+}
+NON_DEBUG_CITATION_LIMIT = 8
+NON_DEBUG_CITATION_TEXT_CHARS = 320
 SEARCH_RESULT_SCORE_FLOOR = 12.0
 CONTEXT_CHUNK_SCORE_FLOOR = 12.0
 WIKI_PAGE_SCORE_FLOOR = 12.0
@@ -1464,7 +1472,6 @@ class BrainService:
             "retrieval_reasons": assessment["reasons"],
             "results": selected,
             "relevant_wiki_pages": wiki_pages,
-            "citations": citation_snapshots,
             "citation_snapshots": citation_snapshots,
             "debug": search_debug if debug else None,
         }
@@ -1566,7 +1573,6 @@ class BrainService:
             "relevant_wiki_pages": wiki_pages,
             "relevant_facts": relevant_facts,
             "supporting_chunks": supporting_chunks,
-            "citations": citation_snapshots,
             "citation_snapshots": citation_snapshots,
             "open_questions": open_questions,
             "omitted_due_to_budget": [
@@ -1592,6 +1598,8 @@ class BrainService:
                 "include_full_text": policy.include_full_text,
             }
             result["retrieval_debug"] = retrieval_debug
+        else:
+            result = slim_retrieve_context_packet(result, policy)
         return result
 
     def relevant_open_questions(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
@@ -2836,6 +2844,218 @@ def relevant_memories_for_query(
         scored.append(row)
     scored.sort(key=lambda row: (-int(row.get("memory_relevance_score") or 0), -float(row.get("confidence") or 0.0), row.get("id") or ""))
     return scored[:limit]
+
+
+def slim_retrieve_context_packet(result: dict[str, Any], policy: RetrievalPolicy) -> dict[str, Any]:
+    packet = dict(result)
+    packet["retrieval_reasons"] = list(packet.get("retrieval_reasons") or [])[:5]
+    packet["active_memories"] = [slim_memory_for_context(row) for row in packet.get("active_memories") or []]
+    packet["candidate_memories"] = [slim_memory_for_context(row) for row in packet.get("candidate_memories") or []]
+    packet["relevant_wiki_pages"] = [slim_wiki_page_for_context(row) for row in packet.get("relevant_wiki_pages") or []]
+    packet["relevant_facts"] = [slim_fact_for_context(row) for row in packet.get("relevant_facts") or []]
+    packet["supporting_chunks"] = [slim_chunk_for_context(row) for row in packet.get("supporting_chunks") or []]
+    packet["open_questions"] = [slim_open_question_for_context(row) for row in packet.get("open_questions") or []]
+    packet["citation_snapshots"] = slim_citation_snapshots(packet.get("citation_snapshots") or [])
+    return trim_context_packet_to_serialized_limit(packet, policy)
+
+
+def slim_memory_for_context(memory: dict[str, Any]) -> dict[str, Any]:
+    return keep_present(
+        {
+            "id": memory.get("id"),
+            "memory_type": memory.get("memory_type"),
+            "scope": memory.get("scope"),
+            "content": truncate_for_packet(str(memory.get("content") or ""), 1200),
+            "confidence": memory.get("confidence"),
+            "source_ids": list(memory.get("source_ids") or [])[:3],
+            "status": memory.get("status"),
+            "created_at": memory.get("created_at"),
+            "updated_at": memory.get("updated_at"),
+            "reviewed_at": memory.get("reviewed_at"),
+            "memory_relevance_score": memory.get("memory_relevance_score"),
+        }
+    )
+
+
+def slim_wiki_page_for_context(page: dict[str, Any]) -> dict[str, Any]:
+    return keep_present(
+        {
+            "title": page.get("title"),
+            "page_type": page.get("page_type"),
+            "path": page.get("path"),
+            "relative_path": page.get("relative_path"),
+            "source_ids": list(page.get("source_ids") or [])[:3],
+            "source_count": page.get("source_count"),
+            "summary": truncate_for_packet(str(page.get("summary") or ""), 800),
+            "score": page.get("score"),
+            "managed": page.get("managed"),
+        }
+    )
+
+
+def slim_fact_for_context(fact: dict[str, Any]) -> dict[str, Any]:
+    output = keep_present(
+        {
+            "id": fact.get("id"),
+            "statement": fact.get("statement"),
+            "entity_key": fact.get("entity_key"),
+            "page_hint": fact.get("page_hint"),
+            "section_hint": fact.get("section_hint"),
+            "source_ids": list(fact.get("source_ids") or [])[:3],
+            "observed_at": fact.get("observed_at"),
+            "confidence": fact.get("confidence"),
+            "source_spans": fact.get("source_spans"),
+            "evidence_quote": truncate_for_packet(str(fact.get("evidence_quote") or ""), 1200),
+            "extraction_method": fact.get("extraction_method"),
+            "extractor_model": fact.get("extractor_model"),
+            "truth_confidence": fact.get("truth_confidence"),
+            "status": fact.get("status"),
+            "retrieval_score": fact.get("retrieval_score"),
+            "authoritative": fact.get("authoritative"),
+            "contested": fact.get("contested"),
+            "conflict_group_id": fact.get("conflict_group_id"),
+        }
+    )
+    contested = fact.get("contested_facts")
+    if isinstance(contested, list):
+        output["contested_facts"] = [slim_fact_for_context(row) for row in contested[:3] if isinstance(row, dict)]
+    return output
+
+
+def slim_chunk_for_context(chunk: dict[str, Any]) -> dict[str, Any]:
+    return keep_present(
+        {
+            "chunk_id": chunk.get("chunk_id"),
+            "document_id": chunk.get("document_id"),
+            "origin_node_id": chunk.get("origin_node_id"),
+            "logical_source_key": chunk.get("logical_source_key"),
+            "source_type": chunk.get("source_type"),
+            "title": chunk.get("title"),
+            "heading_path": chunk.get("heading_path"),
+            "text": chunk.get("text"),
+            "retrieval_score": chunk.get("retrieval_score"),
+            "score": chunk.get("retrieval_score"),
+            "raw_context": chunk.get("raw_context"),
+            "original_token_count": chunk.get("original_token_count"),
+            "returned_token_count": chunk.get("returned_token_count"),
+            "omitted_tokens": chunk.get("omitted_tokens"),
+            "excerpted": chunk.get("excerpted"),
+            "retrieval_mode": chunk.get("retrieval_mode"),
+            "source_token_cap": chunk.get("source_token_cap"),
+        }
+    )
+
+
+def slim_open_question_for_context(question: dict[str, Any]) -> dict[str, Any]:
+    output = {
+        key: question.get(key)
+        for key in [
+            "id",
+            "kind",
+            "entity_key",
+            "page_hint",
+            "fact_ids",
+            "question",
+            "status",
+            "risk_tier",
+            "created_at",
+            "answered_at",
+        ]
+    }
+    options = question.get("options")
+    if isinstance(options, list):
+        output["options"] = options[:3]
+    return keep_present(output)
+
+
+def slim_citation_snapshots(snapshots: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    slimmed: list[dict[str, Any]] = []
+    for snapshot in snapshots[:NON_DEBUG_CITATION_LIMIT]:
+        if not isinstance(snapshot, dict):
+            continue
+        entry = dict(snapshot)
+        if "text" in entry:
+            entry["text"] = truncate_for_packet(str(entry.get("text") or ""), NON_DEBUG_CITATION_TEXT_CHARS)
+        if isinstance(entry.get("source_ids"), list):
+            entry["source_ids"] = entry["source_ids"][:3]
+        slimmed.append(keep_present(entry))
+    return slimmed
+
+
+def trim_context_packet_to_serialized_limit(packet: dict[str, Any], policy: RetrievalPolicy) -> dict[str, Any]:
+    limit = CONTEXT_PACKET_MAX_BYTES.get(policy.mode, CONTEXT_PACKET_MAX_BYTES["default"])
+    if serialized_packet_size(packet) <= limit:
+        return packet
+
+    packet["citation_snapshots"] = []
+    if serialized_packet_size(packet) <= limit:
+        return packet
+
+    for key in [
+        "supporting_chunks",
+        "relevant_wiki_pages",
+        "candidate_memories",
+        "active_memories",
+        "relevant_facts",
+        "open_questions",
+    ]:
+        while serialized_packet_size(packet) > limit and len(packet.get(key) or []) > 1:
+            packet[key].pop()
+        if serialized_packet_size(packet) <= limit:
+            return packet
+
+    for token_limit in [900, 600, 350, 180]:
+        for chunk in packet.get("supporting_chunks") or []:
+            text = str(chunk.get("text") or "")
+            if estimate_tokens(text) > token_limit:
+                chunk["text"] = trim_to_token_budget(text, token_limit)
+                chunk["returned_token_count"] = estimate_tokens(chunk["text"])
+                original = int(chunk.get("original_token_count") or chunk["returned_token_count"])
+                chunk["omitted_tokens"] = max(0, original - int(chunk["returned_token_count"]))
+                chunk["excerpted"] = chunk["omitted_tokens"] > 0
+        if serialized_packet_size(packet) <= limit:
+            return packet
+
+    for char_limit in [800, 400, 200]:
+        trim_packet_strings(packet, char_limit)
+        if serialized_packet_size(packet) <= limit:
+            return packet
+
+    return packet
+
+
+def serialized_packet_size(packet: dict[str, Any]) -> int:
+    return len(dumps(packet).encode("utf-8"))
+
+
+def keep_present(values: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in values.items() if value is not None}
+
+
+def truncate_for_packet(value: str, max_chars: int) -> str:
+    if len(value) <= max_chars:
+        return value
+    if max_chars <= 16:
+        return value[:max_chars]
+    return value[: max_chars - 15].rstrip() + " ... [truncated]"
+
+
+def trim_packet_strings(value: Any, max_chars: int) -> None:
+    if isinstance(value, dict):
+        for key, child in list(value.items()):
+            if isinstance(child, str) and key in {
+                "content",
+                "evidence_quote",
+                "question",
+                "summary",
+                "text",
+            }:
+                value[key] = truncate_for_packet(child, max_chars)
+            else:
+                trim_packet_strings(child, max_chars)
+    elif isinstance(value, list):
+        for child in value:
+            trim_packet_strings(child, max_chars)
 
 
 def retrieval_assessment(

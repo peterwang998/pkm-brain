@@ -20,7 +20,7 @@ The agent-facing retrieval path needs to express uncertainty, prefer curated pag
 ## Non-Goals
 
 - Do not change the fact compiler or conflict-resolution model in this slice.
-- Do not remove existing response keys such as `citations` and `citation_snapshots`; callers still rely on them.
+- Keep `citation_snapshots` as the canonical provenance field; the old duplicate `citations` alias is retired.
 - Do not require MCP callers to know about forked data paths. The server still chooses its `BrainPaths` at startup.
 
 ## Response Contract

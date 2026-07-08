@@ -16,14 +16,8 @@ def create_mcp(home: str | None = None):
         return service.search(query, limit=limit, caller="mcp")
 
     @mcp.tool()
-    def retrieve_context(
-        task: str,
-        project: str | None = None,
-        budget: int | None = None,
-        mode: str = "default",
-        debug: bool = False,
-    ) -> dict:
-        return service.retrieve_context(task=task, project=project, budget=budget, mode=mode, debug=debug)
+    def retrieve_context(task: str, project: str | None = None) -> dict:
+        return service.retrieve_context(task=task, project=project)
 
     @mcp.tool()
     def record_context_feedback(

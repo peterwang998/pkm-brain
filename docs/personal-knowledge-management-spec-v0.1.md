@@ -666,7 +666,6 @@ budget
 retrieval_mode
 supporting_chunks
 citation_snapshots
-citations                  # alias of citation_snapshots for back-compat
 active_memories
 candidate_memories
 relevant_wiki_pages
@@ -675,7 +674,7 @@ omitted_due_to_budget
 retrieval_event_id
 ```
 
-Debug mode additionally returns `retrieval_policy` and `retrieval_debug`. The previously named fields `selected_chunks`, `source_citations`, `related_wiki_pages`, and `confidence_notes` have been renamed or replaced by the fields above; consumers should treat the field names listed here as canonical.
+Non-debug packets are serialized-size bounded and omit bulky diagnostics. Debug mode additionally returns `retrieval_policy`, `retrieval_debug`, and full per-item ranking metadata. The previously named fields `selected_chunks`, `source_citations`, `related_wiki_pages`, and `confidence_notes` have been renamed or replaced by the fields above; consumers should treat the field names listed here as canonical.
 
 `active_memories` are reviewed and trusted. `candidate_memories` are proposed, unreviewed hypotheses surfaced separately for awareness; agents must not treat them as authoritative operational instructions.
 
@@ -1882,7 +1881,7 @@ Operability:
 
 ### 21.4 Spec Drift Notes
 
-- The retrieval context packet field names returned by `service.retrieve_context` were originally specified as `selected_chunks`, `source_citations`, `related_wiki_pages`, and `confidence_notes`. The implementation uses `supporting_chunks`, `citation_snapshots` (with `citations` as a back-compat alias), and `relevant_wiki_pages`. Section 10 has been updated to match.
+- The retrieval context packet field names returned by `service.retrieve_context` were originally specified as `selected_chunks`, `source_citations`, `related_wiki_pages`, and `confidence_notes`. The implementation uses `supporting_chunks`, `citation_snapshots`, and `relevant_wiki_pages`; the old duplicate `citations` alias has been retired. Section 10 has been updated to match.
 - The MCP `retrieve_context` signature in the spec previously included a `repo` parameter. The implementation accepts only `task` and `project`. Section 15 has been updated. Per-call `budget` and `mode` knobs are CLI-only by design to keep MCP payloads compact.
 - The `documents` table schema in Section 7 has been expanded to match the live schema (`raw_path`, `origin_node_id`, `logical_source_key`, `version`). These columns are required to support Primary/Secondary sync.
 - The Web UI is built on stdlib `http.server` rather than FastAPI; this is an intentional V1 dependency tradeoff also noted in the sync spec.

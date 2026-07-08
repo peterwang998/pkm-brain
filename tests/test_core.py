@@ -72,7 +72,8 @@ def test_ingest_markdown_chunks_and_searches(tmp_path: Path) -> None:
     assert stored_snapshots[0]["type"] == "chunk"
     context = svc.retrieve_context("explain sqlite metadata", project="pkm-system")
     assert context["supporting_chunks"]
-    assert context["citations"] == context["citation_snapshots"]
+    assert "citations" not in search
+    assert "citations" not in context
     assert context["citation_snapshots"][0]["type"] == "chunk"
 
 
@@ -121,7 +122,7 @@ def test_retrieve_context_returns_query_relevant_open_questions(tmp_path: Path) 
             ),
         )
 
-    context = svc.retrieve_context("CloudZero dashboard sharing status")
+    context = svc.retrieve_context("CloudZero dashboard sharing status", debug=True)
 
     assert [question["id"] for question in context["open_questions"]] == [
         "question_cloudzero"
@@ -1290,6 +1291,12 @@ def test_retrieve_context_compacts_noisy_agent_logs_with_hard_budget(tmp_path: P
     assert "session_meta" not in chunk["text"].lower()
     assert sum(row["returned_token_count"] for row in context["supporting_chunks"]) <= context["budget"]
 
+    public_context = svc.retrieve_context("agent retrieval policy hard budget compact noisy logs")
+    assert len(json.dumps(public_context, sort_keys=True)) <= 32_000
+    assert "citations" not in public_context
+    assert "selection_reasons" not in public_context["supporting_chunks"][0]
+    assert len(public_context["citation_snapshots"]) <= 8
+
 
 def test_retrieve_context_explicit_budget_caps_first_selected_chunk(tmp_path: Path) -> None:
     svc = service_for(tmp_path)
@@ -1368,7 +1375,7 @@ def test_retrieve_context_latest_query_boosts_recent_documents(tmp_path: Path) -
             ("2026-05-18T00:00:00+00:00", "2026-05-18T00:00:00+00:00", str(new_note)),
         )
 
-    context = svc.retrieve_context("latest retrieval policy shared marker")
+    context = svc.retrieve_context("latest retrieval policy shared marker", debug=True)
 
     assert "new-only" in context["supporting_chunks"][0]["text"]
     assert any("recency intent boost" in reason for reason in context["supporting_chunks"][0]["selection_reasons"])
