@@ -17,6 +17,13 @@ import yaml
 from .audit import audit_memories
 from .automation import index_status
 from .contracts import active_page_contracts, generate_initial_contracts
+from .connectors import (
+    get_connector,
+    list_connectors,
+    run_connector_capture,
+    set_connector_enabled,
+    update_connector_settings,
+)
 from .cos_actions import (
     apply_action,
     decide_action,
@@ -109,6 +116,19 @@ class BrainUIHandler(BaseHTTPRequestHandler):
             return
         self.dispatch_post(parsed.path)
 
+    def do_PUT(self) -> None:
+        parsed = urlparse(self.path)
+        if not parsed.path.startswith("/api/"):
+            self.write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
+            return
+        if not self.authorized():
+            self.write_json(
+                {"error": "missing or invalid bearer token"},
+                status=HTTPStatus.UNAUTHORIZED,
+            )
+            return
+        self.dispatch_put(parsed.path)
+
     def log_message(self, format: str, *args: Any) -> None:
         return
 
@@ -124,6 +144,11 @@ class BrainUIHandler(BaseHTTPRequestHandler):
                 self.write_json(ui_version(self.server))
             elif path == "/api/scheduler":
                 self.write_json(ui_scheduler(self.server))
+            elif path == "/api/connectors":
+                self.write_json(list_connectors(self.server.paths))
+            elif path.startswith("/api/connectors/"):
+                connector_id = path.removeprefix("/api/connectors/").strip("/")
+                self.write_json(get_connector(self.server.paths, connector_id))
             elif path == "/api/status":
                 self.write_json(ui_status(self.server.paths))
             elif path == "/api/setup":
@@ -206,6 +231,23 @@ class BrainUIHandler(BaseHTTPRequestHandler):
                         enabled=parts[3] == "enable",
                     )
                 )
+            elif len(parts) == 3 and parts[0] == "connectors" and parts[2] in {"enable", "disable"}:
+                self.write_json(
+                    set_connector_enabled(
+                        self.server.paths,
+                        parts[1],
+                        enabled=parts[2] == "enable",
+                    )
+                )
+            elif len(parts) == 3 and parts[0] == "connectors" and parts[2] == "run":
+                self.write_json(
+                    run_connector_capture(
+                        self.server.paths,
+                        connector_ids=[parts[1]],
+                        respect_enabled=False,
+                        respect_cadence=False,
+                    ).as_dict()
+                )
             elif parts == ["retrieve"]:
                 payload = self.read_json_body()
                 self.write_json(ui_retrieve(self.server.paths, payload))
@@ -269,6 +311,26 @@ class BrainUIHandler(BaseHTTPRequestHandler):
                     self.write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
             else:
                 self.write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
+        except BadRequestError as exc:
+            self.write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+        except NotFoundError as exc:
+            self.write_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+        except ValueError as exc:
+            self.write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+        except Exception as exc:
+            self.write_json(
+                {"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR
+            )
+
+    def dispatch_put(self, path: str) -> None:
+        try:
+            parts = [part for part in path.removeprefix("/api/").split("/") if part]
+            if len(parts) == 3 and parts[0] == "connectors" and parts[2] == "settings":
+                payload = self.read_json_body()
+                settings = payload.get("settings") if isinstance(payload.get("settings"), dict) else payload
+                self.write_json(update_connector_settings(self.server.paths, parts[1], settings))
+                return
+            self.write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
         except BadRequestError as exc:
             self.write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
         except NotFoundError as exc:

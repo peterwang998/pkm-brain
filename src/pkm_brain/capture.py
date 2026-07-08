@@ -85,6 +85,16 @@ class CaptureResult:
     def as_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
 
+    def merge(self, other: "CaptureResult") -> None:
+        self.discovered += other.discovered
+        self.captured += other.captured
+        self.skipped += other.skipped
+        self.exported += other.exported
+        self.errors.extend(other.errors)
+        self.warnings.extend(other.warnings)
+        self.artifacts.extend(other.artifacts)
+        self.outbox_artifacts.extend(other.outbox_artifacts)
+
 
 class AgentLogAdapter(Protocol):
     agent: str
@@ -134,31 +144,30 @@ class AgentLogCapture:
             except Exception as exc:
                 result.errors.append(f"{adapter.agent}: {exc}")
                 continue
-            result.discovered += len(sessions)
-            for session in sessions:
-                result.warnings.extend(session.warnings)
-                output = self.paths.inbox / session.output_group / session.agent / f"{slugify(session.session_id)}.md"
-                if self._is_unchanged(session):
-                    result.skipped += 1
-                    if export_outbox and not dry_run and output.exists():
-                        try:
-                            export = export_capture_to_outbox(self.paths, session, output)
-                            if export.exported:
-                                result.exported += 1
-                            result.outbox_artifacts.append(str(export.path))
-                        except Exception as exc:
-                            result.errors.append(f"{session.agent}:{session.session_id}: outbox export failed: {exc}")
-                    continue
-                if dry_run:
-                    result.captured += 1
-                    result.artifacts.append(str(output))
-                    continue
-                output.parent.mkdir(parents=True, exist_ok=True)
-                write_text_atomic(output, session.markdown)
-                self._record_capture(session, output, "captured", None)
-                result.captured += 1
-                result.artifacts.append(str(output))
-                if export_outbox:
+            result.merge(
+                self.capture_sessions(
+                    sessions,
+                    dry_run=dry_run,
+                    export_outbox=export_outbox,
+                )
+            )
+        return result
+
+    def capture_sessions(
+        self,
+        sessions: list[AgentSessionCapture],
+        *,
+        dry_run: bool = False,
+        export_outbox: bool = False,
+    ) -> CaptureResult:
+        self.paths.inbox.mkdir(parents=True, exist_ok=True)
+        result = CaptureResult(discovered=len(sessions))
+        for session in sessions:
+            result.warnings.extend(session.warnings)
+            output = self.paths.inbox / session.output_group / session.agent / f"{slugify(session.session_id)}.md"
+            if self._is_unchanged(session):
+                result.skipped += 1
+                if export_outbox and not dry_run and output.exists():
                     try:
                         export = export_capture_to_outbox(self.paths, session, output)
                         if export.exported:
@@ -166,6 +175,24 @@ class AgentLogCapture:
                         result.outbox_artifacts.append(str(export.path))
                     except Exception as exc:
                         result.errors.append(f"{session.agent}:{session.session_id}: outbox export failed: {exc}")
+                continue
+            if dry_run:
+                result.captured += 1
+                result.artifacts.append(str(output))
+                continue
+            output.parent.mkdir(parents=True, exist_ok=True)
+            write_text_atomic(output, session.markdown)
+            self._record_capture(session, output, "captured", None)
+            result.captured += 1
+            result.artifacts.append(str(output))
+            if export_outbox:
+                try:
+                    export = export_capture_to_outbox(self.paths, session, output)
+                    if export.exported:
+                        result.exported += 1
+                    result.outbox_artifacts.append(str(export.path))
+                except Exception as exc:
+                    result.errors.append(f"{session.agent}:{session.session_id}: outbox export failed: {exc}")
         return result
 
     def _is_unchanged(self, session: AgentSessionCapture) -> bool:

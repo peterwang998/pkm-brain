@@ -14,7 +14,11 @@ from pathlib import Path
 from typing import Any
 
 from .audit import audit_memories, provenance_check
-from .capture import AgentLogCapture
+from .connectors import (
+    connector_ids_for_agent,
+    run_connector_capture,
+    runtime_settings,
+)
 from .cos_audit import run_sampled_audit
 from .db import connection, dumps
 from .extraction import extract_recent_documents
@@ -122,18 +126,24 @@ def run_agent_log_ingest(
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return AutomationResult(now_iso(), {}, None, skipped=True, reason="another run is already active")
-        capture_result = AgentLogCapture(
+        connector_ids = connector_ids_for_agent(agent, include_hyprnote=include_hyprnote)
+        explicit_agent = agent != "all"
+        capture_result = run_connector_capture(
             paths,
-            codex_state=codex_state,
-            claude_projects=claude_projects,
-            opencode_db=opencode_db,
-            hyprnote_root=hyprnote_root,
-            include_hyprnote=include_hyprnote,
-        ).capture(agent=agent)
+            connector_ids=connector_ids,
+            respect_enabled=not explicit_agent,
+            respect_cadence=not explicit_agent,
+            settings_overrides=runtime_settings(
+                codex_state=codex_state,
+                claude_projects=claude_projects,
+                opencode_db=opencode_db,
+                hyprnote_root=hyprnote_root,
+            ),
+        )
         ingest_result = service.ingest()
         return AutomationResult(
             started_at=now_iso(),
-            capture=capture_result.__dict__,
+            capture=capture_result.as_dict(),
             ingest=ingest_result.__dict__,
         )
 
@@ -156,19 +166,26 @@ def run_secondary_tick(
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return SecondaryTickResult(now_iso(), {}, None, None, skipped=True, reason="another secondary tick is already active")
-        capture_result = AgentLogCapture(
+        connector_ids = connector_ids_for_agent(agent, include_hyprnote=include_hyprnote)
+        explicit_agent = agent != "all"
+        capture_result = run_connector_capture(
             paths,
-            codex_state=codex_state,
-            claude_projects=claude_projects,
-            opencode_db=opencode_db,
-            hyprnote_root=hyprnote_root,
-            include_hyprnote=include_hyprnote,
-        ).capture(agent=agent, export_outbox=True)
+            connector_ids=connector_ids,
+            respect_enabled=not explicit_agent,
+            respect_cadence=not explicit_agent,
+            export_outbox=True,
+            settings_overrides=runtime_settings(
+                codex_state=codex_state,
+                claude_projects=claude_projects,
+                opencode_db=opencode_db,
+                hyprnote_root=hyprnote_root,
+            ),
+        )
         ingest_result = service.ingest()
         status = index_status(paths, service)
         return SecondaryTickResult(
             started_at=now_iso(),
-            capture=capture_result.__dict__,
+            capture=capture_result.as_dict(),
             ingest=ingest_result.__dict__,
             index_status=status,
         )
@@ -246,15 +263,21 @@ def run_nightly_maintenance(
         error: str | None = None
         try:
             cos_role = cos_role_status(paths)
-            capture_result = AgentLogCapture(
+            connector_ids = connector_ids_for_agent(agent, include_hyprnote=include_hyprnote)
+            explicit_agent = agent != "all"
+            capture_result = run_connector_capture(
                 paths,
-                codex_state=codex_state,
-                claude_projects=claude_projects,
-                opencode_db=opencode_db,
-                hyprnote_root=hyprnote_root,
-                include_hyprnote=include_hyprnote,
-            ).capture(agent=agent)
-            summary["capture"] = capture_result.__dict__
+                connector_ids=connector_ids,
+                respect_enabled=not explicit_agent,
+                respect_cadence=not explicit_agent,
+                settings_overrides=runtime_settings(
+                    codex_state=codex_state,
+                    claude_projects=claude_projects,
+                    opencode_db=opencode_db,
+                    hyprnote_root=hyprnote_root,
+                ),
+            )
+            summary["capture"] = capture_result.as_dict()
 
             ingest_result = service.ingest()
             summary["ingest"] = ingest_result.__dict__

@@ -26,8 +26,12 @@ from .automation import (
     run_nightly_maintenance,
     run_secondary_tick,
 )
-from .capture import AgentLogCapture
 from .daemon import BrainDaemon, daemon_handshake_path
+from .connectors import (
+    connector_ids_for_agent,
+    run_connector_capture,
+    runtime_settings,
+)
 from .db import connection, rows
 from .evals import run_eval
 from .extraction import critic_review_config, reclaim_unrouted_facts
@@ -1381,10 +1385,14 @@ def capture_agents(
 ) -> None:
     svc = service(home)
     svc.init_workspace()
-    result = AgentLogCapture(svc.paths, hyprnote_root=hyprnote_root, include_hyprnote=include_hyprnote).capture(
-        agent=agent,
+    result = run_connector_capture(
+        svc.paths,
+        connector_ids=connector_ids_for_agent(agent, include_hyprnote=include_hyprnote),
+        respect_enabled=False,
+        respect_cadence=False,
         dry_run=dry_run,
         export_outbox=export_outbox,
+        settings_overrides=runtime_settings(hyprnote_root=hyprnote_root),
     )
     if also_ingest and not dry_run:
         ingest_result = svc.ingest()
