@@ -1,7 +1,7 @@
 # CoS Autonomy: Commit → Validate → Regenerate — Task List
 
-**Status:** task list for Codex
-**Last verified:** 2026-07-06 against commit `1e49f05` plus the `--apply` implementation dry-run.
+**Status:** executed rebuild task list; remaining items are post-rebuild cleanup/review
+**Last verified:** 2026-07-08 against commit `b94e7a3` plus live `~/brain` DB checks.
 **Context:** raw sources are the durable source of truth; facts, managed wiki pages, entities, actions, and indexes are derived and regenerable. The new LLM extraction path has now been exercised on real brain data in temp/shadow homes. It produced span-backed facts, clean named-entity links, and reversible action output, but the 2026-07-01 run also exposed a routing blocker: 127/178 accepted facts (71%) fell back to `concepts/extracted-facts.md` because routing hints were loaded once per run by recency rather than ranked per source window.
 
 **Current pre-regeneration prerequisite:** R1 + **R2** page-routing fixes plus extraction H1b hardening are extraction-shadow verified; the original gardener LLM timeout caveat has been addressed by decomposed per-candidate judgment and effort tiering, but a final shadow gardener run remains required before destructive rebuild:
@@ -30,8 +30,8 @@
 
 - [x] **T0.1 — Commit the autonomy implementation in logical groups.** Checkpoint commits landed on 2026-07-03: `0fe315d` for entity/extraction/gardener implementation and tests; `604e3f1` for active extraction/entity/regeneration specs. Re-run `uv run pytest -q` and `uv run ruff check .` after later cleanup diffs.
   - *Acceptance:* clean checkpoint exists; `git log` shows the autonomy commits.
-- [ ] **T0.2 — Stamp all `docs/` per the doc convention** now that a commit exists (`docs/cos-determinism-and-doc-conventions.md` §3): `**Last verified:** <date> against commit <hash>`.
-  - *Acceptance:* active docs carry stamps; `CONTRIBUTING.md` records the convention. Older historical docs can be stamped opportunistically as they are touched.
+- [x] **T0.2 — Stamp all `docs/` per the doc convention** now that a commit exists (`docs/archive/cos-determinism-and-doc-conventions.md` §3): `**Last verified:** <date> against commit <hash>`.
+  - *Result 2026-07-08:* active docs touched by the audit follow-up were re-stamped or marked historical/archived. The remaining convention cleanup is tracked by `docs/project-audit-2026-07-07.md` rather than blocking regeneration.
 
 ## Phase 1 — Validate the new path on a sample (it has never run)
 
@@ -48,8 +48,8 @@
   - *Critic runtime/disposition build 2026-07-06:* `decide_action` now accepts `critic_disagreement_mode=reject`, and extraction config supports `critic_review.max_workers`, `timeout_seconds`, `disagreement_mode`, and `block_rate_anomaly_threshold`. Extraction critic review runs in a bounded thread pool, timeout/provider failures become `critic_decision=unavailable`, and rebuild/default config can route critic disagreement to `status='rejected'` with the rationale preserved in `evidence_json` instead of creating one open question per blocked fact. A per-document block-rate anomaly guard creates one `document_extraction_anomaly` residue when a document's critic-block rate crosses the configured threshold. Live local config now sets critic review to 4 workers, 300s timeout, `disagreement_mode: reject`, and 0.8 anomaly threshold while keeping standing provider separation warning-free.
   - *Stronger extractor experiment 2026-07-06:* same high-yield scope as the narrowed mini run (`Call with David Yuan`, `Databricks Unity Catalog OSS PM Role and Strategy`) was rerun in `/private/tmp/pkm-extractor-full-vrmkHI` with `PKM_BRAIN_LLM_EXTRACTOR_MODEL=gpt-5.4`. Result: 65 candidates, 38 applied with critic agreement, 14 critic-blocked, 13 unrouted residues, runtime 182s. The comparable mini run had 41 fact actions, 20 applied, 18 critic-blocked, and 3 residues. `gpt-5.4` materially improves accepted/applied recall and should be used for rebuild/canary extraction via environment override; the standing config keeps extractor on `gpt-5.4-mini` to preserve no-warning role separation outside rebuild runs.
   - *Acceptance:* facts have `extraction_method='llm'` + non-empty `source_spans`; `evidence_quote` faithful to the cited span; `cos_actions` rows recorded.
-- [ ] **T1.3 — Validate resolver judgment** on the sample: merges are semantically correct (no lexical over-merge); genuine contradictions → `display_contested`/residue, not auto-picked.
-  - *Acceptance:* the opposite-meaning high-overlap test passes; sampled merges spot-checked correct.
+- [x] **T1.3 — Validate resolver judgment** on the sample: merges are semantically correct (no lexical over-merge); genuine contradictions → `display_contested`/residue, not auto-picked.
+  - *Result 2026-07-08:* the full rebuild/canary path exercised contradiction residue live. The extraction-time precheck now persists both sides of conflict reviews; live `fact_conflict_review` rows have populated `fact_ids`/`options` (83 two-sided rows). The conflict eval remains green with `false_truth_resolutions=0`; no truth-conflict timeout path resolves a winner.
 - [x] **T1.4 — Run the eval bundle**; confirm gates are real and green: extraction span-coverage (scoped to `extraction_method='llm'`), topology **real F1** (not smoke), conflict `false_truth_resolutions=0`, retrieval, routing.
   - *Result 2026-07-05:* retrieval was rerun after the live sentence-transformer flip and passed (`eval_c3d362b0548340c0`). Extraction now has a non-vacuous labeled gate and passed (`eval_d200e8a1b56e447f`, 35 labeled cases, 30 auto-eligible clean facts, 0 unsupported/fallback/routing-mismatch auto-eligible cases). Full bundle rerun after the autonomy-policy diff remains required before destructive T4.1.
   - *Result 2026-07-06:* live full bundle passed as `eval_1afe0106e6754f5c` (`/Users/Peter/brain/reports/evals/eval-all-v0.1.0-2026-07-06-eval_1afe0106e6754f5c.json`): conflict `false_truth_resolutions=0`, extraction labeled gate passed with `auto_support_precision=1.0` and `auto_route_accuracy=1.0`, routing coverage 1.0, topology F1 0.923, retrieval passed with negative controls intact and 5/5 semantic paraphrase probes hitting vector sources.
@@ -73,8 +73,8 @@
 
 ## Phase 4 — Execute regeneration (destructive; gated)
 
-- [ ] **T4.1 — Full scoped regeneration.** After Phases 0–3 are green and with explicit human go-ahead + verified backup (T2.2): run `rebuild-facts` over the scoped corpus (meetings/notes/docs).
-  - *Acceptance:* new corpus is `extraction_method='llm'` with ~100% span coverage; legacy facts archived (not silently dropped); managed pages regenerated from facts; retrieval lifecycle correct (superseded suppressed, conflicts contested); human confirmations re-applied; eval bundle green. Run in tranches: canary command should use `PKM_BRAIN_LLM_EXTRACTOR_MODEL=gpt-5.4 PKM_BRAIN_LLM_EXTRACTOR_MODEL_FALLBACKS=gpt-5.4 uv run brain cos rebuild-facts --from-sources --apply --limit 20 --home /Users/Peter/brain`, then pause for 100% audit before continuation commands such as `--offset 20 --limit 20 --continue-run`. Use the built critic runtime guard (`critic_review.max_workers`, `timeout_seconds`) and rebuild-mode disposition (`disagreement_mode: reject`) so critic residue is auditable without generating hundreds of human-review questions. Reserve `needs_human` for conflicts, route failures, and topology/precheck ambiguity.
+- [x] **T4.1 — Full scoped regeneration.** After Phases 0–3 are green and with explicit human go-ahead + verified backup (T2.2): run `rebuild-facts` over the scoped corpus (meetings/notes/docs).
+  - *Result 2026-07-08:* the scoped rebuild completed in tranches. Live DB check shows 1,362 active `extraction_method='llm'` facts, 2,625 archived legacy facts, and 389 active entities. Managed pages were regenerated from the new fact ledger, route reclaim ran, sampled audit/revert paths fired, and the nightly loop subsequently grew the fact ledger autonomously. Remaining human-visible residue is review work, not a rebuild blocker: 197 unrouted facts, 82 open fact-conflict reviews, 40 policy escalations/synthesis reviews, 8 extraction anomalies, 3 sampled-bad audit items, 2 proposed memories, and 113 topology proposals as of this verification.
 
 ## Phase 5 — Verify autonomy posture (parallel-ok)
 
@@ -88,7 +88,7 @@
 ---
 
 ## Suggested order
-T0.2 → T1.3/T1.4 → **(human go-ahead)** → T4.1 canary (`--limit 20`) → audit/inspect → continuation tranches (`--offset`) → post-rebuild eval bundle.
+Post-rebuild order: work the review queue (`brain cos queue-summary --home ~/brain`), activate synthesis once its eval gate is real, schedule runtime backups/pruning, then retire legacy wiki-migration artifacts when no longer needed.
 
 ## Verification bundle (run after each phase)
 ```bash

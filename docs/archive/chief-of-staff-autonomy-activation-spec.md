@@ -43,7 +43,7 @@ Everything else depends on this.
 ### WS2 — Wire the three unwired roles
 **resolver** (replaces deterministic merge/supersede decisions):
 - LLM judges, per `entity_key` group, whether facts are the *same claim*, a *clear supersession*, or a *genuine contradiction*. Emits `fact_merge` / `fact_supersede` / `resolve_conflict` / `display_contested` actions.
-- Keep deterministic *mechanics* (union sources, set status, inverse); move the *decision* to the resolver. Only normalized-exact dup + source-addition stay deterministic-auto (see `docs/cos-determinism-and-doc-conventions.md` §1.2).
+- Keep deterministic *mechanics* (union sources, set status, inverse); move the *decision* to the resolver. Only normalized-exact dup + source-addition stay deterministic-auto (see `docs/archive/cos-determinism-and-doc-conventions.md` §1.2).
 - Classify output: clear supersession ⇒ low/medium risk (auto-eligible); genuine contradiction needing external truth ⇒ high risk ⇒ `display_contested` + escalate. Never timeout into a winner.
 - Files: `wiki_facts.py` (`merge_similar_replacement_facts_with_actions`, `resolve_fact_groups`), new resolver prompt, tests (incl. opposite-meaning high-lexical-overlap must NOT auto-merge).
 

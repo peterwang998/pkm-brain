@@ -37,7 +37,7 @@ How to read this: items are ordered P0 → P3. Each has evidence, an action, and
 **Acceptance:** a plist with a stale flag is detected by `nightly-status`; a memory with an invalid scope no longer fails the nightly run; `doctor` surfaces "last nightly success: Xh ago".
 
 ### 4. Land the in-flight UI v2 working tree (or split it into committable phases)
-**Evidence:** uncommitted diff of **+2,528/−1,226 across `ui_server.py` (3,520 changed lines)**, new untracked `src/pkm_brain/ui_static/` (full scaffold + all six view modules), new `docs/brain-ui-v2-spec.md`, updated `tests/test_ui_auth.py`/`test_ui_endpoints.py`. `ui_shell()` is already deleted in the working tree even though the spec's build plan (§6) keeps it until P5. House convention (`docs/cos-determinism-and-doc-conventions.md` §0) explicitly forbids leaving docs describing behavior that exists only in an uncommitted tree.
+**Evidence:** uncommitted diff of **+2,528/−1,226 across `ui_server.py` (3,520 changed lines)**, new untracked `src/pkm_brain/ui_static/` (full scaffold + all six view modules), new `docs/brain-ui-v2-spec.md`, updated `tests/test_ui_auth.py`/`test_ui_endpoints.py`. `ui_shell()` is already deleted in the working tree even though the spec's build plan (§6) keeps it until P5. House convention (`docs/archive/cos-determinism-and-doc-conventions.md` §0) explicitly forbids leaving docs describing behavior that exists only in an uncommitted tree.
 **Action:** verify each phase's acceptance criteria in `brain-ui-v2-spec.md` §6, run the verification bundle in §9, commit in logical chunks (server/static/queue/wiki-entities/ops), update the spec's Status line to reflect what shipped, and re-stamp per doc conventions. If P5 acceptance (v1 feature-parity checklist) is not actually met, restore the `/legacy` route until it is.
 **Acceptance:** clean `git status`; spec status reflects reality; `pytest` + `ruff` green; v1 parity checklist result recorded in the spec.
 
@@ -129,7 +129,7 @@ How to read this: items are ordered P0 → P3. Each has evidence, an action, and
 **Acceptance:** `brain doctor --json` emits clean JSON on stdout with no progress noise and runs in < ~2s; skipped nightly ticks don't load weights.
 
 ### 20. Docs corpus: separate canonical from historical
-**Evidence:** 17 docs / ~350KB. Self-declared historical: `chief-of-staff-autonomy-activation-spec.md`, `chief-of-staff-retrieval-tuning-plan.md`, spec v0.1 (partially), `cos-determinism-and-doc-conventions.md` (§1 actions largely executed). `chief-of-staff-wiki-curation.md` has **no status stamp at all** and predates the canonical CoS spec.
+**Evidence:** 17 docs / ~350KB. Self-declared historical: `archive/chief-of-staff-autonomy-activation-spec.md`, `archive/chief-of-staff-retrieval-tuning-plan.md`, spec v0.1 (partially), `archive/cos-determinism-and-doc-conventions.md` (§1 actions largely executed). `archive/chief-of-staff-wiki-curation.md` predates the canonical CoS spec.
 **Action:** create `docs/archive/` and move fully historical docs there (keep git history); stamp `chief-of-staff-wiki-curation.md` or archive it; add `docs/README.md` — a 20-line index declaring which docs are canonical (`chief-of-staff-spec`, `architecture-code-guide`, `chief-of-staff-retrieval-contract`, `entity-layer-spec`, `extraction-payload-spec`, `email-ingestion-spec`, `embeddings-productization-spec`, `brain-ui-v2-spec`, sync pair) and which are archived.
 **Acceptance:** every doc has a status stamp; the index exists; no active doc points at an archived one as authoritative.
 
@@ -163,4 +163,4 @@ Still genuinely open and worth keeping visible: query expansion, neighbor-chunk 
 7. Item 14 (module splits) as a standalone mechanical PR series.
 8. Items 21–24 (roadmap).
 
-Every PR: `uv run pytest -q` + `uv run ruff check .` green; re-stamp any doc whose described behavior changed (`docs/cos-determinism-and-doc-conventions.md` §3).
+Every PR: `uv run pytest -q` + `uv run ruff check .` green; re-stamp any doc whose described behavior changed (`docs/archive/cos-determinism-and-doc-conventions.md` §3).

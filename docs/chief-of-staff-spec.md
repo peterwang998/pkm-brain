@@ -212,7 +212,7 @@ Canonical body: deterministic active facts, stable section order, `fact_ids`/`so
 
 ### 5.9 Retrieval (`service.py`, `indexes.py`) — extend
 Engine unchanged (FTS5 + LanceDB chunk vectors + RRF + rerank + source weighting + bounded packet). Facts enter the candidate stream through shared FTS until embeddings are productized. Add:
-- This section is complemented by `docs/chief-of-staff-retrieval-contract.md` and `docs/chief-of-staff-retrieval-tuning-plan.md`, which define verdict/calibration behavior and current tuning notes.
+- This section is complemented by `docs/chief-of-staff-retrieval-contract.md`, which defines verdict/calibration behavior. Historical tuning notes live in `docs/archive/chief-of-staff-retrieval-tuning-plan.md`.
 - Facts in the candidate stream; return facts directly when best **only after** a fact-specific relevance gate. Fact retrieval is dynamic 0..N, never fixed top-k leakage.
 - Fact ranking normalizes raw FTS/vector/reranker signals onto a comparable positive relevance score and applies a calibrated `FACT_SCORE_FLOOR`; raw SQLite BM25 values are not compared directly with chunk/page scores.
 - Return only active facts as authoritative. Conflicted facts may return only as contested pairs. Exclude inactive, superseded, and low-`truth_confidence` facts from authoritative retrieval.

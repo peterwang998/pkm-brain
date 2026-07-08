@@ -1198,6 +1198,8 @@ Privacy remains a source-capture and provider-boundary concern in V1. The schema
 
 ## 14. Forgetting And Redaction
 
+**Implementation status, 2026-07-08:** deferred pending Peter's scope decision. The target design below remains the intended privacy shape, but the current code does not implement `forget_events`, tombstones, or `brain forget` commands. Email ingestion Phase 1 should not proceed until either a minimal `forget source|session` slice lands or this section is explicitly re-scoped for the email launch.
+
 The system captures personal material automatically and must provide a defined path to remove it. Rebuilding from raw is necessary but not sufficient when the goal is to delete the raw itself.
 
 Forget target kinds:
@@ -1828,7 +1830,7 @@ This spec is the target design for a single-user local-first PKM/agent-memory sy
 Workspace, ingestion, retrieval:
 
 - Filesystem layout creation under `~/brain`.
-- SQLite schema with `documents`, `chunks`, `entities`, `relations`, `memories`, `wiki_pages`, `wiki_change_batches`, `wiki_change_items`, `wiki_interviews`, `ingestion_runs`, `sync_runs`, `automation_runs`, `retrieval_events`, `context_lineage_events`, `agent_sessions`, and `capture_sources` tables, with versioned migrations.
+- SQLite schema with `documents`, `chunks`, `entities`, `fact_entities`, `memories`, `wiki_pages`, archived compatibility `wiki_change_*` tables, `ingestion_runs`, `sync_runs`, `automation_runs`, `retrieval_events`, `context_lineage_events`, `agent_sessions`, and `capture_sources` tables, with versioned migrations. Fresh installs no longer create the deferred `relations` table; existing DBs may still contain it until an explicit retirement migration is approved.
 - Markdown / plain-text / agent-log ingestion with `agent_session_log` latest-snapshot retention.
 - Source-specific chunking with provenance, including Hyprnote meeting captures and sanitized derived indexing for agent-session logs.
 - LanceDB vector index plus SQLite FTS5 lexical search.
@@ -1863,21 +1865,21 @@ Operability:
 ### 21.2 Partially Implemented
 
 - **Retrieval quality (Section 10 / Phase 4):** RRF, source-aware rerank, lineage tie-breakers, neighbor caps, and excerpting ship. Query expansion, hypothetical-question vector search, neighbor-chunk expansion, and a true cross-encoder local reranker are not yet implemented.
-- **Embeddings (Section 4 stack):** local hash embedding + optional `SentenceTransformer` ship. Cloud embedding providers and a configurable provider toggle are not yet implemented.
-- **Memory audit (Section 20 Memory Audit):** validates `memory_type`, `status`, `scope`, `source_ids` presence, and `confidence` presence. Duplicate detection, staleness flagging, conflict detection, and broken-source surfacing are pending.
+- **Embeddings (Section 4 stack):** local hash embedding + optional `SentenceTransformer` ship with config/env provider selection, index stamps, non-silent degradation, explicit download, vector rebuild, and live sentence-transformer validation. Cloud embedding providers remain deferred.
+- **Memory audit (Section 20 Memory Audit):** validates `memory_type`, `status`, `scope`, `source_ids`, `confidence`, duplicate active content, stale active rows, unresolved document/chunk/retrieval source IDs, and superseded-review metadata. Semantic memory conflict detection remains deferred.
 - **Run logs (Section 20 Pipeline Run Logs):** `ingestion_runs` tracks discovered/changed/skipped/chunks/embeddings/errors/warnings. `wiki pages proposed` and `memories proposed` per-run counters are not yet populated.
 
 ### 21.3 Not Yet Implemented
 
 - **Section 14 Forgetting And Redaction.** `forget_events` table does not exist. None of `brain forget source|session|memory|pattern|range|list|inspect|undo` is implemented. There is no tombstone-based re-ingestion guard. `brain provenance check` does not yet detect dangling references caused by forgets.
 - **Section 9.2 Tension Audit.** Explicitly future work; no implementation.
-- **Section 20 Golden Query Eval Set.** `~/brain/evals/golden_queries.yaml` is created at workspace init, but there is no `brain eval` runner producing `recall@5`, `recall@10`, `MRR`, or expected-source/page/memory metrics.
+- **Section 20 Golden Query Eval Set.** `brain eval run --suite retrieval` exists and now merges built-in retrieval fixtures with local `~/brain/evals/golden_queries.yaml` cases. The active implementation reports verdict accuracy, source-hit rate, negative-control pass rate, fact precision, calibration error, noise rate, semantic-vector probe metrics, and origin-split metrics rather than the original `recall@5` / `MRR` shape.
 - **Section 20 `brain list documents --status failed`.** No `brain list documents` command exists at all yet.
 - **Section 15 HTTP API.** The optional HTTP endpoints (`POST /query`, `POST /retrieve-context`, `POST /ingest`, `GET /memory`, `POST /memory/propose`, `POST /session`) are not implemented; only MCP and the local Web UI are.
 - **`brain ui service install/status/uninstall`** for running the Web UI as a managed service.
 - **Non-macOS schedulers.** systemd user timers and cron adapters intentionally raise a clear not-yet-implemented error.
 - **Structured `agent_sessions` import from Secondary** and **Secondary read-only MCP mode** (also called out in the sync spec).
-- **`relations` table.** Present in the schema but no writer/reader uses it. Entity identity and fact-entity links are now implemented in the Chief-of-Staff/entity layer; typed relation edges remain deferred.
+- **Typed relation edges.** Entity identity and fact-entity links are implemented in the Chief-of-Staff/entity layer. Fresh installs no longer create the deferred `relations` table, but existing DBs may still contain it; typed relation extraction remains deferred.
 
 ### 21.4 Spec Drift Notes
 
