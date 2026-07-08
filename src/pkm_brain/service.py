@@ -1549,7 +1549,7 @@ class BrainService:
                     caller,
                     dumps(fanout_debug["candidate_ids"]),
                     dumps(selected_ids),
-                    dumps(citation_snapshots),
+                    dumps(citation_snapshots if debug else slim_citation_snapshots(citation_snapshots)),
                     dumps(search_debug) if debug else "{}",
                 ),
             )
@@ -1636,8 +1636,8 @@ class BrainService:
                     "retrieve_context",
                     dumps(fanout_debug["fused"]),
                     dumps([row["chunk_id"] for row in supporting_chunks]),
-                    dumps(citation_snapshots),
-                    dumps(retrieval_debug),
+                    dumps(citation_snapshots if debug else slim_citation_snapshots(citation_snapshots)),
+                    dumps(retrieval_debug) if debug else "{}",
                 ),
             )
             self._record_retrieval_exposures(
@@ -3126,7 +3126,8 @@ def truncate_for_packet(value: str, max_chars: int) -> str:
         return value
     if max_chars <= 16:
         return value[:max_chars]
-    return value[: max_chars - 15].rstrip() + " ... [truncated]"
+    suffix = " ... [truncated]"
+    return value[: max_chars - len(suffix)].rstrip() + suffix
 
 
 def trim_packet_strings(value: Any, max_chars: int) -> None:

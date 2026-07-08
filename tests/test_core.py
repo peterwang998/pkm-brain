@@ -1296,6 +1296,14 @@ def test_retrieve_context_compacts_noisy_agent_logs_with_hard_budget(tmp_path: P
     assert "citations" not in public_context
     assert "selection_reasons" not in public_context["supporting_chunks"][0]
     assert len(public_context["citation_snapshots"]) <= 8
+    with connection(svc.paths.sqlite_path) as conn:
+        stored_event = conn.execute(
+            "SELECT citation_snapshots, debug FROM retrieval_events WHERE id = ?",
+            (public_context["retrieval_event_id"],),
+        ).fetchone()
+    stored_snapshots = json.loads(stored_event["citation_snapshots"])
+    assert stored_event["debug"] == "{}"
+    assert len(stored_snapshots[0]["text"]) <= 320
 
 
 def test_retrieve_context_explicit_budget_caps_first_selected_chunk(tmp_path: Path) -> None:
