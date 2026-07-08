@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Brain</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="/ui/tokens.css">
+  <link rel="stylesheet" href="/ui/app.css">
+</head>
+<body>
+  <div id="shell">
+    <nav id="rail" aria-label="Primary">
+      <div class="rail-brand" title="PKM Brain">◆</div>
+      <a href="#/today"    data-view="today"    title="Today (g t)">Today</a>
+      <a href="#/queue"    data-view="queue"    title="Queue (g q)">Queue<span id="queue-count" class="rail-count" hidden></span></a>
+      <a href="#/wiki"     data-view="wiki"     title="Wiki (g w)">Wiki</a>
+      <a href="#/entities" data-view="entities" title="Entities (g e)">Entities</a>
+      <a href="#/ask"      data-view="ask"      title="Ask (g a)">Ask</a>
+      <a href="#/ops"      data-view="ops"      title="Ops (g o)">Ops</a>
+      <div class="rail-foot">
+        <button id="palette-open" title="Command palette (⌘K)">⌘K</button>
+        <button id="token-open" title="API token">⚿</button>
+      </div>
+    </nav>
+    <main id="view" tabindex="-1" aria-live="polite"></main>
+  </div>
+
+  <!-- Overlays: single elevation exception in the design system -->
+  <div id="palette" class="overlay" hidden></div>
+  <div id="token-dialog" class="overlay" hidden></div>
+  <div id="toast-root" aria-live="assertive"><!-- undo toasts mount here --></div>
+  <div id="popover-root"><!-- provenance popovers mount here --></div>
+
+  <script type="module" src="/ui/app.js"></script>
+</body>
+</html>

@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+from pkm_brain import ui_server
 from pkm_brain.cos_actions import decide_action, propose_action, record_action_audit
 from pkm_brain.db import connection, dumps
 from pkm_brain.paths import BrainPaths
@@ -49,6 +50,23 @@ def request_json(
     response_body = response.read().decode("utf-8")
     conn.close()
     return response.status, json.loads(response_body)
+
+
+def request_raw(
+    host: str,
+    port: int,
+    method: str,
+    path: str,
+    token: str | None = None,
+) -> tuple[int, str, dict[str, str]]:
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    conn = http.client.HTTPConnection(host, port, timeout=5)
+    conn.request(method, path, headers=headers)
+    response = conn.getresponse()
+    response_body = response.read().decode("utf-8")
+    response_headers = {key.lower(): value for key, value in response.getheaders()}
+    conn.close()
+    return response.status, response_body, response_headers
 
 
 def insert_document(paths: BrainPaths, document_id: str = "doc_source") -> None:
@@ -187,6 +205,33 @@ def insert_review_question_for_action(
         )
 
 
+def insert_unrouted_question(paths: BrainPaths, *, question_id: str, fact_id: str) -> None:
+    fact = review_fact_payload(fact_id)
+    with connection(paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO open_questions(
+              id, kind, entity_key, page_hint, fact_ids, question, options, status,
+              context, recommended_action, risk_tier, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                question_id,
+                "unrouted_fact",
+                fact["entity_key"],
+                "",
+                dumps([fact_id]),
+                "Choose the managed page for this extracted fact.",
+                dumps([{"option_type": "candidate_fact", **fact}]),
+                "needs_human",
+                dumps({}),
+                dumps({"action_type": "rehome_fact", "payload": {"fact": fact}}),
+                "low",
+                "2026-07-06T10:01:00+00:00",
+            ),
+        )
+
+
 def test_status_endpoint_returns_service_layer_json(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
 
@@ -204,6 +249,282 @@ def test_status_endpoint_returns_service_layer_json(tmp_path: Path) -> None:
     assert surfaces["Memories"]["searched"] is True
     assert "Legacy wiki packets" not in surfaces
     assert surfaces["CoS action ledger"]["searched"] is False
+
+
+def test_v2_static_shell_serves_without_auth(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+
+    with running_ui(paths) as (host, port, _token):
+        root_status, root_body, root_headers = request_raw(host, port, "GET", "/")
+        js_status, js_body, js_headers = request_raw(host, port, "GET", "/ui/app.js")
+
+    assert root_status == 200
+    assert "<script type=\"module\" src=\"/ui/app.js\"></script>" in root_body
+    assert "text/html" in root_headers["content-type"]
+    assert js_status == 200
+    assert "Hash router" not in js_body
+    assert "no-cache" in js_headers["cache-control"]
+
+
+def test_v2_digest_and_queue_return_complete_review_cards(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    insert_document(paths)
+    write_concept_page(paths, generated=True)
+    fact = review_fact_payload()
+    action = propose_action(
+        paths,
+        "fact_upsert",
+        action_payload={"fact": fact},
+        action_features={"truth_mutation": True, "reversible": True},
+        target_fact_ids=[str(fact["id"])],
+        target_page_paths=[str(fact["page_hint"])],
+        proposed_by="test",
+        risk_tier="medium",
+    )
+    insert_review_question_for_action(
+        paths,
+        question_id="question_v2_queue",
+        action_id=action["id"],
+        fact=fact,
+    )
+    BrainService(paths).propose_memory(
+        "FactMemory", "global", "Review me from v2.", ["document:doc_source"], 0.88
+    )
+
+    with running_ui(paths) as (host, port, token):
+        digest_status, digest = request_json(host, port, token, "GET", "/api/digest")
+        queue_status, queue = request_json(host, port, token, "GET", "/api/queue")
+
+    assert digest_status == 200
+    assert digest["queue_counts"]["total"] == 2
+    assert digest["queue_counts"]["by_kind"]["conflicts"] == 1
+    assert digest["queue_counts"]["by_kind"]["memories"] == 1
+    assert queue_status == 200
+    conflict = next(item for item in queue["items"] if item["id"] == "question_v2_queue")
+    assert conflict["group"] == "conflicts"
+    assert conflict["candidate"]["statement"] == fact["statement"]
+    assert conflict["counterparts"][0]["statement"] == "The old review workflow did not show enough evidence."
+    memory = next(item for item in queue["items"] if item["group"] == "memories")
+    assert memory["memory"]["source_documents"][0]["source_id"] == "document:doc_source"
+
+
+def test_v2_queue_filters_and_paginates_before_expensive_enrichment(
+    tmp_path: Path, monkeypatch
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    for index in range(8):
+        insert_unrouted_question(
+            paths,
+            question_id=f"question_unrouted_{index}",
+            fact_id=f"fact_unrouted_{index}",
+        )
+    BrainService(paths).propose_memory(
+        "FactMemory", "global", "Only the proposed memory should be loaded.", [], 0.8
+    )
+
+    def fail_route_enrichment(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+        raise AssertionError("route candidates should not be built for filtered-out rows")
+
+    monkeypatch.setattr(ui_server, "route_candidates_for_fact", fail_route_enrichment)
+
+    with running_ui(paths) as (host, port, token):
+        status, queue = request_json(
+            host,
+            port,
+            token,
+            "GET",
+            "/api/queue?kind=proposed_memory&limit=1",
+        )
+
+    assert status == 200
+    assert queue["total"] == 1
+    assert len(queue["items"]) == 1
+    assert queue["items"][0]["group"] == "memories"
+
+
+def test_v2_queue_limit_bounds_complete_card_enrichment(
+    tmp_path: Path, monkeypatch
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    for index in range(6):
+        insert_unrouted_question(
+            paths,
+            question_id=f"question_unrouted_{index}",
+            fact_id=f"fact_unrouted_{index}",
+        )
+    calls = 0
+
+    def count_route_enrichment(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+        nonlocal calls
+        calls += 1
+        return []
+
+    monkeypatch.setattr(ui_server, "route_candidates_for_fact", count_route_enrichment)
+
+    with running_ui(paths) as (host, port, token):
+        status, queue = request_json(
+            host,
+            port,
+            token,
+            "GET",
+            "/api/queue?kind=unrouted&limit=1",
+        )
+
+    assert status == 200
+    assert queue["total"] == 6
+    assert len(queue["items"]) == 1
+    assert calls == 1
+
+
+def test_v2_queue_conflict_keys_do_not_collide_with_navigation() -> None:
+    source = (Path(__file__).parents[1] / "src/pkm_brain/ui_static/views/queue.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert '<kbd>1</kbd>keep existing' in source
+    assert '<kbd>2</kbd>candidate wins' in source
+    assert 'key === "k") doDecision' not in source
+    assert 'if (item.group === "conflicts") return {b: "both_true", r: "reject"}' in source
+
+
+def test_v2_queue_decision_applies_and_undoes_linked_action(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    fact = review_fact_payload("fact_v2_apply")
+    action = propose_action(
+        paths,
+        "fact_upsert",
+        action_payload={"fact": fact},
+        action_features={"truth_mutation": True, "reversible": True},
+        target_fact_ids=[str(fact["id"])],
+        target_page_paths=[str(fact["page_hint"])],
+        proposed_by="test",
+        risk_tier="medium",
+    )
+    with connection(paths.sqlite_path) as conn:
+        conn.execute(
+            "UPDATE cos_actions SET status = 'needs_human' WHERE id = ?",
+            (action["id"],),
+        )
+    insert_review_question_for_action(
+        paths,
+        question_id="question_v2_apply",
+        action_id=action["id"],
+        fact=fact,
+    )
+
+    with running_ui(paths) as (host, port, token):
+        status, body = request_json(
+            host,
+            port,
+            token,
+            "POST",
+            "/api/queue/question_v2_apply/decision",
+            {"decision": "candidate_wins"},
+        )
+        undo_status, undo = request_json(
+            host,
+            port,
+            token,
+            "POST",
+            "/api/queue/undo",
+            {"undo_handle": body["undo_handle"]},
+        )
+
+    assert status == 200
+    assert body["result"]["question"]["status"] == "answered"
+    assert body["result"]["action"]["status"] == "applied"
+    assert undo_status == 200
+    assert undo["status"] == "undone"
+    with connection(paths.sqlite_path) as conn:
+        fact_count = conn.execute(
+            "SELECT COUNT(*) FROM facts WHERE id = ?", (fact["id"],)
+        ).fetchone()[0]
+        question = conn.execute(
+            "SELECT status, decided_by FROM open_questions WHERE id = ?",
+            ("question_v2_apply",),
+        ).fetchone()
+        action_row = conn.execute(
+            "SELECT status FROM cos_actions WHERE id = ?", (action["id"],)
+        ).fetchone()
+    assert fact_count == 0
+    assert question["status"] == "needs_human"
+    assert question["decided_by"] is None
+    assert action_row["status"] == "reverted"
+
+
+def test_v2_entities_index_and_detail_surface_identity_layer(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    with connection(paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO entities(id, name, entity_type, aliases, status, source_ids, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "entity_alpha",
+                "AlphaPay",
+                "product",
+                json.dumps(["Alpha Pay"]),
+                "active",
+                "[]",
+                "2026-07-06T10:00:00+00:00",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO facts(
+              id, statement, entity_key, entity_id, page_hint, section_hint,
+              source_ids, observed_at, confidence, status, metadata, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "fact_alpha",
+                "AlphaPay has a browser-visible entity page.",
+                "products:alphapay:summary",
+                "entity_alpha",
+                "products/alphapay.md",
+                "Summary",
+                "[]",
+                "2026-07-06T10:01:00+00:00",
+                0.9,
+                "active",
+                "{}",
+                "2026-07-06T10:01:00+00:00",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO fact_entities(id, fact_id, entity_id, is_primary, mention_text, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "fe_alpha",
+                "fact_alpha",
+                "entity_alpha",
+                1,
+                "AlphaPay",
+                "2026-07-06T10:01:00+00:00",
+            ),
+        )
+
+    with running_ui(paths) as (host, port, token):
+        index_status, index = request_json(host, port, token, "GET", "/api/entities")
+        detail_status, detail = request_json(
+            host, port, token, "GET", "/api/entities/entity_alpha"
+        )
+
+    assert index_status == 200
+    assert index["entities"][0]["name"] == "AlphaPay"
+    assert index["entities"][0]["fact_count"] == 1
+    assert detail_status == 200
+    assert detail["entity"]["aliases"] == ["Alpha Pay"]
+    assert detail["facts_by_page"][0]["page_hint"] == "products/alphapay.md"
+    assert detail["facts_by_page"][0]["facts"][0]["statement"] == "AlphaPay has a browser-visible entity page."
 
 
 def test_cos_review_apply_action_endpoint_applies_linked_action(

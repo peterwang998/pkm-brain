@@ -41,6 +41,7 @@ The most important mental model: raw sources are evidence, facts are the canonic
 - Keep `open_questions` retrieval useful and bounded. UI/wiki/policy flows use the table heavily, and `retrieve_context()` now returns query-relevant unresolved residue, but this should keep improving with ranking/review-surface work.
 - Keep the entity/gardener autonomy boundary honest. The code now has entity identity, merge/split actions, and decomposed gardener judgment, but policy promotion should stay tied to the eval/report gates described in the active specs.
 - Bound retrieval telemetry and bring email in as evidence. Phase 0 retention/housekeeping is implemented; email capture/extraction remains planned. Plan and sequencing: `docs/email-ingestion-spec.md`.
+- Browser UI v2 is the active local control plane. It replaces the old tab UI with six job-oriented destinations, a unified review queue, rendered wiki pages with provenance popovers, entity browsing, retrieval inspection, and Ops views. Design and endpoint contracts live in `docs/brain-ui-v2-spec.md`; static assets ship from `src/pkm_brain/ui_static/`.
 
 ## Detailed Breakdown From Raw Primitives Up
 

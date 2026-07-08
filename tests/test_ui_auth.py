@@ -46,26 +46,25 @@ def request_html(host: str, port: int) -> tuple[int, str]:
     return response.status, body
 
 
-def test_ui_shell_renders_token_driven_browser_pages(tmp_path: Path) -> None:
+def test_v2_ui_shell_renders_static_browser_control_plane(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
 
     with running_ui(paths) as (host, port, _token):
         status, body = request_html(host, port)
 
     assert status == 200
-    assert 'id="token-input"' in body
-    assert 'data-view="status"' in body
-    assert 'data-view="setup"' in body
-    assert 'data-view="sync"' in body
-    assert 'data-view="jobs"' in body
-    assert 'data-view="logs"' in body
+    assert 'id="token-dialog"' in body
+    assert 'data-view="today"' in body
+    assert 'data-view="queue"' in body
     assert 'data-view="wiki"' in body
-    assert 'data-view="curation"' in body
-    assert 'data-view="memory"' in body
+    assert 'data-view="entities"' in body
+    assert 'data-view="ask"' in body
+    assert 'data-view="ops"' in body
+    assert 'data-view="status"' not in body
+    assert 'data-view="curation"' not in body
+    assert 'data-view="memory"' not in body
     assert 'data-view="packets"' not in body
     assert 'data-view="review"' not in body
-    assert "Authorization" in body
-    assert "Bearer" in body
     assert 'href="/api/' not in body
     assert "applyWikiProposal" not in body
     assert 'recordWikiInterview(${jsString(id)}, "approved")' not in body
