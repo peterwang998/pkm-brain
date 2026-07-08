@@ -20,6 +20,9 @@ from pkm_brain.daemon import (
     daemon_handshake_path,
     scheduler_config_path,
 )
+from pkm_brain.automation import run_nightly_maintenance
+from pkm_brain.connectors import load_connector_config, save_connector_config
+from pkm_brain.db import connection
 from pkm_brain.paths import BrainPaths
 from pkm_brain.sync_config import PeerConfig, PrimaryConfig, SyncConfig, write_sync_config
 from pkm_brain.sync_setup import init_secondary
@@ -205,6 +208,26 @@ def test_scheduler_pause_persists(tmp_path: Path) -> None:
     assert resumed["paused_until"] is None
 
 
+def test_scheduler_run_now_bypasses_pause(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    completed: list[str] = []
+    scheduler = SerialJobScheduler(
+        paths,
+        jobs=[SchedulerJob("job", 60, lambda: completed.append("job") or {"status": "success"})],
+    )
+    scheduler.pause(3600)
+    scheduler.start()
+    try:
+        scheduler.run_now("job")
+        deadline = time.time() + 3
+        while not completed and time.time() < deadline:
+            time.sleep(0.01)
+    finally:
+        scheduler.stop()
+
+    assert completed == ["job"]
+
+
 def test_scheduler_registry_is_role_aware(tmp_path: Path) -> None:
     secondary = BrainPaths.from_value(tmp_path / "secondary")
     init_secondary(secondary, "secondary-node", "primary-node")
@@ -229,6 +252,7 @@ def test_scheduler_registry_is_role_aware(tmp_path: Path) -> None:
                         host="secondary-a.local",
                         user="peter",
                         brain_home=Path("/tmp/secondary-a"),
+                        cadence_s=900,
                     ),
                     PeerConfig(
                         node_id="secondary-b",
@@ -242,7 +266,57 @@ def test_scheduler_registry_is_role_aware(tmp_path: Path) -> None:
     )
 
     primary_scheduler = SerialJobScheduler(primary)
-    primary_ids = {job["id"] for job in primary_scheduler.as_dict()["jobs"]}
+    primary_jobs = {str(job["id"]): job for job in primary_scheduler.as_dict()["jobs"]}
+    primary_ids = set(primary_jobs)
     assert "capture_tick" in primary_ids
     assert "secondary_tick" not in primary_ids
     assert {"sync:secondary-a", "sync:secondary-b"}.issubset(primary_ids)
+    assert primary_jobs["sync:secondary-a"]["cadence_s"] == 900
+    assert primary_jobs["sync:secondary-b"]["cadence_s"] == 1800
+
+
+def test_daemon_nightly_summary_matches_automation_shape(tmp_path: Path) -> None:
+    direct = BrainPaths.from_value(tmp_path / "direct")
+    daemon = BrainPaths.from_value(tmp_path / "daemon")
+    disable_all_connectors(direct)
+    disable_all_connectors(daemon)
+
+    direct_result = run_nightly_maintenance(direct, if_due=True, due_after_hours=20)
+    scheduler = SerialJobScheduler(daemon)
+    scheduler.start()
+    try:
+        scheduler.run_now("nightly")
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            nightly = next(job for job in scheduler.as_dict()["jobs"] if job["id"] == "nightly")
+            if nightly["last_status"]:
+                break
+            time.sleep(0.05)
+    finally:
+        scheduler.stop()
+
+    with connection(daemon.sqlite_path) as conn:
+        row = conn.execute(
+            "SELECT summary FROM automation_runs WHERE job_name = ? ORDER BY started_at DESC LIMIT 1",
+            ("nightly-maintenance",),
+        ).fetchone()
+
+    assert direct_result.status == "success"
+    assert row is not None
+    daemon_summary = json.loads(row["summary"])
+    assert summary_shape(daemon_summary) == summary_shape(direct_result.summary)
+
+
+def disable_all_connectors(paths: BrainPaths) -> None:
+    config = load_connector_config(paths)
+    for state in config["connectors"].values():
+        state["enabled"] = False
+    save_connector_config(paths, config)
+
+
+def summary_shape(value: object) -> object:
+    if isinstance(value, dict):
+        return {key: summary_shape(nested) for key, nested in sorted(value.items())}
+    if isinstance(value, list):
+        return [summary_shape(value[0])] if value else []
+    return type(value).__name__

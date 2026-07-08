@@ -6,7 +6,8 @@ let package = Package(
     platforms: [.macOS(.v15)],
     products: [
         .library(name: "PKMBrainKit", targets: ["PKMBrainKit"]),
-        .executable(name: "PKMBrainApp", targets: ["PKMBrainApp"])
+        .executable(name: "PKMBrainApp", targets: ["PKMBrainApp"]),
+        .executable(name: "PKMBrainAcceptance", targets: ["PKMBrainAcceptance"])
     ],
     targets: [
         .target(
@@ -17,8 +18,13 @@ let package = Package(
             name: "PKMBrainApp",
             dependencies: ["PKMBrainKit"],
             path: "Sources",
-            exclude: ["Kit", "App/Info.plist"],
+            exclude: ["Acceptance", "Kit", "App/Info.plist"],
             sources: ["App", "Views"]
+        ),
+        .executableTarget(
+            name: "PKMBrainAcceptance",
+            dependencies: ["PKMBrainKit"],
+            path: "Sources/Acceptance"
         ),
         .testTarget(
             name: "PKMBrainKitTests",

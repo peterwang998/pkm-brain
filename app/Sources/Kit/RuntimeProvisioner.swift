@@ -36,6 +36,7 @@ public final class RuntimeProvisioner: ObservableObject {
         if let bundledRuntime = try? bundledRuntimeSeed(bundle: bundle) {
             if fileManager.isExecutableFile(atPath: currentBrainExecutableURL.path),
                currentRuntimeID() == bundledRuntime.id {
+                try await smokeBrainExecutable(currentBrainExecutableURL)
                 phase = "Ready"
                 message = "Runtime is ready"
                 return currentBrainExecutableURL
@@ -109,40 +110,48 @@ public final class RuntimeProvisioner: ObservableObject {
         let target = runtimeRoot.appendingPathComponent(seed.id, isDirectory: true)
         let brain = target.appendingPathComponent("bin/brain")
         if fileManager.isExecutableFile(atPath: brain.path) {
+            do {
+                try await smokeBrainExecutable(brain)
+                try writeRuntimeID(seed.id, to: target)
+                try activateRuntime(target)
+                phase = "Ready"
+                message = "Runtime is ready"
+                return currentBrainExecutableURL
+            } catch {
+                try? fileManager.removeItem(at: target)
+            }
+        }
+
+        try fileManager.createDirectory(at: runtimeRoot, withIntermediateDirectories: true)
+        try? fileManager.removeItem(at: target)
+        do {
+            message = "Installing Python \(seed.pythonVersion)"
+            try await run(seed.uv, arguments: ["python", "install", seed.pythonVersion])
+            message = "Creating virtual environment"
+            try await run(seed.uv, arguments: ["venv", "--python", seed.pythonVersion, target.path])
+            let python = target.appendingPathComponent("bin/python")
+            message = "Installing locked dependencies"
+            try await run(seed.uv, arguments: ["pip", "install", "--python", python.path, "-r", seed.requirements.path])
+            message = "Installing PKM Brain"
+            try await run(seed.uv, arguments: ["pip", "install", "--python", python.path, seed.wheel.path])
+            guard fileManager.isExecutableFile(atPath: target.appendingPathComponent("bin/brain").path) else {
+                throw RuntimeProvisionerError.cannotProvision("Provisioned runtime did not install a brain executable.")
+            }
+            try await smokeBrainExecutable(target.appendingPathComponent("bin/brain"))
             try writeRuntimeID(seed.id, to: target)
             try activateRuntime(target)
             phase = "Ready"
             message = "Runtime is ready"
             return currentBrainExecutableURL
-        }
-
-        let staging = runtimeRoot.appendingPathComponent(".\(seed.id).partial-\(UUID().uuidString)", isDirectory: true)
-        try fileManager.createDirectory(at: runtimeRoot, withIntermediateDirectories: true)
-        try? fileManager.removeItem(at: staging)
-        do {
-            message = "Installing Python \(seed.pythonVersion)"
-            try await run(seed.uv, arguments: ["python", "install", seed.pythonVersion])
-            message = "Creating virtual environment"
-            try await run(seed.uv, arguments: ["venv", "--python", seed.pythonVersion, staging.path])
-            let python = staging.appendingPathComponent("bin/python")
-            message = "Installing locked dependencies"
-            try await run(seed.uv, arguments: ["pip", "install", "--python", python.path, "-r", seed.requirements.path])
-            message = "Installing PKM Brain"
-            try await run(seed.uv, arguments: ["pip", "install", "--python", python.path, seed.wheel.path])
-            guard fileManager.isExecutableFile(atPath: staging.appendingPathComponent("bin/brain").path) else {
-                throw RuntimeProvisionerError.cannotProvision("Provisioned runtime did not install a brain executable.")
-            }
-            try writeRuntimeID(seed.id, to: staging)
-            try? fileManager.removeItem(at: target)
-            try fileManager.moveItem(at: staging, to: target)
-            try activateRuntime(target)
-            phase = "Ready"
-            message = "Runtime is ready"
-            return currentBrainExecutableURL
         } catch {
-            try? fileManager.removeItem(at: staging)
+            try? fileManager.removeItem(at: target)
             throw error
         }
+    }
+
+    private func smokeBrainExecutable(_ brain: URL) async throws {
+        message = "Checking PKM Brain runtime"
+        try await run(brain, arguments: ["--version"])
     }
 
     private func activateRuntime(_ target: URL) throws {

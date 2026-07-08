@@ -29,3 +29,19 @@ xcodebuild \
   -configuration Release \
   -derivedDataPath DerivedData \
   build
+
+APP_PRODUCT="$APP_DIR/DerivedData/Build/Products/Release/PKM Brain.app"
+APP_RESOURCES="$APP_PRODUCT/Contents/Resources"
+mkdir -p "$APP_RESOURCES"
+ditto "$APP_DIR/Resources" "$APP_RESOURCES"
+
+FRAMEWORK="$APP_PRODUCT/Contents/Frameworks/PKMBrainKit.framework"
+if [[ -d "$FRAMEWORK" ]]; then
+  codesign --force --sign - --timestamp=none "$FRAMEWORK"
+fi
+codesign --force --sign - --timestamp=none "$APP_PRODUCT"
+
+mkdir -p "$ROOT/dist"
+rm -rf "$ROOT/dist/PKM Brain.app" "$ROOT/dist/PKM Brain.zip"
+ditto "$APP_PRODUCT" "$ROOT/dist/PKM Brain.app"
+ditto -c -k --keepParent "$ROOT/dist/PKM Brain.app" "$ROOT/dist/PKM Brain.zip"

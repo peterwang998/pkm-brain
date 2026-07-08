@@ -26,7 +26,7 @@ from .automation import (
     run_nightly_maintenance,
     run_secondary_tick,
 )
-from .daemon import BrainDaemon, daemon_handshake_path
+from .daemon import BrainDaemon, daemon_handshake_path, package_version
 from .connectors import (
     connector_ids_for_agent,
     run_connector_capture,
@@ -61,7 +61,7 @@ from .wiki_curation_promote import promote_wiki_curation
 from .wiki_fact_migration import migrate_existing_wiki_to_facts
 from .wiki_facts import curate_all_managed_fact_pages
 
-app = typer.Typer(help="Local personal knowledge management and agent memory tool.")
+app = typer.Typer(help="Local personal knowledge management and agent memory tool.", invoke_without_command=True)
 inspect_app = typer.Typer(help="Inspect documents and chunks.")
 index_app = typer.Typer(help="Index health commands.")
 db_app = typer.Typer(help="SQLite database maintenance commands.")
@@ -99,6 +99,15 @@ app.add_typer(sync_app, name="sync")
 app.add_typer(scheduler_app, name="scheduler")
 app.add_typer(maintenance_app, name="maintenance")
 console = Console()
+
+
+@app.callback()
+def main(
+    version: bool = typer.Option(False, "--version", help="Print the installed PKM Brain version and exit.", is_eager=True),
+) -> None:
+    if version:
+        console.print(package_version())
+        raise typer.Exit()
 
 
 def service(home: Optional[Path] = None) -> BrainService:

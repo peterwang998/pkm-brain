@@ -58,17 +58,8 @@ struct PKMBrainKitTests {
         let appSupport = tempRoot.appendingPathComponent("AppSupport", isDirectory: true)
         let home = tempRoot.appendingPathComponent("Brain", isDirectory: true)
         let brain = appSupport.appendingPathComponent("runtime/current/bin/brain")
-        try FileManager.default.createDirectory(
-            at: brain.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
         let fakeDaemon = try #require(Bundle.module.url(forResource: "fake_brain_daemon", withExtension: "py"))
-        let launcher = """
-        #!/bin/zsh
-        exec /usr/bin/python3 "\(fakeDaemon.path)" "$@"
-        """
-        try launcher.write(to: brain, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: brain.path)
+        try installFakeBrain(at: brain, fakeDaemon: fakeDaemon)
 
         let provisioner = RuntimeProvisioner(appSupportURL: appSupport)
         let supervisor = DaemonSupervisor(provisioner: provisioner, expectedDaemonVersion: "0.1.0")
@@ -90,6 +81,59 @@ struct PKMBrainKitTests {
         }
     }
 
+    @MainActor
+    @Test("supervisor replaces an adopted daemon with a mismatched version")
+    func supervisorReplacesMismatchedDaemon() async throws {
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PKMBrainKitTests-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: tempRoot)
+        }
+        let appSupport = tempRoot.appendingPathComponent("AppSupport", isDirectory: true)
+        let home = tempRoot.appendingPathComponent("Brain", isDirectory: true)
+        let fakeDaemon = try #require(Bundle.module.url(forResource: "fake_brain_daemon", withExtension: "py"))
+
+        let oldProcess = Process()
+        oldProcess.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        oldProcess.arguments = [fakeDaemon.path, "daemon", "--home", home.path]
+        var oldEnvironment = ProcessInfo.processInfo.environment
+        oldEnvironment["FAKE_BRAIN_VERSION"] = "0.0.1"
+        oldProcess.environment = oldEnvironment
+        try oldProcess.run()
+        defer {
+            if oldProcess.isRunning {
+                oldProcess.terminate()
+            }
+        }
+        try await waitUntil(timeoutSeconds: 4) {
+            let handshakeURL = home.appendingPathComponent("config/local/daemon.json")
+            guard let data = try? Data(contentsOf: handshakeURL),
+                  let handshake = try? JSONDecoder().decode(DaemonHandshake.self, from: data)
+            else {
+                return false
+            }
+            return handshake.pid == oldProcess.processIdentifier
+        }
+
+        let brain = appSupport.appendingPathComponent("runtime/current/bin/brain")
+        try installFakeBrain(at: brain, fakeDaemon: fakeDaemon)
+        let supervisor = DaemonSupervisor(
+            provisioner: RuntimeProvisioner(appSupportURL: appSupport),
+            expectedDaemonVersion: "0.1.0"
+        )
+        await supervisor.start(homeURL: home)
+        let newPID = try #require(supervisor.handshake?.pid)
+
+        #expect(newPID != oldProcess.processIdentifier)
+        try await waitUntil(timeoutSeconds: 4) {
+            !oldProcess.isRunning
+        }
+        await supervisor.stop()
+        try await waitUntil(timeoutSeconds: 4) {
+            !isAlive(newPID)
+        }
+    }
+
     private func decodeFixture<T: Decodable>(_ name: String) throws -> T {
         let url = try #require(Bundle.module.url(forResource: name, withExtension: "json"))
         let data = try Data(contentsOf: url)
@@ -98,6 +142,19 @@ struct PKMBrainKitTests {
 
     private func isAlive(_ pid: Int) -> Bool {
         kill(pid_t(pid), 0) == 0 || errno == EPERM
+    }
+
+    private func installFakeBrain(at brain: URL, fakeDaemon: URL) throws {
+        try FileManager.default.createDirectory(
+            at: brain.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let launcher = """
+        #!/bin/zsh
+        exec /usr/bin/python3 "\(fakeDaemon.path)" "$@"
+        """
+        try launcher.write(to: brain, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: brain.path)
     }
 
     private func waitUntil(timeoutSeconds: TimeInterval, condition: @MainActor @escaping () -> Bool) async throws {

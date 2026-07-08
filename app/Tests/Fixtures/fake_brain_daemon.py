@@ -119,7 +119,7 @@ def main():
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     server.home = home_path
     server.token = token
-    server.version = "0.1.0"
+    server.version = os.environ.get("FAKE_BRAIN_VERSION", "0.1.0")
     server.started_at = started_at
 
     payload = {

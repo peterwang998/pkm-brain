@@ -126,6 +126,7 @@ class SerialJobScheduler:
         self._lock = threading.RLock()
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._queued: set[str] = set()
+        self._force_run: set[str] = set()
         self._stop = threading.Event()
         self._worker_thread: threading.Thread | None = None
         self._ticker_thread: threading.Thread | None = None
@@ -198,8 +199,10 @@ class SerialJobScheduler:
                 return
             with self._lock:
                 self._queued.discard(job_id)
+                force = job_id in self._force_run
+                self._force_run.discard(job_id)
                 job = self.jobs.get(job_id)
-                if job is None or not job.enabled or self._is_paused():
+                if job is None or not job.enabled or (self._is_paused() and not force):
                     continue
                 job.running = True
             started = self._now()
@@ -240,7 +243,7 @@ class SerialJobScheduler:
         with self._lock:
             if job_id not in self.jobs:
                 raise ValueError(f"unknown scheduler job: {job_id}")
-            self._enqueue_locked(job_id)
+            self._enqueue_locked(job_id, force=True)
         return self.as_dict()
 
     def pause(self, seconds: int) -> dict[str, Any]:
@@ -286,10 +289,14 @@ class SerialJobScheduler:
                 ],
             }
 
-    def _enqueue_locked(self, job_id: str) -> None:
+    def _enqueue_locked(self, job_id: str, *, force: bool = False) -> None:
         if job_id in self._queued:
+            if force:
+                self._force_run.add(job_id)
             return
         self._queued.add(job_id)
+        if force:
+            self._force_run.add(job_id)
         self._queue.put(job_id)
 
     def _is_paused(self) -> bool:
@@ -353,7 +360,7 @@ def build_role_jobs(paths: BrainPaths) -> list[SchedulerJob]:
             jobs.append(
                 SchedulerJob(
                     id=f"sync:{peer.node_id}",
-                    cadence_s=DEFAULT_SYNC_CADENCE_SECONDS,
+                    cadence_s=peer.cadence_s or DEFAULT_SYNC_CADENCE_SECONDS,
                     handler=lambda peer_id=peer.node_id: json.loads(
                         json.dumps(sync_run(paths, peer_id, if_reachable=True).__dict__, default=str)
                     ),

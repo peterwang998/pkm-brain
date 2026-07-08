@@ -49,14 +49,16 @@ public final class DaemonSupervisor: ObservableObject {
         healthTask = nil
         if let apiClient {
             _ = try? await apiClient.shutdown()
-            try? await Task.sleep(nanoseconds: 5_000_000_000)
         }
         if let process, process.isRunning {
-            process.terminate()
-            try? await Task.sleep(nanoseconds: 5_000_000_000)
-            if process.isRunning {
-                kill(process.processIdentifier, SIGKILL)
+            if !(await waitUntilProcessStops(process, timeoutSeconds: 5)) {
+                process.terminate()
+                if !(await waitUntilProcessStops(process, timeoutSeconds: 5)) {
+                    kill(process.processIdentifier, SIGKILL)
+                }
             }
+        } else if let pid = handshake?.pid {
+            _ = await waitUntilPIDStops(pid, timeoutSeconds: 5)
         }
         process = nil
         apiClient = nil
@@ -113,12 +115,27 @@ public final class DaemonSupervisor: ObservableObject {
         do {
             try await adopt(handshake: handshake)
             return true
+        } catch DaemonSupervisorError.versionMismatch {
+            await replaceMismatchedDaemon(handshake: handshake, homeURL: homeURL)
+            return false
         } catch {
             if !isProcessAlive(pid: handshake.pid) {
                 removeHandshake(homeURL: homeURL)
             }
             return false
         }
+    }
+
+    private func replaceMismatchedDaemon(handshake: DaemonHandshake, homeURL: URL) async {
+        let client = BrainAPIClient(baseURL: handshake.baseURL, token: handshake.token)
+        _ = try? await client.shutdown()
+        if !(await waitUntilPIDStops(handshake.pid, timeoutSeconds: 5)), isProcessAlive(pid: handshake.pid) {
+            kill(pid_t(handshake.pid), SIGTERM)
+            if !(await waitUntilPIDStops(handshake.pid, timeoutSeconds: 5)), isProcessAlive(pid: handshake.pid) {
+                kill(pid_t(handshake.pid), SIGKILL)
+            }
+        }
+        removeHandshake(homeURL: homeURL)
     }
 
     private func adopt(handshake: DaemonHandshake) async throws {
@@ -205,12 +222,33 @@ public final class DaemonSupervisor: ObservableObject {
         }
         if process.isRunning {
             process.terminate()
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
-            if process.isRunning {
+            if !(await waitUntilProcessStops(process, timeoutSeconds: 1)) {
                 kill(process.processIdentifier, SIGKILL)
             }
         }
         self.process = nil
+    }
+
+    private func waitUntilProcessStops(_ process: Process, timeoutSeconds: TimeInterval) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            if !process.isRunning {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        return !process.isRunning
+    }
+
+    private func waitUntilPIDStops(_ pid: Int, timeoutSeconds: TimeInterval) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            if !isProcessAlive(pid: pid) {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        return !isProcessAlive(pid: pid)
     }
 
     private func waitForHandshake(homeURL: URL, timeoutSeconds: TimeInterval) async throws -> DaemonHandshake {
