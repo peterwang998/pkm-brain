@@ -32,6 +32,7 @@ from .evals import run_eval
 from .extraction import critic_review_config, reclaim_unrouted_facts
 from .cos_policy import promote_policy_for_autonomy
 from .llm import cos_provider_status, provider_status
+from .maintenance import prune_runtime_artifacts
 from .memory_proposals import propose_failure_memories_from_sources, propose_memories_from_lineage
 from .mcp_server import create_mcp
 from .paths import BrainPaths
@@ -73,6 +74,7 @@ automation_app = typer.Typer(help="Scheduled automation commands.")
 launch_agent_app = typer.Typer(help="macOS LaunchAgent commands.")
 sync_app = typer.Typer(help="Primary/Secondary sync commands.")
 scheduler_app = typer.Typer(help="Logical scheduler commands.")
+maintenance_app = typer.Typer(help="Runtime maintenance commands.")
 app.add_typer(inspect_app, name="inspect")
 app.add_typer(index_app, name="index")
 app.add_typer(db_app, name="db")
@@ -90,6 +92,7 @@ app.add_typer(automation_app, name="automation")
 app.add_typer(launch_agent_app, name="launch-agent")
 app.add_typer(sync_app, name="sync")
 app.add_typer(scheduler_app, name="scheduler")
+app.add_typer(maintenance_app, name="maintenance")
 console = Console()
 
 
@@ -613,6 +616,28 @@ def db_compact_retrieval_events(
     except ValueError as exc:
         console.print(str(exc))
         raise typer.Exit(1)
+    console.print_json(json.dumps(result))
+
+
+@maintenance_app.command("prune")
+def maintenance_prune(
+    commit: bool = typer.Option(False, "--commit", help="Delete/rotate the reported artifacts."),
+    keep_runtime_backups: int = typer.Option(3, "--keep-runtime-backups", min=0),
+    keep_days: int = typer.Option(30, "--keep-days", min=0),
+    max_log_bytes: int = typer.Option(10_000_000, "--max-log-bytes", min=1),
+    keep_log_rotations: int = typer.Option(3, "--keep-log-rotations", min=0),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    paths = BrainPaths.from_value(home)
+    BrainService(paths).init_workspace()
+    result = prune_runtime_artifacts(
+        paths,
+        commit=commit,
+        keep_runtime_backups=keep_runtime_backups,
+        keep_days=keep_days,
+        max_log_bytes=max_log_bytes,
+        keep_log_rotations=keep_log_rotations,
+    )
     console.print_json(json.dumps(result))
 
 
