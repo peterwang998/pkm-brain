@@ -1666,6 +1666,63 @@ def test_memory_audit_warns_for_inactive_legacy_schema(tmp_path: Path) -> None:
     assert any(archived_id in warning and "invalid scope legacy-scope" in warning for warning in audit["warnings"])
 
 
+def test_memory_audit_warns_for_duplicate_stale_unresolved_and_superseded_rows(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    with connection(svc.paths.sqlite_path) as conn:
+        for memory_id in ["mem_duplicate_a", "mem_duplicate_b"]:
+            conn.execute(
+                """
+                INSERT INTO memories(
+                  id, memory_type, scope, content, confidence, source_ids,
+                  status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    memory_id,
+                    "FactMemory",
+                    "project:pkm-brain",
+                    "Duplicate active memory content.",
+                    0.8,
+                    json.dumps(["document:missing_doc"]),
+                    "active",
+                    "2026-01-01T00:00:00+00:00",
+                    "2026-01-01T00:00:00+00:00",
+                ),
+            )
+        conn.execute(
+            """
+            INSERT INTO memories(
+              id, memory_type, scope, content, confidence, source_ids,
+              status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "mem_superseded_without_review",
+                "FactMemory",
+                "project:pkm-brain",
+                "Superseded memory missing review metadata.",
+                0.8,
+                json.dumps(["chunk:missing_chunk", "retrieval_event:missing_event"]),
+                "superseded",
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+
+    audit = audit_memories(svc.paths, stale_after_days=30)
+
+    assert audit["errors"] == []
+    assert any("duplicate active memories" in warning for warning in audit["warnings"])
+    assert any("mem_duplicate_a: active memory has not been seen" in warning for warning in audit["warnings"])
+    assert any("mem_duplicate_a: unresolved source_id document:missing_doc" in warning for warning in audit["warnings"])
+    assert any("mem_superseded_without_review: unresolved source_id chunk:missing_chunk" in warning for warning in audit["warnings"])
+    assert any("mem_superseded_without_review: unresolved source_id retrieval_event:missing_event" in warning for warning in audit["warnings"])
+    assert any("mem_superseded_without_review: superseded memory missing reviewed_at" in warning for warning in audit["warnings"])
+    assert any("mem_superseded_without_review: superseded memory missing review_reason" in warning for warning in audit["warnings"])
+    assert audit["checks"]["duplicate_active_content"] is True
+
+
 def test_memory_review_status_updates(tmp_path: Path) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()

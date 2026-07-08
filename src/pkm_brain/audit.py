@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+import re
 from typing import Any
 
 from .db import loads, rows, connection
 from .paths import BrainPaths
+from .util import now_iso
 
 
 VALID_MEMORY_TYPES = {
@@ -22,6 +25,7 @@ VALID_MEMORY_STATUSES = {"proposed", "active", "superseded", "rejected", "archiv
 VALID_EXACT_MEMORY_SCOPES = {"global"}
 VALID_SCOPE_PREFIXES = ("project:", "repo:", "agent:", "topic:", "user:")
 INACTIVE_MEMORY_STATUSES = {"superseded", "rejected", "archived"}
+STALE_ACTIVE_MEMORY_DAYS = 180
 
 
 def valid_memory_scope(scope: str) -> bool:
@@ -31,11 +35,15 @@ def valid_memory_scope(scope: str) -> bool:
     return any(value.startswith(prefix) and len(value) > len(prefix) for prefix in VALID_SCOPE_PREFIXES)
 
 
-def audit_memories(paths: BrainPaths) -> dict[str, Any]:
+def audit_memories(paths: BrainPaths, *, stale_after_days: int = STALE_ACTIVE_MEMORY_DAYS) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
+    active_by_normalized_content: dict[tuple[str, str, str], list[str]] = {}
+    now = parse_audit_timestamp(now_iso()) or datetime.now(timezone.utc)
+    stale_before = now - timedelta(days=stale_after_days)
     with connection(paths.sqlite_path) as conn:
         memories = rows(conn, "SELECT * FROM memories ORDER BY created_at DESC")
+        valid_sources = load_memory_source_indexes(conn)
         for memory in memories:
             mid = memory["id"]
             memory_type = str(memory["memory_type"])
@@ -57,11 +65,113 @@ def audit_memories(paths: BrainPaths) -> dict[str, Any]:
                     status,
                     f"{mid}: invalid scope {scope}",
                 )
-            if not loads(memory["source_ids"], []):
+            source_ids = memory_source_ids(memory, errors)
+            if not source_ids:
                 warnings.append(f"{mid}: missing source_ids")
+            warnings.extend(unresolved_source_warnings(mid, source_ids, valid_sources))
             if memory["confidence"] is None:
                 errors.append(f"{mid}: missing confidence")
-    return {"memories": len(memories), "errors": errors, "warnings": warnings}
+            if status == "active":
+                normalized_content = normalize_memory_content(str(memory["content"] or ""))
+                if normalized_content:
+                    key = (memory_type, scope, normalized_content)
+                    active_by_normalized_content.setdefault(key, []).append(mid)
+                checked_at = parse_audit_timestamp(str(memory["last_seen_at"] or memory["updated_at"] or ""))
+                if checked_at and checked_at < stale_before:
+                    warnings.append(
+                        f"{mid}: active memory has not been seen or updated for {stale_after_days}+ days"
+                    )
+            if status == "superseded":
+                if not memory["reviewed_at"]:
+                    warnings.append(f"{mid}: superseded memory missing reviewed_at")
+                if not str(memory["review_reason"] or "").strip():
+                    warnings.append(f"{mid}: superseded memory missing review_reason")
+        for key, memory_ids in sorted(active_by_normalized_content.items()):
+            if len(memory_ids) > 1:
+                memory_type, scope, _content = key
+                warnings.append(
+                    f"duplicate active memories for {memory_type} in {scope}: {', '.join(sorted(memory_ids))}"
+                )
+    return {
+        "memories": len(memories),
+        "errors": errors,
+        "warnings": warnings,
+        "checks": {
+            "stale_after_days": stale_after_days,
+            "duplicate_active_content": True,
+            "unresolved_source_ids": True,
+            "superseded_review_metadata": True,
+        },
+    }
+
+
+def memory_source_ids(memory: Any, errors: list[str]) -> list[str]:
+    try:
+        parsed = loads(memory["source_ids"], [])
+    except Exception as exc:
+        errors.append(f"{memory['id']}: malformed source_ids: {exc}")
+        return []
+    if not isinstance(parsed, list):
+        errors.append(f"{memory['id']}: source_ids must be a list")
+        return []
+    return [str(item) for item in parsed if str(item or "").strip()]
+
+
+def load_memory_source_indexes(conn: Any) -> dict[str, set[str]]:
+    indexes: dict[str, set[str]] = {
+        "document": set(),
+        "chunk": set(),
+        "retrieval_event": set(),
+    }
+    if audit_table_exists(conn, "documents"):
+        indexes["document"] = {str(row["id"]) for row in conn.execute("SELECT id FROM documents")}
+    if audit_table_exists(conn, "chunks"):
+        indexes["chunk"] = {str(row["id"]) for row in conn.execute("SELECT id FROM chunks")}
+    if audit_table_exists(conn, "retrieval_events"):
+        indexes["retrieval_event"] = {
+            str(row["id"]) for row in conn.execute("SELECT id FROM retrieval_events")
+        }
+    return indexes
+
+
+def unresolved_source_warnings(
+    memory_id: str,
+    source_ids: list[str],
+    valid_sources: dict[str, set[str]],
+) -> list[str]:
+    warnings: list[str] = []
+    for source_id in source_ids:
+        prefix, _, value = source_id.partition(":")
+        if prefix not in valid_sources:
+            continue
+        if value and value not in valid_sources[prefix]:
+            warnings.append(f"{memory_id}: unresolved source_id {source_id}")
+    return warnings
+
+
+def normalize_memory_content(content: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", content.lower()))
+
+
+def parse_audit_timestamp(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def audit_table_exists(conn: Any, table: str) -> bool:
+    return bool(
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+    )
 
 
 def append_memory_schema_issue(
