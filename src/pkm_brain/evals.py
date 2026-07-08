@@ -9,7 +9,7 @@ from typing import Any
 from .db import connection
 from .gardener import deterministic_topology_candidates, tokenize_signal
 from .paths import BrainPaths
-from .retrieval_fixtures import RETRIEVAL_GOLDEN_CASES
+from .retrieval_fixtures import load_retrieval_golden_cases
 from .service import BrainService
 from .util import new_id, now_iso
 from .wiki_facts import fact_is_auto_winner, fact_similarity_signals, facts_should_merge
@@ -708,6 +708,7 @@ def retrieval_eval(paths: BrainPaths) -> dict[str, Any]:
             },
         )
 
+    golden_cases = load_retrieval_golden_cases(paths)
     case_reports: list[dict[str, Any]] = []
     verdict_matches = 0
     source_hits = 0
@@ -728,7 +729,7 @@ def retrieval_eval(paths: BrainPaths) -> dict[str, Any]:
     verdict_matches_by_kind: dict[str, int] = {}
     calibration_rows: list[tuple[float, float]] = []
 
-    for case in RETRIEVAL_GOLDEN_CASES:
+    for case in golden_cases:
         result = svc.retrieve_context(str(case["query"]), debug=True)
         case_kind = str(case.get("kind") or "uncategorized")
         case_count_by_kind[case_kind] = case_count_by_kind.get(case_kind, 0) + 1
@@ -787,6 +788,8 @@ def retrieval_eval(paths: BrainPaths) -> dict[str, Any]:
             {
                 "id": case["id"],
                 "kind": case_kind,
+                "origin": str(case.get("origin") or "unknown"),
+                "fixture_source": str(case.get("fixture_source") or ""),
                 "expected_verdict": expected_verdict,
                 "actual_verdict": actual_verdict,
                 "confidence": confidence,
@@ -807,7 +810,7 @@ def retrieval_eval(paths: BrainPaths) -> dict[str, Any]:
             }
         )
 
-    fixture_count = len(RETRIEVAL_GOLDEN_CASES)
+    fixture_count = len(golden_cases)
     verdict_accuracy = verdict_matches / fixture_count if fixture_count else 1.0
     source_hit_rate = source_hits / source_expected if source_expected else 1.0
     fact_precision = relevant_facts / total_facts if total_facts else 1.0
@@ -836,6 +839,8 @@ def retrieval_eval(paths: BrainPaths) -> dict[str, Any]:
         "semantic_probe_vector_gain_count": len(semantic_probe_vector_gain_ids),
         "semantic_probe_vector_hit_case_ids": semantic_probe_vector_hit_ids,
         "semantic_probe_vector_gain_case_ids": semantic_probe_vector_gain_ids,
+        "case_count_by_origin": count_cases_by_field(case_reports, "origin"),
+        "metrics_by_origin": retrieval_metrics_by_origin(case_reports),
         "case_count_by_kind": dict(sorted(case_count_by_kind.items())),
         "verdict_accuracy_by_kind": {
             kind: round(verdict_matches_by_kind.get(kind, 0) / count, 3)
@@ -876,6 +881,70 @@ def first_fanout_source_rank(rows: list[dict[str, Any]], expected_sources: set[s
         if document_id and f"document:{document_id}" in expected_sources:
             return rank
     return None
+
+
+def count_cases_by_field(case_reports: list[dict[str, Any]], field: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for report in case_reports:
+        value = str(report.get(field) or "unknown")
+        counts[value] = counts.get(value, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def retrieval_metrics_by_origin(case_reports: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {
+        origin: retrieval_case_report_metrics(
+            [report for report in case_reports if str(report.get("origin") or "unknown") == origin]
+        )
+        for origin in count_cases_by_field(case_reports, "origin")
+    }
+
+
+def retrieval_case_report_metrics(case_reports: list[dict[str, Any]]) -> dict[str, Any]:
+    if not case_reports:
+        return {
+            "fixture_count": 0,
+            "verdict_accuracy": 1.0,
+            "source_hit_rate": 1.0,
+            "negative_control_pass_rate": 1.0,
+            "negative_control_fact_leak_count": 0,
+            "semantic_probe_count": 0,
+            "semantic_probe_vector_source_hit_rate": 1.0,
+        }
+    source_expected_reports = [report for report in case_reports if report.get("expected_source_ids")]
+    negative_reports = [report for report in case_reports if report.get("kind") == "negative_control"]
+    semantic_reports = [report for report in case_reports if report.get("semantic_expected_source_ids")]
+    negative_passes = [
+        report
+        for report in negative_reports
+        if report.get("actual_verdict") == "no_strong_match" and not int(report.get("facts") or 0)
+    ]
+    return {
+        "fixture_count": len(case_reports),
+        "verdict_accuracy": round(
+            ratio(len([report for report in case_reports if report.get("verdict_match")]), len(case_reports)),
+            3,
+        ),
+        "source_hit_rate": round(
+            ratio(
+                len([report for report in source_expected_reports if report.get("source_hit")]),
+                len(source_expected_reports),
+            ),
+            3,
+        ),
+        "negative_control_pass_rate": round(ratio(len(negative_passes), len(negative_reports)), 3),
+        "negative_control_fact_leak_count": len(
+            [report for report in negative_reports if int(report.get("facts") or 0) > 0]
+        ),
+        "semantic_probe_count": len(semantic_reports),
+        "semantic_probe_vector_source_hit_rate": round(
+            ratio(
+                len([report for report in semantic_reports if report.get("semantic_vector_source_hit")]),
+                len(semantic_reports),
+            ),
+            3,
+        ),
+    }
 
 
 def retrieval_result_source_ids(paths: BrainPaths, result: dict[str, Any]) -> set[str]:

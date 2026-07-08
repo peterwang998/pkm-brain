@@ -6,6 +6,7 @@ from pathlib import Path
 from pkm_brain.evals import run_eval
 from pkm_brain.db import connection
 from pkm_brain.paths import BrainPaths
+from pkm_brain.retrieval_fixtures import load_retrieval_golden_cases
 from pkm_brain.retrieval_fixtures import RETRIEVAL_GOLDEN_CASES
 from pkm_brain.service import BrainService
 
@@ -67,6 +68,40 @@ def test_retrieval_eval_can_run_directly_on_empty_brain(tmp_path: Path) -> None:
     assert Path(result["report_path"]).name.startswith(
         f"eval-retrieval-v{result['package_version']}-{result['generated_date']}-"
     )
+
+
+def test_retrieval_eval_reads_local_golden_queries(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    svc = BrainService(paths)
+    svc.init_workspace()
+    note = paths.inbox / "sqlite-decision.md"
+    note.write_text("# SQLite Decision\n\nSQLite stores retrieval metadata locally.\n", encoding="utf-8")
+    svc.ingest()
+    with connection(paths.sqlite_path) as conn:
+        document_id = conn.execute("SELECT id FROM documents LIMIT 1").fetchone()["id"]
+    paths.golden_queries_file.write_text(
+        f"""
+- id: local-sqlite
+  query: SQLite retrieval metadata
+  kind: local_query
+  expected_verdict: found
+  expected_sources:
+    - document:{document_id}
+""",
+        encoding="utf-8",
+    )
+
+    loaded = load_retrieval_golden_cases(paths)
+    result = run_eval(paths, suite="retrieval")
+
+    report = result["reports"][0]
+    local_case = [case for case in report["cases"] if case["id"] == "local-sqlite"][0]
+    assert loaded[-1]["origin"] == "local"
+    assert loaded[-1]["expected_source_ids"] == [f"document:{document_id}"]
+    assert report["metrics"]["case_count_by_origin"]["local"] == 1
+    assert report["metrics"]["metrics_by_origin"]["local"]["fixture_count"] == 1
+    assert local_case["origin"] == "local"
+    assert local_case["source_hit"] is True
 
 
 def test_topology_eval_uses_real_candidate_fixture_metrics(tmp_path: Path) -> None:
