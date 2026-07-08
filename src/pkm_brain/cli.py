@@ -27,6 +27,7 @@ from .automation import (
     run_secondary_tick,
 )
 from .capture import AgentLogCapture
+from .daemon import BrainDaemon, daemon_handshake_path
 from .db import connection, rows
 from .evals import run_eval
 from .extraction import critic_review_config, reclaim_unrouted_facts
@@ -255,6 +256,31 @@ def ui_startup_lines(host: str, port: int, token: str) -> list[str]:
         f"Brain UI listening on http://{host}:{port}",
         f"Token: {token}",
     ]
+
+
+@app.command()
+def daemon(
+    port: int = typer.Option(0, "--port", help="Loopback port; 0 chooses an ephemeral port."),
+    serve_web: bool = typer.Option(False, "--serve-web", help="Serve the static browser UI in addition to JSON API."),
+    home: Optional[Path] = typer.Option(None, help="Brain home directory."),
+) -> None:
+    paths = BrainPaths.from_value(home)
+    runtime = BrainDaemon(paths, port=port, serve_web=serve_web)
+    try:
+        runtime.start()
+    except RuntimeError as exc:
+        console.print(str(exc))
+        raise typer.Exit(1)
+    assert runtime.server is not None
+    host, actual_port = runtime.server.server_address
+    console.print(f"Brain daemon listening on http://{host}:{actual_port}")
+    console.print(f"Handshake: {daemon_handshake_path(paths)}")
+    try:
+        runtime.server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        runtime.close()
 
 
 @app.command()

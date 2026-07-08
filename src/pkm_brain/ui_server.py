@@ -4,6 +4,7 @@ import json
 import mimetypes
 import os
 import secrets
+import threading
 from importlib import resources
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -72,6 +73,11 @@ class NotFoundError(ValueError):
 class BrainUIServer(ThreadingHTTPServer):
     paths: BrainPaths
     token: str
+    serve_static: bool
+    daemon_version: str | None
+    daemon_started_at: str | None
+    daemon_scheduler: Any | None
+    daemon_shutdown_enabled: bool
 
 
 class BrainUIHandler(BaseHTTPRequestHandler):
@@ -112,7 +118,13 @@ class BrainUIHandler(BaseHTTPRequestHandler):
 
     def dispatch_get(self, path: str, query: dict[str, list[str]]) -> None:
         try:
-            if path == "/api/status":
+            if path == "/api/health":
+                self.write_json(ui_health(self.server))
+            elif path == "/api/version":
+                self.write_json(ui_version(self.server))
+            elif path == "/api/scheduler":
+                self.write_json(ui_scheduler(self.server))
+            elif path == "/api/status":
                 self.write_json(ui_status(self.server.paths))
             elif path == "/api/setup":
                 self.write_json(build_setup_plan(self.server.paths))
@@ -176,7 +188,25 @@ class BrainUIHandler(BaseHTTPRequestHandler):
     def dispatch_post(self, path: str) -> None:
         try:
             parts = [part for part in path.removeprefix("/api/").split("/") if part]
-            if parts == ["retrieve"]:
+            if parts == ["shutdown"]:
+                self.write_json(ui_shutdown(self.server))
+            elif parts == ["scheduler", "run"]:
+                payload = self.read_json_body()
+                self.write_json(ui_scheduler_run(self.server, payload))
+            elif parts == ["scheduler", "pause"]:
+                payload = self.read_json_body()
+                self.write_json(ui_scheduler_pause(self.server, payload))
+            elif parts == ["scheduler", "resume"]:
+                self.write_json(ui_scheduler_resume(self.server))
+            elif len(parts) == 4 and parts[:2] == ["scheduler", "jobs"] and parts[3] in {"enable", "disable"}:
+                self.write_json(
+                    ui_scheduler_enable(
+                        self.server,
+                        parts[2],
+                        enabled=parts[3] == "enable",
+                    )
+                )
+            elif parts == ["retrieve"]:
                 payload = self.read_json_body()
                 self.write_json(ui_retrieve(self.server.paths, payload))
             elif parts == ["queue", "undo"]:
@@ -299,6 +329,9 @@ class BrainUIHandler(BaseHTTPRequestHandler):
         return json.loads(raw)
 
     def dispatch_static_get(self, path: str) -> None:
+        if not self.server.serve_static:
+            self.write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
+            return
         if path in {"", "/"}:
             self.write_static("index.html")
             return
@@ -347,13 +380,105 @@ class BrainUIHandler(BaseHTTPRequestHandler):
 
 
 def create_ui_server(
-    paths: BrainPaths, host: str, port: int, token: str | None = None
+    paths: BrainPaths,
+    host: str,
+    port: int,
+    token: str | None = None,
+    *,
+    serve_static: bool = True,
 ) -> BrainUIServer:
     token = token or ensure_ui_token(paths)
     server = BrainUIServer((host, port), BrainUIHandler)
     server.paths = paths
     server.token = token
+    server.serve_static = serve_static
+    server.daemon_version = None
+    server.daemon_started_at = None
+    server.daemon_scheduler = None
+    server.daemon_shutdown_enabled = False
     return server
+
+
+def ui_health(server: BrainUIServer) -> dict[str, Any]:
+    host, port = server.server_address
+    return {
+        "ok": True,
+        "version": server.daemon_version or package_version(),
+        "home": str(server.paths.home),
+        "pid": os.getpid(),
+        "host": str(host),
+        "port": int(port),
+        "started_at": server.daemon_started_at,
+        "schema_version": current_schema_version(),
+    }
+
+
+def ui_version(server: BrainUIServer) -> dict[str, Any]:
+    return {
+        "version": server.daemon_version or package_version(),
+        "schema_version": current_schema_version(),
+    }
+
+
+def ui_scheduler(server: BrainUIServer) -> dict[str, Any]:
+    scheduler = server.daemon_scheduler
+    if scheduler is None:
+        raise BadRequestError("scheduler is not available")
+    return scheduler.as_dict()
+
+
+def ui_scheduler_run(server: BrainUIServer, payload: dict[str, Any]) -> dict[str, Any]:
+    scheduler = server.daemon_scheduler
+    if scheduler is None:
+        raise BadRequestError("scheduler is not available")
+    job_id = str(payload.get("job_id") or "").strip()
+    if not job_id:
+        raise BadRequestError("job_id is required")
+    return scheduler.run_now(job_id)
+
+
+def ui_scheduler_pause(server: BrainUIServer, payload: dict[str, Any]) -> dict[str, Any]:
+    scheduler = server.daemon_scheduler
+    if scheduler is None:
+        raise BadRequestError("scheduler is not available")
+    seconds = int(payload.get("seconds") or 0)
+    return scheduler.pause(seconds)
+
+
+def ui_scheduler_resume(server: BrainUIServer) -> dict[str, Any]:
+    scheduler = server.daemon_scheduler
+    if scheduler is None:
+        raise BadRequestError("scheduler is not available")
+    return scheduler.resume()
+
+
+def ui_scheduler_enable(server: BrainUIServer, job_id: str, *, enabled: bool) -> dict[str, Any]:
+    scheduler = server.daemon_scheduler
+    if scheduler is None:
+        raise BadRequestError("scheduler is not available")
+    return scheduler.set_enabled(job_id, enabled)
+
+
+def ui_shutdown(server: BrainUIServer) -> dict[str, Any]:
+    if not server.daemon_shutdown_enabled:
+        raise BadRequestError("shutdown is only available for brain daemon")
+    threading.Thread(target=server.shutdown, name="brain-daemon-shutdown", daemon=True).start()
+    return {"ok": True, "shutting_down": True}
+
+
+def package_version() -> str:
+    from importlib import metadata
+
+    try:
+        return metadata.version("pkm-brain")
+    except metadata.PackageNotFoundError:
+        return "0.0.0+local"
+
+
+def current_schema_version() -> int:
+    from .migrations import MIGRATIONS
+
+    return max((version for version, _name, _fn in MIGRATIONS), default=0)
 
 
 def ensure_ui_token(paths: BrainPaths) -> str:
