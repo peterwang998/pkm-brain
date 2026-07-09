@@ -1,6 +1,7 @@
 import Foundation
 import PKMBrainKit
 import SwiftUI
+import UserNotifications
 
 @MainActor
 final class AppState: ObservableObject {
@@ -39,6 +40,8 @@ final class AppState: ObservableObject {
     let provisioner: RuntimeProvisioner
     let daemon: DaemonSupervisor
     private var didStart = false
+    private let queueBacklogThreshold = 100
+    private let queueBacklogNotificationKey = "PKMBrain.queueBacklogNotificationAt"
 
     init() {
         let defaultHome = ProcessInfo.processInfo.environment["PKM_BRAIN_HOME"]
@@ -81,6 +84,7 @@ final class AppState: ObservableObject {
         }
         didStart = true
         await daemon.start(homeURL: homeURL, serveWeb: serveWeb)
+        await requestNotificationAuthorizationIfNeeded()
         await refreshMigrationPlan()
         await refreshDigest()
     }
@@ -101,8 +105,10 @@ final class AppState: ObservableObject {
             return
         }
         do {
-            digest = try await client.digest()
+            let latestDigest = try await client.digest()
+            digest = latestDigest
             lastError = nil
+            notifyQueueBacklogIfNeeded(count: latestDigest.queue_counts.total)
         } catch {
             lastError = String(describing: error)
         }
@@ -149,5 +155,40 @@ final class AppState: ObservableObject {
     func shutdown() async {
         await daemon.stop()
         didStart = false
+    }
+
+    private func requestNotificationAuthorizationIfNeeded() async {
+        guard notificationsEnabled else {
+            return
+        }
+        _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
+    }
+
+    private func notifyQueueBacklogIfNeeded(count: Int) {
+        guard notificationsEnabled, count >= queueBacklogThreshold else {
+            return
+        }
+        let defaults = UserDefaults.standard
+        let now = Date()
+        let lastTimestamp = defaults.double(forKey: queueBacklogNotificationKey)
+        if lastTimestamp > 0 {
+            let last = Date(timeIntervalSince1970: lastTimestamp)
+            guard now.timeIntervalSince(last) >= 7 * 24 * 60 * 60 else {
+                return
+            }
+        }
+
+        let content = UNMutableNotificationContent()
+        content.title = "PKM Brain Queue"
+        content.body = "\(count) items need review."
+        content.sound = .default
+        content.userInfo = ["destination": "queue"]
+        let request = UNNotificationRequest(
+            identifier: "pkm-brain-queue-backlog",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request) { _ in }
+        defaults.set(now.timeIntervalSince1970, forKey: queueBacklogNotificationKey)
     }
 }

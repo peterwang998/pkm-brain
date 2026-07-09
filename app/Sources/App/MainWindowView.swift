@@ -20,7 +20,7 @@ struct MainWindowView: View {
                     case .today:
                         TodayView()
                     case .queue:
-                        PlaceholderView(title: "Queue", systemImage: "tray.full")
+                        QueueView()
                     case .wiki:
                         PlaceholderView(title: "Wiki", systemImage: "doc.text")
                     case .entities:

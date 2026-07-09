@@ -90,6 +90,136 @@ public struct Digest: Codable, Equatable, Sendable {
     public let raw: [String: JSONValue]?
 }
 
+public struct QueuePage: Codable, Equatable, Sendable {
+    public let kind: String
+    public let counts: QueueCounts
+    public let total: Int
+    public let cursor: Int
+    public let next_cursor: Int?
+    public let items: [QueueItem]
+
+    public init(
+        kind: String,
+        counts: QueueCounts,
+        total: Int,
+        cursor: Int,
+        next_cursor: Int?,
+        items: [QueueItem]
+    ) {
+        self.kind = kind
+        self.counts = counts
+        self.total = total
+        self.cursor = cursor
+        self.next_cursor = next_cursor
+        self.items = items
+    }
+}
+
+public struct QueueItem: Codable, Equatable, Identifiable, Sendable {
+    public let id: String
+    public let source_type: String
+    public let kind: String
+    public let group: String
+    public let title: String?
+    public let summary: String?
+    public let created_at: String?
+    public let status: String?
+    public let risk_tier: String?
+    public let page_hint: String?
+    public let entity_key: String?
+    public let action_id: String?
+    public let candidate: QueueFact?
+    public let counterparts: [QueueFact]?
+    public let route_candidates: [QueueRouteCandidate]?
+    public let memory: QueueMemory?
+    public let action: [String: JSONValue]?
+    public let proposal: JSONValue?
+    public let question: [String: JSONValue]?
+    public let options: [JSONValue]?
+    public let raw: JSONValue?
+
+    public var displayTitle: String {
+        title ?? summary ?? id
+    }
+}
+
+public struct QueueFact: Codable, Equatable, Sendable {
+    public let id: String?
+    public let fact_id: String?
+    public let statement: String?
+    public let evidence_quote: String?
+    public let quote: String?
+    public let truth_confidence: Double?
+    public let confidence: Double?
+    public let page_hint: String?
+    public let section_hint: String?
+    public let entity_key: String?
+    public let source_ids: [String]?
+    public let source_documents: [QueueSourceDocument]?
+
+    public var displayID: String? {
+        id ?? fact_id
+    }
+
+    public var displayQuote: String? {
+        evidence_quote ?? quote
+    }
+
+    public var displayConfidence: Double? {
+        truth_confidence ?? confidence
+    }
+}
+
+public struct QueueRouteCandidate: Codable, Equatable, Identifiable, Sendable {
+    public let page_hint: String
+    public let title: String?
+    public let score: Double?
+    public let page_type: String?
+
+    public var id: String { page_hint }
+}
+
+public struct QueueMemory: Codable, Equatable, Sendable {
+    public let id: String?
+    public let content: String?
+    public let memory_type: String?
+    public let scope: String?
+    public let confidence: Double?
+    public let status: String?
+    public let created_at: String?
+    public let updated_at: String?
+    public let source_ids: [String]?
+    public let source_documents: [QueueSourceDocument]?
+    public let audit: [String: JSONValue]?
+}
+
+public struct QueueSourceDocument: Codable, Equatable, Identifiable, Sendable {
+    public let source_id: String
+    public let title: String?
+    public let source_type: String?
+    public let source_path: String?
+    public let raw_path: String?
+    public let ingested_at: String?
+    public let captured_at: String?
+    public let uri: String?
+    public let path: String?
+    public let origin: String?
+
+    public var id: String { source_id }
+}
+
+public struct QueueDecisionResult: Codable, Equatable, Sendable {
+    public let status: String
+    public let item_id: String?
+    public let result: [String: JSONValue]?
+    public let undo_handle: JSONValue?
+}
+
+public struct QueueUndoResult: Codable, Equatable, Sendable {
+    public let status: String
+    public let undo_handle: JSONValue?
+}
+
 public struct MigrationPlan: Codable, Equatable, Sendable {
     public let state: String
     public let home: String

@@ -33,6 +33,28 @@ public final class BrainAPIClient: Sendable {
         return try await get(path)
     }
 
+    public func queue(kind: String = "all", limit: Int = 200, cursor: Int = 0) async throws -> QueuePage {
+        let escapedKind = percentEncodeQueryValue(kind)
+        return try await get("/api/queue?kind=\(escapedKind)&limit=\(limit)&cursor=\(cursor)")
+    }
+
+    public func decideQueueItem(
+        _ itemID: String,
+        decision: String,
+        payload: [String: JSONValue] = [:]
+    ) async throws -> QueueDecisionResult {
+        var body = payload
+        body["decision"] = .string(decision)
+        return try await post(
+            "/api/queue/\(percentEncodePathComponent(itemID))/decision",
+            payload: body
+        )
+    }
+
+    public func undoQueueDecision(_ handle: JSONValue) async throws -> QueueUndoResult {
+        try await post("/api/queue/undo", payload: ["undo_handle": handle])
+    }
+
     public func runSchedulerJob(_ jobID: String) async throws -> SchedulerState {
         try await post("/api/scheduler/run", payload: ["job_id": jobID])
     }
@@ -90,6 +112,18 @@ public final class BrainAPIClient: Sendable {
 
     private func url(for path: String) -> URL {
         URL(string: path, relativeTo: baseURL)!.absoluteURL
+    }
+
+    private func percentEncodePathComponent(_ value: String) -> String {
+        var allowed = CharacterSet.urlPathAllowed
+        allowed.remove(charactersIn: "/?")
+        return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+    }
+
+    private func percentEncodeQueryValue(_ value: String) -> String {
+        var allowed = CharacterSet.urlQueryAllowed
+        allowed.remove(charactersIn: "&=")
+        return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
     }
 }
 

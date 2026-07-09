@@ -1,0 +1,111 @@
+{
+  "kind": "all",
+  "counts": {
+    "total": 2,
+    "by_kind": {
+      "conflicts": 1,
+      "memories": 1
+    },
+    "raw": {
+      "fact_conflict_review": 1,
+      "proposed_memory": 1
+    }
+  },
+  "total": 2,
+  "cursor": 0,
+  "next_cursor": null,
+  "items": [
+    {
+      "id": "question_v2_queue",
+      "source_type": "question",
+      "kind": "fact_conflict_review",
+      "group": "conflicts",
+      "title": "The native queue renders both facts.",
+      "summary": "Choose which fact should survive.",
+      "created_at": "2026-07-08T18:30:00+00:00",
+      "status": "needs_human",
+      "risk_tier": "medium",
+      "page_hint": "projects/pkm-brain.md",
+      "entity_key": "project:pkm-brain",
+      "action_id": "act_queue_conflict",
+      "candidate": {
+        "id": "fact_candidate",
+        "statement": "The native queue renders both facts.",
+        "evidence_quote": "Queue cards include candidate and existing evidence.",
+        "truth_confidence": 0.86,
+        "page_hint": "projects/pkm-brain.md",
+        "entity_key": "project:pkm-brain",
+        "source_ids": ["document:queue_source"],
+        "source_documents": [
+          {
+            "source_id": "document:queue_source",
+            "title": "Queue design note",
+            "source_type": "document",
+            "captured_at": "2026-07-08T18:00:00+00:00"
+          }
+        ]
+      },
+      "counterparts": [
+        {
+          "id": "fact_existing",
+          "statement": "The old queue hid the existing fact.",
+          "evidence_quote": "The previous review surface required leaving the pane.",
+          "truth_confidence": 0.91,
+          "page_hint": "projects/pkm-brain.md",
+          "source_ids": ["document:legacy_source"],
+          "source_documents": [
+            {
+              "source_id": "document:legacy_source",
+              "title": "Legacy review note",
+              "source_type": "document"
+            }
+          ]
+        }
+      ],
+      "options": [],
+      "question": {
+        "id": "question_v2_queue",
+        "kind": "fact_conflict_review"
+      },
+      "raw": {
+        "id": "question_v2_queue",
+        "kind": "fact_conflict_review"
+      }
+    },
+    {
+      "id": "mem_queue_review",
+      "source_type": "memory",
+      "kind": "proposed_memory",
+      "group": "memories",
+      "title": "Review me from the queue.",
+      "summary": "FactMemory - global",
+      "created_at": "2026-07-08T18:20:00+00:00",
+      "status": "proposed",
+      "risk_tier": "low",
+      "memory": {
+        "id": "mem_queue_review",
+        "content": "Review me from the queue.",
+        "memory_type": "FactMemory",
+        "scope": "global",
+        "confidence": 0.88,
+        "status": "proposed",
+        "source_ids": ["document:queue_source"],
+        "source_documents": [
+          {
+            "source_id": "document:queue_source",
+            "title": "Queue design note",
+            "source_type": "document"
+          }
+        ],
+        "audit": {
+          "errors": [],
+          "warnings": []
+        }
+      },
+      "raw": {
+        "id": "mem_queue_review",
+        "status": "proposed"
+      }
+    }
+  ]
+}

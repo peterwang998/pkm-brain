@@ -32,6 +32,17 @@ struct PKMBrainKitTests {
         #expect(scheduler.jobs.first?.cadence_s == 600)
     }
 
+    @Test("queue fixture decodes")
+    func queueFixtureDecodes() throws {
+        let queue: QueuePage = try decodeFixture("queue")
+
+        #expect(queue.counts.total == 2)
+        #expect(queue.items.first?.group == "conflicts")
+        #expect(queue.items.first?.candidate?.displayQuote == "Queue cards include candidate and existing evidence.")
+        #expect(queue.items.first?.counterparts?.first?.statement == "The old queue hid the existing fact.")
+        #expect(queue.items.last?.memory?.content == "Review me from the queue.")
+    }
+
     @Test("migration fixture decodes")
     func migrationFixtureDecodes() throws {
         let plan: MigrationPlan = try decodeFixture("migration")

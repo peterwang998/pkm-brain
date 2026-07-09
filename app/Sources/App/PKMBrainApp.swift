@@ -1,6 +1,7 @@
 import AppKit
 import ServiceManagement
 import SwiftUI
+@preconcurrency import UserNotifications
 
 @main
 struct PKMBrainApp: App {
@@ -27,6 +28,7 @@ struct PKMBrainApp: App {
                 .environmentObject(appState)
                 .task {
                     appDelegate.appState = appState
+                    NotificationRouter.shared.appState = appState
                     await appState.start()
                 }
         }
@@ -84,9 +86,13 @@ struct PKMBrainApp: App {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     @MainActor weak var appState: AppState?
     private var isTerminating = false
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        UNUserNotificationCenter.current().delegate = self
+    }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if isTerminating {
@@ -98,5 +104,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             sender.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification
+    ) async -> UNNotificationPresentationOptions {
+        [.banner, .sound]
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse
+    ) async {
+        let shouldOpenQueue = response.notification.request.content.userInfo["destination"] as? String == "queue"
+        guard shouldOpenQueue else {
+            return
+        }
+        await NotificationRouter.shared.openQueue()
+    }
+}
+
+@MainActor
+final class NotificationRouter {
+    static let shared = NotificationRouter()
+    weak var appState: AppState?
+
+    func openQueue() {
+        appState?.selectedDestination = .queue
+        NSApp.activate(ignoringOtherApps: true)
     }
 }
