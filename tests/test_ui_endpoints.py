@@ -191,6 +191,7 @@ def insert_review_question_for_action(
                             "option_type": "existing_fact",
                             "fact_id": "fact_existing",
                             "statement": "The old review workflow did not show enough evidence.",
+                            "evidence_quote": "The old review workflow did not show enough evidence.",
                             "source_ids": ["manual:existing"],
                         },
                     ]
@@ -453,7 +454,253 @@ def test_v2_queue_decision_applies_and_undoes_linked_action(tmp_path: Path) -> N
     assert fact_count == 0
     assert question["status"] == "needs_human"
     assert question["decided_by"] is None
-    assert action_row["status"] == "reverted"
+    assert action_row["status"] == "needs_human"
+
+
+def test_m4_queue_acceptance_mixed_decisions_land_and_undo(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    svc = BrainService(paths)
+    svc.init_workspace()
+    write_concept_page(paths, generated=True)
+
+    conflict_questions: list[str] = []
+    conflict_actions: list[str] = []
+    for index in range(5):
+        fact = review_fact_payload(f"fact_m4_conflict_{index}")
+        fact["statement"] = f"M4 conflict candidate {index} has enough evidence."
+        fact["evidence_quote"] = f"M4 conflict candidate {index} has enough evidence."
+        action = propose_action(
+            paths,
+            "fact_upsert",
+            action_payload={"fact": fact},
+            action_features={"truth_mutation": True, "reversible": True},
+            target_fact_ids=[str(fact["id"])],
+            target_page_paths=[str(fact["page_hint"])],
+            proposed_by="m4-test",
+            risk_tier="medium",
+        )
+        with connection(paths.sqlite_path) as conn:
+            conn.execute(
+                "UPDATE cos_actions SET status = 'needs_human' WHERE id = ?",
+                (action["id"],),
+            )
+        question_id = f"question_m4_conflict_{index}"
+        insert_review_question_for_action(
+            paths,
+            question_id=question_id,
+            action_id=action["id"],
+            fact=fact,
+        )
+        conflict_questions.append(question_id)
+        conflict_actions.append(action["id"])
+
+    unrouted_questions: list[str] = []
+    for index in range(5):
+        question_id = f"question_m4_unrouted_{index}"
+        insert_unrouted_question(
+            paths,
+            question_id=question_id,
+            fact_id=f"fact_m4_unrouted_{index}",
+        )
+        unrouted_questions.append(question_id)
+
+    memory_ids = [
+        svc.propose_memory(
+            "FactMemory",
+            "global",
+            f"M4 proposed memory {index}.",
+            ["manual:m4"],
+            0.8 + (index / 100),
+        )
+        for index in range(5)
+    ]
+
+    topology_actions: list[str] = []
+    for index in range(5):
+        page_hint = f"concepts/m4-contract-{index}.md"
+        action = propose_action(
+            paths,
+            "edit_contract",
+            action_payload={
+                "contract": {
+                    "id": f"contract_m4_{index}",
+                    "page_hint": page_hint,
+                    "canonical_entity": f"concept:m4-{index}",
+                    "page_scope": "acceptance",
+                    "retrieval_purpose": "M4 queue acceptance",
+                    "what_belongs_here": "Queue acceptance facts.",
+                    "what_does_not_belong_here": "Unrelated material.",
+                    "freshness_policy": "manual",
+                    "related_pages": [],
+                    "version": 1,
+                    "status": "active",
+                }
+            },
+            action_features={"reversible": True, "affected_fact_count": 0},
+            target_page_paths=[page_hint],
+            proposed_by="m4-test",
+            risk_tier="low",
+        )
+        topology_actions.append(action["id"])
+
+    with running_ui(paths) as (host, port, token):
+        queue_status, queue = request_json(
+            host, port, token, "GET", "/api/queue?limit=25"
+        )
+        assert queue_status == 200
+        assert queue["total"] == 20
+        assert queue["counts"]["by_kind"]["conflicts"] == 5
+        assert queue["counts"]["by_kind"]["unrouted"] == 5
+        assert queue["counts"]["by_kind"]["memories"] == 5
+        assert queue["counts"]["by_kind"]["topology"] == 5
+        first_conflict = next(
+            item for item in queue["items"] if item["id"] == conflict_questions[0]
+        )
+        assert first_conflict["candidate"]["evidence_quote"]
+        assert first_conflict["counterparts"][0]["evidence_quote"]
+
+        status, body = request_json(
+            host,
+            port,
+            token,
+            "POST",
+            f"/api/queue/{conflict_questions[0]}/decision",
+            {"decision": "candidate_wins"},
+        )
+        assert status == 200
+        undo_status, undo = request_json(
+            host,
+            port,
+            token,
+            "POST",
+            "/api/queue/undo",
+            {"undo_handle": body["undo_handle"]},
+        )
+        assert undo_status == 200
+        assert undo["status"] == "undone"
+        status, _body = request_json(
+            host,
+            port,
+            token,
+            "POST",
+            f"/api/queue/{conflict_questions[0]}/decision",
+            {"decision": "reject"},
+        )
+        assert status == 200
+
+        for question_id in conflict_questions[1:]:
+            status, _body = request_json(
+                host,
+                port,
+                token,
+                "POST",
+                f"/api/queue/{question_id}/decision",
+                {"decision": "candidate_wins"},
+            )
+            assert status == 200
+
+        for index, question_id in enumerate(unrouted_questions):
+            status, _body = request_json(
+                host,
+                port,
+                token,
+                "POST",
+                f"/api/queue/{question_id}/decision",
+                {"decision": "route", "page_hint": f"concepts/m4-routed-{index}.md"},
+            )
+            assert status == 200
+
+        for memory_id, decision in zip(
+            memory_ids,
+            ["approve", "reject", "archive", "approve", "reject"],
+            strict=True,
+        ):
+            status, _body = request_json(
+                host,
+                port,
+                token,
+                "POST",
+                f"/api/queue/{memory_id}/decision",
+                {"decision": decision},
+            )
+            assert status == 200
+
+        for action_id, decision in zip(
+            topology_actions,
+            ["approve", "reject", "approve", "reject", "approve"],
+            strict=True,
+        ):
+            status, _body = request_json(
+                host,
+                port,
+                token,
+                "POST",
+                f"/api/queue/{action_id}/decision",
+                {"decision": decision},
+            )
+            assert status == 200
+
+        final_status, final_queue = request_json(host, port, token, "GET", "/api/queue")
+        assert final_status == 200
+        assert final_queue["total"] == 0
+
+    with connection(paths.sqlite_path) as conn:
+        question_rows = {
+            row["id"]: row
+            for row in conn.execute(
+                "SELECT id, status, decided_by FROM open_questions ORDER BY id"
+            )
+        }
+        memory_rows = {
+            row["id"]: row["status"]
+            for row in conn.execute(
+                f"SELECT id, status FROM memories WHERE id IN ({','.join('?' for _ in memory_ids)})",
+                memory_ids,
+            )
+        }
+        action_rows = {
+            row["id"]: row["status"]
+            for row in conn.execute(
+                f"SELECT id, status FROM cos_actions WHERE id IN ({','.join('?' for _ in [*conflict_actions, *topology_actions])})",
+                [*conflict_actions, *topology_actions],
+            )
+        }
+        routed_fact_count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM facts
+            WHERE id LIKE 'fact_m4_unrouted_%'
+              AND page_hint LIKE 'concepts/m4-routed-%.md'
+            """
+        ).fetchone()[0]
+        contract_count = conn.execute(
+            "SELECT COUNT(*) FROM page_contracts WHERE id LIKE 'contract_m4_%'"
+        ).fetchone()[0]
+
+    assert question_rows[conflict_questions[0]]["status"] == "dismissed"
+    assert question_rows[conflict_questions[0]]["decided_by"] == "human"
+    for question_id in [*conflict_questions[1:], *unrouted_questions]:
+        assert question_rows[question_id]["status"] == "answered"
+        assert question_rows[question_id]["decided_by"] == "human"
+    assert action_rows[conflict_actions[0]] == "rejected"
+    for action_id in conflict_actions[1:]:
+        assert action_rows[action_id] == "applied"
+    assert [memory_rows[memory_id] for memory_id in memory_ids] == [
+        "active",
+        "rejected",
+        "archived",
+        "active",
+        "rejected",
+    ]
+    assert [action_rows[action_id] for action_id in topology_actions] == [
+        "applied",
+        "rejected",
+        "applied",
+        "rejected",
+        "applied",
+    ]
+    assert routed_fact_count == 5
+    assert contract_count == 3
 
 
 def test_v2_entities_index_and_detail_surface_identity_layer(tmp_path: Path) -> None:

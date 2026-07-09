@@ -1982,6 +1982,7 @@ def decide_queue_question(
     if normalized in {"both_true", "contested"}:
         return contest_question_candidate(paths, question, previous)
     if normalized in {"apply", "approve", "candidate", "candidate_wins", "accept"}:
+        action_states = linked_question_action_states(paths, question)
         result = apply_question_candidate(paths, question, payload)
         action_ids = action_ids_from_result(result)
         return {
@@ -1992,6 +1993,7 @@ def decide_queue_question(
                 "kind": "question_actions",
                 "question": previous,
                 "action_ids": action_ids,
+                "actions": action_states,
             },
         }
     if normalized in {"reject", "reject_candidate", "keep_existing", "dismiss"}:
@@ -2010,6 +2012,7 @@ def decide_queue_question(
         selected_fact_id = str(payload.get("selected_fact_id") or "").strip()
         if not selected_fact_id:
             raise BadRequestError("selected_fact_id is required")
+        action_states = linked_question_action_states(paths, question)
         result = ui_answer_wiki_question(
             paths, question["id"], {"selected_fact_id": selected_fact_id}
         )
@@ -2021,6 +2024,7 @@ def decide_queue_question(
                 "kind": "question_actions",
                 "question": previous,
                 "action_ids": action_ids_from_result(result),
+                "actions": action_states,
             },
         }
     raise BadRequestError(f"unsupported queue decision: {decision}")
@@ -2152,6 +2156,7 @@ def contest_question_candidate(
     paths: BrainPaths, question: dict[str, Any], previous: dict[str, Any]
 ) -> dict[str, Any]:
     action_id = str(question.get("action_id") or "").strip()
+    action_states = linked_question_action_states(paths, question)
     applied_ids: list[str] = []
     candidate_fact_ids: list[str] = []
     if action_id:
@@ -2210,6 +2215,7 @@ def contest_question_candidate(
             "kind": "question_actions",
             "question": previous,
             "action_ids": list(reversed(applied_ids)),
+            "actions": action_states,
         },
     }
 
@@ -2320,8 +2326,15 @@ def ui_queue_undo(paths: BrainPaths, payload: dict[str, Any]) -> dict[str, Any]:
         raise BadRequestError("undo_handle is required")
     kind = str(handle.get("kind") or "").strip()
     if kind == "question_actions":
+        action_states = {
+            str(state.get("id")): state
+            for state in handle.get("actions") or []
+            if isinstance(state, dict) and str(state.get("id") or "").strip()
+        }
         for action_id in handle.get("action_ids") or []:
-            revert_action(paths, str(action_id))
+            action_id = str(action_id)
+            revert_action(paths, action_id)
+            restore_action_state(paths, action_states.get(action_id))
         restore_question_state(paths, handle.get("question") or {})
     elif kind == "question_reject":
         restore_action_state(paths, handle.get("action") or {})
@@ -2370,10 +2383,24 @@ def action_undo_state(paths: BrainPaths, action_id: str) -> dict[str, Any] | Non
         "id": action["id"],
         "status": action.get("status"),
         "audit_status": action.get("audit_status"),
+        "target_fact_ids": action.get("target_fact_ids"),
+        "target_page_paths": action.get("target_page_paths"),
+        "target_contract_ids": action.get("target_contract_ids"),
         "evidence_json": action.get("evidence_json"),
         "policy_decision": action.get("policy_decision"),
         "autonomy_level": action.get("autonomy_level"),
+        "inverse_action_json": action.get("inverse_action_json"),
+        "applied_state_hash": action.get("applied_state_hash"),
+        "applied_at": action.get("applied_at"),
     }
+
+
+def linked_question_action_states(
+    paths: BrainPaths, question: dict[str, Any]
+) -> list[dict[str, Any]]:
+    action_id = str(question.get("action_id") or "").strip()
+    state = action_undo_state(paths, action_id)
+    return [state] if state else []
 
 
 def action_ids_from_result(result: dict[str, Any]) -> list[str]:
@@ -2418,16 +2445,26 @@ def restore_action_state(paths: BrainPaths, state: dict[str, Any] | None) -> Non
         conn.execute(
             """
             UPDATE cos_actions
-            SET status = ?, audit_status = ?, evidence_json = ?,
-                policy_decision = ?, autonomy_level = ?
+            SET status = ?, audit_status = ?, target_fact_ids = ?,
+                target_page_paths = ?, target_contract_ids = ?, evidence_json = ?,
+                policy_decision = ?, autonomy_level = ?, inverse_action_json = ?,
+                applied_state_hash = ?, applied_at = ?
             WHERE id = ?
             """,
             (
                 state.get("status"),
                 state.get("audit_status"),
+                dumps(state.get("target_fact_ids") or []),
+                dumps(state.get("target_page_paths") or []),
+                dumps(state.get("target_contract_ids") or []),
                 dumps(state.get("evidence_json") or {}),
                 state.get("policy_decision"),
                 state.get("autonomy_level"),
+                dumps(state.get("inverse_action_json"))
+                if state.get("inverse_action_json") is not None
+                else None,
+                state.get("applied_state_hash"),
+                state.get("applied_at"),
                 action_id,
             ),
         )
