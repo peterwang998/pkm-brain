@@ -221,6 +221,7 @@ public struct QueueItem: Codable, Equatable, Identifiable, Sendable {
     public let action_id: String?
     public let candidate: QueueFact?
     public let counterparts: [QueueFact]?
+    public let orientation: QueueOrientation?
     public let route_candidates: [QueueRouteCandidate]?
     public let memory: QueueMemory?
     public let action: [String: JSONValue]?
@@ -230,8 +231,24 @@ public struct QueueItem: Codable, Equatable, Identifiable, Sendable {
     public let raw: JSONValue?
 
     public var displayTitle: String {
-        title ?? summary ?? id
+        orientation?.title ?? title ?? summary ?? id
     }
+}
+
+public struct QueueOrientation: Codable, Equatable, Sendable {
+    public let title: String?
+    public let entity_label: String?
+    public let entity_key: String?
+    public let page_hint: String?
+    public let section_hint: String?
+    public let candidate_observed_at: String?
+    public let existing_observed_at: String?
+    public let temporal_scope: String?
+    public let existing_temporal_scope: String?
+    public let currentness: String?
+    public let relation: String?
+    public let relation_confidence: Double?
+    public let relation_rationale: String?
 }
 
 public struct QueueFact: Codable, Equatable, Sendable {

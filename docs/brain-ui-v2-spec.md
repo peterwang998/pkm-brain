@@ -84,9 +84,9 @@ One unified inbox for every human-judgment item: `unrouted_fact`, `fact_conflict
 │       │   Hightouch offer d…  │  │ src: meeting…  │ src: meeting…  │ │
 │       │   (j/k to move)       │  │ conf 0.86      │ conf 0.91      │ │
 │       │                       │  └────────────────┴────────────────┘ │
-│       │                       │  [1] keep existing [2] candidate     │
-│       │                       │  [b]oth true (contested) [r]eject    │
-│       │                       │  [e]scalate/skip   [u]ndo last       │
+│       │                       │  [e] keep existing [c] candidate     │
+│       │                       │  [b] both true     [s] supports      │
+│       │                       │  [t] temporal      [u] unsure        │
 │       │                       │  (nav keys j/k NEVER decide — v2.1  │
 │       │                       │   fix: k collided with keep)        │
 └───────┴───────────────────────┴──────────────────────────────────────┘
@@ -94,7 +94,7 @@ One unified inbox for every human-judgment item: `unrouted_fact`, `fact_conflict
 
 Interaction contract:
 
-- `j/k` move, `enter` focus, decision keys act on the focused card **and auto-advance**; every decision fires an optimistic update plus a 6-second undo toast wired to the action inverse (or question re-open). `u` undoes the last decision even after advance.
+- `j/k` move, `enter` focus, decision keys act on the focused card **and auto-advance**; every decision fires an optimistic update plus a 6-second undo toast wired to the action inverse (or question re-open). On conflict cards `u` means "unsure"; outside conflict-card decision focus, `u` may still undo the last decision.
 - Progress ("3 of 81") and a session tally ("resolved 14 · skipped 2") — triage should feel like emptying an inbox.
 - Card payloads are complete: no decision may require leaving the pane. Unrouted cards show the fact + top-5 route candidates (fuzzy-ranked, numbered `1–5` to pick) + "new page…" + "reject". Topology cards show the proposal, affected pages/fact counts, and the gardener's evidence. Memory cards show content, type, scope, provenance.
 - Batch mode: `x` selects, visible `Reject selected`/`Route selected…` bar appears. Filters persist in URL.

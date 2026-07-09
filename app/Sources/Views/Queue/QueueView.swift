@@ -470,15 +470,13 @@ struct QueueView: View {
             }
         case (_, 53, _):
             selectedIDs.removeAll()
-        case ("u", _, _):
-            Task { await undoLast() }
         case ("a", _, true):
             Task { await batchApproveSelected() }
-        case ("s", _, _), ("e", _, _):
-            Task { await decide("skip") }
+        case ("u", _, _) where selectedItem?.group != "conflicts":
+            Task { await undoLast() }
         case ("1", _, _), ("2", _, _), ("3", _, _), ("4", _, _), ("5", _, _):
             handleNumberKey(key)
-        case ("a", _, _), ("r", _, _), ("b", _, _), ("d", _, _), ("v", _, _), ("o", _, _):
+        case ("a", _, _), ("r", _, _), ("b", _, _), ("c", _, _), ("d", _, _), ("e", _, _), ("o", _, _), ("s", _, _), ("t", _, _), ("u", _, _), ("v", _, _):
             if let decision = decisionForKey(key, item: selectedItem) {
                 Task { await decide(decision) }
             } else {
@@ -503,11 +501,6 @@ struct QueueView: View {
             return
         }
         if item.group == "conflicts" {
-            if key == "1" {
-                Task { await decide("keep_existing") }
-            } else if key == "2" {
-                Task { await decide("candidate_wins") }
-            }
             return
         }
         guard let index = Int(key), let route = item.route_candidates?[safe: index - 1] else {
@@ -524,15 +517,22 @@ struct QueueView: View {
         }
         switch item.group {
         case "conflicts":
-            return ["b": "both_true", "r": "reject"][key]
+            return [
+                "e": "keep_existing",
+                "c": "candidate_wins",
+                "b": "both_true",
+                "s": "supports_existing",
+                "t": "temporal_update",
+                "u": "unsure",
+            ][key]
         case "unrouted":
-            return ["r": "reject"][key]
+            return ["r": "reject", "e": "skip", "s": "skip"][key]
         case "memories":
-            return ["a": "approve", "r": "reject", "d": "archive"][key]
+            return ["a": "approve", "r": "reject", "d": "archive", "e": "skip", "s": "skip"][key]
         case "audit":
-            return ["v": "revert", "o": "mark_ok"][key]
+            return ["v": "revert", "o": "mark_ok", "e": "skip", "s": "skip"][key]
         default:
-            return ["a": "approve", "r": "reject"][key]
+            return ["a": "approve", "r": "reject", "e": "skip", "s": "skip"][key]
         }
     }
 }
@@ -561,6 +561,9 @@ private struct QueueDetail: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                if let orientation = item.orientation {
+                    OrientationPanel(orientation: orientation)
+                }
                 card
             }
             .padding(22)
@@ -586,26 +589,38 @@ private struct QueueDetail: View {
     }
 
     private var conflictCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        let counterparts = item.counterparts ?? []
+        return VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .top, spacing: 12) {
                 FactPanel(title: "Candidate", fact: item.candidate)
-                FactPanel(title: "Existing", fact: item.counterparts?.first)
+                if counterparts.count <= 1 {
+                    FactPanel(title: "Existing", fact: counterparts.first)
+                } else {
+                    VStack(alignment: .leading, spacing: 12) {
+                        ForEach(Array(counterparts.enumerated()), id: \.offset) { index, fact in
+                            FactPanel(title: "Existing \(index + 1)", fact: fact)
+                        }
+                    }
+                }
             }
             DecisionBar {
-                DecisionButton("Keep Existing", systemImage: "1.circle", key: "1") {
+                DecisionButton("Keep Existing", systemImage: "checkmark.shield", key: "e") {
                     onDecision("keep_existing", [:])
                 }
-                DecisionButton("Candidate", systemImage: "2.circle", key: "2") {
+                DecisionButton("Candidate Wins", systemImage: "checkmark.circle", key: "c") {
                     onDecision("candidate_wins", [:])
                 }
                 DecisionButton("Both True", systemImage: "square.split.2x1", key: "b") {
                     onDecision("both_true", [:])
                 }
-                DecisionButton("Reject", systemImage: "xmark.circle", key: "r") {
-                    onDecision("reject", [:])
+                DecisionButton("Supports Existing", systemImage: "link", key: "s") {
+                    onDecision("supports_existing", [:])
                 }
-                DecisionButton("Skip", systemImage: "arrowshape.turn.up.right", key: "s") {
-                    onDecision("skip", [:])
+                DecisionButton("Temporal Update", systemImage: "clock", key: "t") {
+                    onDecision("temporal_update", [:])
+                }
+                DecisionButton("Unsure", systemImage: "questionmark.circle", key: "u") {
+                    onDecision("unsure", [:])
                 }
             }
         }
@@ -781,6 +796,49 @@ private struct QueueRow: View {
         .frame(maxWidth: .infinity, minHeight: 56, alignment: .leading)
         .background(isSelected ? Color.accentColor.opacity(0.13) : Color.clear)
         .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+private struct OrientationPanel: View {
+    let orientation: QueueOrientation
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Text("Mapped to")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(orientation.entity_label ?? orientation.title ?? "Review Target")
+                .font(.headline)
+                .textSelection(.enabled)
+            MetadataRow(values: [
+                orientation.page_hint,
+                orientation.section_hint,
+                relationText,
+                orientation.temporal_scope,
+                labeledTime("candidate", orientation.candidate_observed_at),
+                labeledTime("existing", orientation.existing_observed_at),
+                orientation.currentness,
+            ])
+            EvidenceQuote(text: orientation.relation_rationale)
+        }
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .overlay(alignment: .top) {
+            Divider()
+        }
+        .overlay(alignment: .bottom) {
+            Divider()
+        }
+    }
+
+    private var relationText: String? {
+        guard let relation = orientation.relation, !relation.isEmpty else {
+            return nil
+        }
+        if let confidence = orientation.relation_confidence {
+            return "relation \(relation) \(String(format: "%.2f", confidence))"
+        }
+        return "relation \(relation)"
     }
 }
 
@@ -1060,6 +1118,17 @@ private func confidenceText(_ value: Double?) -> String? {
         return nil
     }
     return "conf \(String(format: "%.2f", value))"
+}
+
+private func labeledTime(_ label: String, _ value: String?) -> String? {
+    guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        return nil
+    }
+    return "\(label) \(shortDate(value))"
+}
+
+private func shortDate(_ value: String) -> String {
+    String(value.prefix(10))
 }
 
 private extension Array {
