@@ -1,0 +1,18 @@
+{
+  "pages": [
+    {
+      "title": "PKM Brain",
+      "page_type": "project",
+      "status": "active",
+      "relative_path": "projects/pkm-brain.md",
+      "source_ids": ["doc_1"],
+      "source_count": 1,
+      "updated_at": "2026-07-09T12:00:00+00:00",
+      "generated": true,
+      "related": ["concepts/retrieval.md"],
+      "score": 1.25,
+      "summary": "Native app work for PKM Brain."
+    }
+  ],
+  "count": 1
+}

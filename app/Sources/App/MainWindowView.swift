@@ -22,11 +22,11 @@ struct MainWindowView: View {
                     case .queue:
                         QueueView()
                     case .wiki:
-                        PlaceholderView(title: "Wiki", systemImage: "doc.text")
+                        WikiView()
                     case .entities:
-                        PlaceholderView(title: "Entities", systemImage: "person.2")
+                        EntitiesView()
                     case .ask:
-                        PlaceholderView(title: "Ask", systemImage: "text.magnifyingglass")
+                        AskView()
                     case .ops:
                         OpsPreviewView()
                     }

@@ -341,6 +341,175 @@ public struct ConnectorsResponse: Codable, Equatable, Sendable {
     public let count: Int
 }
 
+public struct WikiPagesResponse: Codable, Equatable, Sendable {
+    public let pages: [WikiPageSummary]
+    public let count: Int
+}
+
+public struct WikiPageSummary: Codable, Equatable, Identifiable, Sendable {
+    public let title: String?
+    public let page_type: String?
+    public let status: String?
+    public let relative_path: String
+    public let source_ids: [String]?
+    public let source_count: Int?
+    public let updated_at: String?
+    public let generated: Bool?
+    public let related: [String]?
+    public let score: Double?
+    public let summary: String?
+
+    public var id: String { relative_path }
+    public var displayTitle: String { title ?? relative_path }
+}
+
+public struct WikiPageDetail: Codable, Equatable, Sendable {
+    public let relative_path: String
+    public let frontmatter: [String: JSONValue]?
+    public let body: String?
+    public let markdown: String?
+    public let generated: Bool?
+    public let source_ids: [String]?
+    public let source_documents: [QueueSourceDocument]?
+    public let facts: [QueueFact]?
+    public let contract: [String: JSONValue]?
+    public let snapshots: [WikiSnapshot]?
+    public let related: [String]?
+
+    public var displayTitle: String {
+        frontmatter?["title"]?.stringValue ?? relative_path
+    }
+}
+
+public struct WikiSnapshot: Codable, Equatable, Identifiable, Sendable {
+    public let id: String
+    public let page_path: String?
+    public let reason: String?
+    public let created_at: String?
+    public let before_preview: String?
+    public let after_preview: String?
+}
+
+public struct EntitiesResponse: Codable, Equatable, Sendable {
+    public let entities: [EntitySummary]
+    public let count: Int
+    public let types: [EntityTypeCount]
+}
+
+public struct EntityTypeCount: Codable, Equatable, Identifiable, Sendable {
+    public let entity_type: String
+    public let count: Int
+
+    public var id: String { entity_type }
+}
+
+public struct EntitySummary: Codable, Equatable, Identifiable, Sendable {
+    public let id: String
+    public let name: String
+    public let entity_type: String?
+    public let aliases: [String]?
+    public let alias_count: Int?
+    public let status: String?
+    public let merged_into: String?
+    public let fact_count: Int?
+    public let last_observed_at: String?
+    public let created_at: String?
+}
+
+public struct EntityDetail: Codable, Equatable, Sendable {
+    public let entity: EntitySummary
+    public let facts_by_page: [EntityFactGroup]
+    public let co_mentions: [EntityCoMention]
+    public let merge_candidates: [JSONValue]?
+}
+
+public struct EntityFactGroup: Codable, Equatable, Identifiable, Sendable {
+    public let page_hint: String
+    public let facts: [QueueFact]
+
+    public var id: String { page_hint }
+}
+
+public struct EntityCoMention: Codable, Equatable, Identifiable, Sendable {
+    public let id: String
+    public let name: String
+    public let entity_type: String?
+    public let count: Int
+}
+
+public struct RetrieveRequest: Encodable, Sendable {
+    public let task: String
+    public let mode: String
+    public let debug: Bool
+
+    public init(task: String, mode: String = "default", debug: Bool = false) {
+        self.task = task
+        self.mode = mode
+        self.debug = debug
+    }
+}
+
+public struct RetrieveResult: Codable, Equatable, Sendable {
+    public let task: String?
+    public let project: String?
+    public let budget: Int?
+    public let retrieval_mode: String?
+    public let retrieval_verdict: String?
+    public let retrieval_confidence: Double?
+    public let retrieval_reasons: [String]?
+    public let relevant_facts: [RetrieveFact]?
+    public let relevant_wiki_pages: [RetrieveWikiPage]?
+    public let supporting_chunks: [RetrieveChunk]?
+    public let active_memories: [RetrieveMemory]?
+    public let candidate_memories: [RetrieveMemory]?
+    public let raw: [String: JSONValue]?
+}
+
+public struct RetrieveFact: Codable, Equatable, Identifiable, Sendable {
+    public let id: String
+    public let statement: String?
+    public let page_hint: String?
+    public let retrieval_score: Double?
+    public let score: Double?
+    public let selection_reasons: [String]?
+    public let fact_relevance_reasons: [String]?
+}
+
+public struct RetrieveWikiPage: Codable, Equatable, Identifiable, Sendable {
+    public let relative_path: String
+    public let title: String?
+    public let score: Double?
+    public let selection_reasons: [String]?
+
+    public var id: String { relative_path }
+}
+
+public struct RetrieveChunk: Codable, Equatable, Identifiable, Sendable {
+    public let chunk_id: String?
+    public let id: String?
+    public let document_id: String?
+    public let title: String?
+    public let source_type: String?
+    public let text: String?
+    public let snippet: String?
+    public let score: Double?
+    public let rerank_score: Double?
+    public let selection_reasons: [String]?
+    public let reasons: [String]?
+
+    public var stableID: String { chunk_id ?? id ?? document_id ?? title ?? snippet ?? text ?? "chunk" }
+}
+
+public struct RetrieveMemory: Codable, Equatable, Identifiable, Sendable {
+    public let id: String?
+    public let content: String?
+    public let memory_type: String?
+    public let scope: String?
+    public let memory_relevance_score: Double?
+
+    public var stableID: String { id ?? content ?? memory_type ?? scope ?? "memory" }
+}
+
 public struct ConnectorPayload: Codable, Equatable, Identifiable, Sendable {
     public let manifest: ConnectorManifestSummary
     public let state: ConnectorStateSummary

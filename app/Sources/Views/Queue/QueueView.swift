@@ -938,7 +938,7 @@ private struct FactPanel: View {
     }
 }
 
-private struct EvidenceQuote: View {
+struct EvidenceQuote: View {
     let text: String?
 
     var body: some View {
@@ -955,7 +955,7 @@ private struct EvidenceQuote: View {
     }
 }
 
-private struct MetadataRow: View {
+struct MetadataRow: View {
     let values: [String?]
 
     var body: some View {
@@ -975,7 +975,7 @@ private struct MetadataRow: View {
     }
 }
 
-private struct SourceDocumentsView: View {
+struct SourceDocumentsView: View {
     let documents: [QueueSourceDocument]
 
     var body: some View {
@@ -1200,11 +1200,11 @@ private struct QueueUndoToast: Equatable {
     let expiresAt: Date
 }
 
-private func shortID(_ value: String) -> String {
+func shortID(_ value: String) -> String {
     String(value.prefix(10))
 }
 
-private func confidenceText(_ value: Double?) -> String? {
+func confidenceText(_ value: Double?) -> String? {
     guard let value else {
         return nil
     }

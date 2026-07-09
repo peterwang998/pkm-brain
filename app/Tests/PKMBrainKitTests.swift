@@ -65,6 +65,41 @@ struct PKMBrainKitTests {
         #expect(connectors.connectors.first?.health.last_error == "sessions directory unavailable")
     }
 
+    @Test("wiki fixtures decode")
+    func wikiFixturesDecode() throws {
+        let pages: WikiPagesResponse = try decodeFixture("wiki_pages")
+        let page: WikiPageDetail = try decodeFixture("wiki_page")
+
+        #expect(pages.count == 1)
+        #expect(pages.pages.first?.displayTitle == "PKM Brain")
+        #expect(page.displayTitle == "PKM Brain")
+        #expect(page.facts?.first?.statement == "PKM Brain has a native macOS app shell.")
+        #expect(page.source_documents?.first?.source_id == "doc_1")
+    }
+
+    @Test("entity fixtures decode")
+    func entityFixturesDecode() throws {
+        let index: EntitiesResponse = try decodeFixture("entities")
+        let detail: EntityDetail = try decodeFixture("entity_detail")
+
+        #expect(index.count == 1)
+        #expect(index.types.first?.entity_type == "project")
+        #expect(detail.entity.name == "PKM Brain")
+        #expect(detail.facts_by_page.first?.facts.first?.statement == "PKM Brain has an entity detail view.")
+        #expect(detail.co_mentions.first?.name == "Codex")
+    }
+
+    @Test("retrieve fixture decodes")
+    func retrieveFixtureDecodes() throws {
+        let result: RetrieveResult = try decodeFixture("retrieve")
+
+        #expect(result.retrieval_verdict == "found")
+        #expect(result.relevant_facts?.first?.statement == "The native app has queue review shortcuts.")
+        #expect(result.relevant_wiki_pages?.first?.relative_path == "projects/pkm-brain.md")
+        #expect(result.supporting_chunks?.first?.stableID == "chunk_1")
+        #expect(result.active_memories?.first?.content == "Peter prefers numeric queue shortcuts.")
+    }
+
     @Test("migration fixture decodes")
     func migrationFixtureDecodes() throws {
         let plan: MigrationPlan = try decodeFixture("migration")

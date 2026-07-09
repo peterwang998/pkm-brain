@@ -59,6 +59,45 @@ public final class BrainAPIClient: Sendable {
         try await get("/api/connectors")
     }
 
+    public func wikiPages(query: String = "") async throws -> WikiPagesResponse {
+        if query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return try await get("/api/wiki/pages")
+        }
+        return try await get("/api/wiki/pages?q=\(percentEncodeQueryValue(query))")
+    }
+
+    public func wikiPage(path: String) async throws -> WikiPageDetail {
+        try await get("/api/wiki/page?path=\(percentEncodeQueryValue(path))")
+    }
+
+    public func entities(
+        query: String = "",
+        type: String = "",
+        includeInactive: Bool = false
+    ) async throws -> EntitiesResponse {
+        var items: [String] = []
+        let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedQuery.isEmpty {
+            items.append("q=\(percentEncodeQueryValue(trimmedQuery))")
+        }
+        if !type.isEmpty {
+            items.append("type=\(percentEncodeQueryValue(type))")
+        }
+        if includeInactive {
+            items.append("inactive=1")
+        }
+        let suffix = items.isEmpty ? "" : "?\(items.joined(separator: "&"))"
+        return try await get("/api/entities\(suffix)")
+    }
+
+    public func entityDetail(_ entityID: String) async throws -> EntityDetail {
+        try await get("/api/entities/\(percentEncodePathComponent(entityID))")
+    }
+
+    public func retrieve(_ request: RetrieveRequest) async throws -> RetrieveResult {
+        try await post("/api/retrieve", payload: request)
+    }
+
     public func runSchedulerJob(_ jobID: String) async throws -> SchedulerState {
         try await post("/api/scheduler/run", payload: ["job_id": jobID])
     }
