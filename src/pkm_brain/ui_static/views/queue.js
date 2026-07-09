@@ -130,12 +130,12 @@ function conflictCard(item) {
     ${existingFacts.map((fact, index) => factPanel(existingFacts.length > 1 ? `Existing ${index + 1}` : "Existing", fact)).join("")}
   </div>
   <div class="decision-bar">
-    <button data-decision="keep_existing" type="button"><kbd>e</kbd>keep existing</button>
-    <button data-decision="candidate_wins" type="button"><kbd>c</kbd>candidate wins</button>
-    <button data-decision="both_true" type="button"><kbd>b</kbd>both true</button>
-    <button data-decision="supports_existing" type="button"><kbd>s</kbd>supports existing</button>
-    <button data-decision="temporal_update" type="button" title="Candidate is the current state; existing fact becomes historical."><kbd>t</kbd>candidate current</button>
-    <button data-decision="unsure" type="button"><kbd>u</kbd>unsure</button>
+    <button data-decision="keep_existing" type="button"><kbd>1</kbd>keep existing</button>
+    <button data-decision="candidate_wins" type="button"><kbd>2</kbd>candidate wins</button>
+    <button data-decision="both_true" type="button"><kbd>3</kbd>both true</button>
+    <button data-decision="supports_existing" type="button"><kbd>4</kbd>supports existing</button>
+    <button data-decision="temporal_update" type="button" title="Candidate is the current state; existing fact becomes historical."><kbd>5</kbd>candidate current</button>
+    <button data-decision="unsure" type="button"><kbd>6</kbd>unsure</button>
   </div>`;
 }
 
@@ -181,6 +181,7 @@ function auditCard(item) {
 function actionCard(item) {
   const action = item.action || {};
   return `<h2>${esc(action.action_type)}</h2>
+    ${topologyTargetHtml(item.topology)}
     <div class="meta-row">${chip(action.status || "")}${chip(action.risk_tier || "")}${chip(action.proposed_by || "")}</div>
     <blockquote class="evidence">${esc(item.summary || "")}</blockquote>
     <div class="decision-bar">
@@ -188,6 +189,23 @@ function actionCard(item) {
       <button data-decision="reject" type="button"><kbd>r</kbd>reject</button>
       <button data-decision="skip" type="button"><kbd>e</kbd>skip</button>
     </div>`;
+}
+
+function topologyTargetHtml(topology) {
+  if (!topology) return "";
+  const labels = topology.entity_labels || [];
+  const ids = topology.entity_ids || [];
+  const pages = topology.page_hints || [];
+  const title = topology.target_label || labels.join(", ");
+  if (!title && !ids.length && !pages.length) return "";
+  return `<section class="orientation-panel">
+    <div class="muted">Target</div>
+    <strong>${esc(title || "Topology target")}</strong>
+    <div class="meta-row">
+      ${ids.length ? chip(`ids ${ids.join(", ")}`) : ""}
+      ${pages.length ? chip(`pages ${pages.join(", ")}`) : ""}
+    </div>
+  </section>`;
 }
 
 function genericCard(item) {
@@ -335,12 +353,12 @@ function keyDecision(item, key) {
   if (!item) return "";
   if (item.group === "conflicts") {
     return {
-      e: "keep_existing",
-      c: "candidate_wins",
-      b: "both_true",
-      s: "supports_existing",
-      t: "temporal_update",
-      u: "unsure",
+      1: "keep_existing",
+      2: "candidate_wins",
+      3: "both_true",
+      4: "supports_existing",
+      5: "temporal_update",
+      6: "unsure",
     }[key] || "";
   }
   if (item.group === "unrouted") return {r: "reject"}[key] || "";

@@ -124,14 +124,14 @@ Fallback-routed facts stop asking individually: they auto-file to the target ent
 
 - Conflict cards orient by **destination before candidate text**. The card title must identify the mapped entity/page/section/time frame, not simply repeat the candidate sentence. Required fields in `/api/queue` for fact review items: `orientation.entity_label`, `orientation.entity_key`, `orientation.page_hint`, `orientation.section_hint`, `orientation.candidate_observed_at`, `orientation.existing_observed_at`, `orientation.temporal_scope`, `orientation.currentness`, `orientation.relation`, and `orientation.relation_rationale`.
 - Conflict-card header format: `{entity_label} / {section_hint}` plus chips for page path, relation, candidate observed time, existing observed time, and currentness. The candidate sentence remains visible in the candidate panel, but it is not the primary title.
-- Decision keys gain relation-aware semantics and must be visible on the buttons:
-  - `e` = keep existing / reject candidate.
-  - `c` = candidate wins / replace current state.
-  - `b` = both true / coexist.
-  - `s` = supports existing — merge provenance only; never rewrite the existing statement or primary `evidence_quote`.
-  - `t` = candidate current — the candidate describes the current state; existing fact(s) are marked superseded/historical.
-  - `u` = unsure / skip for later.
-  Number keys remain available for route candidates, but conflict-card decisions use the relation letters above.
+- Decision keys gain relation-aware semantics and must be visible on the buttons, but conflicts use left-to-right numeric keys for speed:
+  - `1` = keep existing / reject candidate.
+  - `2` = candidate wins / replace current state.
+  - `3` = both true / coexist.
+  - `4` = supports existing — merge provenance only; never rewrite the existing statement or primary `evidence_quote`.
+  - `5` = candidate current — the candidate describes the current state; existing fact(s) are marked superseded/historical.
+  - `6` = unsure / skip for later.
+  Number keys are context-sensitive: conflict cards use `1-6` for decisions; unrouted cards use `1-5` for route candidates.
 - Group the queue by relation class with batch-accept per group ("accept all 14 supports-class items").
 - Escalation cards must state the *reason* in words (replace "matched policy policy_0621e9f4…" with the rule's human label + the relation + rationale from W1).
 

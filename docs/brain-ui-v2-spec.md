@@ -84,9 +84,9 @@ One unified inbox for every human-judgment item: `unrouted_fact`, `fact_conflict
 │       │   Hightouch offer d…  │  │ src: meeting…  │ src: meeting…  │ │
 │       │   (j/k to move)       │  │ conf 0.86      │ conf 0.91      │ │
 │       │                       │  └────────────────┴────────────────┘ │
-│       │                       │  [e] keep existing [c] candidate     │
-│       │                       │  [b] both true     [s] supports      │
-│       │                       │  [t] current       [u] unsure        │
+│       │                       │  [1] keep existing [2] candidate     │
+│       │                       │  [3] both true     [4] supports      │
+│       │                       │  [5] current       [6] unsure        │
 │       │                       │  (nav keys j/k NEVER decide — v2.1  │
 │       │                       │   fix: k collided with keep)        │
 └───────┴───────────────────────┴──────────────────────────────────────┘
@@ -94,9 +94,9 @@ One unified inbox for every human-judgment item: `unrouted_fact`, `fact_conflict
 
 Interaction contract:
 
-- `j/k` move, `enter` focus, decision keys act on the focused card **and auto-advance**; every decision fires an optimistic update plus a 6-second undo toast wired to the action inverse (or question re-open). On conflict cards `u` means "unsure"; outside conflict-card decision focus, `u` may still undo the last decision.
+- `j/k` move, `enter` focus, decision keys act on the focused card **and auto-advance**; every decision fires an optimistic update plus a 6-second undo toast wired to the action inverse (or question re-open). On conflict cards `1-6` are left-to-right decisions; outside conflict-card decision focus, `u` may still undo the last decision.
 - Progress ("3 of 81") and a session tally ("resolved 14 · skipped 2") — triage should feel like emptying an inbox.
-- Card payloads are complete: no decision may require leaving the pane. Unrouted cards show the fact + top-5 route candidates (fuzzy-ranked, numbered `1–5` to pick) + "new page…" + "reject". Topology cards show the proposal, affected pages/fact counts, and the gardener's evidence. Memory cards show content, type, scope, provenance.
+- Card payloads are complete: no decision may require leaving the pane. Unrouted cards show the fact + top-5 route candidates (fuzzy-ranked, numbered `1–5` to pick) + "new page…" + "reject". Topology cards show the resolved entity/page target names first, then ids, affected pages/fact counts, and the gardener's evidence. Memory cards show content, type, scope, provenance.
 - Batch mode: `x` selects, visible `Reject selected`/`Route selected…` bar appears. Filters persist in URL.
 - Every decision dispatches to the *existing* primitive (answer question / apply-reject action / approve memory) — the queue endpoint is an aggregator + dispatcher, never a second state store.
 - `/api/queue` must filter and paginate before building complete cards. A live backlog in the hundreds should keep `limit=1` under 300 ms on local hardware, and complete-card enrichment should run only for the returned page.

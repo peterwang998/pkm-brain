@@ -477,17 +477,78 @@ def test_v2_queue_conflict_keys_do_not_collide_with_navigation() -> None:
         encoding="utf-8"
     )
 
-    assert '<kbd>e</kbd>keep existing' in source
-    assert '<kbd>c</kbd>candidate wins' in source
-    assert '<kbd>b</kbd>both true' in source
-    assert '<kbd>s</kbd>supports existing' in source
-    assert '<kbd>t</kbd>candidate current' in source
-    assert '<kbd>u</kbd>unsure' in source
+    assert '<kbd>1</kbd>keep existing' in source
+    assert '<kbd>2</kbd>candidate wins' in source
+    assert '<kbd>3</kbd>both true' in source
+    assert '<kbd>4</kbd>supports existing' in source
+    assert '<kbd>5</kbd>candidate current' in source
+    assert '<kbd>6</kbd>unsure' in source
     assert 'key === "k") doDecision' not in source
-    assert 'e: "keep_existing"' in source
-    assert 'c: "candidate_wins"' in source
-    assert 's: "supports_existing"' in source
-    assert 't: "temporal_update"' in source
+    assert '1: "keep_existing"' in source
+    assert '2: "candidate_wins"' in source
+    assert '4: "supports_existing"' in source
+    assert '5: "temporal_update"' in source
+
+
+def test_v2_queue_topology_surfaces_entity_names(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    with connection(paths.sqlite_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO entities(id, name, entity_type, aliases, status, source_ids, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    "entity_primary",
+                    "Peter",
+                    "person",
+                    "[]",
+                    "active",
+                    "[]",
+                    "2026-07-09T10:00:00+00:00",
+                ),
+                (
+                    "entity_duplicate",
+                    "Peter Wang",
+                    "person",
+                    "[]",
+                    "active",
+                    "[]",
+                    "2026-07-09T10:00:00+00:00",
+                ),
+            ],
+        )
+    action = propose_action(
+        paths,
+        "entity_merge",
+        action_payload={
+            "canonical_entity_id": "entity_primary",
+            "merged_entity_ids": ["entity_duplicate"],
+            "reason": "entities share a normalized name or alias",
+        },
+        action_features={"reversible": True},
+        proposed_by="test",
+        risk_tier="low",
+    )
+
+    with running_ui(paths) as (host, port, token):
+        status, queue = request_json(
+            host,
+            port,
+            token,
+            "GET",
+            "/api/queue?kind=topology&limit=1",
+        )
+
+    assert status == 200
+    item = queue["items"][0]
+    assert item["id"] == action["id"]
+    assert item["title"] == "Merge entities: Peter, Peter Wang"
+    assert item["topology"]["target_label"] == "Peter, Peter Wang"
+    assert item["topology"]["entity_ids"] == ["entity_primary", "entity_duplicate"]
+    assert item["topology"]["entity_labels"] == ["Peter", "Peter Wang"]
 
 
 def test_v2_queue_decision_applies_and_undoes_linked_action(tmp_path: Path) -> None:

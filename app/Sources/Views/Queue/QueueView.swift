@@ -474,7 +474,7 @@ struct QueueView: View {
             Task { await batchApproveSelected() }
         case ("u", _, _) where selectedItem?.group != "conflicts":
             Task { await undoLast() }
-        case ("1", _, _), ("2", _, _), ("3", _, _), ("4", _, _), ("5", _, _):
+        case ("1", _, _), ("2", _, _), ("3", _, _), ("4", _, _), ("5", _, _), ("6", _, _):
             handleNumberKey(key)
         case ("a", _, _), ("r", _, _), ("b", _, _), ("c", _, _), ("d", _, _), ("e", _, _), ("o", _, _), ("s", _, _), ("t", _, _), ("u", _, _), ("v", _, _):
             if let decision = decisionForKey(key, item: selectedItem) {
@@ -518,12 +518,12 @@ struct QueueView: View {
         switch item.group {
         case "conflicts":
             return [
-                "e": "keep_existing",
-                "c": "candidate_wins",
-                "b": "both_true",
-                "s": "supports_existing",
-                "t": "temporal_update",
-                "u": "unsure",
+                "1": "keep_existing",
+                "2": "candidate_wins",
+                "3": "both_true",
+                "4": "supports_existing",
+                "5": "temporal_update",
+                "6": "unsure",
             ][key]
         case "unrouted":
             return ["r": "reject", "e": "skip", "s": "skip"][key]
@@ -604,27 +604,27 @@ private struct QueueDetail: View {
                 }
             }
             DecisionBar {
-                DecisionButton("Keep Existing", systemImage: "checkmark.shield", key: "e") {
+                DecisionButton("Keep Existing", systemImage: "checkmark.shield", key: "1") {
                     onDecision("keep_existing", [:])
                 }
-                DecisionButton("Candidate Wins", systemImage: "checkmark.circle", key: "c") {
+                DecisionButton("Candidate Wins", systemImage: "checkmark.circle", key: "2") {
                     onDecision("candidate_wins", [:])
                 }
-                DecisionButton("Both True", systemImage: "square.split.2x1", key: "b") {
+                DecisionButton("Both True", systemImage: "square.split.2x1", key: "3") {
                     onDecision("both_true", [:])
                 }
-                DecisionButton("Supports Existing", systemImage: "link", key: "s") {
+                DecisionButton("Supports Existing", systemImage: "link", key: "4") {
                     onDecision("supports_existing", [:])
                 }
                 DecisionButton(
                     "Candidate Current",
                     systemImage: "clock",
-                    key: "t",
+                    key: "5",
                     help: "Candidate is the current state; existing fact becomes historical."
                 ) {
                     onDecision("temporal_update", [:])
                 }
-                DecisionButton("Unsure", systemImage: "questionmark.circle", key: "u") {
+                DecisionButton("Unsure", systemImage: "questionmark.circle", key: "6") {
                     onDecision("unsure", [:])
                 }
             }
@@ -730,6 +730,9 @@ private struct QueueDetail: View {
         VStack(alignment: .leading, spacing: 14) {
             Text(actionType)
                 .font(.headline)
+            if let topology = item.topology {
+                TopologyTargetPanel(topology: topology)
+            }
             MetadataRow(values: [item.status, item.risk_tier, actionString("proposed_by")])
             EvidenceQuote(text: item.summary)
             DecisionBar {
@@ -770,6 +773,43 @@ private struct QueueDetail: View {
 
     private func actionString(_ key: String) -> String? {
         item.action?[key]?.stringValue
+    }
+}
+
+private struct TopologyTargetPanel: View {
+    let topology: QueueTopology
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text("Target")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(title)
+                .font(.callout.weight(.semibold))
+                .textSelection(.enabled)
+            MetadataRow(values: metadata)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var title: String {
+        let labels = (topology.entity_labels ?? []).filter { !$0.isEmpty }
+        if let target = topology.target_label, !target.isEmpty {
+            return target
+        }
+        if !labels.isEmpty {
+            return labels.joined(separator: ", ")
+        }
+        return "Topology target"
+    }
+
+    private var metadata: [String?] {
+        let ids = (topology.entity_ids ?? []).filter { !$0.isEmpty }
+        let pages = (topology.page_hints ?? []).filter { !$0.isEmpty }
+        return [
+            ids.isEmpty ? nil : "ids \(ids.joined(separator: ", "))",
+            pages.isEmpty ? nil : "pages \(pages.joined(separator: ", "))",
+        ]
     }
 }
 

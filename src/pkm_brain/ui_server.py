@@ -1157,6 +1157,7 @@ class QueueBuildContext:
         self._active_pages: list[dict[str, Any]] | None = None
         self._action_cache: dict[str, dict[str, Any]] = {}
         self._fact_cache: dict[str, dict[str, Any]] = {}
+        self._entity_cache: dict[str, dict[str, Any] | None] = {}
         self._source_document_cache: dict[str, dict[str, Any] | None] = {}
 
     def active_pages(self) -> list[dict[str, Any]]:
@@ -1184,6 +1185,28 @@ class QueueBuildContext:
             fact_id: self._fact_cache[fact_id]
             for fact_id in fact_ids
             if fact_id in self._fact_cache
+        }
+
+    def entities(self, entity_ids: list[str]) -> dict[str, dict[str, Any]]:
+        requested = [entity_id for entity_id in entity_ids if entity_id]
+        missing = [entity_id for entity_id in requested if entity_id not in self._entity_cache]
+        if missing and ui_table_exists(self.conn, "entities"):
+            placeholders = ",".join("?" for _ in missing)
+            rows = self.conn.execute(
+                f"""
+                SELECT id, name, entity_type, status
+                FROM entities
+                WHERE id IN ({placeholders})
+                """,
+                missing,
+            )
+            found = {str(row["id"]): dict(row) for row in rows}
+            for entity_id in missing:
+                self._entity_cache[entity_id] = found.get(entity_id)
+        return {
+            entity_id: row
+            for entity_id, row in self._entity_cache.items()
+            if entity_id in requested and row
         }
 
     def source_documents(self, source_ids: list[str]) -> list[dict[str, Any]]:
@@ -1914,7 +1937,8 @@ def queue_item_for_action(
     context: BrainPaths | QueueBuildContext, action: dict[str, Any]
 ) -> dict[str, Any]:
     payload = (action.get("evidence_json") or {}).get("payload")
-    title = action_title(action, payload)
+    topology = action_topology(context, action, payload)
+    title = action_title(context, action, payload)
     return {
         "id": action["id"],
         "source_type": "action",
@@ -1925,6 +1949,7 @@ def queue_item_for_action(
         "created_at": action.get("created_at"),
         "status": action.get("status"),
         "risk_tier": action.get("risk_tier"),
+        "topology": topology,
         "action": action,
         "proposal": payload,
         "raw": action,
@@ -1973,20 +1998,115 @@ def queue_item_for_memory(
     }
 
 
-def action_title(action: dict[str, Any], payload: Any) -> str:
+def action_title(
+    context: BrainPaths | QueueBuildContext, action: dict[str, Any], payload: Any
+) -> str:
     action_type = str(action.get("action_type") or "action")
     if isinstance(payload, dict):
         if action_type == "entity_merge":
-            names = payload.get("entity_names") or {}
             ids = [payload.get("canonical_entity_id"), *(payload.get("merged_entity_ids") or [])]
-            surfaces = [str(names.get(entity_id) or entity_id) for entity_id in ids if entity_id]
+            surfaces = entity_surfaces(context, ids, payload.get("entity_names"))
             return f"Merge entities: {', '.join(surfaces)}"
         if payload.get("candidate") and isinstance(payload["candidate"], dict):
-            return action_title(action, payload["candidate"])
+            return action_title(context, action, payload["candidate"])
         for key in ("page_hint", "destination_page_hint", "target_path"):
             if payload.get(key):
                 return f"{action_type}: {payload[key]}"
     return f"{action_type} · {short_id(str(action.get('id') or ''))}"
+
+
+def action_topology(
+    context: BrainPaths | QueueBuildContext, action: dict[str, Any], payload: Any
+) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    candidate = payload.get("candidate")
+    if isinstance(candidate, dict):
+        payload = candidate
+    action_type = str(action.get("action_type") or "action")
+    entity_ids = topology_entity_ids(action_type, payload)
+    page_hints = topology_page_hints(payload)
+    labels = entity_surfaces(context, entity_ids, payload.get("entity_names"))
+    fallback_label = topology_fallback_label(payload)
+    if not labels and fallback_label:
+        labels = [fallback_label]
+    if not entity_ids and not labels and not page_hints:
+        return None
+    return {
+        "entity_ids": entity_ids,
+        "entity_labels": labels,
+        "page_hints": page_hints,
+        "target_label": ", ".join(labels) if labels else "",
+    }
+
+
+def topology_entity_ids(action_type: str, payload: dict[str, Any]) -> list[str]:
+    ids: list[str] = []
+    if action_type == "entity_merge":
+        ids.append(str(payload.get("canonical_entity_id") or "").strip())
+        ids.extend(str(value or "").strip() for value in payload.get("merged_entity_ids") or [])
+    for key in ("entity_id", "canonical_entity_id", "canonical_entity"):
+        ids.append(str(payload.get(key) or "").strip())
+    contract = payload.get("contract")
+    if isinstance(contract, dict):
+        ids.append(str(contract.get("canonical_entity") or "").strip())
+    seen: set[str] = set()
+    unique = []
+    for entity_id in ids:
+        if entity_id and entity_id not in seen:
+            seen.add(entity_id)
+            unique.append(entity_id)
+    return unique
+
+
+def topology_page_hints(payload: dict[str, Any]) -> list[str]:
+    values = [
+        payload.get("page_hint"),
+        payload.get("destination_page_hint"),
+        payload.get("target_path"),
+    ]
+    contract = payload.get("contract")
+    if isinstance(contract, dict):
+        values.append(contract.get("page_hint"))
+    seen: set[str] = set()
+    hints = []
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in seen:
+            seen.add(text)
+            hints.append(text)
+    return hints
+
+
+def topology_fallback_label(payload: dict[str, Any]) -> str:
+    contract = payload.get("contract")
+    if isinstance(contract, dict):
+        return humanize_entity_id(str(contract.get("canonical_entity") or ""))
+    return humanize_entity_id(str(payload.get("canonical_entity") or payload.get("entity_id") or ""))
+
+
+def entity_surfaces(
+    context: BrainPaths | QueueBuildContext, entity_ids: list[Any], embedded_names: Any = None
+) -> list[str]:
+    ids = [str(entity_id or "").strip() for entity_id in entity_ids if str(entity_id or "").strip()]
+    names = embedded_names if isinstance(embedded_names, dict) else {}
+    rows = entities_by_id(context, ids)
+    surfaces = []
+    for entity_id in ids:
+        surface = str(names.get(entity_id) or rows.get(entity_id, {}).get("name") or "").strip()
+        surfaces.append(surface or humanize_entity_id(entity_id) or entity_id)
+    return surfaces
+
+
+def humanize_entity_id(entity_id: str) -> str:
+    value = entity_id.strip()
+    if not value:
+        return ""
+    if value.startswith("entity_"):
+        return ""
+    if ":" in value:
+        value = value.split(":")[-1]
+    return humanize_slug(value)
 
 
 def action_summary(action: dict[str, Any], payload: Any) -> str:
@@ -2033,6 +2153,29 @@ def queue_source_document_summaries(
     if isinstance(context, QueueBuildContext):
         return context.source_documents(source_ids)
     return source_document_summaries(context, source_ids)
+
+
+def entities_by_id(
+    context: BrainPaths | QueueBuildContext, entity_ids: list[str]
+) -> dict[str, dict[str, Any]]:
+    if not entity_ids:
+        return {}
+    if isinstance(context, QueueBuildContext):
+        return context.entities(entity_ids)
+    placeholders = ",".join("?" for _ in entity_ids)
+    paths = queue_context_paths(context)
+    with connection(paths.sqlite_path) as conn:
+        if not ui_table_exists(conn, "entities"):
+            return {}
+        rows = conn.execute(
+            f"""
+            SELECT id, name, entity_type, status
+            FROM entities
+            WHERE id IN ({placeholders})
+            """,
+            entity_ids,
+        )
+        return {str(row["id"]): dict(row) for row in rows}
 
 
 def facts_by_id(
