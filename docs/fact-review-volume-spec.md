@@ -1,7 +1,7 @@
 # Fact Conflict Precision & Review-Volume Budget — Spec
 
 **Status:** implementation spec for Codex
-**Last verified:** 2026-07-09 against the live brain DB (read-only snapshot) and current HEAD (`791bbff`)
+**Last verified:** 2026-07-09 against the live brain DB (read-only snapshot) and implementation commit `1cde4ca`
 **Author:** Claude, from Peter's report: "most of the 'conflicts' I'm asked about are both true — the candidate usually *supports* the existing fact" + "~900 items to review is too high a volume"
 **Companions:** `docs/chief-of-staff-spec.md` (action/policy model — unchanged), `docs/extraction-payload-spec.md` (extraction contract — unchanged), `docs/macos-app-spec.md` M4 Queue (consumes these improvements)
 
