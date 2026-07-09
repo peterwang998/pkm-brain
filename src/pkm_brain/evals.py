@@ -891,7 +891,12 @@ def mine_answered_relation_cases(paths: BrainPaths, *, limit: int = 100) -> list
             continue
         options = loads(question["options"], [])
         candidate = first_option_fact(options, "candidate_fact")
-        existing = first_option_fact(options, "existing_fact") or first_option_fact(options, None)
+        existing = first_option_fact(options, "existing_fact")
+        if not candidate or not existing:
+            pair = option_fact_pair(options)
+            if pair is None:
+                continue
+            existing, candidate = pair
         if not candidate or not existing:
             continue
         case_id = f"mined_{question['id']}"
@@ -927,7 +932,17 @@ def relation_from_answer(answer: Any) -> str | None:
         return "complementary"
     if decision in {"dismiss", "reject", "keep_existing"}:
         return "contradicts"
+    reason = str(answer.get("reason") or "").strip().lower()
+    if "duplicate alternatives merged" in reason:
+        return "duplicate"
     return None
+
+
+def option_fact_pair(options: list[Any]) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    facts = [fact for option in options if (fact := option_to_fact(option)) is not None]
+    if len(facts) < 2:
+        return None
+    return facts[0], facts[1]
 
 
 def first_option_fact(options: list[Any], option_type: str | None) -> dict[str, Any] | None:
@@ -936,21 +951,29 @@ def first_option_fact(options: list[Any], option_type: str | None) -> dict[str, 
             continue
         if option_type is not None and option.get("option_type") != option_type:
             continue
-        statement = str(option.get("statement") or "").strip()
-        if not statement:
-            continue
-        fact_id = str(option.get("fact_id") or option.get("id") or "").strip()
-        return {
-            "id": fact_id or None,
-            "statement": statement,
-            "entity_key": option.get("entity_key"),
-            "page_hint": option.get("page_hint"),
-            "source_ids": option.get("source_ids") or [],
-            "source_spans": option.get("source_spans") or [],
-            "evidence_quote": option.get("evidence_quote"),
-            "observed_at": option.get("observed_at"),
-        }
+        fact = option_to_fact(option)
+        if fact is not None:
+            return fact
     return None
+
+
+def option_to_fact(option: Any) -> dict[str, Any] | None:
+    if not isinstance(option, dict):
+        return None
+    statement = str(option.get("statement") or "").strip()
+    if not statement:
+        return None
+    fact_id = str(option.get("fact_id") or option.get("id") or "").strip()
+    return {
+        "id": fact_id or None,
+        "statement": statement,
+        "entity_key": option.get("entity_key"),
+        "page_hint": option.get("page_hint"),
+        "source_ids": option.get("source_ids") or [],
+        "source_spans": option.get("source_spans") or [],
+        "evidence_quote": option.get("evidence_quote"),
+        "observed_at": option.get("observed_at"),
+    }
 
 
 def evaluate_relation_case(case: dict[str, Any]) -> dict[str, Any]:
