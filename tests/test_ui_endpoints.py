@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Iterator
 
 from pkm_brain import ui_server
-from pkm_brain.cos_actions import decide_action, propose_action, record_action_audit
+from pkm_brain.cos_actions import apply_action, decide_action, propose_action, record_action_audit
 from pkm_brain.db import connection, dumps
 from pkm_brain.paths import BrainPaths
 from pkm_brain.service import BrainService, memory_export_path
@@ -162,9 +162,49 @@ def review_fact_payload(fact_id: str = "fact_review") -> dict[str, object]:
     }
 
 
+def existing_review_fact_payload(fact_id: str = "fact_existing") -> dict[str, object]:
+    fact = review_fact_payload(fact_id)
+    fact.update(
+        {
+            "statement": "The old review workflow did not show enough evidence.",
+            "source_ids": ["manual:existing"],
+            "observed_at": "2026-07-05T10:00:00+00:00",
+            "evidence_quote": "The old review workflow did not show enough evidence.",
+            "source_spans": [
+                {
+                    "source_id": "manual:existing",
+                    "start_char": 0,
+                    "end_char": 54,
+                    "quote": "The old review workflow did not show enough evidence.",
+                }
+            ],
+        }
+    )
+    return fact
+
+
+def apply_existing_review_fact(paths: BrainPaths) -> dict[str, object]:
+    fact = existing_review_fact_payload()
+    apply_action(
+        paths,
+        propose_action(
+            paths,
+            "fact_upsert",
+            action_payload={"fact": fact},
+            action_features={"truth_mutation": True, "reversible": True},
+            target_fact_ids=[str(fact["id"])],
+            target_page_paths=[str(fact["page_hint"])],
+            proposed_by="test",
+            risk_tier="low",
+        )["id"],
+    )
+    return fact
+
+
 def insert_review_question_for_action(
     paths: BrainPaths, *, question_id: str, action_id: str, fact: dict[str, object]
 ) -> None:
+    existing = existing_review_fact_payload()
     with connection(paths.sqlite_path) as conn:
         conn.execute(
             """
@@ -189,10 +229,8 @@ def insert_review_question_for_action(
                         },
                         {
                             "option_type": "existing_fact",
-                            "fact_id": "fact_existing",
-                            "statement": "The old review workflow did not show enough evidence.",
-                            "evidence_quote": "The old review workflow did not show enough evidence.",
-                            "source_ids": ["manual:existing"],
+                            "fact_id": existing["id"],
+                            **existing,
                         },
                     ]
                 ),
@@ -304,6 +342,13 @@ def test_v2_digest_and_queue_return_complete_review_cards(tmp_path: Path) -> Non
     assert queue_status == 200
     conflict = next(item for item in queue["items"] if item["id"] == "question_v2_queue")
     assert conflict["group"] == "conflicts"
+    assert conflict["title"] == "Review Workflow / Summary"
+    assert conflict["orientation"]["entity_label"] == "Review Workflow"
+    assert conflict["orientation"]["page_hint"] == "concepts/review-workflow.md"
+    assert conflict["orientation"]["section_hint"] == "Summary"
+    assert conflict["orientation"]["candidate_observed_at"] == "2026-07-06T10:00:00+00:00"
+    assert conflict["orientation"]["existing_observed_at"] == "2026-07-05T10:00:00+00:00"
+    assert conflict["orientation"]["temporal_scope"] == "atemporal_claim"
     assert conflict["candidate"]["statement"] == fact["statement"]
     assert conflict["counterparts"][0]["statement"] == "The old review workflow did not show enough evidence."
     memory = next(item for item in queue["items"] if item["group"] == "memories")
@@ -432,10 +477,17 @@ def test_v2_queue_conflict_keys_do_not_collide_with_navigation() -> None:
         encoding="utf-8"
     )
 
-    assert '<kbd>1</kbd>keep existing' in source
-    assert '<kbd>2</kbd>candidate wins' in source
+    assert '<kbd>e</kbd>keep existing' in source
+    assert '<kbd>c</kbd>candidate wins' in source
+    assert '<kbd>b</kbd>both true' in source
+    assert '<kbd>s</kbd>supports existing' in source
+    assert '<kbd>t</kbd>temporal update' in source
+    assert '<kbd>u</kbd>unsure' in source
     assert 'key === "k") doDecision' not in source
-    assert 'if (item.group === "conflicts") return {b: "both_true", r: "reject"}' in source
+    assert 'e: "keep_existing"' in source
+    assert 'c: "candidate_wins"' in source
+    assert 's: "supports_existing"' in source
+    assert 't: "temporal_update"' in source
 
 
 def test_v2_queue_decision_applies_and_undoes_linked_action(tmp_path: Path) -> None:
@@ -502,6 +554,102 @@ def test_v2_queue_decision_applies_and_undoes_linked_action(tmp_path: Path) -> N
     assert question["status"] == "needs_human"
     assert question["decided_by"] is None
     assert action_row["status"] == "needs_human"
+
+
+def test_v2_queue_supports_existing_merges_provenance_only(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    apply_existing_review_fact(paths)
+    fact = review_fact_payload("fact_supporting")
+    action = propose_action(
+        paths,
+        "fact_upsert",
+        action_payload={"fact": fact},
+        action_features={"truth_mutation": True, "reversible": True},
+        target_fact_ids=[str(fact["id"])],
+        target_page_paths=[str(fact["page_hint"])],
+        proposed_by="test",
+        risk_tier="medium",
+    )
+    insert_review_question_for_action(
+        paths,
+        question_id="question_supports_existing",
+        action_id=action["id"],
+        fact=fact,
+    )
+
+    with running_ui(paths) as (host, port, token):
+        status, body = request_json(
+            host,
+            port,
+            token,
+            "POST",
+            "/api/queue/question_supports_existing/decision",
+            {"decision": "supports_existing"},
+        )
+
+    assert status == 200
+    assert body["result"]["question"]["answer"]["decision"] == "supports_existing"
+    with connection(paths.sqlite_path) as conn:
+        existing = conn.execute(
+            "SELECT statement, source_ids, evidence_quote, metadata FROM facts WHERE id = 'fact_existing'"
+        ).fetchone()
+        old_action = conn.execute(
+            "SELECT status FROM cos_actions WHERE id = ?", (action["id"],)
+        ).fetchone()
+    assert existing["statement"] == "The old review workflow did not show enough evidence."
+    assert json.loads(existing["source_ids"]) == ["manual:existing", "manual:test"]
+    assert existing["evidence_quote"] == "The old review workflow did not show enough evidence."
+    assert json.loads(existing["metadata"])["supporting_candidates"][0]["question_id"] == "question_supports_existing"
+    assert old_action["status"] == "rejected"
+
+
+def test_v2_queue_temporal_update_supersedes_existing_fact(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    apply_existing_review_fact(paths)
+    fact = review_fact_payload("fact_temporal_current")
+    fact["statement"] = "The review workflow now has enough evidence to make a decision."
+    action = propose_action(
+        paths,
+        "fact_upsert",
+        action_payload={"fact": fact},
+        action_features={"truth_mutation": True, "reversible": True},
+        target_fact_ids=[str(fact["id"])],
+        target_page_paths=[str(fact["page_hint"])],
+        proposed_by="test",
+        risk_tier="medium",
+    )
+    insert_review_question_for_action(
+        paths,
+        question_id="question_temporal_update",
+        action_id=action["id"],
+        fact=fact,
+    )
+
+    with running_ui(paths) as (host, port, token):
+        status, body = request_json(
+            host,
+            port,
+            token,
+            "POST",
+            "/api/queue/question_temporal_update/decision",
+            {"decision": "temporal_update"},
+        )
+
+    assert status == 200
+    assert body["result"]["question"]["answer"]["decision"] == "temporal_update"
+    with connection(paths.sqlite_path) as conn:
+        current = conn.execute(
+            "SELECT status, supersedes_id, metadata FROM facts WHERE id = 'fact_temporal_current'"
+        ).fetchone()
+        existing = conn.execute(
+            "SELECT status FROM facts WHERE id = 'fact_existing'"
+        ).fetchone()
+    assert current["status"] == "active"
+    assert current["supersedes_id"] == "fact_existing"
+    assert json.loads(current["metadata"])["temporal_update"]["superseded_fact_ids"] == ["fact_existing"]
+    assert existing["status"] == "superseded"
 
 
 def test_m4_queue_acceptance_mixed_decisions_land_and_undo(tmp_path: Path) -> None:

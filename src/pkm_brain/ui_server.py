@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import re
 import secrets
 import threading
 from importlib import resources
@@ -62,6 +63,7 @@ from .wiki import (
 )
 from .wiki_facts import (
     answer_open_question,
+    apply_fact_status_action,
     create_confirmed_page_fact,
     managed_fact_page_review,
     reconcile_open_fact_questions,
@@ -1593,8 +1595,10 @@ def queue_item_for_question(
     candidate = question_candidate_fact(context, question)
     counterparts = question_counterpart_facts(context, question)
     summary = readable_question_summary(context, question)
+    orientation = queue_fact_orientation(context, question, candidate, counterparts)
     title = compact_text(
-        (candidate or {}).get("statement")
+        orientation.get("title")
+        or (candidate or {}).get("statement")
         or question.get("question")
         or question.get("page_hint")
         or question.get("entity_key")
@@ -1617,6 +1621,7 @@ def queue_item_for_question(
         "question": question,
         "candidate": candidate,
         "counterparts": counterparts,
+        "orientation": orientation,
         "options": question.get("options") or [],
         "raw": question,
     }
@@ -1660,6 +1665,204 @@ def readable_policy_escalation_reason(
         },
         action.get("action_features") or {},
     )
+
+
+def queue_fact_orientation(
+    context: BrainPaths | QueueBuildContext,
+    question: dict[str, Any],
+    candidate: dict[str, Any] | None,
+    counterparts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    primary = candidate or (counterparts[0] if counterparts else {})
+    if not primary and not question.get("page_hint") and not question.get("entity_key"):
+        return {}
+    relation = queue_relation_context(context, question)
+    page_hint = first_nonempty(
+        (candidate or {}).get("page_hint"),
+        question.get("page_hint"),
+        *[fact.get("page_hint") for fact in counterparts],
+    )
+    section_hint = first_nonempty(
+        (candidate or {}).get("section_hint"),
+        *[fact.get("section_hint") for fact in counterparts],
+        "Summary",
+    )
+    entity_key = first_nonempty(
+        (candidate or {}).get("entity_key"),
+        question.get("entity_key"),
+        *[fact.get("entity_key") for fact in counterparts],
+    )
+    entity_label = fact_entity_label(entity_key, page_hint)
+    candidate_observed_at = first_nonempty(
+        (candidate or {}).get("effective_at"),
+        (candidate or {}).get("observed_at"),
+        (candidate or {}).get("last_seen_at"),
+    )
+    existing_observed_at = newest_timestamp(
+        [
+            first_nonempty(
+                fact.get("effective_at"),
+                fact.get("observed_at"),
+                fact.get("last_seen_at"),
+            )
+            for fact in counterparts
+        ]
+    )
+    temporal_scope = infer_fact_temporal_scope(candidate or primary)
+    existing_temporal_scope = infer_fact_temporal_scope(counterparts[0]) if counterparts else ""
+    currentness = fact_currentness_label(str(relation.get("relation") or ""), temporal_scope)
+    return {
+        "title": orientation_title(entity_label, section_hint),
+        "entity_label": entity_label,
+        "entity_key": entity_key,
+        "page_hint": page_hint,
+        "section_hint": section_hint,
+        "candidate_observed_at": candidate_observed_at,
+        "existing_observed_at": existing_observed_at,
+        "temporal_scope": temporal_scope,
+        "existing_temporal_scope": existing_temporal_scope,
+        "currentness": currentness,
+        "relation": relation.get("relation") or "",
+        "relation_confidence": relation.get("confidence"),
+        "relation_rationale": relation.get("rationale") or "",
+    }
+
+
+def queue_relation_context(
+    context: BrainPaths | QueueBuildContext, question: dict[str, Any]
+) -> dict[str, Any]:
+    question_context = question.get("context") or {}
+    for key in ("relation", "relation_classification"):
+        value = question_context.get(key)
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value:
+            return {"relation": value}
+    action_id = str(question.get("action_id") or "").strip()
+    if not action_id:
+        return {}
+    try:
+        action = get_action_for_queue(context, action_id)
+    except ValueError:
+        return {}
+    features = action.get("action_features") or {}
+    if features.get("relation"):
+        return {
+            "relation": features.get("relation"),
+            "confidence": features.get("relation_confidence"),
+            "rationale": features.get("relation_rationale") or "",
+        }
+    resolver = (action.get("evidence_json") or {}).get("resolver_precheck") or {}
+    classifications = resolver.get("relation_classifications") or []
+    if not isinstance(classifications, list):
+        return {}
+    valid = [item for item in classifications if isinstance(item, dict)]
+    if not valid:
+        return {}
+    return max(valid, key=lambda item: float(item.get("confidence") or 0.0))
+
+
+def infer_fact_temporal_scope(fact: dict[str, Any]) -> str:
+    statement = str(fact.get("statement") or "").casefold()
+    if not statement:
+        return ""
+    if re.search(r"\b(from|between)\b.+\b(to|through|until)\b", statement) or re.search(
+        r"\bsince\b.+\b(until|through|present|now|today)\b", statement
+    ):
+        return "interval_state"
+    stale_markers = (
+        "last week",
+        "yesterday",
+        "tomorrow",
+        "next week",
+        "this morning",
+        "this afternoon",
+        "waiting on",
+        "scheduled",
+        "upcoming",
+    )
+    if any(marker in statement for marker in stale_markers):
+        return "stale_observation"
+    current_markers = (
+        "currently",
+        "right now",
+        "now has",
+        "still",
+        "is in ",
+        "is working",
+        "has an offer",
+        "has one offer",
+        "has two",
+    )
+    if any(marker in statement for marker in current_markers):
+        return "current_state"
+    event_markers = (
+        " said ",
+        " worked ",
+        " interviewed ",
+        " met ",
+        " accepted ",
+        " completed ",
+        " decided ",
+        " launched ",
+        " shipped ",
+    )
+    if any(marker in f" {statement} " for marker in event_markers):
+        return "event"
+    if fact.get("effective_at") and fact.get("observed_at"):
+        return "current_state"
+    return "atemporal_claim"
+
+
+def fact_currentness_label(relation: str, temporal_scope: str) -> str:
+    if relation == "updates":
+        return "candidate becomes current; existing becomes historical"
+    labels = {
+        "current_state": "candidate reads as current state",
+        "interval_state": "candidate describes a time interval",
+        "stale_observation": "time-bound observation; verify whether still current",
+        "event": "historical event",
+        "atemporal_claim": "durable claim",
+    }
+    return labels.get(temporal_scope, "")
+
+
+def orientation_title(entity_label: str, section_hint: str) -> str:
+    parts = [part for part in [entity_label, section_hint] if part]
+    return " / ".join(parts)
+
+
+def fact_entity_label(entity_key: Any, page_hint: Any) -> str:
+    key_parts = [part for part in str(entity_key or "").split(":") if part]
+    useful_parts = [
+        part
+        for part in key_parts
+        if part not in {"summary", "overview", "details", "concepts", "people", "projects", "career"}
+    ]
+    if useful_parts:
+        return humanize_slug(useful_parts[0])
+    path = str(page_hint or "").removesuffix(".md")
+    if path:
+        return humanize_slug(path.split("/")[-1])
+    return ""
+
+
+def humanize_slug(value: str) -> str:
+    words = re.sub(r"[_/-]+", " ", value).strip()
+    return " ".join(word.capitalize() for word in words.split())
+
+
+def newest_timestamp(values: list[Any]) -> str:
+    timestamps = [str(value) for value in values if str(value or "").strip()]
+    return max(timestamps) if timestamps else ""
+
+
+def first_nonempty(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
 
 
 def question_candidate_fact(
@@ -2017,8 +2220,19 @@ def decide_queue_question(
     previous = question_undo_state(question)
     if question.get("kind") == "unrouted_fact" and normalized in {"route", "new_page"}:
         return route_unrouted_question(paths, question, payload, previous)
+    if normalized in {"unsure", "skip_later"}:
+        return {
+            "status": "skipped",
+            "item_id": question["id"],
+            "result": {"question": question},
+            "undo_handle": None,
+        }
     if normalized in {"both_true", "contested"}:
         return contest_question_candidate(paths, question, previous)
+    if normalized in {"supports", "supports_existing", "merge_evidence"}:
+        return support_existing_question_candidate(paths, question, previous)
+    if normalized in {"temporal_update", "updates", "current_state"}:
+        return temporal_update_question_candidate(paths, question, previous)
     if normalized in {"apply", "approve", "candidate", "candidate_wins", "accept"}:
         action_states = linked_question_action_states(paths, question)
         result = apply_question_candidate(paths, question, payload)
@@ -2110,6 +2324,218 @@ def reject_question_candidate(
         action_id=None,
     )
     return {"question": get_review_question(paths, question["id"])}
+
+
+def support_existing_question_candidate(
+    paths: BrainPaths, question: dict[str, Any], previous: dict[str, Any]
+) -> dict[str, Any]:
+    candidate = question_candidate_fact(paths, question)
+    if not candidate:
+        raise BadRequestError("supports_existing requires a candidate fact")
+    counterpart_id = first_counterpart_fact_id(paths, question)
+    if not counterpart_id:
+        raise BadRequestError("supports_existing requires an existing fact")
+    existing = facts_by_id(paths, [counterpart_id]).get(counterpart_id)
+    if not existing:
+        raise BadRequestError(f"existing fact not found: {counterpart_id}")
+    action_states = linked_question_action_states(paths, question)
+    merged = supported_existing_fact(existing, candidate, question["id"])
+    action = apply_action(
+        paths,
+        propose_action(
+            paths,
+            "fact_upsert",
+            action_payload={"fact": merged},
+            action_features={
+                "human_confirmed": True,
+                "truth_mutation": False,
+                "reversible": True,
+                "affected_fact_count": 1,
+                "relation": "supports",
+            },
+            target_fact_ids=[counterpart_id],
+            target_page_paths=[str(merged.get("page_hint") or "")]
+            if merged.get("page_hint")
+            else [],
+            proposed_by="ui_queue_supports_existing",
+            confidence=float(merged.get("confidence") or 1.0),
+            risk_tier="low",
+        )["id"],
+    )
+    old_action_id = str(question.get("action_id") or "").strip()
+    if old_action_id:
+        reject_linked_review_action(
+            paths, old_action_id, "replaced by supports-existing queue decision"
+        )
+    mark_review_question_decided(
+        paths,
+        question["id"],
+        status="answered",
+        answer={
+            "decision": "supports_existing",
+            "existing_fact_id": counterpart_id,
+            "support_action_id": action["id"],
+        },
+        action_id=action["id"],
+    )
+    return {
+        "status": "decided",
+        "item_id": question["id"],
+        "result": {
+            "question": get_review_question(paths, question["id"]),
+            "action": action,
+        },
+        "undo_handle": {
+            "kind": "question_actions",
+            "question": previous,
+            "action_ids": [action["id"]],
+            "actions": action_states,
+        },
+    }
+
+
+def temporal_update_question_candidate(
+    paths: BrainPaths, question: dict[str, Any], previous: dict[str, Any]
+) -> dict[str, Any]:
+    candidate = question_candidate_fact(paths, question)
+    if not candidate:
+        raise BadRequestError("temporal_update requires a candidate fact")
+    counterpart_ids = [
+        str(fact.get("id") or fact.get("fact_id"))
+        for fact in question_counterpart_facts(paths, question)
+        if fact.get("id") or fact.get("fact_id")
+    ]
+    if not counterpart_ids:
+        raise BadRequestError("temporal_update requires existing fact ids")
+    action_states = linked_question_action_states(paths, question)
+    temporal_candidate = temporal_update_fact(candidate, counterpart_ids, question["id"])
+    candidate_action = apply_action(
+        paths,
+        propose_action(
+            paths,
+            "fact_upsert",
+            action_payload={"fact": temporal_candidate},
+            action_features={
+                "human_confirmed": True,
+                "truth_mutation": True,
+                "reversible": True,
+                "affected_fact_count": 1 + len(counterpart_ids),
+                "relation": "updates",
+            },
+            target_fact_ids=[str(temporal_candidate["id"])],
+            target_page_paths=[str(temporal_candidate.get("page_hint") or "")]
+            if temporal_candidate.get("page_hint")
+            else [],
+            proposed_by="ui_queue_temporal_update",
+            confidence=float(temporal_candidate.get("confidence") or 1.0),
+            risk_tier="medium",
+        )["id"],
+    )
+    supersede_action = apply_fact_status_action(
+        paths,
+        "fact_supersede",
+        [
+            {"fact_id": fact_id, "status": "superseded", "conflict_group_id": None}
+            for fact_id in counterpart_ids
+        ],
+        proposed_by="ui_queue_temporal_update",
+        risk_tier="medium",
+    )
+    old_action_id = str(question.get("action_id") or "").strip()
+    if old_action_id:
+        reject_linked_review_action(
+            paths, old_action_id, "replaced by temporal-update queue decision"
+        )
+    action_ids = [candidate_action["id"]]
+    actions = [candidate_action]
+    if supersede_action.get("id"):
+        action_ids.insert(0, str(supersede_action["id"]))
+        actions.append(supersede_action)
+    mark_review_question_decided(
+        paths,
+        question["id"],
+        status="answered",
+        answer={
+            "decision": "temporal_update",
+            "candidate_fact_id": str(temporal_candidate["id"]),
+            "superseded_fact_ids": counterpart_ids,
+            "candidate_action_id": candidate_action["id"],
+            "supersede_action_id": supersede_action.get("id"),
+        },
+        action_id=candidate_action["id"],
+    )
+    return {
+        "status": "decided",
+        "item_id": question["id"],
+        "result": {
+            "question": get_review_question(paths, question["id"]),
+            "actions": actions,
+        },
+        "undo_handle": {
+            "kind": "question_actions",
+            "question": previous,
+            "action_ids": action_ids,
+            "actions": action_states,
+        },
+    }
+
+
+def supported_existing_fact(
+    existing: dict[str, Any], candidate: dict[str, Any], question_id: str
+) -> dict[str, Any]:
+    timestamp = now_iso()
+    metadata = existing.get("metadata") if isinstance(existing.get("metadata"), dict) else {}
+    support_records = metadata.get("supporting_candidates")
+    if not isinstance(support_records, list):
+        support_records = []
+    support_records.append(
+        {
+            "question_id": question_id,
+            "statement": candidate.get("statement"),
+            "evidence_quote": candidate.get("evidence_quote") or candidate.get("quote"),
+            "source_ids": candidate.get("source_ids") or [],
+            "observed_at": candidate.get("observed_at"),
+            "attached_at": timestamp,
+        }
+    )
+    source_spans = [
+        *(existing.get("source_spans") or []),
+        *(candidate.get("source_spans") or []),
+    ]
+    return {
+        **existing,
+        "source_ids": stable_unique_strings(
+            [*(existing.get("source_ids") or []), *(candidate.get("source_ids") or [])]
+        ),
+        "source_spans": source_spans,
+        "metadata": {**metadata, "supporting_candidates": support_records[-25:]},
+        "last_seen_at": candidate.get("observed_at") or timestamp,
+    }
+
+
+def temporal_update_fact(
+    candidate: dict[str, Any], counterpart_ids: list[str], question_id: str
+) -> dict[str, Any]:
+    timestamp = now_iso()
+    metadata = candidate.get("metadata") if isinstance(candidate.get("metadata"), dict) else {}
+    fact_id = str(candidate.get("id") or new_id("fact"))
+    return {
+        **candidate,
+        "id": fact_id,
+        "status": "active",
+        "supersedes_id": counterpart_ids[0],
+        "metadata": {
+            **metadata,
+            "temporal_update": {
+                "question_id": question_id,
+                "superseded_fact_ids": counterpart_ids,
+                "decided_at": timestamp,
+            },
+        },
+        "last_seen_at": candidate.get("last_seen_at")
+        or candidate.get("observed_at")
+        or timestamp,
+    }
 
 
 def route_unrouted_question(

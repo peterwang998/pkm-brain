@@ -83,6 +83,8 @@ details.raw pre { background: var(--panel-2); border: 1px solid var(--line); bor
 .queue-item:hover { background: var(--panel-2); }
 .queue-item[aria-selected="true"] { background: var(--accent-bg); border-color: var(--accent); }
 .queue-item .kind { font-size: var(--fs-xs); color: var(--text-2); }
+.orientation-card { border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); padding: var(--s3) 0; margin-bottom: var(--s4); }
+.orientation-card strong { display: block; font-size: var(--fs-lg); font-weight: 600; margin-bottom: var(--s1); }
 .card-pair { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s3); }
 .decision-bar { display: flex; flex-wrap: wrap; gap: var(--s2); margin-top: var(--s4); }
 .decision-bar kbd {

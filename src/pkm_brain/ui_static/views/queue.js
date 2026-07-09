@@ -108,6 +108,7 @@ function detailHtml(item, state) {
     </div>
     <div class="progress">${esc(position)} · resolved ${state.tally.resolved} · skipped ${state.tally.skipped}</div>
   </div>
+  ${orientationHtml(item)}
   ${cardHtml(item)}
   ${raw(item)}`;
 }
@@ -123,17 +124,18 @@ function cardHtml(item) {
 
 function conflictCard(item) {
   const candidate = item.candidate || {};
-  const existing = item.counterparts?.[0] || {};
+  const existingFacts = item.counterparts?.length ? item.counterparts : [{}];
   return `<div class="card-pair">
     ${factPanel("Candidate", candidate)}
-    ${factPanel("Existing", existing)}
+    ${existingFacts.map((fact, index) => factPanel(existingFacts.length > 1 ? `Existing ${index + 1}` : "Existing", fact)).join("")}
   </div>
   <div class="decision-bar">
-    <button data-decision="keep_existing" type="button"><kbd>1</kbd>keep existing</button>
-    <button data-decision="candidate_wins" type="button"><kbd>2</kbd>candidate wins</button>
+    <button data-decision="keep_existing" type="button"><kbd>e</kbd>keep existing</button>
+    <button data-decision="candidate_wins" type="button"><kbd>c</kbd>candidate wins</button>
     <button data-decision="both_true" type="button"><kbd>b</kbd>both true</button>
-    <button data-decision="reject" type="button"><kbd>r</kbd>reject</button>
-    <button data-decision="skip" type="button"><kbd>e</kbd>skip</button>
+    <button data-decision="supports_existing" type="button"><kbd>s</kbd>supports existing</button>
+    <button data-decision="temporal_update" type="button"><kbd>t</kbd>temporal update</button>
+    <button data-decision="unsure" type="button"><kbd>u</kbd>unsure</button>
   </div>`;
 }
 
@@ -204,6 +206,29 @@ function factPanel(label, fact) {
     <blockquote class="evidence">${esc(fact.evidence_quote || fact.quote || "")}</blockquote>
     <div class="meta-row">${chip(`conf ${fact.truth_confidence ?? fact.confidence ?? ""}`)}${chip(fact.page_hint || "")}</div>
     ${sourceList(fact.source_ids || [], fact.source_documents || [])}
+  </div>`;
+}
+
+function orientationHtml(item) {
+  const orientation = item.orientation || {};
+  if (!orientation.title && !orientation.page_hint && !orientation.entity_label) return "";
+  const relation = orientation.relation ? `relation ${orientation.relation}` : "";
+  const candidateTime = orientation.candidate_observed_at ? `candidate ${fmt(orientation.candidate_observed_at)}` : "";
+  const existingTime = orientation.existing_observed_at ? `existing ${fmt(orientation.existing_observed_at)}` : "";
+  return `<div class="orientation-card">
+    <div>
+      <div class="muted">Mapped to</div>
+      <strong>${esc(orientation.entity_label || item.title || item.id)}</strong>
+      <div class="kind">${esc([orientation.page_hint, orientation.section_hint].filter(Boolean).join(" · "))}</div>
+    </div>
+    <div class="meta-row">
+      ${chip(relation)}
+      ${chip(orientation.temporal_scope || "")}
+      ${chip(candidateTime)}
+      ${chip(existingTime)}
+      ${chip(orientation.currentness || "")}
+    </div>
+    ${orientation.relation_rationale ? `<blockquote class="evidence">${esc(orientation.relation_rationale)}</blockquote>` : ""}
   </div>`;
 }
 
@@ -280,39 +305,44 @@ function onKey(event, el, ctx, state) {
     const item = state.items[state.index];
     if (item) toggleSelected(state, item.id);
     render(el, ctx, state);
-  } else if (key === "e") {
-    event.preventDefault();
-    doDecision(el, ctx, state, "skip");
-  } else if ("12345".includes(key)) {
-    const item = state.items[state.index];
-    const conflictDecision = item?.group === "conflicts" ? {1: "keep_existing", 2: "candidate_wins"}[key] : "";
-    const route = item?.route_candidates?.[Number(key) - 1];
-    if (conflictDecision) {
-      event.preventDefault();
-      doDecision(el, ctx, state, conflictDecision);
-    } else if (route) {
-      event.preventDefault();
-      doDecision(el, ctx, state, "route", {page_hint: route.page_hint});
-    }
-  } else if ("brdavo".includes(key)) {
+  } else {
     const decision = keyDecision(state.items[state.index], key);
     if (decision) {
       event.preventDefault();
       doDecision(el, ctx, state, decision);
-    }
-  } else if (key === "n") {
-    const item = state.items[state.index];
-    if (item?.group === "unrouted") {
+    } else if (key === "e") {
       event.preventDefault();
-      const pageHint = prompt("New page path (for example concepts/topic.md)");
-      if (pageHint) doDecision(el, ctx, state, "route", {page_hint: pageHint});
+      doDecision(el, ctx, state, "skip");
+    } else if ("12345".includes(key)) {
+      const item = state.items[state.index];
+      const route = item?.route_candidates?.[Number(key) - 1];
+      if (route) {
+        event.preventDefault();
+        doDecision(el, ctx, state, "route", {page_hint: route.page_hint});
+      }
+    } else if (key === "n") {
+      const item = state.items[state.index];
+      if (item?.group === "unrouted") {
+        event.preventDefault();
+        const pageHint = prompt("New page path (for example concepts/topic.md)");
+        if (pageHint) doDecision(el, ctx, state, "route", {page_hint: pageHint});
+      }
     }
   }
 }
 
 function keyDecision(item, key) {
   if (!item) return "";
-  if (item.group === "conflicts") return {b: "both_true", r: "reject"}[key] || "";
+  if (item.group === "conflicts") {
+    return {
+      e: "keep_existing",
+      c: "candidate_wins",
+      b: "both_true",
+      s: "supports_existing",
+      t: "temporal_update",
+      u: "unsure",
+    }[key] || "";
+  }
   if (item.group === "unrouted") return {r: "reject"}[key] || "";
   if (item.group === "memories") return {a: "approve", r: "reject", d: "archive"}[key] || "";
   if (item.group === "audit") return {v: "revert", o: "mark_ok"}[key] || "";

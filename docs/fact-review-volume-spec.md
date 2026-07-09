@@ -1,7 +1,7 @@
 # Fact Conflict Precision & Review-Volume Budget — Spec
 
 **Status:** implementation spec for Codex
-**Last verified:** 2026-07-09 against the live brain DB (read-only snapshot) and current HEAD (`1bbf9c4`)
+**Last verified:** 2026-07-09 against the live brain DB (read-only snapshot) and current HEAD (`791bbff`)
 **Author:** Claude, from Peter's report: "most of the 'conflicts' I'm asked about are both true — the candidate usually *supports* the existing fact" + "~900 items to review is too high a volume"
 **Companions:** `docs/chief-of-staff-spec.md` (action/policy model — unchanged), `docs/extraction-payload-spec.md` (extraction contract — unchanged), `docs/macos-app-spec.md` M4 Queue (consumes these improvements)
 
@@ -53,6 +53,13 @@ unrelated      precheck was noise               → proceed normally
 ```
 
 - **Stage 1 (deterministic, free):** exact/normalized duplicate (exists); negation-refinement pattern ("not just X" vs "X" → `refines`); dated-value succession (same entity+attribute, both statements carry timestamps/observed_at ordering → `updates`).
+- **Temporal truth model:** relation decisions compare facts over their time window, not just their words. A fact can be true and still be non-current. Every fact card should expose an inferred `temporal_scope`:
+  - `event` — happened once and remains historically true.
+  - `current_state` — intended to describe the current state and may be superseded.
+  - `interval_state` — true across a known or implied range.
+  - `stale_observation` — was observed at a point in time but should not be treated as current by default.
+  - `atemporal_claim` — durable statement without meaningful time variance.
+  `updates` means the candidate becomes the current state while the older fact is preserved as historical/superseded evidence; it is not a contradiction unless both claims assert the same attribute over the same time window.
 - **Stage 2 (LLM):** extend the existing judge prompt into this 7-way classifier. Reuse the critic's parallel-worker infrastructure (`extraction.py` critic config: 4 workers, timeouts, block-rate anomaly guard). Per-candidate cards, same shape as today's `counterpart_cards`. Low/medium effort tier.
 - **Classifier confidence floor** (config, default 0.7): below it → residue, honestly labeled "classifier unsure".
 - **Placement:** one shared module (`fact_relations.py`), called from BOTH the upsert precheck path (`wiki_facts.py` resolver) and the extraction conflict path — the lexical `facts_directly_conflict` becomes a cheap *candidate-pair finder* (high recall is fine), never a verdict.
@@ -115,7 +122,16 @@ Fallback-routed facts stop asking individually: they auto-file to the target ent
 
 ## 6. W5 — Queue UX for what remains
 
-- Decision keys gain relation-aware semantics: `s` = "supports existing — merge evidence" (distinct from `b` both-true/coexist which already exists), shown only on conflict cards.
+- Conflict cards orient by **destination before candidate text**. The card title must identify the mapped entity/page/section/time frame, not simply repeat the candidate sentence. Required fields in `/api/queue` for fact review items: `orientation.entity_label`, `orientation.entity_key`, `orientation.page_hint`, `orientation.section_hint`, `orientation.candidate_observed_at`, `orientation.existing_observed_at`, `orientation.temporal_scope`, `orientation.currentness`, `orientation.relation`, and `orientation.relation_rationale`.
+- Conflict-card header format: `{entity_label} / {section_hint}` plus chips for page path, relation, candidate observed time, existing observed time, and currentness. The candidate sentence remains visible in the candidate panel, but it is not the primary title.
+- Decision keys gain relation-aware semantics and must be visible on the buttons:
+  - `e` = keep existing / reject candidate.
+  - `c` = candidate wins / replace current state.
+  - `b` = both true / coexist.
+  - `s` = supports existing — merge provenance only; never rewrite the existing statement or primary `evidence_quote`.
+  - `t` = temporal update — candidate becomes current, existing fact(s) are marked superseded/historical.
+  - `u` = unsure / skip for later.
+  Number keys remain available for route candidates, but conflict-card decisions use the relation letters above.
 - Group the queue by relation class with batch-accept per group ("accept all 14 supports-class items").
 - Escalation cards must state the *reason* in words (replace "matched policy policy_0621e9f4…" with the rule's human label + the relation + rationale from W1).
 
