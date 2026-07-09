@@ -40,8 +40,12 @@ final class AppState: ObservableObject {
     let provisioner: RuntimeProvisioner
     let daemon: DaemonSupervisor
     private var didStart = false
+    private var monitorTask: Task<Void, Never>?
     private let queueBacklogThreshold = 100
     private let queueBacklogNotificationKey = "PKMBrain.queueBacklogNotificationAt"
+    private let nightlyFailureNotificationKey = "PKMBrain.nightlyFailureNotification"
+    private let daemonFailureNotificationKey = "PKMBrain.daemonFailureNotification"
+    private let connectorFailureNotificationPrefix = "PKMBrain.connectorFailureNotification."
 
     init() {
         let defaultHome = ProcessInfo.processInfo.environment["PKM_BRAIN_HOME"]
@@ -87,6 +91,8 @@ final class AppState: ObservableObject {
         await requestNotificationAuthorizationIfNeeded()
         await refreshMigrationPlan()
         await refreshDigest()
+        notifyDaemonFailureIfNeeded()
+        startMonitor()
     }
 
     func refreshMigrationPlan() async {
@@ -109,6 +115,8 @@ final class AppState: ObservableObject {
             digest = latestDigest
             lastError = nil
             notifyQueueBacklogIfNeeded(count: latestDigest.queue_counts.total)
+            notifyNightlyFailureIfNeeded(run: latestDigest.latest_run)
+            await notifyConnectorFailuresIfNeeded(client: client)
         } catch {
             lastError = String(describing: error)
         }
@@ -153,8 +161,24 @@ final class AppState: ObservableObject {
     }
 
     func shutdown() async {
+        monitorTask?.cancel()
+        monitorTask = nil
         await daemon.stop()
         didStart = false
+    }
+
+    private func startMonitor() {
+        monitorTask?.cancel()
+        monitorTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 60_000_000_000)
+                guard !Task.isCancelled else {
+                    return
+                }
+                await self?.refreshDigest()
+                self?.notifyDaemonFailureIfNeeded()
+            }
+        }
     }
 
     private func requestNotificationAuthorizationIfNeeded() async {
@@ -190,5 +214,105 @@ final class AppState: ObservableObject {
         )
         UNUserNotificationCenter.current().add(request) { _ in }
         defaults.set(now.timeIntervalSince1970, forKey: queueBacklogNotificationKey)
+    }
+
+    private func notifyNightlyFailureIfNeeded(run: DigestRun?) {
+        guard notificationsEnabled,
+              let run,
+              let status = run.status,
+              status != "success"
+        else {
+            return
+        }
+        let jobName = run.job_name ?? ""
+        guard jobName.contains("nightly") || jobName.isEmpty else {
+            return
+        }
+        let marker = run.id
+            ?? "\(jobName):\(run.finished_at ?? run.started_at ?? ""):\(status)"
+        guard UserDefaults.standard.string(forKey: nightlyFailureNotificationKey) != marker else {
+            return
+        }
+        postNotification(
+            identifier: "pkm-brain-nightly-failed",
+            title: "PKM Brain Nightly Failed",
+            body: run.error ?? "The latest nightly run finished with status \(status).",
+            destination: "ops"
+        )
+        UserDefaults.standard.set(marker, forKey: nightlyFailureNotificationKey)
+    }
+
+    private func notifyConnectorFailuresIfNeeded(client: BrainAPIClient) async {
+        guard notificationsEnabled else {
+            return
+        }
+        guard let response = try? await client.connectors() else {
+            return
+        }
+        for connector in response.connectors where connector.health.consecutive_failures >= 3 {
+            let marker = "\(connector.health.consecutive_failures):\(connector.health.last_run_at ?? "")"
+            let key = connectorFailureNotificationPrefix + connector.id
+            guard UserDefaults.standard.string(forKey: key) != marker else {
+                continue
+            }
+            let displayName = connector.manifest.display_name
+            let error = connector.health.last_error ?? connector.health.status
+            postNotification(
+                identifier: "pkm-brain-connector-\(connector.id)-failing",
+                title: "\(displayName) Connector Failing",
+                body: error,
+                destination: "ops"
+            )
+            UserDefaults.standard.set(marker, forKey: key)
+        }
+    }
+
+    private func notifyDaemonFailureIfNeeded() {
+        guard notificationsEnabled else {
+            return
+        }
+        let message: String?
+        switch daemon.status {
+        case .failed(let value):
+            message = value
+        case .restarting(let value) where value.lowercased().contains("retry 3"):
+            message = value
+        default:
+            message = nil
+        }
+        guard let message else {
+            return
+        }
+        let day = Calendar.current.startOfDay(for: Date()).timeIntervalSince1970
+        let marker = "\(Int(day)):\(message)"
+        guard UserDefaults.standard.string(forKey: daemonFailureNotificationKey) != marker else {
+            return
+        }
+        postNotification(
+            identifier: "pkm-brain-daemon-needs-attention",
+            title: "PKM Brain Daemon Needs Attention",
+            body: message,
+            destination: "ops"
+        )
+        UserDefaults.standard.set(marker, forKey: daemonFailureNotificationKey)
+    }
+
+    private func postNotification(
+        identifier: String,
+        title: String,
+        body: String,
+        destination: String
+    ) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        content.userInfo = ["destination": destination]
+        let request = UNNotificationRequest(
+            identifier: identifier,
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request) { _ in }
     }
 }

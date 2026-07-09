@@ -220,6 +220,55 @@ public struct QueueUndoResult: Codable, Equatable, Sendable {
     public let undo_handle: JSONValue?
 }
 
+public struct ConnectorsResponse: Codable, Equatable, Sendable {
+    public let connectors: [ConnectorPayload]
+    public let count: Int
+}
+
+public struct ConnectorPayload: Codable, Equatable, Identifiable, Sendable {
+    public let manifest: ConnectorManifestSummary
+    public let state: ConnectorStateSummary
+    public let health: ConnectorHealth
+
+    public var id: String { manifest.id }
+}
+
+public struct ConnectorManifestSummary: Codable, Equatable, Sendable {
+    public let id: String
+    public let display_name: String
+    public let description: String
+    public let source_type: String
+    public let default_enabled: Bool
+    public let default_cadence_s: Int
+    public let settings_schema: [ConnectorSettingField]
+    public let permissions_note: String
+}
+
+public struct ConnectorSettingField: Codable, Equatable, Identifiable, Sendable {
+    public let key: String
+    public let label: String
+    public let kind: String
+    public let `default`: JSONValue?
+    public let help: String
+    public let choices: [String]
+
+    public var id: String { key }
+}
+
+public struct ConnectorStateSummary: Codable, Equatable, Sendable {
+    public let enabled: Bool
+    public let cadence_s: Int
+    public let settings: [String: JSONValue]
+}
+
+public struct ConnectorHealth: Codable, Equatable, Sendable {
+    public let status: String
+    public let consecutive_failures: Int
+    public let last_run_at: String?
+    public let last_error: String?
+    public let last_result: JSONValue?
+}
+
 public struct MigrationPlan: Codable, Equatable, Sendable {
     public let state: String
     public let home: String

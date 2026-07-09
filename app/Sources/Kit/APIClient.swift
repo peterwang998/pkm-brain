@@ -55,6 +55,10 @@ public final class BrainAPIClient: Sendable {
         try await post("/api/queue/undo", payload: ["undo_handle": handle])
     }
 
+    public func connectors() async throws -> ConnectorsResponse {
+        try await get("/api/connectors")
+    }
+
     public func runSchedulerJob(_ jobID: String) async throws -> SchedulerState {
         try await post("/api/scheduler/run", payload: ["job_id": jobID])
     }

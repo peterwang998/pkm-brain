@@ -1,0 +1,42 @@
+{
+  "connectors": [
+    {
+      "manifest": {
+        "id": "codex",
+        "display_name": "Codex",
+        "description": "Capture Codex agent sessions.",
+        "source_type": "agent_session",
+        "default_enabled": true,
+        "default_cadence_s": 600,
+        "settings_schema": [
+          {
+            "key": "sessions_dir",
+            "label": "Sessions directory",
+            "kind": "path",
+            "default": "~/.codex/sessions",
+            "help": "Directory containing Codex sessions.",
+            "choices": []
+          }
+        ],
+        "permissions_note": ""
+      },
+      "state": {
+        "enabled": true,
+        "cadence_s": 600,
+        "settings": {
+          "sessions_dir": "~/.codex/sessions"
+        }
+      },
+      "health": {
+        "status": "failing(3)",
+        "consecutive_failures": 3,
+        "last_run_at": "2026-07-08T20:00:00+00:00",
+        "last_error": "sessions directory unavailable",
+        "last_result": {
+          "status": "failed"
+        }
+      }
+    }
+  ],
+  "count": 1
+}

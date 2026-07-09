@@ -117,11 +117,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         _ center: UNUserNotificationCenter,
         didReceive response: UNNotificationResponse
     ) async {
-        let shouldOpenQueue = response.notification.request.content.userInfo["destination"] as? String == "queue"
-        guard shouldOpenQueue else {
+        guard let destination = response.notification.request.content.userInfo["destination"] as? String else {
             return
         }
-        await NotificationRouter.shared.openQueue()
+        await NotificationRouter.shared.open(destination: destination)
     }
 }
 
@@ -130,8 +129,17 @@ final class NotificationRouter {
     static let shared = NotificationRouter()
     weak var appState: AppState?
 
-    func openQueue() {
-        appState?.selectedDestination = .queue
+    func open(destination: String) {
+        switch destination {
+        case "queue":
+            appState?.selectedDestination = .queue
+        case "ops":
+            appState?.selectedDestination = .ops
+        case "today":
+            appState?.selectedDestination = .today
+        default:
+            break
+        }
         NSApp.activate(ignoringOtherApps: true)
     }
 }

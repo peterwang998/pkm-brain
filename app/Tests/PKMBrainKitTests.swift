@@ -43,6 +43,17 @@ struct PKMBrainKitTests {
         #expect(queue.items.last?.memory?.content == "Review me from the queue.")
     }
 
+    @Test("connectors fixture decodes")
+    func connectorsFixtureDecodes() throws {
+        let connectors: ConnectorsResponse = try decodeFixture("connectors")
+
+        #expect(connectors.count == 1)
+        #expect(connectors.connectors.first?.manifest.id == "codex")
+        #expect(connectors.connectors.first?.state.settings["sessions_dir"]?.stringValue == "~/.codex/sessions")
+        #expect(connectors.connectors.first?.health.consecutive_failures == 3)
+        #expect(connectors.connectors.first?.health.last_error == "sessions directory unavailable")
+    }
+
     @Test("migration fixture decodes")
     func migrationFixtureDecodes() throws {
         let plan: MigrationPlan = try decodeFixture("migration")
