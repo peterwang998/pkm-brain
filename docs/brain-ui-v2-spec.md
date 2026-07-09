@@ -94,7 +94,7 @@ One unified inbox for every human-judgment item: `unrouted_fact`, `fact_conflict
 
 Interaction contract:
 
-- `j/k` move, `enter` focus, decision keys act on the focused card **and auto-advance**; every decision fires an optimistic update plus a 6-second undo toast wired to the action inverse (or question re-open). On conflict cards `1-6` are left-to-right decisions; outside conflict-card decision focus, `u` may still undo the last decision.
+- `j/k` move, `enter` focus, numeric decision keys act on the focused card **and auto-advance**; every decision fires an optimistic update plus a 6-second undo toast wired to the action inverse (or question re-open). Conflict cards use `1-6` left-to-right. Unrouted cards number route candidates first, then "new page", "reject", and "skip". Topology/action/audit/memory cards use left-to-right numeric buttons (`1` approve/revert, `2` reject/mark ok, etc.). Outside decision focus, `u` may still undo the last decision.
 - Progress ("3 of 81") and a session tally ("resolved 14 · skipped 2") — triage should feel like emptying an inbox.
 - Card payloads are complete: no decision may require leaving the pane. Unrouted cards show the fact + top-5 route candidates (fuzzy-ranked, numbered `1–5` to pick) + "new page…" + "reject". Topology cards show the resolved entity/page target names first, then ids, affected pages/fact counts, and the gardener's evidence. Memory cards show content, type, scope, provenance.
 - Batch mode: `x` selects, visible `Reject selected`/`Route selected…` bar appears. Filters persist in URL.

@@ -474,14 +474,8 @@ struct QueueView: View {
             Task { await batchApproveSelected() }
         case ("u", _, _) where selectedItem?.group != "conflicts":
             Task { await undoLast() }
-        case ("1", _, _), ("2", _, _), ("3", _, _), ("4", _, _), ("5", _, _), ("6", _, _):
+        case ("1", _, _), ("2", _, _), ("3", _, _), ("4", _, _), ("5", _, _), ("6", _, _), ("7", _, _), ("8", _, _), ("9", _, _):
             handleNumberKey(key)
-        case ("a", _, _), ("r", _, _), ("b", _, _), ("c", _, _), ("d", _, _), ("e", _, _), ("o", _, _), ("s", _, _), ("t", _, _), ("u", _, _), ("v", _, _):
-            if let decision = decisionForKey(key, item: selectedItem) {
-                Task { await decide(decision) }
-            } else {
-                return false
-            }
         default:
             return false
         }
@@ -500,15 +494,31 @@ struct QueueView: View {
         guard let item = selectedItem else {
             return
         }
-        if item.group == "conflicts" {
+        if item.group == "unrouted" {
+            let routes = item.route_candidates ?? []
+            if let index = Int(key), let route = routes[safe: index - 1] {
+                Task {
+                    await decide("route", payload: ["page_hint": .string(route.page_hint)])
+                }
+                return
+            }
+            let manualRouteKey = String(routes.count + 1)
+            if key == manualRouteKey {
+                let pageHint = routePageHint.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !pageHint.isEmpty else {
+                    return
+                }
+                Task {
+                    await decide("route", payload: ["page_hint": .string(pageHint)])
+                    routePageHint = ""
+                }
+                return
+            }
+        }
+        guard let decision = decisionForKey(key, item: item) else {
             return
         }
-        guard let index = Int(key), let route = item.route_candidates?[safe: index - 1] else {
-            return
-        }
-        Task {
-            await decide("route", payload: ["page_hint": .string(route.page_hint)])
-        }
+        Task { await decide(decision) }
     }
 
     private func decisionForKey(_ key: String, item: QueueItem?) -> String? {
@@ -526,13 +536,17 @@ struct QueueView: View {
                 "6": "unsure",
             ][key]
         case "unrouted":
-            return ["r": "reject", "e": "skip", "s": "skip"][key]
+            let routeCount = item.route_candidates?.count ?? 0
+            return [
+                String(routeCount + 2): "reject",
+                String(routeCount + 3): "skip",
+            ][key]
         case "memories":
-            return ["a": "approve", "r": "reject", "d": "archive", "e": "skip", "s": "skip"][key]
+            return ["1": "approve", "2": "reject", "3": "archive", "4": "skip"][key]
         case "audit":
-            return ["v": "revert", "o": "mark_ok", "e": "skip", "s": "skip"][key]
+            return ["1": "revert", "2": "mark_ok", "3": "skip"][key]
         default:
-            return ["a": "approve", "r": "reject", "e": "skip", "s": "skip"][key]
+            return ["1": "approve", "2": "reject", "3": "skip"][key]
         }
     }
 }
@@ -632,17 +646,21 @@ private struct QueueDetail: View {
     }
 
     private var unroutedCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        let routes = item.route_candidates ?? []
+        let manualRouteKey = String(routes.count + 1)
+        let rejectKey = String(routes.count + 2)
+        let skipKey = String(routes.count + 3)
+        return VStack(alignment: .leading, spacing: 14) {
             FactPanel(title: "Fact", fact: item.candidate)
             VStack(alignment: .leading, spacing: 8) {
                 Text("Route Candidates")
                     .font(.headline)
-                ForEach(Array((item.route_candidates ?? []).enumerated()), id: \.element.id) { index, route in
+                ForEach(Array(routes.enumerated()), id: \.element.id) { index, route in
                     Button {
                         onDecision("route", ["page_hint": .string(route.page_hint)])
                     } label: {
                         HStack {
-                            Image(systemName: "\(index + 1).circle")
+                            ShortcutBadge(key: String(index + 1))
                             Text(route.title ?? route.page_hint)
                             Spacer()
                             Text(route.page_hint)
@@ -662,15 +680,22 @@ private struct QueueDetail: View {
                         onDecision("route", ["page_hint": .string(pageHint)])
                         routePageHint = ""
                     } label: {
-                        Label("Route", systemImage: "arrow.turn.down.right")
+                        Label {
+                            HStack(spacing: 7) {
+                                Text("Route")
+                                ShortcutBadge(key: manualRouteKey)
+                            }
+                        } icon: {
+                            Image(systemName: "arrow.turn.down.right")
+                        }
                     }
                 }
             }
             DecisionBar {
-                DecisionButton("Reject", systemImage: "xmark.circle", key: "r") {
+                DecisionButton("Reject", systemImage: "xmark.circle", key: rejectKey) {
                     onDecision("reject", [:])
                 }
-                DecisionButton("Skip", systemImage: "arrowshape.turn.up.right", key: "s") {
+                DecisionButton("Skip", systemImage: "arrowshape.turn.up.right", key: skipKey) {
                     onDecision("skip", [:])
                 }
             }
@@ -690,16 +715,16 @@ private struct QueueDetail: View {
             ])
             SourceDocumentsView(documents: item.memory?.source_documents ?? [])
             DecisionBar {
-                DecisionButton("Approve", systemImage: "checkmark.circle", key: "a") {
+                DecisionButton("Approve", systemImage: "checkmark.circle", key: "1") {
                     onDecision("approve", [:])
                 }
-                DecisionButton("Reject", systemImage: "xmark.circle", key: "r") {
+                DecisionButton("Reject", systemImage: "xmark.circle", key: "2") {
                     onDecision("reject", [:])
                 }
-                DecisionButton("Archive", systemImage: "archivebox", key: "d") {
+                DecisionButton("Archive", systemImage: "archivebox", key: "3") {
                     onDecision("archive", [:])
                 }
-                DecisionButton("Skip", systemImage: "arrowshape.turn.up.right", key: "s") {
+                DecisionButton("Skip", systemImage: "arrowshape.turn.up.right", key: "4") {
                     onDecision("skip", [:])
                 }
             }
@@ -713,13 +738,13 @@ private struct QueueDetail: View {
             MetadataRow(values: [item.status, item.risk_tier, actionString("audit_status")])
             EvidenceQuote(text: item.summary)
             DecisionBar {
-                DecisionButton("Revert", systemImage: "arrow.uturn.backward.circle", key: "v") {
+                DecisionButton("Revert", systemImage: "arrow.uturn.backward.circle", key: "1") {
                     onDecision("revert", [:])
                 }
-                DecisionButton("Mark OK", systemImage: "checkmark.seal", key: "o") {
+                DecisionButton("Mark OK", systemImage: "checkmark.seal", key: "2") {
                     onDecision("mark_ok", [:])
                 }
-                DecisionButton("Skip", systemImage: "arrowshape.turn.up.right", key: "s") {
+                DecisionButton("Skip", systemImage: "arrowshape.turn.up.right", key: "3") {
                     onDecision("skip", [:])
                 }
             }
@@ -736,13 +761,13 @@ private struct QueueDetail: View {
             MetadataRow(values: [item.status, item.risk_tier, actionString("proposed_by")])
             EvidenceQuote(text: item.summary)
             DecisionBar {
-                DecisionButton("Approve", systemImage: "checkmark.circle", key: "a") {
+                DecisionButton("Approve", systemImage: "checkmark.circle", key: "1") {
                     onDecision("approve", [:])
                 }
-                DecisionButton("Reject", systemImage: "xmark.circle", key: "r") {
+                DecisionButton("Reject", systemImage: "xmark.circle", key: "2") {
                     onDecision("reject", [:])
                 }
-                DecisionButton("Skip", systemImage: "arrowshape.turn.up.right", key: "s") {
+                DecisionButton("Skip", systemImage: "arrowshape.turn.up.right", key: "3") {
                     onDecision("skip", [:])
                 }
             }
@@ -754,13 +779,13 @@ private struct QueueDetail: View {
             Text(item.summary ?? item.displayTitle)
                 .textSelection(.enabled)
             DecisionBar {
-                DecisionButton("Approve", systemImage: "checkmark.circle", key: "a") {
+                DecisionButton("Approve", systemImage: "checkmark.circle", key: "1") {
                     onDecision("approve", [:])
                 }
-                DecisionButton("Reject", systemImage: "xmark.circle", key: "r") {
+                DecisionButton("Reject", systemImage: "xmark.circle", key: "2") {
                     onDecision("reject", [:])
                 }
-                DecisionButton("Skip", systemImage: "arrowshape.turn.up.right", key: "s") {
+                DecisionButton("Skip", systemImage: "arrowshape.turn.up.right", key: "3") {
                     onDecision("skip", [:])
                 }
             }
@@ -1009,13 +1034,7 @@ private struct DecisionButton: View {
             Label {
                 HStack(spacing: 7) {
                     Text(title)
-                    Text(key.uppercased())
-                        .font(.caption2.monospaced().weight(.bold))
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 2)
-                        .background(.quaternary, in: RoundedRectangle(cornerRadius: 4))
-                        .accessibilityHidden(true)
+                    ShortcutBadge(key: key)
                 }
             } icon: {
                 Image(systemName: systemImage)
@@ -1024,6 +1043,20 @@ private struct DecisionButton: View {
         .keyboardShortcut(KeyEquivalent(Character(key)), modifiers: [])
         .help(help ?? "\(key.uppercased()) - \(title)")
         .accessibilityLabel("\(title), keyboard shortcut \(key.uppercased())")
+    }
+}
+
+private struct ShortcutBadge: View {
+    let key: String
+
+    var body: some View {
+        Text(key.uppercased())
+            .font(.caption2.monospaced().weight(.bold))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 2)
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 4))
+            .accessibilityHidden(true)
     }
 }
 

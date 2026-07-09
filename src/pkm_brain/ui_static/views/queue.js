@@ -141,15 +141,16 @@ function conflictCard(item) {
 
 function unroutedCard(item) {
   const routes = item.route_candidates || [];
+  const keys = unroutedKeys(item);
   return `${factPanel("Fact", item.candidate || {})}
     <h2>Route Candidates</h2>
     <div class="route-list">
       ${routes.map((route, index) => `<button type="button" data-decision="route" data-page-hint="${esc(route.page_hint)}"><kbd>${index + 1}</kbd>${esc(route.title || route.page_hint)} <span class="muted">${esc(route.page_hint)}</span></button>`).join("") || `<div class="muted">No confident route candidates.</div>`}
     </div>
     <div class="decision-bar">
-      <button data-decision="new_page" type="button"><kbd>n</kbd>new page...</button>
-      <button data-decision="reject" type="button"><kbd>r</kbd>reject</button>
-      <button data-decision="skip" type="button"><kbd>e</kbd>skip</button>
+      <button data-decision="new_page" type="button"><kbd>${keys.newPage}</kbd>new page...</button>
+      <button data-decision="reject" type="button"><kbd>${keys.reject}</kbd>reject</button>
+      <button data-decision="skip" type="button"><kbd>${keys.skip}</kbd>skip</button>
     </div>`;
 }
 
@@ -159,10 +160,10 @@ function memoryCard(item) {
     <div class="meta-row">${chip(memory.memory_type || "")}${chip(memory.scope || "")}${chip(memory.confidence ?? "")}</div>
     ${sourceList(memory.source_ids || [], memory.source_documents || [])}
     <div class="decision-bar">
-      <button data-decision="approve" type="button"><kbd>a</kbd>approve</button>
-      <button data-decision="reject" type="button"><kbd>r</kbd>reject</button>
-      <button data-decision="archive" type="button"><kbd>d</kbd>archive</button>
-      <button data-decision="skip" type="button"><kbd>e</kbd>skip</button>
+      <button data-decision="approve" type="button"><kbd>1</kbd>approve</button>
+      <button data-decision="reject" type="button"><kbd>2</kbd>reject</button>
+      <button data-decision="archive" type="button"><kbd>3</kbd>archive</button>
+      <button data-decision="skip" type="button"><kbd>4</kbd>skip</button>
     </div>`;
 }
 
@@ -172,9 +173,9 @@ function auditCard(item) {
     <div class="meta-row">${chip(action.status || "")}${chip(action.audit_status || "", "bad")}${chip(action.risk_tier || "")}</div>
     <blockquote class="evidence">${esc(item.summary || "Audit marked this action as sampled_bad.")}</blockquote>
     <div class="decision-bar">
-      <button data-decision="revert" type="button"><kbd>v</kbd>revert</button>
-      <button data-decision="mark_ok" type="button"><kbd>o</kbd>mark ok</button>
-      <button data-decision="skip" type="button"><kbd>e</kbd>skip</button>
+      <button data-decision="revert" type="button"><kbd>1</kbd>revert</button>
+      <button data-decision="mark_ok" type="button"><kbd>2</kbd>mark ok</button>
+      <button data-decision="skip" type="button"><kbd>3</kbd>skip</button>
     </div>`;
 }
 
@@ -185,9 +186,9 @@ function actionCard(item) {
     <div class="meta-row">${chip(action.status || "")}${chip(action.risk_tier || "")}${chip(action.proposed_by || "")}</div>
     <blockquote class="evidence">${esc(item.summary || "")}</blockquote>
     <div class="decision-bar">
-      <button data-decision="approve" type="button"><kbd>a</kbd>approve</button>
-      <button data-decision="reject" type="button"><kbd>r</kbd>reject</button>
-      <button data-decision="skip" type="button"><kbd>e</kbd>skip</button>
+      <button data-decision="approve" type="button"><kbd>1</kbd>approve</button>
+      <button data-decision="reject" type="button"><kbd>2</kbd>reject</button>
+      <button data-decision="skip" type="button"><kbd>3</kbd>skip</button>
     </div>`;
 }
 
@@ -211,9 +212,9 @@ function topologyTargetHtml(topology) {
 function genericCard(item) {
   return `<p>${esc(item.summary || item.title || "")}</p>
     <div class="decision-bar">
-      <button data-decision="approve" type="button"><kbd>a</kbd>approve</button>
-      <button data-decision="reject" type="button"><kbd>r</kbd>reject</button>
-      <button data-decision="skip" type="button"><kbd>e</kbd>skip</button>
+      <button data-decision="approve" type="button"><kbd>1</kbd>approve</button>
+      <button data-decision="reject" type="button"><kbd>2</kbd>reject</button>
+      <button data-decision="skip" type="button"><kbd>3</kbd>skip</button>
     </div>`;
 }
 
@@ -324,29 +325,37 @@ function onKey(event, el, ctx, state) {
     if (item) toggleSelected(state, item.id);
     render(el, ctx, state);
   } else {
-    const decision = keyDecision(state.items[state.index], key);
-    if (decision) {
-      event.preventDefault();
-      doDecision(el, ctx, state, decision);
-    } else if (key === "e") {
-      event.preventDefault();
-      doDecision(el, ctx, state, "skip");
-    } else if ("12345".includes(key)) {
-      const item = state.items[state.index];
-      const route = item?.route_candidates?.[Number(key) - 1];
+    const item = state.items[state.index];
+    if (item?.group === "unrouted") {
+      const route = item.route_candidates?.[Number(key) - 1];
       if (route) {
         event.preventDefault();
         doDecision(el, ctx, state, "route", {page_hint: route.page_hint});
+        return;
       }
-    } else if (key === "n") {
-      const item = state.items[state.index];
-      if (item?.group === "unrouted") {
+      const keys = unroutedKeys(item);
+      if (key === keys.newPage) {
         event.preventDefault();
         const pageHint = prompt("New page path (for example concepts/topic.md)");
         if (pageHint) doDecision(el, ctx, state, "route", {page_hint: pageHint});
+        return;
       }
     }
+    const decision = keyDecision(item, key);
+    if (decision) {
+      event.preventDefault();
+      doDecision(el, ctx, state, decision);
+    }
   }
+}
+
+function unroutedKeys(item) {
+  const routeCount = item?.route_candidates?.length || 0;
+  return {
+    newPage: String(routeCount + 1),
+    reject: String(routeCount + 2),
+    skip: String(routeCount + 3),
+  };
 }
 
 function keyDecision(item, key) {
@@ -361,10 +370,16 @@ function keyDecision(item, key) {
       6: "unsure",
     }[key] || "";
   }
-  if (item.group === "unrouted") return {r: "reject"}[key] || "";
-  if (item.group === "memories") return {a: "approve", r: "reject", d: "archive"}[key] || "";
-  if (item.group === "audit") return {v: "revert", o: "mark_ok"}[key] || "";
-  return {a: "approve", r: "reject"}[key] || "";
+  if (item.group === "unrouted") {
+    const keys = unroutedKeys(item);
+    return {
+      [keys.reject]: "reject",
+      [keys.skip]: "skip",
+    }[key] || "";
+  }
+  if (item.group === "memories") return {1: "approve", 2: "reject", 3: "archive", 4: "skip"}[key] || "";
+  if (item.group === "audit") return {1: "revert", 2: "mark_ok", 3: "skip"}[key] || "";
+  return {1: "approve", 2: "reject", 3: "skip"}[key] || "";
 }
 
 function isTyping(target) {

@@ -472,7 +472,7 @@ def test_v2_queue_limit_bounds_complete_card_enrichment(
     assert calls == 1
 
 
-def test_v2_queue_conflict_keys_do_not_collide_with_navigation() -> None:
+def test_v2_queue_review_commands_use_numeric_keys() -> None:
     source = (Path(__file__).parents[1] / "src/pkm_brain/ui_static/views/queue.js").read_text(
         encoding="utf-8"
     )
@@ -488,6 +488,20 @@ def test_v2_queue_conflict_keys_do_not_collide_with_navigation() -> None:
     assert '2: "candidate_wins"' in source
     assert '4: "supports_existing"' in source
     assert '5: "temporal_update"' in source
+    assert '<kbd>1</kbd>approve' in source
+    assert '<kbd>2</kbd>reject' in source
+    assert '<kbd>3</kbd>skip' in source
+    assert '<kbd>3</kbd>archive' in source
+    assert '<kbd>1</kbd>revert' in source
+    assert '<kbd>2</kbd>mark ok' in source
+    assert '<kbd>${keys.newPage}</kbd>new page...' in source
+    assert "[keys.reject]: \"reject\"" in source
+    assert "[keys.skip]: \"skip\"" in source
+    assert '<kbd>a</kbd>' not in source
+    assert '<kbd>r</kbd>' not in source
+    assert '<kbd>e</kbd>' not in source
+    assert '<kbd>v</kbd>' not in source
+    assert '<kbd>o</kbd>' not in source
 
 
 def test_v2_queue_topology_surfaces_entity_names(tmp_path: Path) -> None:
