@@ -38,6 +38,7 @@ def test_eval_run_writes_rebuildable_report(tmp_path: Path) -> None:
         "routing",
         "topology",
         "conflict",
+        "relations",
         "retrieval",
     }
     retrieval_report = [

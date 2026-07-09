@@ -6,7 +6,12 @@ from pathlib import Path
 import re
 from typing import Any
 
-from .db import connection
+from .db import connection, loads, rows
+from .fact_relations import (
+    CONTRADICTION_RECALL_THRESHOLD,
+    FALSE_CONFLICT_RATE_THRESHOLD,
+    classify_fact_relation,
+)
 from .gardener import deterministic_topology_candidates, tokenize_signal
 from .paths import BrainPaths
 from .retrieval_fixtures import load_retrieval_golden_cases
@@ -15,7 +20,7 @@ from .util import new_id, now_iso
 from .wiki_facts import fact_is_auto_winner, fact_similarity_signals, facts_should_merge
 
 
-EVAL_SUITES = {"extraction", "routing", "topology", "conflict", "retrieval"}
+EVAL_SUITES = {"extraction", "routing", "topology", "conflict", "relations", "retrieval"}
 VERDICT_VALUES = {"no_strong_match": 0.0, "partial": 0.5, "found": 1.0}
 EXTRACTION_LABELS_FILENAME = "extraction_labels.jsonl"
 EXTRACTION_FALLBACK_PAGE_HINTS = {"concepts/extracted-facts.md"}
@@ -80,6 +85,8 @@ def run_eval_suite(paths: BrainPaths, suite: str) -> dict[str, Any]:
         return topology_eval(paths)
     if suite == "conflict":
         return conflict_eval(paths)
+    if suite == "relations":
+        return relations_eval(paths)
     if suite == "retrieval":
         return retrieval_eval(paths)
     raise ValueError(f"unknown eval suite: {suite}")
@@ -674,6 +681,302 @@ def evaluate_conflict_fixture_case(case: dict[str, Any]) -> dict[str, Any]:
         "token_jaccard": round(float(signals["token_jaccard"]), 3),
         "anchor_coverage": round(float(signals["anchor_coverage"]), 3),
     }
+
+
+def relations_eval(paths: BrainPaths) -> dict[str, Any]:
+    fixture_cases = relation_fixture_cases()
+    mined_cases = mine_answered_relation_cases(paths)
+    case_reports = [evaluate_relation_case(case) for case in [*fixture_cases, *mined_cases]]
+    contradiction_cases = [
+        case for case in case_reports if case["expected_relation"] == "contradicts"
+    ]
+    predicted_contradictions = [
+        case for case in case_reports if case["actual_relation"] == "contradicts"
+    ]
+    contradiction_true_positive = [
+        case
+        for case in case_reports
+        if case["expected_relation"] == "contradicts"
+        and case["actual_relation"] == "contradicts"
+    ]
+    non_contradiction_cases = [
+        case for case in case_reports if case["expected_relation"] != "contradicts"
+    ]
+    false_conflicts = [
+        case
+        for case in non_contradiction_cases
+        if case["actual_relation"] == "contradicts"
+    ]
+    exact_relation_matches = [
+        case
+        for case in case_reports
+        if case["expected_relation"] == case["actual_relation"]
+    ]
+    contradiction_recall = ratio(len(contradiction_true_positive), len(contradiction_cases))
+    false_conflict_rate = ratio(len(false_conflicts), len(non_contradiction_cases))
+    relation_accuracy = ratio(len(exact_relation_matches), len(case_reports))
+    threshold = {
+        "contradiction_recall": CONTRADICTION_RECALL_THRESHOLD,
+        "false_conflict_rate_max": FALSE_CONFLICT_RATE_THRESHOLD,
+    }
+    metrics = {
+        "label_policy": "fixture_plus_mined" if mined_cases else "fixture_only",
+        "label_case_count": len(case_reports),
+        "static_fixture_count": len(fixture_cases),
+        "mined_case_count": len(mined_cases),
+        "contradiction_case_count": len(contradiction_cases),
+        "predicted_contradiction_count": len(predicted_contradictions),
+        "contradiction_recall": round(contradiction_recall, 3),
+        "false_conflict_rate": round(false_conflict_rate, 3),
+        "false_conflict_count": len(false_conflicts),
+        "false_conflict_case_ids": [case["id"] for case in false_conflicts],
+        "relation_accuracy": round(relation_accuracy, 3),
+        "classifier_mode": "deterministic_eval_only",
+        "activation": "disabled",
+    }
+    passed = (
+        bool(case_reports)
+        and contradiction_recall >= threshold["contradiction_recall"]
+        and false_conflict_rate <= threshold["false_conflict_rate_max"]
+    )
+    return suite_report(
+        "relations",
+        fixture_count=len(case_reports),
+        metrics=metrics,
+        passed=passed,
+        threshold=threshold,
+        cases=case_reports,
+    )
+
+
+def relation_fixture_cases() -> list[dict[str, Any]]:
+    base = {
+        "entity_key": "project:alphapay:summary",
+        "page_hint": "projects/alphapay.md",
+        "source_ids": ["document:alpha-a"],
+    }
+    return [
+        relation_case(
+            "duplicate_same_claim",
+            "AlphaPay uses Stripe Checkout for renewal invoices.",
+            "AlphaPay uses Stripe Checkout for renewal invoices.",
+            "duplicate",
+            existing={**base},
+            candidate={**base},
+        ),
+        relation_case(
+            "supports_new_source",
+            "AlphaPay uses Stripe Checkout for renewal invoices.",
+            "AlphaPay uses Stripe Checkout for renewal invoices.",
+            "supports",
+            existing={**base, "source_ids": ["document:alpha-a"]},
+            candidate={**base, "source_ids": ["document:alpha-b"]},
+        ),
+        relation_case(
+            "refines_same_claim",
+            "AlphaPay uses Stripe Checkout.",
+            "AlphaPay uses Stripe Checkout for renewal invoices after failed card payments.",
+            "refines",
+            existing={**base},
+            candidate={**base},
+        ),
+        relation_case(
+            "temporal_update",
+            "As of 2026-06-01, the CloudZero monthly budget cap is 500 dollars.",
+            "As of 2026-07-09, the CloudZero monthly budget cap is 750 dollars.",
+            "updates",
+            existing={
+                "entity_key": "account:cloudzero:budget",
+                "page_hint": "tools/cloudzero.md",
+                "observed_at": "2026-06-01T00:00:00+00:00",
+                "source_ids": ["document:cloudzero-june"],
+            },
+            candidate={
+                "entity_key": "account:cloudzero:budget",
+                "page_hint": "tools/cloudzero.md",
+                "observed_at": "2026-07-09T00:00:00+00:00",
+                "source_ids": ["document:cloudzero-july"],
+            },
+        ),
+        relation_case(
+            "both_true_progression",
+            "Peter had one interview scheduled for the role.",
+            "Peter is now in final rounds for the role.",
+            "complementary",
+            existing={
+                "entity_key": "person:peter:career",
+                "page_hint": "career/peter.md",
+                "source_ids": ["document:career-a"],
+            },
+            candidate={
+                "entity_key": "person:peter:career",
+                "page_hint": "career/peter.md",
+                "source_ids": ["document:career-b"],
+            },
+        ),
+        relation_case(
+            "negation_contradiction",
+            "AlphaPay auto-renewal is enabled by default for annual plans.",
+            "AlphaPay auto-renewal is not enabled by default for annual plans.",
+            "contradicts",
+            existing={**base},
+            candidate={**base},
+        ),
+        relation_case(
+            "unrelated_different_entity",
+            "AlphaPay uses Stripe Checkout for renewal invoices.",
+            "The patio outlet permit belongs with the home EV project.",
+            "unrelated",
+            existing={**base},
+            candidate={
+                "entity_key": "project:home-ev:electrical",
+                "page_hint": "projects/home-ev.md",
+                "source_ids": ["document:ev"],
+            },
+        ),
+    ]
+
+
+def relation_case(
+    case_id: str,
+    existing_statement: str,
+    candidate_statement: str,
+    expected_relation: str,
+    *,
+    existing: dict[str, Any],
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "id": case_id,
+        "origin": "static_fixture",
+        "expected_relation": expected_relation,
+        "existing": {
+            "id": f"{case_id}_existing",
+            "statement": existing_statement,
+            **existing,
+        },
+        "candidate": {
+            "id": f"{case_id}_candidate",
+            "statement": candidate_statement,
+            **candidate,
+        },
+    }
+
+
+def mine_answered_relation_cases(paths: BrainPaths, *, limit: int = 100) -> list[dict[str, Any]]:
+    if not paths.sqlite_path.exists():
+        return []
+    with connection(paths.sqlite_path) as conn:
+        if not eval_table_exists(conn, "open_questions"):
+            return []
+        question_rows = rows(
+            conn,
+            """
+            SELECT *
+            FROM open_questions
+            WHERE kind IN ('fact_conflict_review', 'conflict')
+              AND status NOT IN ('open', 'needs_human')
+              AND answer IS NOT NULL
+              AND answer != ''
+            ORDER BY COALESCE(answered_at, created_at) DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+    cases: list[dict[str, Any]] = []
+    for question in question_rows:
+        answer = loads(question["answer"], {})
+        expected_relation = relation_from_answer(answer)
+        if expected_relation is None:
+            continue
+        options = loads(question["options"], [])
+        candidate = first_option_fact(options, "candidate_fact")
+        existing = first_option_fact(options, "existing_fact") or first_option_fact(options, None)
+        if not candidate or not existing:
+            continue
+        case_id = f"mined_{question['id']}"
+        cases.append(
+            {
+                "id": case_id,
+                "origin": "answered_queue",
+                "question_id": question["id"],
+                "expected_relation": expected_relation,
+                "candidate": candidate,
+                "existing": existing,
+            }
+        )
+    return cases
+
+
+def relation_from_answer(answer: Any) -> str | None:
+    if not isinstance(answer, dict):
+        return None
+    explicit = str(answer.get("relation") or answer.get("resolution") or "").strip()
+    if explicit in {
+        "duplicate",
+        "supports",
+        "refines",
+        "updates",
+        "complementary",
+        "contradicts",
+        "unrelated",
+    }:
+        return explicit
+    decision = str(answer.get("decision") or "").strip()
+    if decision == "both_true":
+        return "complementary"
+    if decision in {"dismiss", "reject", "keep_existing"}:
+        return "contradicts"
+    return None
+
+
+def first_option_fact(options: list[Any], option_type: str | None) -> dict[str, Any] | None:
+    for option in options:
+        if not isinstance(option, dict):
+            continue
+        if option_type is not None and option.get("option_type") != option_type:
+            continue
+        statement = str(option.get("statement") or "").strip()
+        if not statement:
+            continue
+        fact_id = str(option.get("fact_id") or option.get("id") or "").strip()
+        return {
+            "id": fact_id or None,
+            "statement": statement,
+            "entity_key": option.get("entity_key"),
+            "page_hint": option.get("page_hint"),
+            "source_ids": option.get("source_ids") or [],
+            "source_spans": option.get("source_spans") or [],
+            "evidence_quote": option.get("evidence_quote"),
+            "observed_at": option.get("observed_at"),
+        }
+    return None
+
+
+def evaluate_relation_case(case: dict[str, Any]) -> dict[str, Any]:
+    result = classify_fact_relation(case["candidate"], case["existing"]).as_dict()
+    return {
+        "id": case["id"],
+        "origin": case.get("origin") or "unknown",
+        "question_id": case.get("question_id"),
+        "expected_relation": case["expected_relation"],
+        "actual_relation": result["relation"],
+        "compatible": result["compatible"],
+        "confidence": result["confidence"],
+        "rationale": result["rationale"],
+        "matched": case["expected_relation"] == result["relation"],
+        "candidate_statement": str(case["candidate"].get("statement") or "")[:220],
+        "existing_statement": str(case["existing"].get("statement") or "")[:220],
+    }
+
+
+def eval_table_exists(conn: Any, table: str) -> bool:
+    return bool(
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?",
+            (table,),
+        ).fetchone()
+    )
 
 
 def ratio(numerator: int, denominator: int) -> float:

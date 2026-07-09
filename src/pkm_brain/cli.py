@@ -41,6 +41,7 @@ from .connectors import (
 from .db import connection, rows
 from .evals import run_eval
 from .extraction import critic_review_config, reclaim_unrouted_facts
+from .fact_review_volume import reconcile_backlog_w2b_dry_run, write_reconcile_report
 from .cos_policy import promote_policy_for_autonomy
 from .llm import cos_provider_status, provider_status
 from .maintenance import prune_runtime_artifacts
@@ -487,7 +488,7 @@ def retrieve_context(
 
 @eval_app.command("run")
 def eval_run(
-    suite: Optional[str] = typer.Option(None, "--suite", help="Eval suite: extraction, routing, topology, conflict, or retrieval."),
+    suite: Optional[str] = typer.Option(None, "--suite", help="Eval suite: extraction, routing, topology, conflict, relations, or retrieval."),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
     svc = service(home)
@@ -929,6 +930,29 @@ def cos_reclaim_unrouted(
         critic_review=review,
     )
     console.print_json(json.dumps(result))
+
+
+@cos_app.command("reconcile-backlog")
+def cos_reconcile_backlog(
+    scope: str = typer.Option("w2b", "--scope", help="Backlog scope to inspect. Currently only w2b is implemented."),
+    dry_run: bool = typer.Option(True, "--dry-run/--apply", help="Preview by default; --apply is intentionally blocked until the dry-run is approved."),
+    sample_limit: int = typer.Option(10, "--sample-limit", min=1, max=100, help="Maximum sample rows per section."),
+    output: Optional[Path] = typer.Option(None, "--output", help="Optional path for the JSON dry-run report."),
+    home: Optional[Path] = typer.Option(None, help="Brain home directory."),
+) -> None:
+    normalized_scope = scope.strip().lower()
+    if normalized_scope != "w2b":
+        console.print(f"unsupported reconcile scope: {scope}")
+        raise typer.Exit(1)
+    if not dry_run:
+        console.print("W2b --apply is blocked until Peter approves a dry-run report.")
+        raise typer.Exit(1)
+    paths = BrainPaths.from_value(home)
+    BrainService(paths).init_workspace()
+    report = reconcile_backlog_w2b_dry_run(paths, sample_limit=sample_limit)
+    if output is not None:
+        write_reconcile_report(report, output)
+    console.print_json(json.dumps(report))
 
 
 @memory_app.command("propose")

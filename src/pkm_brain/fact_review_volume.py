@@ -1,0 +1,433 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from .db import connection, loads, rows
+from .paths import BrainPaths
+from .queue_summary import review_queue_summary
+from .util import now_iso
+
+
+ACTIVE_QUESTION_STATUSES = {"open", "needs_human"}
+SYNTHESIZE_DRAIN_STATUSES = {"needs_human", "proposed"}
+FALLBACK_PAGE_HINTS = {"concepts/extracted-facts.md"}
+REPORT_VERSION = "w2b-dry-run-v1"
+
+
+def reconcile_backlog_w2b_dry_run(
+    paths: BrainPaths,
+    *,
+    sample_limit: int = 10,
+) -> dict[str, Any]:
+    generated_at = now_iso()
+    before = review_queue_summary(paths)
+    with connection(paths.sqlite_path) as conn:
+        synthesize = synthesize_page_dry_run(conn, sample_limit=sample_limit)
+        unrouted = unrouted_inbox_dry_run(conn, sample_limit=sample_limit)
+        policy_reasons = policy_reason_dry_run(conn, sample_limit=sample_limit)
+    affected_question_ids = sorted(
+        {
+            *synthesize["affected_question_ids"],
+            *unrouted["affected_question_ids"],
+        }
+    )
+    projected_after = projected_queue_after(before, affected_question_ids)
+    return {
+        "status": "dry_run",
+        "scope": "w2b",
+        "report_version": REPORT_VERSION,
+        "generated_at": generated_at,
+        "acceptance_boundary": {
+            "requires_approval_before_apply": True,
+            "apply_supported_by_this_command": False,
+            "reason": "W2b applies policy/backlog changes only after Peter approves this dry-run report.",
+        },
+        "before": before,
+        "projected_after": projected_after,
+        "synthesize_page": synthesize,
+        "unrouted_inbox_batching": unrouted,
+        "human_readable_escalation_reasons": policy_reasons,
+        "rollback_paths": [
+            "synthesize_page applies through cos_actions with inverse_action_json.delete_synthesis_ids; revert_action can remove derived syntheses after apply.",
+            "unrouted Inbox batching will auto-resolve original questions through open_questions.answer with ledger metadata; each generated fact_upsert remains revertable through cos_actions.",
+            "policy changes are versioned rows in cos_policy; demotion can activate a later stricter policy version without mutating prior rows.",
+        ],
+        "next_step": "Review samples, then run the future --apply implementation only after approval.",
+    }
+
+
+def write_reconcile_report(report: dict[str, Any], output: Path) -> Path:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    import json
+
+    report["report_path"] = str(output)
+    output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return output
+
+
+def synthesize_page_dry_run(conn: Any, *, sample_limit: int) -> dict[str, Any]:
+    if not table_exists(conn, "open_questions") or not table_exists(conn, "cos_actions"):
+        return empty_synthesize_report("missing open_questions or cos_actions table")
+    linked_rows = rows(
+        conn,
+        """
+        SELECT
+          q.id AS question_id,
+          q.question AS question_text,
+          q.page_hint AS question_page_hint,
+          q.context AS question_context,
+          q.risk_tier AS question_risk_tier,
+          q.created_at AS question_created_at,
+          a.id AS action_id,
+          a.status AS action_status,
+          a.target_page_paths AS target_page_paths,
+          a.action_features AS action_features,
+          a.evidence_json AS evidence_json,
+          a.policy_id AS policy_id,
+          a.policy_version AS policy_version,
+          a.policy_decision AS policy_decision,
+          a.autonomy_level AS autonomy_level,
+          a.risk_tier AS action_risk_tier,
+          a.created_at AS action_created_at
+        FROM open_questions q
+        JOIN cos_actions a ON a.id = q.action_id
+        WHERE q.kind = 'policy_escalation'
+          AND q.status IN ('open', 'needs_human')
+          AND a.action_type = 'synthesize_page'
+          AND a.status IN ('needs_human', 'proposed')
+        ORDER BY q.created_at, q.id
+        """,
+    )
+    linked_action_ids = {str(row["action_id"]) for row in linked_rows}
+    unlinked_actions = unlinked_synthesize_actions(conn, linked_action_ids, sample_limit=sample_limit)
+    samples = [synthesize_sample(row) for row in linked_rows[:sample_limit]]
+    action_ids = sorted({*linked_action_ids, *[str(row["id"]) for row in unlinked_actions]})
+    question_ids = sorted(str(row["question_id"]) for row in linked_rows)
+    return {
+        "candidate_action_count": len(action_ids),
+        "linked_policy_escalation_question_count": len(question_ids),
+        "unlinked_proposed_action_count": len(unlinked_actions),
+        "affected_action_ids": action_ids,
+        "affected_question_ids": question_ids,
+        "planned_policy_change": {
+            "action_type": "synthesize_page",
+            "target_autonomy": "L2",
+            "critic_required": False,
+            "audit_sample_rate": 0.25,
+            "live_change_in_dry_run": False,
+            "rationale": "synthesize_page is derived, hash-stamped, revertible page text; source facts remain untouched.",
+        },
+        "planned_backlog_action": "auto-apply eligible synthesize_page actions through the existing action ledger after approval.",
+        "samples": samples,
+        "unlinked_action_samples": [unlinked_synthesize_sample(row) for row in unlinked_actions],
+    }
+
+
+def unlinked_synthesize_actions(conn: Any, linked_action_ids: set[str], *, sample_limit: int) -> list[Any]:
+    placeholders = ",".join("?" for _ in linked_action_ids)
+    exclude = f"AND id NOT IN ({placeholders})" if linked_action_ids else ""
+    return rows(
+        conn,
+        f"""
+        SELECT *
+        FROM cos_actions
+        WHERE action_type = 'synthesize_page'
+          AND status IN ('needs_human', 'proposed')
+          {exclude}
+        ORDER BY created_at, id
+        LIMIT ?
+        """,
+        (*linked_action_ids, sample_limit) if linked_action_ids else (sample_limit,),
+    )
+
+
+def synthesize_sample(row: Any) -> dict[str, Any]:
+    target_pages = loads(row["target_page_paths"], [])
+    features = loads(row["action_features"], {})
+    evidence = loads(row["evidence_json"], {})
+    return {
+        "question_id": row["question_id"],
+        "action_id": row["action_id"],
+        "question": str(row["question_text"] or "")[:240],
+        "current_action_status": row["action_status"],
+        "policy_id": row["policy_id"],
+        "policy_decision": row["policy_decision"],
+        "autonomy_level": row["autonomy_level"],
+        "risk_tier": row["action_risk_tier"] or row["question_risk_tier"],
+        "target_page_paths": target_pages,
+        "affected_fact_count": features.get("affected_fact_count"),
+        "payload_page_hint": payload_page_hint(evidence),
+        "planned_resolution": "apply synthesis through cos_actions; mark linked policy question auto_resolved",
+    }
+
+
+def unlinked_synthesize_sample(row: Any) -> dict[str, Any]:
+    evidence = loads(row["evidence_json"], {})
+    return {
+        "action_id": row["id"],
+        "current_action_status": row["status"],
+        "target_page_paths": loads(row["target_page_paths"], []),
+        "payload_page_hint": payload_page_hint(evidence),
+        "planned_resolution": "decide/apply after W2b approval if still eligible",
+    }
+
+
+def payload_page_hint(evidence: dict[str, Any]) -> str | None:
+    payload = evidence.get("payload") if isinstance(evidence, dict) else None
+    if not isinstance(payload, dict):
+        return None
+    value = str(payload.get("page_hint") or "").strip()
+    return value or None
+
+
+def unrouted_inbox_dry_run(conn: Any, *, sample_limit: int) -> dict[str, Any]:
+    if not table_exists(conn, "open_questions"):
+        return empty_unrouted_report("missing open_questions table")
+    question_rows = rows(
+        conn,
+        """
+        SELECT *
+        FROM open_questions
+        WHERE kind = 'unrouted_fact'
+          AND status IN ('open', 'needs_human')
+        ORDER BY created_at, id
+        """,
+    )
+    action_cache = linked_actions_for_questions(conn, question_rows)
+    groups: dict[str, dict[str, Any]] = {}
+    skipped: list[dict[str, Any]] = []
+    for question in question_rows:
+        action = action_cache.get(str(question["action_id"] or ""))
+        candidate = candidate_fact_from_question(question, action)
+        if not candidate:
+            skipped.append({"question_id": question["id"], "reason": "missing_candidate_fact"})
+            continue
+        target = planned_inbox_target(question, candidate)
+        bucket = groups.setdefault(
+            target["page_hint"],
+            {
+                "page_hint": target["page_hint"],
+                "section": "Inbox",
+                "route_basis": target["route_basis"],
+                "question_ids": [],
+                "action_ids": [],
+                "sample_statements": [],
+            },
+        )
+        bucket["question_ids"].append(str(question["id"]))
+        action_id = str(question["action_id"] or "").strip()
+        if action_id:
+            bucket["action_ids"].append(action_id)
+        if len(bucket["sample_statements"]) < 3:
+            bucket["sample_statements"].append(str(candidate.get("statement") or "")[:220])
+    group_list = sorted(groups.values(), key=lambda item: (-len(item["question_ids"]), item["page_hint"]))
+    affected_question_ids = sorted(str(row["id"]) for row in question_rows)
+    return {
+        "candidate_question_count": len(question_rows),
+        "affected_question_ids": affected_question_ids,
+        "planned_group_count": len(group_list),
+        "planned_weekly_batch_question_count": len(group_list),
+        "planned_action": "append candidate facts to each target page's Inbox section and replace individual unrouted prompts with one weekly batch question per page after approval.",
+        "live_change_in_dry_run": False,
+        "groups": [
+            {
+                **group,
+                "count": len(group["question_ids"]),
+                "question_ids": group["question_ids"][:sample_limit],
+                "action_ids": sorted(set(group["action_ids"]))[:sample_limit],
+            }
+            for group in group_list[:sample_limit]
+        ],
+        "skipped_count": len(skipped),
+        "skipped_examples": skipped[:sample_limit],
+    }
+
+
+def linked_actions_for_questions(conn: Any, question_rows: list[Any]) -> dict[str, Any]:
+    if not table_exists(conn, "cos_actions"):
+        return {}
+    action_ids = sorted({str(row["action_id"] or "") for row in question_rows if str(row["action_id"] or "").strip()})
+    if not action_ids:
+        return {}
+    placeholders = ",".join("?" for _ in action_ids)
+    return {
+        str(row["id"]): row
+        for row in rows(
+            conn,
+            f"SELECT * FROM cos_actions WHERE id IN ({placeholders})",
+            tuple(action_ids),
+        )
+    }
+
+
+def candidate_fact_from_question(question: Any, action: Any | None) -> dict[str, Any] | None:
+    if action is not None:
+        evidence = loads(action["evidence_json"], {})
+        payload = evidence.get("payload") if isinstance(evidence, dict) else None
+        if isinstance(payload, dict):
+            fact = payload.get("fact")
+            if isinstance(fact, dict):
+                return fact
+            if payload.get("statement"):
+                return payload
+    context = loads(question["context"], {})
+    for key in ("fact", "candidate", "candidate_fact"):
+        fact = context.get(key) if isinstance(context, dict) else None
+        if isinstance(fact, dict):
+            return fact
+    options = loads(question["options"], [])
+    for option in options:
+        if isinstance(option, dict) and option.get("statement"):
+            return option
+    return None
+
+
+def planned_inbox_target(question: Any, candidate: dict[str, Any]) -> dict[str, str]:
+    routing = {}
+    metadata = candidate.get("metadata")
+    if isinstance(metadata, dict) and isinstance(metadata.get("routing"), dict):
+        routing = metadata["routing"]
+    for key in ("snapped_page_hint", "resolved_page_hint", "original_page_hint", "normalized_page_hint"):
+        value = normalized_page_hint(routing.get(key))
+        if value and value not in FALLBACK_PAGE_HINTS:
+            return {"page_hint": value, "route_basis": f"candidate.metadata.routing.{key}"}
+    for key in ("page_hint",):
+        value = normalized_page_hint(candidate.get(key))
+        if value and value not in FALLBACK_PAGE_HINTS:
+            return {"page_hint": value, "route_basis": f"candidate.{key}"}
+    value = normalized_page_hint(question["page_hint"])
+    if value and value not in FALLBACK_PAGE_HINTS:
+        return {"page_hint": value, "route_basis": "question.page_hint"}
+    entity_key = str(candidate.get("entity_key") or question["entity_key"] or "").strip()
+    if entity_key:
+        return {
+            "page_hint": f"inbox/{safe_page_slug(entity_key)}.md",
+            "route_basis": "entity_key_fallback",
+        }
+    return {"page_hint": "inbox/unrouted-facts.md", "route_basis": "global_fallback"}
+
+
+def normalized_page_hint(value: Any) -> str:
+    text = str(value or "").strip().lstrip("/")
+    if not text:
+        return ""
+    return text if text.endswith(".md") else f"{text}.md"
+
+
+def safe_page_slug(value: str) -> str:
+    import re
+
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return slug or "unrouted-facts"
+
+
+def policy_reason_dry_run(conn: Any, *, sample_limit: int) -> dict[str, Any]:
+    if not table_exists(conn, "open_questions"):
+        return {"active_policy_escalation_count": 0, "opaque_reason_count": 0, "samples": []}
+    question_rows = rows(
+        conn,
+        """
+        SELECT q.id, q.question, q.action_id, a.action_type, a.policy_id, a.autonomy_level, a.action_features
+        FROM open_questions q
+        LEFT JOIN cos_actions a ON a.id = q.action_id
+        WHERE q.kind = 'policy_escalation'
+          AND q.status IN ('open', 'needs_human')
+        ORDER BY q.created_at, q.id
+        """,
+    )
+    opaque = [
+        row
+        for row in question_rows
+        if str(row["question"] or "").startswith("matched policy ")
+        or "matched policy policy_" in str(row["question"] or "")
+    ]
+    return {
+        "active_policy_escalation_count": len(question_rows),
+        "opaque_reason_count": len(opaque),
+        "samples": [
+            {
+                "question_id": row["id"],
+                "action_id": row["action_id"],
+                "action_type": row["action_type"],
+                "current_question": str(row["question"] or "")[:220],
+                "policy_id": row["policy_id"],
+                "autonomy_level": row["autonomy_level"],
+                "planned_reason_shape": planned_policy_reason_shape(
+                    str(row["action_type"] or ""),
+                    str(row["policy_id"] or ""),
+                    str(row["autonomy_level"] or ""),
+                    loads(row["action_features"], {}),
+                ),
+            }
+            for row in opaque[:sample_limit]
+        ],
+    }
+
+
+def planned_policy_reason_shape(
+    action_type: str, policy_id: str, autonomy_level: str, features: dict[str, Any]
+) -> str:
+    risk = str(features.get("risk_tier") or "").strip()
+    if action_type == "synthesize_page":
+        return (
+            f"Synthesis is derived, revertible page text; policy {policy_id} routes "
+            f"{risk or 'this'} synthesis to {autonomy_level or 'review'}."
+        )
+    if action_type == "fact_upsert":
+        return (
+            f"Fact upsert needs review because the current policy {policy_id} routes "
+            f"{risk or 'this'} fact evidence to {autonomy_level or 'review'}."
+        )
+    return (
+        f"{action_type or 'Action'} needs review because policy {policy_id or 'unknown'} "
+        f"routes it to {autonomy_level or 'human review'}."
+    )
+
+
+def projected_queue_after(before: dict[str, Any], affected_question_ids: list[str]) -> dict[str, Any]:
+    raw = dict(before.get("raw") or {})
+    by_kind = dict(before.get("by_kind") or {})
+    removable = len(set(affected_question_ids))
+    after_total = max(0, int(before.get("total") or 0) - removable)
+    return {
+        "total_if_w2b_applied": after_total,
+        "question_count_removed": removable,
+        "note": "Projection removes active synthesize policy-escalation and unrouted questions only; audit/proposed action counts may shift during apply.",
+        "before_raw": raw,
+        "before_by_kind": by_kind,
+    }
+
+
+def table_exists(conn: Any, table: str) -> bool:
+    return bool(
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?",
+            (table,),
+        ).fetchone()
+    )
+
+
+def empty_synthesize_report(reason: str) -> dict[str, Any]:
+    return {
+        "candidate_action_count": 0,
+        "linked_policy_escalation_question_count": 0,
+        "unlinked_proposed_action_count": 0,
+        "affected_action_ids": [],
+        "affected_question_ids": [],
+        "samples": [],
+        "reason": reason,
+    }
+
+
+def empty_unrouted_report(reason: str) -> dict[str, Any]:
+    return {
+        "candidate_question_count": 0,
+        "affected_question_ids": [],
+        "planned_group_count": 0,
+        "planned_weekly_batch_question_count": 0,
+        "groups": [],
+        "skipped_count": 0,
+        "skipped_examples": [],
+        "reason": reason,
+    }

@@ -19,6 +19,7 @@ data/
 indexes/
 logs/
 local-backups/
+reports/
 
 # Tool caches
 .pytest_cache/

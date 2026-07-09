@@ -63,7 +63,7 @@ def evaluate_policy(
             audit_sample_rate=float(rule["audit_sample_rate"] or 0.0),
             timeout_allowed=bool(rule["timeout_allowed"]),
             timeout_after_seconds=rule["timeout_after_seconds"],
-            reason=f"matched policy {rule['id']}",
+            reason=human_policy_reason(action_type, rule, features),
         )
         return apply_eval_gate(conn, decision, features)
     return PolicyDecision(
@@ -96,6 +96,32 @@ def active_policy_rules(conn: Any) -> list[Any]:
         ORDER BY priority, id
         """,
         (version,),
+    )
+
+
+def human_policy_reason(action_type: str, rule: Any, features: dict[str, Any]) -> str:
+    policy_id = str(rule["id"])
+    autonomy_level = str(rule["autonomy_level"])
+    risk_tier = str(features.get("risk_tier") or "").strip()
+    action_label = str(action_type or "action").replace("_", " ")
+    if action_type == "synthesize_page":
+        return (
+            f"Synthesis is derived, revertible page text; policy {policy_id} routes "
+            f"{risk_tier or 'this'} synthesis to {autonomy_level}."
+        )
+    if action_type == "fact_upsert":
+        return (
+            f"Fact upsert matched {risk_tier or 'current'} evidence policy {policy_id}; "
+            f"review level is {autonomy_level}."
+        )
+    if autonomy_level == "L3":
+        return (
+            f"{action_label.title()} requires human review under policy {policy_id}"
+            f"{f' because risk is {risk_tier}' if risk_tier else ''}."
+        )
+    return (
+        f"{action_label.title()} uses policy {policy_id}; autonomy level is "
+        f"{autonomy_level}{f' with {risk_tier} risk' if risk_tier else ''}."
     )
 
 

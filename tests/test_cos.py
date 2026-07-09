@@ -211,6 +211,8 @@ def test_policy_promotion_matches_low_medium_and_large_topology(tmp_path: Path) 
     assert version == 2
     assert low.autonomy_level == "L1"
     assert low.critic_required is True
+    assert "Synthesis is derived" in low.reason
+    assert "matched policy" not in low.reason
     assert medium.autonomy_level == "L2"
     assert medium.audit_sample_rate == 1.0
     assert clean_fact.autonomy_level == "L2"
