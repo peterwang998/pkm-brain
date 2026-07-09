@@ -159,7 +159,12 @@ def test_policy_promotion_matches_low_medium_and_large_topology(tmp_path: Path) 
         low = evaluate_policy(
             conn,
             "synthesize_page",
-            {"risk_tier": "low", "affected_fact_count": 2},
+            {
+                "risk_tier": "low",
+                "affected_fact_count": 2,
+                "truth_mutation": False,
+                "reversible": True,
+            },
         )
         medium = evaluate_policy(
             conn,
@@ -209,8 +214,9 @@ def test_policy_promotion_matches_low_medium_and_large_topology(tmp_path: Path) 
         )
 
     assert version == 2
-    assert low.autonomy_level == "L1"
-    assert low.critic_required is True
+    assert low.autonomy_level == "L2"
+    assert low.critic_required is False
+    assert low.audit_sample_rate == 0.25
     assert "Synthesis is derived" in low.reason
     assert "matched policy" not in low.reason
     assert medium.autonomy_level == "L2"

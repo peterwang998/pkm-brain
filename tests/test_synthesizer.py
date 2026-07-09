@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from pkm_brain.cos_actions import apply_action
+from pkm_brain.cos_policy import promote_policy_for_autonomy
 from pkm_brain.db import connection
 from pkm_brain.paths import BrainPaths
 from pkm_brain.service import BrainService
@@ -98,6 +99,8 @@ def test_page_synthesizer_generates_cited_shadow_candidate(tmp_path: Path) -> No
 def test_page_synthesizer_proposes_reversible_action(tmp_path: Path) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()
+    with connection(svc.paths.sqlite_path) as conn:
+        promote_policy_for_autonomy(conn, reason="test synthesis L2 policy")
     insert_fact(svc.paths, "fact_synth_a", "The synthesis test page has supported active facts.")
 
     result = generate_page_syntheses(
@@ -109,8 +112,9 @@ def test_page_synthesizer_proposes_reversible_action(tmp_path: Path) -> None:
     assert result["candidate_count"] == 1
     action = result["actions"][0]
     assert action["action_type"] == "synthesize_page"
-    assert action["status"] == "needs_human"
-    assert action["autonomy_level"] == "L3"
+    assert action["status"] == "applied"
+    assert action["autonomy_level"] == "L2"
+    assert action["critic_by"] is None
     applied = apply_action(svc.paths, action["id"])
     facts = active_facts_by_page(svc.paths, ["concepts/synthesis-test.md"])["concepts/synthesis-test.md"]
     synthesis = active_page_synthesis(svc.paths, "concepts/synthesis-test.md", facts)

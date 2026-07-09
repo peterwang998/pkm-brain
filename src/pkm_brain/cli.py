@@ -41,7 +41,11 @@ from .connectors import (
 from .db import connection, rows
 from .evals import run_eval
 from .extraction import critic_review_config, reclaim_unrouted_facts
-from .fact_review_volume import reconcile_backlog_w2b_dry_run, write_reconcile_report
+from .fact_review_volume import (
+    reconcile_backlog_w2b_apply,
+    reconcile_backlog_w2b_dry_run,
+    write_reconcile_report,
+)
 from .cos_policy import promote_policy_for_autonomy
 from .llm import cos_provider_status, provider_status
 from .maintenance import prune_runtime_artifacts
@@ -944,12 +948,12 @@ def cos_reconcile_backlog(
     if normalized_scope != "w2b":
         console.print(f"unsupported reconcile scope: {scope}")
         raise typer.Exit(1)
-    if not dry_run:
-        console.print("W2b --apply is blocked until Peter approves a dry-run report.")
-        raise typer.Exit(1)
     paths = BrainPaths.from_value(home)
     BrainService(paths).init_workspace()
-    report = reconcile_backlog_w2b_dry_run(paths, sample_limit=sample_limit)
+    if dry_run:
+        report = reconcile_backlog_w2b_dry_run(paths, sample_limit=sample_limit)
+    else:
+        report = reconcile_backlog_w2b_apply(paths, sample_limit=sample_limit)
     if output is not None:
         write_reconcile_report(report, output)
     console.print_json(json.dumps(report))

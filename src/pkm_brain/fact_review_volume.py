@@ -3,16 +3,18 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .db import connection, loads, rows
+from .cos_actions import apply_action, propose_action
+from .cos_policy import evaluate_policy, promote_policy_for_autonomy
+from .db import connection, dumps, loads, rows
 from .paths import BrainPaths
 from .queue_summary import review_queue_summary
-from .util import now_iso
+from .util import new_id, now_iso
 
 
 ACTIVE_QUESTION_STATUSES = {"open", "needs_human"}
 SYNTHESIZE_DRAIN_STATUSES = {"needs_human", "proposed"}
 FALLBACK_PAGE_HINTS = {"concepts/extracted-facts.md"}
-REPORT_VERSION = "w2b-dry-run-v1"
+REPORT_VERSION = "w2b-v1"
 
 
 def reconcile_backlog_w2b_dry_run(
@@ -32,7 +34,11 @@ def reconcile_backlog_w2b_dry_run(
             *unrouted["affected_question_ids"],
         }
     )
-    projected_after = projected_queue_after(before, affected_question_ids)
+    projected_after = projected_queue_after(
+        before,
+        affected_question_ids,
+        new_question_count=int(unrouted["planned_weekly_batch_question_count"]),
+    )
     return {
         "status": "dry_run",
         "scope": "w2b",
@@ -40,7 +46,7 @@ def reconcile_backlog_w2b_dry_run(
         "generated_at": generated_at,
         "acceptance_boundary": {
             "requires_approval_before_apply": True,
-            "apply_supported_by_this_command": False,
+            "apply_supported_by_this_command": True,
             "reason": "W2b applies policy/backlog changes only after Peter approves this dry-run report.",
         },
         "before": before,
@@ -57,6 +63,35 @@ def reconcile_backlog_w2b_dry_run(
     }
 
 
+def reconcile_backlog_w2b_apply(
+    paths: BrainPaths,
+    *,
+    sample_limit: int = 10,
+) -> dict[str, Any]:
+    generated_at = now_iso()
+    before = review_queue_summary(paths)
+    promoted_policy_version = ensure_synthesize_page_l2_policy(paths)
+    synthesize = apply_synthesize_page_backlog(paths, sample_limit=sample_limit)
+    unrouted = apply_unrouted_inbox_batching(paths, sample_limit=sample_limit)
+    after = review_queue_summary(paths)
+    return {
+        "status": "ok",
+        "scope": "w2b",
+        "report_version": REPORT_VERSION,
+        "generated_at": generated_at,
+        "before": before,
+        "after": after,
+        "promoted_policy_version": promoted_policy_version,
+        "synthesize_page": synthesize,
+        "unrouted_inbox_batching": unrouted,
+        "rollback_paths": [
+            "synthesize_page actions can be reverted with revert_action(action_id), which deletes inserted syntheses via inverse_action_json.",
+            "unrouted Inbox fact_upsert actions can be reverted with revert_action(new_action_id); original questions retain old/new action ids in answer metadata.",
+            "the W2b policy promotion is append-only; a stricter policy can be promoted after it if audit finds issues.",
+        ],
+    }
+
+
 def write_reconcile_report(report: dict[str, Any], output: Path) -> Path:
     output.parent.mkdir(parents=True, exist_ok=True)
     import json
@@ -64,6 +99,365 @@ def write_reconcile_report(report: dict[str, Any], output: Path) -> Path:
     report["report_path"] = str(output)
     output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return output
+
+
+def ensure_synthesize_page_l2_policy(paths: BrainPaths) -> int | None:
+    with connection(paths.sqlite_path) as conn:
+        decision = evaluate_policy(
+            conn,
+            "synthesize_page",
+            {
+                "risk_tier": "low",
+                "truth_mutation": False,
+                "reversible": True,
+                "affected_fact_count": 1,
+            },
+        )
+        if decision.autonomy_level == "L2" and not decision.critic_required:
+            return None
+        return promote_policy_for_autonomy(
+            conn,
+            reason="W2b fact-review-volume: synthesize_page is derived, revertible text and should apply at L2 with sampled audit",
+        )
+
+
+def apply_synthesize_page_backlog(paths: BrainPaths, *, sample_limit: int) -> dict[str, Any]:
+    with connection(paths.sqlite_path) as conn:
+        candidates = synthesize_page_candidate_rows(conn)
+    applied: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    for row in candidates:
+        action_id = str(row["action_id"])
+        question_id = str(row["question_id"])
+        try:
+            action = apply_action(paths, action_id, applied_status="applied")
+            mark_synthesize_reconciled(paths, action_id, question_id)
+            applied.append(
+                {
+                    "action_id": action_id,
+                    "question_id": question_id,
+                    "status": action["status"],
+                    "target_page_paths": action.get("target_page_paths") or [],
+                    "inverse_action_json": action.get("inverse_action_json") or {},
+                }
+            )
+        except Exception as exc:
+            failed.append(
+                {
+                    "action_id": action_id,
+                    "question_id": question_id,
+                    "error": str(exc)[:500],
+                }
+            )
+    return {
+        "applied_count": len(applied),
+        "resolved_question_count": len(applied),
+        "failed_count": len(failed),
+        "applied_samples": applied[:sample_limit],
+        "failed": failed[:sample_limit],
+    }
+
+
+def synthesize_page_candidate_rows(conn: Any) -> list[Any]:
+    if not table_exists(conn, "open_questions") or not table_exists(conn, "cos_actions"):
+        return []
+    return rows(
+        conn,
+        """
+        SELECT
+          q.id AS question_id,
+          a.id AS action_id
+        FROM open_questions q
+        JOIN cos_actions a ON a.id = q.action_id
+        WHERE q.kind = 'policy_escalation'
+          AND q.status IN ('open', 'needs_human')
+          AND a.action_type = 'synthesize_page'
+          AND a.status IN ('needs_human', 'proposed')
+        ORDER BY q.created_at, q.id
+        """,
+    )
+
+
+def mark_synthesize_reconciled(paths: BrainPaths, action_id: str, question_id: str) -> None:
+    timestamp = now_iso()
+    with connection(paths.sqlite_path) as conn:
+        action = conn.execute(
+            "SELECT * FROM cos_actions WHERE id = ?",
+            (action_id,),
+        ).fetchone()
+        features = loads(action["action_features"], {}) if action else {}
+        policy_features = {
+            **features,
+            "risk_tier": action["risk_tier"] if action else features.get("risk_tier"),
+            "truth_mutation": False,
+            "reversible": True,
+        }
+        policy_features.pop("eval_gate", None)
+        decision = evaluate_policy(conn, "synthesize_page", policy_features)
+        evidence = loads(action["evidence_json"], {}) if action else {}
+        evidence["w2b_reconciliation"] = {
+            "kind": "synthesize_page_auto_apply",
+            "question_id": question_id,
+            "decided_at": timestamp,
+            "removed_eval_gate": "eval_gate" in features,
+        }
+        conn.execute(
+            """
+            UPDATE cos_actions
+            SET policy_id = ?, policy_version = ?, policy_decision = ?,
+                autonomy_level = ?, evidence_json = ?
+            WHERE id = ?
+            """,
+            (
+                decision.policy_id,
+                decision.policy_version,
+                "w2b_synthesize_auto_apply",
+                "L2",
+                dumps(evidence),
+                action_id,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE open_questions
+            SET status = 'auto_resolved',
+                answer = ?,
+                answered_at = ?,
+                decided_by = 'w2b_reconcile'
+            WHERE id = ?
+            """,
+            (
+                dumps(
+                    {
+                        "resolution": "synthesize_page_auto_apply",
+                        "action_id": action_id,
+                        "reason": "W2b approved auto-application for derived, revertible syntheses.",
+                    }
+                ),
+                timestamp,
+                question_id,
+            ),
+        )
+
+
+def apply_unrouted_inbox_batching(paths: BrainPaths, *, sample_limit: int) -> dict[str, Any]:
+    with connection(paths.sqlite_path) as conn:
+        question_rows = rows(
+            conn,
+            """
+            SELECT *
+            FROM open_questions
+            WHERE kind = 'unrouted_fact'
+              AND status IN ('open', 'needs_human')
+            ORDER BY created_at, id
+            """,
+        )
+        action_cache = linked_actions_for_questions(conn, question_rows)
+    applied: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    groups: dict[str, dict[str, Any]] = {}
+    for question in question_rows:
+        action = action_cache.get(str(question["action_id"] or ""))
+        candidate = candidate_fact_from_question(question, action)
+        if candidate is None:
+            skipped.append({"question_id": question["id"], "reason": "missing_candidate_fact"})
+            continue
+        target = planned_inbox_target(question, candidate)
+        inbox_fact = inbox_fact_payload(question, candidate, target)
+        try:
+            new_action = apply_action(
+                paths,
+                propose_action(
+                    paths,
+                    "fact_upsert",
+                    action_payload={"fact": inbox_fact},
+                    action_features={
+                        "human_confirmed": True,
+                        "w2b_unrouted_inbox_batch": True,
+                        "truth_mutation": True,
+                        "reversible": True,
+                        "affected_fact_count": 1,
+                    },
+                    target_fact_ids=[str(inbox_fact.get("id") or "")],
+                    target_page_paths=[target["page_hint"]],
+                    proposed_by="w2b_reconcile_unrouted_inbox",
+                    confidence=float(inbox_fact.get("confidence") or inbox_fact.get("truth_confidence") or 1.0),
+                    risk_tier="medium",
+                )["id"],
+            )
+            mark_unrouted_reconciled(
+                paths,
+                question_id=str(question["id"]),
+                old_action_id=str(question["action_id"] or ""),
+                new_action_id=str(new_action["id"]),
+                target=target,
+            )
+        except Exception as exc:
+            skipped.append(
+                {
+                    "question_id": question["id"],
+                    "old_action_id": question["action_id"],
+                    "reason": "apply_failed",
+                    "error": str(exc)[:500],
+                }
+            )
+            continue
+        group = groups.setdefault(
+            target["page_hint"],
+            {
+                "page_hint": target["page_hint"],
+                "section": "Inbox",
+                "route_basis": target["route_basis"],
+                "question_ids": [],
+                "old_action_ids": [],
+                "new_action_ids": [],
+            },
+        )
+        group["question_ids"].append(str(question["id"]))
+        if question["action_id"]:
+            group["old_action_ids"].append(str(question["action_id"]))
+        group["new_action_ids"].append(str(new_action["id"]))
+        applied.append(
+            {
+                "question_id": question["id"],
+                "old_action_id": question["action_id"],
+                "new_action_id": new_action["id"],
+                "page_hint": target["page_hint"],
+                "section": "Inbox",
+            }
+        )
+    batch_questions = create_unrouted_batch_questions(paths, list(groups.values()))
+    return {
+        "applied_count": len(applied),
+        "resolved_question_count": len(applied),
+        "batch_question_count": len(batch_questions),
+        "skipped_count": len(skipped),
+        "applied_samples": applied[:sample_limit],
+        "batch_questions": batch_questions[:sample_limit],
+        "skipped_examples": skipped[:sample_limit],
+    }
+
+
+def inbox_fact_payload(question: Any, candidate: dict[str, Any], target: dict[str, str]) -> dict[str, Any]:
+    fact = dict(candidate)
+    fact.setdefault("id", new_id("fact"))
+    fact["page_hint"] = target["page_hint"]
+    fact["section_hint"] = "Inbox"
+    metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
+    fact["metadata"] = {
+        **metadata,
+        "w2b_unrouted_inbox": {
+            "question_id": question["id"],
+            "old_page_hint": candidate.get("page_hint"),
+            "new_page_hint": target["page_hint"],
+            "route_basis": target["route_basis"],
+            "filed_at": now_iso(),
+        },
+    }
+    return fact
+
+
+def mark_unrouted_reconciled(
+    paths: BrainPaths,
+    *,
+    question_id: str,
+    old_action_id: str,
+    new_action_id: str,
+    target: dict[str, str],
+) -> None:
+    timestamp = now_iso()
+    answer = {
+        "resolution": "unrouted_inbox_batch",
+        "old_action_id": old_action_id,
+        "new_action_id": new_action_id,
+        "page_hint": target["page_hint"],
+        "section": "Inbox",
+        "route_basis": target["route_basis"],
+    }
+    with connection(paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            UPDATE open_questions
+            SET status = 'auto_resolved',
+                answer = ?,
+                answered_at = ?,
+                action_id = ?,
+                decided_by = 'w2b_reconcile'
+            WHERE id = ?
+            """,
+            (dumps(answer), timestamp, new_action_id, question_id),
+        )
+        if old_action_id:
+            old_row = conn.execute(
+                "SELECT * FROM cos_actions WHERE id = ?",
+                (old_action_id,),
+            ).fetchone()
+            if old_row is not None:
+                evidence = loads(old_row["evidence_json"], {})
+                evidence["w2b_reconciliation"] = answer
+                conn.execute(
+                    """
+                    UPDATE cos_actions
+                    SET status = 'rejected',
+                        policy_decision = COALESCE(policy_decision, 'w2b_replaced_by_inbox_batch'),
+                        evidence_json = ?
+                    WHERE id = ?
+                    """,
+                    (dumps(evidence), old_action_id),
+                )
+
+
+def create_unrouted_batch_questions(
+    paths: BrainPaths, groups: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    created: list[dict[str, Any]] = []
+    timestamp = now_iso()
+    with connection(paths.sqlite_path) as conn:
+        for group in sorted(groups, key=lambda item: str(item["page_hint"])):
+            if not group["question_ids"]:
+                continue
+            question_id = new_id("question")
+            page_hint = str(group["page_hint"])
+            context = {
+                "source": "w2b_unrouted_inbox_batch",
+                "page_hint": page_hint,
+                "section": "Inbox",
+                "source_question_ids": group["question_ids"],
+                "old_action_ids": group["old_action_ids"],
+                "new_action_ids": group["new_action_ids"],
+                "route_basis": group["route_basis"],
+            }
+            conn.execute(
+                """
+                INSERT INTO open_questions(
+                  id, kind, entity_key, page_hint, fact_ids, question, options, status,
+                  context, recommended_action, risk_tier, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    question_id,
+                    "unrouted_inbox_batch",
+                    None,
+                    page_hint,
+                    dumps([]),
+                    f"{len(group['question_ids'])} unrouted facts were filed to the Inbox section on {page_hint}. Sweep or rehome them when convenient.",
+                    dumps([]),
+                    "needs_human",
+                    dumps(context),
+                    dumps({"action_type": "review_unrouted_inbox_batch", "page_hint": page_hint}),
+                    "low",
+                    timestamp,
+                ),
+            )
+            created.append(
+                {
+                    "question_id": question_id,
+                    "page_hint": page_hint,
+                    "count": len(group["question_ids"]),
+                    "new_action_ids": group["new_action_ids"],
+                }
+            )
+    return created
 
 
 def synthesize_page_dry_run(conn: Any, *, sample_limit: int) -> dict[str, Any]:
@@ -385,15 +779,19 @@ def planned_policy_reason_shape(
     )
 
 
-def projected_queue_after(before: dict[str, Any], affected_question_ids: list[str]) -> dict[str, Any]:
+def projected_queue_after(
+    before: dict[str, Any], affected_question_ids: list[str], *, new_question_count: int
+) -> dict[str, Any]:
     raw = dict(before.get("raw") or {})
     by_kind = dict(before.get("by_kind") or {})
     removable = len(set(affected_question_ids))
-    after_total = max(0, int(before.get("total") or 0) - removable)
+    after_total = max(0, int(before.get("total") or 0) - removable + int(new_question_count))
     return {
         "total_if_w2b_applied": after_total,
         "question_count_removed": removable,
-        "note": "Projection removes active synthesize policy-escalation and unrouted questions only; audit/proposed action counts may shift during apply.",
+        "new_weekly_batch_question_count": int(new_question_count),
+        "net_question_delta": int(new_question_count) - removable,
+        "note": "Projection removes active synthesize policy-escalation and unrouted questions, then adds one unrouted Inbox batch question per affected page; audit/proposed action counts may shift during apply.",
         "before_raw": raw,
         "before_by_kind": by_kind,
     }

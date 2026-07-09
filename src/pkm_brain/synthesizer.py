@@ -89,7 +89,6 @@ def generate_page_syntheses(
                         "affected_fact_count": len(candidate.get("fact_ids") or []),
                         "truth_mutation": False,
                         "reversible": True,
-                        "eval_gate": {"suite": "retrieval", "passed": False},
                     },
                     target_fact_ids=list(candidate.get("fact_ids") or []),
                     target_page_paths=[str(candidate["page_hint"])],

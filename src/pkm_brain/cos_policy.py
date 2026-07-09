@@ -570,6 +570,17 @@ def autonomy_policy_rows(
         ),
         policy_row(
             version,
+            "synthesize_page_l2_audit",
+            29,
+            ["synthesize_page"],
+            {"eq": {"risk_tier": "low", "truth_mutation": False, "reversible": True}},
+            "L2",
+            False,
+            0.25,
+            created_at,
+        ),
+        policy_row(
+            version,
             "low_l1_critic",
             30,
             sorted(LOW_AUTONOMY_ACTION_TYPES),
