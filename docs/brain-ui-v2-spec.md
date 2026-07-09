@@ -1,7 +1,7 @@
 # Brain UI v2 — Design Spec
 
 **Status:** implemented — v2 shell, Today, Queue, Wiki, Entities, Ask, Ops, static asset serving, legacy `ui_shell()` retirement, and native app queue orientation are committed.
-**Last verified:** 2026-07-09 against implementation commit `841ba3e`; `swift test --package-path app`, `uv run ruff check .`, and `uv run pytest -q` passed.
+**Last verified:** 2026-07-09 against implementation commit `cfe39bb`; `swift test --package-path app`, `uv run ruff check .`, and `uv run pytest -q` passed.
 **Scaffold:** `src/pkm_brain/ui_static/` (created with this spec — the HTML shell and design tokens are the design; JS view modules are contracts to implement)
 **Standing decisions honored:** the browser stays a *thin local control plane over existing primitives* (wiki decision `pkm-brain-reuse-existing-primitives-for-browser-review`); no parallel backend, no parallel approval system. All mutations dispatch to existing service/CoS/question/memory functions.
 
