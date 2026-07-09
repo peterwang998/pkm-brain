@@ -42,6 +42,7 @@ from .db import connection, rows
 from .evals import run_eval
 from .extraction import critic_review_config, reclaim_unrouted_facts
 from .fact_review_volume import (
+    reconcile_backlog_w2a_dry_run,
     reconcile_backlog_w2b_apply,
     reconcile_backlog_w2b_dry_run,
     write_reconcile_report,
@@ -938,19 +939,24 @@ def cos_reclaim_unrouted(
 
 @cos_app.command("reconcile-backlog")
 def cos_reconcile_backlog(
-    scope: str = typer.Option("w2b", "--scope", help="Backlog scope to inspect. Currently only w2b is implemented."),
+    scope: str = typer.Option("w2b", "--scope", help="Backlog scope to inspect: w2b or w2a."),
     dry_run: bool = typer.Option(True, "--dry-run/--apply", help="Preview by default; --apply is intentionally blocked until the dry-run is approved."),
     sample_limit: int = typer.Option(10, "--sample-limit", min=1, max=100, help="Maximum sample rows per section."),
     output: Optional[Path] = typer.Option(None, "--output", help="Optional path for the JSON dry-run report."),
     home: Optional[Path] = typer.Option(None, help="Brain home directory."),
 ) -> None:
     normalized_scope = scope.strip().lower()
-    if normalized_scope != "w2b":
+    if normalized_scope not in {"w2b", "w2a"}:
         console.print(f"unsupported reconcile scope: {scope}")
+        raise typer.Exit(1)
+    if normalized_scope == "w2a" and not dry_run:
+        console.print("W2a --apply is blocked until Peter approves a W2a dry-run report.")
         raise typer.Exit(1)
     paths = BrainPaths.from_value(home)
     BrainService(paths).init_workspace()
-    if dry_run:
+    if normalized_scope == "w2a":
+        report = reconcile_backlog_w2a_dry_run(paths, sample_limit=sample_limit)
+    elif dry_run:
         report = reconcile_backlog_w2b_dry_run(paths, sample_limit=sample_limit)
     else:
         report = reconcile_backlog_w2b_apply(paths, sample_limit=sample_limit)

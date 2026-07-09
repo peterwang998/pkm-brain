@@ -1800,6 +1800,69 @@ def test_extraction_conflict_precheck_residue_includes_counterpart_options(
     assert options[0]["evidence_quote"] == marker
     assert options[1]["fact_id"] == "fact_alphapay_enabled"
     assert "Review the candidate fact" in question["question"]
+    assert resolver_precheck["relation_classifications"][0]["relation"] == "contradicts"
+
+
+def test_relation_classifier_suppresses_both_true_conflict_residue(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    enable_simple_autonomy(svc.paths)
+    with connection(svc.paths.sqlite_path) as conn:
+        resolution = resolve_entity(conn, "Peter", type_hint="person")
+        assert resolution is not None
+        conn.execute(
+            """
+            INSERT INTO facts(
+              id, statement, entity_key, entity_id, page_hint, section_hint,
+              source_ids, observed_at, confidence, status, metadata, created_at,
+              truth_confidence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "fact_peter_interview_count",
+                "Peter had one interview scheduled for the role.",
+                "people:peter:career",
+                resolution.entity_id,
+                "people/peter.md",
+                "Career",
+                json.dumps(["document:peter-old"]),
+                "2026-06-26T00:00:00+00:00",
+                0.9,
+                "active",
+                "{}",
+                "2026-06-26T00:00:00+00:00",
+                0.9,
+            ),
+        )
+    marker = "Peter now has two interviews scheduled for the role."
+    note = svc.paths.inbox / "source.md"
+    note.write_text(f"# Source\n\n{marker}", encoding="utf-8")
+    svc.ingest()
+    provider = MarkerExtractorProvider(
+        marker=marker,
+        statement=marker,
+        page_hint="people/peter.md",
+        entity_mentions=[
+            {
+                "surface": "Peter",
+                "type": "person",
+                "mention_kind": "named",
+                "is_primary": True,
+            }
+        ],
+    )
+
+    result = extract_recent_documents(svc.paths, shadow=False, llm_provider=provider)
+
+    assert result["status"] == "ok"
+    assert result["actions"][0]["status"] == "auto_applied"
+    with connection(svc.paths.sqlite_path) as conn:
+        residues = conn.execute("SELECT COUNT(*) FROM open_questions").fetchone()[0]
+        facts = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+    assert residues == 0
+    assert facts == 2
 
 
 def test_backfill_fact_conflict_review_questions_repairs_thin_residue(

@@ -35,7 +35,7 @@ from .cos_actions import (
     row_to_action,
 )
 from .cos_audit import COS_AUDIT_CONFIGURED_NOTE, COS_AUDIT_STUB_NOTE, run_sampled_audit
-from .cos_policy import active_policy_rules, active_policy_version
+from .cos_policy import active_policy_rules, active_policy_version, human_policy_reason
 from .db import connection, dumps
 from .gardener import (
     deterministic_entity_candidates,
@@ -1592,6 +1592,7 @@ def queue_item_for_question(
     group = queue_group_for_kind(str(question.get("kind") or ""), action_type)
     candidate = question_candidate_fact(context, question)
     counterparts = question_counterpart_facts(context, question)
+    summary = readable_question_summary(context, question)
     title = compact_text(
         (candidate or {}).get("statement")
         or question.get("question")
@@ -1606,7 +1607,7 @@ def queue_item_for_question(
         "kind": question["kind"],
         "group": group,
         "title": title,
-        "summary": compact_text(question.get("question"), 240),
+        "summary": compact_text(summary, 240),
         "created_at": question.get("created_at"),
         "status": question.get("status"),
         "risk_tier": question.get("risk_tier"),
@@ -1622,6 +1623,43 @@ def queue_item_for_question(
     if group == "unrouted" and candidate:
         item["route_candidates"] = route_candidates_for_fact(context, candidate)
     return item
+
+
+def readable_question_summary(
+    context: BrainPaths | QueueBuildContext, question: dict[str, Any]
+) -> str:
+    policy_reason = readable_policy_escalation_reason(context, question)
+    if policy_reason:
+        return policy_reason
+    return str(question.get("question") or "")
+
+
+def readable_policy_escalation_reason(
+    context: BrainPaths | QueueBuildContext, question: dict[str, Any]
+) -> str | None:
+    if question.get("kind") != "policy_escalation":
+        return None
+    raw_question = str(question.get("question") or "")
+    if raw_question and "matched policy policy_" not in raw_question:
+        return raw_question
+    action_id = str(question.get("action_id") or "").strip()
+    if not action_id:
+        return raw_question or None
+    try:
+        action = get_action_for_queue(context, action_id)
+    except ValueError:
+        return raw_question or None
+    policy_id = str(action.get("policy_id") or "").strip()
+    if not policy_id:
+        return raw_question or None
+    return human_policy_reason(
+        str(action.get("action_type") or "action"),
+        {
+            "id": policy_id,
+            "autonomy_level": action.get("autonomy_level") or "L3",
+        },
+        action.get("action_features") or {},
+    )
 
 
 def question_candidate_fact(

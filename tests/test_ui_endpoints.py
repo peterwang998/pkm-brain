@@ -345,6 +345,53 @@ def test_v2_queue_filters_and_paginates_before_expensive_enrichment(
     assert queue["items"][0]["group"] == "memories"
 
 
+def test_v2_queue_policy_escalation_uses_human_readable_summary(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    action = decide_action(
+        paths,
+        propose_action(
+            paths,
+            "fact_upsert",
+            action_payload={
+                "fact": {
+                    "id": "fact_policy_queue",
+                    "statement": "Policy-gated fact should explain itself.",
+                    "page_hint": "concepts/policy.md",
+                    "confidence": 0.7,
+                }
+            },
+            action_features={
+                "truth_mutation": False,
+                "risk_score": 0.4,
+                "risk_tier": "medium",
+            },
+            target_page_paths=["concepts/policy.md"],
+        )["id"],
+    )
+    with connection(paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            UPDATE open_questions
+            SET question = 'matched policy policy_v1_low_l1_critic'
+            WHERE action_id = ?
+            """,
+            (action["id"],),
+        )
+
+    with running_ui(paths) as (host, port, token):
+        status, queue = request_json(
+            host, port, token, "GET", "/api/queue?kind=policy_escalation"
+        )
+
+    assert status == 200
+    item = queue["items"][0]
+    assert item["kind"] == "policy_escalation"
+    assert "Fact upsert matched" in item["summary"]
+    assert "review level is" in item["summary"]
+    assert "matched policy policy_" not in item["summary"]
+
+
 def test_v2_queue_limit_bounds_complete_card_enrichment(
     tmp_path: Path, monkeypatch
 ) -> None:

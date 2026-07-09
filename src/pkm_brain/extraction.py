@@ -26,6 +26,7 @@ from .entities import (
     normalize_mention_kind,
     resolve_entity,
 )
+from .fact_relations import classify_fact_relation
 from .llm import (
     LLMProvider,
     complete_json,
@@ -1491,22 +1492,44 @@ def resolver_precheck_conflict(
                 create=False,
             )
             entity_id = resolution.entity_id if resolution else ""
-        if not entity_id:
+        if entity_id:
+            fact_rows = rows(
+                conn,
+                """
+                SELECT *
+                FROM facts
+                WHERE entity_id = ?
+                  AND status IN ('active', 'conflicted')
+                ORDER BY observed_at DESC, created_at DESC
+                LIMIT 50
+                """,
+                (entity_id,),
+            )
+        else:
+            fact_rows = []
+        page_hint = normalize_extraction_page_hint(str(candidate.get("page_hint") or ""))
+        if page_hint:
+            page_fact_rows = rows(
+                conn,
+                """
+                SELECT *
+                FROM facts
+                WHERE page_hint = ?
+                  AND status IN ('active', 'conflicted')
+                ORDER BY observed_at DESC, created_at DESC
+                LIMIT 50
+                """,
+                (page_hint,),
+            )
+            seen_fact_ids = {str(row["id"]) for row in fact_rows}
+            fact_rows.extend(
+                row for row in page_fact_rows if str(row["id"]) not in seen_fact_ids
+            )
+        if not fact_rows:
             return None
-        fact_rows = rows(
-            conn,
-            """
-            SELECT *
-            FROM facts
-            WHERE entity_id = ?
-              AND status IN ('active', 'conflicted')
-            ORDER BY observed_at DESC, created_at DESC
-            LIMIT 50
-            """,
-            (entity_id,),
-        )
     conflicted_fact_ids: list[str] = []
     directly_conflicting_fact_ids: list[str] = []
+    relation_classifications: list[dict[str, Any]] = []
     for row in fact_rows:
         fact = row_to_fact(row)
         if fact.get("status") == "conflicted":
@@ -1520,28 +1543,40 @@ def resolver_precheck_conflict(
             for fact in (row_to_fact(row) for row in fact_rows)
             if str(fact["id"]) in directly_conflicting_fact_ids
         ]
-        judgment = resolver_precheck_conflict_judgment(
-            paths,
-            candidate,
-            counterpart_facts[:5],
-        )
-        if judgment.get("decision") == "no_conflict":
+        for fact in counterpart_facts[:5]:
+            relation = classify_fact_relation(candidate, fact).as_dict()
+            relation_classifications.append(relation)
+        contradictions = [
+            item
+            for item in relation_classifications
+            if item["relation"] == "contradicts"
+            and float(item.get("confidence") or 0.0) >= 0.7
+        ]
+        unsure = [
+            item
+            for item in relation_classifications
+            if float(item.get("confidence") or 0.0) < 0.7
+        ]
+        if not contradictions and not unsure:
             return None
         selected_fact_ids = [
-            fact_id
-            for fact_id in judgment.get("counterpart_fact_ids", [])
-            if fact_id in directly_conflicting_fact_ids
+            str(item["existing_fact_id"])
+            for item in [*contradictions, *unsure]
+            if str(item.get("existing_fact_id") or "") in directly_conflicting_fact_ids
         ]
+        reason = (
+            "Relation classifier says candidate contradicts existing nearby fact(s)."
+            if contradictions
+            else "Relation classifier is unsure whether candidate and nearby fact(s) can both be true."
+        )
         return {
-            "reason": (
-                "Resolver precheck says candidate may contradict existing nearby fact(s)."
-            ),
+            "reason": reason,
             "counterpart_fact_ids": selected_fact_ids
             or directly_conflicting_fact_ids[:5],
             "entity_id": entity_id,
             "entity_mention": mention,
-            "precheck": "direct_conflict",
-            "resolver_judgment": judgment,
+            "precheck": "relation_classifier",
+            "relation_classifications": relation_classifications,
         }
     if conflicted_fact_ids:
         return {

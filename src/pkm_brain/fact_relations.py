@@ -100,10 +100,11 @@ def classify_fact_relation(
     overlap = token_overlap(candidate_tokens, existing_tokens)
     jaccard = token_jaccard(candidate_tokens, existing_tokens)
     signals = fact_similarity_signals(candidate_statement, existing_statement)
+    negation_conflict = asymmetric_negation(candidate_tokens, existing_tokens)
     contradiction_signal = (
         bool(signals.get("contradiction"))
         or facts_directly_conflict(existing, candidate)
-        or asymmetric_negation(candidate_tokens, existing_tokens)
+        or negation_conflict
     )
 
     if normalize_statement(candidate_statement) == normalize_statement(existing_statement):
@@ -133,6 +134,14 @@ def classify_fact_relation(
         )
 
     if contradiction_signal and same_entity:
+        if negation_conflict:
+            return fact_relation(
+                "contradicts",
+                0.9,
+                "same entity with asymmetric negation",
+                candidate_id=candidate_id,
+                existing_id=existing_id,
+            )
         if explicitly_dated(candidate) and explicitly_dated(existing) and overlap >= 0.35:
             return fact_relation(
                 "updates",
@@ -229,11 +238,15 @@ def optional_id(fact: dict[str, Any]) -> str | None:
 
 
 def facts_share_entity(candidate: dict[str, Any], existing: dict[str, Any]) -> bool:
-    for key in ("entity_id", "entity_key", "page_hint"):
+    candidate_entity_id = str(candidate.get("entity_id") or "").strip()
+    existing_entity_id = str(existing.get("entity_id") or "").strip()
+    if candidate_entity_id and existing_entity_id:
+        return candidate_entity_id == existing_entity_id
+    for key in ("entity_key", "page_hint"):
         left = str(candidate.get(key) or "").strip()
         right = str(existing.get(key) or "").strip()
-        if left and right:
-            return left == right
+        if left and right and left == right:
+            return True
     return True
 
 

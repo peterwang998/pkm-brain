@@ -6,15 +6,18 @@ from typing import Any
 from .cos_actions import apply_action, propose_action
 from .cos_policy import evaluate_policy, promote_policy_for_autonomy
 from .db import connection, dumps, loads, rows
+from .fact_relations import classify_fact_relation
 from .paths import BrainPaths
 from .queue_summary import review_queue_summary
 from .util import new_id, now_iso
+from .wiki_facts import row_to_fact
 
 
 ACTIVE_QUESTION_STATUSES = {"open", "needs_human"}
 SYNTHESIZE_DRAIN_STATUSES = {"needs_human", "proposed"}
 FALLBACK_PAGE_HINTS = {"concepts/extracted-facts.md"}
-REPORT_VERSION = "w2b-v1"
+W2A_REPORT_VERSION = "w2a-v1"
+W2B_REPORT_VERSION = "w2b-v1"
 
 
 def reconcile_backlog_w2b_dry_run(
@@ -42,7 +45,7 @@ def reconcile_backlog_w2b_dry_run(
     return {
         "status": "dry_run",
         "scope": "w2b",
-        "report_version": REPORT_VERSION,
+        "report_version": W2B_REPORT_VERSION,
         "generated_at": generated_at,
         "acceptance_boundary": {
             "requires_approval_before_apply": True,
@@ -77,7 +80,7 @@ def reconcile_backlog_w2b_apply(
     return {
         "status": "ok",
         "scope": "w2b",
-        "report_version": REPORT_VERSION,
+        "report_version": W2B_REPORT_VERSION,
         "generated_at": generated_at,
         "before": before,
         "after": after,
@@ -89,6 +92,217 @@ def reconcile_backlog_w2b_apply(
             "unrouted Inbox fact_upsert actions can be reverted with revert_action(new_action_id); original questions retain old/new action ids in answer metadata.",
             "the W2b policy promotion is append-only; a stricter policy can be promoted after it if audit finds issues.",
         ],
+    }
+
+
+def reconcile_backlog_w2a_dry_run(
+    paths: BrainPaths,
+    *,
+    sample_limit: int = 20,
+) -> dict[str, Any]:
+    generated_at = now_iso()
+    before = review_queue_summary(paths)
+    with connection(paths.sqlite_path) as conn:
+        items = w2a_candidate_items(conn)
+    classified = [classify_w2a_item(item) for item in items]
+    by_relation: dict[str, int] = {}
+    samples_by_relation: dict[str, list[dict[str, Any]]] = {}
+    for item in classified:
+        relation = str(item["relation"])
+        by_relation[relation] = by_relation.get(relation, 0) + 1
+        samples_by_relation.setdefault(relation, [])
+        if len(samples_by_relation[relation]) < sample_limit:
+            samples_by_relation[relation].append(w2a_sample(item))
+    auto_resolvable = [
+        item
+        for item in classified
+        if item["relation"] not in {"contradicts", "unsure"}
+    ]
+    survivors = [
+        item
+        for item in classified
+        if item["relation"] in {"contradicts", "unsure"}
+    ]
+    return {
+        "status": "dry_run",
+        "scope": "w2a",
+        "report_version": W2A_REPORT_VERSION,
+        "generated_at": generated_at,
+        "acceptance_boundary": {
+            "requires_approval_before_apply": True,
+            "apply_supported_by_this_command": False,
+            "reason": "W2a applies classifier-dependent fact resolutions only after Peter reviews this dry-run report.",
+        },
+        "before": before,
+        "candidate_count": len(classified),
+        "auto_resolvable_count": len(auto_resolvable),
+        "survivor_count": len(survivors),
+        "by_relation": dict(sorted(by_relation.items())),
+        "samples_by_relation": {
+            relation: samples_by_relation[relation]
+            for relation in sorted(samples_by_relation)
+        },
+        "affected_question_ids": sorted(
+            str(item["question_id"]) for item in classified if item.get("question_id")
+        ),
+        "affected_action_ids": sorted(
+            str(item["action_id"]) for item in classified if item.get("action_id")
+        ),
+        "next_step": "Review per-relation samples, then approve W2a --apply separately if the compatible classes look safe.",
+    }
+
+
+def w2a_candidate_items(conn: Any) -> list[dict[str, Any]]:
+    if not table_exists(conn, "open_questions"):
+        return []
+    candidate_rows = rows(
+        conn,
+        """
+        SELECT
+          q.*,
+          a.id AS linked_action_id,
+          a.action_type AS linked_action_type,
+          a.target_fact_ids AS action_target_fact_ids,
+          a.target_page_paths AS action_target_page_paths,
+          a.action_features AS action_features,
+          a.evidence_json AS evidence_json,
+          a.status AS action_status
+        FROM open_questions q
+        LEFT JOIN cos_actions a ON a.id = q.action_id
+        WHERE q.status IN ('open', 'needs_human')
+          AND (
+            q.kind = 'fact_conflict_review'
+            OR (
+              q.kind = 'policy_escalation'
+              AND a.action_type = 'fact_upsert'
+              AND a.status IN ('needs_human', 'proposed')
+            )
+          )
+        ORDER BY q.created_at, q.id
+        """,
+    )
+    output: list[dict[str, Any]] = []
+    for row in candidate_rows:
+        action = row_to_action_like(row)
+        candidate = candidate_fact_from_question(row, action)
+        counterpart_facts = load_counterpart_facts(conn, row, action)
+        output.append(
+            {
+                "question": row,
+                "question_id": row["id"],
+                "kind": row["kind"],
+                "action": action,
+                "action_id": row["linked_action_id"] or row["action_id"],
+                "candidate": candidate,
+                "counterpart_facts": counterpart_facts,
+            }
+        )
+    return output
+
+
+def row_to_action_like(row: Any) -> dict[str, Any] | None:
+    if not row["linked_action_id"]:
+        return None
+    return {
+        "id": row["linked_action_id"],
+        "action_type": row["linked_action_type"],
+        "target_fact_ids": loads(row["action_target_fact_ids"], []),
+        "target_page_paths": loads(row["action_target_page_paths"], []),
+        "action_features": loads(row["action_features"], {}),
+        "evidence_json": loads(row["evidence_json"], {}),
+        "status": row["action_status"],
+    }
+
+
+def load_counterpart_facts(conn: Any, question: Any, action: dict[str, Any] | None) -> list[dict[str, Any]]:
+    fact_ids: list[str] = []
+    fact_ids.extend(str(item) for item in loads(question["fact_ids"], []) if str(item or "").strip())
+    if action is not None:
+        fact_ids.extend(str(item) for item in action.get("target_fact_ids") or [] if str(item or "").strip())
+        resolver = (action.get("evidence_json") or {}).get("resolver_precheck") or {}
+        fact_ids.extend(str(item) for item in resolver.get("counterpart_fact_ids") or [] if str(item or "").strip())
+    fact_ids = stable_unique_strings(fact_ids)
+    if not fact_ids:
+        return []
+    placeholders = ",".join("?" for _ in fact_ids)
+    return [
+        row_to_fact(row)
+        for row in conn.execute(
+            f"SELECT * FROM facts WHERE id IN ({placeholders})",
+            tuple(fact_ids),
+        )
+    ]
+
+
+def classify_w2a_item(item: dict[str, Any]) -> dict[str, Any]:
+    candidate = item.get("candidate")
+    counterpart_facts = item.get("counterpart_facts") or []
+    if not isinstance(candidate, dict):
+        return {
+            **item,
+            "relation": "unsure",
+            "confidence": 0.0,
+            "rationale": "missing candidate fact payload",
+            "classifications": [],
+        }
+    if not counterpart_facts:
+        return {
+            **item,
+            "relation": "unrelated",
+            "confidence": 0.7,
+            "rationale": "no counterpart facts supplied; routine fact_upsert policy escalation",
+            "classifications": [],
+        }
+    classifications = [
+        classify_fact_relation(candidate, counterpart).as_dict()
+        for counterpart in counterpart_facts
+    ]
+    selected = select_w2a_classification(classifications)
+    return {
+        **item,
+        "relation": selected["relation"],
+        "confidence": selected["confidence"],
+        "rationale": selected["rationale"],
+        "classifications": classifications,
+    }
+
+
+def select_w2a_classification(classifications: list[dict[str, Any]]) -> dict[str, Any]:
+    if not classifications:
+        return {"relation": "unrelated", "confidence": 0.7, "rationale": "no classifications"}
+    low_confidence = [item for item in classifications if float(item["confidence"]) < 0.7]
+    contradictions = [item for item in classifications if item["relation"] == "contradicts"]
+    if contradictions:
+        return max(contradictions, key=lambda item: float(item["confidence"]))
+    if low_confidence:
+        item = min(low_confidence, key=lambda value: float(value["confidence"]))
+        return {
+            **item,
+            "relation": "unsure",
+            "rationale": f"classifier confidence below floor: {item['rationale']}",
+        }
+    precedence = ["updates", "refines", "supports", "duplicate", "complementary", "unrelated"]
+    for relation in precedence:
+        matching = [item for item in classifications if item["relation"] == relation]
+        if matching:
+            return max(matching, key=lambda item: float(item["confidence"]))
+    return classifications[0]
+
+
+def w2a_sample(item: dict[str, Any]) -> dict[str, Any]:
+    candidate = item.get("candidate") if isinstance(item.get("candidate"), dict) else {}
+    return {
+        "question_id": item.get("question_id"),
+        "action_id": item.get("action_id"),
+        "kind": item.get("kind"),
+        "relation": item.get("relation"),
+        "confidence": item.get("confidence"),
+        "rationale": item.get("rationale"),
+        "candidate_statement": str(candidate.get("statement") or "")[:220],
+        "counterpart_fact_ids": [
+            str(fact.get("id") or "") for fact in item.get("counterpart_facts") or []
+        ],
+        "classification_count": len(item.get("classifications") or []),
     }
 
 
@@ -657,7 +871,8 @@ def linked_actions_for_questions(conn: Any, question_rows: list[Any]) -> dict[st
 
 def candidate_fact_from_question(question: Any, action: Any | None) -> dict[str, Any] | None:
     if action is not None:
-        evidence = loads(action["evidence_json"], {})
+        evidence_value = action["evidence_json"]
+        evidence = evidence_value if isinstance(evidence_value, dict) else loads(evidence_value, {})
         payload = evidence.get("payload") if isinstance(evidence, dict) else None
         if isinstance(payload, dict):
             fact = payload.get("fact")
@@ -714,6 +929,18 @@ def safe_page_slug(value: str) -> str:
 
     slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
     return slug or "unrouted-facts"
+
+
+def stable_unique_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    output: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        output.append(text)
+    return output
 
 
 def policy_reason_dry_run(conn: Any, *, sample_limit: int) -> dict[str, Any]:

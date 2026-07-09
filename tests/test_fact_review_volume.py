@@ -7,7 +7,11 @@ from typer.testing import CliRunner
 
 from pkm_brain.cli import app
 from pkm_brain.db import connection, dumps
-from pkm_brain.fact_review_volume import reconcile_backlog_w2b_apply, reconcile_backlog_w2b_dry_run
+from pkm_brain.fact_review_volume import (
+    reconcile_backlog_w2a_dry_run,
+    reconcile_backlog_w2b_apply,
+    reconcile_backlog_w2b_dry_run,
+)
 from pkm_brain.paths import BrainPaths
 from pkm_brain.service import BrainService
 from pkm_brain.util import now_iso
@@ -197,6 +201,92 @@ def test_reconcile_backlog_cli_applies_when_requested(tmp_path: Path) -> None:
     assert json.loads(result.stdout)["status"] == "ok"
 
 
+def test_w2a_dry_run_classifies_conflicts_and_policy_escalations(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    created_at = now_iso()
+    with connection(paths.sqlite_path) as conn:
+        insert_fact(
+            conn,
+            "fact_existing",
+            "AlphaPay auto-renewal is enabled by default for annual plans.",
+            page_hint="concepts/alphapay.md",
+        )
+        insert_action(
+            conn,
+            "action_conflict",
+            "fact_upsert",
+            "needs_human",
+            target_fact_ids=["fact_existing"],
+            evidence_json={
+                "payload": {
+                    "fact": {
+                        "statement": "AlphaPay auto-renewal is not enabled by default for annual plans.",
+                        "entity_key": "concepts:alphapay:summary",
+                        "page_hint": "concepts/alphapay.md",
+                    }
+                },
+                "resolver_precheck": {"counterpart_fact_ids": ["fact_existing"]},
+            },
+        )
+        insert_question(
+            conn,
+            "question_conflict",
+            "fact_conflict_review",
+            "Relation classifier says candidate contradicts existing nearby fact(s).",
+            created_at,
+            action_id="action_conflict",
+            page_hint="concepts/alphapay.md",
+            fact_ids=["fact_existing"],
+        )
+        insert_action(
+            conn,
+            "action_policy",
+            "fact_upsert",
+            "needs_human",
+            evidence_json={
+                "payload": {
+                    "fact": {
+                        "statement": "A clean fact has no counterpart.",
+                        "page_hint": "concepts/clean.md",
+                    }
+                }
+            },
+        )
+        insert_question(
+            conn,
+            "question_policy",
+            "policy_escalation",
+            "Fact upsert needs review.",
+            created_at,
+            action_id="action_policy",
+            page_hint="concepts/clean.md",
+        )
+
+    report = reconcile_backlog_w2a_dry_run(paths, sample_limit=5)
+
+    assert report["status"] == "dry_run"
+    assert report["acceptance_boundary"]["apply_supported_by_this_command"] is False
+    assert report["candidate_count"] == 2
+    assert report["by_relation"]["contradicts"] == 1
+    assert report["by_relation"]["unrelated"] == 1
+    assert report["survivor_count"] == 1
+    assert report["auto_resolvable_count"] == 1
+
+
+def test_reconcile_backlog_cli_blocks_w2a_apply(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+
+    result = runner.invoke(
+        app,
+        ["cos", "reconcile-backlog", "--scope", "w2a", "--home", str(paths.home), "--apply"],
+    )
+
+    assert result.exit_code == 1
+    assert "W2a --apply is blocked" in result.stdout
+
+
 def test_reconcile_backlog_cli_writes_dry_run_report(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
     BrainService(paths).init_workspace()
@@ -226,6 +316,7 @@ def insert_action(
     action_type: str,
     status: str,
     *,
+    target_fact_ids: list[str] | None = None,
     target_page_paths: list[str] | None = None,
     action_features: dict | None = None,
     evidence_json: dict | None = None,
@@ -242,7 +333,7 @@ def insert_action(
             action_id,
             action_type,
             status,
-            "[]",
+            dumps(target_fact_ids or []),
             dumps(target_page_paths or []),
             "[]",
             dumps(action_features or {}),
@@ -263,6 +354,7 @@ def insert_question(
     *,
     action_id: str | None,
     page_hint: str | None,
+    fact_ids: list[str] | None = None,
 ) -> None:
     conn.execute(
         """
@@ -276,7 +368,7 @@ def insert_question(
             kind,
             None,
             page_hint,
-            "[]",
+            dumps(fact_ids or []),
             question,
             "[]",
             "needs_human",
@@ -284,5 +376,36 @@ def insert_question(
             created_at,
             action_id,
             "{}",
+        ),
+    )
+
+
+def insert_fact(
+    conn,
+    fact_id: str,
+    statement: str,
+    *,
+    page_hint: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO facts(
+          id, statement, entity_key, page_hint, section_hint, source_ids,
+          observed_at, confidence, status, metadata, created_at, truth_confidence
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            fact_id,
+            statement,
+            page_hint.removesuffix(".md").replace("/", ":"),
+            page_hint,
+            "Summary",
+            "[]",
+            now_iso(),
+            0.9,
+            "active",
+            "{}",
+            now_iso(),
+            0.9,
         ),
     )
