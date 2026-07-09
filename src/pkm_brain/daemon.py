@@ -211,6 +211,8 @@ class SerialJobScheduler:
                 result = json.loads(json.dumps(raw_result, default=str))
                 status = str(result.get("status") or ("skipped" if result.get("skipped") else "success"))
                 error = result.get("error")
+                if not error and status == "skipped":
+                    error = result.get("reason")
             except Exception as exc:
                 result = {}
                 status = "failed"
@@ -280,6 +282,7 @@ class SerialJobScheduler:
                         "cadence_s": job.cadence_s,
                         "last_run_at": job.last_run_at,
                         "last_status": job.last_status,
+                        "last_result": job.last_result,
                         "last_error": job.last_error,
                         "next_due_at": job.next_due_at,
                         "running": job.running,

@@ -13,12 +13,22 @@ struct OpsPreviewView: View {
                         Text(job.id)
                     }
                     TableColumn("Status") { job in
-                        Text(job.last_status ?? "pending")
+                        Text(job.displayStatus)
+                    }
+                    TableColumn("Last Run") { job in
+                        Text(job.last_run_at ?? "")
                     }
                     TableColumn("Next Due") { job in
                         Text(job.next_due_at ?? "")
                     }
+                    TableColumn("Detail") { job in
+                        Text(job.statusDetail ?? "")
+                            .lineLimit(2)
+                    }
                 }
+                Text("Today shows the latest recorded automation run. This table shows daemon scheduler checks, including no-op skips.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             } else {
                 Text("Scheduler state is unavailable.")
                     .foregroundStyle(.secondary)
@@ -28,4 +38,3 @@ struct OpsPreviewView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 }
-

@@ -22,6 +22,10 @@ struct PKMBrainKitTests {
         #expect(digest.queue_counts.total == 8)
         #expect(digest.facts_by_page.first?.page_hint == "projects/pkm-brain.md")
         #expect(digest.latest_run?.status == "success")
+        let evals = try #require(digest.pulse.first { $0.key == "evals" })
+        #expect(digest.detailText(for: evals)?.contains("22 sampled findings") == true)
+        let nightly = try #require(digest.pulse.first { $0.key == "nightly" })
+        #expect(digest.detailText(for: nightly)?.contains("Scheduler check status is shown in Ops") == true)
     }
 
     @Test("scheduler fixture decodes")
@@ -30,6 +34,9 @@ struct PKMBrainKitTests {
 
         #expect(scheduler.jobs.map(\.id).contains("capture_tick"))
         #expect(scheduler.jobs.first?.cadence_s == 600)
+        let nightly = try #require(scheduler.jobs.first { $0.id == "nightly" })
+        #expect(nightly.displayStatus == "skipped")
+        #expect(nightly.statusDetail == "last successful nightly run is less than 20 hours old")
     }
 
     @Test("queue fixture decodes")

@@ -5,7 +5,7 @@ struct MigrationAssistantView: View {
     @EnvironmentObject private var appState: AppState
 
     var body: some View {
-        if let plan = appState.migrationPlan, plan.state != "fresh" {
+        if let plan = appState.migrationPlan, plan.shouldShowAssistant {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(alignment: .firstTextBaseline) {
                     Label(title(for: plan), systemImage: icon(for: plan))
@@ -33,11 +33,15 @@ struct MigrationAssistantView: View {
                     }
                 }
 
+                Text("CLI shims are app-managed `brain` and `brain-mcp` commands in \(plan.shim_dir). They let agents reach the app daemon without using legacy LaunchAgents.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
                 HStack {
                     Button {
                         Task { await appState.installMigrationShims() }
                     } label: {
-                        Label("Install Shims", systemImage: "terminal")
+                        Label("Install CLI Shims", systemImage: "terminal")
                     }
                     Button {
                         Task { await appState.dryRunLaunchAgentRetirement() }

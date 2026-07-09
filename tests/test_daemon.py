@@ -209,6 +209,39 @@ def test_scheduler_pause_persists(tmp_path: Path) -> None:
     assert resumed["paused_until"] is None
 
 
+def test_scheduler_preserves_skipped_reason(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    scheduler = SerialJobScheduler(
+        paths,
+        jobs=[
+            SchedulerJob(
+                "job",
+                60,
+                lambda: {
+                    "status": "skipped",
+                    "reason": "last successful nightly run is less than 20 hours old",
+                },
+            )
+        ],
+    )
+    scheduler.run_now("job")
+    scheduler.start()
+    try:
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            job = scheduler.as_dict()["jobs"][0]
+            if job["last_status"]:
+                break
+            time.sleep(0.01)
+    finally:
+        scheduler.stop()
+
+    job = scheduler.as_dict()["jobs"][0]
+    assert job["last_status"] == "skipped"
+    assert job["last_error"] == "last successful nightly run is less than 20 hours old"
+    assert job["last_result"]["reason"] == "last successful nightly run is less than 20 hours old"
+
+
 def test_scheduler_run_now_bypasses_pause(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
     completed: list[str] = []

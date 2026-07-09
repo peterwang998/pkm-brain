@@ -36,10 +36,34 @@ public struct SchedulerJobState: Codable, Equatable, Identifiable, Sendable {
     public let cadence_s: Int
     public let last_run_at: String?
     public let last_status: String?
+    public let last_result: JSONValue?
     public let last_error: String?
     public let next_due_at: String?
     public let running: Bool
     public let queued: Bool?
+
+    public var displayStatus: String {
+        if running {
+            return "running"
+        }
+        if queued == true {
+            return "queued"
+        }
+        return last_status ?? "pending"
+    }
+
+    public var statusDetail: String? {
+        if let last_error, !last_error.isEmpty {
+            return last_error
+        }
+        if let reason = last_result?.objectValue?["reason"]?.stringValue, !reason.isEmpty {
+            return reason
+        }
+        if displayStatus == "skipped" {
+            return "Skipped without a recorded reason."
+        }
+        return nil
+    }
 }
 
 public struct PulseChip: Codable, Equatable, Identifiable, Sendable {
@@ -88,6 +112,73 @@ public struct Digest: Codable, Equatable, Sendable {
     public let eval_transitions: [JSONValue]
     public let queue_counts: QueueCounts
     public let raw: [String: JSONValue]?
+
+    public func detailText(for chip: PulseChip) -> String? {
+        switch chip.key.lowercased() {
+        case "nightly":
+            var lines: [String] = []
+            if let latest_run {
+                let status = latest_run.status ?? chip.value ?? "unknown"
+                let name = latest_run.job_name ?? "automation run"
+                if let finished = latest_run.finished_at ?? latest_run.started_at {
+                    lines.append("Latest \(name): \(status) at \(finished).")
+                } else {
+                    lines.append("Latest \(name): \(status).")
+                }
+                if let error = latest_run.error, !error.isEmpty {
+                    lines.append(error)
+                }
+            } else if let timestamp = chip.timestamp {
+                lines.append("Latest status at \(timestamp).")
+            }
+            lines.append("Scheduler check status is shown in Ops.")
+            return joinedDetail(lines)
+        case "evals":
+            guard let audit = raw?["audit"]?.objectValue else {
+                return nil
+            }
+            let counts = audit["counts"]?.objectValue ?? [:]
+            var parts: [String] = []
+            if let bad = counts["sampled_bad"]?.intValue {
+                parts.append("\(bad) sampled findings")
+            }
+            if let ok = counts["sampled_ok"]?.intValue {
+                parts.append("\(ok) sampled ok")
+            }
+            if let unaudited = counts["unaudited"]?.intValue {
+                parts.append("\(unaudited) unaudited")
+            }
+            if let note = audit["note"]?.stringValue, !note.isEmpty {
+                parts.append(note)
+            }
+            return joinedDetail(parts)
+        case "index":
+            guard let index = raw?["index"]?.objectValue else {
+                return nil
+            }
+            if let documents = index["documents"]?.intValue,
+               let chunks = index["chunks"]?.intValue {
+                return "\(documents) documents, \(chunks) chunks indexed."
+            }
+            return index["embedding_provider"]?.stringValue
+        case "agents":
+            guard let jobs = raw?["jobs"]?.objectValue?["jobs"]?.arrayValue else {
+                return nil
+            }
+            let loaded = jobs.filter { $0.objectValue?["loaded"]?.boolValue == true }.count
+            return "\(jobs.count) legacy scheduler checks, \(loaded) loaded."
+        case "sync":
+            guard let sync = raw?["sync"]?.objectValue else {
+                return nil
+            }
+            let role = sync["role"]?.stringValue ?? chip.value ?? "configured"
+            let peers = sync["peers"]?.arrayValue?.count ?? 0
+            let warnings = sync["warnings"]?.arrayValue?.count ?? 0
+            return "\(role) role, \(peers) peers, \(warnings) warnings."
+        default:
+            return chip.timestamp.map { "Latest status at \($0)." }
+        }
+    }
 }
 
 public struct QueuePage: Codable, Equatable, Sendable {
@@ -283,6 +374,10 @@ public struct MigrationPlan: Codable, Equatable, Sendable {
     public var needsMigration: Bool {
         state == "migrate"
     }
+
+    public var shouldShowAssistant: Bool {
+        needsMigration || !detected_launch_agents.isEmpty
+    }
 }
 
 public struct DetectedLaunchAgent: Codable, Equatable, Identifiable, Sendable {
@@ -324,4 +419,14 @@ public enum DaemonStatus: Equatable, Sendable {
             return message
         }
     }
+}
+
+private func joinedDetail(_ parts: [String]) -> String? {
+    let nonEmpty = parts
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+    if nonEmpty.isEmpty {
+        return nil
+    }
+    return nonEmpty.joined(separator: " ")
 }

@@ -12,7 +12,9 @@ struct QueueView: View {
     @State private var undoToast: QueueUndoToast?
     @State private var routePageHint = ""
     @State private var isLoading = false
+    @State private var isLoadingMore = false
     @State private var errorMessage: String?
+    private let queuePageLimit = 50
 
     private var items: [QueueItem] {
         page?.items ?? []
@@ -93,7 +95,11 @@ struct QueueView: View {
             }
             ScrollView {
                 LazyVStack(spacing: 2) {
-                    if items.isEmpty, !isLoading {
+                    if page == nil, isLoading {
+                        ProgressView("Loading review queue...")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(12)
+                    } else if items.isEmpty, !isLoading {
                         Text("Nothing needs you. Nightly runs will add items here.")
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -111,6 +117,22 @@ struct QueueView: View {
                             .onTapGesture {
                                 selectedID = item.id
                             }
+                        }
+                        if page?.next_cursor != nil {
+                            Button {
+                                Task { await loadMoreQueueItems() }
+                            } label: {
+                                if isLoadingMore {
+                                    Label("Loading More", systemImage: "arrow.clockwise")
+                                } else {
+                                    Label("Load More", systemImage: "plus.circle")
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(isLoadingMore)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(12)
                         }
                     }
                 }
@@ -189,6 +211,13 @@ struct QueueView: View {
                         Task { await decide(decision, payload: payload) }
                     }
                 )
+            } else if page == nil, isLoading {
+                VStack(spacing: 10) {
+                    ProgressView()
+                    Text("Loading review queue...")
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 VStack(spacing: 8) {
                     Image(systemName: "tray")
@@ -218,11 +247,11 @@ struct QueueView: View {
     }
 
     private var progressText: String {
+        let total = page?.total ?? 0
         guard !items.isEmpty else {
-            let total = page?.total ?? 0
             return "\(total) items - resolved \(tally.resolved) - skipped \(tally.skipped)"
         }
-        return "\(selectedIndex + 1) of \(items.count) - resolved \(tally.resolved) - skipped \(tally.skipped)"
+        return "\(selectedIndex + 1) of \(items.count) shown - \(total) total - resolved \(tally.resolved) - skipped \(tally.skipped)"
     }
 
     private func label(for kind: String) -> String {
@@ -232,14 +261,14 @@ struct QueueView: View {
     }
 
     private func loadQueue() async {
-        guard let client = appState.daemon.apiClient else {
-            errorMessage = "Daemon API is unavailable."
-            return
-        }
         isLoading = true
         defer { isLoading = false }
+        guard let client = await waitForQueueClient() else {
+            errorMessage = "Queue is waiting for the daemon API. Use Refresh after the daemon is running."
+            return
+        }
         do {
-            let latest = try await client.queue(kind: filter)
+            let latest = try await client.queue(kind: filter, limit: queuePageLimit)
             page = latest
             errorMessage = nil
             if selectedID == nil || !latest.items.contains(where: { $0.id == selectedID }) {
@@ -249,6 +278,43 @@ struct QueueView: View {
         } catch {
             errorMessage = String(describing: error)
         }
+    }
+
+    private func loadMoreQueueItems() async {
+        guard let current = page, let cursor = current.next_cursor else {
+            return
+        }
+        guard let client = await waitForQueueClient() else {
+            errorMessage = "Queue is waiting for the daemon API. Use Refresh after the daemon is running."
+            return
+        }
+        isLoadingMore = true
+        defer { isLoadingMore = false }
+        do {
+            let next = try await client.queue(kind: filter, limit: queuePageLimit, cursor: cursor)
+            let merged = current.items + next.items
+            page = QueuePage(
+                kind: next.kind,
+                counts: next.counts,
+                total: next.total,
+                cursor: current.cursor,
+                next_cursor: next.next_cursor,
+                items: merged
+            )
+            errorMessage = nil
+        } catch {
+            errorMessage = String(describing: error)
+        }
+    }
+
+    private func waitForQueueClient() async -> BrainAPIClient? {
+        for _ in 0..<25 {
+            if let client = appState.daemon.apiClient {
+                return client
+            }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        return nil
     }
 
     private func decide(_ decision: String, payload: [String: JSONValue] = [:]) async {

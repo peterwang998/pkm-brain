@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import PKMBrainKit
 import SwiftUI
@@ -40,6 +41,7 @@ final class AppState: ObservableObject {
     let provisioner: RuntimeProvisioner
     let daemon: DaemonSupervisor
     private var didStart = false
+    private var daemonCancellable: AnyCancellable?
     private var monitorTask: Task<Void, Never>?
     private let queueBacklogThreshold = 100
     private let queueBacklogNotificationKey = "PKMBrain.queueBacklogNotificationAt"
@@ -53,6 +55,11 @@ final class AppState: ObservableObject {
         homePath = defaultHome
         provisioner = RuntimeProvisioner()
         daemon = DaemonSupervisor(provisioner: provisioner)
+        daemonCancellable = daemon.objectWillChange.sink { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.objectWillChange.send()
+            }
+        }
     }
 
     var homeURL: URL {
@@ -141,7 +148,8 @@ final class AppState: ObservableObject {
         }
         do {
             _ = try await client.installMigrationShims()
-            migrationActionMessage = "Shims installed"
+            let shimDir = migrationPlan?.shim_dir ?? "the app bin directory"
+            migrationActionMessage = "CLI shims installed in \(shimDir)"
             await refreshMigrationPlan()
         } catch {
             lastError = String(describing: error)

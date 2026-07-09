@@ -49,6 +49,16 @@
     "total": 8
   },
   "raw": {
+    "audit": {
+      "counts": {
+        "sampled_bad": 22,
+        "sampled_ok": 1289,
+        "unaudited": 2664
+      },
+      "mode": "configured",
+      "note": "Independent auditor configured.",
+      "status": "ok"
+    },
     "index": {
       "embedding_provider": "hash"
     }
@@ -56,4 +66,3 @@
   "reverts": [],
   "since": null
 }
-

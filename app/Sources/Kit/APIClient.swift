@@ -33,7 +33,7 @@ public final class BrainAPIClient: Sendable {
         return try await get(path)
     }
 
-    public func queue(kind: String = "all", limit: Int = 200, cursor: Int = 0) async throws -> QueuePage {
+    public func queue(kind: String = "all", limit: Int = 50, cursor: Int = 0) async throws -> QueuePage {
         let escapedKind = percentEncodeQueryValue(kind)
         return try await get("/api/queue?kind=\(escapedKind)&limit=\(limit)&cursor=\(cursor)")
     }

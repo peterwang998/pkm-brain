@@ -47,9 +47,12 @@ struct TodayView: View {
     }
 
     private var pulseGrid: some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), spacing: 12)], alignment: .leading, spacing: 12) {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: 12)], alignment: .leading, spacing: 12) {
             ForEach(appState.digest?.pulse ?? []) { chip in
-                PulseChipView(chip: chip)
+                PulseChipView(
+                    chip: chip,
+                    detail: appState.digest?.detailText(for: chip)
+                )
             }
         }
     }
@@ -105,19 +108,28 @@ struct TodayView: View {
 
 private struct PulseChipView: View {
     let chip: PulseChip
+    let detail: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 7) {
             Label(chip.label, systemImage: symbol)
                 .font(.headline)
             Text(chip.value ?? "unknown")
                 .font(.callout)
                 .foregroundStyle(.secondary)
+            if let detail {
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(12)
-        .frame(maxWidth: .infinity, minHeight: 76, alignment: .leading)
+        .frame(maxWidth: .infinity, minHeight: 112, alignment: .topLeading)
         .background(background)
         .clipShape(RoundedRectangle(cornerRadius: 8))
+        .help(detail ?? chip.value ?? chip.label)
     }
 
     private var symbol: String {
@@ -138,4 +150,3 @@ private struct PulseChipView: View {
         }
     }
 }
-

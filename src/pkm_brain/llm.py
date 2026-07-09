@@ -229,6 +229,7 @@ class CodexProvider:
                 "read-only",
                 "--cd",
                 str(self.cwd),
+                "--skip-git-repo-check",
                 "--model",
                 model,
                 "--output-last-message",
