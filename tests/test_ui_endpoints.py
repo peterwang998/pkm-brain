@@ -481,7 +481,7 @@ def test_v2_queue_conflict_keys_do_not_collide_with_navigation() -> None:
     assert '<kbd>c</kbd>candidate wins' in source
     assert '<kbd>b</kbd>both true' in source
     assert '<kbd>s</kbd>supports existing' in source
-    assert '<kbd>t</kbd>temporal update' in source
+    assert '<kbd>t</kbd>candidate current' in source
     assert '<kbd>u</kbd>unsure' in source
     assert 'key === "k") doDecision' not in source
     assert 'e: "keep_existing"' in source

@@ -86,7 +86,7 @@ One unified inbox for every human-judgment item: `unrouted_fact`, `fact_conflict
 │       │                       │  └────────────────┴────────────────┘ │
 │       │                       │  [e] keep existing [c] candidate     │
 │       │                       │  [b] both true     [s] supports      │
-│       │                       │  [t] temporal      [u] unsure        │
+│       │                       │  [t] current       [u] unsure        │
 │       │                       │  (nav keys j/k NEVER decide — v2.1  │
 │       │                       │   fix: k collided with keep)        │
 └───────┴───────────────────────┴──────────────────────────────────────┘

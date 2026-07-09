@@ -616,7 +616,12 @@ private struct QueueDetail: View {
                 DecisionButton("Supports Existing", systemImage: "link", key: "s") {
                     onDecision("supports_existing", [:])
                 }
-                DecisionButton("Temporal Update", systemImage: "clock", key: "t") {
+                DecisionButton(
+                    "Candidate Current",
+                    systemImage: "clock",
+                    key: "t",
+                    help: "Candidate is the current state; existing fact becomes historical."
+                ) {
                     onDecision("temporal_update", [:])
                 }
                 DecisionButton("Unsure", systemImage: "questionmark.circle", key: "u") {
@@ -948,24 +953,37 @@ private struct DecisionButton: View {
     let title: String
     let systemImage: String
     let key: String
+    let help: String?
     let action: () -> Void
 
-    init(_ title: String, systemImage: String, key: String, action: @escaping () -> Void) {
+    init(_ title: String, systemImage: String, key: String, help: String? = nil, action: @escaping () -> Void) {
         self.title = title
         self.systemImage = systemImage
         self.key = key
+        self.help = help
         self.action = action
     }
 
     var body: some View {
         Button(action: action) {
             Label {
-                Text(title)
+                HStack(spacing: 7) {
+                    Text(title)
+                    Text(key.uppercased())
+                        .font(.caption2.monospaced().weight(.bold))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(.quaternary, in: RoundedRectangle(cornerRadius: 4))
+                        .accessibilityHidden(true)
+                }
             } icon: {
                 Image(systemName: systemImage)
             }
         }
         .keyboardShortcut(KeyEquivalent(Character(key)), modifiers: [])
+        .help(help ?? "\(key.uppercased()) - \(title)")
+        .accessibilityLabel("\(title), keyboard shortcut \(key.uppercased())")
     }
 }
 

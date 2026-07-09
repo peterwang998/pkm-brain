@@ -129,7 +129,7 @@ Fallback-routed facts stop asking individually: they auto-file to the target ent
   - `c` = candidate wins / replace current state.
   - `b` = both true / coexist.
   - `s` = supports existing — merge provenance only; never rewrite the existing statement or primary `evidence_quote`.
-  - `t` = temporal update — candidate becomes current, existing fact(s) are marked superseded/historical.
+  - `t` = candidate current — the candidate describes the current state; existing fact(s) are marked superseded/historical.
   - `u` = unsure / skip for later.
   Number keys remain available for route candidates, but conflict-card decisions use the relation letters above.
 - Group the queue by relation class with batch-accept per group ("accept all 14 supports-class items").

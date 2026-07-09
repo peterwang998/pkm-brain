@@ -134,7 +134,7 @@ function conflictCard(item) {
     <button data-decision="candidate_wins" type="button"><kbd>c</kbd>candidate wins</button>
     <button data-decision="both_true" type="button"><kbd>b</kbd>both true</button>
     <button data-decision="supports_existing" type="button"><kbd>s</kbd>supports existing</button>
-    <button data-decision="temporal_update" type="button"><kbd>t</kbd>temporal update</button>
+    <button data-decision="temporal_update" type="button" title="Candidate is the current state; existing fact becomes historical."><kbd>t</kbd>candidate current</button>
     <button data-decision="unsure" type="button"><kbd>u</kbd>unsure</button>
   </div>`;
 }
