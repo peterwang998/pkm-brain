@@ -47,7 +47,7 @@ uv run brain index rebuild-vectors --home ~/brain
   memory/      optional exported memory Markdown
   db/          SQLite control plane
   indexes/     LanceDB vectors and related indexes
-  logs/        LaunchAgent and runtime logs
+  logs/        automation and runtime logs
   config/      local config, sync config, role providers
   evals/       local eval inputs, including golden_queries.yaml
   outbox/      secondary-node export artifacts
@@ -99,13 +99,31 @@ uv run brain wiki curate-facts --home ~/brain
 
 Provider roles are configured in `~/brain/config/local/cos_llm.yaml` or with `PKM_BRAIN_LLM_<ROLE>_*` environment variables. Roles are `extractor`, `resolver`, `gardener`, `synthesizer`, `critic`, and `auditor`.
 
-## Browser UI
+## macOS App
+
+The native app is the normal daily and background surface on macOS. It supervises
+the Python daemon, schedules capture/nightly/sync jobs, exposes Today, Queue,
+Wiki, Entities, Ask, Ops, and Settings, and keeps the CLI/MCP service available
+through app-managed shims.
+
+For a development build:
+
+```bash
+scripts/build-app.sh
+open "dist/PKM Brain.app"
+```
+
+The app adopts `~/brain` in place; private data does not move into the bundle.
+
+## Browser Fallback
 
 ```bash
 uv run brain ui --home ~/brain
 ```
 
-The UI is a local stdlib HTTP server with token auth. It exposes the unified review queue, wiki/entity browsing, retrieval inspection, operations status, and review actions. By default it binds to loopback only.
+The browser is an off-by-default fallback over the same loopback JSON API and
+mutation primitives as the native app. It remains useful for platform
+portability and diagnostics. By default it binds to loopback only.
 
 ## MCP Tools
 
@@ -133,16 +151,22 @@ uv run brain mcp --home ~/brain
 
 ## Automation
 
-macOS LaunchAgents support frequent capture and nightly maintenance:
+Normal macOS automation runs inside the app-supervised daemon. Jobs include
+capture, nightly maintenance, Secondary export, and one independent sync job per
+configured peer. Ops and the menu bar expose due/running/paused state and
+preserve no-op reasons.
+
+For headless development:
 
 ```bash
-uv run brain launch-agent install --home ~/brain
-uv run brain launch-agent install-nightly --home ~/brain
-uv run brain launch-agent status --home ~/brain
+uv run brain daemon --home ~/brain
 uv run brain doctor --home ~/brain
 ```
 
 Nightly maintenance captures/ingests sources, runs CoS extraction/gardener/synthesis/audit stages according to provider configuration, compacts telemetry, optimizes indexes, checks provenance, lints wiki pages, and audits memories. Secondary sync nodes skip mutation-capable CoS stages by default.
+
+Legacy `brain launch-agent` commands remain for migration rollback and
+development compatibility; they are not the normal app-managed path.
 
 Runtime cleanup is dry-run-first:
 
@@ -164,7 +188,8 @@ uv run brain sync status --home ~/brain
 uv run brain sync acceptance --home ~/brain
 ```
 
-See [docs/primary-secondary-brain-sync-spec.md](docs/primary-secondary-brain-sync-spec.md).
+See [the Sync And Topology spec](docs/specs/sync-and-topology.md) and
+[acceptance runbook](docs/runbooks/sync-acceptance.md).
 
 ## Development
 

@@ -1,332 +1,222 @@
-# PKM Brain Architecture Guide
+# PKM Brain Architecture Code Guide
+
+**Status:** current code-navigation guide
+**Last verified:** 2026-07-11 against the 0.1.1 release candidate working tree; baseline commit pending
 
-**Status:** current code guide
-**Last verified:** 2026-07-08 against commit `b94e7a3`
+This guide answers where behavior lives. Feature requirements and open work belong in [the specs index](README.md), not here.
 
-This guide is derived from the code paths in `src/pkm_brain/`, not from the spec docs. It is meant to explain how the system is currently wired and how the harder concepts fit together.
+## System Map
 
-## One Page Overview
+```text
+capture.py / connectors.py
+  -> service.py ingest
+  -> db.py + migrations.py
+  -> chunking.py + indexes.py + embeddings.py
+  -> extraction.py
+  -> cos_actions.py + cos_policy.py
+  -> wiki_facts.py + entities.py + gardener.py
+  -> service.py retrieval
+  -> mcp_server.py / ui_server.py / cli.py
 
-PKM Brain is a local-first knowledge system built around a runtime home directory, usually `~/brain`. The repo code lives separately from the private brain data. The runtime home has inbox files, immutable raw copies, a Markdown wiki, reviewed memory exports, SQLite state, vector indexes, logs, config, eval reports, and optional sync outboxes.
+daemon.py + automation.py schedule the same primitives.
+SwiftUI and browser assets call ui_server.py JSON endpoints.
+sync_* modules move source files, never live DB/index state.
+```
 
-The core service is `BrainService`. Most entry points call into it or adjacent modules:
+## Authority Map
 
-- CLI commands are in `cli.py`.
-- MCP tools are in `mcp_server.py`.
-- The browser UI is a stdlib HTTP server in `ui_server.py`.
-- Scheduled jobs are in `automation.py`.
-- Fact/wiki curation is mostly in `wiki_facts.py`.
-- Chief-of-Staff action/policy/audit logic is in `cos_actions.py`, `cos_policy.py`, and `cos_audit.py`.
-- The gardener topology pass is in `gardener.py`.
+| Layer | Canonical representation | Main code |
+|---|---|---|
+| runtime paths | `BrainPaths` rooted at one home | `paths.py` |
+| capture state | inbox files and `capture_sources` | `capture.py`, `connectors.py` |
+| source evidence | raw artifacts, `documents`, `chunks` | `service.py`, `chunking.py` |
+| lexical/vector index | FTS5 and stamped LanceDB chunks | `indexes.py`, `embeddings.py` |
+| facts | `facts` plus exact source spans/quotes | `extraction.py`, `wiki_facts.py` |
+| entity identity | `entities` and `fact_entities` | `entities.py` |
+| durable mutation | `cos_actions` plus inverse | `cos_actions.py` |
+| autonomy | versioned `cos_policy` and eval state | `cos_policy.py`, `evals.py` |
+| review residue | `open_questions`, proposed memories, audit flags | `wiki_facts.py`, `memory.py`, `ui_server.py` |
+| page projection | contracts, facts, synthesis, snapshots, Markdown | `wiki_facts.py`, `contracts.py` |
+| retrieval packet | facts/pages/chunks/memories plus verdict/lineage | `service.py` |
+| automation | jobs and `automation_runs` | `daemon.py`, `automation.py` |
+| sync | source outbox/staging/mirror and `sync_runs` | `sync_*.py` |
 
-The durable control plane is SQLite. It stores documents, chunks, memories, facts, open questions, wiki page index rows, curation runs, page snapshots, CoS actions, policies, page contracts, retrieval events, lineage events, capture state, sync runs, and automation runs. LanceDB stores chunk vectors. SQLite FTS stores lexical indexes for raw chunks and facts.
+## Package Guide
 
-The main data flow is:
+### Workspace And Persistence
 
-1. Capture and ingest source material into `documents`, `chunks`, FTS, and vectors.
-2. Retrieve context by combining lexical search, vector search, fact search, wiki page selection, active memories, and lineage feedback.
-3. Curate durable knowledge as facts, not primarily as Markdown.
-4. Render managed wiki pages from active facts.
-5. Use CoS actions to record important mutations with policy decisions, inverses, target hashes, and audit status.
-6. Use open questions as residue when the system cannot safely decide truth.
-7. Use the gardener to look for topology problems, such as duplicate pages, singleton facts that belong elsewhere, dense pages that may need splitting, and missing or stale page contracts.
-8. Use sampled audits and evals to constrain autonomous behavior.
+- `paths.py`: all home-relative paths, node identity, lock/token/handshake paths.
+- `db.py`: base schema, connection helpers, FTS setup, row helpers.
+- `migrations.py`: ordered idempotent migrations 1-21.
+- `config.py` and `sync_config.py`: local/shared and role-specific config.
 
-The most important mental model: raw sources are evidence, facts are the canonical knowledge ledger, and managed wiki pages are rebuildable projections from that fact ledger. A wiki page may be the human-readable surface, but for managed pages it is not the source of truth.
+Do not create ad hoc paths or SQLite connections in UI/Swift code.
 
-## Major TODOs
+### Capture And Ingest
 
-- Extend retrieval quality now that semantic embeddings are productized. Config/env provider selection, index provenance stamping, non-silent degradation, `brain embeddings download`, full/missing-only vector rebuild paths, side-by-side eval, paraphrase goldens, and the live real-brain flip to `sentence-transformer:BAAI/bge-small-en-v1.5` are complete. Remaining retrieval work is fact vectors as a second stamped collection, query expansion, neighbor expansion, and rerank experiments.
-- Tighten deterministic fact resolution. Mutation mechanics should stay deterministic, but semantic decisions such as lexical near-duplicate merging or recency-implies-truth should route to exact-match/source-only rules, residue, critic, LLM, or human review instead of silent auto-merge.
-- Keep `open_questions` retrieval useful and bounded. UI/wiki/policy flows use the table heavily, and `retrieve_context()` now returns query-relevant unresolved residue, but this should keep improving with ranking/review-surface work.
-- Keep the entity/gardener autonomy boundary honest. The code now has entity identity, merge/split actions, and decomposed gardener judgment, but policy promotion should stay tied to the eval/report gates described in the active specs.
-- Bound runtime growth and bring email in as evidence. Retrieval telemetry compaction, index maintenance, runtime-prune dry runs, queue summaries, and live cleanup tooling are implemented. Email capture/extraction is explicitly paused until `docs/email-ingestion-spec.md` is revised.
-- Browser UI v2 is the active local control plane. It replaces the old tab UI with six job-oriented destinations, a unified review queue, rendered wiki pages with provenance popovers, entity browsing, retrieval inspection, and Ops views. Design and endpoint contracts live in `docs/brain-ui-v2-spec.md`; static assets ship from `src/pkm_brain/ui_static/`.
+- `connectors.py`: connector registry, manifests, config, health.
+- `capture.py`: built-in agent/note capture adapters and snapshot export.
+- `service.py`: workspace initialization, source detection, ingest, chunk/index writes, quarantine, status.
+- `chunking.py`: deterministic chunk boundaries and evidence text preparation.
 
-## Detailed Breakdown From Raw Primitives Up
+Connector output stops at `inbox/`. `BrainService.ingest` is the single entry to raw/document/chunk/index state.
 
-This section starts with the lowest-level runtime objects and builds upward to the agent-facing systems. Each layer states what generates it, how it is retrieved, and whether the generation is deterministic or LLM-assisted.
+### Embeddings And Indexes
 
-### 1. Runtime Home And Path Primitives
+- `embeddings.py`: config resolution, hash/ST providers, unavailable sentinel, query/passsage interface.
+- `indexes.py`: LanceDB tables, provider stamp checks, vector rebuild/backfill, index statistics.
+- SQLite FTS definitions live in `db.py` and service helpers.
 
-`paths.py` defines `BrainPaths`, the root object that maps a brain home to directories such as `inbox/`, `raw/`, `wiki/`, `memory/`, `db/`, `indexes/`, `logs/`, `config/`, `evals/`, and `outbox/`.
+Provider mismatch must disable/refuse the vector channel; never mix spaces or silently substitute hash.
 
-- Generated by: `BrainService.init_workspace()` creates directories, initializes SQLite, and writes default local config/eval files when absent.
-- Retrieved/public exposure: not retrieved as knowledge. Paths appear in `doctor`, UI status, logs, citations, and debug output.
-- Deterministic vs LLM: fully deterministic.
+### Facts, Entities, And Pages
 
-### 2. Configuration, Node Identity, And Sync Role
+- `extraction.py`: document/window selection, prompts, evidence units, validation/retry, watermarks, critic/conflict helpers.
+- `fact_relations.py`: typed candidate/counterpart relation classifier.
+- `source_evidence.py`: source-date and source-document evidence normalization shared by review projections.
+- `routing_coherence.py`: source-document routing priors used without overriding contradictory fact evidence.
+- `entities.py`: normalization, resolution, type/mention gates, aliases, link helpers.
+- `wiki_facts.py`: fact persistence/lifecycle, open questions, routing, page projection, snapshots, human answers.
+- `contracts.py`: page-scope and retrieval-purpose contracts.
+- `gardener.py`: deterministic topology candidates, per-candidate LLM disposition, proposal.
+- `regeneration.py`: source-driven rebuild workflow and safety/reporting.
 
-Local config lives under `config/local/`. Sync config lives at `config/sync.yaml` and is parsed by `sync_config.py`. Node identity comes from `config/local/node_id` or the hostname.
+Entity identity is not a page path. `fact_entities` is link authority; `facts.entity_id` is a primary-link cache.
 
-- Generated by: setup/sync CLI flows and direct config writes to `config/local/config.yaml` and `config/sync.yaml`.
-- Retrieved/public exposure: not searched. Used operationally by automation, sync, launch-agent generation, and role gating.
-- Deterministic vs LLM: fully deterministic.
+### Actions, Policy, Audit, And Evals
 
-### 3. SQLite Control Plane
+- `cos_actions.py`: action type registry, proposal/application, inverse capture, guarded revert, sibling retirement.
+- `cos_policy.py`: risk features, ordered policy matching, version activation/demotion.
+- `curation_settings.py`: strict/balanced/lenient future-action presets.
+- `cos_audit.py`: sampled action audit and demotion.
+- `evals.py` and `retrieval_fixtures.py`: extraction/routing/topology/conflict/relations/retrieval gates.
+- `fact_review_volume.py`: approval-gated W2 reconciliation reporting/application.
+- `review_admission.py`: schema-21 Queue admission budget, grandfathering, deferral, and promotion.
+- `policy_reconciliation.py` and `topology_reconciliation.py`: dry-run-first repair commands for legacy review residue.
 
-SQLite is the authoritative state store. `db.py` defines the base schema, and `migrations.py` adds fact curation, CoS actions, policy, page contracts, page syntheses, and shared retrieval FTS.
+Semantic judgment may choose an operation. Only `cos_actions.py` applies durable state.
 
-- Generated by: `init_db()` plus `run_migrations()`, called through workspace initialization.
-- Retrieved/public exposure: not searched as content. Every public surface reads through it: CLI, UI, MCP, retrieval, curation, audit, and sync status.
-- Deterministic vs LLM: schema creation and migration are deterministic.
+### Retrieval And Memory
 
-### 4. Capture State And Inbox Artifacts
+- `service.py`: search, layer selection, reranking, verdict/calibration, context packet, lineage, telemetry compaction.
+- `memory.py` and `memory_proposals.py`: typed memory lifecycle and model/deterministic proposals.
+- `mcp_server.py`: small stable agent-facing tool surface.
 
-`capture.py` captures local agent/session sources into Markdown files under `inbox/`. It tracks source hashes and capture state in `capture_sources`.
+Retrieval exposure is telemetry. It can order review work but cannot alter truth confidence.
 
-- Generated by: `AgentLogCapture.capture()` and adapters for Codex, Claude, OpenCode, and optionally Hyprnote.
-- Retrieved/public exposure: inbox files are not searched until ingested. Capture status is visible through CLI/UI/job summaries. Captured Markdown becomes searchable after ingest.
-- Deterministic vs LLM: capture, sanitization, redaction, hash checks, and Markdown rendering are deterministic. No external LLM is called here.
+### Automation And Operations
 
-### 5. Raw Source Documents
+- `automation.py`: capture/nightly stage orchestration and summaries.
+- `daemon.py`: loopback API process, serial scheduler registry, token/lock/handshake, parent monitor.
+- `maintenance.py`: bounded storage inventory and dry-run-first backup cleanup; user-created brain backups are never auto-pruned.
+- `launch_agents.py` and scheduler adapters: legacy/development automation.
+- `ui_server.py`: auth HTTP handler, JSON endpoints, Queue projection/dispatch, browser static serving.
+- `cli.py`: command registration and presentation over lower-level functions.
 
-`BrainService.ingest()` copies changed input files to immutable-ish raw storage under `raw/<source_type>/<yyyy>/<mm>/`, then records `documents` rows.
+The app daemon is normal production automation. LaunchAgent commands are compatibility paths.
 
-- Generated by: ingest scans `inbox/` or a supplied path, detects source type, hashes content, computes title, deduplicates by origin/logical key, and copies to `raw/`.
-- Retrieved/public exposure: documents are not returned whole by normal search, but their metadata and raw paths appear in chunks, citations, raw-context links, inspect commands, and debug output.
-- Deterministic vs LLM: deterministic. Title detection and source-type detection are local heuristics.
+### Sync
 
-### 6. Chunks
+- `sync_config.py`: role/peer config and validation.
+- `sync_ssh.py`: SSH command and host-key handling.
+- `sync_rsync.py`: pure rsync command construction and allowlists.
+- `sync_transfer.py`: staged pull, validation, ingest, push, remote rebuild.
+- `sync_service.py`: high-level status/run/acceptance operations.
 
-Chunks are the retrieval units derived from source documents. They live in `chunks` with heading path, offsets, token count, content hash, and document link.
+The primary initiates transfer. Source artifacts cross machines; databases and indexes do not.
 
-- Generated by: `chunk_text()` inside ingest, mirror rebuild, index reset, and reindex commands.
-- Retrieved/public exposure: chunks are the primary `search()` and `retrieve_context()` text payloads. They are also inspectable by document ID.
-- Deterministic vs LLM: deterministic chunking and scoring inputs. No external LLM is called.
+## Frontends
 
-### 7. BM25 Lexical And Vector Indexes
+### Native
 
-The system has SQLite FTS5 BM25 lexical search and LanceDB vector search. `chunk_fts` indexes raw chunks. `retrieval_fts` indexes both chunks and facts. Search queries call SQLite FTS5 `bm25(...)` over these virtual tables. LanceDB stores chunk vectors.
+- `app/Sources/App`: scenes, navigation, app state, menu bar, notifications.
+- `app/Sources/Kit`: API models/client, daemon supervisor, runtime provisioner, process-aware runtime retention.
+- `app/Sources/Views`: Today, Queue, Wiki, Entities, Ask, Ops, Settings.
+- `app/Sources/Acceptance`: headless app/runtime acceptance harness.
+- `app/UITests`: rendered navigation and Queue keyboard acceptance coverage.
 
-- Generated by: ingest and reindex write FTS rows; `rebuild_vector_index()` rewrites LanceDB from SQLite chunks; fact mutations call `rebuild_fact_retrieval_index()` for fact FTS rows.
-- Retrieved/public exposure: `search()` and `retrieve_context()` use BM25 FTS and vectors for candidate fanout. Users see ranked chunks/facts, not the indexes directly.
-- Deterministic vs LLM: BM25 FTS is deterministic. Code defaults remain deterministic hash embeddings for dependency-free new installs, but live `~/brain` is configured for local sentence-transformer embeddings. Local model vectorization is model-assisted retrieval, not an external LLM agent call.
+Wiki Markdown uses Apple's `swift-markdown` package and bounded explicit fact disclosure. Queue, Wiki, Entities, Ask, Ops, and Settings share typed API models and deep-link state. `QueueView.swift` and `Models.swift` remain decomposition candidates documented in the audit.
 
-### 8. Retrieval Events And Context Lineage
+### Browser
 
-`retrieval_events` records what a search/context call returned. `context_lineage_events` records exposure, explicit feedback, and references from agent session logs.
+- `src/pkm_brain/ui_static/index.html`: shell.
+- `app.js` and view modules: route/view state.
+- `api.js`: authenticated API client.
+- `app.css` and `tokens.css`: layout and visual tokens.
 
-- Generated by: `search()`, `retrieve_context()`, `record_context_feedback()`, and ingest-time agent-log lineage extraction.
-- Retrieved/public exposure: not searched as user knowledge. It influences future ranking through lineage boosts and supports later memory proposal generation.
-- Deterministic vs LLM: retrieval event creation, exposure recording, lineage scoring, decay, and boosts are deterministic. Memory proposal generation from lineage can later call an LLM, but the lineage table itself is generated deterministically.
+The browser and native clients consume the same endpoints and mutation primitives.
 
-### 9. Reviewed Memories
+## Public Surfaces
 
-Memories are durable human-reviewed or proposed notes in `memories`, optionally exported as Markdown under `memory/<scope>/` when active.
+- `cli.py` registers `brain`.
+- `mcp_server.py` registers agent tools.
+- `ui_server.py` owns local HTTP routes.
+- `daemon.py` owns normal app-supervised process lifetime.
+- `app/Package.swift` and `project.yml` own Swift package/Xcode builds.
+- `scripts/build-app.sh` owns release app assembly.
+- `scripts/install-app.sh` owns verified `/Applications` staging, rollback, activation, and login-item installation.
+- `scripts/ui-acceptance.sh` owns isolated rendered macOS UI acceptance.
 
-- Generated by: MCP/CLI/UI calls to `BrainService.propose_memory()`, memory import/export, and optional LLM proposal jobs in `memory_proposals.py`.
-- Retrieved/public exposure: active memories are returned by `retrieve_context()` and `get_memories`. Proposed memories can be included as candidate memories in context retrieval.
-- Deterministic vs LLM: creating/reviewing/importing/exporting memories is deterministic. `propose_failure_memories_from_sources()` and `propose_memories_from_lineage()` call an external/configured LLM provider to draft proposals, but approval remains a separate review action.
+## Current Pressure Points
 
-### 10. Facts
+Largest Python modules in the audited working tree:
 
-Facts are atomic claims in the `facts` table. They carry statement, entity key, page hint, section hint, source IDs, source spans, evidence quote, extraction metadata, confidence fields, status, conflict/supersession metadata, and confirmation state.
+| File | Lines | Mixed responsibilities |
+|---|---:|---|
+| `ui_server.py` | 6,032 | HTTP/auth, all endpoints, Queue, Wiki/Entities/Ops, migration, static serving |
+| `service.py` | 4,920 | init/ingest, retrieval, telemetry, FTS/index helpers, parsing |
+| `extraction.py` | 4,402 | selection, prompt/provider calls, validation, relation/critic helpers, metrics |
+| `wiki_facts.py` | 3,540 | fact lifecycle, questions, routing, page projection, snapshots |
+| `cos_actions.py` | 3,353 | generic ledger plus every action implementation/inverse |
 
-- Generated by: wiki migration, LLM extraction when enabled, human confirmed fact creation, open-question answers, fact merges, fact supersession, conflict display, and fact rehome actions. Current LLM extraction is document/window based: the model sees one source window plus routing hints, returns `chunk_id` and an exact `evidence_quote`, and deterministic validation derives `source_spans`.
-- Retrieved/public exposure: active and conflicted facts are indexed into `retrieval_fts` and returned by `retrieve_context()` as `relevant_facts`. Managed wiki pages render active facts. UI curation views expose all page facts.
-- Deterministic vs LLM: fact mutation mechanics are deterministic once a candidate or decision exists: write the row, union evidence, set status, record inverses, rebuild fact FTS. Semantic decisions are a separate concern. Exact normalized matches and adding evidence to an otherwise identical claim are safe deterministic cases. Lexical near-duplicate merging, recency-implies-truth, and contradiction resolution are semantic decisions and should route to residue, critic, LLM, or human review unless a narrow safe rule applies. Candidate extraction from source documents in `extraction.py` calls a configured LLM provider when enabled.
+Largest Swift view is `QueueView.swift` at 1,952 lines. These are not automatically bugs, but they increase ownership ambiguity and make focused tests/refactors harder. `tests/test_architecture_boundaries.py` now enforces these exact counts as no-growth ceilings: behavior must move into focused modules before a guarded file can grow.
 
-### 11. Open Questions
+See [the current audit](audits/project-audit-2026-07-10.md) and [implementation plan](plans/project-implementation-plan.md) before moving code.
 
-`open_questions` is the residue table for uncertainty or blocked automation. It stores conflicts, policy escalations, revert drift, recommended actions, risk tier, answers, and resolution metadata.
+## How To Change The System
 
-- Generated by: unresolved fact conflicts, `display_contested`, policy escalation in `mark_needs_human()`, guarded revert drift, and human question-answer flows.
-- Retrieved/public exposure: UI fact curation and the unified review queue surface open questions. `retrieve_context()` returns query-relevant unresolved residue in bounded form, so agents can see directly related conflicts or review items without receiving the whole queue.
-- Deterministic vs LLM: deterministic. The reasons may reference LLM-originated actions, but question creation itself is local rule logic.
+When adding a capture source:
 
-### 12. Chief-of-Staff Actions
+1. implement a connector that writes inbox artifacts and state;
+2. reuse ingest/source detection;
+3. add source-weight, redaction, and eval fixtures;
+4. do not write facts/indexes from the connector.
 
-`cos_actions` is the mutation ledger for significant CoS changes. It records action type, status, targets, payload/evidence, policy decision, autonomy level, inverse JSON, state hash, audit status, and timestamps.
+When adding a durable curation operation:
 
-- Generated by: `propose_action()` callers across fact curation, contracts, gardener, extraction, page archive/revert, and manual correction flows.
-- Retrieved/public exposure: visible in UI CoS actions and audit status. Not searched as knowledge unless some action data is later captured as an ingested source.
-- Deterministic vs LLM: proposal/application mechanics are deterministic. Some proposals may be based on LLM-generated candidates or LLM gardener/audit judgments. Action application itself is deterministic and type-dispatched.
+1. define deterministic candidate/evidence;
+2. add action type plus inverse and guarded revert;
+3. classify risk and policy;
+4. add eval/audit coverage;
+5. expose the existing action through UI, not a new write path.
 
-### 13. Policy Rules And Eval Gates
+When changing retrieval:
 
-`cos_policy` stores versioned autonomy rules. `cos_policy.py` matches action type and flattened action features, then optionally applies an eval gate.
+1. add or update fixtures first;
+2. measure verdict, source hit, precision, calibration, noise, and negative controls;
+3. keep provider/index degradation explicit;
+4. verify context packet size and telemetry growth.
 
-- Generated by: migrations seed default policy; demotion can create a new policy version; future tools can insert policy rows.
-- Retrieved/public exposure: visible in UI policy/audit contexts. Not searched as knowledge.
-- Deterministic vs LLM: deterministic predicate matching, autonomy selection, eval-gate checking, and demotion writes. LLM audit results can trigger demotion, but policy evaluation itself does not call an LLM.
+When changing UI:
 
-### 14. Page Contracts
+1. update the shared endpoint contract;
+2. keep browser/native writes on the same primitive;
+3. test complete data and error states;
+4. verify rendered light/dark and minimum/normal window sizes;
+5. reconcile global counts after mutations.
 
-`page_contracts` describes what belongs on a managed page: canonical entity, scope, retrieval purpose, inclusions, exclusions, freshness, and related pages.
+When adding a repair or reconciliation:
 
-- Generated by: `generate_initial_contracts()`, gardener `edit_contract` candidates, and `edit_contract` CoS actions.
-- Retrieved/public exposure: UI contract views and gardener/audit cards use them. They are not directly returned by search/context retrieval.
-- Deterministic vs LLM: default contract generation and contract validation are deterministic. Gardener can use an LLM judge to keep/drop a contract-related candidate, but the contract payload generator is deterministic.
+1. use a shared scan/report/approve/apply shape;
+2. make dry-run the default and record provenance on application;
+3. keep ordinary future work behind `review_admission.py` rather than bypassing Queue limits;
+4. archive or consolidate mission-specific repair code when its migration is complete.
 
-### 15. Human And Legacy Wiki Markdown Inputs
+## Specs
 
-Markdown files under `wiki/` can also exist independently of the fact ledger. This is the source-like side of the wiki: human-owned pages, old generated pages, references, and legacy pages that can be migrated into facts. This is not the managed wiki projection described below.
-
-- Generated by: humans, legacy wiki tooling, reference-page tooling, managed page archive/revert operations, and any direct file writes outside the system.
-- Retrieved/public exposure: `select_wiki_pages()` scans Markdown pages directly and can return relevant human/legacy pages in search/context results. UI wiki views expose them.
-- Deterministic vs LLM: parsing/linting/indexing these files is deterministic. The prose itself may have any origin. Current code has no active LLM wiki writer for these pages.
-
-### 16. Derived Page Syntheses
-
-`wiki_page_syntheses` stores optional derived synthesis Markdown for a page, keyed by page hint and fact hash. Managed page rendering can include this under `Derived Synthesis` when the fact hash still matches.
-
-- Generated by: `synthesizer.py` selects managed pages whose active fact set needs synthesis, calls the configured `synthesizer` role, validates that the response cites existing fact IDs, and emits `synthesize_page` CoS actions. `automation.py` can run this as the `cos_synthesis` nightly stage when LLM wiki synthesis is enabled.
-- Retrieved/public exposure: if present and not stale by hash, it is embedded into managed wiki pages. It can also appear in audit cards.
-- Deterministic vs LLM: page selection, staleness checks, validation, action application, and rendering are deterministic. The synthesis prose itself is LLM-produced by the configured `synthesizer` role. Synthesis is derived text only and never becomes fact evidence.
-
-### 17. Managed Wiki Page Projection
-
-Managed wiki pages are Markdown projections from active facts. They are identified by the CoS marker or `managed: true`.
-
-- Generated by: `curate_managed_pages()`, `curate_all_managed_fact_pages()`, `regenerate_managed_fact_page()`, and question/manual correction flows that call curation afterward.
-- Retrieved/public exposure: selected by `select_wiki_pages()` in search/context retrieval, visible in UI wiki/curation views, and cited by source IDs in page frontmatter.
-- Deterministic vs LLM: page rendering, section routing, duplicate bullet suppression, lint checks, rollback, snapshots, and wiki page index sync are deterministic. Optional `Derived Synthesis` text is only included if already stored and hash-current.
-
-### 18. Wiki Page Index
-
-`wiki_pages` is the SQLite index of Markdown wiki pages. It stores title, type, status, path, source IDs, related pages, tags, and managed/fact metadata.
-
-- Generated by: `lint_wiki()` through `sync_wiki_pages()`, plus managed page sync after successful curation writes.
-- Retrieved/public exposure: used by UI summaries and managed-page dashboards. Search reads Markdown files directly for page body matching, but indexed rows help status and curation views.
-- Deterministic vs LLM: deterministic.
-
-### 19. Page Snapshots
-
-`wiki_page_snapshots` records before/after Markdown around managed page writes, archive operations, and snapshot reverts.
-
-- Generated by: successful managed page curation writes, orphan managed page archival, and snapshot reverts.
-- Retrieved/public exposure: UI page review shows recent snapshots. Not searched as knowledge.
-- Deterministic vs LLM: deterministic.
-
-### 20. Fact-To-Wiki Pipeline
-
-The end-to-end path from sources to managed wiki is layered:
-
-1. A candidate fact is produced by migration, manual correction, question answer, or optional LLM extraction.
-2. `upsert_candidate_facts()` normalizes it, finds exact/near-duplicate facts, merges evidence when possible, and applies a `fact_upsert` action.
-3. Fact action application writes `facts` and rebuilds fact FTS rows.
-4. `resolve_fact_groups()` groups by entity and section, merges exact/near-duplicate replacement facts, auto-supersedes selected winners, or marks unresolved alternatives as `conflicted`. The near-duplicate and supersession decisions are the risky boundary: the mechanics are deterministic, but the semantic decision policy needs strict gates.
-5. `display_contested` creates an open conflict question when no safe truth winner exists.
-6. `reconcile_open_fact_questions()` canonicalizes routes, re-runs resolution, merges duplicate alternatives, and updates/dismisses open questions.
-7. `curate_managed_pages()` renders active facts to Markdown, validates projection quality, lints the wiki, rolls back bad writes, syncs the page index, and records snapshots.
-
-- Generated by: `wiki_fact_migration.py`, `extraction.py`, `wiki_facts.py`, and `cos_actions.py`.
-- Retrieved/public exposure: final active/conflicted facts are returned by context retrieval; final managed pages are returned by wiki page selection. Superseded/retracted facts and curation runs are mostly UI/inspection surfaces.
-- Deterministic vs LLM: normalization, action application, rendering, linting, rollback, and contested display are deterministic. Some current merge/supersede heuristics are also deterministic, but they should be treated as policy-sensitive semantic decisions rather than blanket-safe mechanics. Source-to-fact extraction uses an LLM only when the extractor role is configured; when configured, it is still gated by deterministic source-type policy, quote validation, retry diagnostics, and CoS action policy.
-
-### 21. Gardener Candidates
-
-The gardener is the topology/organization layer. It reads managed pages, facts, and contracts, then proposes cleanup candidates.
-
-- Generated by: `generate_gardener_candidates()` loads managed page summaries, enriches them with fact evidence, computes deterministic topology candidates, optionally applies LLM judgment, and optionally proposes actions.
-- Retrieved/public exposure: nightly summaries, UI/CoS action views if proposed, and evals. Gardener candidates are not returned by normal search/context retrieval.
-- Deterministic vs LLM: base candidate generation is deterministic. Candidate classes include `page_merge`, `rehome_fact`, `page_split`, and `edit_contract`. If `llm_provider` or `provider` is supplied, `apply_gardener_judgment()` calls an external/configured LLM to keep/drop candidates or adjust score/risk. In scheduled automation, gardener runs in shadow mode without a provider, so it is deterministic candidate reporting.
-
-Important current behavior:
-
-- `edit_contract`, `rehome_fact`, `page_merge`, `page_split`, `rename_page`, `archive_page`, `entity_merge`, and `entity_split` action application are implemented with inverse capture where applicable.
-- Gardener proposed actions include topology eval gates and should not silently mutate topology without passing policy/eval checks.
-
-### 22. Sampled Audit
-
-Sampled audit reviews applied CoS actions and records audit status.
-
-- Generated by: `run_sampled_audit()` samples applied/auto-applied unaudited actions, builds action cards, optionally calls an auditor provider, records audit status, demotes policy on threshold breaches, and optionally reverts bad actions.
-- Retrieved/public exposure: UI audit status and CoS action records. Audit cards/statuses are not normal search content.
-- Deterministic vs LLM: sampling, action-card construction, demotion threshold math, and guarded revert are deterministic. Judgment is stubbed unless an auditor provider or `PKM_BRAIN_LLM_AUDITOR_PROVIDER` is configured; configured mode calls an external/configured LLM auditor.
-
-### 23. Evals
-
-Eval reports are JSON files written under `reports/evals/`.
-
-- Generated by: `run_eval()` and suite-specific code in `evals.py`.
-- Retrieved/public exposure: not searched. Policy eval gates can load the latest report for a suite. CLI/UI can expose eval results.
-- Deterministic vs LLM: current eval suites are deterministic. They exercise extraction span coverage, routing coverage, topology candidate metrics, conflict safety, and retrieval golden cases. Retrieval eval uses the same deterministic retrieval pipeline plus whatever embedding provider is configured.
-
-### 24. Automation Runs
-
-`automation.py` coordinates recurring capture, ingest, CoS shadow stages, index maintenance, audit, provenance, wiki lint, optional memory proposals, and memory audit.
-
-- Generated by: `run_nightly_maintenance()` and other automation commands; results are stored in `automation_runs`.
-- Retrieved/public exposure: job status/log UI and CLI run inspection. Automation summaries are not searched as knowledge unless exported/captured elsewhere.
-- Deterministic vs LLM: the default nightly path is deterministic except for optional memory proposal jobs and configured CoS roles. Extraction runs in shadow mode and skips unless the extractor role is configured; when enabled, it calls the extractor LLM over policy-selected source windows. Gardener candidate generation remains deterministic unless a gardener role is configured for judgment.
-
-### 25. Sync And Outbox
-
-Sync moves files between nodes without multi-writer SQLite replication. Secondary outboxes can export captured artifacts; primary ingest absorbs them.
-
-- Generated by: sync setup/config commands, capture outbox export, transfer commands, and sync run recording.
-- Retrieved/public exposure: sync status/conflicts and sync run records are operational surfaces, not knowledge search surfaces.
-- Deterministic vs LLM: deterministic.
-
-### 26. Public Surfaces
-
-The public interfaces sit on top of the layers above:
-
-- CLI: broad operator surface in `cli.py`.
-- MCP: agent-facing retrieval/memory/session tools in `mcp_server.py`.
-- UI: local HTTP dashboard and review interface in `ui_server.py`.
-- Scheduler/launch agents: recurring execution setup.
-
-- Generated by: user/operator invocation, scheduled automation, or agent tool calls.
-- Retrieved/public exposure: these are the exposure mechanisms. Normal knowledge retrieval is `search()` and `retrieve_context()`, not direct table dumps.
-- Deterministic vs LLM: surface routing is deterministic. LLM involvement depends on the command invoked and whether a provider is configured.
-
-## Deterministic Vs LLM-Assisted Summary
-
-Deterministic by default:
-
-- Workspace/path setup.
-- Schema and migrations.
-- Capture and sanitization.
-- Ingest, raw copy, chunking, FTS indexing, hash embeddings.
-- Search fanout/reranking/selection.
-- Retrieval exposure and lineage scoring.
-- Wiki linting and page indexing.
-- Fact mutation mechanics, action application, page rendering, snapshots, and contested-residue creation.
-- Policy matching and eval-gate checks.
-- Contract generation/validation.
-- Base gardener candidates.
-- Evals.
-- Sync and automation orchestration.
-
-LLM-assisted only when explicitly configured or supplied a provider:
-
-- Source-to-fact extraction in `extraction.py`.
-- Semantic fact merge/supersession decisions when exact deterministic rules are insufficient.
-- Gardener candidate judgment in `gardener.py`.
-- Sampled audit judgment in `cos_audit.py`.
-- Memory proposal drafting in `memory_proposals.py`.
-
-Supported but not actively generated by a visible current path:
-
-- Derived page synthesis rows in `wiki_page_syntheses`; the action/storage/rendering path exists, but this code scan did not find an active producer for synthesis Markdown.
-
-## How To Read The Code
-
-For a quick understanding pass, read in this order:
-
-1. `paths.py`: runtime layout.
-2. `db.py` and `migrations.py`: durable state model.
-3. `service.py`: ingest, retrieval, memory lifecycle, search.
-4. `wiki_facts.py`: fact ledger and managed wiki projection.
-5. `cos_actions.py`: mutation ledger and reversibility.
-6. `cos_policy.py`: autonomy rules and eval gates.
-7. `gardener.py`: topology candidates.
-8. `cos_audit.py`: sampled audit and policy demotion.
-9. `automation.py`: scheduled orchestration.
-10. `cli.py`, `mcp_server.py`, and `ui_server.py`: external surfaces.
-
-## Practical Mental Models
-
-- Raw files answer "what evidence did we ingest?"
-- Chunks and vectors answer "what text can retrieval find?"
-- Memories answer "what durable agent preference or lesson has been reviewed?"
-- Facts answer "what atomic claims does the system currently know?"
-- Open questions answer "where did the system refuse to decide?"
-- Managed wiki pages answer "what readable page can be projected from current facts?"
-- CoS actions answer "what mutation happened, why, by what policy, and can it be reverted?"
-- Contracts answer "what belongs on a page?"
-- The gardener answers "does the page topology look wrong?"
-- Audits answer "were sampled autonomous actions actually safe and supported?"
+- [Product Foundation](specs/product-foundation.md)
+- [Capture And Knowledge](specs/capture-and-knowledge.md)
+- [Retrieval And Memory](specs/retrieval-and-memory.md)
+- [Curation And Review](specs/curation-and-review.md)
+- [App And Operations](specs/app-and-operations.md)
+- [Sync And Topology](specs/sync-and-topology.md)
