@@ -22,5 +22,15 @@ jobs:
       - run: brew install xcodegen
       - run: uv sync --dev
       - run: swift test --package-path app
-      - run: scripts/ui-acceptance.sh
       - run: scripts/build-app.sh
+      - name: Run rendered UI acceptance
+        run: scripts/ui-acceptance.sh "$RUNNER_TEMP/pkm-brain-ui-acceptance"
+      - name: Upload UI acceptance diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-ui-acceptance-diagnostics
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/pkm-brain-ui-acceptance
+            ~/Library/Logs/DiagnosticReports
