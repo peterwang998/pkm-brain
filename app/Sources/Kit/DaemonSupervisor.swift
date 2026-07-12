@@ -3,6 +3,7 @@ import Foundation
 
 public enum DaemonSupervisorError: Error, Equatable {
     case versionMismatch(expected: String, actual: String)
+    case runtimeMismatch(expected: String, actual: String?)
 }
 
 @MainActor
@@ -14,6 +15,7 @@ public final class DaemonSupervisor: ObservableObject {
     public private(set) var apiClient: BrainAPIClient?
     private let provisioner: RuntimeProvisioner
     private let expectedDaemonVersion: String?
+    private var expectedRuntimeID: String?
     private var process: Process?
     private var healthTask: Task<Void, Never>?
     private var launchConfiguration: LaunchConfiguration?
@@ -21,22 +23,35 @@ public final class DaemonSupervisor: ObservableObject {
 
     public init(
         provisioner: RuntimeProvisioner,
-        expectedDaemonVersion: String? = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        expectedDaemonVersion: String? = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+        expectedRuntimeID: String? = nil
     ) {
         self.provisioner = provisioner
         self.expectedDaemonVersion = expectedDaemonVersion
+        self.expectedRuntimeID = expectedRuntimeID
     }
 
     public func start(homeURL: URL, serveWeb: Bool = false) async {
         status = .starting
+        if expectedRuntimeID == nil {
+            expectedRuntimeID = provisioner.expectedRuntimeID()
+        }
         if await adoptExistingDaemon(homeURL: homeURL) {
             return
         }
         do {
             status = .provisioning("Provisioning runtime")
             let brain = try await provisioner.ensureRuntime()
-            launchConfiguration = LaunchConfiguration(brain: brain, homeURL: homeURL, serveWeb: serveWeb)
-            try launchDaemon(brain: brain, homeURL: homeURL, serveWeb: serveWeb)
+            expectedRuntimeID = provisioner.activeRuntimeID
+                ?? provisioner.currentRuntimeID()
+                ?? expectedRuntimeID
+            launchConfiguration = LaunchConfiguration(
+                brain: brain,
+                homeURL: homeURL,
+                serveWeb: serveWeb,
+                runtimeID: expectedRuntimeID
+            )
+            try launchDaemon(brain: brain, homeURL: homeURL, serveWeb: serveWeb, runtimeID: expectedRuntimeID)
             let handshake = try await waitForHandshake(homeURL: homeURL, timeoutSeconds: 10)
             try await adopt(handshake: handshake)
         } catch {
@@ -91,7 +106,7 @@ public final class DaemonSupervisor: ObservableObject {
         }
     }
 
-    private func launchDaemon(brain: URL, homeURL: URL, serveWeb: Bool) throws {
+    private func launchDaemon(brain: URL, homeURL: URL, serveWeb: Bool, runtimeID: String?) throws {
         status = .starting
         let process = Process()
         process.executableURL = brain
@@ -107,8 +122,13 @@ public final class DaemonSupervisor: ObservableObject {
         }
         process.arguments = arguments
         var environment = ProcessInfo.processInfo.environment
-        environment["SENTENCE_TRANSFORMERS_HOME"] = provisioner.appSupportURL
-            .appendingPathComponent("models", isDirectory: true).path
+        if let runtimeID {
+            environment["PKM_BRAIN_RUNTIME_ID"] = runtimeID
+        }
+        let managedModels = provisioner.appSupportURL.appendingPathComponent("models", isDirectory: true)
+        if provisioner.fileManager.fileExists(atPath: managedModels.path) {
+            environment["SENTENCE_TRANSFORMERS_HOME"] = managedModels.path
+        }
         process.environment = environment
         try process.run()
         self.process = process
@@ -121,7 +141,8 @@ public final class DaemonSupervisor: ObservableObject {
         do {
             try await adopt(handshake: handshake)
             return true
-        } catch DaemonSupervisorError.versionMismatch {
+        } catch DaemonSupervisorError.versionMismatch,
+                DaemonSupervisorError.runtimeMismatch {
             await replaceMismatchedDaemon(handshake: handshake, homeURL: homeURL)
             return false
         } catch {
@@ -150,12 +171,29 @@ public final class DaemonSupervisor: ObservableObject {
         if let expectedDaemonVersion, health.version != expectedDaemonVersion {
             throw DaemonSupervisorError.versionMismatch(expected: expectedDaemonVersion, actual: health.version)
         }
+        if let expectedRuntimeID, health.runtime_id != expectedRuntimeID {
+            throw DaemonSupervisorError.runtimeMismatch(expected: expectedRuntimeID, actual: health.runtime_id)
+        }
         self.handshake = handshake
         self.apiClient = client
         self.scheduler = try? await client.scheduler()
         status = .running(health)
         restartFailures = 0
         startHealthPolling()
+        scheduleRuntimePrune(runtimeID: health.runtime_id)
+    }
+
+    private func scheduleRuntimePrune(runtimeID: String?) {
+        guard let runtimeID, runtimeID != "dev" else {
+            return
+        }
+        let runtimeRoot = provisioner.appSupportURL.appendingPathComponent("runtime", isDirectory: true)
+        Task.detached(priority: .utility) {
+            _ = try? RuntimeRetentionManager(runtimeRoot: runtimeRoot).prune(
+                currentRuntimeID: runtimeID,
+                keepRollbacks: 1
+            )
+        }
     }
 
     private func startHealthPolling() {
@@ -207,7 +245,8 @@ public final class DaemonSupervisor: ObservableObject {
                 try launchDaemon(
                     brain: launchConfiguration.brain,
                     homeURL: launchConfiguration.homeURL,
-                    serveWeb: launchConfiguration.serveWeb
+                    serveWeb: launchConfiguration.serveWeb,
+                    runtimeID: launchConfiguration.runtimeID
                 )
                 let handshake = try await waitForHandshake(homeURL: launchConfiguration.homeURL, timeoutSeconds: 10)
                 try await adopt(handshake: handshake)
@@ -291,4 +330,5 @@ private struct LaunchConfiguration {
     let brain: URL
     let homeURL: URL
     let serveWeb: Bool
+    let runtimeID: String?
 }

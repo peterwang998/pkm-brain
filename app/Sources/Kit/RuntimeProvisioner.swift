@@ -9,16 +9,21 @@ public enum RuntimeProvisionerError: Error, Equatable {
 public final class RuntimeProvisioner: ObservableObject {
     @Published public private(set) var phase: String = "Idle"
     @Published public private(set) var message: String = ""
+    @Published public private(set) var activeRuntimeID: String?
 
     public let appSupportURL: URL
     public let fileManager: FileManager
 
     public init(
-        appSupportURL: URL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("PKM Brain", isDirectory: true),
+        appSupportURL: URL? = nil,
         fileManager: FileManager = .default
     ) {
         self.appSupportURL = appSupportURL
+            ?? ProcessInfo.processInfo.environment["PKM_BRAIN_APP_SUPPORT"].map {
+                URL(fileURLWithPath: $0, isDirectory: true)
+            }
+            ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("PKM Brain", isDirectory: true)
         self.fileManager = fileManager
     }
 
@@ -30,23 +35,30 @@ public final class RuntimeProvisioner: ObservableObject {
         appSupportURL.appendingPathComponent("runtime/current/.pkm-brain-runtime-id")
     }
 
+    public func expectedRuntimeID(bundle: Bundle = .main) -> String? {
+        try? bundledRuntimeSeed(bundle: bundle).id
+    }
+
     public func ensureRuntime(bundle: Bundle = .main) async throws -> URL {
         phase = "Checking Runtime"
         message = "Checking app-managed Python runtime"
+        if let devBin = ProcessInfo.processInfo.environment["PKM_BRAIN_DEV_BRAIN_BIN"],
+           fileManager.isExecutableFile(atPath: devBin) {
+            phase = "Ready"
+            message = "Using development brain executable"
+            activeRuntimeID = "dev"
+            return URL(fileURLWithPath: devBin)
+        }
         if let bundledRuntime = try? bundledRuntimeSeed(bundle: bundle) {
             if fileManager.isExecutableFile(atPath: currentBrainExecutableURL.path),
                currentRuntimeID() == bundledRuntime.id {
                 try await smokeBrainExecutable(currentBrainExecutableURL)
                 phase = "Ready"
                 message = "Runtime is ready"
+                activeRuntimeID = bundledRuntime.id
                 return currentBrainExecutableURL
             }
             return try await provisionBundledRuntime(bundledRuntime)
-        }
-        if let devBin = ProcessInfo.processInfo.environment["PKM_BRAIN_DEV_BRAIN_BIN"], fileManager.isExecutableFile(atPath: devBin) {
-            phase = "Ready"
-            message = "Using development brain executable"
-            return URL(fileURLWithPath: devBin)
         }
         if let repo = ProcessInfo.processInfo.environment["PKM_BRAIN_REPO_PATH"] {
             return try createDevelopmentRuntime(repoPath: URL(fileURLWithPath: repo))
@@ -54,6 +66,7 @@ public final class RuntimeProvisioner: ObservableObject {
         if fileManager.isExecutableFile(atPath: currentBrainExecutableURL.path) {
             phase = "Ready"
             message = "Runtime is ready"
+            activeRuntimeID = currentRuntimeID()
             return currentBrainExecutableURL
         }
         throw RuntimeProvisionerError.cannotProvision(
@@ -118,6 +131,7 @@ public final class RuntimeProvisioner: ObservableObject {
                 try activateRuntime(target)
                 phase = "Ready"
                 message = "Runtime is ready"
+                activeRuntimeID = seed.id
                 return currentBrainExecutableURL
             } catch {
                 try? fileManager.removeItem(at: target)
@@ -144,6 +158,7 @@ public final class RuntimeProvisioner: ObservableObject {
             try activateRuntime(target)
             phase = "Ready"
             message = "Runtime is ready"
+            activeRuntimeID = seed.id
             return currentBrainExecutableURL
         } catch {
             try? fileManager.removeItem(at: target)
@@ -163,7 +178,7 @@ public final class RuntimeProvisioner: ObservableObject {
         try fileManager.createSymbolicLink(at: current, withDestinationURL: target)
     }
 
-    private func currentRuntimeID() -> String? {
+    public func currentRuntimeID() -> String? {
         try? String(contentsOf: currentRuntimeIDURL, encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
@@ -221,6 +236,7 @@ public final class RuntimeProvisioner: ObservableObject {
         )
         phase = "Ready"
         message = "Development runtime is ready"
+        activeRuntimeID = "dev"
         return brain
     }
 

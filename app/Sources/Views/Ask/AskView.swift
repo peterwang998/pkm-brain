@@ -1,3 +1,4 @@
+import AppKit
 import PKMBrainKit
 import SwiftUI
 
@@ -85,6 +86,7 @@ struct AskView: View {
                     ProgressView("Retrieving context...")
                 } else if let result {
                     verdictBanner(result)
+                    retrievalTrace(result.retrieval_debug)
                     factsSection(result.relevant_facts ?? [])
                     pagesSection(result.relevant_wiki_pages ?? [])
                     chunksSection(result.supporting_chunks ?? [])
@@ -166,8 +168,29 @@ struct AskView: View {
         resultSection(title: "Facts", isEmpty: facts.isEmpty, emptyText: "No facts returned.") {
             ForEach(facts) { fact in
                 VStack(alignment: .leading, spacing: 5) {
-                    Text(fact.statement ?? "Untitled fact")
-                        .textSelection(.enabled)
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(fact.statement ?? "Untitled fact")
+                            .textSelection(.enabled)
+                        Spacer()
+                        if let page = fact.page_hint {
+                            Button {
+                                appState.showWiki(path: page)
+                            } label: {
+                                Image(systemName: "doc.text")
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Open owning Wiki page")
+                        }
+                        if let entityID = fact.entity_id {
+                            Button {
+                                appState.showEntity(id: entityID)
+                            } label: {
+                                Image(systemName: "person.crop.circle")
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Open owning entity")
+                        }
+                    }
                     MetadataRow(values: [
                         scoreText(fact.retrieval_score ?? fact.score),
                         fact.page_hint,
@@ -185,9 +208,16 @@ struct AskView: View {
         resultSection(title: "Wiki Pages", isEmpty: pages.isEmpty, emptyText: "No wiki pages returned.") {
             ForEach(pages) { page in
                 VStack(alignment: .leading, spacing: 5) {
-                    Text(page.title ?? page.relative_path)
+                    Button {
+                        appState.showWiki(path: page.relative_path)
+                    } label: {
+                        Label(
+                            page.title ?? page.relative_path,
+                            systemImage: "doc.text"
+                        )
                         .font(.callout.weight(.medium))
-                        .textSelection(.enabled)
+                    }
+                    .buttonStyle(.plain)
                     MetadataRow(values: [
                         scoreText(page.score),
                         page.relative_path,
@@ -214,6 +244,14 @@ struct AskView: View {
                         chunk.document_id.map(shortID),
                     ])
                     reasonsText(chunk.selection_reasons ?? chunk.reasons)
+                    if chunkSourcePath(chunk) != nil {
+                        Button {
+                            revealChunkSource(chunk)
+                        } label: {
+                            Label("Reveal Source", systemImage: "folder")
+                        }
+                        .buttonStyle(.borderless)
+                    }
                 }
                 .padding(.vertical, 5)
                 Divider()
@@ -283,6 +321,46 @@ struct AskView: View {
         }
     }
 
+    private func retrievalTrace(_ trace: [String: JSONValue]?) -> some View {
+        Group {
+            if let trace, !trace.isEmpty {
+                DisclosureGroup("Retrieval Trace") {
+                    Text(prettyJSON(.object(trace)))
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.top, 6)
+                }
+            }
+        }
+    }
+
+    private func chunkSourcePath(_ chunk: RetrieveChunk) -> String? {
+        guard let context = chunk.raw_context else {
+            return nil
+        }
+        return ["raw_path", "source_path", "path"]
+            .compactMap { context[$0]?.stringValue }
+            .first { !$0.isEmpty }
+    }
+
+    private func revealChunkSource(_ chunk: RetrieveChunk) {
+        guard let path = chunkSourcePath(chunk) else {
+            return
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+    }
+
+    private func prettyJSON(_ value: JSONValue) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        guard let data = try? encoder.encode(value) else {
+            return "Debug detail unavailable."
+        }
+        return String(decoding: data, as: UTF8.self)
+    }
+
     private func runAsk() async {
         guard let client = appState.daemon.apiClient else {
             errorMessage = "Daemon API is unavailable."
@@ -299,7 +377,7 @@ struct AskView: View {
             errorMessage = nil
             history = AskHistoryItem.push(.init(task: trimmedTask, mode: mode), into: history)
         } catch {
-            errorMessage = String(describing: error)
+            errorMessage = error.localizedDescription
         }
     }
 }

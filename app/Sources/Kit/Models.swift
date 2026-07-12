@@ -5,6 +5,7 @@ public struct DaemonHandshake: Codable, Equatable, Sendable {
     public let port: Int
     public let token: String
     public let version: String
+    public let runtime_id: String?
     public let home: String
     public let started_at: String
     public let host: String?
@@ -17,6 +18,7 @@ public struct DaemonHandshake: Codable, Equatable, Sendable {
 public struct DaemonHealth: Codable, Equatable, Sendable {
     public let ok: Bool
     public let version: String
+    public let runtime_id: String?
     public let home: String
     public let pid: Int
     public let host: String
@@ -83,6 +85,23 @@ public struct QueueCounts: Codable, Equatable, Sendable {
     public let raw: [String: Int]
 }
 
+public struct QueueSummary: Codable, Equatable, Sendable {
+    public let as_of: String
+    public let server_pid: Int?
+    public let home: String?
+    public let active_total: Int
+    public let actionable_total: Int
+    public let blocked_total: Int
+    public let deferred_total: Int
+    public let active_limit: Int?
+    public let daily_admission_limit: Int?
+    public let admitted_today: Int?
+    public let by_kind: [String: Int]
+    public let blocked_by_kind: [String: Int]?
+    public let deferred_by_kind: [String: Int]?
+    public let raw: [String: Int]
+}
+
 public struct FactPageDelta: Codable, Equatable, Identifiable, Sendable {
     public let page_hint: String
     public let count: Int
@@ -110,6 +129,7 @@ public struct Digest: Codable, Equatable, Sendable {
     public let reverts: [JSONValue]
     public let demotions: [JSONValue]
     public let eval_transitions: [JSONValue]
+    public let queue_summary: QueueSummary?
     public let queue_counts: QueueCounts
     public let raw: [String: JSONValue]?
 
@@ -183,6 +203,9 @@ public struct Digest: Codable, Equatable, Sendable {
 
 public struct QueuePage: Codable, Equatable, Sendable {
     public let kind: String
+    public let state: String?
+    public let sort: String?
+    public let queue_summary: QueueSummary?
     public let counts: QueueCounts
     public let total: Int
     public let cursor: Int
@@ -191,6 +214,9 @@ public struct QueuePage: Codable, Equatable, Sendable {
 
     public init(
         kind: String,
+        state: String? = nil,
+        sort: String? = nil,
+        queue_summary: QueueSummary? = nil,
         counts: QueueCounts,
         total: Int,
         cursor: Int,
@@ -198,6 +224,9 @@ public struct QueuePage: Codable, Equatable, Sendable {
         items: [QueueItem]
     ) {
         self.kind = kind
+        self.state = state
+        self.sort = sort
+        self.queue_summary = queue_summary
         self.counts = counts
         self.total = total
         self.cursor = cursor
@@ -221,26 +250,110 @@ public struct QueueItem: Codable, Equatable, Identifiable, Sendable {
     public let action_id: String?
     public let candidate: QueueFact?
     public let counterparts: [QueueFact]?
+    public let comparison_mode: String?
+    public let alternatives: [QueueFact]?
     public let orientation: QueueOrientation?
     public let route_candidates: [QueueRouteCandidate]?
     public let memory: QueueMemory?
+    public let anomaly: QueueAnomaly?
+    public let audit: QueueAuditFinding?
     public let topology: QueueTopology?
     public let action: [String: JSONValue]?
     public let proposal: JSONValue?
     public let question: [String: JSONValue]?
     public let options: [JSONValue]?
     public let raw: JSONValue?
+    public let popularity: QueuePopularity?
+    public let approvable: Bool?
+    public let blocking_code: String?
+    public let blocking_reason: String?
 
     public var displayTitle: String {
         orientation?.title ?? title ?? summary ?? id
     }
+
+    public var primaryConfidence: Double? {
+        candidate?.displayConfidence
+            ?? alternatives?.first?.displayConfidence
+            ?? memory?.confidence
+            ?? orientation?.relation_confidence
+    }
+
+    public var isApprovable: Bool {
+        approvable ?? true
+    }
+
+    public var isAlternativeComparison: Bool {
+        comparison_mode == "alternatives"
+    }
+}
+
+public struct QueueAnomaly: Codable, Equatable, Sendable {
+    public let document_id: String?
+    public let document_title: String?
+    public let reviewed_count: Int
+    public let blocked_count: Int
+    public let block_rate: Double?
+}
+
+public struct QueueAuditFinding: Codable, Equatable, Sendable {
+    public let status: String?
+    public let rationale: String
+    public let provider: String?
+    public let model: String?
+    public let audited_at: String?
+    public let action_type: String?
+    public let action_status: String?
+    public let affected_fact_count: Int?
+    public let affected_page_count: Int?
+    public let affected_contract_count: Int?
+    public let affected_facts: [QueueFact]?
+    public let revertible: Bool?
+    public let revert_mode: String?
+    public let reviewability_reason: String?
+}
+
+public struct QueuePopularity: Codable, Equatable, Sendable {
+    public let retrieval_count: Int
+    public let last_retrieved_at: String?
+    public let fact_retrieval_count: Int?
+    public let entity_retrieval_count: Int?
 }
 
 public struct QueueTopology: Codable, Equatable, Sendable {
     public let entity_ids: [String]?
     public let entity_labels: [String]?
+    public let entity_statuses: [String: String]?
     public let page_hints: [String]?
+    public let page_statuses: [String: String]?
     public let target_label: String?
+    public let merge_destination_label: String?
+    public let merge_source_labels: [String]?
+    public let split_preview: QueueSplitPreview?
+}
+
+public struct QueueSplitPreview: Codable, Equatable, Sendable {
+    public let source_page_hint: String
+    public let source_page_retained: Bool
+    public let resulting_page_count: Int
+    public let movable_fact_count: Int
+    public let children: [QueueSplitChild]
+    public let approvable: Bool
+}
+
+public struct QueueSplitChild: Codable, Equatable, Identifiable, Sendable {
+    public let section: String
+    public let page_hint: String
+    public let fact_count: Int
+    public let representative_facts: [QueueSplitFact]
+
+    public var id: String { page_hint }
+}
+
+public struct QueueSplitFact: Codable, Equatable, Sendable {
+    public let id: String?
+    public let statement: String?
+    public let evidence_quote: String?
 }
 
 public struct QueueOrientation: Codable, Equatable, Sendable {
@@ -270,8 +383,13 @@ public struct QueueFact: Codable, Equatable, Sendable {
     public let page_hint: String?
     public let section_hint: String?
     public let entity_key: String?
+    public let observed_at: String?
+    public let source_date: String?
+    public let source_date_basis: String?
     public let source_ids: [String]?
     public let source_documents: [QueueSourceDocument]?
+    public let retrieval_count: Int?
+    public let last_retrieved_at: String?
 
     public var displayID: String? {
         id ?? fact_id
@@ -291,6 +409,8 @@ public struct QueueRouteCandidate: Codable, Equatable, Identifiable, Sendable {
     public let title: String?
     public let score: Double?
     public let page_type: String?
+    public let document_coherence_count: Int?
+    public let document_coherence_share: Double?
 
     public var id: String { page_hint }
 }
@@ -315,11 +435,13 @@ public struct QueueSourceDocument: Codable, Equatable, Identifiable, Sendable {
     public let source_type: String?
     public let source_path: String?
     public let raw_path: String?
+    public let created_at: String?
     public let ingested_at: String?
     public let captured_at: String?
     public let uri: String?
     public let path: String?
     public let origin: String?
+    public let source_refs: [String]?
 
     public var id: String { source_id }
 }
@@ -329,11 +451,13 @@ public struct QueueDecisionResult: Codable, Equatable, Sendable {
     public let item_id: String?
     public let result: [String: JSONValue]?
     public let undo_handle: JSONValue?
+    public let queue_summary: QueueSummary?
 }
 
 public struct QueueUndoResult: Codable, Equatable, Sendable {
     public let status: String
     public let undo_handle: JSONValue?
+    public let queue_summary: QueueSummary?
 }
 
 public struct ConnectorsResponse: Codable, Equatable, Sendable {
@@ -394,6 +518,7 @@ public struct EntitiesResponse: Codable, Equatable, Sendable {
     public let entities: [EntitySummary]
     public let count: Int
     public let types: [EntityTypeCount]
+    public let sort: String?
 }
 
 public struct EntityTypeCount: Codable, Equatable, Identifiable, Sendable {
@@ -412,6 +537,8 @@ public struct EntitySummary: Codable, Equatable, Identifiable, Sendable {
     public let status: String?
     public let merged_into: String?
     public let fact_count: Int?
+    public let retrieval_count: Int?
+    public let last_retrieved_at: String?
     public let last_observed_at: String?
     public let created_at: String?
 }
@@ -420,7 +547,50 @@ public struct EntityDetail: Codable, Equatable, Sendable {
     public let entity: EntitySummary
     public let facts_by_page: [EntityFactGroup]
     public let co_mentions: [EntityCoMention]
-    public let merge_candidates: [JSONValue]?
+    public let merge_candidates: [EntityMergeCandidate]?
+}
+
+public struct EntityMergeCandidate: Codable, Equatable, Identifiable, Sendable {
+    public let candidate_key: String?
+    public let action_type: String?
+    public let entity_ids: [String]
+    public let canonical_entity_id: String?
+    public let merged_entity_ids: [String]?
+    public let entity_names: [String: String]?
+    public let entity_types: [String: String]?
+    public let page_hints: [String]?
+    public let reason: String?
+    public let merge_signal: String?
+    public let score: Double?
+    public let similarity: Double?
+    public let affected_fact_count: Int?
+    public let risk_tier: String?
+
+    public var id: String {
+        candidate_key ?? "entity_merge:\(entity_ids.sorted().joined(separator: ","))"
+    }
+
+    public var canonicalID: String? {
+        canonical_entity_id ?? entity_ids.first
+    }
+
+    public var sourceIDs: [String] {
+        if let merged_entity_ids, !merged_entity_ids.isEmpty {
+            return merged_entity_ids
+        }
+        guard let canonicalID else {
+            return []
+        }
+        return entity_ids.filter { $0 != canonicalID }
+    }
+
+    public func name(for entityID: String) -> String {
+        entity_names?[entityID] ?? entityID
+    }
+}
+
+public struct EntityMergeResponse: Codable, Equatable, Sendable {
+    public let action: [String: JSONValue]
 }
 
 public struct EntityFactGroup: Codable, Equatable, Identifiable, Sendable {
@@ -435,6 +605,35 @@ public struct EntityCoMention: Codable, Equatable, Identifiable, Sendable {
     public let name: String
     public let entity_type: String?
     public let count: Int
+}
+
+public struct CurationSettingsResponse: Codable, Equatable, Sendable {
+    public let strictness: String
+    public let label: String
+    public let minimum_auto_confidence: Double
+    public let merge_aggressiveness: Double
+    public let split_aggressiveness: Double
+    public let policy_version: Int?
+    public let updated_at: String?
+    public let configured: Bool
+    public let changed: Bool
+    public let applies_to: String
+    public let existing_queue_unchanged: Bool
+    public let topology_applies_to: String
+    public let profiles: [CurationProfile]
+    public let hard_review_boundaries: [String]
+}
+
+public struct CurationProfile: Codable, Equatable, Identifiable, Sendable {
+    public let id: String
+    public let label: String
+    public let minimum_auto_confidence: Double
+
+    public init(id: String, label: String, minimum_auto_confidence: Double) {
+        self.id = id
+        self.label = label
+        self.minimum_auto_confidence = minimum_auto_confidence
+    }
 }
 
 public struct RetrieveRequest: Encodable, Sendable {
@@ -462,6 +661,7 @@ public struct RetrieveResult: Codable, Equatable, Sendable {
     public let supporting_chunks: [RetrieveChunk]?
     public let active_memories: [RetrieveMemory]?
     public let candidate_memories: [RetrieveMemory]?
+    public let retrieval_debug: [String: JSONValue]?
     public let raw: [String: JSONValue]?
 }
 
@@ -469,6 +669,7 @@ public struct RetrieveFact: Codable, Equatable, Identifiable, Sendable {
     public let id: String
     public let statement: String?
     public let page_hint: String?
+    public let entity_id: String?
     public let retrieval_score: Double?
     public let score: Double?
     public let selection_reasons: [String]?
@@ -496,6 +697,7 @@ public struct RetrieveChunk: Codable, Equatable, Identifiable, Sendable {
     public let rerank_score: Double?
     public let selection_reasons: [String]?
     public let reasons: [String]?
+    public let raw_context: [String: JSONValue]?
 
     public var stableID: String { chunk_id ?? id ?? document_id ?? title ?? snippet ?? text ?? "chunk" }
 }
@@ -552,6 +754,53 @@ public struct ConnectorHealth: Codable, Equatable, Sendable {
     public let last_run_at: String?
     public let last_error: String?
     public let last_result: JSONValue?
+}
+
+public struct OpsRunsResponse: Codable, Equatable, Sendable {
+    public let automation_runs: [OpsRun]
+    public let ingestion_runs: [OpsRun]
+}
+
+public struct OpsRun: Codable, Equatable, Identifiable, Sendable {
+    public let run_id: String?
+    public let job_name: String?
+    public let source_type: String?
+    public let status: String?
+    public let started_at: String?
+    public let finished_at: String?
+    public let error: String?
+
+    public var id: String {
+        run_id ?? "\(job_name ?? source_type ?? "run"):\(started_at ?? finished_at ?? "")"
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case run_id = "id"
+        case job_name
+        case source_type
+        case status
+        case started_at
+        case finished_at
+        case error
+    }
+}
+
+public struct StorageInventory: Codable, Equatable, Sendable {
+    public let generated_at: String
+    public let roots: [StorageEntry]
+    public let details: [StorageEntry]
+    public let managed_root_bytes: Int64
+}
+
+public struct StorageEntry: Codable, Equatable, Identifiable, Sendable {
+    public let key: String
+    public let path: String
+    public let exists: Bool
+    public let bytes: Int64
+    public let policy: String
+    public let item_count: Int?
+
+    public var id: String { key }
 }
 
 public struct MigrationPlan: Codable, Equatable, Sendable {

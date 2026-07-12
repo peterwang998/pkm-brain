@@ -80,6 +80,8 @@ struct PKMBrainAcceptance {
             "brain_home": brainHome.path,
             "digest_generated_at": typedDigest.generated_at,
             "digest_queue_total": typedDigest.queue_counts.total,
+            "digest_queue_actionable": typedDigest.queue_summary?.actionable_total ?? typedDigest.queue_counts.total,
+            "digest_queue_blocked": typedDigest.queue_summary?.blocked_total ?? 0,
             "first_pid": firstPID,
             "restarted_pid": restartedPID,
             "runtime_phase": provisioner.phase,
@@ -116,8 +118,21 @@ struct PKMBrainAcceptance {
             && lhs.reverts == rhs.reverts
             && lhs.demotions == rhs.demotions
             && lhs.eval_transitions == rhs.eval_transitions
+            && queueSummaryContentMatches(lhs.queue_summary, rhs.queue_summary)
             && lhs.queue_counts == rhs.queue_counts
             && lhs.raw == rhs.raw
+    }
+
+    private static func queueSummaryContentMatches(_ lhs: QueueSummary?, _ rhs: QueueSummary?) -> Bool {
+        lhs?.server_pid == rhs?.server_pid
+            && lhs?.home == rhs?.home
+            && lhs?.active_total == rhs?.active_total
+            && lhs?.actionable_total == rhs?.actionable_total
+            && lhs?.blocked_total == rhs?.blocked_total
+            && lhs?.deferred_total == rhs?.deferred_total
+            && lhs?.by_kind == rhs?.by_kind
+            && lhs?.blocked_by_kind == rhs?.blocked_by_kind
+            && lhs?.raw == rhs?.raw
     }
 
     private static func waitUntil(timeoutSeconds: TimeInterval, condition: @MainActor @escaping () -> Bool) async throws {

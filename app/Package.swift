@@ -9,6 +9,12 @@ let package = Package(
         .executable(name: "PKMBrainApp", targets: ["PKMBrainApp"]),
         .executable(name: "PKMBrainAcceptance", targets: ["PKMBrainAcceptance"])
     ],
+    dependencies: [
+        .package(
+            url: "https://github.com/swiftlang/swift-markdown.git",
+            from: "0.8.0"
+        )
+    ],
     targets: [
         .target(
             name: "PKMBrainKit",
@@ -16,7 +22,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "PKMBrainApp",
-            dependencies: ["PKMBrainKit"],
+            dependencies: [
+                "PKMBrainKit",
+                .product(name: "Markdown", package: "swift-markdown")
+            ],
             path: "Sources",
             exclude: ["Acceptance", "Kit", "App/Info.plist"],
             sources: ["App", "Views"]

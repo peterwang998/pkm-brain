@@ -7,8 +7,17 @@ struct MainWindowView: View {
         NavigationSplitView {
             List(selection: $appState.selectedDestination) {
                 ForEach(AppState.Destination.allCases) { destination in
-                    Label(destination.rawValue, systemImage: destination.symbol)
-                        .tag(destination)
+                    HStack {
+                        Label(destination.rawValue, systemImage: destination.symbol)
+                        Spacer()
+                        if destination == .queue, appState.queueTotal > 0 {
+                            Text("\(appState.queueTotal)")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                                .help("Actionable review items")
+                        }
+                    }
+                    .tag(destination)
                 }
             }
             .navigationSplitViewColumnWidth(min: 180, ideal: 200)
@@ -29,6 +38,8 @@ struct MainWindowView: View {
                         AskView()
                     case .ops:
                         OpsPreviewView()
+                    case .settings:
+                        GeneralSettingsView(showsHeader: true)
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)

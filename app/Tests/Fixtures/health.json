@@ -4,8 +4,8 @@
   "ok": true,
   "pid": 123,
   "port": 54321,
-  "schema_version": 20,
+  "runtime_id": "test-runtime",
+  "schema_version": 21,
   "started_at": "2026-07-08T08:00:00+00:00",
-  "version": "0.1.0"
+  "version": "0.1.1"
 }
-

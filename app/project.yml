@@ -6,6 +6,10 @@ options:
 settings:
   base:
     SWIFT_VERSION: "6.0"
+packages:
+  Markdown:
+    url: https://github.com/swiftlang/swift-markdown.git
+    from: 0.8.0
 targets:
   PKMBrainKit:
     type: framework
@@ -26,9 +30,11 @@ targets:
       - Resources
     dependencies:
       - target: PKMBrainKit
+      - package: Markdown
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.pkm-brain.app
+        PKM_BRAIN_APP_BUNDLE_ID: com.pkm-brain.app
+        PRODUCT_BUNDLE_IDENTIFIER: $(PKM_BRAIN_APP_BUNDLE_ID)
         PRODUCT_NAME: PKM Brain
         INFOPLIST_FILE: Sources/App/Info.plist
         CODE_SIGN_STYLE: Automatic
@@ -41,3 +47,15 @@ targets:
       - Tests/Fixtures
     dependencies:
       - target: PKMBrainKit
+  PKM BrainUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    sources:
+      - UITests
+    dependencies:
+      - target: PKM Brain
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.pkm-brain.app-uitests
+        TEST_TARGET_NAME: PKM Brain
+        GENERATE_INFOPLIST_FILE: YES

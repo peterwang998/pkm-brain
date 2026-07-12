@@ -32,6 +32,7 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "version": self.server.version,
+                    "runtime_id": self.server.runtime_id,
                     "home": str(self.server.home),
                     "pid": os.getpid(),
                     "host": "127.0.0.1",
@@ -120,6 +121,7 @@ def main():
     server.home = home_path
     server.token = token
     server.version = os.environ.get("FAKE_BRAIN_VERSION", "0.1.0")
+    server.runtime_id = os.environ.get("PKM_BRAIN_RUNTIME_ID")
     server.started_at = started_at
 
     payload = {
@@ -127,6 +129,7 @@ def main():
         "port": server.server_port,
         "token": token,
         "version": server.version,
+        "runtime_id": server.runtime_id,
         "home": str(home_path),
         "started_at": started_at,
         "host": "127.0.0.1",

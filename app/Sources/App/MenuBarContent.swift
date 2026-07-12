@@ -15,7 +15,14 @@ struct MenuBarContent: View {
             }
             if appState.queueTotal > 0 {
                 Button("Review \(appState.queueTotal) Items") {
-                    appState.selectedDestination = .queue
+                    appState.showQueue()
+                    openWindow(id: "main")
+                    NSApp.activate(ignoringOtherApps: true)
+                }
+            }
+            if let deferred = appState.queueSummary?.deferred_total, deferred > 0 {
+                Button("View \(deferred) Deferred") {
+                    appState.showQueue(state: "deferred")
                     openWindow(id: "main")
                     NSApp.activate(ignoringOtherApps: true)
                 }

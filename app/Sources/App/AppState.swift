@@ -13,6 +13,7 @@ final class AppState: ObservableObject {
         case entities = "Entities"
         case ask = "Ask"
         case ops = "Ops"
+        case settings = "Settings"
 
         var id: String { rawValue }
 
@@ -24,12 +25,14 @@ final class AppState: ObservableObject {
             case .entities: return "person.2"
             case .ask: return "text.magnifyingglass"
             case .ops: return "slider.horizontal.3"
+            case .settings: return "gearshape"
             }
         }
     }
 
-    @Published var selectedDestination: Destination = .today
+    @Published var selectedDestination: Destination
     @Published var digest: Digest?
+    @Published private(set) var queueSummary: QueueSummary?
     @Published var lastError: String?
     @Published var notificationsEnabled = true
     @Published var loginItemEnabled = false
@@ -37,21 +40,29 @@ final class AppState: ObservableObject {
     @Published var homePath: String
     @Published var migrationPlan: MigrationPlan?
     @Published var migrationActionMessage: String?
+    @Published var requestedWikiPath: String?
+    @Published var requestedEntityID: String?
+    @Published var requestedQueueState: String?
 
     let provisioner: RuntimeProvisioner
     let daemon: DaemonSupervisor
     private var didStart = false
     private var daemonCancellable: AnyCancellable?
+    private var handshakeCancellable: AnyCancellable?
     private var monitorTask: Task<Void, Never>?
+    private var queueSummaryDaemonPID: Int?
     private let queueBacklogThreshold = 100
     private let queueBacklogNotificationKey = "PKMBrain.queueBacklogNotificationAt"
+    private let homeDefaultsKey = "PKMBrain.homePath"
     private let nightlyFailureNotificationKey = "PKMBrain.nightlyFailureNotification"
     private let daemonFailureNotificationKey = "PKMBrain.daemonFailureNotification"
     private let connectorFailureNotificationPrefix = "PKMBrain.connectorFailureNotification."
 
-    init() {
+    init(initialDestination: Destination = .today) {
         let defaultHome = ProcessInfo.processInfo.environment["PKM_BRAIN_HOME"]
+            ?? UserDefaults.standard.string(forKey: "PKMBrain.homePath")
             ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("brain").path
+        selectedDestination = initialDestination
         homePath = defaultHome
         provisioner = RuntimeProvisioner()
         daemon = DaemonSupervisor(provisioner: provisioner)
@@ -60,6 +71,14 @@ final class AppState: ObservableObject {
                 self?.objectWillChange.send()
             }
         }
+        handshakeCancellable = daemon.$handshake
+            .map { $0?.pid }
+            .removeDuplicates()
+            .sink { [weak self] pid in
+                Task { @MainActor [weak self] in
+                    self?.handleDaemonPID(pid)
+                }
+            }
     }
 
     var homeURL: URL {
@@ -86,7 +105,98 @@ final class AppState: ObservableObject {
     }
 
     var queueTotal: Int {
-        digest?.queue_counts.total ?? 0
+        queueSummary?.actionable_total
+            ?? digest?.queue_summary?.actionable_total
+            ?? digest?.queue_counts.total
+            ?? 0
+    }
+
+    func acceptQueueSummary(_ candidate: QueueSummary?) {
+        guard let candidate else {
+            return
+        }
+        let daemonPID = daemon.handshake?.pid
+        if let serverPID = candidate.server_pid, serverPID != daemonPID {
+            return
+        }
+        if let summaryHome = candidate.home,
+           URL(fileURLWithPath: summaryHome).standardizedFileURL != homeURL.standardizedFileURL {
+            return
+        }
+        if queueSummaryDaemonPID != daemonPID {
+            queueSummary = nil
+            queueSummaryDaemonPID = daemonPID
+        }
+        if let current = queueSummary, current.as_of > candidate.as_of {
+            return
+        }
+        queueSummary = candidate
+        notifyQueueBacklogIfNeeded(count: candidate.actionable_total)
+    }
+
+    func showWiki(path: String) {
+        requestedWikiPath = path
+        selectedDestination = .wiki
+    }
+
+    func showEntity(id: String) {
+        requestedEntityID = id
+        selectedDestination = .entities
+    }
+
+    func showQueue(state: String = "actionable") {
+        requestedQueueState = state
+        selectedDestination = .queue
+    }
+
+    func switchHome(to requestedPath: String) async -> Bool {
+        let expanded = NSString(string: requestedPath).expandingTildeInPath
+        let target = URL(fileURLWithPath: expanded, isDirectory: true).standardizedFileURL
+        let previous = homeURL.standardizedFileURL
+        guard expanded.hasPrefix("/"), target != previous else {
+            return target == previous
+        }
+
+        await daemon.stop()
+        await daemon.start(homeURL: target, serveWeb: serveWeb)
+        if daemon.handshake.map({
+            URL(fileURLWithPath: $0.home).standardizedFileURL == target
+        }) == true {
+            homePath = target.path
+            UserDefaults.standard.set(target.path, forKey: homeDefaultsKey)
+            queueSummary = nil
+            digest = nil
+            await refreshMigrationPlan()
+            await refreshDigest()
+            lastError = nil
+            return true
+        }
+
+        let targetFailure = daemon.status.label
+        await daemon.stop()
+        await daemon.start(homeURL: previous, serveWeb: serveWeb)
+        homePath = previous.path
+        await refreshMigrationPlan()
+        await refreshDigest()
+        lastError = "Could not open \(target.path) (\(targetFailure)); restored \(previous.path)."
+        return false
+    }
+
+    func waitForAPIClient(maxAttempts: Int = 100) async -> BrainAPIClient? {
+        for _ in 0..<maxAttempts {
+            guard !Task.isCancelled else {
+                return nil
+            }
+            if let client = daemon.apiClient {
+                return client
+            }
+            do {
+                try await Task.sleep(nanoseconds: 200_000_000)
+            } catch {
+                return nil
+            }
+        }
+        return daemon.apiClient
     }
 
     func start() async {
@@ -95,7 +205,9 @@ final class AppState: ObservableObject {
         }
         didStart = true
         await daemon.start(homeURL: homeURL, serveWeb: serveWeb)
-        await requestNotificationAuthorizationIfNeeded()
+        if ProcessInfo.processInfo.environment["PKM_BRAIN_UI_TEST"] != "1" {
+            await requestNotificationAuthorizationIfNeeded()
+        }
         await refreshMigrationPlan()
         await refreshDigest()
         notifyDaemonFailureIfNeeded()
@@ -109,7 +221,7 @@ final class AppState: ObservableObject {
         do {
             migrationPlan = try await client.migrationPlan()
         } catch {
-            lastError = String(describing: error)
+            lastError = error.localizedDescription
         }
     }
 
@@ -120,12 +232,12 @@ final class AppState: ObservableObject {
         do {
             let latestDigest = try await client.digest()
             digest = latestDigest
+            acceptQueueSummary(latestDigest.queue_summary)
             lastError = nil
-            notifyQueueBacklogIfNeeded(count: latestDigest.queue_counts.total)
             notifyNightlyFailureIfNeeded(run: latestDigest.latest_run)
             await notifyConnectorFailuresIfNeeded(client: client)
         } catch {
-            lastError = String(describing: error)
+            lastError = error.localizedDescription
         }
     }
 
@@ -152,7 +264,7 @@ final class AppState: ObservableObject {
             migrationActionMessage = "CLI shims installed in \(shimDir)"
             await refreshMigrationPlan()
         } catch {
-            lastError = String(describing: error)
+            lastError = error.localizedDescription
         }
     }
 
@@ -164,7 +276,7 @@ final class AppState: ObservableObject {
             _ = try await client.dryRunLaunchAgentRetirement()
             migrationActionMessage = "LaunchAgent retirement dry run complete"
         } catch {
-            lastError = String(describing: error)
+            lastError = error.localizedDescription
         }
     }
 
@@ -186,6 +298,18 @@ final class AppState: ObservableObject {
                 await self?.refreshDigest()
                 self?.notifyDaemonFailureIfNeeded()
             }
+        }
+    }
+
+    private func handleDaemonPID(_ pid: Int?) {
+        guard queueSummaryDaemonPID != pid else {
+            return
+        }
+        queueSummaryDaemonPID = pid
+        queueSummary = nil
+        digest = nil
+        if pid != nil, didStart {
+            Task { await refreshDigest() }
         }
     }
 

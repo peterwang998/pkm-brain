@@ -39,9 +39,10 @@ struct TodayView: View {
             }
             Spacer()
             if let generated = appState.digest?.generated_at {
-                Text(generated)
+                Text("Updated \(displayDateTime(generated))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .help(generated)
             }
         }
     }
@@ -61,24 +62,52 @@ struct TodayView: View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Needs You")
                 .font(.title2.weight(.semibold))
-            if let counts = appState.digest?.queue_counts, counts.total > 0 {
+            if let summary = appState.queueSummary,
+               summary.active_total + summary.deferred_total > 0 {
                 HStack(spacing: 10) {
-                    ForEach(counts.by_kind.sorted(by: { $0.key < $1.key }), id: \.key) { kind, count in
+                    ForEach(actionableCounts(summary), id: \.key) { kind, count in
                         Label("\(kind) \(count)", systemImage: "circle.fill")
                             .labelStyle(.titleAndIcon)
                             .font(.callout)
                     }
+                    if summary.blocked_total > 0 {
+                        Label("blocked \(summary.blocked_total)", systemImage: "exclamationmark.triangle.fill")
+                            .font(.callout)
+                            .foregroundStyle(.orange)
+                    }
+                    if summary.deferred_total > 0 {
+                        Label("deferred \(summary.deferred_total)", systemImage: "clock")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
                 }
-                Button {
-                    appState.selectedDestination = .queue
-                } label: {
-                    Label("Start Review", systemImage: "arrow.right.circle")
+                if summary.actionable_total > 0 {
+                    Button {
+                        appState.showQueue()
+                    } label: {
+                        Label("Start Review", systemImage: "arrow.right.circle")
+                    }
+                }
+                if summary.deferred_total > 0 {
+                    Button {
+                        appState.showQueue(state: "deferred")
+                    } label: {
+                        Label("View Deferred", systemImage: "clock.arrow.circlepath")
+                    }
                 }
             } else {
                 Text("No review items in the current digest.")
                     .foregroundStyle(.secondary)
             }
         }
+    }
+
+    private func actionableCounts(_ summary: QueueSummary) -> [(key: String, value: Int)] {
+        summary.by_kind.compactMap { kind, activeCount in
+            let count = activeCount - (summary.blocked_by_kind?[kind] ?? 0)
+            return count > 0 ? (kind, count) : nil
+        }
+        .sorted { $0.key < $1.key }
     }
 
     private var recentFacts: some View {

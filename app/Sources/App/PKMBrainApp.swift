@@ -6,7 +6,7 @@ import SwiftUI
 @main
 struct PKMBrainApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var appState = AppState()
+    @StateObject private var appState: AppState
 
     init() {
         let arguments = Set(CommandLine.arguments.dropFirst())
@@ -20,19 +20,52 @@ struct PKMBrainApp: App {
         if arguments.contains("--disable-login-item") {
             Self.setLoginItem(enabled: false)
         }
+        _appState = StateObject(
+            wrappedValue: AppState(initialDestination: Self.requestedDestination(from: arguments))
+        )
     }
 
     var body: some Scene {
         WindowGroup("PKM Brain", id: "main") {
             MainWindowView()
                 .environmentObject(appState)
+                .onAppear {
+                    guard ProcessInfo.processInfo.environment["PKM_BRAIN_UI_TEST"] == "1" else {
+                        return
+                    }
+                    NSApp.setActivationPolicy(.regular)
+                    NSApp.activate(ignoringOtherApps: true)
+                    NSApp.windows.forEach { $0.makeKeyAndOrderFront(nil) }
+                }
                 .task {
                     appDelegate.appState = appState
                     NotificationRouter.shared.appState = appState
                     await appState.start()
                 }
         }
+        .defaultLaunchBehavior(
+            ProcessInfo.processInfo.environment["PKM_BRAIN_UI_TEST"] == "1"
+                ? .presented
+                : .automatic
+        )
         .commands {
+            CommandMenu("Navigate") {
+                Button("Today") { appState.selectedDestination = .today }
+                    .keyboardShortcut("1", modifiers: [.command])
+                Button("Queue") { appState.selectedDestination = .queue }
+                    .keyboardShortcut("2", modifiers: [.command])
+                Button("Wiki") { appState.selectedDestination = .wiki }
+                    .keyboardShortcut("3", modifiers: [.command])
+                Button("Entities") { appState.selectedDestination = .entities }
+                    .keyboardShortcut("4", modifiers: [.command])
+                Button("Ask") { appState.selectedDestination = .ask }
+                    .keyboardShortcut("5", modifiers: [.command])
+                Button("Ops") { appState.selectedDestination = .ops }
+                    .keyboardShortcut("6", modifiers: [.command])
+                Divider()
+                Button("Settings") { appState.selectedDestination = .settings }
+                    .keyboardShortcut("7", modifiers: [.command])
+            }
             CommandMenu("Brain") {
                 Button("Refresh Today") {
                     Task { await appState.refreshDigest() }
@@ -83,6 +116,16 @@ struct PKMBrainApp: App {
         @unknown default:
             return "unknown"
         }
+    }
+
+    private static func requestedDestination(from arguments: Set<String>) -> AppState.Destination {
+        guard let argument = arguments.first(where: { $0.hasPrefix("--destination=") }) else {
+            return .today
+        }
+        let requested = argument.dropFirst("--destination=".count)
+        return AppState.Destination.allCases.first {
+            $0.rawValue.lowercased() == requested.lowercased()
+        } ?? .today
     }
 }
 

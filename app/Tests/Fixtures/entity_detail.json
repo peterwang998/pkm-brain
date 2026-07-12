@@ -8,6 +8,8 @@
     "status": "active",
     "merged_into": null,
     "fact_count": 1,
+    "retrieval_count": 14,
+    "last_retrieved_at": "2026-07-09T18:30:00+00:00",
     "last_observed_at": "2026-07-09T12:00:00+00:00",
     "created_at": "2026-07-01T12:00:00+00:00"
   },
@@ -19,6 +21,8 @@
           "id": "fact_1",
           "statement": "PKM Brain has an entity detail view.",
           "truth_confidence": 0.9,
+          "retrieval_count": 14,
+          "last_retrieved_at": "2026-07-09T18:30:00+00:00",
           "page_hint": "projects/pkm-brain.md",
           "section_hint": "Entities"
         }

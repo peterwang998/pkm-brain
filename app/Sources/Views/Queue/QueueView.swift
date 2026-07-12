@@ -7,13 +7,17 @@ struct QueueView: View {
     @State private var page: QueuePage?
     @State private var selectedID: String?
     @State private var filter = "all"
+    @State private var reviewState = "actionable"
+    @State private var sortMode = "retrieval"
     @State private var selectedIDs: Set<String> = []
+    @State private var alternativeSelections: [String: Set<String>] = [:]
     @State private var tally = QueueSessionTally()
     @State private var undoToast: QueueUndoToast?
     @State private var routePageHint = ""
     @State private var isLoading = false
     @State private var isLoadingMore = false
     @State private var errorMessage: String?
+    @State private var activeLoadID: UUID?
     private let queuePageLimit = 50
 
     private var items: [QueueItem] {
@@ -38,11 +42,17 @@ struct QueueView: View {
         VStack(spacing: 0) {
             header
             Divider()
-            HStack(spacing: 0) {
-                listPane
-                    .frame(width: 340)
-                Divider()
-                detailPane
+            ZStack {
+                HStack(spacing: 0) {
+                    listPane
+                        .frame(width: 340)
+                    Divider()
+                    detailPane
+                }
+                .disabled(isLoading)
+                if isLoading {
+                    queueLoadingState
+                }
             }
         }
         .background(
@@ -51,12 +61,23 @@ struct QueueView: View {
             }
             .frame(width: 0, height: 0)
         )
-        .task {
+        .task(id: appState.daemon.handshake?.pid) {
+            if let requested = appState.requestedQueueState {
+                reviewState = requested
+                appState.requestedQueueState = nil
+            }
             await loadQueue()
+        }
+        .onChange(of: appState.requestedQueueState) { _, requested in
+            guard let requested else {
+                return
+            }
+            reviewState = requested
+            appState.requestedQueueState = nil
         }
         .toolbar {
             Button {
-                Task { await loadQueue() }
+                startQueueLoad()
             } label: {
                 Label("Refresh", systemImage: "arrow.clockwise")
             }
@@ -72,6 +93,38 @@ struct QueueView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
+            Picker("Queue State", selection: $reviewState) {
+                Text("Review \(page?.queue_summary?.actionable_total ?? 0)")
+                    .tag("actionable")
+                Text("Needs Repair \(page?.queue_summary?.blocked_total ?? 0)")
+                    .tag("blocked")
+                Text("Deferred \(page?.queue_summary?.deferred_total ?? 0)")
+                    .tag("deferred")
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 360)
+            .onChange(of: reviewState) { _, _ in
+                filter = "all"
+                selectedID = nil
+                selectedIDs.removeAll()
+                startQueueLoad()
+            }
+            Text("Sort")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            Picker("Sort", selection: $sortMode) {
+                Label("Most Retrieved", systemImage: "chart.bar.xaxis").tag("retrieval")
+                Label("Review Priority", systemImage: "exclamationmark.triangle").tag("priority")
+                Label("Newest", systemImage: "clock").tag("newest")
+            }
+            .pickerStyle(.menu)
+            .labelsHidden()
+            .frame(width: 155)
+            .onChange(of: sortMode) { _, _ in
+                selectedID = nil
+                selectedIDs.removeAll()
+                startQueueLoad()
+            }
             if isLoading {
                 ProgressView()
                     .controlSize(.small)
@@ -151,7 +204,7 @@ struct QueueView: View {
                         filter = entry.kind
                         selectedID = nil
                         selectedIDs.removeAll()
-                        Task { await loadQueue() }
+                        startQueueLoad()
                     } label: {
                         Text("\(entry.label) \(entry.count)")
                             .font(.callout)
@@ -204,9 +257,10 @@ struct QueueView: View {
             if let item = selectedItem {
                 QueueDetail(
                     item: item,
-                    position: "\(selectedIndex + 1) of \(items.count)",
+                    position: "\(selectedIndex + 1) of \(items.count) loaded - \(page?.total ?? items.count) total",
                     tally: tally,
                     routePageHint: $routePageHint,
+                    selectedAlternativeIDs: alternativeSelectionBinding(for: item.id),
                     onDecision: { decision, payload in
                         Task { await decide(decision, payload: payload) }
                     }
@@ -235,7 +289,7 @@ struct QueueView: View {
     private var filterEntries: [(kind: String, label: String, count: Int)] {
         let counts = page?.counts
         let byKind = counts?.by_kind ?? [:]
-        let preferred = ["conflicts", "unrouted", "topology", "memories", "audit", "anomalies"]
+        let preferred = ["conflicts", "unrouted", "policy", "topology", "memories", "audit", "anomalies"]
         var entries: [(String, String, Int)] = [("all", "All", counts?.total ?? 0)]
         for kind in preferred where byKind[kind] != nil {
             entries.append((kind, label(for: kind), byKind[kind] ?? 0))
@@ -248,35 +302,118 @@ struct QueueView: View {
 
     private var progressText: String {
         let total = page?.total ?? 0
-        guard !items.isEmpty else {
-            return "\(total) items - resolved \(tally.resolved) - skipped \(tally.skipped)"
+        let actionable = page?.queue_summary?.actionable_total ?? total
+        let blocked = page?.queue_summary?.blocked_total ?? 0
+        let deferred = page?.queue_summary?.deferred_total ?? 0
+        let workload: String
+        switch reviewState {
+        case "blocked":
+            workload = "\(total) needs repair - \(actionable) actionable"
+        case "deferred":
+            workload = "\(total) deferred - \(actionable) actionable"
+        default:
+            workload = "\(total) to review - \(blocked) needs repair - \(deferred) deferred"
         }
-        return "\(selectedIndex + 1) of \(items.count) shown - \(total) total - resolved \(tally.resolved) - skipped \(tally.skipped)"
+        guard !items.isEmpty else {
+            return "\(workload) - resolved \(tally.resolved) - skipped \(tally.skipped)"
+        }
+        return "\(selectedIndex + 1) of \(items.count) shown - \(workload) - resolved \(tally.resolved) - skipped \(tally.skipped)"
+    }
+
+    private var queueLoadingState: some View {
+        VStack(spacing: 10) {
+            ProgressView()
+                .controlSize(.regular)
+            Text("Loading \(label(for: filter))...")
+                .font(.callout.weight(.medium))
+            Text("Updating the review list and evidence.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Loading \(label(for: filter)) review items")
     }
 
     private func label(for kind: String) -> String {
-        kind.split(separator: "_").map { word in
+        let labels = [
+            "conflicts": "Conflicts",
+            "unrouted": "Inbox",
+            "topology": "Topology",
+            "memories": "Memories",
+            "audit": "Audit",
+            "anomalies": "Anomalies",
+            "policy_escalation": "Policy",
+            "policy": "Policy",
+        ]
+        if let label = labels[kind] {
+            return label
+        }
+        return kind.split(separator: "_").map { word in
             word.prefix(1).uppercased() + word.dropFirst()
         }.joined(separator: " ")
     }
 
+    private func startQueueLoad() {
+        let request = beginQueueLoad()
+        Task { await performQueueLoad(request) }
+    }
+
     private func loadQueue() async {
+        await performQueueLoad(beginQueueLoad())
+    }
+
+    private func beginQueueLoad() -> QueueLoadRequest {
+        let request = QueueLoadRequest(
+            id: UUID(),
+            kind: filter,
+            state: reviewState,
+            sort: sortMode
+        )
+        activeLoadID = request.id
         isLoading = true
-        defer { isLoading = false }
-        guard let client = await waitForQueueClient() else {
-            errorMessage = "Queue is waiting for the daemon API. Use Refresh after the daemon is running."
+        errorMessage = nil
+        return request
+    }
+
+    private func performQueueLoad(_ request: QueueLoadRequest) async {
+        defer {
+            if activeLoadID == request.id {
+                isLoading = false
+            }
+        }
+        guard let client = await appState.waitForAPIClient() else {
+            if !Task.isCancelled, activeLoadID == request.id {
+                errorMessage = "Queue is waiting for the daemon API. Use Refresh after the daemon is running."
+            }
             return
         }
         do {
-            let latest = try await client.queue(kind: filter, limit: queuePageLimit)
+            let latest = try await client.queue(
+                kind: request.kind,
+                state: request.state,
+                sort: request.sort,
+                limit: queuePageLimit
+            )
+            guard activeLoadID == request.id, !Task.isCancelled else {
+                return
+            }
             page = latest
+            appState.acceptQueueSummary(latest.queue_summary)
             errorMessage = nil
             if selectedID == nil || !latest.items.contains(where: { $0.id == selectedID }) {
                 selectedID = latest.items.first?.id
             }
             selectedIDs = selectedIDs.intersection(Set(latest.items.map(\.id)))
+            let currentIDs = Set(latest.items.map(\.id))
+            alternativeSelections = alternativeSelections.filter {
+                currentIDs.contains($0.key)
+            }
         } catch {
-            errorMessage = String(describing: error)
+            if activeLoadID == request.id, !Task.isCancelled {
+                errorMessage = error.localizedDescription
+            }
         }
     }
 
@@ -284,37 +421,39 @@ struct QueueView: View {
         guard let current = page, let cursor = current.next_cursor else {
             return
         }
-        guard let client = await waitForQueueClient() else {
-            errorMessage = "Queue is waiting for the daemon API. Use Refresh after the daemon is running."
+        guard let client = await appState.waitForAPIClient() else {
+            if !Task.isCancelled {
+                errorMessage = "Queue is waiting for the daemon API. Use Refresh after the daemon is running."
+            }
             return
         }
         isLoadingMore = true
         defer { isLoadingMore = false }
         do {
-            let next = try await client.queue(kind: filter, limit: queuePageLimit, cursor: cursor)
+            let next = try await client.queue(
+                kind: filter,
+                state: reviewState,
+                sort: sortMode,
+                limit: queuePageLimit,
+                cursor: cursor
+            )
             let merged = current.items + next.items
             page = QueuePage(
                 kind: next.kind,
+                state: next.state,
+                sort: next.sort,
+                queue_summary: next.queue_summary,
                 counts: next.counts,
                 total: next.total,
                 cursor: current.cursor,
                 next_cursor: next.next_cursor,
                 items: merged
             )
+            appState.acceptQueueSummary(next.queue_summary)
             errorMessage = nil
         } catch {
-            errorMessage = String(describing: error)
+            errorMessage = error.localizedDescription
         }
-    }
-
-    private func waitForQueueClient() async -> BrainAPIClient? {
-        for _ in 0..<25 {
-            if let client = appState.daemon.apiClient {
-                return client
-            }
-            try? await Task.sleep(nanoseconds: 200_000_000)
-        }
-        return nil
     }
 
     private func decide(_ decision: String, payload: [String: JSONValue] = [:]) async {
@@ -324,6 +463,10 @@ struct QueueView: View {
         if decision == "skip" {
             tally.skipped += 1
             advanceSelection(from: selectedIndex + 1, in: items)
+            return
+        }
+        guard item.isApprovable else {
+            errorMessage = item.blocking_reason ?? "This review card is incomplete."
             return
         }
         guard let client = appState.daemon.apiClient else {
@@ -337,6 +480,7 @@ struct QueueView: View {
         removeItem(item.id, nextIndex: previousIndex)
         do {
             let result = try await client.decideQueueItem(item.id, decision: decision, payload: payload)
+            appState.acceptQueueSummary(result.queue_summary)
             tally.resolved += 1
             if let handle = result.undo_handle, !handle.isNull {
                 undoToast = QueueUndoToast(
@@ -349,7 +493,7 @@ struct QueueView: View {
         } catch {
             page = previousPage
             selectedID = previousSelection
-            errorMessage = String(describing: error)
+            errorMessage = error.localizedDescription
         }
     }
 
@@ -363,13 +507,14 @@ struct QueueView: View {
             return
         }
         do {
-            _ = try await client.undoQueueDecision(toast.handle)
+            let result = try await client.undoQueueDecision(toast.handle)
+            appState.acceptQueueSummary(result.queue_summary)
             undoToast = nil
             tally.resolved = max(0, tally.resolved - 1)
             await loadQueue()
             await appState.refreshDigest()
         } catch {
-            errorMessage = String(describing: error)
+            errorMessage = error.localizedDescription
         }
     }
 
@@ -377,6 +522,7 @@ struct QueueView: View {
         let ids = selectedIDs
         for id in ids {
             guard let item = page?.items.first(where: { $0.id == id }),
+                  item.isApprovable,
                   let decision = approveDecision(for: item)
             else {
                 continue
@@ -391,6 +537,7 @@ struct QueueView: View {
         let ids = selectedIDs
         for id in ids {
             guard let item = page?.items.first(where: { $0.id == id }),
+                  item.isApprovable,
                   let decision = rejectDecision(for: item)
             else {
                 continue
@@ -402,6 +549,9 @@ struct QueueView: View {
     }
 
     private func approveDecision(for item: QueueItem) -> String? {
+        guard item.isApprovable, !item.isAlternativeComparison else {
+            return nil
+        }
         switch item.group {
         case "conflicts":
             return "candidate_wins"
@@ -415,7 +565,10 @@ struct QueueView: View {
     }
 
     private func rejectDecision(for item: QueueItem) -> String? {
-        item.group == "audit" ? "revert" : "reject"
+        guard item.isApprovable, !item.isAlternativeComparison else {
+            return nil
+        }
+        return item.group == "audit" ? "revert" : "reject"
     }
 
     private func removeItem(_ id: String, nextIndex: Int) {
@@ -426,6 +579,9 @@ struct QueueView: View {
         updated.removeAll { $0.id == id }
         page = QueuePage(
             kind: current.kind,
+            state: current.state,
+            sort: current.sort,
+            queue_summary: current.queue_summary,
             counts: current.counts,
             total: max(0, current.total - 1),
             cursor: current.cursor,
@@ -433,7 +589,36 @@ struct QueueView: View {
             items: updated
         )
         selectedIDs.remove(id)
+        alternativeSelections.removeValue(forKey: id)
         advanceSelection(from: nextIndex, in: updated)
+    }
+
+    private func alternativeSelectionBinding(for itemID: String) -> Binding<Set<String>> {
+        Binding(
+            get: { alternativeSelections[itemID] ?? [] },
+            set: { alternativeSelections[itemID] = $0 }
+        )
+    }
+
+    private func submitAlternativeSelection() {
+        guard let item = selectedItem, item.isAlternativeComparison else {
+            return
+        }
+        let selected = alternativeSelections[item.id] ?? []
+        let orderedIDs = (item.alternatives ?? []).compactMap(\.displayID).filter {
+            selected.contains($0)
+        }
+        guard !orderedIDs.isEmpty else {
+            return
+        }
+        Task {
+            await decide(
+                "select_facts",
+                payload: [
+                    "selected_fact_ids": .array(orderedIDs.map(JSONValue.string))
+                ]
+            )
+        }
     }
 
     private func advanceSelection(from index: Int, in currentItems: [QueueItem]) {
@@ -445,6 +630,12 @@ struct QueueView: View {
     }
 
     private func toggleSelected(_ id: String) {
+        guard let item = page?.items.first(where: { $0.id == id }),
+              item.isApprovable,
+              !item.isAlternativeComparison
+        else {
+            return
+        }
         if selectedIDs.contains(id) {
             selectedIDs.remove(id)
         } else {
@@ -453,6 +644,9 @@ struct QueueView: View {
     }
 
     private func handleKey(_ event: NSEvent) -> Bool {
+        guard !isLoading else {
+            return true
+        }
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         if flags.contains(.command) || flags.contains(.control) || flags.contains(.option) {
             return false
@@ -474,6 +668,8 @@ struct QueueView: View {
             Task { await batchApproveSelected() }
         case ("u", _, _) where selectedItem?.group != "conflicts":
             Task { await undoLast() }
+        case (_, 36, _) where selectedItem?.isAlternativeComparison == true:
+            submitAlternativeSelection()
         case ("1", _, _), ("2", _, _), ("3", _, _), ("4", _, _), ("5", _, _), ("6", _, _), ("7", _, _), ("8", _, _), ("9", _, _):
             handleNumberKey(key)
         default:
@@ -492,6 +688,32 @@ struct QueueView: View {
 
     private func handleNumberKey(_ key: String) {
         guard let item = selectedItem else {
+            return
+        }
+        if item.isAlternativeComparison {
+            let alternatives = item.alternatives ?? []
+            if let index = Int(key),
+               index <= min(alternatives.count, 7),
+               let factID = alternatives[index - 1].displayID
+            {
+                var selected = alternativeSelections[item.id] ?? []
+                if selected.contains(factID) {
+                    selected.remove(factID)
+                } else {
+                    selected.insert(factID)
+                }
+                alternativeSelections[item.id] = selected
+                return
+            }
+            let selectAllKey = String(min(alternatives.count, 7) + 1)
+            let unsureKey = String(min(alternatives.count, 7) + 2)
+            if key == selectAllKey {
+                alternativeSelections[item.id] = Set(
+                    alternatives.compactMap(\.displayID)
+                )
+            } else if key == unsureKey {
+                Task { await decide("unsure") }
+            }
             return
         }
         if item.group == "unrouted" {
@@ -525,8 +747,20 @@ struct QueueView: View {
         guard let item else {
             return nil
         }
+        guard item.isApprovable else {
+            return nil
+        }
+        if key == "1", item.topology?.split_preview?.approvable == false {
+            return nil
+        }
+        if item.kind == "document_extraction_anomaly" {
+            return ["1": "acknowledge", "2": "dismiss", "3": "skip"][key]
+        }
         switch item.group {
         case "conflicts":
+            guard !item.isAlternativeComparison else {
+                return nil
+            }
             return [
                 "1": "keep_existing",
                 "2": "candidate_wins",
@@ -556,6 +790,8 @@ private struct QueueDetail: View {
     let position: String
     let tally: QueueSessionTally
     @Binding var routePageHint: String
+    @Binding var selectedAlternativeIDs: Set<String>
+    @FocusState private var routeFieldFocused: Bool
     let onDecision: (String, [String: JSONValue]) -> Void
 
     var body: some View {
@@ -575,10 +811,21 @@ private struct QueueDetail: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                HStack(spacing: 8) {
+                    RetrievalBadge(
+                        count: item.popularity?.retrieval_count,
+                        lastRetrievedAt: item.popularity?.last_retrieved_at
+                    )
+                    ConfidenceBadge(value: item.primaryConfidence)
+                }
                 if let orientation = item.orientation {
                     OrientationPanel(orientation: orientation)
                 }
+                if !item.isApprovable {
+                    BlockedReviewNotice(reason: item.blocking_reason)
+                }
                 card
+                    .disabled(!item.isApprovable)
             }
             .padding(22)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -586,7 +833,14 @@ private struct QueueDetail: View {
     }
 
     @ViewBuilder private var card: some View {
-        switch item.group {
+        if item.kind == "policy_escalation" {
+            policyCard
+        } else if item.kind == "unrouted_inbox_batch" {
+            inboxBatchCard
+        } else if item.kind == "document_extraction_anomaly" {
+            anomalyCard
+        } else {
+            switch item.group {
         case "conflicts":
             conflictCard
         case "unrouted":
@@ -599,47 +853,242 @@ private struct QueueDetail: View {
             actionCard
         default:
             genericCard
+            }
         }
     }
 
-    private var conflictCard: some View {
-        let counterparts = item.counterparts ?? []
-        return VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .top, spacing: 12) {
+    private var policyCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            MetadataRow(values: [humanized(actionType), item.risk_tier, item.orientation?.relation])
+            EvidenceQuote(text: item.summary)
+            if let topology = item.topology {
+                TopologyTargetPanel(topology: topology)
+                if let preview = topology.split_preview {
+                    SplitPreviewPanel(preview: preview)
+                }
+            }
+            if item.candidate != nil {
                 FactPanel(title: "Candidate", fact: item.candidate)
-                if counterparts.count <= 1 {
-                    FactPanel(title: "Existing", fact: counterparts.first)
-                } else {
-                    VStack(alignment: .leading, spacing: 12) {
-                        ForEach(Array(counterparts.enumerated()), id: \.offset) { index, fact in
-                            FactPanel(title: "Existing \(index + 1)", fact: fact)
-                        }
-                    }
+            }
+            if let counterparts = item.counterparts, !counterparts.isEmpty {
+                Text("Existing Context")
+                    .font(.headline)
+                ForEach(Array(counterparts.enumerated()), id: \.offset) { index, fact in
+                    FactPanel(title: "Existing \(index + 1)", fact: fact)
                 }
             }
             DecisionBar {
-                DecisionButton("Keep Existing", systemImage: "checkmark.shield", key: "1") {
-                    onDecision("keep_existing", [:])
+                DecisionButton("Approve", systemImage: "checkmark.circle", key: "1") {
+                    onDecision("approve", [:])
                 }
-                DecisionButton("Candidate Wins", systemImage: "checkmark.circle", key: "2") {
-                    onDecision("candidate_wins", [:])
+                .disabled(item.topology?.split_preview?.approvable == false)
+                DecisionButton("Reject", systemImage: "xmark.circle", key: "2") {
+                    onDecision("reject", [:])
                 }
-                DecisionButton("Both True", systemImage: "square.split.2x1", key: "3") {
-                    onDecision("both_true", [:])
+                DecisionButton("Skip", systemImage: "arrowshape.turn.up.right", key: "3") {
+                    onDecision("skip", [:])
                 }
-                DecisionButton("Supports Existing", systemImage: "link", key: "4") {
-                    onDecision("supports_existing", [:])
+            }
+        }
+    }
+
+    private var inboxBatchCard: some View {
+        let context = item.question?["context"]?.objectValue
+        let count = context?["source_question_ids"]?.arrayValue?.count ?? 0
+        return VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text("Inbox Batch")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text(item.page_hint ?? context?["page_hint"]?.stringValue ?? "Inbox")
+                    .font(.headline)
+                MetadataRow(values: ["\(count) facts", context?["section"]?.stringValue ?? "Inbox"])
+            }
+            Text(item.summary ?? "")
+                .textSelection(.enabled)
+            DecisionBar {
+                DecisionButton("Mark Reviewed", systemImage: "checkmark.circle", key: "1") {
+                    onDecision("reviewed", [:])
                 }
+                DecisionButton("Dismiss", systemImage: "xmark.circle", key: "2") {
+                    onDecision("dismiss", [:])
+                }
+                DecisionButton("Later", systemImage: "arrowshape.turn.up.right", key: "3") {
+                    onDecision("skip", [:])
+                }
+            }
+        }
+    }
+
+    private var anomalyCard: some View {
+        let anomaly = item.anomaly
+        let rate = anomaly?.block_rate.map {
+            "\(Int(($0 * 100).rounded()))% blocked"
+        }
+        return VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text("Source Document")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text(anomaly?.document_title ?? item.displayTitle)
+                    .font(.headline)
+                    .textSelection(.enabled)
+            }
+            MetadataRow(values: [
+                rate,
+                anomaly.map { "\($0.blocked_count) blocked" },
+                anomaly.map { "\($0.reviewed_count) reviewed" },
+            ])
+            EvidenceQuote(text: item.summary)
+            DecisionBar {
                 DecisionButton(
-                    "Candidate Current",
-                    systemImage: "clock",
-                    key: "5",
-                    help: "Candidate is the current state; existing fact becomes historical."
+                    "Confirm Quality Issue",
+                    systemImage: "checkmark.circle",
+                    key: "1"
                 ) {
-                    onDecision("temporal_update", [:])
+                    onDecision("acknowledge", [:])
                 }
-                DecisionButton("Unsure", systemImage: "questionmark.circle", key: "6") {
-                    onDecision("unsure", [:])
+                DecisionButton("False Positive", systemImage: "xmark.circle", key: "2") {
+                    onDecision("dismiss", [:])
+                }
+                DecisionButton("Later", systemImage: "arrowshape.turn.up.right", key: "3") {
+                    onDecision("skip", [:])
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private var conflictCard: some View {
+        if item.isAlternativeComparison {
+            let alternatives = item.alternatives ?? []
+            let shortcutCount = min(alternatives.count, 7)
+            let selectAllKey = String(shortcutCount + 1)
+            let unsureKey = String(shortcutCount + 2)
+            VStack(alignment: .leading, spacing: 14) {
+                ForEach(Array(alternatives.enumerated()), id: \.offset) { index, fact in
+                    VStack(alignment: .leading, spacing: 8) {
+                        FactPanel(title: "Historical Fact \(index + 1)", fact: fact)
+                        Button {
+                            guard let factID = fact.displayID else {
+                                return
+                            }
+                            if selectedAlternativeIDs.contains(factID) {
+                                selectedAlternativeIDs.remove(factID)
+                            } else {
+                                selectedAlternativeIDs.insert(factID)
+                            }
+                        } label: {
+                            Label {
+                                HStack(spacing: 7) {
+                                    Text("Keep This Fact")
+                                    if index < shortcutCount {
+                                        ShortcutBadge(key: String(index + 1))
+                                    }
+                                }
+                            } icon: {
+                                Image(
+                                    systemName: selectedAlternativeIDs.contains(
+                                        fact.displayID ?? ""
+                                    )
+                                        ? "checkmark.square.fill"
+                                        : "square"
+                                )
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(
+                            selectedAlternativeIDs.contains(fact.displayID ?? "")
+                                ? .accentColor
+                                : .secondary
+                        )
+                        .queueKeyboardShortcut(
+                            index < shortcutCount ? String(index + 1) : ""
+                        )
+                        .disabled(fact.displayID == nil)
+                    }
+                }
+                DecisionBar {
+                    DecisionButton(
+                        "Keep Selected",
+                        systemImage: "checkmark.circle",
+                        key: "enter"
+                    ) {
+                        let orderedIDs = alternatives.compactMap(\.displayID).filter {
+                            selectedAlternativeIDs.contains($0)
+                        }
+                        onDecision(
+                            "select_facts",
+                            [
+                                "selected_fact_ids": .array(
+                                    orderedIDs.map(JSONValue.string)
+                                )
+                            ]
+                        )
+                    }
+                    .disabled(selectedAlternativeIDs.isEmpty)
+                    DecisionButton(
+                        "Select All",
+                        systemImage: "checkmark.square",
+                        key: selectAllKey
+                    ) {
+                        selectedAlternativeIDs = Set(
+                            alternatives.compactMap(\.displayID)
+                        )
+                    }
+                    Button {
+                        selectedAlternativeIDs.removeAll()
+                    } label: {
+                        Label("Clear", systemImage: "xmark.square")
+                    }
+                    .buttonStyle(.bordered)
+                    DecisionButton(
+                        "Unsure",
+                        systemImage: "questionmark.circle",
+                        key: unsureKey
+                    ) {
+                        onDecision("unsure", [:])
+                    }
+                }
+            }
+        } else {
+            let counterparts = item.counterparts ?? []
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(alignment: .top, spacing: 12) {
+                    FactPanel(title: "Candidate", fact: item.candidate)
+                    if counterparts.count <= 1 {
+                        FactPanel(title: "Existing", fact: counterparts.first)
+                    } else {
+                        VStack(alignment: .leading, spacing: 12) {
+                            ForEach(Array(counterparts.enumerated()), id: \.offset) { index, fact in
+                                FactPanel(title: "Existing \(index + 1)", fact: fact)
+                            }
+                        }
+                    }
+                }
+                DecisionBar {
+                    DecisionButton("Keep Existing", systemImage: "checkmark.shield", key: "1") {
+                        onDecision("keep_existing", [:])
+                    }
+                    DecisionButton("Candidate Wins", systemImage: "checkmark.circle", key: "2") {
+                        onDecision("candidate_wins", [:])
+                    }
+                    DecisionButton("Both True", systemImage: "square.split.2x1", key: "3") {
+                        onDecision("both_true", [:])
+                    }
+                    DecisionButton("Supports Existing", systemImage: "link", key: "4") {
+                        onDecision("supports_existing", [:])
+                    }
+                    DecisionButton(
+                        "Candidate Current",
+                        systemImage: "clock",
+                        key: "5",
+                        help: "Candidate is the current state; existing fact becomes historical."
+                    ) {
+                        onDecision("temporal_update", [:])
+                    }
+                    DecisionButton("Unsure", systemImage: "questionmark.circle", key: "6") {
+                        onDecision("unsure", [:])
+                    }
                 }
             }
         }
@@ -657,28 +1106,39 @@ private struct QueueDetail: View {
                     .font(.headline)
                 ForEach(Array(routes.enumerated()), id: \.element.id) { index, route in
                     Button {
+                        routeFieldFocused = false
                         onDecision("route", ["page_hint": .string(route.page_hint)])
                     } label: {
                         HStack {
                             ShortcutBadge(key: String(index + 1))
-                            Text(route.title ?? route.page_hint)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(route.title ?? route.page_hint)
+                                if let count = route.document_coherence_count, count > 0 {
+                                    Text("\(count) routed facts from this source")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
                             Spacer()
                             Text(route.page_hint)
                                 .foregroundStyle(.secondary)
                         }
                     }
                     .buttonStyle(.bordered)
+                    .queueKeyboardShortcut(
+                        routeFieldFocused ? "" : String(index + 1)
+                    )
+                    .help("\(index + 1) - Route to \(route.title ?? route.page_hint)")
                 }
                 HStack(spacing: 8) {
                     TextField("concepts/topic.md", text: $routePageHint)
                         .textFieldStyle(.roundedBorder)
-                    Button {
-                        let pageHint = routePageHint.trimmingCharacters(in: .whitespacesAndNewlines)
-                        guard !pageHint.isEmpty else {
-                            return
+                        .focused($routeFieldFocused)
+                        .onSubmit {
+                            submitManualRoute()
                         }
-                        onDecision("route", ["page_hint": .string(pageHint)])
-                        routePageHint = ""
+                    Button {
+                        submitManualRoute()
                     } label: {
                         Label {
                             HStack(spacing: 7) {
@@ -689,17 +1149,45 @@ private struct QueueDetail: View {
                             Image(systemName: "arrow.turn.down.right")
                         }
                     }
+                    .queueKeyboardShortcut(
+                        routeFieldFocused ? "" : manualRouteKey
+                    )
+                    .disabled(manualRoutePageHint.isEmpty)
                 }
             }
             DecisionBar {
-                DecisionButton("Reject", systemImage: "xmark.circle", key: rejectKey) {
+                DecisionButton(
+                    "Reject",
+                    systemImage: "xmark.circle",
+                    key: rejectKey,
+                    shortcutEnabled: !routeFieldFocused
+                ) {
                     onDecision("reject", [:])
                 }
-                DecisionButton("Skip", systemImage: "arrowshape.turn.up.right", key: skipKey) {
+                DecisionButton(
+                    "Skip",
+                    systemImage: "arrowshape.turn.up.right",
+                    key: skipKey,
+                    shortcutEnabled: !routeFieldFocused
+                ) {
                     onDecision("skip", [:])
                 }
             }
         }
+    }
+
+    private var manualRoutePageHint: String {
+        routePageHint.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func submitManualRoute() {
+        guard !manualRoutePageHint.isEmpty else {
+            return
+        }
+        let pageHint = manualRoutePageHint
+        routeFieldFocused = false
+        routePageHint = ""
+        onDecision("route", ["page_hint": .string(pageHint)])
     }
 
     private var memoryCard: some View {
@@ -710,9 +1198,9 @@ private struct QueueDetail: View {
             MetadataRow(values: [
                 item.memory?.memory_type,
                 item.memory?.scope,
-                confidenceText(item.memory?.confidence),
                 item.memory?.status,
             ])
+            ConfidenceBadge(value: item.memory?.confidence)
             SourceDocumentsView(documents: item.memory?.source_documents ?? [])
             DecisionBar {
                 DecisionButton("Approve", systemImage: "checkmark.circle", key: "1") {
@@ -732,23 +1220,84 @@ private struct QueueDetail: View {
     }
 
     private var auditCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text(actionType)
+        let isFact = item.audit?.action_type == "fact_upsert"
+        let rejectsCurrentFact = item.audit?.revert_mode == "reject_current_fact"
+        return VStack(alignment: .leading, spacing: 14) {
+            Text("Auditor Finding")
                 .font(.headline)
-            MetadataRow(values: [item.status, item.risk_tier, actionString("audit_status")])
-            EvidenceQuote(text: item.summary)
+            MetadataRow(values: [
+                item.audit?.status,
+                item.audit?.model,
+                item.audit?.audited_at.map { shortDate($0) },
+                item.audit?.action_status,
+            ])
+            EvidenceQuote(text: item.audit?.rationale ?? item.summary)
+            if let candidate = item.candidate {
+                FactPanel(title: "Applied Fact", fact: candidate)
+            }
+            if let topology = item.topology {
+                Text("Applied Change")
+                    .font(.headline)
+                TopologyTargetPanel(topology: topology)
+                MetadataRow(values: [
+                    item.audit?.affected_fact_count.map { "\($0) affected \($0 == 1 ? "fact" : "facts")" },
+                    item.audit?.affected_page_count.map { "\($0) affected \($0 == 1 ? "page" : "pages")" },
+                    item.audit?.affected_contract_count.map { "\($0) affected \($0 == 1 ? "contract" : "contracts")" },
+                ])
+                if item.candidate == nil,
+                   let facts = item.audit?.affected_facts,
+                   !facts.isEmpty {
+                    Text("Representative Affected Facts")
+                        .font(.subheadline.weight(.semibold))
+                    ForEach(Array(facts.enumerated()), id: \.offset) { index, fact in
+                        FactPanel(title: "Affected Fact \(index + 1)", fact: fact)
+                    }
+                }
+            }
+            if item.audit?.revertible == false {
+                Label(auditRevertUnavailableText, systemImage: "exclamationmark.triangle")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+            } else if rejectsCurrentFact {
+                Label(
+                    "Related state changed after apply. Reject will target the current active fact and remain undoable.",
+                    systemImage: "info.circle"
+                )
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            }
             DecisionBar {
-                DecisionButton("Revert", systemImage: "arrow.uturn.backward.circle", key: "1") {
+                DecisionButton(
+                    rejectsCurrentFact
+                        ? "Reject Applied Fact"
+                        : (isFact ? "Revert Applied Fact" : "Revert Applied Action"),
+                    systemImage: rejectsCurrentFact
+                        ? "xmark.circle"
+                        : "arrow.uturn.backward.circle",
+                    key: "1"
+                ) {
                     onDecision("revert", [:])
                 }
-                DecisionButton("Mark OK", systemImage: "checkmark.seal", key: "2") {
+                .disabled(item.audit?.revertible == false)
+                DecisionButton(
+                    isFact ? "Keep Applied Fact" : "Keep Applied Action",
+                    systemImage: "checkmark.seal",
+                    key: "2"
+                ) {
                     onDecision("mark_ok", [:])
                 }
-                DecisionButton("Skip", systemImage: "arrowshape.turn.up.right", key: "3") {
+                DecisionButton("Later", systemImage: "arrowshape.turn.up.right", key: "3") {
                     onDecision("skip", [:])
                 }
             }
         }
+    }
+
+    private var auditRevertUnavailableText: String {
+        if item.audit?.reviewability_reason == "audited_fact_still_active_after_related_drift" {
+            return "Related state changed after apply. The audited fact is still active, but direct revert is no longer safe."
+        }
+        return "This action has no safe direct revert."
     }
 
     private var actionCard: some View {
@@ -757,6 +1306,9 @@ private struct QueueDetail: View {
                 .font(.headline)
             if let topology = item.topology {
                 TopologyTargetPanel(topology: topology)
+                if let preview = topology.split_preview {
+                    SplitPreviewPanel(preview: preview)
+                }
             }
             MetadataRow(values: [item.status, item.risk_tier, actionString("proposed_by")])
             EvidenceQuote(text: item.summary)
@@ -764,6 +1316,7 @@ private struct QueueDetail: View {
                 DecisionButton("Approve", systemImage: "checkmark.circle", key: "1") {
                     onDecision("approve", [:])
                 }
+                .disabled(item.topology?.split_preview?.approvable == false)
                 DecisionButton("Reject", systemImage: "xmark.circle", key: "2") {
                     onDecision("reject", [:])
                 }
@@ -799,6 +1352,12 @@ private struct QueueDetail: View {
     private func actionString(_ key: String) -> String? {
         item.action?[key]?.stringValue
     }
+
+    private func humanized(_ value: String) -> String {
+        value.split(separator: "_").map { word in
+            word.prefix(1).uppercased() + word.dropFirst()
+        }.joined(separator: " ")
+    }
 }
 
 private struct TopologyTargetPanel: View {
@@ -825,16 +1384,88 @@ private struct TopologyTargetPanel: View {
         if !labels.isEmpty {
             return labels.joined(separator: ", ")
         }
+        if let page = topology.page_hints?.first, !page.isEmpty {
+            return page
+        }
         return "Topology target"
     }
 
     private var metadata: [String?] {
         let ids = (topology.entity_ids ?? []).filter { !$0.isEmpty }
         let pages = (topology.page_hints ?? []).filter { !$0.isEmpty }
+        let statuses = ids.compactMap { entityID -> String? in
+            guard let status = topology.entity_statuses?[entityID], !status.isEmpty else {
+                return nil
+            }
+            return "\(shortID(entityID)) \(status)"
+        }
+        let pageStatuses = pages.compactMap { page -> String? in
+            guard let status = topology.page_statuses?[page], !status.isEmpty else {
+                return nil
+            }
+            return "\(page) \(status)"
+        }
         return [
+            topology.merge_destination_label.map { "destination \($0)" },
+            topology.merge_source_labels.map { "sources \($0.joined(separator: ", "))" },
+            statuses.isEmpty ? nil : statuses.joined(separator: ", "),
+            pageStatuses.isEmpty ? nil : pageStatuses.joined(separator: ", "),
             ids.isEmpty ? nil : "ids \(ids.joined(separator: ", "))",
             pages.isEmpty ? nil : "pages \(pages.joined(separator: ", "))",
         ]
+    }
+}
+
+private struct SplitPreviewPanel: View {
+    let preview: QueueSplitPreview
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Page Split Preview")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(preview.source_page_hint)
+                        .font(.headline)
+                        .textSelection(.enabled)
+                }
+                Spacer()
+                MetadataRow(values: [
+                    "\(preview.movable_fact_count) facts move",
+                    "\(preview.resulting_page_count) resulting pages",
+                ])
+            }
+            if preview.children.isEmpty {
+                Text("No movable section facts remain. Approval is disabled.")
+                    .foregroundStyle(.red)
+            } else {
+                ForEach(preview.children) { child in
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack(alignment: .firstTextBaseline) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(child.section)
+                                    .font(.callout.weight(.semibold))
+                                Text(child.page_hint)
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Text("\(child.fact_count) facts")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        ForEach(Array(child.representative_facts.enumerated()), id: \.offset) { _, fact in
+                            Text(fact.statement ?? "")
+                                .font(.callout)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    .padding(.vertical, 7)
+                    Divider()
+                }
+            }
+        }
     }
 }
 
@@ -845,12 +1476,19 @@ private struct QueueRow: View {
     let onCheck: () -> Void
 
     var body: some View {
+        let batchSelectable = item.isApprovable && !item.isAlternativeComparison
         HStack(alignment: .top, spacing: 8) {
             Button(action: onCheck) {
                 Image(systemName: isChecked ? "checkmark.square.fill" : "square")
                     .frame(width: 18, height: 18)
             }
             .buttonStyle(.plain)
+            .disabled(!batchSelectable)
+            .help(
+                batchSelectable
+                    ? "Select for batch review"
+                    : (item.blocking_reason ?? "This comparison requires an individual choice")
+            )
             VStack(alignment: .leading, spacing: 3) {
                 Text(item.displayTitle)
                     .font(.callout.weight(isSelected ? .semibold : .regular))
@@ -859,6 +1497,19 @@ private struct QueueRow: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                HStack(spacing: 6) {
+                    if !item.isApprovable {
+                        Label("Blocked", systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.orange)
+                    }
+                    RetrievalBadge(
+                        count: item.popularity?.retrieval_count,
+                        lastRetrievedAt: item.popularity?.last_retrieved_at,
+                        compact: true
+                    )
+                    ConfidenceBadge(value: item.primaryConfidence, compact: true)
+                }
             }
         }
         .padding(.horizontal, 10)
@@ -866,6 +1517,28 @@ private struct QueueRow: View {
         .frame(maxWidth: .infinity, minHeight: 56, alignment: .leading)
         .background(isSelected ? Color.accentColor.opacity(0.13) : Color.clear)
         .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+private struct BlockedReviewNotice: View {
+    let reason: String?
+
+    var body: some View {
+        Label {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Decision controls disabled")
+                    .font(.callout.weight(.semibold))
+                Text(reason ?? "This card is missing required review evidence.")
+                    .font(.callout)
+            }
+        } icon: {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.12))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 }
 
@@ -883,12 +1556,13 @@ private struct OrientationPanel: View {
             MetadataRow(values: [
                 orientation.page_hint,
                 orientation.section_hint,
-                relationText,
+                relationName,
                 orientation.temporal_scope,
                 labeledTime("candidate", orientation.candidate_observed_at),
                 labeledTime("existing", orientation.existing_observed_at),
                 orientation.currentness,
             ])
+            ConfidenceBadge(value: orientation.relation_confidence)
             EvidenceQuote(text: orientation.relation_rationale)
         }
         .padding(.vertical, 12)
@@ -901,12 +1575,9 @@ private struct OrientationPanel: View {
         }
     }
 
-    private var relationText: String? {
+    private var relationName: String? {
         guard let relation = orientation.relation, !relation.isEmpty else {
             return nil
-        }
-        if let confidence = orientation.relation_confidence {
-            return "relation \(relation) \(String(format: "%.2f", confidence))"
         }
         return "relation \(relation)"
     }
@@ -924,11 +1595,21 @@ private struct FactPanel: View {
                 .textSelection(.enabled)
             EvidenceQuote(text: fact?.displayQuote)
             MetadataRow(values: [
-                confidenceText(fact?.displayConfidence),
                 fact?.page_hint,
                 fact?.entity_key,
                 fact?.displayID.map(shortID),
             ])
+            FlowLayout(spacing: 8) {
+                SourceDateBadge(
+                    value: fact?.source_date,
+                    basis: fact?.source_date_basis
+                )
+                ConfidenceBadge(value: fact?.displayConfidence)
+                RetrievalBadge(
+                    count: fact?.retrieval_count,
+                    lastRetrievedAt: fact?.last_retrieved_at
+                )
+            }
             SourceDocumentsView(documents: fact?.source_documents ?? [])
         }
         .padding(12)
@@ -982,15 +1663,23 @@ struct SourceDocumentsView: View {
         if !documents.isEmpty {
             VStack(alignment: .leading, spacing: 5) {
                 ForEach(documents.prefix(4)) { document in
-                    HStack(spacing: 6) {
-                        Image(systemName: "doc.text")
-                            .foregroundStyle(.secondary)
-                        Text(document.title ?? document.source_id)
-                            .lineLimit(1)
-                        Spacer()
-                        Text(shortID(document.source_id))
-                            .font(.caption.monospaced())
-                            .foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "doc.text")
+                                .foregroundStyle(.secondary)
+                            Text(document.title ?? document.source_id)
+                                .lineLimit(1)
+                            Spacer()
+                            Text(shortID(document.source_id))
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                        }
+                        if let sourceDate = document.captured_at ?? document.created_at ?? document.ingested_at {
+                            Text("Source \(dateOnly(sourceDate))")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .help(sourceDate)
+                        }
                     }
                     .font(.caption)
                 }
@@ -1018,13 +1707,22 @@ private struct DecisionButton: View {
     let title: String
     let systemImage: String
     let key: String
+    let shortcutEnabled: Bool
     let help: String?
     let action: () -> Void
 
-    init(_ title: String, systemImage: String, key: String, help: String? = nil, action: @escaping () -> Void) {
+    init(
+        _ title: String,
+        systemImage: String,
+        key: String,
+        shortcutEnabled: Bool = true,
+        help: String? = nil,
+        action: @escaping () -> Void
+    ) {
         self.title = title
         self.systemImage = systemImage
         self.key = key
+        self.shortcutEnabled = shortcutEnabled
         self.help = help
         self.action = action
     }
@@ -1040,9 +1738,27 @@ private struct DecisionButton: View {
                 Image(systemName: systemImage)
             }
         }
-        .keyboardShortcut(KeyEquivalent(Character(key)), modifiers: [])
+        .queueKeyboardShortcut(shortcutEnabled ? key : "")
         .help(help ?? "\(key.uppercased()) - \(title)")
         .accessibilityLabel("\(title), keyboard shortcut \(key.uppercased())")
+    }
+}
+
+private extension View {
+    @ViewBuilder
+    func queueKeyboardShortcut(_ key: String) -> some View {
+        switch key.lowercased() {
+        case "enter", "return":
+            keyboardShortcut(.return, modifiers: [])
+        case "escape", "esc":
+            keyboardShortcut(.escape, modifiers: [])
+        default:
+            if key.count == 1, let character = key.first {
+                keyboardShortcut(KeyEquivalent(character), modifiers: [])
+            } else {
+                self
+            }
+        }
     }
 }
 
@@ -1192,6 +1908,13 @@ private struct QueueKeyCaptureView: NSViewRepresentable {
 private struct QueueSessionTally: Equatable {
     var resolved = 0
     var skipped = 0
+}
+
+private struct QueueLoadRequest: Sendable {
+    let id: UUID
+    let kind: String
+    let state: String
+    let sort: String
 }
 
 private struct QueueUndoToast: Equatable {

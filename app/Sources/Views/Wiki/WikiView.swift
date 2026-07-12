@@ -1,3 +1,4 @@
+import AppKit
 import PKMBrainKit
 import SwiftUI
 
@@ -9,6 +10,9 @@ struct WikiView: View {
     @State private var searchText = ""
     @State private var isLoading = false
     @State private var errorMessage: String?
+    @State private var visibleFactCount = 20
+    @State private var factActionID: String?
+    @State private var factActionMessage: String?
 
     private var filteredPages: [WikiPageSummary] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -33,8 +37,17 @@ struct WikiView: View {
                 pageDetail
             }
         }
-        .task {
+        .task(id: appState.daemon.handshake?.pid) {
             await loadPages()
+        }
+        .onChange(of: appState.requestedWikiPath) { _, requested in
+            guard let requested else {
+                return
+            }
+            Task {
+                await selectPage(requested)
+                appState.requestedWikiPath = nil
+            }
         }
         .toolbar {
             Button {
@@ -118,7 +131,7 @@ struct WikiView: View {
                     ProgressView("Loading wiki...")
                 } else if let selectedPage {
                     pageHeader(selectedPage)
-                    markdownBody(selectedPage.body ?? "")
+                    MarkdownDocumentView(markdown: selectedPage.body ?? "")
                     factsSection(selectedPage.facts ?? [])
                     metadataSection(selectedPage)
                 } else {
@@ -148,37 +161,93 @@ struct WikiView: View {
         }
     }
 
-    private func markdownBody(_ body: String) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            ForEach(Array(displayLines(from: body).enumerated()), id: \.offset) { _index, line in
-                Text(line.text)
-                    .font(line.isHeading ? .headline : .body)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-    }
-
     private func factsSection(_ facts: [QueueFact]) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Facts")
-                .font(.title3.weight(.semibold))
+            HStack {
+                Text("Facts")
+                    .font(.title3.weight(.semibold))
+                Spacer()
+                if !facts.isEmpty {
+                    Text("Showing \(min(visibleFactCount, facts.count)) of \(facts.count)")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if let factActionMessage {
+                Text(factActionMessage)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
             if facts.isEmpty {
                 Text("No active facts on this page.")
                     .foregroundStyle(.secondary)
             } else {
-                ForEach(Array(facts.prefix(20).enumerated()), id: \.offset) { _index, fact in
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text(fact.statement ?? "Untitled fact")
-                            .textSelection(.enabled)
-                        MetadataRow(values: [
-                            confidenceText(fact.displayConfidence),
-                            fact.section_hint,
-                            fact.displayID.map(shortID),
-                        ])
+                ForEach(Array(facts.prefix(visibleFactCount).enumerated()), id: \.offset) { _index, fact in
+                    DisclosureGroup {
+                        VStack(alignment: .leading, spacing: 8) {
+                            if let quote = fact.displayQuote, !quote.isEmpty {
+                                Text(quote)
+                                    .font(.callout.monospaced())
+                                    .foregroundStyle(.secondary)
+                                    .textSelection(.enabled)
+                            } else {
+                                Text("No verbatim quote is stored for this fact.")
+                                    .font(.callout)
+                                    .foregroundStyle(.secondary)
+                            }
+                            MetadataRow(values: [
+                                fact.source_date.map { "source \($0)" },
+                                fact.source_date_basis,
+                                fact.entity_key,
+                            ])
+                            factSources(fact.source_documents ?? [])
+                            if let factID = fact.displayID {
+                                HStack(spacing: 8) {
+                                    Button {
+                                        Task { await actOnFact(factID, confirm: true) }
+                                    } label: {
+                                        Label("Confirm", systemImage: "checkmark.circle")
+                                    }
+                                    .disabled(factActionID != nil)
+                                    Button {
+                                        Task { await actOnFact(factID, confirm: false) }
+                                    } label: {
+                                        Label("Flag", systemImage: "flag")
+                                    }
+                                    .disabled(factActionID != nil)
+                                    if factActionID == factID {
+                                        ProgressView()
+                                            .controlSize(.small)
+                                    }
+                                }
+                            }
+                        }
+                        .padding(.top, 6)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text(fact.statement ?? "Untitled fact")
+                                .textSelection(.enabled)
+                            HStack(spacing: 8) {
+                                ConfidenceBadge(value: fact.displayConfidence)
+                                MetadataRow(values: [
+                                    fact.section_hint,
+                                    fact.displayID.map(shortID),
+                                ])
+                            }
+                        }
                     }
                     .padding(.vertical, 6)
                     Divider()
+                }
+                if visibleFactCount < facts.count {
+                    Button {
+                        visibleFactCount = min(facts.count, visibleFactCount + 20)
+                    } label: {
+                        Label(
+                            "Show \(min(20, facts.count - visibleFactCount)) more",
+                            systemImage: "chevron.down"
+                        )
+                    }
                 }
             }
         }
@@ -188,33 +257,69 @@ struct WikiView: View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Metadata")
                 .font(.title3.weight(.semibold))
-            MetadataRow(values: page.related?.map { "related \($0)" } ?? [])
             if let contract = page.contract, !contract.isEmpty {
-                Text(contract["retrieval_purpose"]?.stringValue ?? contract["page_scope"]?.stringValue ?? "Contract available.")
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
+                DisclosureGroup("Page Contract") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(contract.keys.sorted(), id: \.self) { key in
+                            LabeledContent(key.replacingOccurrences(of: "_", with: " ")) {
+                                Text(jsonText(contract[key]))
+                                    .foregroundStyle(.secondary)
+                                    .textSelection(.enabled)
+                            }
+                        }
+                    }
+                    .padding(.top, 6)
+                }
+            }
+            if let snapshots = page.snapshots, !snapshots.isEmpty {
+                DisclosureGroup("Recent Changes (\(snapshots.count))") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ForEach(snapshots) { snapshot in
+                            VStack(alignment: .leading, spacing: 4) {
+                                MetadataRow(values: [snapshot.created_at, snapshot.reason])
+                                if let before = snapshot.before_preview, !before.isEmpty {
+                                    Text("Before: \(before)")
+                                        .foregroundStyle(.secondary)
+                                }
+                                if let after = snapshot.after_preview, !after.isEmpty {
+                                    Text("After: \(after)")
+                                }
+                            }
+                            Divider()
+                        }
+                    }
+                    .padding(.top, 6)
+                }
+            }
+            if let related = page.related, !related.isEmpty {
+                MetadataRow(values: related.map { "related \($0)" })
             }
             SourceDocumentsView(documents: page.source_documents ?? [])
         }
     }
 
     private func loadPages() async {
-        guard let client = appState.daemon.apiClient else {
-            errorMessage = "Daemon API is unavailable."
-            return
-        }
         isLoading = true
         defer { isLoading = false }
+        guard let client = await appState.waitForAPIClient() else {
+            if !Task.isCancelled {
+                errorMessage = "Daemon API is unavailable."
+            }
+            return
+        }
         do {
             let response = try await client.wikiPages()
             pages = response.pages
             errorMessage = nil
-            let nextPath = selectedPath ?? pages.first?.relative_path
+            let nextPath = appState.requestedWikiPath ?? selectedPath ?? pages.first?.relative_path
             if let nextPath {
                 await selectPage(nextPath)
+                if appState.requestedWikiPath == nextPath {
+                    appState.requestedWikiPath = nil
+                }
             }
         } catch {
-            errorMessage = String(describing: error)
+            errorMessage = error.localizedDescription
         }
     }
 
@@ -224,25 +329,86 @@ struct WikiView: View {
             return
         }
         selectedPath = path
+        visibleFactCount = 20
+        factActionMessage = nil
         do {
             selectedPage = try await client.wikiPage(path: path)
             errorMessage = nil
         } catch {
-            errorMessage = String(describing: error)
+            errorMessage = error.localizedDescription
         }
     }
-}
 
-private func displayLines(from markdown: String) -> [(text: String, isHeading: Bool)] {
-    markdown
-        .split(separator: "\n", omittingEmptySubsequences: false)
-        .map { rawLine in
-            let line = String(rawLine)
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("#") {
-                return (text: trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "# ")), isHeading: true)
+    private func factSources(_ documents: [QueueSourceDocument]) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            ForEach(documents.prefix(8)) { document in
+                HStack(spacing: 8) {
+                    Image(systemName: "doc.text")
+                        .foregroundStyle(.secondary)
+                    Text(document.title ?? document.source_id)
+                        .lineLimit(2)
+                    Spacer()
+                    Button {
+                        openSource(document)
+                    } label: {
+                        Image(systemName: "folder")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Reveal source")
+                    .disabled(sourcePath(document) == nil)
+                }
             }
-            return (text: line, isHeading: false)
         }
-        .filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+
+    private func actOnFact(_ factID: String, confirm: Bool) async {
+        guard let client = appState.daemon.apiClient else {
+            errorMessage = "Daemon API is unavailable."
+            return
+        }
+        factActionID = factID
+        defer { factActionID = nil }
+        do {
+            if confirm {
+                _ = try await client.confirmWikiFact(factID)
+                factActionMessage = "Fact confirmed."
+            } else {
+                _ = try await client.flagWikiFact(factID)
+                factActionMessage = "Fact added to review."
+            }
+            if let selectedPath {
+                selectedPage = try await client.wikiPage(path: selectedPath)
+            }
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func sourcePath(_ document: QueueSourceDocument) -> String? {
+        [document.raw_path, document.source_path, document.path]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
+    }
+
+    private func openSource(_ document: QueueSourceDocument) {
+        guard let path = sourcePath(document) else {
+            return
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+    }
+
+    private func jsonText(_ value: JSONValue?) -> String {
+        guard let value else {
+            return "-"
+        }
+        switch value {
+        case .string(let text): return text
+        case .number(let number): return number.formatted()
+        case .bool(let enabled): return enabled ? "yes" : "no"
+        case .array(let values): return values.map { jsonText($0) }.joined(separator: ", ")
+        case .object: return "Structured value"
+        case .null: return "-"
+        }
+    }
 }

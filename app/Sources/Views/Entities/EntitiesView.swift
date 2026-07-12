@@ -8,9 +8,13 @@ struct EntitiesView: View {
     @State private var detail: EntityDetail?
     @State private var searchText = ""
     @State private var selectedType = ""
+    @State private var entitySort = "retrieval"
+    @State private var factSort = "retrieval"
     @State private var includeInactive = false
     @State private var isLoading = false
     @State private var errorMessage: String?
+    @State private var proposingCandidateID: String?
+    @State private var proposalStatus: String?
 
     private var entities: [EntitySummary] {
         response?.entities ?? []
@@ -27,8 +31,21 @@ struct EntitiesView: View {
                 entityDetail
             }
         }
-        .task {
-            await loadIndex(selectFirst: true)
+        .task(id: appState.daemon.handshake?.pid) {
+            await loadIndex(selectFirst: appState.requestedEntityID == nil)
+            if let requested = appState.requestedEntityID {
+                await selectEntity(requested)
+                appState.requestedEntityID = nil
+            }
+        }
+        .onChange(of: appState.requestedEntityID) { _, requested in
+            guard let requested else {
+                return
+            }
+            Task {
+                await selectEntity(requested)
+                appState.requestedEntityID = nil
+            }
         }
         .toolbar {
             Button {
@@ -69,6 +86,16 @@ struct EntitiesView: View {
                     .onChange(of: includeInactive) { _, _ in
                         Task { await loadIndex(selectFirst: true) }
                     }
+                Picker("Sort entities", selection: $entitySort) {
+                    Label("Most Retrieved", systemImage: "chart.bar.xaxis").tag("retrieval")
+                    Label("Most Facts", systemImage: "number").tag("facts")
+                    Label("Recently Observed", systemImage: "clock").tag("recent")
+                    Label("Name", systemImage: "textformat").tag("name")
+                }
+                .pickerStyle(.menu)
+                .onChange(of: entitySort) { _, _ in
+                    Task { await loadIndex(selectFirst: true) }
+                }
                 typeFilter
             }
             .padding(.horizontal, 12)
@@ -103,6 +130,11 @@ struct EntitiesView: View {
                                     countText(entity.alias_count, "aliases"),
                                     entity.last_observed_at,
                                 ])
+                                RetrievalBadge(
+                                    count: entity.retrieval_count,
+                                    lastRetrievedAt: entity.last_retrieved_at,
+                                    compact: true
+                                )
                             }
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.horizontal, 10)
@@ -176,6 +208,10 @@ struct EntitiesView: View {
                 countText(entity.fact_count, "facts"),
                 entity.last_observed_at,
             ])
+            RetrievalBadge(
+                count: entity.retrieval_count,
+                lastRetrievedAt: entity.last_retrieved_at
+            )
             MetadataRow(values: entity.aliases ?? [])
         }
     }
@@ -188,33 +224,70 @@ struct EntitiesView: View {
                 Text("No co-mentions.")
                     .foregroundStyle(.secondary)
             } else {
-                MetadataRow(values: items.prefix(20).map { "\($0.name) \($0.count)" })
+                ForEach(items.prefix(20)) { item in
+                    Button {
+                        Task { await selectEntity(item.id) }
+                    } label: {
+                        HStack {
+                            Text(item.name)
+                            Spacer()
+                            Text("\(item.count)")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
             }
         }
     }
 
     private func factGroups(_ groups: [EntityFactGroup]) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Facts")
-                .font(.title3.weight(.semibold))
+            HStack {
+                Text("Facts")
+                    .font(.title3.weight(.semibold))
+                Spacer()
+                Text("Sort facts")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Picker("Sort facts", selection: $factSort) {
+                    Label("Most Retrieved", systemImage: "chart.bar.xaxis").tag("retrieval")
+                    Label("Confidence", systemImage: "gauge").tag("confidence")
+                    Label("Recent", systemImage: "clock").tag("recent")
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+                .frame(width: 155)
+            }
             if groups.isEmpty {
                 Text("No active facts.")
                     .foregroundStyle(.secondary)
             } else {
-                ForEach(groups) { group in
+                ForEach(sortedFactGroups(groups)) { group in
                     VStack(alignment: .leading, spacing: 8) {
-                        Text(group.page_hint)
-                            .font(.headline)
-                            .textSelection(.enabled)
-                        ForEach(Array(group.facts.prefix(20).enumerated()), id: \.offset) { _index, fact in
+                        Button {
+                            appState.showWiki(path: group.page_hint)
+                        } label: {
+                            Label(group.page_hint, systemImage: "doc.text")
+                                .font(.headline)
+                        }
+                        .buttonStyle(.plain)
+                        ForEach(Array(sortedFacts(group.facts).prefix(20).enumerated()), id: \.offset) { _index, fact in
                             VStack(alignment: .leading, spacing: 5) {
                                 Text(fact.statement ?? "Untitled fact")
                                     .textSelection(.enabled)
                                 MetadataRow(values: [
-                                    confidenceText(fact.displayConfidence),
                                     fact.section_hint,
                                     fact.displayID.map(shortID),
                                 ])
+                                HStack(spacing: 8) {
+                                    ConfidenceBadge(value: fact.displayConfidence)
+                                    RetrievalBadge(
+                                        count: fact.retrieval_count,
+                                        lastRetrievedAt: fact.last_retrieved_at
+                                    )
+                                }
                             }
                             .padding(.vertical, 5)
                             Divider()
@@ -225,34 +298,75 @@ struct EntitiesView: View {
         }
     }
 
-    private func mergeCandidates(_ candidates: [JSONValue]) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
+    private func mergeCandidates(_ candidates: [EntityMergeCandidate]) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
             Text("Merge Candidates")
                 .font(.title3.weight(.semibold))
+            if let proposalStatus {
+                Text(proposalStatus)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
             if candidates.isEmpty {
                 Text("No merge candidates.")
                     .foregroundStyle(.secondary)
             } else {
-                ForEach(Array(candidates.prefix(8).enumerated()), id: \.offset) { _index, candidate in
-                    Text(candidate.objectValue?["reason"]?.stringValue ?? "Candidate merge available.")
-                        .foregroundStyle(.secondary)
+                ForEach(candidates.prefix(8)) { candidate in
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(mergeDirection(candidate))
+                            .font(.callout.weight(.semibold))
+                            .fixedSize(horizontal: false, vertical: true)
+                        MetadataRow(values: [
+                            candidate.risk_tier.map { "\($0) risk" },
+                            candidate.affected_fact_count.map { "\($0) facts" },
+                            candidate.score.map { "score \(Int(($0 * 100).rounded()))%" },
+                            candidate.merge_signal,
+                        ])
+                        if let reason = candidate.reason, !reason.isEmpty {
+                            Text(reason)
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                        Button {
+                            Task { await proposeMerge(candidate) }
+                        } label: {
+                            Label("Propose Merge", systemImage: "arrow.triangle.merge")
+                        }
+                        .disabled(
+                            proposingCandidateID != nil
+                                || candidate.canonicalID == nil
+                                || candidate.sourceIDs.isEmpty
+                        )
+                        if proposingCandidateID == candidate.id {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                    }
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.secondary.opacity(0.08))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
                 }
             }
         }
     }
 
     private func loadIndex(selectFirst: Bool) async {
-        guard let client = appState.daemon.apiClient else {
-            errorMessage = "Daemon API is unavailable."
-            return
-        }
         isLoading = true
         defer { isLoading = false }
+        guard let client = await appState.waitForAPIClient() else {
+            if !Task.isCancelled {
+                errorMessage = "Daemon API is unavailable."
+            }
+            return
+        }
         do {
             let result = try await client.entities(
                 query: searchText,
                 type: selectedType,
-                includeInactive: includeInactive
+                includeInactive: includeInactive,
+                sort: entitySort
             )
             response = result
             errorMessage = nil
@@ -265,7 +379,7 @@ struct EntitiesView: View {
                 detail = nil
             }
         } catch {
-            errorMessage = String(describing: error)
+            errorMessage = error.localizedDescription
         }
     }
 
@@ -279,7 +393,76 @@ struct EntitiesView: View {
             detail = try await client.entityDetail(id)
             errorMessage = nil
         } catch {
-            errorMessage = String(describing: error)
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func mergeDirection(_ candidate: EntityMergeCandidate) -> String {
+        guard let canonicalID = candidate.canonicalID else {
+            return "Merge direction unavailable"
+        }
+        let destination = candidate.name(for: canonicalID)
+        let sources = candidate.sourceIDs.map { candidate.name(for: $0) }.joined(separator: ", ")
+        return "Merge \(sources) into \(destination)"
+    }
+
+    private func proposeMerge(_ candidate: EntityMergeCandidate) async {
+        guard let client = appState.daemon.apiClient else {
+            errorMessage = "Daemon API is unavailable."
+            return
+        }
+        proposingCandidateID = candidate.id
+        defer { proposingCandidateID = nil }
+        do {
+            let response = try await client.proposeEntityMerge(candidate)
+            let status = response.action["status"]?.stringValue ?? "proposed"
+            proposalStatus = status == "applied"
+                ? "Merge applied under the active policy."
+                : "Merge sent to the review queue (\(status))."
+            await appState.refreshDigest()
+            if let selectedID {
+                detail = try await client.entityDetail(selectedID)
+            }
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func sortedFactGroups(_ groups: [EntityFactGroup]) -> [EntityFactGroup] {
+        groups.sorted { left, right in
+            let leftValue = groupSortValue(left)
+            let rightValue = groupSortValue(right)
+            if leftValue == rightValue {
+                return left.page_hint.localizedCaseInsensitiveCompare(right.page_hint) == .orderedAscending
+            }
+            return leftValue > rightValue
+        }
+    }
+
+    private func sortedFacts(_ facts: [QueueFact]) -> [QueueFact] {
+        facts.sorted { left, right in
+            let leftValue = factSortValue(left)
+            let rightValue = factSortValue(right)
+            if leftValue == rightValue {
+                return (left.statement ?? "").localizedCaseInsensitiveCompare(right.statement ?? "") == .orderedAscending
+            }
+            return leftValue > rightValue
+        }
+    }
+
+    private func groupSortValue(_ group: EntityFactGroup) -> String {
+        group.facts.map(factSortValue).max() ?? ""
+    }
+
+    private func factSortValue(_ fact: QueueFact) -> String {
+        switch factSort {
+        case "confidence":
+            return String(format: "%020.8f", fact.displayConfidence ?? -1)
+        case "recent":
+            return fact.observed_at ?? fact.last_retrieved_at ?? ""
+        default:
+            return String(format: "%020d", fact.retrieval_count ?? 0)
         }
     }
 }

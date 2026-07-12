@@ -37,7 +37,7 @@
   "active_memories": [
     {
       "id": "mem_1",
-      "content": "Peter prefers numeric queue shortcuts.",
+      "content": "Alex prefers numeric queue shortcuts.",
       "memory_type": "preference",
       "scope": "pkm-brain",
       "memory_relevance_score": 0.72
