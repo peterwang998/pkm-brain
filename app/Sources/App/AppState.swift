@@ -344,7 +344,7 @@ final class AppState: ObservableObject {
             content: content,
             trigger: nil
         )
-        UNUserNotificationCenter.current().add(request) { _ in }
+        UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
         defaults.set(now.timeIntervalSince1970, forKey: queueBacklogNotificationKey)
     }
 
@@ -445,6 +445,6 @@ final class AppState: ObservableObject {
             content: content,
             trigger: nil
         )
-        UNUserNotificationCenter.current().add(request) { _ in }
+        UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
     }
 }
