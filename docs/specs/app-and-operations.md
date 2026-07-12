@@ -1,7 +1,7 @@
 # App And Operations
 
 **Status:** canonical living feature spec; native app is primary and browser UI is an off-by-default fallback
-**Last verified:** 2026-07-11 against the release `0.1.1` working tree; baseline commit pending
+**Last verified:** 2026-07-11 against public release `0.1.1` snapshot `71a6462`
 **Owns:** daemon, scheduler, connector operations, native/browser UI, settings, provisioning, packaging, migration, and operational retention
 
 ## Product Shape

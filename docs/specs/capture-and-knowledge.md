@@ -1,7 +1,7 @@
 # Capture And Knowledge
 
 **Status:** canonical living feature spec
-**Last verified:** 2026-07-11 against commit `e43e9c1e1287` plus the current working tree
+**Last verified:** 2026-07-11 against public release `0.1.1` snapshot `71a6462`
 **Owns:** connectors, ingest, source normalization, extraction, facts, entities, routing, gardener topology, and wiki projection
 
 ## Feature Boundary

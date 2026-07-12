@@ -1,7 +1,7 @@
 # Project Improvement Implementation Plan
 
 **Status:** execution in progress; R1-R4 complete, R5/R6 partially complete in release `0.1.1`
-**Last verified:** 2026-07-11 against the release `0.1.1` working tree; baseline commit pending
+**Last verified:** 2026-07-11 against public release `0.1.1` snapshot `71a6462`
 **Inputs:** [Project Audit](../audits/project-audit-2026-07-10.md) and the six [canonical feature specs](../README.md)
 
 ## Objective
