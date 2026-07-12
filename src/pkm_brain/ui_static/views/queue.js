@@ -15,6 +15,8 @@ export default function mount(el, segments, ctx) {
     summary: null,
     nextCursor: null,
     limit: 50,
+    routePages: [],
+    routePagesLoaded: false,
   };
   const keydown = event => onKey(event, el, ctx, state);
   window.addEventListener("keydown", keydown);
@@ -126,6 +128,7 @@ function render(el, ctx, state) {
   });
   const loadMoreButton = el.querySelector("#load-more");
   if (loadMoreButton) loadMoreButton.addEventListener("click", () => loadMore(el, ctx, state));
+  bindManualRoute(el, ctx, state, current);
   if (current?.approvable === false) {
     for (const control of el.querySelectorAll(".queue-detail [data-decision]")) {
       control.disabled = true;
@@ -191,7 +194,7 @@ function cardHtml(item, state) {
   if (item.kind === "unrouted_inbox_batch") return inboxBatchCard(item);
   if (item.kind === "document_extraction_anomaly") return anomalyCard(item);
   if (item.group === "conflicts") return conflictCard(item, state);
-  if (item.group === "unrouted") return unroutedCard(item);
+  if (item.group === "unrouted") return unroutedCard(item, state);
   if (item.group === "memories") return memoryCard(item);
   if (item.group === "audit") return auditCard(item);
   if (item.group === "topology") return actionCard(item);
@@ -297,19 +300,74 @@ function alternativeConflictCard(item, state) {
     </div>`;
 }
 
-function unroutedCard(item) {
+function unroutedCard(item, state) {
   const routes = item.route_candidates || [];
   const keys = unroutedKeys(item);
+  const disabled = item.approvable === false ? "disabled" : "";
   return `${factPanel("Fact", item.candidate || {})}
     <h2>Route Candidates</h2>
     <div class="route-list">
       ${routes.map((route, index) => `<button type="button" data-decision="route" data-page-hint="${esc(route.page_hint)}"><kbd>${index + 1}</kbd>${esc(route.title || route.page_hint)} <span class="muted">${route.document_coherence_count ? `${esc(route.document_coherence_count)} routed facts from this source - ` : ""}${esc(route.page_hint)}</span></button>`).join("") || `<div class="muted">No confident route candidates.</div>`}
     </div>
+    <div class="route-manual">
+      <input id="manual-route" type="text" list="route-page-options" placeholder="concepts/topic.md" aria-label="Custom page path" autocomplete="off" ${disabled}>
+      <datalist id="route-page-options">${routePageOptions(state.routePages, "")}</datalist>
+      <button id="submit-manual-route" type="button" disabled><kbd>${keys.newPage}</kbd>route</button>
+    </div>
     <div class="decision-bar">
-      <button data-decision="new_page" type="button"><kbd>${keys.newPage}</kbd>new page...</button>
       <button data-decision="reject" type="button"><kbd>${keys.reject}</kbd>reject</button>
       <button data-decision="skip" type="button"><kbd>${keys.skip}</kbd>skip</button>
     </div>`;
+}
+
+function bindManualRoute(el, ctx, state, item) {
+  const input = el.querySelector("#manual-route");
+  const submit = el.querySelector("#submit-manual-route");
+  if (!input || !submit || item?.group !== "unrouted") return;
+  const refresh = () => {
+    const value = input.value.trim();
+    const options = el.querySelector("#route-page-options");
+    if (options) options.innerHTML = routePageOptions(state.routePages, value);
+    submit.disabled = !value || item.approvable === false;
+  };
+  const route = () => {
+    const pageHint = input.value.trim();
+    if (pageHint) doDecision(el, ctx, state, "route", {page_hint: pageHint});
+  };
+  input.addEventListener("focus", async () => {
+    await loadRoutePages(ctx, state);
+    refresh();
+  });
+  input.addEventListener("input", refresh);
+  input.addEventListener("keydown", event => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      route();
+    }
+  });
+  submit.addEventListener("click", route);
+}
+
+async function loadRoutePages(ctx, state) {
+  if (state.routePagesLoaded) return;
+  try {
+    const data = await ctx.api("/api/wiki/pages?routable=1");
+    state.routePages = data.pages || [];
+    state.routePagesLoaded = true;
+  } catch (error) {
+    ctx.toast(error.message || "Could not load Wiki route paths.");
+  }
+}
+
+function routePageOptions(pages, query) {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return "";
+  return pages
+    .filter(page => `${page.relative_path || ""} ${page.title || ""}`.toLowerCase().includes(needle))
+    .sort((left, right) => String(left.relative_path || "").localeCompare(String(right.relative_path || "")))
+    .slice(0, 12)
+    .map(page => `<option value="${esc(page.relative_path || "")}">${esc(page.title || page.relative_path || "")}</option>`)
+    .join("");
 }
 
 function memoryCard(item) {
@@ -450,12 +508,6 @@ function payloadFromButton(button) {
   const payload = {};
   if (button.dataset.pageHint) payload.page_hint = button.dataset.pageHint;
   if (button.dataset.factId) payload.selected_fact_id = button.dataset.factId;
-  if (button.dataset.decision === "new_page") {
-    const pageHint = prompt("New page path (for example concepts/topic.md)");
-    if (!pageHint) payload.cancelled = true;
-    payload.page_hint = pageHint;
-    payload.decision = "route";
-  }
   return payload;
 }
 
@@ -592,8 +644,7 @@ function onKey(event, el, ctx, state) {
       const keys = unroutedKeys(item);
       if (key === keys.newPage) {
         event.preventDefault();
-        const pageHint = prompt("New page path (for example concepts/topic.md)");
-        if (pageHint) doDecision(el, ctx, state, "route", {page_hint: pageHint});
+        el.querySelector("#manual-route")?.focus();
         return;
       }
     }

@@ -613,6 +613,7 @@ public struct CurationSettingsResponse: Codable, Equatable, Sendable {
     public let minimum_auto_confidence: Double
     public let merge_aggressiveness: Double
     public let split_aggressiveness: Double
+    public let topology_review_threshold: Int
     public let policy_version: Int?
     public let updated_at: String?
     public let configured: Bool

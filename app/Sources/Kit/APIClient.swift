@@ -119,6 +119,10 @@ public final class BrainAPIClient: Sendable {
         return try await get("/api/wiki/pages?q=\(percentEncodeQueryValue(query))")
     }
 
+    public func routableWikiPages() async throws -> WikiPagesResponse {
+        try await get("/api/wiki/pages?routable=1")
+    }
+
     public func wikiPage(path: String) async throws -> WikiPageDetail {
         try await get("/api/wiki/page?path=\(percentEncodeQueryValue(path))")
     }
@@ -193,12 +197,14 @@ public final class BrainAPIClient: Sendable {
     public func updateCurationSettings(
         strictness: String,
         mergeAggressiveness: Double,
-        splitAggressiveness: Double
+        splitAggressiveness: Double,
+        topologyReviewThreshold: Int
     ) async throws -> CurationSettingsResponse {
         let payload: [String: JSONValue] = [
             "strictness": .string(strictness),
             "merge_aggressiveness": .number(mergeAggressiveness),
             "split_aggressiveness": .number(splitAggressiveness),
+            "topology_review_threshold": .number(Double(topologyReviewThreshold)),
         ]
         return try await put(
             "/api/settings/curation",

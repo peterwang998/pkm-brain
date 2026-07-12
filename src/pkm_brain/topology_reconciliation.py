@@ -174,12 +174,14 @@ def current_topology_context(paths: BrainPaths) -> dict[str, Any]:
         suppressed_candidate_keys=set(),
         merge_aggressiveness=float(settings["merge_aggressiveness"]),
         split_aggressiveness=float(settings["split_aggressiveness"]),
+        topology_review_threshold=int(settings["topology_review_threshold"]),
     )
     candidates.extend(
         deterministic_entity_candidates(
             paths,
             suppressed_candidate_keys=set(),
             merge_aggressiveness=float(settings["merge_aggressiveness"]),
+            topology_review_threshold=int(settings["topology_review_threshold"]),
         )
     )
     return {

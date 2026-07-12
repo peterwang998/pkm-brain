@@ -97,11 +97,18 @@ struct PKMBrainKitTests {
         let pages: WikiPagesResponse = try decodeFixture("wiki_pages")
         let page: WikiPageDetail = try decodeFixture("wiki_page")
 
-        #expect(pages.count == 1)
+        #expect(pages.count == 3)
         #expect(pages.pages.first?.displayTitle == "PKM Brain")
         #expect(page.displayTitle == "PKM Brain")
         #expect(page.facts?.first?.statement == "PKM Brain has a native macOS app shell.")
         #expect(page.source_documents?.first?.source_id == "doc_1")
+        let routeMatches = RoutePathMatcher.suggestions(
+            in: pages.pages,
+            matching: "severance"
+        )
+        #expect(routeMatches.map(\.relative_path) == [
+            "career/databricks-severance-discussions.md"
+        ])
     }
 
     @Test("entity fixtures decode")
@@ -127,6 +134,7 @@ struct PKMBrainKitTests {
         #expect(settings.minimum_auto_confidence == 0.8)
         #expect(settings.merge_aggressiveness == 0.7)
         #expect(settings.split_aggressiveness == 0.2)
+        #expect(settings.topology_review_threshold == 32)
         #expect(settings.applies_to == "future_actions_only")
         #expect(settings.topology_applies_to == "future_gardener_runs_only")
         #expect(settings.profiles.map(\.id) == ["strict", "balanced", "lenient"])

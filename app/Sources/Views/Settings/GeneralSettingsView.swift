@@ -9,6 +9,7 @@ struct GeneralSettingsView: View {
     @State private var curationSettings: CurationSettingsResponse?
     @State private var selectedStrictness = "balanced"
     @State private var selectedTopologyBias = 0.5
+    @State private var selectedTopologyReviewThreshold = 8
     @State private var curationError: String?
     @State private var curationStatus: String?
     @State private var isLoadingCuration = false
@@ -157,6 +158,7 @@ struct GeneralSettingsView: View {
             Divider()
 
             topologyBiasSlider
+            topologyReviewThresholdControl
             LabeledContent("Topology scope", value: "Future gardener jobs")
 
             HStack(spacing: 10) {
@@ -210,6 +212,7 @@ struct GeneralSettingsView: View {
         }
         return selectedStrictness != settings.strictness
             || abs(selectedTopologyBias - topologyBias(for: settings)) > 0.001
+            || selectedTopologyReviewThreshold != settings.topology_review_threshold
     }
 
     private var topologyBiasSlider: some View {
@@ -247,6 +250,19 @@ struct GeneralSettingsView: View {
         return "Balanced"
     }
 
+    private var topologyReviewThresholdControl: some View {
+        LabeledContent("Topology review threshold") {
+            Stepper(
+                "\(selectedTopologyReviewThreshold)+ affected facts/pages",
+                value: $selectedTopologyReviewThreshold,
+                in: 4...200,
+                step: 4
+            )
+            .disabled(isLoadingCuration || isSavingCuration)
+            .help("Higher values send fewer otherwise-safe topology actions to review.")
+        }
+    }
+
     private func topologyBias(for settings: CurationSettingsResponse) -> Double {
         let bias = (settings.merge_aggressiveness + (1 - settings.split_aggressiveness)) / 2
         return min(1, max(0, bias))
@@ -266,6 +282,7 @@ struct GeneralSettingsView: View {
             curationSettings = settings
             selectedStrictness = settings.strictness
             selectedTopologyBias = topologyBias(for: settings)
+            selectedTopologyReviewThreshold = settings.topology_review_threshold
             curationError = nil
         } catch {
             curationError = error.localizedDescription
@@ -283,11 +300,13 @@ struct GeneralSettingsView: View {
             let settings = try await client.updateCurationSettings(
                 strictness: selectedStrictness,
                 mergeAggressiveness: selectedTopologyBias,
-                splitAggressiveness: 1 - selectedTopologyBias
+                splitAggressiveness: 1 - selectedTopologyBias,
+                topologyReviewThreshold: selectedTopologyReviewThreshold
             )
             curationSettings = settings
             selectedStrictness = settings.strictness
             selectedTopologyBias = topologyBias(for: settings)
+            selectedTopologyReviewThreshold = settings.topology_review_threshold
             curationStatus = changesSavedText(settings.updated_at)
             curationError = nil
         } catch {
