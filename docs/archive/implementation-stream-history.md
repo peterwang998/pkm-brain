@@ -63,6 +63,7 @@ This file preserves the durable outcomes of earlier implementation-stream specs 
 - Review admission became durable in schema 21: existing work is grandfathered, ordinary future work is limited to 25 admissions per day and 100 active items, hard boundaries bypass limits, and Deferred remains visible.
 - Retrieval and automation payloads gained write-time size limits; test/eval retrieval no longer inflates popularity; managed storage inventory classifies runtime, backups, database, indexes, and logs.
 - Runtime `0.1.1` gained immutable IDs, model-cache reuse, process-aware retention, a verified `/Applications` installer, macOS CI, and isolated rendered XCUITest coverage.
+- Public CI run `29184839657` passed 472 Python tests, 17 Swift tests, the release build, and seven-destination XCUITest on macOS 15/Xcode 16.4. The runner exposed and verified the fix for a notification completion handler that had inherited main-actor isolation on a private callback queue.
 - Native Wiki moved to `swift-markdown` with evidence and fact actions; Entities gained policy-gated merge proposals; Ask gained debug/source navigation; Ops gained scheduler, runs, connectors, and storage; Settings gained rollback-safe home switching.
 - A line-count ratchet now prevents growth in the six largest Python/Swift modules. `PlaceholderView`, `BrainUIHandler.write_html`, and `queue_action_count` were removed as confirmed orphans.
 

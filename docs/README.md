@@ -1,7 +1,7 @@
 # PKM Brain Documentation
 
 **Status:** authoritative docs index
-**Last verified:** 2026-07-11 against public release `0.1.1` snapshot `71a6462`
+**Last verified:** 2026-07-11 against public release `0.1.1` code snapshot `b3ba211`
 
 Current requirements are organized by product feature, not implementation stream. Start with Product Foundation, then read the owning feature spec for the behavior being changed.
 

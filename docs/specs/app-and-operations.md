@@ -1,7 +1,7 @@
 # App And Operations
 
 **Status:** canonical living feature spec; native app is primary and browser UI is an off-by-default fallback
-**Last verified:** 2026-07-11 against public release `0.1.1` snapshot `71a6462`
+**Last verified:** 2026-07-11 against public release `0.1.1` code snapshot `b3ba211`
 **Owns:** daemon, scheduler, connector operations, native/browser UI, settings, provisioning, packaging, migration, and operational retention
 
 ## Product Shape
@@ -309,6 +309,8 @@ Rollback restores launchd operation without rewriting Brain data.
 ## Frontend Test Contract
 
 Swift unit tests verify model/fixture decoding, daemon supervision, runtime identity replacement, and process-aware retention. XCUITest launches an isolated temporary Brain/app-support home under a dedicated bundle ID, explicitly opens the main window for fresh menu-bar state, renders all seven destinations, captures screenshots, and exercises the Queue number/Return path. CI runs both suites on macOS in addition to Python tests on Ubuntu.
+
+Concurrent health polling, destination loads, and notification delivery must not share mutable response decoders or capture main-actor state in arbitrary-queue completion handlers. Failed CI UI runs retain the result bundle and macOS diagnostic reports.
 
 Required coverage for completion:
 

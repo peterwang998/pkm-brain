@@ -1,7 +1,7 @@
 # Sync And Topology
 
 **Status:** canonical living feature spec; Primary/Secondary transport is implemented, role mobility and profiles are planned
-**Last verified:** 2026-07-11 against public release `0.1.1` snapshot `71a6462` and the 2026-07-08 two-machine acceptance record
+**Last verified:** 2026-07-11 against public release `0.1.1` code snapshot `b3ba211` and the 2026-07-08 two-machine acceptance record
 **Owns:** node roles, sync ownership/transport, per-peer scheduling, role mobility, snapshot replication, and multi-profile isolation
 
 ## Topology

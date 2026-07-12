@@ -1,7 +1,7 @@
 # Product Foundation
 
 **Status:** canonical living feature spec
-**Last verified:** 2026-07-11 against public release `0.1.1` snapshot `71a6462`
+**Last verified:** 2026-07-11 against public release `0.1.1` code snapshot `b3ba211`
 **Owns:** product boundaries, authority hierarchy, persistence model, privacy rules, and cross-feature invariants
 
 ## Purpose
