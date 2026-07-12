@@ -35,7 +35,6 @@ public final class BrainAPIClient: Sendable {
     public let baseURL: URL
     public let token: String
     private let session: URLSession
-    private let decoder = JSONDecoder()
 
     public init(baseURL: URL, token: String, session: URLSession = .shared) {
         self.baseURL = baseURL
@@ -279,7 +278,7 @@ public final class BrainAPIClient: Sendable {
         guard (200..<300).contains(http.statusCode) else {
             throw APIClientError.httpStatus(http.statusCode, String(data: data, encoding: .utf8) ?? "")
         }
-        return try decoder.decode(T.self, from: data)
+        return try JSONDecoder().decode(T.self, from: data)
     }
 
     private func url(for path: String) -> URL {
