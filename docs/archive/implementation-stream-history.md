@@ -1,7 +1,7 @@
 # Implementation Stream History
 
 **Status:** compact historical summary
-**Last verified:** 2026-07-11 against the release `0.1.1` working tree; baseline commit pending
+**Last verified:** 2026-07-11 against public release `0.1.1` snapshot `71a6462`
 
 This file preserves the durable outcomes of earlier implementation-stream specs without retaining thousands of lines of completed phase instructions. Full prior documents remain in git history.
 
