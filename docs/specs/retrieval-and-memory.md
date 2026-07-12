@@ -1,7 +1,7 @@
 # Retrieval And Memory
 
 **Status:** canonical living feature spec
-**Last verified:** 2026-07-11 against public release `0.1.1` snapshot `71a6462`
+**Last verified:** 2026-07-11 against public release `0.1.1` code snapshot `b3ba211`
 **Owns:** search, context packets, ranking/calibration, embeddings, retrieval telemetry, evals, and reviewed memories
 
 ## Retrieval Contract

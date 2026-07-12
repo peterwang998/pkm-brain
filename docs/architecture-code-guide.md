@@ -1,7 +1,7 @@
 # PKM Brain Architecture Code Guide
 
 **Status:** current code-navigation guide
-**Last verified:** 2026-07-11 against public release `0.1.1` snapshot `71a6462`
+**Last verified:** 2026-07-11 against public release `0.1.1` code snapshot `b3ba211`
 
 This guide answers where behavior lives. Feature requirements and open work belong in [the specs index](README.md), not here.
 
