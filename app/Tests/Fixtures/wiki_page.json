@@ -1,0 +1,48 @@
+{
+  "relative_path": "projects/pkm-brain.md",
+  "frontmatter": {
+    "title": "PKM Brain",
+    "page_type": "project",
+    "status": "active",
+    "source_ids": ["doc_1"],
+    "related": ["concepts/retrieval.md"]
+  },
+  "body": "# PKM Brain\nNative app page.",
+  "markdown": "---\ntitle: PKM Brain\n---\n# PKM Brain\nNative app page.",
+  "generated": true,
+  "source_ids": ["doc_1"],
+  "source_documents": [
+    {
+      "source_id": "doc_1",
+      "title": "Implementation Session",
+      "source_type": "agent_session",
+      "source_path": "sources/doc_1.jsonl"
+    }
+  ],
+  "facts": [
+    {
+      "id": "fact_1",
+      "statement": "PKM Brain has a native macOS app shell.",
+      "evidence_quote": "native macOS app shell",
+      "truth_confidence": 0.95,
+      "page_hint": "projects/pkm-brain.md",
+      "section_hint": "App",
+      "entity_key": "pkm-brain",
+      "source_ids": ["doc_1"]
+    }
+  ],
+  "contract": {
+    "retrieval_purpose": "Project context for app work."
+  },
+  "snapshots": [
+    {
+      "id": "snap_1",
+      "page_path": "projects/pkm-brain.md",
+      "reason": "nightly",
+      "created_at": "2026-07-09T12:05:00+00:00",
+      "before_preview": "",
+      "after_preview": "Native app page."
+    }
+  ],
+  "related": ["concepts/retrieval.md"]
+}

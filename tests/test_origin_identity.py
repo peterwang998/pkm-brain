@@ -8,7 +8,7 @@ from pkm_brain.service import BrainService
 
 
 def service_for(tmp_path: Path) -> BrainService:
-    return BrainService(BrainPaths.from_value(tmp_path / "brain"), prefer_model_embeddings=False)
+    return BrainService(BrainPaths.from_value(tmp_path / "brain"))
 
 
 def write_agent_log(path: Path, token: str) -> None:

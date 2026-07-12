@@ -1,0 +1,51 @@
+{
+  "entity": {
+    "id": "entity_alpha",
+    "name": "PKM Brain",
+    "entity_type": "project",
+    "aliases": ["Brain"],
+    "alias_count": 1,
+    "status": "active",
+    "merged_into": null,
+    "fact_count": 1,
+    "retrieval_count": 14,
+    "last_retrieved_at": "2026-07-09T18:30:00+00:00",
+    "last_observed_at": "2026-07-09T12:00:00+00:00",
+    "created_at": "2026-07-01T12:00:00+00:00"
+  },
+  "facts_by_page": [
+    {
+      "page_hint": "projects/pkm-brain.md",
+      "facts": [
+        {
+          "id": "fact_1",
+          "statement": "PKM Brain has an entity detail view.",
+          "truth_confidence": 0.9,
+          "retrieval_count": 14,
+          "last_retrieved_at": "2026-07-09T18:30:00+00:00",
+          "page_hint": "projects/pkm-brain.md",
+          "section_hint": "Entities"
+        }
+      ]
+    }
+  ],
+  "co_mentions": [
+    {
+      "id": "entity_beta",
+      "name": "Codex",
+      "entity_type": "tool",
+      "count": 1
+    }
+  ],
+  "merge_candidates": [
+    {
+      "reason": "similar alias",
+      "score": 0.8,
+      "entity_ids": ["entity_alpha", "entity_gamma"],
+      "entity_names": {
+        "entity_alpha": "PKM Brain",
+        "entity_gamma": "Brain"
+      }
+    }
+  ]
+}

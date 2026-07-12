@@ -40,7 +40,7 @@ def test_primary_and_secondary_same_session_id_coexist_after_pull(tmp_path: Path
     local_log = primary.inbox / "agent_logs" / "codex" / "same-session.md"
     local_log.parent.mkdir(parents=True, exist_ok=True)
     local_log.write_text(agent_markdown("same-session", "primary-token"), encoding="utf-8")
-    BrainService(primary, prefer_model_embeddings=False).ingest(local_log)
+    BrainService(primary).ingest(local_log)
     write_outbox_file(secondary_home, "agent_logs/codex/same-session.md", agent_markdown("same-session", "secondary-token"))
 
     sync_pull(primary, "secondary", transport=LocalRsyncTransport(remote_home=secondary_home), run_id="run-coexist")

@@ -1029,15 +1029,19 @@ wheels = [
 
 [[package]]
 name = "pkm-brain"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "lancedb" },
     { name = "mcp" },
     { name = "pyyaml" },
     { name = "rich" },
-    { name = "sentence-transformers" },
     { name = "typer" },
+]
+
+[package.optional-dependencies]
+embeddings = [
+    { name = "sentence-transformers" },
 ]
 
 [package.dev-dependencies]
@@ -1052,9 +1056,10 @@ requires-dist = [
     { name = "mcp", specifier = ">=1.27.0" },
     { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "rich", specifier = ">=15.0.0" },
-    { name = "sentence-transformers", specifier = ">=5.4.1" },
+    { name = "sentence-transformers", marker = "extra == 'embeddings'", specifier = ">=5.4.1" },
     { name = "typer", specifier = ">=0.25.1" },
 ]
+provides-extras = ["embeddings"]
 
 [package.metadata.requires-dev]
 dev = [

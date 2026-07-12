@@ -26,6 +26,7 @@ class PeerConfig:
     identity_path: Path | None = None
     host_key_fingerprint: str | None = None
     mirror_paths: list[str] = field(default_factory=list)
+    cadence_s: int | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PeerConfig":
@@ -47,6 +48,7 @@ class PeerConfig:
             identity_path=optional_path(data, "identity_path"),
             host_key_fingerprint=optional_string(data, "host_key_fingerprint"),
             mirror_paths=mirror_paths,
+            cadence_s=optional_positive_int(data, "cadence_s"),
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -62,6 +64,7 @@ class PeerConfig:
             "identity_path": str(self.identity_path) if self.identity_path else None,
             "host_key_fingerprint": self.host_key_fingerprint,
             "mirror_paths": list(self.mirror_paths),
+            "cadence_s": self.cadence_s,
         }
 
 
@@ -193,6 +196,16 @@ def optional_string(data: dict[str, Any], key: str) -> str | None:
 def optional_path(data: dict[str, Any], key: str) -> Path | None:
     value = optional_string(data, key)
     return Path(value).expanduser() if value else None
+
+
+def optional_positive_int(data: dict[str, Any], key: str) -> int | None:
+    value = data.get(key)
+    if value is None or str(value).strip() == "":
+        return None
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError(f"{key} must be positive")
+    return parsed
 
 
 def validate_mirror_paths(mirror_paths: list[str]) -> None:

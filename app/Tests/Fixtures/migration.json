@@ -1,0 +1,35 @@
+{
+  "app_support": "/Users/example/Library/Application Support/PKM Brain",
+  "detected_launch_agents": [
+    {
+      "label": "com.pkm-brain.agent-log-ingest",
+      "plist_path": "/Users/example/Library/LaunchAgents/com.pkm-brain.agent-log-ingest.plist",
+      "role_set": "shared",
+      "start_interval": 600
+    },
+    {
+      "label": "com.pkm-brain.capture-secondary",
+      "plist_path": "/Users/example/Library/LaunchAgents/com.pkm-brain.capture-secondary.plist",
+      "role_set": "secondary",
+      "start_interval": 600
+    }
+  ],
+  "home": "/Users/example/brain",
+  "home_exists": true,
+  "launch_agents_dir": "/Users/example/Library/LaunchAgents",
+  "rollback_script": "/Users/example/Library/Application Support/PKM Brain/migration/plists-backup/rollback.sh",
+  "shim_dir": "/Users/example/Library/Application Support/PKM Brain/bin",
+  "state": "migrate",
+  "steps": [
+    {
+      "id": "preflight",
+      "label": "Preflight",
+      "required": true
+    },
+    {
+      "id": "cli_shims",
+      "label": "Install CLI and MCP shims",
+      "required": true
+    }
+  ]
+}

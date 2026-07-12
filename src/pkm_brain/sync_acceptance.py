@@ -67,7 +67,7 @@ def run_acceptance_report(
     retrieval_phrase: str | None = None,
     transport: Transport | None = None,
 ) -> dict[str, Any]:
-    service = BrainService(paths, prefer_model_embeddings=False)
+    service = BrainService(paths)
     service.init_workspace()
     checks: list[AcceptanceCheck] = []
     report: dict[str, Any] = {
@@ -98,21 +98,39 @@ def run_acceptance_report(
 
     if peer and test_connection_now:
         try:
-            connection_result = test_connection(paths, peer.node_id, transport=transport).as_dict()
+            connection_result = test_connection(
+                paths, peer.node_id, transport=transport
+            ).as_dict()
             report["connection_test"] = connection_result
             status = "ok" if connection_result["ready"] else "fail"
-            message = "connection ready" if connection_result["ready"] else "connection validation failed"
-            checks.append(AcceptanceCheck("connection_test", status, message, connection_result["checks"]))
+            message = (
+                "connection ready"
+                if connection_result["ready"]
+                else "connection validation failed"
+            )
+            checks.append(
+                AcceptanceCheck(
+                    "connection_test", status, message, connection_result["checks"]
+                )
+            )
         except Exception as exc:
             checks.append(AcceptanceCheck("connection_test", "fail", str(exc)))
     elif peer:
-        checks.append(AcceptanceCheck("connection_test", "skipped", "connection test skipped by request"))
+        checks.append(
+            AcceptanceCheck(
+                "connection_test", "skipped", "connection test skipped by request"
+            )
+        )
     else:
         checks.append(AcceptanceCheck("connection_test", "skipped", "no selected peer"))
 
     if run_sync_now:
         if not peer:
-            checks.append(AcceptanceCheck("sync_run", "fail", "cannot run sync without a selected peer"))
+            checks.append(
+                AcceptanceCheck(
+                    "sync_run", "fail", "cannot run sync without a selected peer"
+                )
+            )
         else:
             try:
                 result = sync_run(paths, peer.node_id, transport=transport).as_dict()
@@ -121,13 +139,25 @@ def run_acceptance_report(
             else:
                 report["sync_run"] = result
                 status = "ok" if result["status"] == "ok" else "fail"
-                checks.append(AcceptanceCheck("sync_run", status, f"sync run status: {result['status']}"))
+                checks.append(
+                    AcceptanceCheck(
+                        "sync_run", status, f"sync run status: {result['status']}"
+                    )
+                )
     else:
-        checks.append(AcceptanceCheck("sync_run", "skipped", "pass --run-sync to execute pull/push acceptance"))
+        checks.append(
+            AcceptanceCheck(
+                "sync_run", "skipped", "pass --run-sync to execute pull/push acceptance"
+            )
+        )
 
     if retrieval_phrase:
         try:
-            retrieval = service.retrieve_context(task=retrieval_phrase, mode="compact")
+            retrieval = service.retrieve_context(
+                task=retrieval_phrase,
+                mode="compact",
+                record_telemetry=False,
+            )
         except Exception as exc:
             checks.append(AcceptanceCheck("retrieval", "fail", str(exc)))
         else:
@@ -137,17 +167,28 @@ def run_acceptance_report(
                 "supporting_chunks": len(retrieval.get("supporting_chunks") or []),
                 "relevant_wiki_pages": len(retrieval.get("relevant_wiki_pages") or []),
             }
-            found = bool((retrieval.get("supporting_chunks") or []) or (retrieval.get("relevant_wiki_pages") or []))
+            found = bool(
+                (retrieval.get("supporting_chunks") or [])
+                or (retrieval.get("relevant_wiki_pages") or [])
+            )
             checks.append(
                 AcceptanceCheck(
                     "retrieval",
                     "ok" if found else "fail",
-                    "retrieval found candidate context" if found else "retrieval found no candidate context",
+                    "retrieval found candidate context"
+                    if found
+                    else "retrieval found no candidate context",
                     report["retrieval"],
                 )
             )
     else:
-        checks.append(AcceptanceCheck("retrieval", "skipped", "pass --retrieval-phrase to verify Secondary session retrieval"))
+        checks.append(
+            AcceptanceCheck(
+                "retrieval",
+                "skipped",
+                "pass --retrieval-phrase to verify Secondary session retrieval",
+            )
+        )
 
     report["checks"] = [check.as_dict() for check in checks]
     report["ready"] = all(check.status != "fail" for check in checks)
@@ -155,10 +196,17 @@ def run_acceptance_report(
     return report
 
 
-def audit_schema(paths: BrainPaths, checks: list[AcceptanceCheck], report: dict[str, Any]) -> None:
+def audit_schema(
+    paths: BrainPaths, checks: list[AcceptanceCheck], report: dict[str, Any]
+) -> None:
     with connection(paths.sqlite_path) as conn:
         try:
-            migrations = [dict(row) for row in conn.execute("SELECT version, applied_at FROM schema_migrations ORDER BY version")]
+            migrations = [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT version, applied_at FROM schema_migrations ORDER BY version"
+                )
+            ]
         except sqlite3.OperationalError as exc:
             migrations = []
             checks.append(AcceptanceCheck("schema_migrations", "fail", str(exc)))
@@ -166,26 +214,70 @@ def audit_schema(paths: BrainPaths, checks: list[AcceptanceCheck], report: dict[
             versions = {int(row["version"]) for row in migrations}
             missing = sorted(EXPECTED_MIGRATIONS - versions)
             if missing:
-                checks.append(AcceptanceCheck("schema_migrations", "fail", f"missing migration versions: {missing}", migrations))
+                checks.append(
+                    AcceptanceCheck(
+                        "schema_migrations",
+                        "fail",
+                        f"missing migration versions: {missing}",
+                        migrations,
+                    )
+                )
             else:
-                checks.append(AcceptanceCheck("schema_migrations", "ok", "required migration versions present", migrations))
+                checks.append(
+                    AcceptanceCheck(
+                        "schema_migrations",
+                        "ok",
+                        "required migration versions present",
+                        migrations,
+                    )
+                )
         report["schema_migrations"] = migrations
 
-        sync_runs_columns = [row["name"] for row in conn.execute("PRAGMA table_info(sync_runs)")]
+        sync_runs_columns = [
+            row["name"] for row in conn.execute("PRAGMA table_info(sync_runs)")
+        ]
         report["sync_runs_columns"] = sync_runs_columns
-        missing_columns = [column for column in EXPECTED_SYNC_RUN_COLUMNS if column not in sync_runs_columns]
+        missing_columns = [
+            column
+            for column in EXPECTED_SYNC_RUN_COLUMNS
+            if column not in sync_runs_columns
+        ]
         if missing_columns:
-            checks.append(AcceptanceCheck("sync_runs_schema", "fail", f"missing columns: {missing_columns}", sync_runs_columns))
+            checks.append(
+                AcceptanceCheck(
+                    "sync_runs_schema",
+                    "fail",
+                    f"missing columns: {missing_columns}",
+                    sync_runs_columns,
+                )
+            )
         else:
-            checks.append(AcceptanceCheck("sync_runs_schema", "ok", "sync_runs has expected V1 columns", sync_runs_columns))
+            checks.append(
+                AcceptanceCheck(
+                    "sync_runs_schema",
+                    "ok",
+                    "sync_runs has expected V1 columns",
+                    sync_runs_columns,
+                )
+            )
 
         missing_identity = conn.execute(
             "SELECT COUNT(*) AS count FROM documents WHERE origin_node_id IS NULL OR logical_source_key IS NULL"
         ).fetchone()["count"]
         if missing_identity:
-            checks.append(AcceptanceCheck("origin_identity", "fail", f"{missing_identity} documents missing origin identity"))
+            checks.append(
+                AcceptanceCheck(
+                    "origin_identity",
+                    "fail",
+                    f"{missing_identity} documents missing origin identity",
+                )
+            )
         else:
-            checks.append(AcceptanceCheck("origin_identity", "ok", "all documents have origin identity"))
+            checks.append(
+                AcceptanceCheck(
+                    "origin_identity", "ok", "all documents have origin identity"
+                )
+            )
 
 
 def audit_sync_doctor_and_config(
@@ -213,12 +305,18 @@ def audit_sync_doctor_and_config(
     except Exception as exc:
         checks.append(AcceptanceCheck("sync_config", "fail", str(exc)))
         return None
-    checks.append(AcceptanceCheck("sync_config", "ok", f"configured as {config.role}/{config.node_id}"))
+    checks.append(
+        AcceptanceCheck(
+            "sync_config", "ok", f"configured as {config.role}/{config.node_id}"
+        )
+    )
     checks.append(
         AcceptanceCheck(
             "primary_role",
             "ok" if config.role == "primary" else "fail",
-            "acceptance runner is on Primary" if config.role == "primary" else f"acceptance must run on Primary, found {config.role}",
+            "acceptance runner is on Primary"
+            if config.role == "primary"
+            else f"acceptance must run on Primary, found {config.role}",
         )
     )
     return config
@@ -230,24 +328,52 @@ def select_acceptance_peer(
     checks: list[AcceptanceCheck],
 ) -> PeerConfig | None:
     if not config or not config.primary:
-        checks.append(AcceptanceCheck("peer_configured", "fail", "Primary peer config is unavailable"))
+        checks.append(
+            AcceptanceCheck(
+                "peer_configured", "fail", "Primary peer config is unavailable"
+            )
+        )
         return None
     peers = config.primary.peers
     if peer_node_id:
-        peer = next((candidate for candidate in peers if candidate.node_id == peer_node_id), None)
+        peer = next(
+            (candidate for candidate in peers if candidate.node_id == peer_node_id),
+            None,
+        )
         if not peer:
-            checks.append(AcceptanceCheck("peer_configured", "fail", f"peer not found: {peer_node_id}"))
+            checks.append(
+                AcceptanceCheck(
+                    "peer_configured", "fail", f"peer not found: {peer_node_id}"
+                )
+            )
             return None
-        checks.append(AcceptanceCheck("peer_configured", "ok", f"selected peer {peer.node_id}", peer.as_dict()))
+        checks.append(
+            AcceptanceCheck(
+                "peer_configured", "ok", f"selected peer {peer.node_id}", peer.as_dict()
+            )
+        )
         return peer
     if len(peers) == 1:
         peer = peers[0]
-        checks.append(AcceptanceCheck("peer_configured", "ok", f"selected only configured peer {peer.node_id}", peer.as_dict()))
+        checks.append(
+            AcceptanceCheck(
+                "peer_configured",
+                "ok",
+                f"selected only configured peer {peer.node_id}",
+                peer.as_dict(),
+            )
+        )
         return peer
     if not peers:
-        checks.append(AcceptanceCheck("peer_configured", "fail", "no Secondary peer configured"))
+        checks.append(
+            AcceptanceCheck("peer_configured", "fail", "no Secondary peer configured")
+        )
     else:
-        checks.append(AcceptanceCheck("peer_configured", "fail", "multiple peers configured; pass --peer"))
+        checks.append(
+            AcceptanceCheck(
+                "peer_configured", "fail", "multiple peers configured; pass --peer"
+            )
+        )
     return None
 
 

@@ -1,0 +1,26 @@
+{
+  "entities": [
+    {
+      "id": "entity_alpha",
+      "name": "PKM Brain",
+      "entity_type": "project",
+      "aliases": ["Brain"],
+      "alias_count": 1,
+      "status": "active",
+      "merged_into": null,
+      "fact_count": 2,
+      "retrieval_count": 14,
+      "last_retrieved_at": "2026-07-09T18:30:00+00:00",
+      "last_observed_at": "2026-07-09T12:00:00+00:00",
+      "created_at": "2026-07-01T12:00:00+00:00"
+    }
+  ],
+  "count": 1,
+  "sort": "retrieval",
+  "types": [
+    {
+      "entity_type": "project",
+      "count": 1
+    }
+  ]
+}

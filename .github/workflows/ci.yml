@@ -5,7 +5,7 @@ on:
   pull_request:
 
 jobs:
-  test:
+  python:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -13,3 +13,14 @@ jobs:
       - run: uv sync --dev
       - run: uv run ruff check .
       - run: uv run pytest
+
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: brew install xcodegen
+      - run: uv sync --dev
+      - run: swift test --package-path app
+      - run: scripts/ui-acceptance.sh
+      - run: scripts/build-app.sh

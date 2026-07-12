@@ -22,16 +22,56 @@ from .automation import (
     uninstall_launch_agent,
     uninstall_nightly_launch_agent,
     run_agent_log_ingest,
+    run_cos_once,
     run_nightly_maintenance,
     run_secondary_tick,
 )
-from .capture import AgentLogCapture
+from .app_migration import (
+    build_migration_plan,
+    create_runtime_backup,
+    install_runtime_shims,
+    retire_launch_agents,
+)
+from .daemon import BrainDaemon, daemon_handshake_path, package_version
+from .connectors import (
+    connector_ids_for_agent,
+    run_connector_capture,
+    runtime_settings,
+)
 from .db import connection, rows
-from .evals import run_eval
-from .llm import provider_status
-from .memory_proposals import propose_failure_memories_from_sources, propose_memories_from_lineage
+from .evals import purge_retrieval_eval_telemetry, run_eval
+from .extraction import (
+    critic_review_config,
+    reclaim_unrouted_facts,
+    reconcile_fact_conflict_reviews,
+)
+from .fact_review_volume import (
+    reconcile_backlog_w2a_apply,
+    reconcile_backlog_w2a_dry_run,
+    reconcile_backlog_w2b_apply,
+    reconcile_backlog_w2b_dry_run,
+    write_reconcile_report,
+)
+from .cos_policy import (
+    CURATION_STRICTNESS_PROFILES,
+    normalize_curation_strictness,
+    promote_policy_for_autonomy,
+)
+from .llm import cos_provider_status, provider_status
+from .maintenance import managed_storage_inventory, prune_runtime_artifacts
+from .memory_proposals import (
+    propose_failure_memories_from_sources,
+    propose_memories_from_lineage,
+)
 from .mcp_server import create_mcp
 from .paths import BrainPaths
+from .policy_reconciliation import reconcile_policy_escalations
+from .queue_summary import review_queue_summary
+from .regeneration import (
+    backup_runtime_brain,
+    export_human_state,
+    rebuild_facts_from_sources,
+)
 from .service import BrainService
 from .setup_wizard import run_setup_plan
 from .sync_acceptance import run_acceptance_report
@@ -44,13 +84,22 @@ from .sync_status import format_status_table_rows, local_sync_snapshot
 from .sync_transfer import sync_pull as run_sync_pull
 from .sync_transfer import sync_push as run_sync_push
 from .sync_transfer import sync_run as run_sync_run
-from .ui_server import create_ui_server, ensure_ui_token, ui_token_path, validate_ui_bind
+from .topology_reconciliation import reconcile_topology_proposals
+from .ui_server import (
+    create_ui_server,
+    ensure_ui_token,
+    ui_token_path,
+    validate_ui_bind,
+)
 from .wiki import lint_wiki
 from .wiki_curation_promote import promote_wiki_curation
 from .wiki_fact_migration import migrate_existing_wiki_to_facts
 from .wiki_facts import curate_all_managed_fact_pages
 
-app = typer.Typer(help="Local personal knowledge management and agent memory tool.")
+app = typer.Typer(
+    help="Local personal knowledge management and agent memory tool.",
+    invoke_without_command=True,
+)
 inspect_app = typer.Typer(help="Inspect documents and chunks.")
 index_app = typer.Typer(help="Index health commands.")
 db_app = typer.Typer(help="SQLite database maintenance commands.")
@@ -58,6 +107,8 @@ wiki_app = typer.Typer(help="Wiki commands.")
 memory_app = typer.Typer(help="Typed memory commands.")
 context_app = typer.Typer(help="Context lineage and feedback commands.")
 llm_app = typer.Typer(help="LLM provider commands.")
+embeddings_app = typer.Typer(help="Embedding provider commands.")
+cos_app = typer.Typer(help="Chief-of-Staff commands.")
 eval_app = typer.Typer(help="Chief-of-Staff eval commands.")
 runs_app = typer.Typer(help="Pipeline run commands.")
 provenance_app = typer.Typer(help="Provenance validation commands.")
@@ -66,6 +117,8 @@ automation_app = typer.Typer(help="Scheduled automation commands.")
 launch_agent_app = typer.Typer(help="macOS LaunchAgent commands.")
 sync_app = typer.Typer(help="Primary/Secondary sync commands.")
 scheduler_app = typer.Typer(help="Logical scheduler commands.")
+maintenance_app = typer.Typer(help="Runtime maintenance commands.")
+app_migration_app = typer.Typer(help="macOS app migration commands.")
 app.add_typer(inspect_app, name="inspect")
 app.add_typer(index_app, name="index")
 app.add_typer(db_app, name="db")
@@ -73,6 +126,8 @@ app.add_typer(wiki_app, name="wiki")
 app.add_typer(memory_app, name="memory")
 app.add_typer(context_app, name="context")
 app.add_typer(llm_app, name="llm")
+app.add_typer(embeddings_app, name="embeddings")
+app.add_typer(cos_app, name="cos")
 app.add_typer(eval_app, name="eval")
 app.add_typer(runs_app, name="runs")
 app.add_typer(provenance_app, name="provenance")
@@ -81,7 +136,31 @@ app.add_typer(automation_app, name="automation")
 app.add_typer(launch_agent_app, name="launch-agent")
 app.add_typer(sync_app, name="sync")
 app.add_typer(scheduler_app, name="scheduler")
+app.add_typer(maintenance_app, name="maintenance")
+app.add_typer(app_migration_app, name="app-migration")
 console = Console()
+
+
+@app.callback()
+def main(
+    version: bool = typer.Option(
+        False,
+        "--version",
+        help="Print the installed PKM Brain version and exit.",
+        is_eager=True,
+    ),
+) -> None:
+    if version:
+        console.print(package_version())
+        raise typer.Exit()
+
+
+@launch_agent_app.callback()
+def launch_agent_deprecation() -> None:
+    Console(stderr=True).print(
+        "brain launch-agent is retained for rollback/dev use; migrated installs should use PKM Brain.app scheduling.",
+        style="yellow",
+    )
 
 
 def service(home: Optional[Path] = None) -> BrainService:
@@ -142,7 +221,9 @@ def run_setup_cli(
             secondary_outbox_path=secondary_outbox_path,
         )
         if role in {"primary", "secondary"} and not install_scheduler:
-            install_scheduler = typer.confirm("Install the scheduled sync job after validation?", default=False)
+            install_scheduler = typer.confirm(
+                "Install the scheduled sync job after validation?", default=False
+            )
     try:
         result = run_setup_plan(
             paths,
@@ -181,9 +262,13 @@ def resolve_setup_role(role: Optional[str], interactive: bool) -> str:
         return role
     if not interactive:
         return "single"
-    if not typer.confirm("Set up multi-device Primary/Secondary sync now?", default=False):
+    if not typer.confirm(
+        "Set up multi-device Primary/Secondary sync now?", default=False
+    ):
         return "single"
-    return str(typer.prompt("Role for this machine (primary/secondary)")).strip().lower()
+    return (
+        str(typer.prompt("Role for this machine (primary/secondary)")).strip().lower()
+    )
 
 
 def prompt_setup_fields(
@@ -198,23 +283,51 @@ def prompt_setup_fields(
     peer_brain_home: Optional[Path],
     identity_path: Optional[Path],
     secondary_outbox_path: Optional[Path],
-) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[Path], Optional[Path], Optional[Path]]:
+) -> tuple[
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[Path],
+    Optional[Path],
+    Optional[Path],
+]:
     if role == "primary":
         node_id = node_id or str(typer.prompt("Primary node_id")).strip()
         if typer.confirm("Add a Secondary now?", default=False):
-            peer_node_id = peer_node_id or str(typer.prompt("Secondary node_id")).strip()
+            peer_node_id = (
+                peer_node_id or str(typer.prompt("Secondary node_id")).strip()
+            )
             peer_host = peer_host or str(typer.prompt("SSH host")).strip()
             peer_user = peer_user or str(typer.prompt("SSH user")).strip()
-            peer_brain_home = peer_brain_home or Path(str(typer.prompt("Remote Brain home")).strip())
-            identity = str(typer.prompt("SSH identity file path (optional)", default="")).strip()
+            peer_brain_home = peer_brain_home or Path(
+                str(typer.prompt("Remote Brain home")).strip()
+            )
+            identity = str(
+                typer.prompt("SSH identity file path (optional)", default="")
+            ).strip()
             identity_path = identity_path or (Path(identity) if identity else None)
     elif role == "secondary":
         node_id = node_id or str(typer.prompt("Secondary node_id")).strip()
-        primary_node_id = primary_node_id or str(typer.prompt("Expected Primary node_id")).strip()
+        primary_node_id = (
+            primary_node_id or str(typer.prompt("Expected Primary node_id")).strip()
+        )
         default_outbox = paths.outbox / node_id
-        outbox = str(typer.prompt("Secondary outbox path", default=str(default_outbox))).strip()
+        outbox = str(
+            typer.prompt("Secondary outbox path", default=str(default_outbox))
+        ).strip()
         secondary_outbox_path = secondary_outbox_path or Path(outbox)
-    return node_id, primary_node_id, peer_node_id, peer_host, peer_user, peer_brain_home, identity_path, secondary_outbox_path
+    return (
+        node_id,
+        primary_node_id,
+        peer_node_id,
+        peer_host,
+        peer_user,
+        peer_brain_home,
+        identity_path,
+        secondary_outbox_path,
+    )
 
 
 def emit_setup_result(result: dict[str, object], *, json_output: bool) -> None:
@@ -230,11 +343,15 @@ def emit_setup_result(result: dict[str, object], *, json_output: bool) -> None:
     table.add_row("planned_writes", str(len(result.get("planned_writes", []))))
     table.add_row("validations", ", ".join(result.get("validation_steps", [])))  # type: ignore[arg-type]
     labels = result.get("planned_launch_agent_labels", [])
-    table.add_row("launch_agents", ", ".join(labels) if isinstance(labels, list) else "")
+    table.add_row(
+        "launch_agents", ", ".join(labels) if isinstance(labels, list) else ""
+    )
     table.add_row("dry_run", str(result.get("dry_run", False)))
     table.add_row("applied", str(result.get("applied", False)))
     if result.get("scheduler_install_blocked"):
-        table.add_row("scheduler_blocked", str(result.get("scheduler_block_reason") or "yes"))
+        table.add_row(
+            "scheduler_blocked", str(result.get("scheduler_block_reason") or "yes")
+        )
     console.print(table)
 
 
@@ -246,11 +363,51 @@ def ui_startup_lines(host: str, port: int, token: str) -> list[str]:
 
 
 @app.command()
+def daemon(
+    port: int = typer.Option(
+        0, "--port", help="Loopback port; 0 chooses an ephemeral port."
+    ),
+    serve_web: bool = typer.Option(
+        False,
+        "--serve-web",
+        help="Serve the static browser UI in addition to JSON API.",
+    ),
+    parent_pid: Optional[int] = typer.Option(
+        None, "--parent-pid", help="Exit when this supervising parent PID disappears."
+    ),
+    home: Optional[Path] = typer.Option(None, help="Brain home directory."),
+) -> None:
+    paths = BrainPaths.from_value(home)
+    runtime = BrainDaemon(paths, port=port, serve_web=serve_web, parent_pid=parent_pid)
+    try:
+        runtime.start()
+    except RuntimeError as exc:
+        console.print(str(exc))
+        raise typer.Exit(1)
+    assert runtime.server is not None
+    host, actual_port = runtime.server.server_address
+    console.print(f"Brain daemon listening on http://{host}:{actual_port}")
+    console.print(f"Handshake: {daemon_handshake_path(paths)}")
+    try:
+        runtime.server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        runtime.close()
+
+
+@app.command()
 def init(
     home: Optional[Path] = typer.Option(None, help="Brain home directory."),
     wizard: bool = typer.Option(False, "--wizard", help="Run the guided setup flow."),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Preview setup writes when used with --wizard."),
-    json_output: bool = typer.Option(False, "--json", help="Print machine-readable setup output when used with --wizard."),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Preview setup writes when used with --wizard."
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Print machine-readable setup output when used with --wizard.",
+    ),
     yes: bool = typer.Option(False, "--yes", help="Run wizard non-interactively."),
 ) -> None:
     if wizard:
@@ -281,7 +438,9 @@ def init(
 
 @app.command()
 def setup(
-    role: Optional[str] = typer.Option(None, "--role", help="Setup role: single, primary, or secondary."),
+    role: Optional[str] = typer.Option(
+        None, "--role", help="Setup role: single, primary, or secondary."
+    ),
     node_id: Optional[str] = typer.Option(None, "--node-id"),
     primary_node_id: Optional[str] = typer.Option(None, "--primary-node-id"),
     peer_node_id: Optional[str] = typer.Option(None, "--peer-node-id"),
@@ -292,11 +451,17 @@ def setup(
     identity_path: Optional[Path] = typer.Option(None, "--identity-path"),
     secondary_outbox_path: Optional[Path] = typer.Option(None, "--outbox-path"),
     install_scheduler: bool = typer.Option(False, "--install-scheduler"),
-    interval: int = typer.Option(1800, help="Scheduled sync/capture interval in seconds."),
+    interval: int = typer.Option(
+        1800, help="Scheduled sync/capture interval in seconds."
+    ),
     dry_run: bool = typer.Option(False, "--dry-run"),
     json_output: bool = typer.Option(False, "--json"),
-    yes: bool = typer.Option(False, "--yes", help="Run non-interactively; required fields must be provided."),
-    force: bool = typer.Option(False, "--force", help="Overwrite an existing sync.yaml."),
+    yes: bool = typer.Option(
+        False, "--yes", help="Run non-interactively; required fields must be provided."
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="Overwrite an existing sync.yaml."
+    ),
     home: Optional[Path] = typer.Option(None, help="Brain home directory."),
 ) -> None:
     run_setup_cli(
@@ -337,7 +502,16 @@ def ui(
     if dry_run:
         if bind["warning"]:
             console.print(bind["warning"])
-        console.print_json(json.dumps({**bind, "port": port, "token_path": str(ui_token_path(paths)), "dry_run": True}))
+        console.print_json(
+            json.dumps(
+                {
+                    **bind,
+                    "port": port,
+                    "token_path": str(ui_token_path(paths)),
+                    "dry_run": True,
+                }
+            )
+        )
         return
     token = ensure_ui_token(paths)
     if bind["warning"]:
@@ -352,7 +526,10 @@ def ui(
 
 
 @app.command()
-def doctor(home: Optional[Path] = typer.Option(None), json_output: bool = typer.Option(False, "--json")) -> None:
+def doctor(
+    home: Optional[Path] = typer.Option(None),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
     status = service(home).doctor()
     if json_output:
         console.print_json(json.dumps(status))
@@ -362,9 +539,29 @@ def doctor(home: Optional[Path] = typer.Option(None), json_output: bool = typer.
     table.add_column("Status")
     table.add_column("Detail")
     table.add_row("home", "ok", status["home"])
-    table.add_row("sqlite", "ok" if status["sqlite"] else "missing", str(status["sqlite"]))
-    table.add_row("lancedb", "ok" if status["lancedb"] else "missing", str(status["lancedb"]))
-    table.add_row("embedding_provider", "ok", status["embedding_provider"])
+    table.add_row(
+        "sqlite", "ok" if status["sqlite"] else "missing", str(status["sqlite"])
+    )
+    table.add_row(
+        "lancedb", "ok" if status["lancedb"] else "missing", str(status["lancedb"])
+    )
+    nightly = status.get("nightly") or {}
+    nightly_detail = nightly.get("warning") or (
+        f"last success {nightly.get('last_success_age_hours')}h ago"
+        if nightly.get("last_success_age_hours") is not None
+        else "no status"
+    )
+    table.add_row(
+        "nightly", str(nightly.get("status") or "unknown"), str(nightly_detail)
+    )
+    embedding = status["embedding"]
+    table.add_row(
+        "embedding_provider",
+        "ok" if embedding["available"] else "unavailable",
+        status["embedding_provider"]
+        if embedding["available"]
+        else f"{status['embedding_provider']} ({embedding['reason']})",
+    )
     for name, exists in status["directories"].items():
         table.add_row(f"directory:{name}", "ok" if exists else "missing", str(exists))
     console.print(table)
@@ -372,12 +569,20 @@ def doctor(home: Optional[Path] = typer.Option(None), json_output: bool = typer.
 
 @app.command()
 def ingest(
-    path: Optional[Path] = typer.Argument(None, help="Path to ingest. Defaults to inbox."),
+    path: Optional[Path] = typer.Argument(
+        None, help="Path to ingest. Defaults to inbox."
+    ),
     dry_run: bool = typer.Option(False, "--dry-run"),
-    retry_quarantine: bool = typer.Option(False, "--retry-quarantine", help="Restore and retry files in external inbox quarantine."),
+    retry_quarantine: bool = typer.Option(
+        False,
+        "--retry-quarantine",
+        help="Restore and retry files in external inbox quarantine.",
+    ),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
-    result = service(home).ingest(path, dry_run=dry_run, retry_quarantine=retry_quarantine)
+    result = service(home).ingest(
+        path, dry_run=dry_run, retry_quarantine=retry_quarantine
+    )
     console.print_json(json.dumps(result.as_dict()))
 
 
@@ -396,18 +601,28 @@ def search(
 def retrieve_context(
     task: str = typer.Option(...),
     project: Optional[str] = typer.Option(None),
-    budget: Optional[int] = typer.Option(None, help="Override the selected retrieval mode's token budget."),
-    mode: str = typer.Option("default", help="Retrieval mode: compact, default, broad, or inspect."),
+    budget: Optional[int] = typer.Option(
+        None, help="Override the selected retrieval mode's token budget."
+    ),
+    mode: str = typer.Option(
+        "default", help="Retrieval mode: compact, default, broad, or inspect."
+    ),
     debug: bool = typer.Option(False, "--debug"),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
-    result = service(home).retrieve_context(task, project=project, budget=budget, mode=mode, debug=debug)
+    result = service(home).retrieve_context(
+        task, project=project, budget=budget, mode=mode, debug=debug
+    )
     console.print_json(json.dumps(result))
 
 
 @eval_app.command("run")
 def eval_run(
-    suite: Optional[str] = typer.Option(None, "--suite", help="Eval suite: extraction, routing, topology, conflict, or retrieval."),
+    suite: Optional[str] = typer.Option(
+        None,
+        "--suite",
+        help="Eval suite: extraction, routing, topology, conflict, relations, or retrieval.",
+    ),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
     svc = service(home)
@@ -422,12 +637,38 @@ def eval_run(
         raise typer.Exit(1)
 
 
+@eval_app.command("purge-retrieval-telemetry")
+def eval_purge_retrieval_telemetry(
+    dry_run: bool = typer.Option(
+        True,
+        "--dry-run/--apply",
+        help="Preview by default; --apply removes legacy eval lineage and relabels its retrieval events.",
+    ),
+    sample_limit: int = typer.Option(
+        20, "--sample-limit", min=1, max=100, help="Maximum sample rows to report."
+    ),
+    home: Optional[Path] = typer.Option(None, help="Brain home directory."),
+) -> None:
+    svc = service(home)
+    svc.init_workspace()
+    result = purge_retrieval_eval_telemetry(
+        svc.paths,
+        dry_run=dry_run,
+        sample_limit=sample_limit,
+    )
+    console.print_json(json.dumps(result))
+
+
 @context_app.command("feedback")
 def context_feedback(
     target_type: str,
     target_id: str,
-    useful: bool = typer.Option(False, "--useful", help="Mark the target as useful context."),
-    not_useful: bool = typer.Option(False, "--not-useful", help="Mark the target as not useful context."),
+    useful: bool = typer.Option(
+        False, "--useful", help="Mark the target as useful context."
+    ),
+    not_useful: bool = typer.Option(
+        False, "--not-useful", help="Mark the target as not useful context."
+    ),
     note: Optional[str] = typer.Option(None, "--note"),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
@@ -435,7 +676,9 @@ def context_feedback(
         console.print("Choose exactly one of --useful or --not-useful.")
         raise typer.Exit(1)
     try:
-        result = service(home).record_context_feedback(target_type, target_id, useful=useful, note=note)
+        result = service(home).record_context_feedback(
+            target_type, target_id, useful=useful, note=note
+        )
     except ValueError as exc:
         console.print(str(exc))
         raise typer.Exit(1)
@@ -443,11 +686,15 @@ def context_feedback(
 
 
 @inspect_app.command("document")
-def inspect_document(document_id: str, home: Optional[Path] = typer.Option(None)) -> None:
+def inspect_document(
+    document_id: str, home: Optional[Path] = typer.Option(None)
+) -> None:
     svc = service(home)
     svc.init_workspace()
     with connection(svc.paths.sqlite_path) as conn:
-        row = conn.execute("SELECT * FROM documents WHERE id = ?", (document_id,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM documents WHERE id = ?", (document_id,)
+        ).fetchone()
     if not row:
         console.print(f"Document not found: {document_id}")
         raise typer.Exit(1)
@@ -459,7 +706,11 @@ def inspect_chunks(document_id: str, home: Optional[Path] = typer.Option(None)) 
     svc = service(home)
     svc.init_workspace()
     with connection(svc.paths.sqlite_path) as conn:
-        found = rows(conn, "SELECT * FROM chunks WHERE document_id = ? ORDER BY chunk_index", (document_id,))
+        found = rows(
+            conn,
+            "SELECT * FROM chunks WHERE document_id = ? ORDER BY chunk_index",
+            (document_id,),
+        )
     table = Table(title=f"Chunks for {document_id}")
     for col in ["chunk_index", "id", "heading_path", "token_count", "preview"]:
         table.add_column(col)
@@ -488,26 +739,82 @@ def index_doctor(home: Optional[Path] = typer.Option(None)) -> None:
 
 @index_app.command("optimize")
 def index_optimize(
-    cleanup_older_than_days: int = typer.Option(1, "--cleanup-older-than-days", help="Delete LanceDB versions older than this many days."),
+    cleanup_older_than_days: int = typer.Option(
+        1,
+        "--cleanup-older-than-days",
+        help="Delete LanceDB versions older than this many days.",
+    ),
+    fts: bool = typer.Option(
+        False,
+        "--fts",
+        help="Also run FTS5 optimize merges for chunk and retrieval FTS tables.",
+    ),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
-    console.print_json(json.dumps(service(home).optimize_indexes(cleanup_older_than_days=cleanup_older_than_days)))
+    svc = service(home)
+    if not fts:
+        console.print_json(
+            json.dumps(
+                svc.optimize_indexes(cleanup_older_than_days=cleanup_older_than_days)
+            )
+        )
+        return
+    result = {
+        "status": "ok",
+        "vectors": svc.optimize_indexes(
+            cleanup_older_than_days=cleanup_older_than_days
+        ),
+        "fts": svc.optimize_fts_indexes(),
+    }
+    console.print_json(json.dumps(result))
 
 
 @index_app.command("rebuild-vectors")
 def index_rebuild_vectors(
-    delete_backup: bool = typer.Option(False, "--delete-backup", help="Delete the previous LanceDB backup after verification succeeds."),
+    delete_backup: bool = typer.Option(
+        False,
+        "--delete-backup",
+        help="Delete the previous LanceDB backup after verification succeeds.",
+    ),
+    missing_only: bool = typer.Option(
+        False, "--missing-only", help="Only write vectors missing from LanceDB."
+    ),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
-    result = service(home).rebuild_vector_index(delete_backup=delete_backup)
+    result = service(home).rebuild_vector_index(
+        delete_backup=delete_backup, missing_only=missing_only
+    )
     console.print_json(json.dumps(result))
     if result["status"] != "ok":
         raise typer.Exit(1)
 
 
+@embeddings_app.command("status")
+def embeddings_status(
+    home: Optional[Path] = typer.Option(None),
+    check: bool = typer.Option(
+        False,
+        "--check",
+        help="Load the configured embedding model to verify availability.",
+    ),
+) -> None:
+    svc = service(home)
+    console.print_json(json.dumps(svc.embedding_provider.status(check_available=check)))
+
+
+@embeddings_app.command("download")
+def embeddings_download(home: Optional[Path] = typer.Option(None)) -> None:
+    result = service(home).download_embedding_model()
+    console.print_json(json.dumps(result))
+    if result["status"] == "failed":
+        raise typer.Exit(1)
+
+
 @index_app.command("reset-retrieval")
 def index_reset_retrieval(
-    yes: bool = typer.Option(False, "--yes", help="Confirm destructive retrieval/index reset."),
+    yes: bool = typer.Option(
+        False, "--yes", help="Confirm destructive retrieval/index reset."
+    ),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
     if not yes:
@@ -523,11 +830,29 @@ def index_reset_retrieval(
 
 @db_app.command("reindex-chunks")
 def db_reindex_chunks(
-    source_type: str = typer.Option("agent_session_log", "--source-type", help="Only reindex documents with this source_type."),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Report affected documents and projected chunks without writing."),
-    all_documents: bool = typer.Option(False, "--all-documents", help="Reindex all documents of the source type, not only oversized chunks."),
-    target_tokens: int = typer.Option(1200, "--target-tokens", help="Maximum tokens per regenerated chunk."),
-    overlap_tokens: int = typer.Option(200, "--overlap-tokens", help="Tokens to overlap between split oversized chunks."),
+    source_type: str = typer.Option(
+        "agent_session_log",
+        "--source-type",
+        help="Only reindex documents with this source_type.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Report affected documents and projected chunks without writing.",
+    ),
+    all_documents: bool = typer.Option(
+        False,
+        "--all-documents",
+        help="Reindex all documents of the source type, not only oversized chunks.",
+    ),
+    target_tokens: int = typer.Option(
+        1200, "--target-tokens", help="Maximum tokens per regenerated chunk."
+    ),
+    overlap_tokens: int = typer.Option(
+        200,
+        "--overlap-tokens",
+        help="Tokens to overlap between split oversized chunks.",
+    ),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
     result = service(home).reindex_chunks(
@@ -542,6 +867,82 @@ def db_reindex_chunks(
         raise typer.Exit(1)
 
 
+@db_app.command("compact-retrieval-events")
+def db_compact_retrieval_events(
+    older_than_days: int = typer.Option(
+        90,
+        "--older-than-days",
+        help="Clear retrieval event payloads older than this many days.",
+    ),
+    automation_summary_older_than_days: int = typer.Option(
+        180,
+        "--automation-summary-older-than-days",
+        help="Clear automation run summaries older than this many days.",
+    ),
+    dry_run: bool = typer.Option(
+        True,
+        "--dry-run/--apply",
+        help="Preview by default; pass --apply to write compaction changes.",
+    ),
+    vacuum: bool = typer.Option(
+        False,
+        "--vacuum",
+        help="After --apply, run SQLite VACUUM to return free pages to disk.",
+    ),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    try:
+        result = service(home).compact_retrieval_events(
+            older_than_days=older_than_days,
+            automation_summary_older_than_days=automation_summary_older_than_days,
+            dry_run=dry_run,
+            vacuum=vacuum,
+        )
+    except ValueError as exc:
+        console.print(str(exc))
+        raise typer.Exit(1)
+    console.print_json(json.dumps(result))
+
+
+@maintenance_app.command("prune")
+def maintenance_prune(
+    commit: bool = typer.Option(
+        False, "--commit", help="Delete/rotate the reported artifacts."
+    ),
+    keep_runtime_backups: int = typer.Option(3, "--keep-runtime-backups", min=0),
+    keep_days: int = typer.Option(30, "--keep-days", min=0),
+    max_log_bytes: int = typer.Option(10_000_000, "--max-log-bytes", min=1),
+    keep_log_rotations: int = typer.Option(3, "--keep-log-rotations", min=0),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    paths = BrainPaths.from_value(home)
+    BrainService(paths).init_workspace()
+    result = prune_runtime_artifacts(
+        paths,
+        commit=commit,
+        keep_runtime_backups=keep_runtime_backups,
+        keep_days=keep_days,
+        max_log_bytes=max_log_bytes,
+        keep_log_rotations=keep_log_rotations,
+    )
+    console.print_json(json.dumps(result))
+
+
+@maintenance_app.command("inventory")
+def maintenance_inventory(
+    app_support: Optional[Path] = typer.Option(
+        None,
+        "--app-support",
+        help="Override the PKM Brain Application Support directory.",
+    ),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    paths = BrainPaths.from_value(home)
+    console.print_json(
+        json.dumps(managed_storage_inventory(paths, app_support=app_support))
+    )
+
+
 @wiki_app.command("lint")
 def wiki_lint(home: Optional[Path] = typer.Option(None)) -> None:
     svc = service(home)
@@ -554,9 +955,21 @@ def wiki_lint(home: Optional[Path] = typer.Option(None)) -> None:
 
 @wiki_app.command("migrate-to-facts")
 def wiki_migrate_to_facts(
-    dry_run: bool = typer.Option(True, "--dry-run/--apply", help="Preview by default; pass --apply to write facts."),
-    overwrite_existing: bool = typer.Option(False, "--overwrite-existing", help="Allow managed page regeneration to overwrite existing wiki pages."),
-    include_references: bool = typer.Option(False, "--include-references", help="Also import reference pages; usually not needed for this one-time migration."),
+    dry_run: bool = typer.Option(
+        True,
+        "--dry-run/--apply",
+        help="Preview by default; pass --apply to write facts.",
+    ),
+    overwrite_existing: bool = typer.Option(
+        False,
+        "--overwrite-existing",
+        help="Allow managed page regeneration to overwrite existing wiki pages.",
+    ),
+    include_references: bool = typer.Option(
+        False,
+        "--include-references",
+        help="Also import reference pages; usually not needed for this one-time migration.",
+    ),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
     svc = service(home)
@@ -575,7 +988,11 @@ def wiki_migrate_to_facts(
 
 @wiki_app.command("curate-facts")
 def wiki_curate_facts(
-    overwrite_existing: bool = typer.Option(False, "--overwrite-existing", help="Allow managed page regeneration to overwrite existing wiki pages."),
+    overwrite_existing: bool = typer.Option(
+        False,
+        "--overwrite-existing",
+        help="Allow managed page regeneration to overwrite existing wiki pages.",
+    ),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
     svc = service(home)
@@ -598,10 +1015,26 @@ def wiki_curate_facts(
 
 @wiki_app.command("promote-curation")
 def wiki_promote_curation(
-    source_home: Path = typer.Option(..., "--source-home", help="Forked Brain home containing resolved curation state."),
-    dry_run: bool = typer.Option(True, "--dry-run/--apply", help="Preview by default; pass --apply to promote curation state."),
-    replace_existing: bool = typer.Option(False, "--replace-existing", help="Allow replacing existing target facts/questions/runs."),
-    backup: bool = typer.Option(True, "--backup/--no-backup", help="Back up the target DB and wiki before applying."),
+    source_home: Path = typer.Option(
+        ...,
+        "--source-home",
+        help="Forked Brain home containing resolved curation state.",
+    ),
+    dry_run: bool = typer.Option(
+        True,
+        "--dry-run/--apply",
+        help="Preview by default; pass --apply to promote curation state.",
+    ),
+    replace_existing: bool = typer.Option(
+        False,
+        "--replace-existing",
+        help="Allow replacing existing target facts/questions/runs.",
+    ),
+    backup: bool = typer.Option(
+        True,
+        "--backup/--no-backup",
+        help="Back up the target DB and wiki before applying.",
+    ),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
     target = BrainPaths.from_value(home)
@@ -622,6 +1055,365 @@ def llm_doctor(provider: Optional[str] = typer.Option(None)) -> None:
     console.print_json(json.dumps(provider_status(provider)))
 
 
+@cos_app.command("providers")
+def cos_providers(
+    home: Optional[Path] = typer.Option(None, help="Brain home directory."),
+    json_output: bool = typer.Option(
+        False, "--json", help="Print machine-readable provider status."
+    ),
+) -> None:
+    result = cos_provider_status(BrainPaths.from_value(home))
+    if json_output:
+        console.print_json(json.dumps(result))
+        return
+    table = Table(title="CoS LLM Providers")
+    table.add_column("Role")
+    table.add_column("Provider")
+    table.add_column("Model")
+    table.add_column("Effort")
+    table.add_column("Ready")
+    table.add_column("Source")
+    table.add_column("Missing")
+    for row in result["roles"]:
+        table.add_row(
+            str(row["role"]),
+            str(row.get("provider") or "unconfigured"),
+            str(row.get("model") or ""),
+            str(row.get("reasoning_effort") or ""),
+            "yes" if row.get("configured") else "no",
+            str(row.get("provider_source") or ""),
+            ", ".join(row.get("missing") or []),
+        )
+    console.print(
+        f"Config: {result['config_path']} ({'present' if result['config_exists'] else 'absent'})"
+    )
+    console.print(table)
+    if result["warnings"]:
+        console.print("Warnings:")
+        for warning in result["warnings"]:
+            console.print(f"- {warning}")
+
+
+@cos_app.command("promote-policy")
+def cos_promote_policy(
+    reason: str = typer.Option(
+        "activate chief-of-staff low/medium autonomy", "--reason"
+    ),
+    large_topology_fact_threshold: int = typer.Option(
+        8, "--large-topology-fact-threshold"
+    ),
+    strictness: str = typer.Option(
+        "balanced",
+        "--strictness",
+        help="Curation autonomy: strict, balanced, or lenient.",
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", help="Confirm policy promotion non-interactively."
+    ),
+    home: Optional[Path] = typer.Option(None, help="Brain home directory."),
+) -> None:
+    if not yes:
+        typer.confirm("Create a new active CoS autonomy policy version?", abort=True)
+    paths = BrainPaths.from_value(home)
+    BrainService(paths).init_workspace()
+    normalized_strictness = normalize_curation_strictness(strictness)
+    minimum_auto_confidence = float(
+        CURATION_STRICTNESS_PROFILES[normalized_strictness]["minimum_auto_confidence"]
+    )
+    with connection(paths.sqlite_path) as conn:
+        version = promote_policy_for_autonomy(
+            conn,
+            reason=reason,
+            large_topology_fact_threshold=large_topology_fact_threshold,
+            strictness=normalized_strictness,
+            minimum_auto_confidence=minimum_auto_confidence,
+        )
+    console.print_json(
+        json.dumps(
+            {
+                "status": "ok",
+                "policy_version": version,
+                "large_topology_fact_threshold": large_topology_fact_threshold,
+                "strictness": normalized_strictness,
+                "minimum_auto_confidence": minimum_auto_confidence,
+            }
+        )
+    )
+
+
+@cos_app.command("reconcile-policy-escalations")
+def cos_reconcile_policy_escalations(
+    dry_run: bool = typer.Option(
+        True,
+        "--dry-run/--apply",
+        help="Preview by default; --apply re-decides eligible actions under the active policy.",
+    ),
+    limit: Optional[int] = typer.Option(
+        None, "--limit", min=1, help="Maximum active Policy questions to inspect."
+    ),
+    critic_disagreement_mode: str = typer.Option(
+        "reject",
+        "--critic-disagreement-mode",
+        help="How critic disagreement is handled for eligible actions.",
+    ),
+    critic_workers: Optional[int] = typer.Option(
+        None, "--critic-workers", min=1, help="Parallel critic workers for apply mode."
+    ),
+    critic_timeout_seconds: Optional[int] = typer.Option(
+        None,
+        "--critic-timeout-seconds",
+        min=1,
+        help="Per-action critic timeout for apply mode.",
+    ),
+    home: Optional[Path] = typer.Option(None, help="Brain home directory."),
+) -> None:
+    paths = BrainPaths.from_value(home)
+    BrainService(paths).init_workspace()
+    review = critic_review_config(
+        {},
+        disagreement_mode=critic_disagreement_mode,
+        max_workers=critic_workers,
+        timeout_seconds=critic_timeout_seconds,
+    )
+    result = reconcile_policy_escalations(
+        paths,
+        dry_run=dry_run,
+        limit=limit,
+        critic_review=review,
+    )
+    console.print_json(json.dumps(result))
+
+
+@cos_app.command("reconcile-topology")
+def cos_reconcile_topology(
+    dry_run: bool = typer.Option(
+        True,
+        "--dry-run/--apply",
+        help="Preview by default; --apply rechecks open topology under current settings and policy.",
+    ),
+    critic_disagreement_mode: str = typer.Option(
+        "reject",
+        "--critic-disagreement-mode",
+        help="How critic disagreement is handled for currently admitted topology actions.",
+    ),
+    critic_workers: Optional[int] = typer.Option(
+        None, "--critic-workers", min=1, help="Parallel critic workers for apply mode."
+    ),
+    critic_timeout_seconds: Optional[int] = typer.Option(
+        None,
+        "--critic-timeout-seconds",
+        min=1,
+        help="Per-action critic timeout for apply mode.",
+    ),
+    home: Optional[Path] = typer.Option(None, help="Brain home directory."),
+) -> None:
+    paths = BrainPaths.from_value(home)
+    BrainService(paths).init_workspace()
+    review = critic_review_config(
+        {},
+        disagreement_mode=critic_disagreement_mode,
+        max_workers=critic_workers,
+        timeout_seconds=critic_timeout_seconds,
+    )
+    result = reconcile_topology_proposals(
+        paths,
+        dry_run=dry_run,
+        critic_review=review,
+    )
+    console.print_json(json.dumps(result))
+
+
+@cos_app.command("run")
+def cos_run(
+    llm_wiki: bool = typer.Option(True, "--llm-wiki/--no-llm-wiki"),
+    home: Optional[Path] = typer.Option(None, help="Brain home directory."),
+) -> None:
+    paths = BrainPaths.from_value(home)
+    result = run_cos_once(paths, llm_wiki=llm_wiki)
+    console.print_json(json.dumps(result))
+
+
+@cos_app.command("queue-summary")
+def cos_queue_summary(
+    home: Optional[Path] = typer.Option(None, help="Brain home directory."),
+) -> None:
+    paths = BrainPaths.from_value(home)
+    BrainService(paths).init_workspace()
+    console.print_json(json.dumps(review_queue_summary(paths)))
+
+
+@cos_app.command("export-human-state")
+def cos_export_human_state(
+    output_dir: Optional[Path] = typer.Option(
+        None, "--output-dir", help="Directory for human_state.json."
+    ),
+    home: Optional[Path] = typer.Option(None, help="Brain home directory."),
+) -> None:
+    result = export_human_state(BrainPaths.from_value(home), output_dir=output_dir)
+    console.print_json(json.dumps(result))
+
+
+@cos_app.command("backup-runtime")
+def cos_backup_runtime(
+    output_dir: Optional[Path] = typer.Option(
+        None, "--output-dir", help="Directory for db/wiki backup."
+    ),
+    home: Optional[Path] = typer.Option(None, help="Brain home directory."),
+) -> None:
+    result = backup_runtime_brain(BrainPaths.from_value(home), output_dir=output_dir)
+    console.print_json(json.dumps(result))
+
+
+@cos_app.command("rebuild-facts")
+def cos_rebuild_facts(
+    from_sources: bool = typer.Option(
+        False, "--from-sources", help="Plan a rebuild from active source documents."
+    ),
+    dry_run: bool = typer.Option(
+        True,
+        "--dry-run/--apply",
+        help="Preview by default; --apply executes the from-source rebuild.",
+    ),
+    source_type: Optional[list[str]] = typer.Option(
+        None, "--source-type", help="Restrict to a source_type; may be repeated."
+    ),
+    limit: Optional[int] = typer.Option(
+        None, "--limit", min=1, help="Maximum source documents to include."
+    ),
+    offset: int = typer.Option(
+        0,
+        "--offset",
+        min=0,
+        help="Skip this many selected source documents for tranche continuation.",
+    ),
+    reset: Optional[bool] = typer.Option(
+        None,
+        "--reset/--continue-run",
+        help="Archive existing derived state before apply. Defaults to reset only when offset is 0.",
+    ),
+    home: Optional[Path] = typer.Option(None, help="Brain home directory."),
+) -> None:
+    try:
+        result = rebuild_facts_from_sources(
+            BrainPaths.from_value(home),
+            from_sources=from_sources,
+            dry_run=dry_run,
+            source_types=source_type or [],
+            limit=limit,
+            offset=offset,
+            reset=reset,
+        )
+    except ValueError as exc:
+        console.print(str(exc))
+        raise typer.Exit(1)
+    console.print_json(json.dumps(result))
+
+
+@cos_app.command("reclaim-unrouted")
+def cos_reclaim_unrouted(
+    dry_run: bool = typer.Option(
+        True,
+        "--dry-run/--apply",
+        help="Preview by default; --apply writes replacement actions and resolves reclaimed residue.",
+    ),
+    limit: Optional[int] = typer.Option(
+        None, "--limit", min=1, help="Maximum unrouted residue questions to inspect."
+    ),
+    min_score: float = typer.Option(
+        8.0,
+        "--min-score",
+        help="Minimum deterministic route score required to reclaim.",
+    ),
+    min_overlap: int = typer.Option(
+        2,
+        "--min-overlap",
+        min=1,
+        help="Minimum route-token overlap unless the page phrase is an exact substring.",
+    ),
+    critic_disagreement_mode: str = typer.Option(
+        "reject",
+        "--critic-disagreement-mode",
+        help="How critic disagreement is handled for reclaimed fact_upsert actions.",
+    ),
+    critic_workers: Optional[int] = typer.Option(
+        None, "--critic-workers", min=1, help="Parallel critic workers for apply mode."
+    ),
+    critic_timeout_seconds: Optional[int] = typer.Option(
+        None,
+        "--critic-timeout-seconds",
+        min=1,
+        help="Per-fact critic timeout for apply mode.",
+    ),
+    home: Optional[Path] = typer.Option(None, help="Brain home directory."),
+) -> None:
+    paths = BrainPaths.from_value(home)
+    BrainService(paths).init_workspace()
+    review = critic_review_config(
+        {},
+        disagreement_mode=critic_disagreement_mode,
+        max_workers=critic_workers,
+        timeout_seconds=critic_timeout_seconds,
+    )
+    result = reclaim_unrouted_facts(
+        paths,
+        dry_run=dry_run,
+        limit=limit,
+        min_score=min_score,
+        min_overlap=min_overlap,
+        critic_review=review,
+    )
+    console.print_json(json.dumps(result))
+
+
+@cos_app.command("reconcile-backlog")
+def cos_reconcile_backlog(
+    scope: str = typer.Option(
+        "w2b", "--scope", help="Backlog scope to inspect: w2b or w2a."
+    ),
+    dry_run: bool = typer.Option(
+        True,
+        "--dry-run/--apply",
+        help="Preview by default; apply requires the scope's explicit approval boundary.",
+    ),
+    approved_by_peter: bool = typer.Option(
+        False,
+        "--approved-by-peter",
+        help="Record Peter's explicit approval for a gated W2a apply.",
+    ),
+    sample_limit: int = typer.Option(
+        10, "--sample-limit", min=1, max=100, help="Maximum sample rows per section."
+    ),
+    output: Optional[Path] = typer.Option(
+        None, "--output", help="Optional path for the JSON dry-run report."
+    ),
+    home: Optional[Path] = typer.Option(None, help="Brain home directory."),
+) -> None:
+    normalized_scope = scope.strip().lower()
+    if normalized_scope not in {"w2b", "w2a"}:
+        console.print(f"unsupported reconcile scope: {scope}")
+        raise typer.Exit(1)
+    if normalized_scope == "w2a" and not dry_run and not approved_by_peter:
+        console.print("W2a --apply requires Peter's explicit --approved-by-peter flag.")
+        raise typer.Exit(1)
+    paths = BrainPaths.from_value(home)
+    BrainService(paths).init_workspace()
+    if normalized_scope == "w2a" and dry_run:
+        report = reconcile_backlog_w2a_dry_run(paths, sample_limit=sample_limit)
+    elif normalized_scope == "w2a":
+        report = reconcile_backlog_w2a_apply(
+            paths,
+            approved_by="Peter",
+            sample_limit=sample_limit,
+        )
+    elif dry_run:
+        report = reconcile_backlog_w2b_dry_run(paths, sample_limit=sample_limit)
+    else:
+        report = reconcile_backlog_w2b_apply(paths, sample_limit=sample_limit)
+    if output is not None:
+        write_reconcile_report(report, output)
+    console.print_json(json.dumps(report))
+
+
 @memory_app.command("propose")
 def memory_propose(
     memory_type: str,
@@ -631,12 +1423,21 @@ def memory_propose(
     confidence: float = typer.Option(0.8),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
-    memory_id = service(home).propose_memory(memory_type, scope, content, source, confidence)
+    try:
+        memory_id = service(home).propose_memory(
+            memory_type, scope, content, source, confidence
+        )
+    except ValueError as exc:
+        console.print(str(exc))
+        raise typer.Exit(1)
     console.print_json(json.dumps({"memory_id": memory_id, "status": "proposed"}))
 
 
 @memory_app.command("list")
-def memory_list(status: Optional[str] = typer.Option(None), home: Optional[Path] = typer.Option(None)) -> None:
+def memory_list(
+    status: Optional[str] = typer.Option(None),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
     svc = service(home)
     console.print_json(json.dumps(svc.list_memories(status=status)))
 
@@ -662,10 +1463,55 @@ def memory_approve(memory_id: str, home: Optional[Path] = typer.Option(None)) ->
     console.print_json(json.dumps(result))
 
 
+@cos_app.command("reconcile-conflicts")
+def cos_reconcile_conflicts(
+    dry_run: bool = typer.Option(
+        True,
+        "--dry-run/--apply",
+        help="Preview by default; --apply releases false conflicts through normal policy evaluation.",
+    ),
+    limit: Optional[int] = typer.Option(
+        None, "--limit", min=1, help="Maximum active conflict questions to inspect."
+    ),
+    critic_disagreement_mode: str = typer.Option(
+        "reject",
+        "--critic-disagreement-mode",
+        help="How critic disagreement is handled after a false conflict is released.",
+    ),
+    critic_workers: Optional[int] = typer.Option(
+        None, "--critic-workers", min=1, help="Parallel critic workers for apply mode."
+    ),
+    critic_timeout_seconds: Optional[int] = typer.Option(
+        None,
+        "--critic-timeout-seconds",
+        min=1,
+        help="Per-fact critic timeout for apply mode.",
+    ),
+    home: Optional[Path] = typer.Option(None, help="Brain home directory."),
+) -> None:
+    paths = BrainPaths.from_value(home)
+    BrainService(paths).init_workspace()
+    review = critic_review_config(
+        {},
+        disagreement_mode=critic_disagreement_mode,
+        max_workers=critic_workers,
+        timeout_seconds=critic_timeout_seconds,
+    )
+    result = reconcile_fact_conflict_reviews(
+        paths,
+        dry_run=dry_run,
+        limit=limit,
+        critic_review=review,
+    )
+    console.print_json(json.dumps(result))
+
+
 @memory_app.command("reject")
 def memory_reject(
     memory_id: str,
-    reason: str = typer.Option(..., "--reason", help="Reason for rejecting the proposed memory."),
+    reason: str = typer.Option(
+        ..., "--reason", help="Reason for rejecting the proposed memory."
+    ),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
     try:
@@ -694,12 +1540,16 @@ def memory_export_all(home: Optional[Path] = typer.Option(None)) -> None:
 
 @memory_app.command("import")
 def memory_import(
-    from_dir: Path = typer.Option(..., "--from", help="Directory containing memory markdown exports."),
+    from_dir: Path = typer.Option(
+        ..., "--from", help="Directory containing memory markdown exports."
+    ),
     allow_missing_sources: bool = typer.Option(False, "--allow-missing-sources"),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
     try:
-        result = service(home).import_memories(from_dir, allow_missing_sources=allow_missing_sources)
+        result = service(home).import_memories(
+            from_dir, allow_missing_sources=allow_missing_sources
+        )
     except ValueError as exc:
         console.print(str(exc))
         raise typer.Exit(1)
@@ -716,7 +1566,9 @@ def memory_propose_from_sources(
 ) -> None:
     svc = service(home)
     svc.init_workspace()
-    result = propose_failure_memories_from_sources(svc.paths, provider_name=provider, limit=limit)
+    result = propose_failure_memories_from_sources(
+        svc.paths, provider_name=provider, limit=limit
+    )
     console.print_json(json.dumps(result))
 
 
@@ -728,7 +1580,9 @@ def memory_propose_from_lineage(
 ) -> None:
     svc = service(home)
     svc.init_workspace()
-    result = propose_memories_from_lineage(svc.paths, provider_name=provider, limit=limit)
+    result = propose_memories_from_lineage(
+        svc.paths, provider_name=provider, limit=limit
+    )
     console.print_json(json.dumps(result))
 
 
@@ -757,7 +1611,12 @@ def runs_list(home: Optional[Path] = typer.Option(None)) -> None:
     svc = service(home)
     svc.init_workspace()
     with connection(svc.paths.sqlite_path) as conn:
-        found = [dict(row) for row in rows(conn, "SELECT * FROM ingestion_runs ORDER BY started_at DESC LIMIT 20")]
+        found = [
+            dict(row)
+            for row in rows(
+                conn, "SELECT * FROM ingestion_runs ORDER BY started_at DESC LIMIT 20"
+            )
+        ]
     console.print_json(json.dumps(found))
 
 
@@ -766,7 +1625,9 @@ def runs_inspect(run_id: str, home: Optional[Path] = typer.Option(None)) -> None
     svc = service(home)
     svc.init_workspace()
     with connection(svc.paths.sqlite_path) as conn:
-        row = conn.execute("SELECT * FROM ingestion_runs WHERE id = ?", (run_id,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM ingestion_runs WHERE id = ?", (run_id,)
+        ).fetchone()
     if not row:
         console.print(f"Run not found: {run_id}")
         raise typer.Exit(1)
@@ -778,7 +1639,7 @@ def sync_doctor(
     home: Optional[Path] = typer.Option(None),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    svc = BrainService(BrainPaths.from_value(home), prefer_model_embeddings=False)
+    svc = BrainService(BrainPaths.from_value(home))
     result = svc.sync_doctor()
     if json_output:
         console.print_json(json.dumps(result))
@@ -800,13 +1661,19 @@ def sync_doctor(
 @sync_app.command("init-primary")
 def sync_init_primary(
     node_id: Optional[str] = typer.Option(None, "--node-id"),
-    yes: bool = typer.Option(False, "--yes", help="Run non-interactively; required fields must be provided."),
-    force: bool = typer.Option(False, "--force", help="Overwrite an existing sync.yaml."),
+    yes: bool = typer.Option(
+        False, "--yes", help="Run non-interactively; required fields must be provided."
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="Overwrite an existing sync.yaml."
+    ),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
     paths = BrainPaths.from_value(home)
     try:
-        resolved_node_id = required_or_prompt(node_id, "--node-id", "Primary node_id", yes)
+        resolved_node_id = required_or_prompt(
+            node_id, "--node-id", "Primary node_id", yes
+        )
         result = sync_init_primary_config(paths, resolved_node_id, force=force)
     except ValueError as exc:
         console.print(str(exc))
@@ -819,14 +1686,22 @@ def sync_init_secondary(
     node_id: Optional[str] = typer.Option(None, "--node-id"),
     primary_node_id: Optional[str] = typer.Option(None, "--primary-node-id"),
     outbox_path: Optional[Path] = typer.Option(None, "--outbox-path"),
-    yes: bool = typer.Option(False, "--yes", help="Run non-interactively; required fields must be provided."),
-    force: bool = typer.Option(False, "--force", help="Overwrite an existing sync.yaml."),
+    yes: bool = typer.Option(
+        False, "--yes", help="Run non-interactively; required fields must be provided."
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="Overwrite an existing sync.yaml."
+    ),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
     paths = BrainPaths.from_value(home)
     try:
-        resolved_node_id = required_or_prompt(node_id, "--node-id", "Secondary node_id", yes)
-        resolved_primary_node_id = required_or_prompt(primary_node_id, "--primary-node-id", "Expected Primary node_id", yes)
+        resolved_node_id = required_or_prompt(
+            node_id, "--node-id", "Secondary node_id", yes
+        )
+        resolved_primary_node_id = required_or_prompt(
+            primary_node_id, "--primary-node-id", "Expected Primary node_id", yes
+        )
         result = sync_init_secondary_config(
             paths,
             resolved_node_id,
@@ -846,24 +1721,47 @@ def sync_add_peer(
     host: Optional[str] = typer.Option(None, "--host"),
     user: Optional[str] = typer.Option(None, "--user"),
     brain_home: Optional[Path] = typer.Option(None, "--brain-home"),
-    outbox_path: Optional[Path] = typer.Option(None, "--outbox-path", help="Remote outbox path when not <brain-home>/outbox/<node-id>."),
+    outbox_path: Optional[Path] = typer.Option(
+        None,
+        "--outbox-path",
+        help="Remote outbox path when not <brain-home>/outbox/<node-id>.",
+    ),
     identity_path: Optional[Path] = typer.Option(None, "--identity-path"),
     allow_first_host_key: bool = typer.Option(False, "--allow-first-host-key"),
-    test_connection_now: bool = typer.Option(False, "--test-connection", help="Run test-connection after adding the peer."),
-    yes: bool = typer.Option(False, "--yes", help="Run non-interactively; required fields must be provided."),
+    test_connection_now: bool = typer.Option(
+        False, "--test-connection", help="Run test-connection after adding the peer."
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", help="Run non-interactively; required fields must be provided."
+    ),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
     paths = BrainPaths.from_value(home)
     try:
-        resolved_node_id = required_or_prompt(node_id, "--node-id", "Secondary node_id", yes)
+        resolved_node_id = required_or_prompt(
+            node_id, "--node-id", "Secondary node_id", yes
+        )
         resolved_host = required_or_prompt(host, "--host", "SSH host", yes)
         resolved_user = required_or_prompt(user, "--user", "SSH user", yes)
-        resolved_brain_home = Path(required_or_prompt(str(brain_home) if brain_home else None, "--brain-home", "Remote Brain home", yes))
+        resolved_brain_home = Path(
+            required_or_prompt(
+                str(brain_home) if brain_home else None,
+                "--brain-home",
+                "Remote Brain home",
+                yes,
+            )
+        )
         host_key_candidate = None
         if allow_first_host_key:
-            candidate, observed_fingerprint = first_host_key_with_fingerprint(resolved_host)
-            console.print(f"Observed host key fingerprint for {resolved_host}: {observed_fingerprint}")
-            if not yes and not typer.confirm("Accept this host key fingerprint after out-of-band verification?"):
+            candidate, observed_fingerprint = first_host_key_with_fingerprint(
+                resolved_host
+            )
+            console.print(
+                f"Observed host key fingerprint for {resolved_host}: {observed_fingerprint}"
+            )
+            if not yes and not typer.confirm(
+                "Accept this host key fingerprint after out-of-band verification?"
+            ):
                 raise ValueError("host key was not accepted")
             host_key_candidate = candidate
         result = sync_add_peer_config(
@@ -880,7 +1778,9 @@ def sync_add_peer(
         if not yes and not should_test:
             should_test = typer.confirm("Test connection now?", default=False)
         if should_test:
-            result["connection_test"] = run_sync_test_connection(paths, resolved_node_id).as_dict()
+            result["connection_test"] = run_sync_test_connection(
+                paths, resolved_node_id
+            ).as_dict()
     except (RuntimeError, ValueError) as exc:
         console.print(str(exc))
         raise typer.Exit(1)
@@ -949,8 +1849,12 @@ def sync_push(
 @sync_app.command("run")
 def sync_run(
     peer_node_id: str,
-    if_reachable: bool = typer.Option(False, "--if-reachable", help="Skip cleanly when the peer is unreachable."),
-    no_remote_ingest: bool = typer.Option(False, "--no-remote-ingest", help="Skip remote ingest after a successful push."),
+    if_reachable: bool = typer.Option(
+        False, "--if-reachable", help="Skip cleanly when the peer is unreachable."
+    ),
+    no_remote_ingest: bool = typer.Option(
+        False, "--no-remote-ingest", help="Skip remote ingest after a successful push."
+    ),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
     try:
@@ -1047,10 +1951,22 @@ def sync_conflicts(
 
 @sync_app.command("acceptance")
 def sync_acceptance(
-    peer_node_id: Optional[str] = typer.Option(None, "--peer", help="Secondary peer node_id. Inferred when exactly one peer is configured."),
-    run_sync: bool = typer.Option(False, "--run-sync", help="Execute the real pull/push/remote-ingest sync step."),
-    skip_connection: bool = typer.Option(False, "--skip-connection", help="Skip the SSH/rsync connection test."),
-    retrieval_phrase: Optional[str] = typer.Option(None, "--retrieval-phrase", help="Unique Secondary session phrase to verify retrieval after sync."),
+    peer_node_id: Optional[str] = typer.Option(
+        None,
+        "--peer",
+        help="Secondary peer node_id. Inferred when exactly one peer is configured.",
+    ),
+    run_sync: bool = typer.Option(
+        False, "--run-sync", help="Execute the real pull/push/remote-ingest sync step."
+    ),
+    skip_connection: bool = typer.Option(
+        False, "--skip-connection", help="Skip the SSH/rsync connection test."
+    ),
+    retrieval_phrase: Optional[str] = typer.Option(
+        None,
+        "--retrieval-phrase",
+        help="Unique Secondary session phrase to verify retrieval after sync.",
+    ),
     home: Optional[Path] = typer.Option(None),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
@@ -1076,73 +1992,181 @@ def sync_acceptance(
         console.print(f"Ready: {'yes' if report['ready'] else 'no'}")
         console.print(f"Complete: {'yes' if report['complete'] else 'no'}")
         if not report["complete"]:
-            console.print("Run with --run-sync and --retrieval-phrase after the Secondary has produced a unique session.")
+            console.print(
+                "Run with --run-sync and --retrieval-phrase after the Secondary has produced a unique session."
+            )
     if not report["ready"]:
         raise typer.Exit(1)
 
 
 @app.command()
 def mcp(home: Optional[Path] = typer.Option(None)) -> None:
+    paths = BrainPaths.from_value(home)
+    if daemon_handshake_path(paths).exists():
+        Console(stderr=True).print(
+            "brain mcp is the development direct-DB server; migrated agents should use the brain-mcp shim.",
+            style="yellow",
+        )
     create_mcp(str(home) if home else None).run()
+
+
+@app_migration_app.command("plan")
+def app_migration_plan(
+    home: Optional[Path] = typer.Option(None),
+    app_support_dir: Optional[Path] = typer.Option(None, "--app-support-dir"),
+    launch_agents_dir: Optional[Path] = typer.Option(None, "--launch-agents-dir"),
+) -> None:
+    result = build_migration_plan(
+        BrainPaths.from_value(home),
+        app_support_dir=app_support_dir,
+        launch_agents_dir=launch_agents_dir,
+    )
+    console.print_json(json.dumps(result))
+
+
+@app_migration_app.command("backup-runtime")
+def app_migration_backup_runtime(
+    home: Optional[Path] = typer.Option(None),
+    app_support_dir: Optional[Path] = typer.Option(None, "--app-support-dir"),
+) -> None:
+    result = create_runtime_backup(
+        BrainPaths.from_value(home),
+        app_support_dir=app_support_dir,
+    )
+    console.print_json(json.dumps(result))
+
+
+@app_migration_app.command("install-shims")
+def app_migration_install_shims(
+    app_support_dir: Optional[Path] = typer.Option(None, "--app-support-dir"),
+) -> None:
+    result = install_runtime_shims(app_support_dir=app_support_dir)
+    console.print_json(json.dumps(result))
+
+
+@app_migration_app.command("retire-launch-agents")
+def app_migration_retire_launch_agents(
+    app_support_dir: Optional[Path] = typer.Option(None, "--app-support-dir"),
+    launch_agents_dir: Optional[Path] = typer.Option(None, "--launch-agents-dir"),
+    commit: bool = typer.Option(
+        False, "--commit", help="Actually bootout and move detected legacy plists."
+    ),
+) -> None:
+    result = retire_launch_agents(
+        app_support_dir=app_support_dir,
+        launch_agents_dir=launch_agents_dir,
+        dry_run=not commit,
+    )
+    console.print_json(json.dumps(result))
 
 
 @capture_app.command("agents")
 def capture_agents(
-    agent: str = typer.Option("all", help="Source to capture: all, codex, claude, opencode, or hyprnote."),
-    include_hyprnote: bool = typer.Option(False, "--include-hyprnote", help="Include Hyprnote when --agent all is used."),
+    agent: str = typer.Option(
+        "all", help="Source to capture: all, codex, claude, opencode, or hyprnote."
+    ),
+    include_hyprnote: bool = typer.Option(
+        False, "--include-hyprnote", help="Include Hyprnote when --agent all is used."
+    ),
     hyprnote_root: Optional[Path] = typer.Option(None, help="Hyprnote root directory."),
     dry_run: bool = typer.Option(False, "--dry-run"),
-    export_outbox: bool = typer.Option(False, "--export-outbox", help="Export captured files into this node's sync outbox."),
-    also_ingest: bool = typer.Option(False, "--also-ingest", help="Run local ingest after capture."),
+    export_outbox: bool = typer.Option(
+        False,
+        "--export-outbox",
+        help="Export captured files into this node's sync outbox.",
+    ),
+    also_ingest: bool = typer.Option(
+        False, "--also-ingest", help="Run local ingest after capture."
+    ),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
     svc = service(home)
     svc.init_workspace()
-    result = AgentLogCapture(svc.paths, hyprnote_root=hyprnote_root, include_hyprnote=include_hyprnote).capture(
-        agent=agent,
+    result = run_connector_capture(
+        svc.paths,
+        connector_ids=connector_ids_for_agent(agent, include_hyprnote=include_hyprnote),
+        respect_enabled=False,
+        respect_cadence=False,
         dry_run=dry_run,
         export_outbox=export_outbox,
+        settings_overrides=runtime_settings(hyprnote_root=hyprnote_root),
     )
     if also_ingest and not dry_run:
         ingest_result = svc.ingest()
-        console.print_json(json.dumps({"capture": result.as_dict(), "ingest": ingest_result.as_dict()}))
+        console.print_json(
+            json.dumps({"capture": result.as_dict(), "ingest": ingest_result.as_dict()})
+        )
         return
     console.print_json(json.dumps(result.as_dict()))
 
 
 @automation_app.command("run-agent-log-ingest")
 def automation_run_agent_log_ingest(
-    agent: str = typer.Option("all", help="Source to capture: all, codex, claude, opencode, or hyprnote."),
-    include_hyprnote: bool = typer.Option(False, "--include-hyprnote", help="Include Hyprnote when --agent all is used."),
+    agent: str = typer.Option(
+        "all", help="Source to capture: all, codex, claude, opencode, or hyprnote."
+    ),
+    include_hyprnote: bool = typer.Option(
+        False, "--include-hyprnote", help="Include Hyprnote when --agent all is used."
+    ),
     hyprnote_root: Optional[Path] = typer.Option(None, help="Hyprnote root directory."),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
     paths = BrainPaths.from_value(home)
-    result = run_agent_log_ingest(paths, agent=agent, hyprnote_root=hyprnote_root, include_hyprnote=include_hyprnote)
+    result = run_agent_log_ingest(
+        paths,
+        agent=agent,
+        hyprnote_root=hyprnote_root,
+        include_hyprnote=include_hyprnote,
+    )
     console.print_json(json.dumps(as_jsonable(result)))
 
 
 @automation_app.command("secondary-tick")
 def automation_secondary_tick(
-    agent: str = typer.Option("all", help="Source to capture: all, codex, claude, opencode, or hyprnote."),
-    include_hyprnote: bool = typer.Option(False, "--include-hyprnote", help="Include Hyprnote when --agent all is used."),
+    agent: str = typer.Option(
+        "all", help="Source to capture: all, codex, claude, opencode, or hyprnote."
+    ),
+    include_hyprnote: bool = typer.Option(
+        False, "--include-hyprnote", help="Include Hyprnote when --agent all is used."
+    ),
     hyprnote_root: Optional[Path] = typer.Option(None, help="Hyprnote root directory."),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
     paths = BrainPaths.from_value(home)
-    result = run_secondary_tick(paths, agent=agent, hyprnote_root=hyprnote_root, include_hyprnote=include_hyprnote)
+    result = run_secondary_tick(
+        paths,
+        agent=agent,
+        hyprnote_root=hyprnote_root,
+        include_hyprnote=include_hyprnote,
+    )
     console.print_json(json.dumps(as_jsonable(result)))
 
 
 @automation_app.command("nightly")
 def automation_nightly(
-    if_due: bool = typer.Option(False, "--if-due", help="Skip when the last successful nightly run is still recent."),
-    due_after_hours: int = typer.Option(20, help="Minimum hours between successful nightly runs when --if-due is set."),
-    agent: str = typer.Option("all", help="Source to capture: all, codex, claude, opencode, or hyprnote."),
-    include_hyprnote: bool = typer.Option(False, "--include-hyprnote", help="Include Hyprnote when --agent all is used."),
+    if_due: bool = typer.Option(
+        False,
+        "--if-due",
+        help="Skip when the last successful nightly run is still recent.",
+    ),
+    due_after_hours: int = typer.Option(
+        20, help="Minimum hours between successful nightly runs when --if-due is set."
+    ),
+    agent: str = typer.Option(
+        "all", help="Source to capture: all, codex, claude, opencode, or hyprnote."
+    ),
+    include_hyprnote: bool = typer.Option(
+        False, "--include-hyprnote", help="Include Hyprnote when --agent all is used."
+    ),
     hyprnote_root: Optional[Path] = typer.Option(None, help="Hyprnote root directory."),
-    with_llm_memory_proposals: bool = typer.Option(False, "--with-llm-memory-proposals"),
-    llm_wiki: bool = typer.Option(True, "--llm-wiki/--no-llm-wiki"),
+    with_llm_memory_proposals: bool = typer.Option(
+        False, "--with-llm-memory-proposals"
+    ),
+    llm_wiki: bool = typer.Option(
+        True,
+        "--llm-wiki/--no-llm-wiki",
+        help="Enable shadow CoS wiki synthesis when a synthesizer provider is configured.",
+    ),
     provider: Optional[str] = typer.Option(None),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
@@ -1215,13 +2239,17 @@ def scheduler_uninstall_sync() -> None:
 def scheduler_uninstall_secondary_capture() -> None:
     from .scheduler.launchd import CAPTURE_SECONDARY_LABEL, LaunchdScheduler
 
-    console.print_json(json.dumps(LaunchdScheduler().uninstall(CAPTURE_SECONDARY_LABEL)))
+    console.print_json(
+        json.dumps(LaunchdScheduler().uninstall(CAPTURE_SECONDARY_LABEL))
+    )
 
 
 @launch_agent_app.command("install")
 def launch_agent_install(
     interval: int = typer.Option(600, help="Polling interval in seconds."),
-    include_hyprnote: bool = typer.Option(False, "--include-hyprnote", help="Include Hyprnote in scheduled capture."),
+    include_hyprnote: bool = typer.Option(
+        False, "--include-hyprnote", help="Include Hyprnote in scheduled capture."
+    ),
     dry_run: bool = typer.Option(False, "--dry-run"),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
@@ -1257,17 +2285,33 @@ def launch_agent_render(
 ) -> None:
     paths = BrainPaths.from_value(home)
     uv = shutil.which("uv") or "/opt/homebrew/bin/uv"
-    plist = render_launch_agent(Path.cwd(), paths.home, Path(uv), interval=interval, include_hyprnote=include_hyprnote)
+    plist = render_launch_agent(
+        Path.cwd(),
+        paths.home,
+        Path(uv),
+        interval=interval,
+        include_hyprnote=include_hyprnote,
+    )
     console.print_json(json.dumps(plist))
 
 
 @launch_agent_app.command("install-nightly")
 def launch_agent_install_nightly(
     interval: int = typer.Option(3600, help="Wake-check interval in seconds."),
-    due_after_hours: int = typer.Option(20, help="Minimum hours between successful nightly runs."),
-    with_llm_memory_proposals: bool = typer.Option(False, "--with-llm-memory-proposals"),
-    llm_wiki: bool = typer.Option(True, "--llm-wiki/--no-llm-wiki"),
-    provider: Optional[str] = typer.Option(None, help="LLM provider for proposals: codex, openai, anthropic, or ollama."),
+    due_after_hours: int = typer.Option(
+        20, help="Minimum hours between successful nightly runs."
+    ),
+    with_llm_memory_proposals: bool = typer.Option(
+        False, "--with-llm-memory-proposals"
+    ),
+    llm_wiki: bool = typer.Option(
+        True,
+        "--llm-wiki/--no-llm-wiki",
+        help="Enable shadow CoS wiki synthesis when a synthesizer provider is configured.",
+    ),
+    provider: Optional[str] = typer.Option(
+        None, help="LLM provider for proposals: codex, openai, anthropic, or ollama."
+    ),
     dry_run: bool = typer.Option(False, "--dry-run"),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
@@ -1302,9 +2346,17 @@ def launch_agent_uninstall_nightly() -> None:
 def launch_agent_render_nightly(
     interval: int = typer.Option(3600),
     due_after_hours: int = typer.Option(20),
-    with_llm_memory_proposals: bool = typer.Option(False, "--with-llm-memory-proposals"),
-    llm_wiki: bool = typer.Option(True, "--llm-wiki/--no-llm-wiki"),
-    provider: Optional[str] = typer.Option(None, help="LLM provider for proposals: codex, openai, anthropic, or ollama."),
+    with_llm_memory_proposals: bool = typer.Option(
+        False, "--with-llm-memory-proposals"
+    ),
+    llm_wiki: bool = typer.Option(
+        True,
+        "--llm-wiki/--no-llm-wiki",
+        help="Enable shadow CoS wiki synthesis when a synthesizer provider is configured.",
+    ),
+    provider: Optional[str] = typer.Option(
+        None, help="LLM provider for proposals: codex, openai, anthropic, or ollama."
+    ),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
     paths = BrainPaths.from_value(home)

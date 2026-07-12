@@ -73,7 +73,7 @@ class FakeTransport:
             from pkm_brain.paths import BrainPaths
             from pkm_brain.service import BrainService
 
-            result = BrainService(BrainPaths.from_value(self.remote_home), prefer_model_embeddings=False).rebuild_mirror_index()
+            result = BrainService(BrainPaths.from_value(self.remote_home)).rebuild_mirror_index()
             return SubprocessResult(0, json.dumps(result) + "\n", "")
         if command.startswith("brain ingest --home"):
             return SubprocessResult(0 if self.remote_ingest else 1, '{"changed":0}\n', "remote ingest failed")

@@ -1,0 +1,50 @@
+{
+  "task": "What changed in the native app?",
+  "project": "pkm-brain",
+  "budget": 8000,
+  "retrieval_mode": "default",
+  "retrieval_verdict": "found",
+  "retrieval_confidence": 0.82,
+  "retrieval_reasons": ["matched active facts", "matched wiki page"],
+  "relevant_facts": [
+    {
+      "id": "fact_1",
+      "statement": "The native app has queue review shortcuts.",
+      "page_hint": "projects/pkm-brain.md",
+      "retrieval_score": 0.91,
+      "selection_reasons": ["exact project match"]
+    }
+  ],
+  "relevant_wiki_pages": [
+    {
+      "relative_path": "projects/pkm-brain.md",
+      "title": "PKM Brain",
+      "score": 0.88,
+      "selection_reasons": ["source-linked project page"]
+    }
+  ],
+  "supporting_chunks": [
+    {
+      "chunk_id": "chunk_1",
+      "document_id": "doc_1",
+      "title": "Implementation Session",
+      "source_type": "agent_session",
+      "text": "Native app work added nonblank tabs.",
+      "score": 0.77,
+      "selection_reasons": ["recent source"]
+    }
+  ],
+  "active_memories": [
+    {
+      "id": "mem_1",
+      "content": "Alex prefers numeric queue shortcuts.",
+      "memory_type": "preference",
+      "scope": "pkm-brain",
+      "memory_relevance_score": 0.72
+    }
+  ],
+  "candidate_memories": [],
+  "raw": {
+    "debug": false
+  }
+}

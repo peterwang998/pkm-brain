@@ -31,7 +31,7 @@ def test_sync_run_pulls_pushes_and_runs_remote_ingest(tmp_path: Path) -> None:
     with connection(secondary_home / "db" / "brain.sqlite") as conn:
         assert conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] >= 1
-    search = BrainService(BrainPaths.from_value(secondary_home), prefer_model_embeddings=False).search("secondary-token")
+    search = BrainService(BrainPaths.from_value(secondary_home)).search("secondary-token")
     assert search["results"]
 
 

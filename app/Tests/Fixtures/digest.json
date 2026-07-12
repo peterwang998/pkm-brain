@@ -1,0 +1,68 @@
+{
+  "demotions": [],
+  "eval_transitions": [],
+  "facts_by_page": [
+    {
+      "count": 12,
+      "latest_at": "2026-07-08T08:00:00+00:00",
+      "page_hint": "projects/pkm-brain.md"
+    }
+  ],
+  "generated_at": "2026-07-08T08:00:00+00:00",
+  "latest_run": {
+    "error": null,
+    "finished_at": "2026-07-08T07:30:00+00:00",
+    "id": "automation_1",
+    "job_name": "nightly-maintenance",
+    "started_at": "2026-07-08T07:29:00+00:00",
+    "status": "success",
+    "summary": {
+      "warnings": 0
+    }
+  },
+  "pulse": [
+    {
+      "href": "#/ops/runs",
+      "key": "nightly",
+      "label": "nightly",
+      "state": "ok",
+      "timestamp": "2026-07-08T07:30:00+00:00",
+      "value": "success"
+    },
+    {
+      "href": "#/ops/audit",
+      "key": "evals",
+      "label": "evals",
+      "state": "warn",
+      "value": "findings"
+    }
+  ],
+  "queue_counts": {
+    "by_kind": {
+      "conflicts": 3,
+      "unrouted": 5
+    },
+    "raw": {
+      "fact_conflict_review": 3,
+      "unrouted_fact": 5
+    },
+    "total": 8
+  },
+  "raw": {
+    "audit": {
+      "counts": {
+        "sampled_bad": 22,
+        "sampled_ok": 1289,
+        "unaudited": 2664
+      },
+      "mode": "configured",
+      "note": "Independent auditor configured.",
+      "status": "ok"
+    },
+    "index": {
+      "embedding_provider": "hash"
+    }
+  },
+  "reverts": [],
+  "since": null
+}

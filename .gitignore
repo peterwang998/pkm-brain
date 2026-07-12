@@ -18,7 +18,18 @@ brain/
 data/
 indexes/
 logs/
+local-backups/
+reports/
 
 # Tool caches
 .pytest_cache/
 .ruff_cache/
+*.profraw
+
+# Generated Apple project files
+app/.build/
+app/*.xcodeproj/
+app/DerivedData/
+app/Resources/bin/uv
+app/Resources/models/
+app/Resources/runtime/

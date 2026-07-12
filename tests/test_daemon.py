@@ -1,0 +1,377 @@
+from __future__ import annotations
+
+import http.client
+import json
+import stat
+import sys
+import threading
+import time
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Iterator
+
+import pytest
+
+from pkm_brain.daemon import (
+    BrainDaemon,
+    SchedulerJob,
+    SerialJobScheduler,
+    daemon_handshake_path,
+    parent_process_missing,
+    scheduler_config_path,
+)
+from pkm_brain.automation import run_nightly_maintenance
+from pkm_brain.connectors import load_connector_config, save_connector_config
+from pkm_brain.db import connection
+from pkm_brain.paths import BrainPaths
+from pkm_brain.sync_config import PeerConfig, PrimaryConfig, SyncConfig, write_sync_config
+from pkm_brain.sync_setup import init_secondary
+
+
+@contextmanager
+def running_daemon(
+    paths: BrainPaths,
+    *,
+    serve_web: bool = False,
+    start_scheduler: bool = False,
+) -> Iterator[tuple[BrainDaemon, str, int, str]]:
+    runtime = BrainDaemon(
+        paths,
+        serve_web=serve_web,
+        start_scheduler=start_scheduler,
+        runtime_id="test-runtime",
+    )
+    runtime.start()
+    assert runtime.server is not None
+    thread = threading.Thread(target=runtime.server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = runtime.server.server_address
+        yield runtime, str(host), int(port), runtime.token
+    finally:
+        runtime.server.shutdown()
+        thread.join(timeout=2)
+        runtime.close()
+
+
+def request_json(
+    host: str,
+    port: int,
+    method: str,
+    path: str,
+    *,
+    token: str | None = None,
+    payload: dict[str, object] | None = None,
+) -> tuple[int, dict[str, object]]:
+    body = json.dumps(payload or {}).encode("utf-8") if payload is not None else None
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    conn = http.client.HTTPConnection(host, port, timeout=5)
+    conn.request(method, path, body=body, headers=headers)
+    response = conn.getresponse()
+    raw = response.read().decode("utf-8")
+    conn.close()
+    return response.status, json.loads(raw)
+
+
+def request_text(host: str, port: int, path: str) -> tuple[int, str]:
+    conn = http.client.HTTPConnection(host, port, timeout=5)
+    conn.request("GET", path)
+    response = conn.getresponse()
+    body = response.read().decode("utf-8")
+    conn.close()
+    return response.status, body
+
+
+def test_daemon_boot_handshake_lock_health_and_shutdown(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+
+    with running_daemon(paths) as (_runtime, host, port, token):
+        handshake = daemon_handshake_path(paths)
+        payload = json.loads(handshake.read_text(encoding="utf-8"))
+
+        assert stat.S_IMODE(handshake.stat().st_mode) == 0o600
+        assert payload["port"] == port
+        assert payload["token"] == token
+        assert payload["home"] == str(paths.home)
+        assert payload["runtime_id"] == "test-runtime"
+
+        second = BrainDaemon(paths)
+        with pytest.raises(RuntimeError, match="already running"):
+            second.start()
+
+        status, body = request_json(host, port, "GET", "/api/health")
+        assert status == 401
+        assert "token" in str(body["error"])
+
+        status, body = request_json(host, port, "GET", "/api/health", token=token)
+        assert status == 200
+        assert body["ok"] is True
+        assert body["port"] == port
+        assert body["home"] == str(paths.home)
+        assert body["runtime_id"] == "test-runtime"
+
+        status, body = request_json(host, port, "GET", "/api/version", token=token)
+        assert status == 200
+        assert body["version"]
+        assert body["runtime_id"] == "test-runtime"
+
+        status, body = request_json(host, port, "POST", "/api/shutdown", token=token)
+        assert status == 200
+        assert body["shutting_down"] is True
+
+    assert not daemon_handshake_path(paths).exists()
+
+
+def test_daemon_health_does_not_load_sentence_transformers(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    sys.modules.pop("sentence_transformers", None)
+
+    with running_daemon(paths) as (_runtime, host, port, token):
+        started = time.perf_counter()
+        status, body = request_json(host, port, "GET", "/api/health", token=token)
+        elapsed = time.perf_counter() - started
+
+    assert status == 200
+    assert body["ok"] is True
+    assert elapsed < 0.05
+    assert "sentence_transformers" not in sys.modules
+
+
+def test_daemon_static_ui_is_gated_by_serve_web(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+
+    with running_daemon(paths, serve_web=False) as (_runtime, host, port, _token):
+        status, body = request_text(host, port, "/")
+    assert status == 404
+    assert "not found" in body
+
+    with running_daemon(paths, serve_web=True) as (_runtime, host, port, _token):
+        status, body = request_text(host, port, "/")
+    assert status == 200
+    assert 'id="token-dialog"' in body
+
+
+def test_scheduler_due_math_and_serial_executor(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    current = {"now": now}
+    active = 0
+    max_active = 0
+    completed: list[str] = []
+    lock = threading.Lock()
+
+    def clock() -> datetime:
+        return current["now"]
+
+    def handler(name: str) -> dict[str, object]:
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.05)
+        with lock:
+            active -= 1
+            completed.append(name)
+        return {"status": "success", "name": name}
+
+    scheduler = SerialJobScheduler(
+        paths,
+        tick_seconds=60,
+        now=clock,
+        jobs=[
+            SchedulerJob("a", 10, lambda: handler("a")),
+            SchedulerJob("b", 10, lambda: handler("b")),
+        ],
+    )
+    assert scheduler.enqueue_due_jobs() == []
+    current["now"] = now + timedelta(seconds=10)
+    assert scheduler.enqueue_due_jobs() == ["a", "b"]
+
+    scheduler.start()
+    try:
+        deadline = time.time() + 3
+        while len(completed) < 2 and time.time() < deadline:
+            time.sleep(0.01)
+    finally:
+        scheduler.stop()
+
+    assert sorted(completed) == ["a", "b"]
+    assert max_active == 1
+
+
+def test_scheduler_pause_persists(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    scheduler = SerialJobScheduler(paths, jobs=[SchedulerJob("job", 60, lambda: {"status": "success"})])
+
+    state = scheduler.pause(120)
+    assert state["paused_until"]
+    assert scheduler_config_path(paths).exists()
+
+    reloaded = SerialJobScheduler(paths, jobs=[SchedulerJob("job", 60, lambda: {"status": "success"})])
+    assert reloaded.as_dict()["paused_until"] == state["paused_until"]
+
+    resumed = reloaded.resume()
+    assert resumed["paused_until"] is None
+
+
+def test_scheduler_preserves_skipped_reason(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    scheduler = SerialJobScheduler(
+        paths,
+        jobs=[
+            SchedulerJob(
+                "job",
+                60,
+                lambda: {
+                    "status": "skipped",
+                    "reason": "last successful nightly run is less than 20 hours old",
+                },
+            )
+        ],
+    )
+    scheduler.run_now("job")
+    scheduler.start()
+    try:
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            job = scheduler.as_dict()["jobs"][0]
+            if job["last_status"]:
+                break
+            time.sleep(0.01)
+    finally:
+        scheduler.stop()
+
+    job = scheduler.as_dict()["jobs"][0]
+    assert job["last_status"] == "skipped"
+    assert job["last_error"] == "last successful nightly run is less than 20 hours old"
+    assert job["last_result"]["reason"] == "last successful nightly run is less than 20 hours old"
+
+
+def test_scheduler_run_now_bypasses_pause(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    completed: list[str] = []
+    scheduler = SerialJobScheduler(
+        paths,
+        jobs=[SchedulerJob("job", 60, lambda: completed.append("job") or {"status": "success"})],
+    )
+    scheduler.pause(3600)
+    scheduler.start()
+    try:
+        scheduler.run_now("job")
+        deadline = time.time() + 3
+        while not completed and time.time() < deadline:
+            time.sleep(0.01)
+    finally:
+        scheduler.stop()
+
+    assert completed == ["job"]
+
+
+def test_scheduler_registry_is_role_aware(tmp_path: Path) -> None:
+    secondary = BrainPaths.from_value(tmp_path / "secondary")
+    init_secondary(secondary, "secondary-node", "primary-node")
+
+    secondary_scheduler = SerialJobScheduler(secondary)
+    secondary_ids = {job["id"] for job in secondary_scheduler.as_dict()["jobs"]}
+    assert "secondary_tick" in secondary_ids
+    assert "capture_tick" not in secondary_ids
+    assert not any(str(job_id).startswith("sync:") for job_id in secondary_ids)
+
+    primary = BrainPaths.from_value(tmp_path / "primary")
+    write_sync_config(
+        primary,
+        SyncConfig(
+            node_id="primary-node",
+            role="primary",
+            brain_home=primary.home,
+            primary=PrimaryConfig(
+                peers=[
+                    PeerConfig(
+                        node_id="secondary-a",
+                        host="secondary-a.local",
+                        user="peter",
+                        brain_home=Path("/tmp/secondary-a"),
+                        cadence_s=900,
+                    ),
+                    PeerConfig(
+                        node_id="secondary-b",
+                        host="secondary-b.local",
+                        user="peter",
+                        brain_home=Path("/tmp/secondary-b"),
+                    ),
+                ]
+            ),
+        ),
+    )
+
+    primary_scheduler = SerialJobScheduler(primary)
+    primary_jobs = {str(job["id"]): job for job in primary_scheduler.as_dict()["jobs"]}
+    primary_ids = set(primary_jobs)
+    assert "capture_tick" in primary_ids
+    assert "secondary_tick" not in primary_ids
+    assert {"sync:secondary-a", "sync:secondary-b"}.issubset(primary_ids)
+    assert primary_jobs["sync:secondary-a"]["cadence_s"] == 900
+    assert primary_jobs["sync:secondary-b"]["cadence_s"] == 1800
+
+
+def test_daemon_nightly_summary_matches_automation_shape(tmp_path: Path) -> None:
+    direct = BrainPaths.from_value(tmp_path / "direct")
+    daemon = BrainPaths.from_value(tmp_path / "daemon")
+    disable_all_connectors(direct)
+    disable_all_connectors(daemon)
+
+    direct_result = run_nightly_maintenance(direct, if_due=True, due_after_hours=20)
+    scheduler = SerialJobScheduler(daemon)
+    scheduler.start()
+    try:
+        scheduler.run_now("nightly")
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            nightly = next(job for job in scheduler.as_dict()["jobs"] if job["id"] == "nightly")
+            if nightly["last_status"]:
+                break
+            time.sleep(0.05)
+    finally:
+        scheduler.stop()
+
+    with connection(daemon.sqlite_path) as conn:
+        row = conn.execute(
+            "SELECT summary FROM automation_runs WHERE job_name = ? ORDER BY started_at DESC LIMIT 1",
+            ("nightly-maintenance",),
+        ).fetchone()
+
+    assert direct_result.status == "success"
+    assert row is not None
+    daemon_summary = json.loads(row["summary"])
+    assert summary_shape(daemon_summary) == summary_shape(direct_result.summary)
+
+
+def test_parent_process_missing_checks_ppid_and_liveness(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("pkm_brain.daemon.os.getppid", lambda: 123)
+    monkeypatch.setattr("pkm_brain.daemon.process_alive", lambda pid: True)
+    assert parent_process_missing(123) is False
+
+    monkeypatch.setattr("pkm_brain.daemon.os.getppid", lambda: 1)
+    assert parent_process_missing(123) is True
+
+    monkeypatch.setattr("pkm_brain.daemon.os.getppid", lambda: 123)
+    monkeypatch.setattr("pkm_brain.daemon.process_alive", lambda pid: False)
+    assert parent_process_missing(123) is True
+
+
+def disable_all_connectors(paths: BrainPaths) -> None:
+    config = load_connector_config(paths)
+    for state in config["connectors"].values():
+        state["enabled"] = False
+    save_connector_config(paths, config)
+
+
+def summary_shape(value: object) -> object:
+    if isinstance(value, dict):
+        return {key: summary_shape(nested) for key, nested in sorted(value.items())}
+    if isinstance(value, list):
+        return [summary_shape(value[0])] if value else []
+    return type(value).__name__

@@ -10,7 +10,7 @@ from pkm_brain.service import BrainService
 
 def test_service_result_surfaces_are_json_serializable(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
-    svc = BrainService(paths, prefer_model_embeddings=False)
+    svc = BrainService(paths)
     svc.init_workspace()
     paths.sync_config_file.write_text(
         f"""
@@ -35,3 +35,5 @@ peers: []
     json.dumps(sync_doctor)
     json.dumps(memories)
     json.dumps(capture)
+    assert doctor["nightly"]["status"] == "warning"
+    assert doctor["nightly"]["warning"] == "no successful nightly run recorded"

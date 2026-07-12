@@ -1,0 +1,23 @@
+[
+  {
+    "id": "builtin-project-architecture",
+    "kind": "public_contract_probe",
+    "query": "How does the local-first knowledge system separate raw evidence, facts, wiki projections, and retrieval indexes?",
+    "expected_source_ids": [],
+    "expected_verdict": "partial"
+  },
+  {
+    "id": "builtin-review-queue",
+    "kind": "public_contract_probe",
+    "query": "What safeguards prevent incomplete review cards from being approved?",
+    "expected_source_ids": [],
+    "expected_verdict": "partial"
+  },
+  {
+    "id": "builtin-negative-fictional",
+    "kind": "negative_control",
+    "query": "Zephyr Lantern submarine project",
+    "expected_source_ids": [],
+    "expected_verdict": "no_strong_match"
+  }
+]
