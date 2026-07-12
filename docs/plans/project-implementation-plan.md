@@ -1,7 +1,7 @@
 # Project Improvement Implementation Plan
 
-**Status:** execution in progress; R1-R4 complete, R5/R6 partially complete in release `0.1.1`
-**Last verified:** 2026-07-11 against public release `0.1.1` code snapshot `b3ba211`
+**Status:** execution in progress; R1-R4 complete, R5/R6 partially complete in release `0.1.2`
+**Last verified:** 2026-07-12 against public release `0.1.2` code snapshot `b5a4920`
 **Inputs:** [Project Audit](../audits/project-audit-2026-07-10.md) and the six [canonical feature specs](../README.md)
 
 ## Objective
@@ -165,12 +165,15 @@ Implementation checkpoint, 2026-07-10:
 - implemented: retrieval eval and sync-acceptance telemetry isolation plus an idempotent legacy eval-lineage purge;
 - implemented: focus-independent native number shortcuts for historical fact toggles and a real Return-key binding for Keep Selected;
 - implemented: focus-independent native number shortcuts for Inbox route candidates, with text-entry focus protection and Return submission for custom page paths;
+- implemented: native/browser custom Inbox routes autocomplete substring matches from the active routable Wiki-page pool while retaining manual new-path entry;
+- implemented: a future-job topology review threshold replaces the hidden eight-fact L3 boundary, is candidate-stamped, and promotes one policy version without rewriting the current Queue;
 - implemented: immediate native Queue transition loading plus request identities so late group/state/sort responses cannot display or mutate stale cards;
 - implemented: sampled audit can demote only an attributed policy rule whose own threshold is breached; unscoped findings cannot demote, and unrelated active rules retain their autonomy/critic/sample settings;
 - implemented: dry-run-first Policy escalation reconciliation that re-decides current L0-L2 actions through the critic/action ledger and retains current L3 work;
 - implemented: dry-run-first topology reconciliation that removes stale admission and duplicate rows, reruns gardener judgment, arbitrates merge before split, and policy-routes the surviving canonical actions;
 - implemented: Settings hides internal policy versions and reports a persisted human-readable last-saved timestamp;
 - implemented: state-aware sampled-audit admission shared by Queue counts, rows, and decisions; topology cards now show merge direction, current page/contract state, affected counts, and representative facts, while drifted fact findings use targeted ledgered correction and obsolete drifted topology findings are excluded;
+- implemented: applied entity-merge audit completeness recognizes the expected active-destination/merged-source post-state instead of blocking a valid reversible finding;
 - implemented: Hyprnote capture restores true multi-channel chronology with stable speaker labels, explicitly groups legacy synthetic-clock tracks, suppresses metadata-only placeholders, and carries speaker identity through evidence units;
 - implemented: fact critic review distinguishes unsupported statements from incomplete evidence packets, performs one bounded citation union plus fresh review, falls back from malformed entity disambiguation, and isolates parallel action failures;
 - verified: the incremental approved W2a pass resolved 19 later candidates with zero failures and annotated 51 survivors, leaving the live deduplicated Queue at 230 actionable and 0 blocked;

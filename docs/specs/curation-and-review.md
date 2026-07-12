@@ -1,7 +1,7 @@
 # Curation And Review
 
 **Status:** canonical living feature spec
-**Last verified:** 2026-07-11 against public release `0.1.1` code snapshot `b3ba211`
+**Last verified:** 2026-07-12 against public release `0.1.2` code snapshot `b5a4920`
 **Owns:** Chief-of-Staff roles, action/policy/audit flow, fact relations, review Queue, autonomy settings, and review-volume controls
 
 ## Operating Model
@@ -169,7 +169,7 @@ Every fact card shows a labeled source date. `source_date` is the fact's `observ
 
 A candidate-less candidate-versus-existing decision is invalid UI state. The server must either hydrate the candidate or mark the card non-approvable. Legacy `kind=conflict` groups are an explicit exception because they are symmetric comparisons: the Queue hydrates their untyped options and fact IDs into `alternatives`, labels the orientation `contested`, and never renders an empty Candidate panel.
 
-Unrouted route choices include only active semantic Wiki pages. `reference` and `index` page types, `references/*` and `agent_session_log/*` paths, `index.md` and `log.md`, malformed page types, and titles containing the internal Codex-provider prompt are excluded both when loading the route pool and when scoring final candidates. Returned route labels are whitespace-compacted and bounded to 120 characters.
+Unrouted route choices include only active semantic Wiki pages. `reference` and `index` page types, `references/*` and `agent_session_log/*` paths, `index.md` and `log.md`, malformed page types, and titles containing the internal Codex-provider prompt are excluded both when loading the route pool and when scoring final candidates. Returned route labels are whitespace-compacted and bounded to 120 characters. The native and browser custom-route fields load this same routable pool and offer substring matches over page titles and `.md` paths while preserving manual entry for a genuinely new destination.
 
 ### Anomaly And Audit Semantics
 
@@ -180,6 +180,7 @@ An `audit_flagged` Queue item means the post-apply auditor sampled an already-ap
 Audit admission is state-aware and is shared by Queue rows, Queue counts, and direct decision lookup:
 
 - if the current target-state hash still equals the action's recorded applied-state hash, the finding remains reviewable and Revert executes the guarded inverse;
+- an applied entity merge is complete when its destination is active and each source is merged, while an unapplied merge proposal still requires every entity to be active;
 - if a topology action's target state has drifted, its historical action-level finding is obsolete and is excluded rather than offering an unsafe or misleading revert;
 - if a `fact_upsert` target has drifted but the exact audited statement still exists as an active or contested fact, the finding remains reviewable against that current fact and Reject Applied Fact records a targeted, reversible fact-status correction through the action ledger;
 - if the audited fact no longer exists in a reviewable state, the finding is excluded;
@@ -254,7 +255,9 @@ Applying a mode:
 
 The native Settings surface does not expose the internal policy version. Its header shows `Last saved <date/time>`, and a successful write reports `Changes saved at <time>`. The API may retain `policy_version` for diagnostics and compatibility, but that implementation identifier is not user-facing state.
 
-Hard boundaries do not move: contradictions, missing quote, invalid/fallback route, failed eval, cross-type merge, and large topology remain review work.
+Hard boundaries do not move: contradictions, missing quote, invalid/fallback route, failed eval, and cross-type topology remain review work.
+
+Topology size has a separate `topology_review_threshold`, validated from 4 through 200 affected facts/pages and defaulting to 8. At or above the configured threshold, ordinary page/entity topology is classified high risk and forced to L3 review. Raising the threshold lets confidence-qualified, reversible, same-type topology below that size continue through the normal L1/L2 critic and sampled-audit path; it does not bypass contradictions, cross-type work, failed gates, critic rejection, or minimum-confidence policy. Each future gardener candidate records the threshold used so its risk decision remains auditable.
 
 The same endpoint exposes independent `merge_aggressiveness` and `split_aggressiveness` values from 0.0 through 1.0. The native Settings view combines them into one Topology Bias slider: Prefer Splits on the left, Balanced in the center, and Prefer Merges on the right. Moving right raises merge admission and lowers split admission by the same amount; moving left does the inverse. Existing non-complementary API/config values are summarized into a bias for display and are not rewritten until the reviewer moves and applies the control. These values change deterministic candidate admission only, not whether an admitted action may auto-apply.
 
@@ -269,13 +272,15 @@ Anchor behavior is:
 
 Exact normalized-name and punctuation/spacing-equivalent entity duplicates remain eligible at every merge setting because they are deterministic identity signals. Below the balanced midpoint, fuzzy name-containment pairs require progressively stronger name similarity and shared-source/fact evidence; this prevents broad names such as an organization from automatically matching a project or POC name. The split side currently governs page splits only; the gardener does not generate automatic entity-split candidates.
 
-Applying the topology-bias control writes the underlying merge/split values to local config and affects only future gardener runs. A topology-only change does not append an autonomy policy version, run the gardener, rebuild facts, alter existing actions, or remove current Queue items. Changing autonomy mode and topology bias together still appends a policy version only for the autonomy change.
+Applying the topology-bias control writes the underlying merge/split values to local config and affects only future gardener runs. A bias-only change does not append an autonomy policy version, run the gardener, rebuild facts, alter existing actions, or remove current Queue items.
 
-`brain cos reconcile-topology` is the explicit repair path for old merge/split proposals; it remains separate from the Settings write. Dry-run mode groups open rows by deterministic `candidate_key`, reports duplicates, and compares each unique candidate with current page/entity evidence and current topology settings. Apply mode retires no-longer-admitted candidates, reruns gardener judgment for survivors, prefers non-overlapping merges over splits touching the same page, refreshes one canonical action per candidate, dismisses duplicate rows, and sends every survivor through the current policy and critic path. Large topology remains L3 human-review work.
+Changing the topology review threshold writes local config and appends a policy version carrying the new size boundary. It affects only candidates proposed/decided by future gardener jobs and does not rerun the gardener or reclassify the existing Queue. Changing mode, bias, and threshold together creates at most one new policy version for the mode/threshold state.
+
+`brain cos reconcile-topology` is the explicit repair path for old merge/split proposals; it remains separate from the Settings write. Dry-run mode groups open rows by deterministic `candidate_key`, reports duplicates, and compares each unique candidate with current page/entity evidence and current topology settings. Apply mode retires no-longer-admitted candidates, reruns gardener judgment for survivors, prefers non-overlapping merges over splits touching the same page, refreshes one canonical action per candidate, dismisses duplicate rows, and sends every survivor through the current policy and critic path. Topology at or above the configured review threshold remains L3 human-review work.
 
 New gardener runs use the same sequence. Deterministic admission is followed by per-candidate gardener judgment and merge-first overlap arbitration; `shadow=False` proposals are policy-decided instead of being left as unclassified `proposed` rows. Page topology actions use a report-backed `{"suite": "topology"}` eval gate rather than a caller-supplied failed gate.
 
-The live setting read during this verification was More Autonomy, policy v12, floor 0.60, with merge admission 0.80 and split admission 0.20. Policy v12 restored the intended profile after unscoped legacy audit findings had incorrectly raised every rule in v10 and v11 to L3.
+The live setting verified after installing `0.1.2` is More Autonomy, floor 0.60, merge admission 0.80, split admission 0.20, and a topology review threshold of 32. The internal policy version remains diagnostic state rather than a user-facing setting.
 
 ## Review Volume
 
