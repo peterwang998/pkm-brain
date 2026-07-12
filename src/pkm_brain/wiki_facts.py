@@ -1667,6 +1667,7 @@ def answer_open_question(
     question_id: str,
     *,
     selected_fact_id: str | None = None,
+    selected_fact_ids: list[str] | None = None,
     answer: str | None = None,
     overwrite_existing: bool = False,
 ) -> dict[str, Any]:
@@ -1678,21 +1679,34 @@ def answer_open_question(
         if not question_row:
             raise ValueError(f"open question not found: {question_id}")
         question = row_to_question(question_row)
-        if question["status"] != "open":
+        if question["status"] not in {"open", "needs_human"}:
             raise ValueError(f"question is not open: {question_id}")
         fact_ids = [str(fact_id) for fact_id in question.get("fact_ids") or []]
         page_hint = question.get("page_hint")
     actions: list[dict[str, Any]] = []
-    if selected_fact_id:
-        if selected_fact_id not in fact_ids:
-            raise ValueError("selected_fact_id is not one of the question facts")
+    selection_requested = selected_fact_id is not None or selected_fact_ids is not None
+    selected_ids = stable_unique(
+        str(fact_id).strip()
+        for fact_id in [selected_fact_id, *(selected_fact_ids or [])]
+        if str(fact_id or "").strip()
+    )
+    if selection_requested:
+        if not selected_ids:
+            raise ValueError("selected_fact_ids must contain at least one fact")
+        invalid_ids = [fact_id for fact_id in selected_ids if fact_id not in fact_ids]
+        if invalid_ids:
+            raise ValueError("selected_fact_ids contains a fact outside the question")
         updates = [
-            {
-                "fact_id": selected_fact_id,
-                "status": "active",
-                "confirmed_by_user": True,
-                "conflict_group_id": None,
-            },
+            *[
+                {
+                    "fact_id": fact_id,
+                    "status": "active",
+                    "confirmed_by_user": True,
+                    "conflict_group_id": None,
+                }
+                for fact_id in fact_ids
+                if fact_id in selected_ids
+            ],
             *[
                 {
                     "fact_id": fact_id,
@@ -1700,7 +1714,7 @@ def answer_open_question(
                     "conflict_group_id": None,
                 }
                 for fact_id in fact_ids
-                if fact_id != selected_fact_id
+                if fact_id not in selected_ids
             ],
         ]
         action = apply_action(
@@ -1724,7 +1738,11 @@ def answer_open_question(
         )
         actions.append(action)
         answer_payload = {
-            "selected_fact_id": selected_fact_id,
+            "selected_fact_ids": selected_ids,
+            "selected_fact_id": selected_ids[0] if len(selected_ids) == 1 else None,
+            "superseded_fact_ids": [
+                fact_id for fact_id in fact_ids if fact_id not in selected_ids
+            ],
             "answer": answer or "",
         }
     else:

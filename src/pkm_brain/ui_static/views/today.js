@@ -12,7 +12,9 @@ async function render(el, ctx, isCancelled) {
   const since = localStorage.getItem("brain_last_visit") || "";
   const data = await ctx.api(`/api/digest${since ? `?since=${encodeURIComponent(since)}` : ""}`);
   if (isCancelled()) return;
-  const total = Number(data.queue_counts?.total || 0);
+  ctx.acceptQueueSummary(data.queue_summary);
+  const summary = data.queue_summary || {};
+  const total = Number(summary.actionable_total ?? data.queue_counts?.total ?? 0);
   el.innerHTML = `
     <h1>Today</h1>
     <div class="pulse">
@@ -25,7 +27,7 @@ async function render(el, ctx, isCancelled) {
     <section class="panel needs-strip">
       <div>
         <h2>Needs You</h2>
-        <div class="meta-row">${queueCounts(data.queue_counts?.by_kind || {})}</div>
+        <div class="meta-row">${queueCounts(summary, data.queue_counts)}</div>
       </div>
       <button class="primary" type="button" id="start-review">Start Review</button>
     </section>
@@ -65,8 +67,13 @@ function digestHtml(data) {
   </div>`;
 }
 
-function queueCounts(counts) {
-  const entries = Object.entries(counts);
-  if (!entries.length) return chip("empty", "ok");
-  return entries.map(([kind, count]) => chip(`${kind} ${count}`, count ? "warn" : "ok")).join("");
+function queueCounts(summary = {}, legacy = {}) {
+  const counts = summary.by_kind || legacy?.by_kind || {};
+  const blocked = summary.blocked_by_kind || {};
+  const entries = Object.entries(counts)
+    .map(([kind, count]) => [kind, Math.max(0, Number(count) - Number(blocked[kind] || 0))])
+    .filter(([, count]) => count > 0);
+  const blockedChip = summary.blocked_total ? chip(`blocked ${summary.blocked_total}`, "warn") : "";
+  if (!entries.length) return blockedChip || chip("empty", "ok");
+  return entries.map(([kind, count]) => chip(`${kind} ${count}`, "warn")).join("") + blockedChip;
 }

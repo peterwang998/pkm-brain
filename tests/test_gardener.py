@@ -11,6 +11,9 @@ from pkm_brain.gardener import (
     entity_merge_candidate,
     generate_gardener_candidates,
     gardener_candidate_reasoning_effort,
+    merge_candidate,
+    page_split_candidate,
+    prioritize_topology_candidates,
     propose_gardener_action,
 )
 from pkm_brain.paths import BrainPaths
@@ -110,15 +113,15 @@ def insert_entity(
 
 def test_high_certainty_entity_merge_stays_low_risk_despite_many_facts() -> None:
     left = {
-        "id": "entity_hightouch",
-        "name": "Hightouch",
+        "id": "entity_databridge",
+        "name": "DataBridge",
         "entity_type": "organization",
-        "name_keys": ["hightouch"],
-        "compact_keys": ["hightouch"],
-        "fact_ids": [f"fact_hightouch_{index}" for index in range(20)],
-        "primary_fact_ids": [f"fact_hightouch_{index}" for index in range(20)],
-        "page_hints": ["companies/hightouch.md"],
-        "source_ids": ["document:hightouch"],
+        "name_keys": ["databridge"],
+        "compact_keys": ["databridge"],
+        "fact_ids": [f"fact_databridge_{index}" for index in range(20)],
+        "primary_fact_ids": [f"fact_databridge_{index}" for index in range(20)],
+        "page_hints": ["companies/databridge.md"],
+        "source_ids": ["document:databridge"],
         "fact_tokens": ["warehouse", "native", "activation"],
     }
     right = {
@@ -126,22 +129,56 @@ def test_high_certainty_entity_merge_stays_low_risk_despite_many_facts() -> None
         "name": "High Touch",
         "entity_type": "organization",
         "name_keys": ["high touch"],
-        "compact_keys": ["hightouch"],
+        "compact_keys": ["databridge"],
         "fact_ids": ["fact_high_touch"],
         "primary_fact_ids": ["fact_high_touch"],
         "page_hints": ["companies/high-touch.md"],
-        "source_ids": ["document:hightouch"],
+        "source_ids": ["document:databridge"],
         "fact_tokens": ["warehouse", "native", "activation"],
     }
 
     candidate = entity_merge_candidate(left, right)
+    conservative_candidate = entity_merge_candidate(
+        left, right, merge_aggressiveness=0.0
+    )
 
     assert candidate is not None
+    assert conservative_candidate is not None
     assert candidate["merge_signal"] == "same_compact_name_or_alias"
     assert candidate["large_topology"] is True
     assert candidate["affected_fact_count"] == 21
     assert candidate["risk_tier"] == "low"
     assert gardener_candidate_reasoning_effort(candidate) == "low"
+
+
+def test_conservative_merge_bias_suppresses_fuzzy_entity_containment() -> None:
+    left = {
+        "id": "entity_northwind",
+        "name": "Northwind",
+        "entity_type": "organization",
+        "name_keys": ["northwind"],
+        "compact_keys": ["northwind"],
+        "fact_ids": ["fact_northwind"],
+        "primary_fact_ids": ["fact_northwind"],
+        "page_hints": ["companies/northwind.md"],
+        "source_ids": ["document:northwind"],
+        "fact_tokens": ["customer", "agent"],
+    }
+    right = {
+        "id": "entity_northwind_poc",
+        "name": "Northwind POC",
+        "entity_type": "organization",
+        "name_keys": ["northwind poc"],
+        "compact_keys": ["northwindpoc"],
+        "fact_ids": ["fact_northwind_poc"],
+        "primary_fact_ids": ["fact_northwind_poc"],
+        "page_hints": ["projects/northwind-poc.md"],
+        "source_ids": ["document:northwind"],
+        "fact_tokens": ["pilot", "criteria"],
+    }
+
+    assert entity_merge_candidate(left, right, merge_aggressiveness=0.5) is not None
+    assert entity_merge_candidate(left, right, merge_aggressiveness=0.0) is None
 
 
 def link_fact_to_entity(
@@ -214,39 +251,131 @@ def test_gardener_merge_candidates_require_fact_overlap(tmp_path: Path) -> None:
     assert merges[0]["shared_source_count"] == 1
 
 
+def test_merge_aggressiveness_changes_candidate_admission() -> None:
+    def page(relative_path: str) -> dict[str, object]:
+        return {
+            "relative_path": relative_path,
+            "fact_tokens": [],
+            "entity_keys": [],
+            "source_ids": ["document:shared"],
+        }
+
+    balanced_only = merge_candidate(
+        page("concepts/agent-memory.md"),
+        page("concepts/agent-memories.md"),
+        {},
+        merge_aggressiveness=0.5,
+    )
+    conservative = merge_candidate(
+        page("concepts/agent-memory.md"),
+        page("concepts/agent-memories.md"),
+        {},
+        merge_aggressiveness=0.0,
+    )
+    aggressive_only = merge_candidate(
+        page("concepts/customer-data.md"),
+        page("concepts/customer-data-platform.md"),
+        {},
+        merge_aggressiveness=1.0,
+    )
+    balanced = merge_candidate(
+        page("concepts/customer-data.md"),
+        page("concepts/customer-data-platform.md"),
+        {},
+        merge_aggressiveness=0.5,
+    )
+
+    assert balanced_only is not None
+    assert conservative is None
+    assert aggressive_only is not None
+    assert balanced is None
+    assert aggressive_only["merge_aggressiveness"] == 1.0
+
+
+def test_split_aggressiveness_suppresses_weak_page_split_candidates() -> None:
+    page = {
+        "relative_path": "concepts/agent-memory.md",
+        "active_fact_count": 6,
+        "section_counts": {"Architecture": 2, "Evaluation": 2, "Operations": 2},
+    }
+
+    balanced = page_split_candidate(page, {}, split_aggressiveness=0.5)
+    conservative = page_split_candidate(page, {}, split_aggressiveness=0.2)
+
+    assert balanced is not None
+    assert balanced["admission_thresholds"] == {
+        "fact_floor": 5,
+        "section_floor": 3,
+        "minimum_facts_per_section": 1,
+    }
+    assert conservative is None
+
+
+def test_topology_arbitration_prefers_merge_over_split_for_the_same_page() -> None:
+    merge = {
+        "action_type": "page_merge",
+        "candidate_key": "page_merge:concepts/agent-memory.md,concepts/agent-memories.md:",
+        "page_hints": [
+            "concepts/agent-memory.md",
+            "concepts/agent-memories.md",
+        ],
+        "score": 0.91,
+        "risk_tier": "medium",
+    }
+    split = {
+        "action_type": "page_split",
+        "candidate_key": "page_split:concepts/agent-memory.md:",
+        "page_hints": ["concepts/agent-memory.md"],
+        "score": 0.95,
+        "risk_tier": "medium",
+    }
+
+    selected, summary = prioritize_topology_candidates([split, merge])
+
+    assert [candidate["candidate_key"] for candidate in selected] == [
+        merge["candidate_key"]
+    ]
+    assert summary == {
+        "input_count": 2,
+        "selected_count": 1,
+        "suppressed_count": 1,
+        "suppressed_by_reason": {"split_conflicts_with_preferred_merge": 1},
+    }
+
+
 def test_entity_gardener_proposes_and_applies_compact_duplicate_merge(tmp_path: Path) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()
     with connection(svc.paths.sqlite_path) as conn:
-        insert_entity(conn, "entity_hightouch", "Hightouch")
-        insert_entity(conn, "entity_high_touch", "High Touch")
+        insert_entity(conn, "entity_databridge", "DataBridge")
+        insert_entity(conn, "entity_high_touch", "Data Bridge")
         insert_fact(
             conn,
-            "fact_hightouch",
-            "Hightouch uses warehouse-native customer data activation.",
-            page_hint="companies/hightouch.md",
-            entity_key="companies:hightouch:summary",
-            source_ids=["document:hightouch"],
+            "fact_databridge",
+            "DataBridge uses warehouse-native customer data activation.",
+            page_hint="companies/databridge.md",
+            entity_key="companies:databridge:summary",
+            source_ids=["document:databridge"],
         )
         link_fact_to_entity(
             conn,
-            "fact_hightouch",
-            "entity_hightouch",
-            mention_text="Hightouch",
+            "fact_databridge",
+            "entity_databridge",
+            mention_text="DataBridge",
         )
         insert_fact(
             conn,
             "fact_high_touch",
-            "High Touch uses warehouse-native customer data activation.",
-            page_hint="companies/high-touch.md",
-            entity_key="companies:high-touch:summary",
-            source_ids=["document:hightouch"],
+            "Data Bridge uses warehouse-native customer data activation.",
+            page_hint="companies/data-bridge.md",
+            entity_key="companies:data-bridge:summary",
+            source_ids=["document:databridge"],
         )
         link_fact_to_entity(
             conn,
             "fact_high_touch",
             "entity_high_touch",
-            mention_text="High Touch",
+            mention_text="Data Bridge",
         )
 
     result = generate_gardener_candidates(svc.paths, shadow=False)
@@ -257,17 +386,22 @@ def test_entity_gardener_proposes_and_applies_compact_duplicate_merge(tmp_path: 
     )
     action = next(action for action in result["actions"] if action["action_type"] == "entity_merge")
 
-    assert candidate["canonical_entity_id"] == "entity_hightouch"
+    assert candidate["canonical_entity_id"] == "entity_databridge"
     assert candidate["merged_entity_ids"] == ["entity_high_touch"]
     assert candidate["merge_signal"] == "same_compact_name_or_alias"
     assert candidate["risk_tier"] == "low"
-    assert action["target_fact_ids"] == ["fact_hightouch", "fact_high_touch"]
+    assert action["target_fact_ids"] == ["fact_databridge", "fact_high_touch"]
     assert action["action_features"]["merged_entity_count"] == 2
+    assert action["action_features"]["merge_signal"] == "same_compact_name_or_alias"
+    assert action["policy_version"] is not None
+    assert action["policy_decision"] == "matched"
+    assert action["autonomy_level"] == "L3"
+    assert action["status"] == "needs_human"
     assert action["evidence_json"]["payload"] == {
-        "canonical_entity_id": "entity_hightouch",
+        "canonical_entity_id": "entity_databridge",
         "merged_entity_ids": ["entity_high_touch"],
         "reason": "entity names differ only by spacing or punctuation",
-        "candidate_key": "entity_merge:entities:entity_high_touch,entity_hightouch",
+        "candidate_key": "entity_merge:entities:entity_databridge,entity_high_touch",
     }
 
     apply_action(svc.paths, action["id"])
@@ -284,9 +418,9 @@ def test_entity_gardener_proposes_and_applies_compact_duplicate_merge(tmp_path: 
         ).fetchone()
 
     assert source["status"] == "merged"
-    assert source["merged_into"] == "entity_hightouch"
-    assert fact["entity_id"] == "entity_hightouch"
-    assert link["entity_id"] == "entity_hightouch"
+    assert source["merged_into"] == "entity_databridge"
+    assert fact["entity_id"] == "entity_databridge"
+    assert link["entity_id"] == "entity_databridge"
 
 
 def test_entity_gardener_skips_known_type_mismatch(tmp_path: Path) -> None:
@@ -331,30 +465,30 @@ def test_entity_gardener_llm_can_drop_entity_merge_candidate(tmp_path: Path) -> 
     svc = service_for(tmp_path)
     svc.init_workspace()
     with connection(svc.paths.sqlite_path) as conn:
-        insert_entity(conn, "entity_sierra", "Sierra")
-        insert_entity(conn, "entity_sierra_poc", "Sierra POC")
+        insert_entity(conn, "entity_northwind", "Northwind")
+        insert_entity(conn, "entity_northwind_poc", "Northwind POC")
         insert_fact(
             conn,
-            "fact_sierra",
-            "Sierra is evaluating customer-facing AI agent workflows.",
-            page_hint="companies/sierra.md",
-            entity_key="companies:sierra:summary",
-            source_ids=["document:sierra"],
+            "fact_northwind",
+            "Northwind is evaluating customer-facing AI agent workflows.",
+            page_hint="companies/northwind.md",
+            entity_key="companies:northwind:summary",
+            source_ids=["document:northwind"],
         )
-        link_fact_to_entity(conn, "fact_sierra", "entity_sierra", mention_text="Sierra")
+        link_fact_to_entity(conn, "fact_northwind", "entity_northwind", mention_text="Northwind")
         insert_fact(
             conn,
-            "fact_sierra_poc",
-            "Sierra POC planning tracks pilot scope and success criteria.",
-            page_hint="projects/sierra-poc.md",
-            entity_key="projects:sierra-poc:summary",
-            source_ids=["document:sierra"],
+            "fact_northwind_poc",
+            "Northwind POC planning tracks pilot scope and success criteria.",
+            page_hint="projects/northwind-poc.md",
+            entity_key="projects:northwind-poc:summary",
+            source_ids=["document:northwind"],
         )
         link_fact_to_entity(
             conn,
-            "fact_sierra_poc",
-            "entity_sierra_poc",
-            mention_text="Sierra POC",
+            "fact_northwind_poc",
+            "entity_northwind_poc",
+            mention_text="Northwind POC",
         )
 
     first = generate_gardener_candidates(svc.paths)
@@ -366,7 +500,7 @@ def test_entity_gardener_llm_can_drop_entity_merge_candidate(tmp_path: Path) -> 
 
         def complete(self, prompt: str) -> str:
             assert "Candidates may be page topology changes or entity merges" in prompt
-            assert "entity_sierra_poc" in prompt
+            assert "entity_northwind_poc" in prompt
             return json.dumps(
                 {
                     "judgments": [
@@ -385,7 +519,7 @@ def test_entity_gardener_llm_can_drop_entity_merge_candidate(tmp_path: Path) -> 
     assert result["llm_judgment"]["dropped_candidate_count"] == 1
     assert dropped[0]["candidate_key"] == merge["candidate_key"]
     assert dropped[0]["action_type"] == "entity_merge"
-    assert dropped[0]["entity_names"]["entity_sierra_poc"] == "Sierra POC"
+    assert dropped[0]["entity_names"]["entity_northwind_poc"] == "Northwind POC"
     assert dropped[0]["llm_judgment"]["rationale"] == "The POC is a project, not the company identity."
     assert not any(candidate["candidate_key"] == merge["candidate_key"] for candidate in result["candidates"])
 
@@ -648,12 +782,12 @@ def test_gardener_tiers_reasoning_effort_by_candidate_signal(tmp_path: Path, mon
                 {
                     "judgments": [
                         {
-                            "candidate_key": "entity_merge:entities:entity_hightouch,entity_high_touch",
+                            "candidate_key": "entity_merge:entities:entity_databridge,entity_high_touch",
                             "decision": "keep",
                             "rationale": "Compact name match.",
                         },
                         {
-                            "candidate_key": "entity_merge:entities:entity_sierra,entity_sierra_poc",
+                            "candidate_key": "entity_merge:entities:entity_northwind,entity_northwind_poc",
                             "decision": "keep",
                             "rationale": "Needs semantic review.",
                         },
@@ -672,14 +806,14 @@ def test_gardener_tiers_reasoning_effort_by_candidate_signal(tmp_path: Path, mon
         [
             {
                 "action_type": "entity_merge",
-                "candidate_key": "entity_merge:entities:entity_hightouch,entity_high_touch",
+                "candidate_key": "entity_merge:entities:entity_databridge,entity_high_touch",
                 "risk_tier": "low",
                 "merge_signal": "same_compact_name_or_alias",
                 "score": 0.94,
             },
             {
                 "action_type": "entity_merge",
-                "candidate_key": "entity_merge:entities:entity_sierra,entity_sierra_poc",
+                "candidate_key": "entity_merge:entities:entity_northwind,entity_northwind_poc",
                 "risk_tier": "medium",
                 "merge_signal": "name_containment",
                 "score": 0.78,

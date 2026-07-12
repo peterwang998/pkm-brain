@@ -10,7 +10,9 @@ export function attr(value) {
 }
 
 export function chip(text, state = "") {
-  return `<span class="chip ${state}">${esc(text)}</span>`;
+  const value = String(text ?? "").trim();
+  if (!value) return "";
+  return `<span class="chip ${state}">${esc(value)}</span>`;
 }
 
 export function id(value) {
@@ -29,6 +31,11 @@ export function fmt(value) {
   return date.toLocaleString();
 }
 
+export function dateOnly(value) {
+  const text = String(value || "").trim();
+  return text.length >= 10 ? text.slice(0, 10) : text;
+}
+
 export function compact(value, limit = 140) {
   const text = String(value || "").replace(/\s+/g, " ").trim();
   if (text.length <= limit) return text;
@@ -40,8 +47,17 @@ export function empty(text) {
 }
 
 export function sourceList(sourceIds = [], docs = []) {
-  const docItems = docs.map(doc => `<li><strong>${esc(doc.source_id || doc.id)}</strong> ${esc(doc.title || "")}<br><span class="muted">${esc(doc.source_type || "")} ${esc(doc.source_path || "")}</span></li>`);
-  const known = new Set(docs.map(doc => doc.source_id || `document:${doc.id}`));
+  const docItems = docs.map(doc => {
+    const sourceDate = doc.captured_at || doc.created_at || doc.ingested_at || "";
+    const metadata = [doc.source_type, doc.source_path, sourceDate ? `source ${dateOnly(sourceDate)}` : ""]
+      .filter(Boolean)
+      .join(" · ");
+    return `<li><strong>${esc(doc.source_id || doc.id)}</strong> ${esc(doc.title || "")}<br><span class="muted" title="${esc(sourceDate)}">${esc(metadata)}</span></li>`;
+  });
+  const known = new Set(docs.flatMap(doc => [
+    doc.source_id || `document:${doc.id}`,
+    ...(doc.source_refs || []),
+  ]));
   const unresolved = sourceIds
     .filter(sourceId => !known.has(sourceId))
     .map(sourceId => `<li><strong>${esc(sourceId)}</strong></li>`);

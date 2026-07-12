@@ -1,4 +1,4 @@
-/* Brain UI v2 — layout + core components. Encodes spec §3–§4.
+/* Brain UI fallback layout and components. Contract: docs/specs/app-and-operations.md.
    Views compose these classes; new visual patterns require a spec change, not ad-hoc CSS. */
 
 * { box-sizing: border-box; }
@@ -56,7 +56,7 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 .chip.warn { color: var(--warn); background: var(--warn-bg); border-color: transparent; }
 .chip.bad  { color: var(--bad);  background: var(--bad-bg);  border-color: transparent; }
 
-/* evidence quotes: always mono, always this treatment (spec §4) */
+/* Evidence quotes use one consistent monospaced treatment. */
 blockquote.evidence {
   margin: var(--s2) 0; padding: var(--s2) var(--s3);
   border-left: 2px solid var(--line-2); background: var(--panel-2);
@@ -72,19 +72,21 @@ table.compact th, table.compact td { padding: 6px var(--s3); border-bottom: 1px 
 table.compact th { font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .02em; color: var(--text-2); font-weight: 500; }
 table.compact tr:hover td { background: var(--panel-2); }
 
-/* raw JSON is a debug affordance behind a disclosure, never primary (spec §2) */
+/* Raw JSON is a debug affordance behind a disclosure, never primary. */
 details.raw > summary { color: var(--text-2); font-size: var(--fs-xs); cursor: pointer; margin-top: var(--s3); }
 details.raw pre { background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius-s); padding: var(--s3); overflow: auto; font-size: var(--fs-xs); }
 
-/* ---- queue split pane (spec §3.2) ---- */
+/* ---- queue split pane ---- */
 .queue-layout { display: grid; grid-template-columns: minmax(260px, 340px) 1fr; gap: var(--s4); align-items: start; }
 .queue-list { display: flex; flex-direction: column; gap: 2px; }
 .queue-item { padding: var(--s2) var(--s3); border-radius: var(--radius-s); cursor: pointer; border: 1px solid transparent; }
 .queue-item:hover { background: var(--panel-2); }
 .queue-item[aria-selected="true"] { background: var(--accent-bg); border-color: var(--accent); }
 .queue-item .kind { font-size: var(--fs-xs); color: var(--text-2); }
+.queue-summary { margin-top: 2px; font-size: var(--fs-xs); line-height: 1.35; }
 .orientation-card { border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); padding: var(--s3) 0; margin-bottom: var(--s4); }
 .orientation-card strong { display: block; font-size: var(--fs-lg); font-weight: 600; margin-bottom: var(--s1); }
+.review-blocked { display: grid; gap: var(--s1); margin-bottom: var(--s4); padding: var(--s3); border: 1px solid var(--warn); border-radius: var(--radius-s); background: var(--warn-bg); color: var(--warn); }
 .card-pair { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s3); }
 .decision-bar { display: flex; flex-wrap: wrap; gap: var(--s2); margin-top: var(--s4); }
 .decision-bar kbd {
@@ -92,8 +94,18 @@ details.raw pre { background: var(--panel-2); border: 1px solid var(--line); bor
   border: 1px solid var(--line-2); border-bottom-width: 2px; border-radius: 4px; padding: 0 5px; margin-right: 4px;
 }
 .progress { color: var(--text-2); font-size: var(--fs-xs); }
+.fact-card { min-width: 0; padding: var(--s3); border: 1px solid var(--line); border-radius: var(--radius-s); }
+.alternative-list { display: grid; gap: var(--s4); }
+.alternative-choice { display: grid; gap: var(--s2); }
+.alternative-choice > button { justify-self: start; }
+.alternative-choice > button[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-bg); color: var(--accent); }
+.orientation-panel { padding: var(--s3); border-left: 3px solid var(--accent); background: var(--panel-2); }
+.split-preview { display: grid; gap: var(--s2); padding-top: var(--s2); }
+.split-child { display: grid; grid-template-columns: minmax(180px, 1fr) auto minmax(240px, 2fr); gap: var(--s3); align-items: start; padding: var(--s3) 0; border-top: 1px solid var(--line); }
+.split-child ul { margin: 0; padding-left: var(--s4); }
+.split-child li { margin-bottom: var(--s1); }
 
-/* ---- wiki reading surface (spec §3.3) ---- */
+/* ---- wiki reading surface ---- */
 .wiki-layout { display: grid; grid-template-columns: minmax(220px, 280px) minmax(0, 1fr) minmax(200px, 260px); gap: var(--s5); align-items: start; }
 .reading { max-width: var(--measure-read); font-size: var(--fs-read); line-height: var(--lh-read); }
 .reading li { margin-bottom: var(--s2); }
@@ -126,6 +138,8 @@ details.raw pre { background: var(--panel-2); border: 1px solid var(--line); bor
 .toolbar { display: flex; flex-wrap: wrap; gap: var(--s2); align-items: center; margin-bottom: var(--s3); }
 .filters { display: flex; flex-wrap: wrap; gap: var(--s2); margin-bottom: var(--s3); }
 .filters button[aria-pressed="true"], .filters a[aria-current="true"] { border-color: var(--accent); background: var(--accent-bg); color: var(--accent); }
+.queue-state-control { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s2); margin-bottom: var(--s3); }
+.queue-state-control button[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-bg); color: var(--accent); }
 .meta-row, .alias-row { display: flex; flex-wrap: wrap; gap: var(--s2); align-items: center; margin: var(--s2) 0; }
 .bad-text { color: var(--bad); }
 .source-list { margin: var(--s2) 0 0; padding-left: var(--s4); color: var(--text-2); }
@@ -136,6 +150,7 @@ details.raw pre { background: var(--panel-2); border: 1px solid var(--line); bor
 .batch-bar { display: flex; gap: var(--s2); align-items: center; margin: var(--s3) 0; padding: var(--s2); border: 1px solid var(--line); border-radius: var(--radius-s); background: var(--panel-2); }
 .queue-item { display: grid; grid-template-columns: 18px 1fr; gap: var(--s2); align-items: start; }
 .queue-item input { margin-top: 2px; }
+.queue-item .bad-text { margin-top: 2px; font-size: var(--fs-xs); }
 .detail-head, .entity-head { display: flex; justify-content: space-between; gap: var(--s4); align-items: start; margin-bottom: var(--s4); }
 .route-list { display: grid; gap: var(--s2); }
 .route-list button { display: flex; gap: var(--s2); justify-content: space-between; text-align: left; }
@@ -173,6 +188,7 @@ kbd {
 
 @media (max-width: 980px) {
   .wiki-layout, .entities-layout, .ask-layout, .ops-layout { grid-template-columns: 1fr; }
+  .split-child { grid-template-columns: 1fr; }
   .ask-form { grid-template-columns: 1fr; }
   .needs-strip, .detail-head, .entity-head { flex-direction: column; align-items: stretch; }
 }

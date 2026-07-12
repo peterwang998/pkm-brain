@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import tempfile
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -21,6 +22,15 @@ MAX_RAW_JSON_CHARS = 1200
 SKIPPED_TEXT_KEYS = {"data"}
 SKIPPED_CONTAINER_KEYS = {"snapshot", "pastedContents"}
 CAPTURE_FORMAT_VERSION = "agent-md-v5"
+HYPRNOTE_TRANSCRIPT_RENDER_VERSION = "chronological-speaker-turns-v2"
+HYPRNOTE_MAX_TURN_WORDS = 240
+HYPRNOTE_TURN_GAP_MS = 2500
+HYPRNOTE_TRACK_CLOCK_MIN_OVERLAP_WORDS = 8
+HYPRNOTE_TRACK_CLOCK_OVERLAP_THRESHOLD = 0.8
+HYPRNOTE_TRACK_ORDER_NOTE = (
+    "[Transcript note: source timestamps use overlapping speaker-track clocks; "
+    "tracks are grouped by speaker and are not presented as turn order.]"
+)
 SENSITIVE_KEY_PATTERNS = (
     "secret",
     "token",
@@ -461,9 +471,11 @@ class HyprnoteAdapter:
         session_id = str(meta.get("id") or session_dir.name)
         event = meta.get("event") if isinstance(meta.get("event"), dict) else {}
         title = str(meta.get("title") or event.get("title") or f"Hyprnote session {session_id}")
+        participant_names, participant_paths = hyprnote_participant_names(self.root, meta)
         summary = read_text_if_exists(session_dir / "_summary.md")
         memo = read_text_if_exists(session_dir / "_memo.md")
         transcript = render_hyprnote_transcript(session_dir / "transcript.json")
+        hash_paths = [*existing, *participant_paths]
         stats = [path.stat() for path in existing]
         metadata = {
             "source_type": "hyprnote_meeting",
@@ -477,8 +489,18 @@ class HyprnoteAdapter:
             "event_started_at": event.get("started_at") or "",
             "event_ended_at": event.get("ended_at") or "",
             "location": event.get("location") or "",
+            "participants": ", ".join(participant_names),
+            "transcript_render_version": HYPRNOTE_TRANSCRIPT_RENDER_VERSION,
         }
-        source_hash = text_sha256("\n".join(path.read_text(encoding="utf-8", errors="replace") for path in existing))
+        source_hash = text_sha256(
+            "\n".join(
+                [HYPRNOTE_TRANSCRIPT_RENDER_VERSION]
+                + [
+                    path.read_text(encoding="utf-8", errors="replace")
+                    for path in hash_paths
+                ]
+            )
+        )
         return AgentSessionCapture(
             agent="hyprnote",
             session_id=session_id,
@@ -674,6 +696,11 @@ def render_markdown(metadata: dict[str, Any], events: list[dict[str, Any]]) -> s
 
 def render_hyprnote_markdown(metadata: dict[str, Any], summary: str, memo: str, transcript: str) -> str:
     title = metadata.get("title") or "Hyprnote meeting"
+    participants = [
+        value.strip()
+        for value in str(metadata.get("participants") or "").split(",")
+        if value.strip()
+    ]
     lines = [
         "---",
         *yaml_frontmatter_lines(metadata),
@@ -681,19 +708,32 @@ def render_hyprnote_markdown(metadata: dict[str, Any], summary: str, memo: str, 
         "",
         f"# Meeting: {title}",
         "",
-        "## Summary",
-        "",
-        summary.strip() or "No summary was captured.",
-        "",
-        "## Memo",
-        "",
-        memo.strip() or "No memo was captured.",
-        "",
-        "## Transcript",
-        "",
-        transcript.strip() or "No transcript was captured.",
-        "",
     ]
+    if participants:
+        lines.extend(
+            [
+                "## Known Participants",
+                "",
+                *[f"- {participant}" for participant in participants],
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "## Summary",
+            "",
+            summary.strip() or "No summary was captured.",
+            "",
+            "## Memo",
+            "",
+            memo.strip() or "No memo was captured.",
+            "",
+            "## Transcript",
+            "",
+            transcript.strip() or "No transcript was captured.",
+            "",
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -712,18 +752,219 @@ def render_hyprnote_transcript(path: Path) -> str:
     transcripts = data.get("transcripts")
     if not isinstance(transcripts, list):
         return ""
-    rendered: list[str] = []
-    for transcript in transcripts:
+    words: list[dict[str, Any]] = []
+    stable_index = 0
+    for transcript_index, transcript in enumerate(transcripts):
         if not isinstance(transcript, dict):
             continue
-        words = transcript.get("words")
-        if not isinstance(words, list):
+        transcript_words = transcript.get("words")
+        if not isinstance(transcript_words, list):
             continue
-        text = "".join(str(word.get("text", "")) for word in words if isinstance(word, dict))
-        cleaned = re.sub(r"\s+", " ", text).strip()
+        speaker_hints = hyprnote_speaker_hints(transcript)
+        transcript_started_at = hyprnote_timestamp_ms(transcript.get("started_at"))
+        for word_index, word in enumerate(transcript_words):
+            if not isinstance(word, dict) or not str(word.get("text") or "").strip():
+                continue
+            start_ms = optional_number(word.get("start_ms"))
+            end_ms = optional_number(word.get("end_ms"))
+            absolute_start = (
+                transcript_started_at + start_ms
+                if transcript_started_at is not None and start_ms is not None
+                else start_ms
+            )
+            absolute_end = (
+                transcript_started_at + end_ms
+                if transcript_started_at is not None and end_ms is not None
+                else end_ms
+            )
+            word_id = str(word.get("id") or "")
+            channel = word.get("channel")
+            speaker_index = speaker_hints.get(word_id)
+            if speaker_index is not None:
+                speaker_key = f"channel:{channel}:speaker:{speaker_index}"
+            elif channel is not None:
+                speaker_key = f"channel:{channel}"
+            else:
+                speaker_key = f"transcript:{transcript_index}"
+            words.append(
+                {
+                    "text": str(word.get("text") or ""),
+                    "speaker_key": speaker_key,
+                    "channel": channel,
+                    "start_ms": absolute_start,
+                    "end_ms": absolute_end,
+                    "stable_index": stable_index,
+                    "fallback_order": (transcript_index, word_index),
+                }
+            )
+            stable_index += 1
+    if not words:
+        return ""
+    grouped_tracks = hyprnote_uses_overlapping_track_clocks(words)
+    if grouped_tracks:
+        speaker_order: dict[str, int] = {}
+        for word in words:
+            speaker_key = str(word["speaker_key"])
+            speaker_order.setdefault(speaker_key, len(speaker_order))
+        words.sort(
+            key=lambda word: (
+                speaker_order[str(word["speaker_key"])],
+                *hyprnote_word_sort_key(word),
+            )
+        )
+    else:
+        words.sort(key=hyprnote_word_sort_key)
+    speaker_labels: dict[str, str] = {}
+    turns: list[dict[str, Any]] = []
+    for word in words:
+        speaker_key = str(word["speaker_key"])
+        speaker_labels.setdefault(speaker_key, f"Speaker {len(speaker_labels) + 1}")
+        current = turns[-1] if turns else None
+        gap_ms = hyprnote_word_gap_ms(current, word)
+        if (
+            current is None
+            or current["speaker_key"] != speaker_key
+            or len(current["words"]) >= HYPRNOTE_MAX_TURN_WORDS
+            or (gap_ms is not None and gap_ms > HYPRNOTE_TURN_GAP_MS)
+        ):
+            current = {
+                "speaker_key": speaker_key,
+                "words": [],
+                "end_ms": word.get("end_ms"),
+            }
+            turns.append(current)
+        current["words"].append(str(word["text"]))
+        if word.get("end_ms") is not None:
+            current["end_ms"] = word["end_ms"]
+    rendered = [HYPRNOTE_TRACK_ORDER_NOTE] if grouped_tracks else []
+    for turn in turns:
+        cleaned = join_hyprnote_word_texts(turn["words"])
         if cleaned:
-            rendered.append(cleaned)
+            rendered.append(f"{speaker_labels[turn['speaker_key']]}: {cleaned}")
     return "\n\n".join(rendered)
+
+
+def hyprnote_participant_names(
+    root: Path, meta: dict[str, Any]
+) -> tuple[list[str], list[Path]]:
+    participants = meta.get("participants")
+    if not isinstance(participants, list):
+        return [], []
+    names: list[str] = []
+    paths: list[Path] = []
+    for participant in participants:
+        if not isinstance(participant, dict):
+            continue
+        human_id = str(participant.get("human_id") or "").strip()
+        if not human_id:
+            continue
+        path = root / "humans" / f"{human_id}.md"
+        if not path.exists():
+            continue
+        paths.append(path)
+        name = hyprnote_human_name(path)
+        if name and name not in names:
+            names.append(name)
+    return names, paths
+
+
+def hyprnote_human_name(path: Path) -> str:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    match = re.search(r"(?m)^name:\s*(.+?)\s*$", text)
+    if match is None:
+        return ""
+    return match.group(1).strip().strip("'\"")
+
+
+def hyprnote_speaker_hints(transcript: dict[str, Any]) -> dict[str, int]:
+    output: dict[str, int] = {}
+    hints = transcript.get("speaker_hints")
+    if not isinstance(hints, list):
+        return output
+    for hint in hints:
+        if not isinstance(hint, dict) or hint.get("type") != "provider_speaker_index":
+            continue
+        word_id = str(hint.get("word_id") or "").strip()
+        if not word_id:
+            continue
+        try:
+            value = json.loads(str(hint.get("value") or "{}"))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(value, dict):
+            continue
+        speaker_index = value.get("speaker_index")
+        if isinstance(speaker_index, int):
+            output[word_id] = speaker_index
+    return output
+
+
+def hyprnote_timestamp_ms(value: Any) -> float | None:
+    numeric = optional_number(value)
+    if numeric is not None:
+        return numeric
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp() * 1000
+    except ValueError:
+        return None
+
+
+def optional_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def hyprnote_word_sort_key(word: dict[str, Any]) -> tuple[Any, ...]:
+    start_ms = word.get("start_ms")
+    if start_ms is None:
+        return (1, *word["fallback_order"], word["stable_index"])
+    return (0, float(start_ms), word["stable_index"])
+
+
+def hyprnote_word_gap_ms(
+    current: dict[str, Any] | None, word: dict[str, Any]
+) -> float | None:
+    if current is None or current.get("end_ms") is None or word.get("start_ms") is None:
+        return None
+    return float(word["start_ms"]) - float(current["end_ms"])
+
+
+def hyprnote_uses_overlapping_track_clocks(words: list[dict[str, Any]]) -> bool:
+    starts_by_channel: dict[str, set[float]] = {}
+    for word in words:
+        channel = word.get("channel")
+        start_ms = word.get("start_ms")
+        if channel is None or start_ms is None:
+            continue
+        starts_by_channel.setdefault(str(channel), set()).add(float(start_ms))
+    channels = sorted(starts_by_channel)
+    for index, left_channel in enumerate(channels):
+        left = starts_by_channel[left_channel]
+        for right_channel in channels[index + 1 :]:
+            right = starts_by_channel[right_channel]
+            denominator = min(len(left), len(right))
+            if denominator < HYPRNOTE_TRACK_CLOCK_MIN_OVERLAP_WORDS:
+                continue
+            overlap = len(left & right) / denominator
+            if overlap >= HYPRNOTE_TRACK_CLOCK_OVERLAP_THRESHOLD:
+                return True
+    return False
+
+
+def join_hyprnote_word_texts(words: list[str]) -> str:
+    cleaned = " ".join(part.strip() for part in words if part.strip())
+    cleaned = re.sub(r"\s+([,.;:!?%])", r"\1", cleaned)
+    cleaned = re.sub(r"([([{])\s+", r"\1", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
 def read_json_object(path: Path) -> dict[str, Any]:

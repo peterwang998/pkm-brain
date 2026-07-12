@@ -35,7 +35,19 @@ from .llm import (
     load_cos_llm_config,
 )
 from .paths import BrainPaths
+from .routing_coherence import (
+    coherence_bonus,
+    fact_document_id,
+    load_document_route_priors,
+    route_priors_from_facts,
+    strong_document_prior,
+)
+from .source_evidence import (
+    evidence_units_for_text,
+    resolve_evidence_unit_ids,
+)
 from .util import new_id, now_iso
+from .wiki import NON_ROUTABLE_PAGE_TYPES
 from .wiki_facts import (
     canonical_page_hint_for_fact,
     entity_key_for_change,
@@ -73,11 +85,11 @@ CONFLICT_PRECHECK_SCHEMA = {
         "rationale": {"type": "string"},
     },
 }
-EXTRACTION_PROMPT_VERSION = "extractor-evidence-units-v5"
+EXTRACTION_PROMPT_VERSION = "extractor-evidence-units-v6-speaker-context"
+COMPATIBLE_EXTRACTION_PROMPT_VERSIONS = ("extractor-evidence-units-v5",)
 EXTRACTION_STAGE = "extractor"
 EXTRACTION_VALIDATION_ATTEMPTS = 2
-MAX_EVIDENCE_UNITS_PER_FACT = 3
-EVIDENCE_UNIT_TARGET_TOKENS = 80
+MAX_EVIDENCE_UNITS_PER_FACT = 5
 DEFAULT_EXTRACTION_WINDOW_CHUNKS = 6
 DEFAULT_EXTRACTION_WINDOW_OVERLAP_CHUNKS = 1
 DEFAULT_EXTRACTION_MAX_WORKERS = 1
@@ -85,6 +97,7 @@ MAX_EXTRACTION_MAX_WORKERS = 16
 DEFAULT_CRITIC_REVIEW_MAX_WORKERS = 4
 DEFAULT_CRITIC_REVIEW_TIMEOUT_SECONDS = 300
 DEFAULT_CRITIC_BLOCK_RATE_ANOMALY_THRESHOLD = 0.8
+DEFAULT_CRITIC_BLOCK_RATE_ANOMALY_MIN_REVIEWED = 5
 DEFAULT_ROUTING_HINT_LIMIT = 80
 ROUTING_HINT_POOL_LIMIT = 2000
 DEFAULT_SKIPPED_SOURCE_TYPES = {"agent_session_log"}
@@ -98,7 +111,7 @@ INVALID_ROUTE_PREFIXES = (
     "db/",
     "config/",
 )
-INVALID_ROUTE_PAGE_TYPES = {"reference", "index"}
+INVALID_ROUTE_PAGE_TYPES = NON_ROUTABLE_PAGE_TYPES
 CANONICAL_ROUTE_NAMESPACES = {
     "career",
     "companies",
@@ -133,12 +146,28 @@ CLAIM_CLASSES = DURABLE_CLAIM_CLASSES | NON_CLAIM_CLASSES
 LOW_INFORMATION_LINE_PATTERNS = (
     re.compile(r"^---+$"),
     re.compile(r"^\.\.\.+$"),
+    re.compile(r"^#{1,6}\s+.*$"),
     re.compile(r"^title\s*:\s*.+$", re.IGNORECASE),
+    re.compile(
+        r"^(source_type|agent|source_updated_at|location|participants|"
+        r"transcript_render_version)\s*:\s*.*$",
+        re.IGNORECASE,
+    ),
     re.compile(r"^(event_)?(started|ended)_at\s*:\s*.+$", re.IGNORECASE),
     re.compile(r"^(created|updated|captured|ingested)_at\s*:\s*.+$", re.IGNORECASE),
     re.compile(r"^source_path\s*:\s*.+$", re.IGNORECASE),
     re.compile(r"^session_id\s*:\s*.+$", re.IGNORECASE),
     re.compile(r"^no\s+(summary|memo|transcript)\s+was\s+captured\.?$", re.IGNORECASE),
+    re.compile(
+        r"^\[transcript note:\s*source timestamps use overlapping speaker-track clocks;.*\]$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?:the\s+)?(?:hyprnote\s+)?(?:meeting\s+)?"
+        r"(?:document|session|record)\b.*\bhas\s+no\s+captured\s+"
+        r"(summary|memo|transcript)\.?$",
+        re.IGNORECASE,
+    ),
     re.compile(
         r"^\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+-]\d{2}:\d{2})?$",
         re.IGNORECASE,
@@ -147,6 +176,12 @@ LOW_INFORMATION_LINE_PATTERNS = (
 LOW_VALUE_FACT_STATEMENT_PATTERNS = (
     re.compile(
         r"^no\s+(summary|memo|transcript)\s+was\s+captured(?:\s+for\b.*)?\.?$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?:the\s+)?(?:hyprnote\s+)?(?:meeting\s+)?"
+        r"(?:document|session|record)\b.*\bhas\s+no\s+captured\s+"
+        r"(summary|memo|transcript)\.?$",
         re.IGNORECASE,
     ),
 )
@@ -167,6 +202,7 @@ def extract_recent_documents(
     critic_max_workers: int | None = None,
     critic_timeout_seconds: int | None = None,
     source_types: list[str] | None = None,
+    document_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     run_started = time.perf_counter()
     if not cos_role_provider_configured(
@@ -196,10 +232,15 @@ def extract_recent_documents(
         max_workers=critic_max_workers,
         timeout_seconds=critic_timeout_seconds,
     )
-    source_type_filter = {str(item).strip() for item in source_types or [] if str(item).strip()}
+    source_type_filter = {
+        str(item).strip() for item in source_types or [] if str(item).strip()
+    }
+    document_id_filter = {
+        str(item).strip() for item in document_ids or [] if str(item).strip()
+    }
     selection_limit = (
         max(1, limit)
-        if offset <= 0 and not source_type_filter
+        if offset <= 0 and not source_type_filter and not document_id_filter
         else 10_000_000
     )
     documents = recent_source_cards(
@@ -215,6 +256,12 @@ def extract_recent_documents(
             document
             for document in documents
             if str(document.get("source_type") or "") in source_type_filter
+        ]
+    if document_id_filter:
+        documents = [
+            document
+            for document in documents
+            if str(document.get("document_id") or "") in document_id_filter
         ]
     if offset > 0:
         documents = documents[offset:]
@@ -254,8 +301,11 @@ def extract_recent_documents(
     extraction_duration_ms = elapsed_ms(extraction_started)
     candidates: list[dict[str, Any]] = []
     document_validations: list[dict[str, Any]] = []
+    route_targets = load_extraction_route_targets(paths)
     for index, document in enumerate(documents):
-        document_candidates = document_outputs[index]["candidates"]
+        document_candidates = apply_document_route_coherence(
+            document_outputs[index]["candidates"], route_targets
+        )
         window_validations = document_outputs[index]["window_validations"]
         document_validation = aggregate_document_validation(
             document, window_validations, document_candidates
@@ -642,15 +692,19 @@ def extraction_terminal_watermark_exists(
     extractor_model: str | None,
     prompt_version: str,
 ) -> bool:
+    prompt_versions = [prompt_version]
+    if prompt_version == EXTRACTION_PROMPT_VERSION:
+        prompt_versions.extend(COMPATIBLE_EXTRACTION_PROMPT_VERSIONS)
+    prompt_placeholders = ",".join("?" for _ in prompt_versions)
     row = conn.execute(
-        """
+        f"""
         SELECT 1
         FROM cos_stage_watermarks
         WHERE stage = ?
           AND document_id = ?
           AND content_hash = ?
           AND COALESCE(model, '') = COALESCE(?, '')
-          AND prompt_version = ?
+          AND prompt_version IN ({prompt_placeholders})
           AND status IN (?, ?)
         LIMIT 1
         """,
@@ -659,7 +713,7 @@ def extraction_terminal_watermark_exists(
             document_id,
             content_hash,
             extractor_model,
-            prompt_version,
+            *prompt_versions,
             *sorted(TERMINAL_EXTRACTION_WATERMARK_STATUSES),
         ),
     ).fetchone()
@@ -760,6 +814,10 @@ def normalize_critic_review_config(value: Any) -> dict[str, Any]:
         "block_rate_anomaly_threshold": normalize_threshold(
             raw.get("block_rate_anomaly_threshold"),
             DEFAULT_CRITIC_BLOCK_RATE_ANOMALY_THRESHOLD,
+        ),
+        "block_rate_anomaly_min_reviewed": normalize_positive_int(
+            raw.get("block_rate_anomaly_min_reviewed"),
+            DEFAULT_CRITIC_BLOCK_RATE_ANOMALY_MIN_REVIEWED,
         ),
     }
 
@@ -919,18 +977,60 @@ def decide_policy_actions(
         ),
     }
     if max_workers <= 1:
-        return [decide_action(paths, action_id, **kwargs) for action_id in action_ids]
+        return [
+            decide_policy_action_safely(paths, action_id, kwargs=kwargs)
+            for action_id in action_ids
+        ]
     results: dict[int, dict[str, Any]] = {}
     with ThreadPoolExecutor(
         max_workers=max_workers, thread_name_prefix="brain-critic"
     ) as executor:
         futures = {
-            executor.submit(decide_action, paths, action_id, **kwargs): index
+            executor.submit(
+                decide_policy_action_safely,
+                paths,
+                action_id,
+                kwargs=kwargs,
+            ): index
             for index, action_id in enumerate(action_ids)
         }
         for future in as_completed(futures):
             results[futures[future]] = future.result()
     return [results[index] for index in range(len(action_ids))]
+
+
+def decide_policy_action_safely(
+    paths: BrainPaths,
+    action_id: str,
+    *,
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        return decide_action(paths, action_id, **kwargs)
+    except Exception as exc:
+        return mark_policy_action_decision_failure(paths, action_id, exc)
+
+
+def mark_policy_action_decision_failure(
+    paths: BrainPaths,
+    action_id: str,
+    error: Exception,
+) -> dict[str, Any]:
+    action = get_action(paths, action_id)
+    if action.get("status") in {"applied", "auto_applied"}:
+        return action
+    evidence = dict(action.get("evidence_json") or {})
+    evidence["decision_failure"] = {
+        "error_type": type(error).__name__,
+        "message": str(error)[:1000],
+        "at": now_iso(),
+    }
+    with connection(paths.sqlite_path) as conn:
+        conn.execute(
+            "UPDATE cos_actions SET status = 'failed', evidence_json = ? WHERE id = ?",
+            (dumps(evidence), action_id),
+        )
+    return get_action(paths, action_id)
 
 
 def record_critic_block_rate_anomalies(
@@ -946,6 +1046,10 @@ def record_critic_block_rate_anomalies(
         parsed_threshold = float(threshold)
     except (TypeError, ValueError):
         parsed_threshold = DEFAULT_CRITIC_BLOCK_RATE_ANOMALY_THRESHOLD
+    min_reviewed = normalize_positive_int(
+        critic_review.get("block_rate_anomaly_min_reviewed"),
+        DEFAULT_CRITIC_BLOCK_RATE_ANOMALY_MIN_REVIEWED,
+    )
     per_doc: dict[str, dict[str, Any]] = {}
     for action in actions:
         if action.get("action_type") != "fact_upsert":
@@ -976,7 +1080,7 @@ def record_critic_block_rate_anomalies(
         for document_id, bucket in per_doc.items():
             reviewed = int(bucket["reviewed"])
             blocked = int(bucket["blocked"])
-            if reviewed < 3:
+            if reviewed < min_reviewed:
                 continue
             block_rate = blocked / reviewed if reviewed else 0.0
             if block_rate < parsed_threshold:
@@ -1075,19 +1179,50 @@ def earned_fact_decision(
             "fact": merge_candidate_into_existing_fact(duplicate, candidate),
         }
     conflict = resolver_precheck_conflict(paths, candidate)
+    resolver_precheck_evidence: dict[str, Any] | None = None
     if conflict:
-        return simple_residue_decision(
-            "fact_conflict_review",
-            str(conflict["reason"]),
-            target_fact_ids=conflict["counterpart_fact_ids"],
-            evidence={"resolver_precheck": conflict},
+        counterpart_facts = facts_for_ids(paths, conflict["counterpart_fact_ids"])
+        judgment = resolver_precheck_conflict_judgment(
+            paths, candidate, counterpart_facts
         )
+        conflict["resolver_judgment"] = judgment
+        if judgment["decision"] == "conflict":
+            selected_ids = [
+                fact_id
+                for fact_id in judgment["counterpart_fact_ids"]
+                if fact_id in conflict["counterpart_fact_ids"]
+            ]
+            conflict["counterpart_fact_ids"] = (
+                selected_ids or conflict["counterpart_fact_ids"]
+            )
+            return simple_residue_decision(
+                "fact_conflict_review",
+                str(conflict["reason"]),
+                target_fact_ids=conflict["counterpart_fact_ids"],
+                evidence={"resolver_precheck": conflict},
+            )
+        resolver_precheck_evidence = {
+            "resolver_precheck": {
+                **conflict,
+                "counterpart_fact_ids": [],
+                "reason": "Resolver confirmed the candidate can coexist with nearby facts.",
+            }
+        }
     return {
         "decision": "apply",
-        "reason": "Unit-backed, routed candidate with no resolver precheck conflict signal.",
+        "reason": (
+            "Unit-backed, routed candidate; resolver confirmed nearby facts can coexist."
+            if resolver_precheck_evidence
+            else "Unit-backed, routed candidate with no resolver precheck conflict signal."
+        ),
         "risk_tier": "medium",
         "fact_upsert_resolution": "new_clean_fact",
         "target_fact_ids": [],
+        **(
+            {"evidence": resolver_precheck_evidence}
+            if resolver_precheck_evidence
+            else {}
+        ),
     }
 
 
@@ -1145,9 +1280,13 @@ def candidate_route_metadata(candidate: dict[str, Any]) -> dict[str, Any]:
 
 
 def fact_route_reclaim_query(candidate: dict[str, Any]) -> str:
-    metadata = candidate.get("metadata") if isinstance(candidate.get("metadata"), dict) else {}
+    metadata = (
+        candidate.get("metadata") if isinstance(candidate.get("metadata"), dict) else {}
+    )
     mention_surfaces = []
-    for mention in metadata.get("model_entity_mentions") or candidate.get("entity_mentions") or []:
+    for mention in (
+        metadata.get("model_entity_mentions") or candidate.get("entity_mentions") or []
+    ):
         if isinstance(mention, dict) and mention.get("surface"):
             mention_surfaces.append(str(mention["surface"]))
     return "\n".join(
@@ -1194,6 +1333,100 @@ RECLAIM_ROUTE_EXTRA_STOP_TOKENS = {
     "workflows",
 }
 
+DOCUMENT_ROUTE_UNCERTAIN_CONFIDENCE = 0.65
+DOCUMENT_ROUTE_MIN_SIBLINGS = 2
+DOCUMENT_ROUTE_MIN_SHARE = 0.6
+
+
+def apply_document_route_coherence(
+    candidates: list[dict[str, Any]],
+    route_targets: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    priors = [
+        prior
+        for prior in route_priors_from_facts(candidates)
+        if str(prior["page_hint"]) in route_targets
+    ]
+    if not priors:
+        return candidates
+    output: list[dict[str, Any]] = []
+    for candidate in candidates:
+        routing = candidate_route_metadata(candidate)
+        confidence = optional_float(candidate.get("routing_confidence"))
+        current_page_hint = normalize_extraction_page_hint(
+            str(candidate.get("page_hint") or "")
+        )
+        uncertain = (
+            routing.get("route_destination_valid") is False
+            or current_page_hint in DEFAULT_FALLBACK_PAGE_HINTS
+            or (
+                confidence is not None
+                and confidence < DOCUMENT_ROUTE_UNCERTAIN_CONFIDENCE
+            )
+        )
+        if not uncertain:
+            output.append(candidate)
+            continue
+        choices: list[tuple[float, str, dict[str, Any], dict[str, Any]]] = []
+        query_text = fact_route_reclaim_query(candidate)
+        for prior in priors:
+            if (
+                int(prior.get("fact_count") or 0) < DOCUMENT_ROUTE_MIN_SIBLINGS
+                or float(prior.get("share") or 0.0) < DOCUMENT_ROUTE_MIN_SHARE
+            ):
+                continue
+            hint = route_targets[str(prior["page_hint"])]
+            lexical = score_reclaim_route(query_text, hint)
+            has_fact_support = bool(
+                lexical["overlap"] or float(lexical["phrase_bonus"] or 0.0) > 0
+            )
+            if not has_fact_support and not strong_document_prior(prior):
+                continue
+            total_score = float(lexical["score"]) + coherence_bonus(prior)
+            choices.append((total_score, str(prior["page_hint"]), prior, lexical))
+        if not choices:
+            output.append(candidate)
+            continue
+        choices.sort(key=lambda choice: (choice[0], choice[1]), reverse=True)
+        total_score, selected_page_hint, prior, lexical = choices[0]
+        if selected_page_hint == current_page_hint:
+            output.append(candidate)
+            continue
+        page_hint, resolved_routing = resolve_extraction_page_hint(
+            selected_page_hint, route_targets
+        )
+        if (
+            resolved_routing.get("route_destination_valid") is False
+            or page_hint in DEFAULT_FALLBACK_PAGE_HINTS
+        ):
+            output.append(candidate)
+            continue
+        routed = dict(candidate)
+        routed["page_hint"] = page_hint
+        routed["entity_key"] = entity_key_for_change(
+            topic_for_path(page_hint),
+            page_hint,
+            str(routed.get("section_hint") or "Summary"),
+        )
+        metadata = (
+            dict(routed.get("metadata") or {})
+            if isinstance(routed.get("metadata"), dict)
+            else {}
+        )
+        metadata["routing"] = {
+            **resolved_routing,
+            "route_resolution": "document_coherence_reroute",
+            "coherence_original_page_hint": current_page_hint,
+            "document_coherence_fact_count": prior["fact_count"],
+            "document_coherence_share": prior["share"],
+            "document_coherence_bonus": coherence_bonus(prior),
+            "document_coherence_lexical_overlap": lexical["overlap"],
+            "document_coherence_score": round(total_score, 4),
+        }
+        routed["metadata"] = metadata
+        output.append(routed)
+    return output
+
 
 def reclaim_route_tokens(value: str) -> set[str]:
     return routing_signal_tokens(value) - RECLAIM_ROUTE_EXTRA_STOP_TOKENS
@@ -1224,10 +1457,15 @@ def select_reclaim_route(
     *,
     min_score: float,
     min_overlap: int,
+    document_priors: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
-    original_page_hint = normalize_extraction_page_hint(str(candidate.get("page_hint") or ""))
+    original_page_hint = normalize_extraction_page_hint(
+        str(candidate.get("page_hint") or "")
+    )
     if original_page_hint and original_page_hint not in DEFAULT_FALLBACK_PAGE_HINTS:
-        resolved_page_hint, routing = resolve_extraction_page_hint(original_page_hint, route_targets)
+        resolved_page_hint, routing = resolve_extraction_page_hint(
+            original_page_hint, route_targets
+        )
         if (
             routing.get("route_destination_valid") is not False
             and resolved_page_hint not in DEFAULT_FALLBACK_PAGE_HINTS
@@ -1242,20 +1480,46 @@ def select_reclaim_route(
             }
 
     query_text = fact_route_reclaim_query(candidate)
+    priors_by_page = {
+        str(prior.get("page_hint") or ""): prior
+        for prior in document_priors or []
+        if prior.get("page_hint")
+    }
     best: dict[str, Any] | None = None
     for hint in route_targets.values():
         page_hint = normalize_extraction_page_hint(str(hint.get("page_hint") or ""))
         if not page_hint or page_hint in DEFAULT_FALLBACK_PAGE_HINTS:
             continue
         scored = score_reclaim_route(query_text, hint)
+        prior = priors_by_page.get(page_hint) or {}
+        prior_bonus = coherence_bonus(prior)
+        scored["score"] = round(float(scored["score"]) + prior_bonus, 4)
+        scored["document_coherence_fact_count"] = int(prior.get("fact_count") or 0)
+        scored["document_coherence_share"] = float(prior.get("share") or 0.0)
+        scored["document_coherence_bonus"] = prior_bonus
         overlap_count = len(scored["overlap"])
+        coherence_supported = (
+            int(prior.get("fact_count") or 0) >= DOCUMENT_ROUTE_MIN_SIBLINGS
+            and float(prior.get("share") or 0.0) >= DOCUMENT_ROUTE_MIN_SHARE
+            and overlap_count >= 1
+        )
         if overlap_count < min_overlap:
-            if float(scored["phrase_bonus"] or 0.0) <= 0.0:
+            if (
+                float(scored["phrase_bonus"] or 0.0) <= 0.0
+                and not coherence_supported
+                and not strong_document_prior(prior)
+            ):
                 continue
             namespace = page_hint.split("/", 1)[0]
-            if namespace not in {"companies", "people"}:
+            if (
+                namespace not in {"companies", "people"}
+                and not coherence_supported
+                and not strong_document_prior(prior)
+            ):
                 continue
-        if float(scored["score"]) < min_score:
+        if float(scored["score"]) < min_score and not (
+            strong_document_prior(prior) and float(scored["score"]) >= 4.0
+        ):
             continue
         if best is None or (float(scored["score"]), page_hint) > (
             float(best["score"]),
@@ -1271,26 +1535,37 @@ def reroute_unrouted_candidate(
     *,
     min_score: float,
     min_overlap: int,
+    document_priors: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     selected = select_reclaim_route(
         candidate,
         route_targets,
         min_score=min_score,
         min_overlap=min_overlap,
+        document_priors=document_priors,
     )
     if selected is None:
         return None
     routed = json.loads(json.dumps(candidate))
-    original_page_hint = normalize_extraction_page_hint(str(candidate.get("page_hint") or ""))
-    page_hint, routing = resolve_extraction_page_hint(str(selected["page_hint"]), route_targets)
-    if routing.get("route_destination_valid") is False or page_hint in DEFAULT_FALLBACK_PAGE_HINTS:
+    original_page_hint = normalize_extraction_page_hint(
+        str(candidate.get("page_hint") or "")
+    )
+    page_hint, routing = resolve_extraction_page_hint(
+        str(selected["page_hint"]), route_targets
+    )
+    if (
+        routing.get("route_destination_valid") is False
+        or page_hint in DEFAULT_FALLBACK_PAGE_HINTS
+    ):
         return None
     routed["page_hint"] = page_hint
     section_hint = str(routed.get("section_hint") or "")
     routed["entity_key"] = entity_key_for_change(
         topic_for_path(page_hint), page_hint, section_hint
     )
-    metadata = routed.get("metadata") if isinstance(routed.get("metadata"), dict) else {}
+    metadata = (
+        routed.get("metadata") if isinstance(routed.get("metadata"), dict) else {}
+    )
     metadata = dict(metadata)
     metadata["routing"] = {
         **routing,
@@ -1298,6 +1573,11 @@ def reroute_unrouted_candidate(
         "reclaim_route_score": selected.get("score"),
         "reclaim_route_overlap": selected.get("overlap") or [],
         "reclaim_route_source": selected.get("source"),
+        "document_coherence_fact_count": selected.get(
+            "document_coherence_fact_count", 0
+        ),
+        "document_coherence_share": selected.get("document_coherence_share", 0.0),
+        "document_coherence_bonus": selected.get("document_coherence_bonus", 0.0),
     }
     routed["metadata"] = metadata
     return routed
@@ -1330,26 +1610,48 @@ def reclaim_unrouted_facts(
         )
     reclaimable: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
+    document_prior_cache: dict[str, list[dict[str, Any]]] = {}
     for question in question_rows:
         action_id = str(question["action_id"] or "")
         if not action_id:
-            skipped.append({"question_id": question["id"], "reason": "missing_action_id"})
+            skipped.append(
+                {"question_id": question["id"], "reason": "missing_action_id"}
+            )
             continue
         try:
             action = get_action(paths, action_id)
         except ValueError:
-            skipped.append({"question_id": question["id"], "action_id": action_id, "reason": "missing_action"})
+            skipped.append(
+                {
+                    "question_id": question["id"],
+                    "action_id": action_id,
+                    "reason": "missing_action",
+                }
+            )
             continue
         payload = (action.get("evidence_json") or {}).get("payload") or {}
         candidate = payload.get("fact") if isinstance(payload, dict) else None
         if not isinstance(candidate, dict):
-            skipped.append({"question_id": question["id"], "action_id": action_id, "reason": "missing_fact_payload"})
+            skipped.append(
+                {
+                    "question_id": question["id"],
+                    "action_id": action_id,
+                    "reason": "missing_fact_payload",
+                }
+            )
             continue
+        document_id = fact_document_id(candidate)
+        if document_id not in document_prior_cache:
+            with connection(paths.sqlite_path) as conn:
+                document_prior_cache[document_id] = load_document_route_priors(
+                    conn, document_id
+                )
         rerouted = reroute_unrouted_candidate(
             candidate,
             route_targets,
             min_score=min_score,
             min_overlap=min_overlap,
+            document_priors=document_prior_cache[document_id],
         )
         if rerouted is None:
             skipped.append(
@@ -1426,7 +1728,12 @@ def reclaim_unrouted_facts(
                     decided_by = ?
                 WHERE id = ?
                 """,
-                (dumps(answer), timestamp, "reclaim_unrouted_facts", item["question_id"]),
+                (
+                    dumps(answer),
+                    timestamp,
+                    "reclaim_unrouted_facts",
+                    item["question_id"],
+                ),
             )
             old_row = conn.execute(
                 "SELECT * FROM cos_actions WHERE id = ?", (item["old_action_id"],)
@@ -1507,7 +1814,9 @@ def resolver_precheck_conflict(
             )
         else:
             fact_rows = []
-        page_hint = normalize_extraction_page_hint(str(candidate.get("page_hint") or ""))
+        page_hint = normalize_extraction_page_hint(
+            str(candidate.get("page_hint") or "")
+        )
         if page_hint:
             page_fact_rows = rows(
                 conn,
@@ -1527,14 +1836,10 @@ def resolver_precheck_conflict(
             )
         if not fact_rows:
             return None
-    conflicted_fact_ids: list[str] = []
     directly_conflicting_fact_ids: list[str] = []
     relation_classifications: list[dict[str, Any]] = []
     for row in fact_rows:
         fact = row_to_fact(row)
-        if fact.get("status") == "conflicted":
-            conflicted_fact_ids.append(str(fact["id"]))
-            continue
         if facts_directly_conflict(fact, {"statement": statement}):
             directly_conflicting_fact_ids.append(str(fact["id"]))
     if directly_conflicting_fact_ids:
@@ -1552,25 +1857,18 @@ def resolver_precheck_conflict(
             if item["relation"] == "contradicts"
             and float(item.get("confidence") or 0.0) >= 0.7
         ]
-        unsure = [
-            item
-            for item in relation_classifications
-            if float(item.get("confidence") or 0.0) < 0.7
-        ]
-        if not contradictions and not unsure:
+        if not contradictions:
             return None
         selected_fact_ids = [
             str(item["existing_fact_id"])
-            for item in [*contradictions, *unsure]
+            for item in contradictions
             if str(item.get("existing_fact_id") or "") in directly_conflicting_fact_ids
         ]
-        reason = (
-            "Relation classifier says candidate contradicts existing nearby fact(s)."
-            if contradictions
-            else "Relation classifier is unsure whether candidate and nearby fact(s) can both be true."
-        )
         return {
-            "reason": reason,
+            "reason": (
+                "Pairwise relation classifier says the candidate may not coexist "
+                "with existing fact(s) in the same scope."
+            ),
             "counterpart_fact_ids": selected_fact_ids
             or directly_conflicting_fact_ids[:5],
             "entity_id": entity_id,
@@ -1578,15 +1876,23 @@ def resolver_precheck_conflict(
             "precheck": "relation_classifier",
             "relation_classifications": relation_classifications,
         }
-    if conflicted_fact_ids:
-        return {
-            "reason": "Nearby facts are already contested; review this candidate with the existing conflict.",
-            "counterpart_fact_ids": conflicted_fact_ids[:5],
-            "entity_id": entity_id,
-            "entity_mention": mention,
-            "precheck": "existing_contested_facts",
-        }
     return None
+
+
+def facts_for_ids(paths: BrainPaths, fact_ids: list[str]) -> list[dict[str, Any]]:
+    requested = [str(fact_id) for fact_id in fact_ids if str(fact_id).strip()]
+    if not requested:
+        return []
+    placeholders = ",".join("?" for _ in requested)
+    with connection(paths.sqlite_path) as conn:
+        by_id = {
+            str(row["id"]): row_to_fact(row)
+            for row in conn.execute(
+                f"SELECT * FROM facts WHERE id IN ({placeholders})",
+                requested,
+            )
+        }
+    return [by_id[fact_id] for fact_id in requested if fact_id in by_id]
 
 
 def resolver_precheck_conflict_judgment(
@@ -1630,7 +1936,9 @@ def resolver_precheck_conflict_judgment(
     ]
     return {
         "decision": decision,
-        "counterpart_fact_ids": selected_ids or counterpart_fact_ids,
+        "counterpart_fact_ids": (
+            (selected_ids or counterpart_fact_ids) if decision == "conflict" else []
+        ),
         "rationale": str(parsed.get("rationale") or "")[:1000],
     }
 
@@ -1664,8 +1972,9 @@ def conflict_precheck_prompt(
     return (
         "Judge whether a proposed PKM fact genuinely contradicts existing facts. "
         "Return decision 'conflict' only when the candidate and at least one existing fact "
-        "cannot both be true under the same entity, topic, time, and scope, or when resolving "
-        "them would require external truth. Return 'no_conflict' for unrelated facts, "
+        "cannot both be true under the same entity, topic, time, and scope. Return "
+        "'no_conflict' when the facts could coexist, including when context is insufficient "
+        "to prove a direct contradiction. Return 'no_conflict' for unrelated facts, "
         "complementary facts, different attributes of the same entity, same-topic facts that "
         "can both be true, or lexical cue matches caused only by words like before/after, "
         "not, rather than, high/low, or different numbers. Do not judge whether the candidate "
@@ -1697,7 +2006,9 @@ def backfill_fact_conflict_review_questions(paths: BrainPaths) -> dict[str, Any]
         inspected += 1
         action_id = str(question.get("action_id") or "")
         if not action_id:
-            skipped.append({"question_id": question["id"], "reason": "missing_action_id"})
+            skipped.append(
+                {"question_id": question["id"], "reason": "missing_action_id"}
+            )
             continue
         try:
             action = get_action(paths, action_id)
@@ -1705,13 +2016,17 @@ def backfill_fact_conflict_review_questions(paths: BrainPaths) -> dict[str, Any]
             skipped.append({"question_id": question["id"], "reason": "missing_action"})
             continue
         evidence = dict(action.get("evidence_json") or {})
-        candidate = ((evidence.get("payload") or {}).get("fact") or {})
+        candidate = (evidence.get("payload") or {}).get("fact") or {}
         if not isinstance(candidate, dict) or not candidate:
-            skipped.append({"question_id": question["id"], "reason": "missing_candidate"})
+            skipped.append(
+                {"question_id": question["id"], "reason": "missing_candidate"}
+            )
             continue
         conflict = resolver_precheck_conflict(paths, candidate)
         if not conflict:
-            skipped.append({"question_id": question["id"], "reason": "no_counterpart_found"})
+            skipped.append(
+                {"question_id": question["id"], "reason": "no_counterpart_found"}
+            )
             continue
         counterpart_fact_ids = [str(item) for item in conflict["counterpart_fact_ids"]]
         evidence["resolver_precheck"] = conflict
@@ -1746,6 +2061,332 @@ def backfill_fact_conflict_review_questions(paths: BrainPaths) -> dict[str, Any]
         "inspected": inspected,
         "updated": updated,
         "skipped": skipped,
+    }
+
+
+def reconcile_fact_conflict_reviews(
+    paths: BrainPaths,
+    *,
+    dry_run: bool = True,
+    limit: int | None = None,
+    critic_review: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Re-run active extraction conflicts through the strict pairwise gate."""
+    query = """
+        SELECT id, action_id, created_at
+        FROM open_questions
+        WHERE kind = 'fact_conflict_review'
+          AND status IN ('open', 'needs_human')
+        ORDER BY created_at, id
+    """
+    params: list[Any] = []
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(max(1, int(limit)))
+    with connection(paths.sqlite_path) as conn:
+        question_rows = [dict(row) for row in conn.execute(query, params)]
+
+    released: list[dict[str, Any]] = []
+    retained: list[dict[str, Any]] = []
+    terminal: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    preview: list[dict[str, Any]] = []
+    terminal_statuses = {
+        "auto_applied",
+        "applied",
+        "rejected",
+        "dismissed",
+        "failed",
+        "reverted",
+    }
+    for question in question_rows:
+        question_id = str(question["id"])
+        action_id = str(question.get("action_id") or "")
+        if not action_id:
+            skipped.append({"question_id": question_id, "reason": "missing_action_id"})
+            continue
+        try:
+            action = get_action(paths, action_id)
+        except ValueError:
+            skipped.append({"question_id": question_id, "reason": "missing_action"})
+            continue
+        if str(action.get("status") or "") in terminal_statuses:
+            terminal.append(
+                {
+                    "question_id": question_id,
+                    "action_id": action_id,
+                    "action_status": action["status"],
+                }
+            )
+            continue
+        evidence = dict(action.get("evidence_json") or {})
+        candidate = (evidence.get("payload") or {}).get("fact") or {}
+        if not isinstance(candidate, dict) or not candidate:
+            skipped.append(
+                {
+                    "question_id": question_id,
+                    "action_id": action_id,
+                    "reason": "missing_candidate_payload",
+                }
+            )
+            continue
+        conflict = resolver_precheck_conflict(paths, candidate)
+        item = {
+            "question_id": question_id,
+            "action_id": action_id,
+            "statement": str(candidate.get("statement") or "")[:240],
+            "action": action,
+            "candidate": candidate,
+            "conflict": conflict,
+        }
+        if conflict is None:
+            item["reason"] = "no_direct_pairwise_contradiction"
+            released.append(item)
+            preview.append(
+                {
+                    "question_id": question_id,
+                    "action_id": action_id,
+                    "outcome": "release",
+                    "reason": item["reason"],
+                    "statement": item["statement"],
+                }
+            )
+            continue
+        if dry_run:
+            item["reason"] = "resolver_confirmation_required"
+            retained.append(item)
+            preview.append(
+                {
+                    "question_id": question_id,
+                    "action_id": action_id,
+                    "outcome": "resolver_review",
+                    "counterpart_fact_ids": conflict["counterpart_fact_ids"],
+                    "statement": item["statement"],
+                }
+            )
+            continue
+        counterpart_facts = facts_for_ids(paths, conflict["counterpart_fact_ids"])
+        judgment = resolver_precheck_conflict_judgment(
+            paths, candidate, counterpart_facts
+        )
+        conflict["resolver_judgment"] = judgment
+        if judgment["decision"] == "no_conflict":
+            conflict["counterpart_fact_ids"] = []
+            item["reason"] = "resolver_confirmed_coexistence"
+            released.append(item)
+            preview.append(
+                {
+                    "question_id": question_id,
+                    "action_id": action_id,
+                    "outcome": "release",
+                    "reason": item["reason"],
+                    "statement": item["statement"],
+                }
+            )
+            continue
+        selected_ids = [
+            fact_id
+            for fact_id in judgment["counterpart_fact_ids"]
+            if fact_id in conflict["counterpart_fact_ids"]
+        ]
+        conflict["counterpart_fact_ids"] = (
+            selected_ids or conflict["counterpart_fact_ids"]
+        )
+        conflict["reason"] = (
+            "A direct pairwise contradiction remains after resolver review."
+        )
+        item["reason"] = "direct_conflict_retained"
+        retained.append(item)
+        preview.append(
+            {
+                "question_id": question_id,
+                "action_id": action_id,
+                "outcome": "retain",
+                "counterpart_fact_ids": conflict["counterpart_fact_ids"],
+                "statement": item["statement"],
+            }
+        )
+
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "inspected": len(question_rows),
+            "release_without_resolver": len(released),
+            "resolver_review_required": len(retained),
+            "terminal_question_count": len(terminal),
+            "skipped_count": len(skipped),
+            "preview": preview[:25],
+            "skipped": skipped[:25],
+        }
+
+    timestamp = now_iso()
+    for item in retained:
+        action = item["action"]
+        conflict = item["conflict"]
+        evidence = dict(action.get("evidence_json") or {})
+        evidence["resolver_precheck"] = conflict
+        evidence["conflict_reconciliation"] = {
+            "version": "pairwise-v2",
+            "outcome": "retained",
+            "reason": item["reason"],
+            "question_id": item["question_id"],
+            "reconciled_at": timestamp,
+        }
+        features = dict(action.get("action_features") or {})
+        features.update(
+            {
+                "clean_fact_upsert": False,
+                "fact_upsert_resolution": None,
+                "simple_decision": "residue",
+                "residue_kind": "fact_conflict_review",
+                "resolver_precheck": "residue",
+                "resolver_precheck_counterpart_fact_ids": conflict[
+                    "counterpart_fact_ids"
+                ],
+                "risk_tier": "high",
+            }
+        )
+        with connection(paths.sqlite_path) as conn:
+            conn.execute(
+                """
+                UPDATE cos_actions
+                SET target_fact_ids = ?, action_features = ?, evidence_json = ?,
+                    risk_tier = 'high'
+                WHERE id = ?
+                """,
+                (
+                    dumps(conflict["counterpart_fact_ids"]),
+                    dumps(features),
+                    dumps(evidence),
+                    item["action_id"],
+                ),
+            )
+        refreshed = get_action(paths, item["action_id"])
+        with connection(paths.sqlite_path) as conn:
+            refresh_action_residue_question(
+                conn,
+                refreshed,
+                item["question_id"],
+                kind="fact_conflict_review",
+                reason=str(conflict["reason"]),
+            )
+
+    for item in released:
+        action = item["action"]
+        candidate = item["candidate"]
+        evidence = dict(action.get("evidence_json") or {})
+        conflict = item.get("conflict") or {}
+        evidence["resolver_precheck"] = {
+            **conflict,
+            "counterpart_fact_ids": [],
+            "precheck": "pairwise_v2_passed",
+            "reason": (
+                "No direct, same-scope contradiction remains after pairwise reconciliation."
+            ),
+        }
+        evidence["conflict_reconciliation"] = {
+            "version": "pairwise-v2",
+            "outcome": "released",
+            "reason": item["reason"],
+            "question_id": item["question_id"],
+            "reconciled_at": timestamp,
+        }
+        decision = {
+            "decision": "apply",
+            "fact_upsert_resolution": "new_clean_fact",
+            "target_fact_ids": [],
+        }
+        features = dict(action.get("action_features") or {})
+        for stale_key in (
+            "classifier_version",
+            "relation",
+            "relation_confidence",
+            "relation_rationale",
+            "resolver_precheck_counterpart_fact_ids",
+        ):
+            features.pop(stale_key, None)
+        features.update(earned_fact_action_features(candidate, decision))
+        features["risk_tier"] = "medium"
+        features["target_fact_ids"] = []
+        with connection(paths.sqlite_path) as conn:
+            conn.execute(
+                """
+                UPDATE cos_actions
+                SET status = 'proposed', target_fact_ids = '[]',
+                    action_features = ?, evidence_json = ?, risk_tier = 'medium',
+                    policy_id = NULL, policy_version = NULL,
+                    policy_decision = NULL, autonomy_level = NULL,
+                    critic_by = NULL, critic_decision = NULL
+                WHERE id = ?
+                """,
+                (dumps(features), dumps(evidence), item["action_id"]),
+            )
+
+    decided_actions = decide_policy_actions(
+        paths,
+        [item["action_id"] for item in released],
+        critic_review=critic_review or default_critic_review_config(),
+    )
+    decided_by_id = {str(action["id"]): action for action in decided_actions}
+    with connection(paths.sqlite_path) as conn:
+        for item in released:
+            result = decided_by_id.get(item["action_id"], {})
+            conn.execute(
+                """
+                UPDATE open_questions
+                SET status = 'auto_resolved', answer = ?, answered_at = ?,
+                    decided_by = 'conflict_reconciliation_v2'
+                WHERE id = ?
+                """,
+                (
+                    dumps(
+                        {
+                            "decision": "released_to_policy",
+                            "reason": item["reason"],
+                            "action_id": item["action_id"],
+                            "action_status": result.get("status"),
+                            "policy_decision": result.get("policy_decision"),
+                            "critic_decision": result.get("critic_decision"),
+                        }
+                    ),
+                    timestamp,
+                    item["question_id"],
+                ),
+            )
+        for item in terminal:
+            conn.execute(
+                """
+                UPDATE open_questions
+                SET status = 'auto_resolved', answer = ?, answered_at = ?,
+                    decided_by = 'conflict_reconciliation_v2'
+                WHERE id = ?
+                """,
+                (
+                    dumps(
+                        {
+                            "decision": "stale_question_closed",
+                            "action_id": item["action_id"],
+                            "action_status": item["action_status"],
+                        }
+                    ),
+                    timestamp,
+                    item["question_id"],
+                ),
+            )
+    status_counts: dict[str, int] = {}
+    for action in decided_actions:
+        status = str(action.get("status") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+    return {
+        "status": "applied",
+        "inspected": len(question_rows),
+        "released": len(released),
+        "retained": len(retained),
+        "terminal_questions_closed": len(terminal),
+        "skipped_count": len(skipped),
+        "released_action_status_counts": status_counts,
+        "preview": preview[:25],
+        "skipped": skipped[:25],
     }
 
 
@@ -1800,7 +2441,8 @@ def simple_fact_decision(
     page_hint = normalize_extraction_page_hint(str(candidate.get("page_hint") or ""))
     routing = candidate_route_metadata(candidate)
     if (
-        page_hint in set(
+        page_hint
+        in set(
             simple_autonomy.get("fallback_page_hints") or DEFAULT_FALLBACK_PAGE_HINTS
         )
         and routing.get("route_review_reason") == "fallback_page"
@@ -1939,6 +2581,14 @@ def merge_candidate_into_existing_fact(
     candidate: dict[str, Any],
 ) -> dict[str, Any]:
     metadata = dict(existing.get("metadata") or {})
+    candidate_metadata = (
+        candidate.get("metadata")
+        if isinstance(candidate.get("metadata"), dict)
+        else {}
+    )
+    for key in ("document_id", "window_id", "evidence_units"):
+        if candidate_metadata.get(key) is not None:
+            metadata[key] = candidate_metadata[key]
     metadata.setdefault("simple_autonomy", {})
     metadata["simple_autonomy"] = {
         **(
@@ -1960,8 +2610,9 @@ def merge_candidate_into_existing_fact(
                 *(candidate.get("source_spans") or []),
             ]
         ),
-        "evidence_quote": existing.get("evidence_quote")
-        or candidate.get("evidence_quote"),
+        "evidence_quote": candidate.get("evidence_quote")
+        or existing.get("evidence_quote"),
+        "evidence_unit_ids": candidate.get("evidence_unit_ids") or [],
         "extraction_confidence": max_optional_float(
             existing.get("extraction_confidence"),
             candidate.get("extraction_confidence"),
@@ -2105,79 +2756,17 @@ def source_window_with_evidence_units(window: dict[str, Any]) -> dict[str, Any]:
         {key: value for key, value in chunk.items() if key != "text"}
         | {
             "units": [
-                {"unit_id": unit["unit_id"], "text": unit["text"]}
+                {
+                    "unit_id": unit["unit_id"],
+                    "text": unit["text"],
+                    **({"speaker": unit["speaker"]} if unit.get("speaker") else {}),
+                }
                 for unit in evidence_units_for_text(str(chunk.get("text") or ""))
             ],
         }
         for chunk in window.get("chunks") or []
     ]
     return output
-
-
-SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+|\n+")
-TOKEN_SPAN_RE = re.compile(r"\S+")
-
-
-def evidence_units_for_text(
-    text: str,
-    *,
-    target_tokens: int = EVIDENCE_UNIT_TARGET_TOKENS,
-) -> list[dict[str, Any]]:
-    units: list[dict[str, Any]] = []
-    for start, end in evidence_unit_segment_spans(text, target_tokens=target_tokens):
-        trimmed_start, trimmed_end = trim_span_whitespace(text, start, end)
-        if trimmed_start >= trimmed_end:
-            continue
-        units.append(
-            {
-                "unit_id": f"u{len(units)}",
-                "unit_index": len(units),
-                "start": trimmed_start,
-                "end": trimmed_end,
-                "text": text[trimmed_start:trimmed_end],
-            }
-        )
-    return units
-
-
-def evidence_unit_segment_spans(
-    text: str, *, target_tokens: int
-) -> list[tuple[int, int]]:
-    spans: list[tuple[int, int]] = []
-    start = 0
-    for match in SENTENCE_BOUNDARY_RE.finditer(text):
-        end = match.start()
-        if start < end:
-            spans.extend(
-                split_long_evidence_span(text, start, end, target_tokens=target_tokens)
-            )
-        start = match.end()
-    if start < len(text):
-        spans.extend(
-            split_long_evidence_span(
-                text, start, len(text), target_tokens=target_tokens
-            )
-        )
-    return spans
-
-
-def split_long_evidence_span(
-    text: str,
-    start: int,
-    end: int,
-    *,
-    target_tokens: int,
-) -> list[tuple[int, int]]:
-    token_matches = list(TOKEN_SPAN_RE.finditer(text[start:end]))
-    if len(token_matches) <= target_tokens:
-        return [(start, end)]
-    spans: list[tuple[int, int]] = []
-    for token_start in range(0, len(token_matches), target_tokens):
-        window = token_matches[token_start : token_start + target_tokens]
-        if not window:
-            continue
-        spans.append((start + window[0].start(), start + window[-1].end()))
-    return spans
 
 
 ROUTING_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_/-]{1,}")
@@ -2310,9 +2899,11 @@ def closest_route_target(
         if namespace and target_namespace and namespace != target_namespace:
             continue
         target_key = route_fuzzy_key(target_page_hint)
-        score = 1.0 if source_key == target_key else SequenceMatcher(
-            None, source_key, target_key
-        ).ratio()
+        score = (
+            1.0
+            if source_key == target_key
+            else SequenceMatcher(None, source_key, target_key).ratio()
+        )
         if score > best_score:
             best_score = score
             best_page_hint = target_page_hint
@@ -2601,6 +3192,10 @@ def extraction_prompt(source_window: dict[str, Any]) -> str:
         "supported side; do not join it with an unsupported inference.\n"
         "- Preserve uncertainty and negation from the source. If the source says a speaker was confused, unsure, "
         "or not continuing a process, the statement must say that rather than smoothing it into a clean fact.\n"
+        "- Transcript unit speaker labels are stable within one source document. Attribute a statement to a named "
+        "person only when the source window establishes that the labeled speaker is that person through a "
+        "self-introduction or direct address. A participant list alone does not establish speaker identity; use the "
+        "Speaker N label when identity is unresolved.\n"
         "Evidence rules:\n"
         "- Use the exact chunk_id string from the source card.\n"
         '- Cite evidence by evidence_unit_ids from that chunk\'s units array, such as ["u3"] or ["u3", "u4"].\n'
@@ -2612,6 +3207,10 @@ def extraction_prompt(source_window: dict[str, Any]) -> str:
         "Routing rules:\n"
         "- page_hint must be a wiki-relative markdown path such as projects/example.md or concepts/example.md.\n"
         "- Prefer one of the provided routing_hints when a hint fits the fact.\n"
+        "- Treat the source document's title and dominant topic as a routing prior: facts from one "
+        "conversation usually belong with other facts from that conversation. Keep a fact on a "
+        "different page when its own evidence clearly changes topic; document coherence is a preference, "
+        "not an absolute rule.\n"
         "- Use concepts/extracted-facts.md only when no canonical routing target fits.\n"
         "- Never use references/*.md, wiki/references/*.md, agent_session_log pages, absolute file paths, "
         "raw source paths, or docs/*.md audit file paths as page_hint.\n\n"
@@ -2633,6 +3232,8 @@ def extraction_validation_retry_prompt(
         "Every corrected statement must be directly entailed by the cited units. Drop or narrow any fact that "
         "adds an unsupported title, role, business impact, location, active-process status, or causal explanation. "
         "Preserve negation and uncertainty exactly when the source is ambiguous or says a process is not continuing.\n\n"
+        "For transcript facts, keep the source speaker label unless the source window directly establishes the "
+        "speaker's name. Do not infer speaker identity from a participant list alone.\n\n"
         "For every returned entity mention, include mention_kind as one of named, concept, generic, deictic. "
         "Use generic/deictic rather than forcing role classes or speaker-relative phrases into named entities.\n\n"
         "Validation failures JSON:\n"
@@ -2833,9 +3434,7 @@ def validate_extracted_facts_with_report(
                         "evidence_unit_truncation": {
                             "original_count": evidence_ref["original_unit_count"],
                             "kept_count": len(evidence_ref["unit_ids"]),
-                            "truncated_count": evidence_ref[
-                                "truncated_unit_count"
-                            ],
+                            "truncated_count": evidence_ref["truncated_unit_count"],
                         }
                     }
                     if evidence_ref
@@ -2903,8 +3502,12 @@ def resolve_evidence_units(
     if chunk_context is None:
         return empty_resolved_evidence([f"unknown chunk_id: {clip_text(chunk_id, 80)}"])
     text = str(chunk_context["text"])
-    units_by_id = {unit["unit_id"]: unit for unit in evidence_units_for_text(text)}
-    missing = [unit_id for unit_id in unit_ids if unit_id not in units_by_id]
+    resolved = resolve_evidence_unit_ids(
+        text,
+        chunk_id=chunk_id,
+        unit_ids=unit_ids,
+    )
+    missing = resolved["missing_unit_ids"]
     if missing:
         return empty_resolved_evidence(
             [
@@ -2912,47 +3515,13 @@ def resolve_evidence_units(
                 f"{', '.join(missing)}"
             ]
         )
-    selected = sorted(
-        (units_by_id[unit_id] for unit_id in unit_ids),
-        key=lambda unit: unit["unit_index"],
-    )
-    spans: list[dict[str, Any]] = []
-    quotes: list[str] = []
-    evidence_units: list[dict[str, Any]] = []
-    for group in consecutive_unit_groups(selected):
-        start = int(group[0]["start"])
-        end = int(group[-1]["end"])
-        spans.append({"chunk_id": chunk_id, "start": start, "end": end})
-        quotes.append(text[start:end])
-    for unit in selected:
-        evidence_units.append(
-            {
-                "chunk_id": chunk_id,
-                "unit_id": unit["unit_id"],
-                "start": unit["start"],
-                "end": unit["end"],
-            }
-        )
     return {
-        "source_spans": spans,
-        "quotes": quotes,
-        "source_ids": [f"chunk:{chunk_id}"],
-        "evidence_units": evidence_units,
+        "source_spans": resolved["source_spans"],
+        "quotes": resolved["quotes"],
+        "source_ids": resolved["source_ids"],
+        "evidence_units": resolved["evidence_units"],
         "reasons": [],
     }
-
-
-def consecutive_unit_groups(units: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
-    groups: list[list[dict[str, Any]]] = []
-    for unit in units:
-        if (
-            not groups
-            or int(unit["unit_index"]) != int(groups[-1][-1]["unit_index"]) + 1
-        ):
-            groups.append([unit])
-            continue
-        groups[-1].append(unit)
-    return groups
 
 
 def empty_resolved_evidence(reasons: list[str]) -> dict[str, Any]:
@@ -3080,9 +3649,13 @@ def digit_token_is_identifierish(text: str, start: int, end: int) -> bool:
         return True
     if before == "/" or after == "/":
         return True
-    if before == "-" and any(char.isalpha() for char in text[max(0, start - 12) : start]):
+    if before == "-" and any(
+        char.isalpha() for char in text[max(0, start - 12) : start]
+    ):
         return True
-    if after == "-" and any(char.isalpha() for char in text[end : min(len(text), end + 12)]):
+    if after == "-" and any(
+        char.isalpha() for char in text[end : min(len(text), end + 12)]
+    ):
         return True
     return False
 
@@ -3364,14 +3937,6 @@ def stable_unique_strings(values: list[str]) -> list[str]:
     return output
 
 
-def trim_span_whitespace(text: str, start: int, end: int) -> tuple[int, int]:
-    while start < end and text[start].isspace():
-        start += 1
-    while end > start and text[end - 1].isspace():
-        end -= 1
-    return start, end
-
-
 def find_quote_span(text: str, quote: str) -> tuple[int, int] | None:
     stripped = quote.strip()
     if not stripped:
@@ -3448,7 +4013,9 @@ def route_validation_metrics(candidates: list[dict[str, Any]]) -> dict[str, Any]
     new_page_count = 0
     snapped_count = 0
     for candidate in candidates:
-        page_hint = normalize_extraction_page_hint(str(candidate.get("page_hint") or ""))
+        page_hint = normalize_extraction_page_hint(
+            str(candidate.get("page_hint") or "")
+        )
         routing = candidate_route_metadata(candidate)
         resolution = str(routing.get("route_resolution") or "unknown")
         resolution_counts[resolution] = resolution_counts.get(resolution, 0) + 1
@@ -3758,10 +4325,19 @@ def normalized_extraction_content_hash(chunks: list[dict[str, Any]]) -> str:
 
 def normalized_extraction_content(chunks: list[dict[str, Any]]) -> str:
     lines: list[str] = []
+    skip_section = False
     for chunk in chunks:
         for raw_line in str(chunk.get("text") or "").splitlines():
             line = re.sub(r"\s+", " ", raw_line.strip())
             if not line:
+                continue
+            heading_match = re.match(r"^#{1,6}\s+(.+)$", line)
+            if heading_match:
+                skip_section = heading_match.group(1).strip().casefold() in {
+                    "known participants"
+                }
+                continue
+            if skip_section:
                 continue
             if low_information_line(line):
                 continue
@@ -3775,7 +4351,9 @@ def low_information_line(line: str) -> bool:
 
 def low_value_fact_statement(statement: str) -> bool:
     normalized = re.sub(r"\s+", " ", statement.strip())
-    return any(pattern.match(normalized) for pattern in LOW_VALUE_FACT_STATEMENT_PATTERNS)
+    return any(
+        pattern.match(normalized) for pattern in LOW_VALUE_FACT_STATEMENT_PATTERNS
+    )
 
 
 def elapsed_ms(started: float) -> float:

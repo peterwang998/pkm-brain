@@ -11,11 +11,14 @@ from pkm_brain.automation import run_cos_timeout_sweep
 from pkm_brain.cos_actions import (
     ACTION_TYPE_SPECS,
     apply_action,
+    apply_decided_action,
     critic_prompt,
     decide_action,
     get_action,
     mark_action_residue,
     propose_action,
+    record_action_audit,
+    repair_refused_fact_audit_revert,
     revert_action,
 )
 from pkm_brain.cos_audit import run_sampled_audit
@@ -28,13 +31,19 @@ from pkm_brain.cos_policy import (
 from pkm_brain.db import connection
 from pkm_brain.entities import resolve_entity
 from pkm_brain.extraction import (
+    apply_document_route_coherence,
     backfill_fact_conflict_review_questions,
+    conflict_precheck_prompt,
     decide_policy_actions,
+    earned_fact_decision,
     evidence_units_for_text,
     extraction_prompt,
     extract_recent_documents,
+    normalized_extraction_content,
     record_critic_block_rate_anomalies,
     reclaim_unrouted_facts,
+    reconcile_fact_conflict_reviews,
+    resolver_precheck_conflict,
     validate_extracted_facts,
     validate_extracted_facts_with_report,
 )
@@ -44,9 +53,7 @@ from pkm_brain.service import BrainService
 
 
 def service_for(tmp_path: Path) -> BrainService:
-    return BrainService(
-        BrainPaths.from_value(tmp_path / "brain")
-    )
+    return BrainService(BrainPaths.from_value(tmp_path / "brain"))
 
 
 def evidence_unit_ids_containing(text: str, needle: str) -> list[str]:
@@ -69,6 +76,208 @@ def test_extraction_prompt_requires_direct_entailment_for_clean_facts() -> None:
     assert "Every part of the statement must be directly entailed" in prompt
     assert "do not join it with an unsupported inference" in prompt
     assert "Preserve uncertainty and negation" in prompt
+    assert "document coherence is a preference, not an absolute rule" in prompt
+
+
+def test_evidence_units_propagate_speaker_identity_across_sentences() -> None:
+    units = evidence_units_for_text(
+        "Speaker 1: First sentence. Second sentence.\n\n"
+        "Speaker 2: Different speaker."
+    )
+
+    assert [unit.get("speaker") for unit in units] == [
+        "Speaker 1",
+        "Speaker 1",
+        "Speaker 2",
+    ]
+
+
+def test_extraction_normalization_ignores_empty_hyprnote_capture() -> None:
+    normalized = normalized_extraction_content(
+        [
+            {
+                "text": (
+                    "---\n"
+                    'source_type: "hyprnote_meeting"\n'
+                    'agent: "hyprnote"\n'
+                    'title: "Chase"\n'
+                    'session_id: "session-1"\n'
+                    'participants: "Alex, Recruiter"\n'
+                    'transcript_render_version: "chronological-speaker-turns-v2"\n'
+                    "---\n\n"
+                    "# Meeting: Chase\n\n"
+                    "## Known Participants\n\n- Alex\n- Recruiter\n\n"
+                    "## Summary\n\nNo summary was captured.\n\n"
+                    "## Memo\n\nNo memo was captured.\n\n"
+                    "## Transcript\n\nNo transcript was captured.\n"
+                )
+            }
+        ]
+    )
+
+    assert normalized == ""
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "The hyprnote meeting document titled Chase has no captured summary.",
+        "Hyprnote session session-1 has no captured memo.",
+        'The meeting record "Welcome" has no captured transcript.',
+    ],
+)
+def test_extraction_drops_wrapped_empty_capture_placeholder(
+    tmp_path: Path, statement: str
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+
+    report = validate_extracted_facts_with_report(
+        svc.paths,
+        [
+            {
+                "statement": statement,
+                "chunk_id": "unused-placeholder-chunk",
+                "evidence_unit_ids": ["u0"],
+                "claim_class": "factual_update",
+            }
+        ],
+    )
+
+    assert report["accepted_count"] == 0
+    assert report["dropped_count"] == 1
+    assert report["dropped"][0]["reason"] == "low_value_placeholder_fact"
+
+
+def test_extraction_document_id_filter_isolates_target_document(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    (svc.paths.inbox / "target.md").write_text(
+        "# Target\n\nTargeted extraction marker is present.", encoding="utf-8"
+    )
+    (svc.paths.inbox / "other.md").write_text(
+        "# Other\n\nUnrelated extraction marker is present.", encoding="utf-8"
+    )
+    svc.ingest()
+    with connection(svc.paths.sqlite_path) as conn:
+        target_id = conn.execute(
+            "SELECT id FROM documents WHERE source_path LIKE '%/target.md'"
+        ).fetchone()[0]
+    provider = MarkerExtractorProvider(
+        marker="Targeted extraction marker",
+        statement="Targeted extraction marker is present.",
+    )
+
+    result = extract_recent_documents(
+        svc.paths,
+        limit=10,
+        shadow=True,
+        changed_only=False,
+        document_ids=[target_id],
+        llm_provider=provider,
+    )
+
+    assert [document["document_id"] for document in result["documents"]] == [
+        target_id
+    ]
+    assert [candidate["statement"] for candidate in result["candidates"]] == [
+        "Targeted extraction marker is present."
+    ]
+    assert provider.calls == 1
+
+
+def test_document_route_coherence_reroutes_only_uncertain_dominant_topic() -> None:
+    route_targets = {
+        "projects/northstar-transition-plan.md": {
+            "page_hint": "projects/northstar-transition-plan.md",
+            "canonical_entity": "Northstar Transition Plan",
+            "page_scope": "Contract transition milestones and timing.",
+            "retrieval_purpose": "Answer transition-planning questions.",
+        },
+        "career/role-preferences.md": {
+            "page_hint": "career/role-preferences.md",
+            "canonical_entity": "Role Preferences",
+            "page_scope": "Career role preferences.",
+            "retrieval_purpose": "Answer career preference questions.",
+        },
+    }
+    siblings = [
+        {
+            "id": f"fact_sibling_{index}",
+            "statement": f"Northstar transition-plan detail {index}.",
+            "page_hint": "projects/northstar-transition-plan.md",
+            "section_hint": "Summary",
+            "routing_confidence": 0.95,
+            "metadata": {"routing": {"route_destination_valid": True}},
+        }
+        for index in range(3)
+    ]
+    uncertain = {
+        "statement": "Morgan recommended extending the transition to reach a contractual milestone.",
+        "page_hint": "concepts/extracted-facts.md",
+        "section_hint": "Summary",
+        "routing_confidence": 0.4,
+        "metadata": {
+            "routing": {
+                "route_destination_valid": False,
+                "route_review_reason": "fallback_page",
+            }
+        },
+    }
+    explicit_outlier = {
+        "statement": "Alex prefers an early-stage individual-contributor role.",
+        "page_hint": "career/role-preferences.md",
+        "section_hint": "Summary",
+        "routing_confidence": 0.92,
+        "metadata": {"routing": {"route_destination_valid": True}},
+    }
+
+    routed = apply_document_route_coherence(
+        [*siblings, uncertain, explicit_outlier], route_targets
+    )
+
+    assert routed[3]["page_hint"] == "projects/northstar-transition-plan.md"
+    assert routed[3]["metadata"]["routing"]["route_resolution"] == (
+        "document_coherence_reroute"
+    )
+    assert routed[4]["page_hint"] == "career/role-preferences.md"
+
+
+def test_document_route_coherence_does_not_force_split_document_topics() -> None:
+    route_targets = {
+        page_hint: {
+            "page_hint": page_hint,
+            "canonical_entity": page_hint,
+            "page_scope": page_hint,
+            "retrieval_purpose": page_hint,
+        }
+        for page_hint in ("concepts/alpha.md", "concepts/beta.md")
+    }
+    candidates = [
+        {
+            "id": f"fact_{page}_{index}",
+            "statement": f"{page} detail {index}",
+            "page_hint": f"concepts/{page}.md",
+            "section_hint": "Summary",
+            "routing_confidence": 0.95,
+            "metadata": {"routing": {"route_destination_valid": True}},
+        }
+        for page in ("alpha", "beta")
+        for index in range(2)
+    ]
+    uncertain = {
+        "statement": "A third topic without a clear destination.",
+        "page_hint": "concepts/extracted-facts.md",
+        "section_hint": "Summary",
+        "routing_confidence": 0.3,
+        "metadata": {"routing": {"route_destination_valid": False}},
+    }
+
+    routed = apply_document_route_coherence([*candidates, uncertain], route_targets)
+
+    assert routed[-1]["page_hint"] == "concepts/extracted-facts.md"
 
 
 def test_policy_first_match_and_truth_defaults_to_l3(tmp_path: Path) -> None:
@@ -380,6 +589,89 @@ def test_l3_decision_records_policy_version_and_creates_residue(tmp_path: Path) 
     assert residue["status"] == "needs_human"
 
 
+def test_candidate_key_reuses_open_action_and_retires_legacy_sibling(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    candidate_key = "canonicalize_page:concepts/review.md"
+    first = propose_action(
+        svc.paths,
+        "canonicalize_page",
+        action_payload={"page_hint": "concepts/review.md"},
+        action_features={"candidate_key": candidate_key, "reversible": True},
+        target_page_paths=["concepts/review.md"],
+    )
+    repeated = propose_action(
+        svc.paths,
+        "canonicalize_page",
+        action_payload={"page_hint": "concepts/review.md"},
+        action_features={"candidate_key": candidate_key, "reversible": True},
+        target_page_paths=["concepts/review.md"],
+    )
+    legacy_sibling = propose_action(
+        svc.paths,
+        "canonicalize_page",
+        action_payload={"page_hint": "concepts/review.md"},
+        action_features={"reversible": True},
+        target_page_paths=["concepts/review.md"],
+    )
+    with connection(svc.paths.sqlite_path) as conn:
+        features = json.loads(
+            conn.execute(
+                "SELECT action_features FROM cos_actions WHERE id = ?",
+                (legacy_sibling["id"],),
+            ).fetchone()[0]
+        )
+        features["candidate_key"] = candidate_key
+        conn.execute(
+            "UPDATE cos_actions SET action_features = ? WHERE id = ?",
+            (json.dumps(features), legacy_sibling["id"]),
+        )
+        conn.execute(
+            """
+            INSERT INTO open_questions(
+              id, kind, fact_ids, question, options, status, context,
+              action_id, recommended_action, risk_tier, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "question_legacy_duplicate",
+                "policy_escalation",
+                "[]",
+                "Review duplicate candidate.",
+                "[]",
+                "needs_human",
+                "{}",
+                legacy_sibling["id"],
+                "{}",
+                "low",
+                "2026-07-09T12:00:00+00:00",
+            ),
+        )
+
+    applied = apply_action(svc.paths, first["id"])
+
+    assert repeated["id"] == first["id"]
+    assert applied["status"] == "applied"
+    with connection(svc.paths.sqlite_path) as conn:
+        sibling = conn.execute(
+            "SELECT status, evidence_json FROM cos_actions WHERE id = ?",
+            (legacy_sibling["id"],),
+        ).fetchone()
+        question = conn.execute(
+            "SELECT status, decided_by FROM open_questions WHERE id = ?",
+            ("question_legacy_duplicate",),
+        ).fetchone()
+    assert sibling["status"] == "dismissed"
+    assert (
+        json.loads(sibling["evidence_json"])["candidate_superseded"]["by_action_id"]
+        == first["id"]
+    )
+    assert question["status"] == "dismissed"
+    assert question["decided_by"] == "candidate_deduplication"
+
+
 def test_fact_upsert_revert_round_trip_and_drift_refusal(tmp_path: Path) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()
@@ -434,6 +726,60 @@ def test_fact_upsert_revert_round_trip_and_drift_refusal(tmp_path: Path) -> None
         ).fetchone()
     assert residue is not None
     assert residue["kind"] == "revert_drift"
+
+
+def test_repair_refused_fact_audit_revert_restores_reviewable_action(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    action = apply_action(
+        svc.paths,
+        propose_action(
+            svc.paths,
+            "fact_upsert",
+            action_payload={
+                "fact": {
+                    "id": "fact_audit_repair",
+                    "statement": "The audited fact remains active after routing drift.",
+                    "entity_key": "concept:test:summary",
+                    "page_hint": "concepts/test.md",
+                    "section_hint": "Summary",
+                    "source_ids": ["manual:test"],
+                    "confidence": 0.9,
+                }
+            },
+            action_features={"reversible": True},
+        )["id"],
+    )
+    record_action_audit(
+        svc.paths,
+        action["id"],
+        "sampled_bad",
+        metadata={"rationale": "Fact needs review."},
+    )
+    with connection(svc.paths.sqlite_path) as conn:
+        conn.execute(
+            "UPDATE facts SET page_hint = 'concepts/new-home.md' WHERE id = 'fact_audit_repair'"
+        )
+
+    failed = revert_action(svc.paths, action["id"])
+    repaired = repair_refused_fact_audit_revert(svc.paths, action["id"])
+
+    assert failed["status"] == "failed"
+    assert repaired["status"] == "repaired"
+    assert repaired["action"]["status"] == "applied"
+    assert repaired["action"]["audit_status"] == "sampled_bad"
+    assert repaired["action"]["evidence_json"]["audit_queue_reconciliation"][
+        "outcome"
+    ] == "restored_applied_status_after_refused_revert"
+    with connection(svc.paths.sqlite_path) as conn:
+        residue = conn.execute(
+            "SELECT status, decided_by FROM open_questions WHERE action_id = ?",
+            (action["id"],),
+        ).fetchone()
+    assert residue["status"] == "auto_resolved"
+    assert residue["decided_by"] == "audit_queue_reconciliation_v1"
 
 
 def test_action_type_support_map_and_declared_failure(tmp_path: Path) -> None:
@@ -746,6 +1092,29 @@ def test_extraction_watermark_skips_unchanged_document(tmp_path: Path) -> None:
         )
 
 
+def test_extraction_accepts_v5_watermark_without_global_rebuild(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "source.md"
+    note.write_text("# Source\n\nWatermarked extraction marker.", encoding="utf-8")
+    svc.ingest()
+    provider = FakeExtractorProvider()
+    first = extract_recent_documents(svc.paths, shadow=True, llm_provider=provider)
+    with connection(svc.paths.sqlite_path) as conn:
+        conn.execute(
+            "UPDATE cos_stage_watermarks SET prompt_version = ?",
+            ("extractor-evidence-units-v5",),
+        )
+
+    second = extract_recent_documents(svc.paths, shadow=True, llm_provider=provider)
+
+    assert len(first["documents"]) == 1
+    assert second["documents"] == []
+    assert provider.calls == 1
+
+
 def test_extraction_retries_semantically_invalid_response(tmp_path: Path) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()
@@ -975,7 +1344,7 @@ def test_extraction_ranks_routing_hints_by_window_relevance(
         encoding="utf-8",
     )
     note = svc.paths.inbox / "source.md"
-    note.write_text("# Source\n\nSierra relevance marker.", encoding="utf-8")
+    note.write_text("# Source\n\nNorthwind relevance marker.", encoding="utf-8")
     svc.ingest()
     insert_test_contract(
         svc.paths,
@@ -986,14 +1355,14 @@ def test_extraction_ranks_routing_hints_by_window_relevance(
     )
     insert_test_contract(
         svc.paths,
-        "contract_sierra",
-        "companies/sierra.md",
-        canonical_entity="Sierra",
-        page_scope="Facts about Sierra customers and products.",
+        "contract_northwind",
+        "companies/northwind.md",
+        canonical_entity="Northwind",
+        page_scope="Facts about Northwind customers and products.",
     )
     provider = MarkerExtractorProvider(
-        marker="Sierra relevance marker.",
-        statement="Sierra relevance marker is present.",
+        marker="Northwind relevance marker.",
+        statement="Northwind relevance marker is present.",
     )
 
     result = extract_recent_documents(svc.paths, shadow=True, llm_provider=provider)
@@ -1002,15 +1371,15 @@ def test_extraction_ranks_routing_hints_by_window_relevance(
     assert result["status"] == "ok"
     assert source_window["routing_hints"] == [
         {
-            "page_hint": "companies/sierra.md",
-            "canonical_entity": "Sierra",
-            "page_scope": "Facts about Sierra customers and products.",
+            "page_hint": "companies/northwind.md",
+            "canonical_entity": "Northwind",
+            "page_scope": "Facts about Northwind customers and products.",
             "retrieval_purpose": "Answer test questions.",
         }
     ]
     assert result["document_validations"][0]["windows"][0][
         "routing_hint_page_hints"
-    ] == ["companies/sierra.md"]
+    ] == ["companies/northwind.md"]
 
 
 def test_extraction_routing_hints_exclude_reference_destinations(
@@ -1024,36 +1393,36 @@ def test_extraction_routing_hints_exclude_reference_destinations(
         encoding="utf-8",
     )
     note = svc.paths.inbox / "source.md"
-    note.write_text("# Source\n\nSierra routing hygiene marker.", encoding="utf-8")
+    note.write_text("# Source\n\nNorthwind routing hygiene marker.", encoding="utf-8")
     svc.ingest()
     insert_test_wiki_page(
         svc.paths,
-        "page_reference_sierra",
-        "/Users/Peter/brain/wiki/references/spencer-peter-sierra-chat.md",
-        title="Spencer Peter Sierra Chat",
+        "page_reference_northwind",
+        "/Users/example/brain/wiki/references/spencer-alex-northwind-chat.md",
+        title="Spencer Alex Northwind Chat",
         page_type="reference",
         managed=True,
     )
     insert_test_wiki_page(
         svc.paths,
-        "page_agent_log_sierra",
-        "references/agent_session_log/sierra-routing-hygiene.md",
-        title="Sierra Routing Hygiene Log",
+        "page_agent_log_northwind",
+        "references/agent_session_log/northwind-routing-hygiene.md",
+        title="Northwind Routing Hygiene Log",
         page_type="reference",
         managed=True,
     )
     insert_test_wiki_page(
         svc.paths,
-        "page_project_sierra",
-        "/Users/Peter/brain/wiki/projects/sierra.md",
-        title="Sierra",
+        "page_project_northwind",
+        "/Users/example/brain/wiki/projects/northwind.md",
+        title="Northwind",
         page_type="project",
         managed=True,
     )
     provider = MarkerExtractorProvider(
-        marker="Sierra routing hygiene marker.",
-        statement="Sierra routing hygiene marker is present.",
-        page_hint="projects/sierra.md",
+        marker="Northwind routing hygiene marker.",
+        statement="Northwind routing hygiene marker is present.",
+        page_hint="projects/northwind.md",
     )
 
     result = extract_recent_documents(svc.paths, shadow=True, llm_provider=provider)
@@ -1061,7 +1430,7 @@ def test_extraction_routing_hints_exclude_reference_destinations(
     source_window = json.loads(provider.prompts[0].rsplit("Source window JSON:", 1)[-1])
     page_hints = [hint["page_hint"] for hint in source_window["routing_hints"]]
     assert result["status"] == "ok"
-    assert "projects/sierra.md" in page_hints
+    assert "projects/northwind.md" in page_hints
     assert all("references/" not in page_hint for page_hint in page_hints)
 
 
@@ -1086,7 +1455,10 @@ def test_extraction_reference_page_hint_becomes_unrouted_residue(
     assert result["candidates"][0]["page_hint"] == "concepts/extracted-facts.md"
     assert result["validation"]["invalid_route_destination_count"] == 1
     routing = result["candidates"][0]["metadata"]["routing"]
-    assert routing["original_page_hint"] == "wiki/references/agent_session_log/reference-route.md"
+    assert (
+        routing["original_page_hint"]
+        == "wiki/references/agent_session_log/reference-route.md"
+    )
     assert routing["route_destination_valid"] is False
     assert routing["route_review_reason"] == "non_canonical_route_namespace"
     assert result["actions"][0]["status"] == "needs_human"
@@ -1107,30 +1479,30 @@ def test_extraction_normalizes_wiki_prefix_for_canonical_route(
     enable_simple_autonomy(svc.paths)
     insert_test_wiki_page(
         svc.paths,
-        "page_project_hightouch",
-        "projects/hightouch.md",
-        title="Hightouch",
+        "page_project_databridge",
+        "projects/databridge.md",
+        title="DataBridge",
         page_type="project",
         managed=True,
     )
     note = svc.paths.inbox / "source.md"
-    note.write_text("# Source\n\nHightouch route marker.", encoding="utf-8")
+    note.write_text("# Source\n\nDataBridge route marker.", encoding="utf-8")
     svc.ingest()
     provider = MarkerExtractorProvider(
-        marker="Hightouch route marker.",
-        statement="Hightouch route marker is present.",
-        page_hint="wiki/projects/hightouch.md",
+        marker="DataBridge route marker.",
+        statement="DataBridge route marker is present.",
+        page_hint="wiki/projects/databridge.md",
     )
 
     result = extract_recent_documents(svc.paths, shadow=False, llm_provider=provider)
 
     assert result["status"] == "ok"
-    assert result["candidates"][0]["page_hint"] == "projects/hightouch.md"
+    assert result["candidates"][0]["page_hint"] == "projects/databridge.md"
     assert result["validation"]["existing_route_target_count"] == 1
     assert result["actions"][0]["status"] == "auto_applied"
     with connection(svc.paths.sqlite_path) as conn:
         fact = conn.execute("SELECT page_hint FROM facts").fetchone()
-    assert fact["page_hint"] == "projects/hightouch.md"
+    assert fact["page_hint"] == "projects/databridge.md"
 
 
 def test_extraction_fuzzy_snaps_near_duplicate_canonical_route(
@@ -1270,7 +1642,9 @@ def test_extraction_truncates_excess_evidence_unit_ids(tmp_path: Path) -> None:
         "Beta evidence appears. "
         "Gamma evidence appears. "
         "Delta evidence appears. "
-        "Epsilon evidence appears.",
+        "Epsilon evidence appears. "
+        "Zeta evidence appears. "
+        "Eta evidence appears.",
         encoding="utf-8",
     )
     svc.ingest()
@@ -1284,7 +1658,7 @@ def test_extraction_truncates_excess_evidence_unit_ids(tmp_path: Path) -> None:
             {
                 "statement": "Alpha evidence appears.",
                 "chunk_id": chunk["id"],
-                "evidence_unit_ids": unit_ids[:5],
+                "evidence_unit_ids": unit_ids[:7],
                 "claim_class": "factual_update",
             }
         ],
@@ -1293,10 +1667,10 @@ def test_extraction_truncates_excess_evidence_unit_ids(tmp_path: Path) -> None:
 
     assert report["rejected_count"] == 0
     assert len(report["candidates"]) == 1
-    assert report["candidates"][0]["evidence_unit_ids"] == unit_ids[:3]
+    assert report["candidates"][0]["evidence_unit_ids"] == unit_ids[:5]
     assert report["candidates"][0]["metadata"]["evidence_unit_truncation"] == {
-        "original_count": 5,
-        "kept_count": 3,
+        "original_count": 7,
+        "kept_count": 5,
         "truncated_count": 2,
     }
 
@@ -1305,7 +1679,7 @@ def test_extraction_accepts_structured_entity_mentions(tmp_path: Path) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()
     note = svc.paths.inbox / "source.md"
-    note.write_text("# Source\n\nDatabricks signed Hightouch.", encoding="utf-8")
+    note.write_text("# Source\n\nLakehouseCo signed DataBridge.", encoding="utf-8")
     svc.ingest()
     with connection(svc.paths.sqlite_path) as conn:
         chunk = conn.execute("SELECT id, text FROM chunks LIMIT 1").fetchone()
@@ -1314,24 +1688,24 @@ def test_extraction_accepts_structured_entity_mentions(tmp_path: Path) -> None:
         svc.paths,
         [
             {
-                "statement": "Databricks signed Hightouch.",
+                "statement": "LakehouseCo signed DataBridge.",
                 "chunk_id": chunk["id"],
                 "evidence_unit_ids": evidence_unit_ids_containing(
-                    chunk["text"], "Databricks"
+                    chunk["text"], "LakehouseCo"
                 ),
                 "claim_class": "factual_update",
-                "page_hint": "companies/databricks.md",
+                "page_hint": "companies/lakehouseco.md",
                 "section_hint": "Partnerships",
-                "entity_key": "Databricks",
+                "entity_key": "LakehouseCo",
                 "entities": [
                     {
-                        "surface": "Databricks",
+                        "surface": "LakehouseCo",
                         "type": "organization",
                         "mention_kind": "named",
                         "is_primary": True,
                     },
                     {
-                        "surface": "Hightouch",
+                        "surface": "DataBridge",
                         "type": "organization",
                         "mention_kind": "named",
                         "is_primary": False,
@@ -1344,15 +1718,15 @@ def test_extraction_accepts_structured_entity_mentions(tmp_path: Path) -> None:
 
     assert len(candidates) == 1
     candidate = candidates[0]
-    assert candidate["entity_mention"] == "Databricks"
+    assert candidate["entity_mention"] == "LakehouseCo"
     assert candidate["entity_type"] == "organization"
-    assert candidate["metadata"]["model_entity_key"] == "Databricks"
+    assert candidate["metadata"]["model_entity_key"] == "LakehouseCo"
     assert (
         candidate["entity_mentions"] == candidate["metadata"]["model_entity_mentions"]
     )
     assert [mention["surface"] for mention in candidate["entity_mentions"]] == [
-        "Databricks",
-        "Hightouch",
+        "LakehouseCo",
+        "DataBridge",
     ]
     assert [mention["mention_kind"] for mention in candidate["entity_mentions"]] == [
         "named",
@@ -1377,7 +1751,7 @@ def test_extraction_treats_entity_faithfulness_as_advisory(
         svc.paths,
         [
             {
-                "statement": "Databricks Unity Catalog governs access.",
+                "statement": "LakehouseCo Unity Catalog governs access.",
                 "chunk_id": chunk["id"],
                 "evidence_unit_ids": evidence_unit_ids_containing(
                     chunk["text"], "Unity Catalog"
@@ -1385,7 +1759,7 @@ def test_extraction_treats_entity_faithfulness_as_advisory(
                 "claim_class": "factual_update",
                 "entities": [
                     {
-                        "surface": "Databricks",
+                        "surface": "LakehouseCo",
                         "type": "organization",
                         "mention_kind": "named",
                         "is_primary": True,
@@ -1397,7 +1771,7 @@ def test_extraction_treats_entity_faithfulness_as_advisory(
     )
 
     assert len(candidates) == 1
-    assert candidates[0]["entity_mention"] == "Databricks"
+    assert candidates[0]["entity_mention"] == "LakehouseCo"
 
 
 def test_extraction_accepts_supported_numeric_paraphrase(tmp_path: Path) -> None:
@@ -1405,7 +1779,7 @@ def test_extraction_accepts_supported_numeric_paraphrase(tmp_path: Path) -> None
     svc.init_workspace()
     note = svc.paths.inbox / "source.md"
     note.write_text(
-        "# Source\n\nSierra reached two hundred million ARR in eight or nine quarters.",
+        "# Source\n\nNorthwind reached two hundred million ARR in eight or nine quarters.",
         encoding="utf-8",
     )
     svc.ingest()
@@ -1416,7 +1790,7 @@ def test_extraction_accepts_supported_numeric_paraphrase(tmp_path: Path) -> None
         svc.paths,
         [
             {
-                "statement": "Sierra reached $200M ARR in eight or nine quarters.",
+                "statement": "Northwind reached $200M ARR in eight or nine quarters.",
                 "chunk_id": chunk["id"],
                 "evidence_unit_ids": evidence_unit_ids_containing(
                     chunk["text"], "two hundred million"
@@ -1424,7 +1798,7 @@ def test_extraction_accepts_supported_numeric_paraphrase(tmp_path: Path) -> None
                 "claim_class": "factual_update",
                 "entities": [
                     {
-                        "surface": "Sierra",
+                        "surface": "Northwind",
                         "type": "organization",
                         "mention_kind": "named",
                         "is_primary": True,
@@ -1487,7 +1861,7 @@ def test_extraction_rejects_unsupported_statement_number(tmp_path: Path) -> None
     svc.init_workspace()
     note = svc.paths.inbox / "source.md"
     note.write_text(
-        "# Source\n\nPeter expects probably sixty seven hours a week of work.",
+        "# Source\n\nAlex expects probably sixty seven hours a week of work.",
         encoding="utf-8",
     )
     svc.ingest()
@@ -1498,7 +1872,7 @@ def test_extraction_rejects_unsupported_statement_number(tmp_path: Path) -> None
         svc.paths,
         [
             {
-                "statement": "Peter expects probably sixty hours a week of work.",
+                "statement": "Alex expects probably sixty hours a week of work.",
                 "chunk_id": chunk["id"],
                 "evidence_unit_ids": evidence_unit_ids_containing(
                     chunk["text"], "sixty seven"
@@ -1524,7 +1898,7 @@ def test_extraction_does_not_retry_unsupported_statement_faithfulness(
     svc.init_workspace()
     note = svc.paths.inbox / "source.md"
     note.write_text(
-        "# Source\n\nPeter expects probably sixty seven hours a week of work.",
+        "# Source\n\nAlex expects probably sixty seven hours a week of work.",
         encoding="utf-8",
     )
     svc.ingest()
@@ -1618,7 +1992,7 @@ def test_extraction_empty_normalized_content_skips_cosmetic_reexports(
         "doc_empty_template",
         "hyprnote_meeting",
         [
-            'title: "Netflix interview block"\n'
+            'title: "StreamingCo interview block"\n'
             'event_started_at: "2026-06-25T16:00:00+00:00"\n'
             "No summary was captured.\n"
             "No memo was captured.\n"
@@ -1636,7 +2010,7 @@ def test_extraction_empty_normalized_content_skips_cosmetic_reexports(
         conn.execute(
             "UPDATE chunks SET text = ?, content_hash = ? WHERE document_id = ?",
             (
-                'title: "Netflix interview block re-exported"\n'
+                'title: "StreamingCo interview block re-exported"\n'
                 'event_started_at: "2026-06-25T16:00:01+00:00"\n'
                 "No summary was captured.\n"
                 "No memo was captured.\n"
@@ -1803,14 +2177,13 @@ def test_extraction_conflict_precheck_residue_includes_counterpart_options(
     assert resolver_precheck["relation_classifications"][0]["relation"] == "contradicts"
 
 
-def test_relation_classifier_suppresses_both_true_conflict_residue(
+def test_conflict_precheck_does_not_propagate_unrelated_contested_bucket(
     tmp_path: Path,
 ) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()
-    enable_simple_autonomy(svc.paths)
     with connection(svc.paths.sqlite_path) as conn:
-        resolution = resolve_entity(conn, "Peter", type_hint="person")
+        resolution = resolve_entity(conn, "Alex", type_hint="person")
         assert resolution is not None
         conn.execute(
             """
@@ -1821,13 +2194,356 @@ def test_relation_classifier_suppresses_both_true_conflict_residue(
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                "fact_peter_interview_count",
-                "Peter had one interview scheduled for the role.",
-                "people:peter:career",
+                "fact_transition_contested",
+                "Alex's next vesting date is in June.",
+                "career:role-preferences:summary",
                 resolution.entity_id,
-                "people/peter.md",
+                "career/role-preferences.md",
+                "Summary",
+                "[]",
+                "2026-07-10T00:00:00+00:00",
+                0.9,
+                "conflicted",
+                "{}",
+                "2026-07-10T00:00:00+00:00",
+                0.9,
+            ),
+        )
+
+    conflict = resolver_precheck_conflict(
+        svc.paths,
+        {
+            "statement": "Alex is open to individual-contributor roles at startups.",
+            "entity_id": resolution.entity_id,
+            "entity_key": "career:role-preferences:summary",
+            "page_hint": "career/role-preferences.md",
+        },
+    )
+
+    assert conflict is None
+
+
+def test_resolver_confirmation_can_release_deterministic_conflict_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    with connection(svc.paths.sqlite_path) as conn:
+        resolution = resolve_entity(conn, "AlphaPay", type_hint="product")
+        assert resolution is not None
+        conn.execute(
+            """
+            INSERT INTO facts(
+              id, statement, entity_key, entity_id, page_hint, section_hint,
+              source_ids, observed_at, confidence, status, metadata, created_at,
+              truth_confidence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "fact_alphapay_enabled",
+                "AlphaPay auto-renewal is enabled by default for annual plans.",
+                "concepts:alphapay:summary",
+                resolution.entity_id,
+                "concepts/alphapay.md",
+                "Summary",
+                "[]",
+                "2026-07-10T00:00:00+00:00",
+                0.9,
+                "active",
+                "{}",
+                "2026-07-10T00:00:00+00:00",
+                0.9,
+            ),
+        )
+    candidate = {
+        "statement": "AlphaPay auto-renewal is not enabled by default for annual plans.",
+        "entity_id": resolution.entity_id,
+        "entity_key": "concepts:alphapay:summary",
+        "page_hint": "concepts/alphapay.md",
+        "section_hint": "Summary",
+        "source_ids": ["chunk:new"],
+        "source_spans": [{"chunk_id": "new", "start": 0, "end": 20}],
+        "evidence_quote": "AlphaPay auto-renewal is not enabled by default.",
+    }
+    monkeypatch.setattr(
+        "pkm_brain.extraction.resolver_precheck_conflict_judgment",
+        lambda *_args, **_kwargs: {
+            "decision": "no_conflict",
+            "counterpart_fact_ids": [],
+            "rationale": "The scopes differ.",
+        },
+    )
+
+    decision = earned_fact_decision(svc.paths, candidate)
+
+    assert decision["decision"] == "apply"
+    assert decision["target_fact_ids"] == []
+    assert (
+        decision["evidence"]["resolver_precheck"]["resolver_judgment"]["decision"]
+        == "no_conflict"
+    )
+
+
+def test_conflict_prompt_requires_direct_irreconcilability() -> None:
+    prompt = conflict_precheck_prompt(
+        {"statement": "Candidate fact."},
+        [{"id": "fact_existing", "statement": "Existing fact."}],
+    )
+
+    assert "cannot both be true under the same entity, topic, time, and scope" in prompt
+    assert "context is insufficient to prove a direct contradiction" in prompt
+    assert "require external truth" not in prompt
+
+
+def test_reconcile_fact_conflict_reviews_releases_complementary_card(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    with connection(svc.paths.sqlite_path) as conn:
+        resolution = resolve_entity(conn, "Alex", type_hint="person")
+        assert resolution is not None
+        conn.execute(
+            """
+            INSERT INTO facts(
+              id, statement, entity_key, entity_id, page_hint, section_hint,
+              source_ids, observed_at, confidence, status, metadata, created_at,
+              truth_confidence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "fact_alex_vesting",
+                "Alex's next vesting date is in June.",
+                "people:alex:career",
+                resolution.entity_id,
+                "people/alex.md",
                 "Career",
-                json.dumps(["document:peter-old"]),
+                "[]",
+                "2026-07-10T00:00:00+00:00",
+                0.9,
+                "active",
+                "{}",
+                "2026-07-10T00:00:00+00:00",
+                0.9,
+            ),
+        )
+    candidate = {
+        "statement": "Alex prefers product leadership roles at growth-stage companies.",
+        "entity_id": resolution.entity_id,
+        "entity_key": "people:alex:career",
+        "page_hint": "people/alex.md",
+        "section_hint": "Career",
+        "source_ids": ["chunk:new"],
+        "source_spans": [{"chunk_id": "new", "start": 0, "end": 40}],
+        "evidence_quote": "Alex prefers product leadership roles.",
+        "truth_confidence": 0.9,
+        "routing_confidence": 0.9,
+        "metadata": {"routing": {"route_destination_valid": True}},
+    }
+    action = propose_action(
+        svc.paths,
+        "fact_upsert",
+        action_payload={"fact": candidate},
+        action_features={
+            "clean_fact_upsert": False,
+            "residue_kind": "fact_conflict_review",
+            "resolver_precheck": "residue",
+        },
+        target_fact_ids=["fact_alex_vesting"],
+        target_page_paths=["people/alex.md"],
+        proposed_by="extractor",
+        decide=False,
+    )
+    mark_action_residue(
+        svc.paths,
+        action["id"],
+        kind="fact_conflict_review",
+        reason="Nearby facts are already contested.",
+    )
+
+    preview = reconcile_fact_conflict_reviews(svc.paths)
+
+    assert preview["release_without_resolver"] == 1
+    assert preview["resolver_review_required"] == 0
+
+    def fake_decide_policy_actions(
+        paths: BrainPaths,
+        action_ids: list[str],
+        *,
+        critic_review: dict[str, object],
+    ) -> list[dict[str, object]]:
+        assert critic_review["disagreement_mode"] == "reject"
+        with connection(paths.sqlite_path) as conn:
+            conn.execute(
+                """
+                UPDATE cos_actions
+                SET status = 'auto_applied', policy_decision = 'test_policy'
+                WHERE id = ?
+                """,
+                (action_ids[0],),
+            )
+        return [get_action(paths, action_ids[0])]
+
+    monkeypatch.setattr(
+        "pkm_brain.extraction.decide_policy_actions", fake_decide_policy_actions
+    )
+    result = reconcile_fact_conflict_reviews(
+        svc.paths,
+        dry_run=False,
+        critic_review={
+            "max_workers": 1,
+            "timeout_seconds": 30,
+            "disagreement_mode": "reject",
+        },
+    )
+
+    assert result["released"] == 1
+    assert result["retained"] == 0
+    with connection(svc.paths.sqlite_path) as conn:
+        question = conn.execute(
+            "SELECT status, decided_by FROM open_questions WHERE action_id = ?",
+            (action["id"],),
+        ).fetchone()
+        action_row = conn.execute(
+            """
+            SELECT status, target_fact_ids, action_features, risk_tier
+            FROM cos_actions WHERE id = ?
+            """,
+            (action["id"],),
+        ).fetchone()
+    assert question["status"] == "auto_resolved"
+    assert question["decided_by"] == "conflict_reconciliation_v2"
+    assert action_row["status"] == "auto_applied"
+    assert json.loads(action_row["target_fact_ids"]) == []
+    assert action_row["risk_tier"] == "medium"
+    features = json.loads(action_row["action_features"])
+    assert features["clean_fact_upsert"] is True
+    assert features["residue_kind"] is None
+    assert features["resolver_precheck"] == "passed"
+
+
+def test_reconcile_fact_conflict_reviews_retains_resolver_confirmed_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    with connection(svc.paths.sqlite_path) as conn:
+        resolution = resolve_entity(conn, "AlphaPay", type_hint="product")
+        assert resolution is not None
+        conn.execute(
+            """
+            INSERT INTO facts(
+              id, statement, entity_key, entity_id, page_hint, section_hint,
+              source_ids, observed_at, confidence, status, metadata, created_at,
+              truth_confidence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "fact_alphapay_enabled_reconcile",
+                "AlphaPay auto-renewal is enabled by default for annual plans.",
+                "concepts:alphapay:summary",
+                resolution.entity_id,
+                "concepts/alphapay.md",
+                "Summary",
+                "[]",
+                "2026-07-10T00:00:00+00:00",
+                0.9,
+                "active",
+                "{}",
+                "2026-07-10T00:00:00+00:00",
+                0.9,
+            ),
+        )
+    candidate = {
+        "statement": "AlphaPay auto-renewal is not enabled by default for annual plans.",
+        "entity_id": resolution.entity_id,
+        "entity_key": "concepts:alphapay:summary",
+        "page_hint": "concepts/alphapay.md",
+        "section_hint": "Summary",
+        "source_ids": ["chunk:new"],
+        "source_spans": [{"chunk_id": "new", "start": 0, "end": 70}],
+        "evidence_quote": "AlphaPay auto-renewal is not enabled by default.",
+        "truth_confidence": 0.95,
+        "routing_confidence": 0.95,
+        "metadata": {"routing": {"route_destination_valid": True}},
+    }
+    action = propose_action(
+        svc.paths,
+        "fact_upsert",
+        action_payload={"fact": candidate},
+        action_features={"resolver_precheck": "residue"},
+        target_fact_ids=["fact_alphapay_enabled_reconcile"],
+        target_page_paths=["concepts/alphapay.md"],
+        proposed_by="extractor",
+        decide=False,
+    )
+    mark_action_residue(
+        svc.paths,
+        action["id"],
+        kind="fact_conflict_review",
+        reason="Candidate appears to contradict an existing fact.",
+    )
+    monkeypatch.setattr(
+        "pkm_brain.extraction.resolver_precheck_conflict_judgment",
+        lambda *_args, **_kwargs: {
+            "decision": "conflict",
+            "counterpart_fact_ids": ["fact_alphapay_enabled_reconcile"],
+            "rationale": "The same setting cannot be both enabled and disabled.",
+        },
+    )
+
+    result = reconcile_fact_conflict_reviews(svc.paths, dry_run=False)
+
+    assert result["released"] == 0
+    assert result["retained"] == 1
+    with connection(svc.paths.sqlite_path) as conn:
+        question = conn.execute(
+            "SELECT status, fact_ids, options FROM open_questions WHERE action_id = ?",
+            (action["id"],),
+        ).fetchone()
+        action_row = conn.execute(
+            "SELECT target_fact_ids, evidence_json FROM cos_actions WHERE id = ?",
+            (action["id"],),
+        ).fetchone()
+    assert question["status"] == "needs_human"
+    assert json.loads(question["fact_ids"]) == ["fact_alphapay_enabled_reconcile"]
+    assert len(json.loads(question["options"])) == 2
+    assert json.loads(action_row["target_fact_ids"]) == [
+        "fact_alphapay_enabled_reconcile"
+    ]
+    assert (
+        json.loads(action_row["evidence_json"])["resolver_precheck"][
+            "resolver_judgment"
+        ]["decision"]
+        == "conflict"
+    )
+
+
+def test_relation_classifier_suppresses_both_true_conflict_residue(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    enable_simple_autonomy(svc.paths)
+    with connection(svc.paths.sqlite_path) as conn:
+        resolution = resolve_entity(conn, "Alex", type_hint="person")
+        assert resolution is not None
+        conn.execute(
+            """
+            INSERT INTO facts(
+              id, statement, entity_key, entity_id, page_hint, section_hint,
+              source_ids, observed_at, confidence, status, metadata, created_at,
+              truth_confidence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "fact_alex_interview_count",
+                "Alex had one interview scheduled for the role.",
+                "people:alex:career",
+                resolution.entity_id,
+                "people/alex.md",
+                "Career",
+                json.dumps(["document:alex-old"]),
                 "2026-06-26T00:00:00+00:00",
                 0.9,
                 "active",
@@ -1836,17 +2552,17 @@ def test_relation_classifier_suppresses_both_true_conflict_residue(
                 0.9,
             ),
         )
-    marker = "Peter now has two interviews scheduled for the role."
+    marker = "Alex now has two interviews scheduled for the role."
     note = svc.paths.inbox / "source.md"
     note.write_text(f"# Source\n\n{marker}", encoding="utf-8")
     svc.ingest()
     provider = MarkerExtractorProvider(
         marker=marker,
         statement=marker,
-        page_hint="people/peter.md",
+        page_hint="people/alex.md",
         entity_mentions=[
             {
-                "surface": "Peter",
+                "surface": "Alex",
                 "type": "person",
                 "mention_kind": "named",
                 "is_primary": True,
@@ -2176,7 +2892,9 @@ def test_sampled_audit_respects_zero_policy_sample_rate(tmp_path: Path) -> None:
     assert result["audited"] == []
 
 
-def test_sampled_audit_bad_demotes_policy_and_reverts(tmp_path: Path) -> None:
+def test_sampled_audit_unscoped_bad_reverts_without_demoting_policy(
+    tmp_path: Path,
+) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()
     action = apply_action(
@@ -2203,7 +2921,8 @@ def test_sampled_audit_bad_demotes_policy_and_reverts(tmp_path: Path) -> None:
     )
 
     assert result["bad_action_ids"] == [action["id"]]
-    assert result["demoted_policy_version"] == 2
+    assert result["unscoped_bad_action_ids"] == [action["id"]]
+    assert result["demoted_policy_version"] is None
     assert result["reverted"][0]["status"] == "reverted"
     assert get_action(svc.paths, action["id"])["status"] == "reverted"
     with connection(svc.paths.sqlite_path) as conn:
@@ -2263,6 +2982,33 @@ def test_sampled_audit_demotes_when_policy_bad_rate_exceeds_threshold(
         {"audit_threshold_case": "above"},
         demotion_threshold=0.4,
     )
+    with connection(svc.paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO cos_policy(
+              id, version, priority, match_action_types, match_predicate,
+              autonomy_level, critic_required, timeout_allowed,
+              timeout_after_seconds, audit_sample_rate, demotion_threshold,
+              auto_revert_signals, active, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "policy_audit_unrelated",
+                99,
+                2,
+                '["synthesize_page"]',
+                "{}",
+                "L2",
+                1,
+                0,
+                None,
+                0.25,
+                0.4,
+                "[]",
+                1,
+                "2026-06-25T00:00:00+00:00",
+            ),
+        )
     first = decide_action(
         svc.paths,
         propose_action(
@@ -2300,6 +3046,24 @@ def test_sampled_audit_demotes_when_policy_bad_rate_exceeds_threshold(
             "demotion_threshold": 0.4,
         }
     ]
+    with connection(svc.paths.sqlite_path) as conn:
+        levels = {
+            row["match_action_types"]: (
+                row["autonomy_level"],
+                bool(row["critic_required"]),
+                float(row["audit_sample_rate"]),
+            )
+            for row in conn.execute(
+                """
+                SELECT match_action_types, autonomy_level, critic_required,
+                       audit_sample_rate
+                FROM cos_policy
+                WHERE version = 100 AND priority IN (1, 2)
+                """
+            )
+        }
+    assert levels['["canonicalize_page"]'] == ("L3", False, 1.0)
+    assert levels['["synthesize_page"]'] == ("L2", True, 0.25)
 
 
 def test_sampled_audit_auto_revert_refuses_on_drift_and_creates_residue(
@@ -2430,6 +3194,73 @@ def test_critic_llm_agreement_allows_l1_auto_apply(tmp_path: Path) -> None:
     }
 
 
+def test_critic_repairs_incomplete_fact_citation_before_apply(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "source.md"
+    note.write_text(
+        "# Source\n\n"
+        "Speaker 1: The product is available in Europe. "
+        "It is also available in Canada.",
+        encoding="utf-8",
+    )
+    svc.ingest()
+    with connection(svc.paths.sqlite_path) as conn:
+        chunk = conn.execute("SELECT id, text FROM chunks LIMIT 1").fetchone()
+    current_unit_ids = evidence_unit_ids_containing(chunk["text"], "Europe")
+    additional_unit_ids = evidence_unit_ids_containing(chunk["text"], "Canada")
+    repaired_unit_ids = [
+        *current_unit_ids,
+        *additional_unit_ids,
+    ]
+    candidate = validate_extracted_facts(
+        svc.paths,
+        [
+            {
+                "statement": "The product is available in Europe and Canada.",
+                "chunk_id": chunk["id"],
+                "evidence_unit_ids": current_unit_ids,
+                "claim_class": "factual_update",
+                "page_hint": "concepts/product-availability.md",
+                "section_hint": "Summary",
+            }
+        ],
+    )[0]
+    insert_critic_policy(
+        svc.paths,
+        "policy_test_fact_evidence_repair",
+        "L2",
+        "needs_fact_evidence_repair",
+        action_type="fact_upsert",
+    )
+    action = propose_action(
+        svc.paths,
+        "fact_upsert",
+        action_payload={"fact": candidate},
+        action_features={"needs_fact_evidence_repair": True},
+        target_page_paths=[candidate["page_hint"]],
+    )
+    provider = RepairingCriticProvider(additional_unit_ids)
+
+    decided = decide_action(
+        svc.paths,
+        action["id"],
+        critic_llm_provider=provider,
+        critic_disagreement_mode="reject",
+    )
+
+    assert provider.calls == 2
+    assert decided["status"] == "applied"
+    assert decided["critic_decision"] == "agree"
+    repaired_fact = decided["evidence_json"]["payload"]["fact"]
+    assert repaired_fact["evidence_unit_ids"] == repaired_unit_ids
+    assert "Canada" in repaired_fact["evidence_quote"]
+    repair_record = decided["evidence_json"]["critic_evidence_repair"]
+    assert repair_record["repair"]["status"] == "repaired"
+    assert repair_record["initial_review"]["decision"] == "evidence_incomplete"
+    assert repair_record["final_review"]["decision"] == "agree"
+
+
 def test_critic_llm_disagreement_blocks_l2_apply(tmp_path: Path) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()
@@ -2453,6 +3284,40 @@ def test_critic_llm_disagreement_blocks_l2_apply(tmp_path: Path) -> None:
     assert decided["status"] == "needs_human"
     assert decided["autonomy_level"] == "L2"
     assert decided["critic_decision"] == "disagree"
+
+
+def test_fact_apply_falls_back_when_entity_llm_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    calls: list[bool] = []
+
+    def fake_apply_action(
+        paths: BrainPaths,
+        action_id: str,
+        *,
+        applied_status: str,
+        allow_llm_entity_resolution: bool = True,
+    ) -> dict[str, object]:
+        assert paths == svc.paths
+        assert applied_status == "applied"
+        calls.append(allow_llm_entity_resolution)
+        if allow_llm_entity_resolution:
+            raise LLMProviderError("malformed entity disambiguation response")
+        return {"id": action_id, "status": applied_status}
+
+    monkeypatch.setattr("pkm_brain.cos_actions.apply_action", fake_apply_action)
+
+    result = apply_decided_action(
+        svc.paths,
+        "cosact_test",
+        applied_status="applied",
+        action={"action_type": "fact_upsert"},
+    )
+
+    assert result["status"] == "applied"
+    assert calls == [True, False]
 
 
 def test_critic_disagreement_can_reject_without_human_residue(tmp_path: Path) -> None:
@@ -2530,7 +3395,9 @@ def test_decide_policy_actions_parallel_preserves_order(
     svc.init_workspace()
     calls: list[str] = []
 
-    def fake_decide_action(paths: BrainPaths, action_id: str, **kwargs: object) -> dict[str, object]:
+    def fake_decide_action(
+        paths: BrainPaths, action_id: str, **kwargs: object
+    ) -> dict[str, object]:
         assert paths == svc.paths
         assert kwargs["critic_disagreement_mode"] == "reject"
         time.sleep(0.05)
@@ -2560,6 +3427,51 @@ def test_decide_policy_actions_parallel_preserves_order(
     assert sorted(calls) == ["action_1", "action_2", "action_3", "action_4"]
 
 
+def test_decide_policy_actions_isolates_worker_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    actions = [
+        propose_action(
+            svc.paths,
+            "canonicalize_page",
+            action_payload={"page_hint": f"concepts/test-{index}.md"},
+        )
+        for index in range(2)
+    ]
+
+    def fake_decide_action(
+        paths: BrainPaths, action_id: str, **kwargs: object
+    ) -> dict[str, object]:
+        assert paths == svc.paths
+        if action_id == actions[0]["id"]:
+            raise RuntimeError("isolated decision failure")
+        return {"id": action_id, "status": "applied"}
+
+    monkeypatch.setattr("pkm_brain.extraction.decide_action", fake_decide_action)
+
+    decided = decide_policy_actions(
+        svc.paths,
+        [action["id"] for action in actions],
+        critic_review={
+            "max_workers": 2,
+            "timeout_seconds": 1,
+            "disagreement_mode": "reject",
+        },
+    )
+
+    assert [action["id"] for action in decided] == [
+        action["id"] for action in actions
+    ]
+    assert decided[0]["status"] == "failed"
+    assert (
+        decided[0]["evidence_json"]["decision_failure"]["message"]
+        == "isolated decision failure"
+    )
+    assert decided[1]["status"] == "applied"
+
+
 def test_critic_block_rate_anomaly_creates_one_document_residue(
     tmp_path: Path,
 ) -> None:
@@ -2587,7 +3499,9 @@ def test_critic_block_rate_anomaly_creates_one_document_residue(
             ),
         )
     actions = []
-    for index, critic_decision in enumerate(["disagree", "disagree", "disagree", "agree"]):
+    for index, critic_decision in enumerate(
+        ["disagree", "disagree", "disagree", "disagree", "agree"]
+    ):
         action = propose_action(
             svc.paths,
             "fact_upsert",
@@ -2631,8 +3545,47 @@ def test_critic_block_rate_anomaly_creates_one_document_residue(
         )
     assert len(residues) == 1
     assert residues[0]["status"] == "needs_human"
-    assert "3/4 extracted facts" in residues[0]["question"]
+    assert "4/5 extracted facts" in residues[0]["question"]
     assert json.loads(residues[0]["context"])["document_id"] == "doc_blocked"
+
+
+def test_critic_block_rate_anomaly_ignores_three_fact_sample(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    actions = []
+    for index in range(3):
+        action = propose_action(
+            svc.paths,
+            "fact_upsert",
+            action_payload={
+                "fact": {
+                    "statement": f"Tiny sample fact {index}.",
+                    "page_hint": "concepts/test.md",
+                    "metadata": {"document_id": "doc_tiny_sample"},
+                }
+            },
+        )
+        with connection(svc.paths.sqlite_path) as conn:
+            conn.execute(
+                "UPDATE cos_actions SET critic_decision = 'disagree' WHERE id = ?",
+                (action["id"],),
+            )
+        actions.append(get_action(svc.paths, action["id"]))
+
+    record_critic_block_rate_anomalies(
+        svc.paths,
+        actions,
+        critic_review={"block_rate_anomaly_threshold": 0.8},
+    )
+
+    with connection(svc.paths.sqlite_path) as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM open_questions "
+            "WHERE kind = 'document_extraction_anomaly'"
+        ).fetchone()[0]
+    assert count == 0
 
 
 def test_reclaim_unrouted_facts_dry_run_routes_against_current_page_pool(
@@ -2649,11 +3602,11 @@ def test_reclaim_unrouted_facts_dry_run_routes_against_current_page_pool(
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                "page_sierra",
-                "Sierra",
+                "page_northwind",
+                "Northwind",
                 "organization",
                 "active",
-                str(svc.paths.wiki / "companies/sierra.md"),
+                str(svc.paths.wiki / "companies/northwind.md"),
                 "[]",
                 "[]",
                 "[]",
@@ -2668,13 +3621,13 @@ def test_reclaim_unrouted_facts_dry_run_routes_against_current_page_pool(
         "fact_upsert",
         action_payload={
             "fact": {
-                "statement": "Sierra builds agent customer-service software.",
+                "statement": "Northwind builds agent customer-service software.",
                 "entity_key": "concepts:concepts-extracted-facts:summary",
                 "page_hint": "concepts/extracted-facts.md",
                 "section_hint": "Summary",
                 "source_ids": ["chunk:chunk_test"],
                 "source_spans": [{"chunk_id": "chunk_test", "start": 0, "end": 40}],
-                "evidence_quote": "Sierra builds agent customer-service software.",
+                "evidence_quote": "Northwind builds agent customer-service software.",
                 "confidence": 0.5,
                 "truth_confidence": 0.5,
                 "metadata": {
@@ -2703,7 +3656,7 @@ def test_reclaim_unrouted_facts_dry_run_routes_against_current_page_pool(
 
     assert result["reclaimable"] == 1
     assert result["preview"][0]["old_action_id"] == action["id"]
-    assert result["preview"][0]["new_page_hint"] == "companies/sierra.md"
+    assert result["preview"][0]["new_page_hint"] == "companies/northwind.md"
 
 
 def test_missing_critic_provider_blocks_required_critic_auto_apply(
@@ -2745,6 +3698,35 @@ class FakeCriticProvider:
         assert "should be human-reviewed" not in prompt
         return json.dumps(
             {"decision": self.decision, "rationale": "test critic judgment"}
+        )
+
+
+class RepairingCriticProvider:
+    name = "fake"
+    model = "fake-critic-model"
+
+    def __init__(self, repaired_unit_ids: list[str]) -> None:
+        self.repaired_unit_ids = repaired_unit_ids
+        self.calls = 0
+
+    def complete(self, prompt: str) -> str:
+        self.calls += 1
+        assert "repairable_units" in prompt
+        assert "Speaker 1" in prompt
+        if self.calls == 1:
+            return json.dumps(
+                {
+                    "decision": "evidence_incomplete",
+                    "rationale": "The Canada sentence must be included.",
+                    "repaired_evidence_unit_ids": self.repaired_unit_ids,
+                }
+            )
+        assert "Canada" in prompt
+        return json.dumps(
+            {
+                "decision": "agree",
+                "rationale": "The repaired citation directly supports both locations.",
+            }
         )
 
 
@@ -2940,7 +3922,7 @@ class UnsupportedNumberExtractorProvider:
             {
                 "facts": [
                     {
-                        "statement": "Peter expects probably sixty hours a week of work.",
+                        "statement": "Alex expects probably sixty hours a week of work.",
                         "chunk_id": chunk_id,
                         "evidence_unit_ids": unit_ids,
                         "claim_class": "factual_update",
@@ -3290,7 +4272,12 @@ def insert_audit_policy(
 
 
 def insert_critic_policy(
-    paths: BrainPaths, policy_id: str, autonomy_level: str, feature_name: str
+    paths: BrainPaths,
+    policy_id: str,
+    autonomy_level: str,
+    feature_name: str,
+    *,
+    action_type: str = "canonicalize_page",
 ) -> None:
     with connection(paths.sqlite_path) as conn:
         conn.execute(
@@ -3306,7 +4293,7 @@ def insert_critic_policy(
                 policy_id,
                 199,
                 1,
-                '["canonicalize_page"]',
+                json.dumps([action_type]),
                 json.dumps({"eq": {feature_name: True}}),
                 autonomy_level,
                 1,

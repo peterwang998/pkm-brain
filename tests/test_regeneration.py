@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sqlite3
 
 import pytest
 
@@ -111,6 +112,24 @@ def test_backup_runtime_brain_copies_db_and_wiki(tmp_path: Path) -> None:
     assert Path(result["wiki_backup"]).exists()
     assert Path(result["wiki_backup"], "concepts", "hand-note.md").exists()
     assert Path(result["path"], "backup_metadata.json").exists()
+    assert result["db_backup_method"] == "sqlite_online_backup"
+
+
+def test_backup_runtime_brain_includes_committed_wal_pages(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    with sqlite3.connect(paths.sqlite_path) as writer:
+        writer.execute("PRAGMA journal_mode = WAL")
+        writer.execute("PRAGMA wal_autocheckpoint = 0")
+        writer.execute("CREATE TABLE backup_probe(value TEXT NOT NULL)")
+        writer.execute("INSERT INTO backup_probe(value) VALUES ('committed-in-wal')")
+        writer.commit()
+
+        result = backup_runtime_brain(paths, output_dir=tmp_path / "backup")
+
+    with sqlite3.connect(result["db_backup"]) as backup:
+        value = backup.execute("SELECT value FROM backup_probe").fetchone()[0]
+    assert value == "committed-in-wal"
 
 
 def test_rebuild_facts_dry_run_reports_scope_without_mutating(tmp_path: Path) -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from .cos_actions import reviewable_bad_audit_actions
 from .db import connection
 from .paths import BrainPaths
 from .util import now_iso
@@ -166,14 +167,16 @@ def proposed_topology_action_summary(conn: Any, exclude_action_ids: set[str]) ->
 
 
 def audit_flagged_action_summary(conn: Any) -> Any:
-    return conn.execute(
-        """
-        SELECT COUNT(*) AS count, MIN(COALESCE(applied_at, created_at)) AS oldest_created_at
-        FROM cos_actions
-        WHERE audit_status = 'sampled_bad'
-          AND status NOT IN ('reverted', 'rejected', 'dismissed')
-        """
-    ).fetchone()
+    actions = reviewable_bad_audit_actions(conn)
+    timestamps = [
+        str(action.get("applied_at") or action.get("created_at") or "")
+        for action in actions
+        if action.get("applied_at") or action.get("created_at")
+    ]
+    return {
+        "count": len(actions),
+        "oldest_created_at": min(timestamps) if timestamps else None,
+    }
 
 
 def table_exists(conn: Any, table: str) -> bool:

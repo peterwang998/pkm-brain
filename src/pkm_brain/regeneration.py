@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -60,7 +61,10 @@ def backup_runtime_brain(paths: BrainPaths, output_dir: Path | None = None) -> d
     target_dir.mkdir(parents=True, exist_ok=True)
     db_target = target_dir / "brain.sqlite"
     wiki_target = target_dir / "wiki"
-    shutil.copy2(paths.sqlite_path, db_target)
+    db_target.unlink(missing_ok=True)
+    with sqlite3.connect(paths.sqlite_path) as source_conn:
+        with sqlite3.connect(db_target) as target_conn:
+            source_conn.backup(target_conn)
     if wiki_target.exists():
         shutil.rmtree(wiki_target)
     shutil.copytree(paths.wiki, wiki_target)
@@ -70,6 +74,7 @@ def backup_runtime_brain(paths: BrainPaths, output_dir: Path | None = None) -> d
         "db_source": str(paths.sqlite_path),
         "wiki_source": str(paths.wiki),
         "db_backup": str(db_target),
+        "db_backup_method": "sqlite_online_backup",
         "wiki_backup": str(wiki_target),
         "db_bytes": db_target.stat().st_size,
         "wiki_file_count": sum(1 for item in wiki_target.rglob("*") if item.is_file()),

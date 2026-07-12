@@ -36,7 +36,12 @@ def running_daemon(
     serve_web: bool = False,
     start_scheduler: bool = False,
 ) -> Iterator[tuple[BrainDaemon, str, int, str]]:
-    runtime = BrainDaemon(paths, serve_web=serve_web, start_scheduler=start_scheduler)
+    runtime = BrainDaemon(
+        paths,
+        serve_web=serve_web,
+        start_scheduler=start_scheduler,
+        runtime_id="test-runtime",
+    )
     runtime.start()
     assert runtime.server is not None
     thread = threading.Thread(target=runtime.server.serve_forever, daemon=True)
@@ -91,6 +96,7 @@ def test_daemon_boot_handshake_lock_health_and_shutdown(tmp_path: Path) -> None:
         assert payload["port"] == port
         assert payload["token"] == token
         assert payload["home"] == str(paths.home)
+        assert payload["runtime_id"] == "test-runtime"
 
         second = BrainDaemon(paths)
         with pytest.raises(RuntimeError, match="already running"):
@@ -105,10 +111,12 @@ def test_daemon_boot_handshake_lock_health_and_shutdown(tmp_path: Path) -> None:
         assert body["ok"] is True
         assert body["port"] == port
         assert body["home"] == str(paths.home)
+        assert body["runtime_id"] == "test-runtime"
 
         status, body = request_json(host, port, "GET", "/api/version", token=token)
         assert status == 200
         assert body["version"]
+        assert body["runtime_id"] == "test-runtime"
 
         status, body = request_json(host, port, "POST", "/api/shutdown", token=token)
         assert status == 200

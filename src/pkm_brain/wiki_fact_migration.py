@@ -7,7 +7,7 @@ from typing import Any
 from .db import connection
 from .paths import BrainPaths
 from .util import stable_unique
-from .wiki import GENERATED_MARKER, parse_frontmatter
+from .wiki import GENERATED_MARKER, NON_ROUTABLE_PAGE_TYPES, parse_frontmatter
 from .wiki_facts import (
     CHIEF_OF_STAFF_MARKER,
     clean_statement_fragment,
@@ -54,7 +54,7 @@ FACT_SECTIONS = {
     "Current Understanding",
     "Needed Evidence",
 }
-IGNORED_PAGE_TYPES = {"index", "reference"}
+IGNORED_PAGE_TYPES = NON_ROUTABLE_PAGE_TYPES
 IGNORED_FILENAMES = {"index.md", "log.md"}
 EMPTY_FACT_MARKERS = {
     "",

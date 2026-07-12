@@ -22,17 +22,17 @@ def test_entity_normalization_collapses_case_and_format_variants(tmp_path: Path)
     svc.init_workspace()
 
     assert normalize_entity_name("Unity Catalog") == normalize_entity_name("unity_catalog")
-    assert normalize_entity_name("  Hightouch  ") == normalize_entity_name("hightouch")
+    assert normalize_entity_name("  DataBridge  ") == normalize_entity_name("databridge")
     with connection(svc.paths.sqlite_path) as conn:
-        first = resolve_entity(conn, "Sierra")
-        second = resolve_entity(conn, "sierra")
-        third = resolve_entity(conn, "Sierra")
+        first = resolve_entity(conn, "Northwind")
+        second = resolve_entity(conn, "northwind")
+        third = resolve_entity(conn, "Northwind")
         row = conn.execute("SELECT aliases FROM entities WHERE id = ?", (first.entity_id,)).fetchone()
 
     assert first.entity_id == second.entity_id == third.entity_id
     assert first.resolution_method == "created"
     assert second.resolution_method == "exact"
-    assert loads(row["aliases"], []) == ["sierra"]
+    assert loads(row["aliases"], []) == ["northwind"]
 
 
 def test_entity_type_blocks_cross_kind_surface_match(tmp_path: Path) -> None:
@@ -62,29 +62,29 @@ def test_entity_resolver_llm_chooses_from_closed_candidates(tmp_path: Path) -> N
     svc.init_workspace()
 
     with connection(svc.paths.sqlite_path) as conn:
-        peter = resolve_entity(conn, "Peter", type_hint="person")
-        peter_wang = resolve_entity(conn, "Peter Wang", type_hint="person")
-        provider = FakeEntityResolverProvider(peter_wang.entity_id)
+        alex = resolve_entity(conn, "Alex", type_hint="person")
+        alex_rivera = resolve_entity(conn, "Alex Rivera", type_hint="person")
+        provider = FakeEntityResolverProvider(alex_rivera.entity_id)
         resolved = resolve_entity(
             conn,
-            "Peter",
+            "Alex",
             type_hint="person",
             paths=svc.paths,
             llm_provider=provider,
-            context={"statement": "Peter Wang joined the interview loop."},
+            context={"statement": "Alex Rivera joined the interview loop."},
         )
         unknown = resolve_entity(
             conn,
-            "Peter",
+            "Alex",
             type_hint="person",
             paths=svc.paths,
             llm_provider=FakeEntityResolverProvider("entity_missing"),
-            context={"statement": "Peter stayed as the short-name entity."},
+            context={"statement": "Alex stayed as the short-name entity."},
         )
 
-    assert resolved.entity_id == peter_wang.entity_id
+    assert resolved.entity_id == alex_rivera.entity_id
     assert resolved.resolution_method == "llm"
-    assert unknown.entity_id == peter.entity_id
+    assert unknown.entity_id == alex.entity_id
     assert provider.prompts and "Never invent an entity_id" in provider.prompts[0]
 
 
@@ -92,8 +92,8 @@ def test_fact_upsert_writes_primary_entity_link_across_page_routes(tmp_path: Pat
     svc = service_for(tmp_path)
     svc.init_workspace()
 
-    first = apply_fact(svc.paths, "fact_databricks", "career/databricks.md", "Peter Wang")
-    second = apply_fact(svc.paths, "fact_google", "career/google.md", "Peter Wang")
+    first = apply_fact(svc.paths, "fact_lakehouseco", "career/lakehouseco.md", "Alex Rivera")
+    second = apply_fact(svc.paths, "fact_google", "career/google.md", "Alex Rivera")
 
     with connection(svc.paths.sqlite_path) as conn:
         facts = conn.execute(
@@ -103,7 +103,7 @@ def test_fact_upsert_writes_primary_entity_link_across_page_routes(tmp_path: Pat
             WHERE id IN (?, ?)
             ORDER BY id
             """,
-            ("fact_databricks", "fact_google"),
+            ("fact_lakehouseco", "fact_google"),
         ).fetchall()
         links = conn.execute(
             """
@@ -112,7 +112,7 @@ def test_fact_upsert_writes_primary_entity_link_across_page_routes(tmp_path: Pat
             WHERE fact_id IN (?, ?)
             ORDER BY fact_id
             """,
-            ("fact_databricks", "fact_google"),
+            ("fact_lakehouseco", "fact_google"),
         ).fetchall()
 
     assert first["status"] == "applied"
@@ -120,7 +120,7 @@ def test_fact_upsert_writes_primary_entity_link_across_page_routes(tmp_path: Pat
     assert facts[0]["entity_id"] == facts[1]["entity_id"]
     assert facts[0]["entity_key"] != facts[1]["entity_key"]
     assert [link["is_primary"] for link in links] == [1, 1]
-    assert {link["mention_text"] for link in links} == {"Peter Wang"}
+    assert {link["mention_text"] for link in links} == {"Alex Rivera"}
     assert {link["resolution_method"] for link in links} == {"created", "exact"}
 
 
@@ -129,7 +129,7 @@ def test_fact_upsert_writes_secondary_entity_mentions_and_types(tmp_path: Path) 
     svc.init_workspace()
     mentions = [
         {
-            "surface": "Databricks",
+            "surface": "LakehouseCo",
             "entity_type": "organization",
             "mention_kind": "named",
             "is_primary": True,
@@ -137,7 +137,7 @@ def test_fact_upsert_writes_secondary_entity_mentions_and_types(tmp_path: Path) 
             "confidence": 0.9,
         },
         {
-            "surface": "Hightouch",
+            "surface": "DataBridge",
             "entity_type": "organization",
             "mention_kind": "named",
             "is_primary": False,
@@ -149,8 +149,8 @@ def test_fact_upsert_writes_secondary_entity_mentions_and_types(tmp_path: Path) 
     apply_fact(
         svc.paths,
         "fact_partnership",
-        "career/databricks.md",
-        "Databricks",
+        "career/lakehouseco.md",
+        "LakehouseCo",
         entity_mentions=mentions,
     )
 
@@ -168,12 +168,12 @@ def test_fact_upsert_writes_secondary_entity_mentions_and_types(tmp_path: Path) 
         ).fetchall()
 
     assert len(links) == 2
-    assert links[0]["name"] == "Databricks"
+    assert links[0]["name"] == "LakehouseCo"
     assert links[0]["is_primary"] == 1
     assert links[0]["mention_kind"] == "named"
     assert links[0]["entity_type"] == "organization"
     assert links[0]["entity_id"] == fact["entity_id"]
-    assert links[1]["name"] == "Hightouch"
+    assert links[1]["name"] == "DataBridge"
     assert links[1]["is_primary"] == 0
     assert links[1]["mention_kind"] == "named"
     assert links[1]["entity_type"] == "organization"
@@ -244,7 +244,7 @@ def test_fact_upsert_admits_concepts_only_when_configured(tmp_path: Path) -> Non
 
     default_mentions = [
         {
-            "surface": "Databricks",
+            "surface": "LakehouseCo",
             "entity_type": "organization",
             "mention_kind": "named",
             "is_primary": True,
@@ -259,8 +259,8 @@ def test_fact_upsert_admits_concepts_only_when_configured(tmp_path: Path) -> Non
     apply_fact(
         svc.paths,
         "fact_concept_default",
-        "companies/databricks.md",
-        "Databricks",
+        "companies/lakehouseco.md",
+        "LakehouseCo",
         entity_mentions=default_mentions,
     )
 
@@ -272,14 +272,14 @@ def test_fact_upsert_admits_concepts_only_when_configured(tmp_path: Path) -> Non
         encoding="utf-8",
     )
     concept_mentions = [
-        {**default_mentions[0], "surface": "Hightouch"},
+        {**default_mentions[0], "surface": "DataBridge"},
         default_mentions[1],
     ]
     apply_fact(
         svc.paths,
         "fact_concept_enabled",
-        "companies/hightouch.md",
-        "Hightouch",
+        "companies/databridge.md",
+        "DataBridge",
         entity_mentions=concept_mentions,
     )
 
@@ -297,13 +297,13 @@ def test_fact_upsert_admits_concepts_only_when_configured(tmp_path: Path) -> Non
             """
         ).fetchall()
 
-    assert [row["mention_text"] for row in default_links] == ["Databricks"]
-    assert {row["mention_text"] for row in enabled_links} == {"Hightouch", "Lineage"}
+    assert [row["mention_text"] for row in default_links] == ["LakehouseCo"]
+    assert {row["mention_text"] for row in enabled_links} == {"DataBridge", "Lineage"}
     assert {
         (row["mention_text"], row["mention_kind"], row["entity_type"])
         for row in enabled_links
     } == {
-        ("Hightouch", "named", "organization"),
+        ("DataBridge", "named", "organization"),
         ("Lineage", "concept", "concept"),
     }
 
@@ -357,12 +357,12 @@ def test_entity_merge_repoints_links_denorm_and_aliases(tmp_path: Path) -> None:
     svc.init_workspace()
     apply_fact(
         svc.paths,
-        "fact_hightouch",
-        "companies/hightouch.md",
-        "Hightouch",
+        "fact_databridge",
+        "companies/databridge.md",
+        "DataBridge",
         entity_mentions=[
             {
-                "surface": "Hightouch",
+                "surface": "DataBridge",
                 "entity_type": "organization",
                 "mention_kind": "named",
                 "is_primary": True,
@@ -384,7 +384,7 @@ def test_entity_merge_repoints_links_denorm_and_aliases(tmp_path: Path) -> None:
         ],
     )
     with connection(svc.paths.sqlite_path) as conn:
-        canonical_id = entity_id_by_name(conn, "Hightouch")
+        canonical_id = entity_id_by_name(conn, "DataBridge")
         source_id = entity_id_by_name(conn, "High Touch")
 
     action = apply_action(
@@ -432,6 +432,32 @@ def test_entity_merge_repoints_links_denorm_and_aliases(tmp_path: Path) -> None:
     assert "restore_entities" in action["inverse_action_json"]
     assert action["target_fact_ids"] == ["fact_high_touch"]
 
+    stale_retry = apply_action(
+        svc.paths,
+        propose_action(
+            svc.paths,
+            "entity_merge",
+            action_payload={
+                "canonical_entity_id": canonical_id,
+                "merged_entity_ids": [source_id],
+            },
+            action_features={
+                "candidate_key": f"entity_merge:entities:{source_id},{canonical_id}",
+                "affected_fact_count": 1,
+                "merged_entity_count": 1,
+            },
+            risk_tier="medium",
+        )["id"],
+    )
+
+    assert stale_retry["status"] == "applied"
+    assert stale_retry["inverse_action_json"]["noop"] is True
+    assert stale_retry["inverse_action_json"]["already_applied"] == {
+        "canonical_entity_id": canonical_id,
+        "merged_entity_ids": [source_id],
+    }
+    revert_action(svc.paths, stale_retry["id"])
+
     revert_action(svc.paths, action["id"])
 
     with connection(svc.paths.sqlite_path) as conn:
@@ -461,12 +487,12 @@ def test_entity_split_restores_prior_links_and_entity_status(tmp_path: Path) -> 
     svc.init_workspace()
     apply_fact(
         svc.paths,
-        "fact_hightouch",
-        "companies/hightouch.md",
-        "Hightouch",
+        "fact_databridge",
+        "companies/databridge.md",
+        "DataBridge",
         entity_mentions=[
             {
-                "surface": "Hightouch",
+                "surface": "DataBridge",
                 "entity_type": "organization",
                 "mention_kind": "named",
                 "is_primary": True,
@@ -488,7 +514,7 @@ def test_entity_split_restores_prior_links_and_entity_status(tmp_path: Path) -> 
         ],
     )
     with connection(svc.paths.sqlite_path) as conn:
-        canonical_id = entity_id_by_name(conn, "Hightouch")
+        canonical_id = entity_id_by_name(conn, "DataBridge")
         source_id = entity_id_by_name(conn, "High Touch")
     merged = apply_action(
         svc.paths,

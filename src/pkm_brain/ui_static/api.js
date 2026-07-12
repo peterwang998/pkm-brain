@@ -1,5 +1,5 @@
 /**
- * Brain UI v2 — API client. Contract per docs/brain-ui-v2-spec.md §5.
+ * Brain UI fallback API client. Contract: docs/specs/app-and-operations.md.
  */
 export class ApiError extends Error {
   constructor(status, message, payload = null) {

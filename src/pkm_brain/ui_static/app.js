@@ -13,6 +13,7 @@ let currentUnmount = null;
 let chord = "";
 let lastUndo = null;
 let paletteCache = null;
+let latestQueueSummary = null;
 
 const ctx = {
   api,
@@ -24,6 +25,7 @@ const ctx = {
   setLastUndo: handle => {
     lastUndo = handle;
   },
+  acceptQueueSummary,
 };
 
 window.addEventListener("hashchange", route);
@@ -68,15 +70,34 @@ function setActiveRail(view) {
 }
 
 async function refreshQueueBadge() {
-  const badge = document.getElementById("queue-count");
   try {
     const data = await api("/api/digest");
-    const count = Number(data.queue_counts?.total || 0);
-    badge.hidden = count === 0;
-    badge.textContent = count > 99 ? "99+" : String(count);
+    acceptQueueSummary(data.queue_summary || {
+      as_of: data.generated_at || "",
+      active_total: Number(data.queue_counts?.total || 0),
+      actionable_total: Number(data.queue_counts?.total || 0),
+      blocked_total: 0,
+      deferred_total: 0,
+      by_kind: data.queue_counts?.by_kind || {},
+      raw: data.queue_counts?.raw || {},
+    });
   } catch (_error) {
-    badge.hidden = true;
+    if (!latestQueueSummary) document.getElementById("queue-count").hidden = true;
   }
+}
+
+function acceptQueueSummary(summary) {
+  if (!summary?.as_of) return false;
+  if (latestQueueSummary && latestQueueSummary.as_of > summary.as_of) return false;
+  latestQueueSummary = summary;
+  const count = Number(summary.actionable_total || 0);
+  const badge = document.getElementById("queue-count");
+  badge.hidden = count === 0;
+  badge.textContent = count > 999 ? "999+" : String(count);
+  badge.title = summary.blocked_total
+    ? `${count} actionable; ${summary.blocked_total} blocked`
+    : `${count} actionable`;
+  return true;
 }
 
 function globalKeydown(event) {
@@ -141,7 +162,8 @@ async function undoLast() {
   const handle = lastUndo;
   lastUndo = null;
   try {
-    await api("/api/queue/undo", {method: "POST", body: {undo_handle: handle}});
+    const result = await api("/api/queue/undo", {method: "POST", body: {undo_handle: handle}});
+    acceptQueueSummary(result.queue_summary);
     toast("Undone.");
     route();
   } catch (error) {

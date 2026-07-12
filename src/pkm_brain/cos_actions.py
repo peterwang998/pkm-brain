@@ -27,18 +27,29 @@ from .llm import (
     load_cos_llm_config,
 )
 from .paths import BrainPaths
+from .source_evidence import evidence_units_for_text, resolve_evidence_unit_ids
 from .util import new_id, now_iso
 
 
 APPLIED_STATUSES = {"applied", "auto_applied"}
+OPEN_ACTION_STATUSES = {"proposed", "needs_human"}
 CRITIC_DISAGREEMENT_MODES = {"needs_human", "reject"}
+MAX_CRITIC_REPAIR_EVIDENCE_UNITS = 5
+CRITIC_CONTEXT_RADIUS = 4
 _COS_ROLE_PROVIDER_LOCK = Lock()
 CRITIC_SCHEMA = {
     "type": "object",
     "required": ["decision", "rationale"],
     "properties": {
-        "decision": {"type": "string"},
+        "decision": {
+            "type": "string",
+            "enum": ["agree", "evidence_incomplete", "disagree"],
+        },
         "rationale": {"type": "string"},
+        "repaired_evidence_unit_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
     },
 }
 ACTION_TYPE_SPECS: dict[str, dict[str, Any]] = {
@@ -171,14 +182,27 @@ def propose_action(
     if action_payload is not None:
         evidence_json["payload"] = action_payload
     features = dict(action_features or {})
+    if confidence is not None:
+        features.setdefault("confidence", float(confidence))
     features.setdefault("target_fact_ids", target_fact_ids or [])
     features.setdefault("target_page_paths", target_page_paths or [])
     features.setdefault("target_contract_ids", target_contract_ids or [])
-    resolved_risk_tier = classify_action_risk(action_type, features, explicit_risk_tier=risk_tier)
+    resolved_risk_tier = classify_action_risk(
+        action_type, features, explicit_risk_tier=risk_tier
+    )
     features.setdefault("risk_tier", resolved_risk_tier)
     created_at = now_iso()
+    candidate_key = str(features.get("candidate_key") or "").strip()
+    existing_action_id: str | None = None
     with connection(paths.sqlite_path) as conn:
-        if run_id:
+        existing = (
+            open_action_for_candidate_key(conn, action_type, candidate_key)
+            if candidate_key
+            else None
+        )
+        if existing is not None:
+            existing_action_id = str(existing["id"])
+        elif run_id:
             conn.execute(
                 """
                 INSERT OR IGNORE INTO wiki_curation_runs(
@@ -194,33 +218,133 @@ def propose_action(
                     created_at,
                 ),
             )
-        conn.execute(
-            """
-            INSERT INTO cos_actions(
-              id, run_id, action_type, status, target_fact_ids, target_page_paths,
-              target_contract_ids, action_features, proposed_by, confidence,
-              risk_tier, evidence_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                action_id,
-                run_id,
-                action_type,
-                "proposed",
-                dumps(target_fact_ids or []),
-                dumps(target_page_paths or []),
-                dumps(target_contract_ids or []),
-                dumps(features),
-                proposed_by,
-                confidence,
-                resolved_risk_tier,
-                dumps(evidence_json),
-                created_at,
-            ),
-        )
+        if existing_action_id is None:
+            conn.execute(
+                """
+                INSERT INTO cos_actions(
+                  id, run_id, action_type, status, target_fact_ids, target_page_paths,
+                  target_contract_ids, action_features, proposed_by, confidence,
+                  risk_tier, evidence_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    action_id,
+                    run_id,
+                    action_type,
+                    "proposed",
+                    dumps(target_fact_ids or []),
+                    dumps(target_page_paths or []),
+                    dumps(target_contract_ids or []),
+                    dumps(features),
+                    proposed_by,
+                    confidence,
+                    resolved_risk_tier,
+                    dumps(evidence_json),
+                    created_at,
+                ),
+            )
+    if existing_action_id is not None:
+        existing_action = get_action(paths, existing_action_id)
+        if decide and existing_action["status"] == "proposed":
+            return decide_action(paths, existing_action_id)
+        return existing_action
     if decide:
         return decide_action(paths, action_id)
     return get_action(paths, action_id)
+
+
+def open_action_for_candidate_key(
+    conn: Any, action_type: str, candidate_key: str
+) -> dict[str, Any] | None:
+    if not candidate_key:
+        return None
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM cos_actions
+        WHERE action_type = ?
+          AND status IN ('proposed', 'needs_human')
+        ORDER BY created_at, id
+        """,
+        (action_type,),
+    )
+    for row in rows:
+        action = row_to_action(row)
+        if action_candidate_key(action) == candidate_key:
+            return action
+    return None
+
+
+def action_candidate_key(action: dict[str, Any]) -> str:
+    features = action.get("action_features")
+    if isinstance(features, dict):
+        key = str(features.get("candidate_key") or "").strip()
+        if key:
+            return key
+    payload = action_payload(action)
+    if isinstance(payload, dict):
+        candidate = payload.get("candidate")
+        if isinstance(candidate, dict):
+            return str(candidate.get("candidate_key") or "").strip()
+        return str(payload.get("candidate_key") or "").strip()
+    return ""
+
+
+def retire_open_candidate_siblings(
+    conn: Any, action: dict[str, Any], *, reason: str
+) -> list[str]:
+    candidate_key = action_candidate_key(action)
+    if not candidate_key:
+        return []
+    sibling_ids: list[str] = []
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM cos_actions
+        WHERE action_type = ?
+          AND status IN ('proposed', 'needs_human')
+          AND id != ?
+        ORDER BY created_at, id
+        """,
+        (action["action_type"], action["id"]),
+    )
+    for row in rows:
+        sibling = row_to_action(row)
+        if action_candidate_key(sibling) != candidate_key:
+            continue
+        sibling_ids.append(str(sibling["id"]))
+        evidence = dict(sibling.get("evidence_json") or {})
+        evidence["candidate_superseded"] = {
+            "by_action_id": action["id"],
+            "candidate_key": candidate_key,
+            "reason": reason,
+            "at": now_iso(),
+        }
+        conn.execute(
+            "UPDATE cos_actions SET status = 'dismissed', evidence_json = ? WHERE id = ?",
+            (dumps(evidence), sibling["id"]),
+        )
+    if sibling_ids:
+        placeholders = ",".join("?" for _ in sibling_ids)
+        answer = dumps(
+            {
+                "decision": "obsolete",
+                "reason": reason,
+                "superseded_by_action_id": action["id"],
+                "candidate_key": candidate_key,
+            }
+        )
+        conn.execute(
+            f"""
+            UPDATE open_questions
+            SET status = 'dismissed', answer = ?, answered_at = ?,
+                decided_by = 'candidate_deduplication'
+            WHERE action_id IN ({placeholders})
+              AND status IN ('open', 'needs_human')
+            """,
+            [answer, now_iso(), *sibling_ids],
+        )
+    return sibling_ids
 
 
 def decide_action(
@@ -229,6 +353,7 @@ def decide_action(
     *,
     critic_by: str | None = None,
     critic_decision: str | None = None,
+    critic_rationale: str | None = None,
     critic_llm_provider: LLMProvider | None = None,
     critic_provider: str | None = None,
     critic_timeout_seconds: int | None = None,
@@ -252,9 +377,54 @@ def decide_action(
             provider=critic_provider,
             timeout_seconds=critic_timeout_seconds,
         )
+        if review["decision"] == "evidence_incomplete":
+            initial_review = dict(review)
+            repair = repair_fact_action_evidence(paths, action, review)
+            if repair["status"] == "repaired":
+                review = critic_review(
+                    paths,
+                    action,
+                    decision,
+                    llm_provider=critic_llm_provider,
+                    provider=critic_provider,
+                    timeout_seconds=critic_timeout_seconds,
+                )
+                if review["decision"] == "evidence_incomplete":
+                    review = {
+                        "critic_by": review["critic_by"],
+                        "decision": "disagree",
+                        "rationale": (
+                            "Citation remained incomplete after one bounded evidence repair: "
+                            f"{review.get('rationale') or ''}"
+                        )[:1000],
+                    }
+            else:
+                review = {
+                    "critic_by": initial_review["critic_by"],
+                    "decision": "disagree",
+                    "rationale": (
+                        "Critic identified incomplete evidence, but no valid bounded citation "
+                        f"repair was available: {repair.get('reason') or 'unknown reason'}"
+                    )[:1000],
+                }
+            action["evidence_json"] = evidence_with_critic_repair(
+                action,
+                initial_review=initial_review,
+                repair=repair,
+                final_review=review,
+            )
         critic_by = review["critic_by"]
         critic_decision = review["decision"]
         action["evidence_json"] = evidence_with_critic_review(action, review)
+    elif decision.critic_required and critic_decision is not None:
+        action["evidence_json"] = evidence_with_critic_review(
+            action,
+            {
+                "critic_by": critic_by or "critic:provided",
+                "decision": critic_decision,
+                "rationale": critic_rationale or "",
+            },
+        )
     with connection(paths.sqlite_path) as conn:
         conn.execute(
             """
@@ -277,23 +447,51 @@ def decide_action(
             ),
         )
     if decision.autonomy_level == "L0":
-        return apply_action(paths, action_id, applied_status="auto_applied")
+        return apply_decided_action(
+            paths, action_id, applied_status="auto_applied", action=action
+        )
     if decision.autonomy_level == "L1":
         if decision.critic_required and critic_decision != "agree":
             handle_critic_disagreement(
                 paths, action_id, decision, critic_disagreement_mode
             )
             return get_action(paths, action_id)
-        return apply_action(paths, action_id, applied_status="auto_applied")
+        return apply_decided_action(
+            paths, action_id, applied_status="auto_applied", action=action
+        )
     if decision.autonomy_level == "L2":
         if decision.critic_required and critic_decision != "agree":
             handle_critic_disagreement(
                 paths, action_id, decision, critic_disagreement_mode
             )
             return get_action(paths, action_id)
-        return apply_action(paths, action_id, applied_status="applied")
-    mark_needs_human(paths, action_id, decision, decision.reason or "requires human decision")
+        return apply_decided_action(
+            paths, action_id, applied_status="applied", action=action
+        )
+    mark_needs_human(
+        paths, action_id, decision, decision.reason or "requires human decision"
+    )
     return get_action(paths, action_id)
+
+
+def apply_decided_action(
+    paths: BrainPaths,
+    action_id: str,
+    *,
+    applied_status: str,
+    action: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        return apply_action(paths, action_id, applied_status=applied_status)
+    except LLMProviderError:
+        if action.get("action_type") != "fact_upsert":
+            raise
+        return apply_action(
+            paths,
+            action_id,
+            applied_status=applied_status,
+            allow_llm_entity_resolution=False,
+        )
 
 
 def critic_review(
@@ -304,8 +502,10 @@ def critic_review(
     llm_provider: LLMProvider | None = None,
     provider: str | None = None,
     timeout_seconds: int | None = None,
-) -> dict[str, str]:
-    if not cos_role_provider_configured(paths, "critic", llm_provider=llm_provider, provider=provider):
+) -> dict[str, Any]:
+    if not cos_role_provider_configured(
+        paths, "critic", llm_provider=llm_provider, provider=provider
+    ):
         return {
             "critic_by": "critic:unconfigured",
             "decision": "unavailable",
@@ -323,11 +523,19 @@ def critic_review(
             "rationale": "No CoS LLM provider configured for critic role",
         }
     previous_timeout = getattr(active_provider, "timeout", None)
-    if timeout_seconds is not None and timeout_seconds > 0 and hasattr(active_provider, "timeout"):
+    if (
+        timeout_seconds is not None
+        and timeout_seconds > 0
+        and hasattr(active_provider, "timeout")
+    ):
         setattr(active_provider, "timeout", int(timeout_seconds))
     try:
         parsed = complete_json(
-            critic_prompt(action, decision),
+            critic_prompt(
+                action,
+                decision,
+                source_context=critic_fact_source_context(paths, action),
+            ),
             schema=CRITIC_SCHEMA,
             role="critic",
             provider=provider,
@@ -343,14 +551,25 @@ def critic_review(
     finally:
         if previous_timeout is not None and hasattr(active_provider, "timeout"):
             setattr(active_provider, "timeout", previous_timeout)
-    return {
+    review: dict[str, Any] = {
         "critic_by": critic_provider_label(active_provider),
         "decision": normalize_critic_decision(parsed.get("decision")),
         "rationale": str(parsed.get("rationale") or "")[:1000],
     }
+    repair_unit_ids = stable_critic_repair_unit_ids(
+        parsed.get("repaired_evidence_unit_ids")
+    )
+    if repair_unit_ids:
+        review["repaired_evidence_unit_ids"] = repair_unit_ids
+    return review
 
 
-def critic_prompt(action: dict[str, Any], decision: PolicyDecision) -> str:
+def critic_prompt(
+    action: dict[str, Any],
+    decision: PolicyDecision,
+    *,
+    source_context: dict[str, Any] | None = None,
+) -> str:
     action_card = {
         "id": action.get("id"),
         "action_type": action.get("action_type"),
@@ -371,16 +590,23 @@ def critic_prompt(action: dict[str, Any], decision: PolicyDecision) -> str:
         "autonomy_level": decision.autonomy_level,
         "reason": decision.reason,
     }
+    source_context_card = source_context or {"available": False}
     return (
         "Review this Chief-of-Staff action before autonomous application. "
         "For fact_upsert actions, answer only the narrow support question: is the proposed statement "
         "directly entailed by the cited evidence in the payload, with negation, uncertainty, entity, "
-        "quantity, and attribution preserved? Return decision 'agree' when the statement is directly "
-        "supported, even if the fact is mundane or you would not have written it yourself. Return "
-        "'disagree' only when the statement is unsupported, over-broad, misattributed, contradicts "
-        "the cited evidence, or lacks enough evidence to verify. For non-fact actions, require the "
+        "quantity, and attribution preserved? Return decision 'agree' when the currently cited evidence "
+        "directly supports the statement, even if the fact is mundane or you would not have written it "
+        "yourself. Return 'evidence_incomplete' only when the statement is directly supported by the "
+        "repairable context units from the same chunk but the current citation omitted necessary units; "
+        "then return up to 5 repaired_evidence_unit_ids using only ids in repairable_units. You may return "
+        "only omitted units; deterministic repair unions them with the current citation. Return 'disagree' "
+        "when the statement remains unsupported, over-broad, misattributed, or contradictory after "
+        "considering context. Document titles and participant lists are context, not proof of a substantive "
+        "claim. Speaker identity context may establish attribution but cannot establish the claim itself. "
+        "For non-fact actions, require the "
         "payload, targets, policy, and risk features to support safe application. Do not rewrite the action.\n\n"
-        f"Action:\n{action_card}\n\nPolicy:\n{policy_card}"
+        f"Action:\n{action_card}\n\nSource context:\n{source_context_card}\n\nPolicy:\n{policy_card}"
     )
 
 
@@ -388,9 +614,329 @@ def normalize_critic_decision(value: Any) -> str:
     decision = str(value or "").strip().lower()
     if decision in {"agree", "approve", "approved", "pass", "passed", "ok", "safe"}:
         return "agree"
-    if decision in {"disagree", "reject", "rejected", "block", "blocked", "fail", "failed", "unsafe"}:
+    if decision in {
+        "disagree",
+        "reject",
+        "rejected",
+        "block",
+        "blocked",
+        "fail",
+        "failed",
+        "unsafe",
+    }:
         return "disagree"
+    if decision in {
+        "evidence_incomplete",
+        "incomplete_evidence",
+        "citation_incomplete",
+        "repair_evidence",
+    }:
+        return "evidence_incomplete"
     return "unavailable"
+
+
+def stable_critic_repair_unit_ids(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    output: list[str] = []
+    for item in value:
+        unit_id = str(item or "").strip()
+        if not unit_id or unit_id in output:
+            continue
+        output.append(unit_id)
+        if len(output) >= MAX_CRITIC_REPAIR_EVIDENCE_UNITS:
+            break
+    return output
+
+
+def stable_unique_strings(values: list[Any]) -> list[str]:
+    output: list[str] = []
+    for item in values:
+        value = str(item or "").strip()
+        if value and value not in output:
+            output.append(value)
+    return output
+
+
+def critic_fact_source_context(
+    paths: BrainPaths, action: dict[str, Any]
+) -> dict[str, Any] | None:
+    if action.get("action_type") != "fact_upsert":
+        return None
+    payload = action_payload(action)
+    fact = payload.get("fact") if isinstance(payload.get("fact"), dict) else None
+    if fact is None:
+        return {"available": False, "reason": "fact payload missing"}
+    chunk_id = critic_fact_chunk_id(fact)
+    if not chunk_id:
+        return {"available": False, "reason": "fact evidence chunk missing"}
+    with connection(paths.sqlite_path) as conn:
+        row = conn.execute(
+            """
+            SELECT c.id AS chunk_id, c.document_id, c.chunk_index, c.text,
+                   d.title, d.source_type
+            FROM chunks c
+            JOIN documents d ON d.id = c.document_id
+            WHERE c.id = ?
+            """,
+            (chunk_id,),
+        ).fetchone()
+        if row is None:
+            return {"available": False, "reason": "evidence chunk not found"}
+        document_chunks = list(
+            conn.execute(
+                """
+                SELECT id, chunk_index, text
+                FROM chunks
+                WHERE document_id = ?
+                ORDER BY chunk_index
+                """,
+                (row["document_id"],),
+            )
+        )
+    units = evidence_units_for_text(str(row["text"] or ""))
+    units_by_id = {str(unit["unit_id"]): unit for unit in units}
+    cited_unit_ids = critic_fact_evidence_unit_ids(fact)
+    cited_units = [
+        units_by_id[unit_id]
+        for unit_id in cited_unit_ids
+        if unit_id in units_by_id
+    ]
+    cited_indexes = [int(unit["unit_index"]) for unit in cited_units]
+    if cited_indexes:
+        context_start = max(0, min(cited_indexes) - CRITIC_CONTEXT_RADIUS)
+        context_end = min(len(units), max(cited_indexes) + CRITIC_CONTEXT_RADIUS + 1)
+    else:
+        context_start = 0
+        context_end = min(len(units), CRITIC_CONTEXT_RADIUS * 2 + 1)
+    repairable_units = [
+        critic_unit_card(unit, cited_unit_ids=cited_unit_ids)
+        for unit in units[context_start:context_end]
+    ]
+    relevant_speakers = {
+        str(unit.get("speaker") or "") for unit in cited_units if unit.get("speaker")
+    }
+    return {
+        "available": True,
+        "document": {
+            "document_id": str(row["document_id"]),
+            "title": str(row["title"] or ""),
+            "source_type": str(row["source_type"] or ""),
+        },
+        "repairable_chunk_id": chunk_id,
+        "currently_cited_unit_ids": cited_unit_ids,
+        "repairable_units": repairable_units,
+        "speaker_identity_context": critic_speaker_identity_context(
+            document_chunks, relevant_speakers
+        ),
+        "known_participants": critic_known_participants(document_chunks),
+    }
+
+
+def critic_fact_chunk_id(fact: dict[str, Any]) -> str:
+    metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
+    evidence_units = metadata.get("evidence_units")
+    if isinstance(evidence_units, list):
+        for unit in evidence_units:
+            if isinstance(unit, dict) and str(unit.get("chunk_id") or "").strip():
+                return str(unit["chunk_id"]).strip()
+    spans = fact.get("source_spans")
+    if isinstance(spans, list):
+        for span in spans:
+            if isinstance(span, dict) and str(span.get("chunk_id") or "").strip():
+                return str(span["chunk_id"]).strip()
+    return ""
+
+
+def critic_fact_evidence_unit_ids(fact: dict[str, Any]) -> list[str]:
+    direct = fact.get("evidence_unit_ids")
+    if isinstance(direct, list):
+        unit_ids = stable_critic_repair_unit_ids(direct)
+        if unit_ids:
+            return unit_ids
+    metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
+    evidence_units = metadata.get("evidence_units")
+    if not isinstance(evidence_units, list):
+        return []
+    return stable_critic_repair_unit_ids(
+        [
+            unit.get("unit_id")
+            for unit in evidence_units
+            if isinstance(unit, dict)
+        ]
+    )
+
+
+def critic_unit_card(
+    unit: dict[str, Any], *, cited_unit_ids: list[str]
+) -> dict[str, Any]:
+    return {
+        "unit_id": str(unit["unit_id"]),
+        "text": str(unit["text"]),
+        "cited": str(unit["unit_id"]) in cited_unit_ids,
+        **({"speaker": str(unit["speaker"])} if unit.get("speaker") else {}),
+    }
+
+
+def critic_speaker_identity_context(
+    chunks: list[Any], relevant_speakers: set[str]
+) -> list[dict[str, Any]]:
+    if not relevant_speakers:
+        return []
+    output: list[dict[str, Any]] = []
+    per_speaker_count: dict[str, int] = {}
+    identity_re = re.compile(
+        r"\b(?:i(?:'|\N{RIGHT SINGLE QUOTATION MARK})m|i am|this is|my name is)\b",
+        re.IGNORECASE,
+    )
+    for chunk in chunks:
+        for unit in evidence_units_for_text(str(chunk["text"] or "")):
+            speaker = str(unit.get("speaker") or "")
+            if speaker not in relevant_speakers:
+                continue
+            seen_count = per_speaker_count.get(speaker, 0)
+            is_identity_unit = bool(identity_re.search(str(unit["text"])))
+            if seen_count >= 2 and not is_identity_unit:
+                continue
+            output.append(
+                {
+                    "chunk_id": str(chunk["id"]),
+                    "unit_id": str(unit["unit_id"]),
+                    "speaker": speaker,
+                    "text": str(unit["text"]),
+                }
+            )
+            per_speaker_count[speaker] = seen_count + 1
+            if len(output) >= 8:
+                return output
+    return output
+
+
+def critic_known_participants(chunks: list[Any]) -> list[str]:
+    output: list[str] = []
+    in_participants = False
+    for chunk in chunks:
+        for raw_line in str(chunk["text"] or "").splitlines():
+            line = raw_line.strip()
+            if line.casefold() == "## known participants":
+                in_participants = True
+                continue
+            if in_participants and line.startswith("## "):
+                in_participants = False
+            if in_participants and line.startswith("- "):
+                participant = line[2:].strip()
+                if participant and participant not in output:
+                    output.append(participant)
+            if len(output) >= 12:
+                return output
+    return output
+
+
+def repair_fact_action_evidence(
+    paths: BrainPaths,
+    action: dict[str, Any],
+    review: dict[str, Any],
+) -> dict[str, Any]:
+    if action.get("action_type") != "fact_upsert":
+        return {"status": "not_repaired", "reason": "action is not fact_upsert"}
+    requested_unit_ids = stable_critic_repair_unit_ids(
+        review.get("repaired_evidence_unit_ids")
+    )
+    if not requested_unit_ids:
+        return {
+            "status": "not_repaired",
+            "reason": "critic did not return repaired evidence unit ids",
+        }
+    context = critic_fact_source_context(paths, action)
+    if not context or not context.get("available"):
+        return {
+            "status": "not_repaired",
+            "reason": str((context or {}).get("reason") or "source context unavailable"),
+        }
+    original_unit_ids = critic_fact_evidence_unit_ids(
+        (action_payload(action).get("fact") or {})
+    )
+    repaired_unit_ids = stable_critic_repair_unit_ids(
+        [*original_unit_ids, *requested_unit_ids]
+    )
+    repairable_ids = {
+        str(unit.get("unit_id") or "")
+        for unit in context.get("repairable_units") or []
+        if isinstance(unit, dict)
+    }
+    invalid_ids = [unit_id for unit_id in repaired_unit_ids if unit_id not in repairable_ids]
+    if invalid_ids:
+        return {
+            "status": "not_repaired",
+            "reason": "critic selected units outside the bounded repair context",
+            "invalid_unit_ids": invalid_ids,
+        }
+    chunk_id = str(context["repairable_chunk_id"])
+    rebuilt = rebuild_fact_action_evidence(
+        paths,
+        action,
+        chunk_id=chunk_id,
+        unit_ids=repaired_unit_ids,
+    )
+    if rebuilt["status"] != "repaired":
+        return rebuilt
+    return {
+        **rebuilt,
+        "original_evidence_unit_ids": original_unit_ids,
+        "requested_evidence_unit_ids": requested_unit_ids,
+    }
+
+
+def rebuild_fact_action_evidence(
+    paths: BrainPaths,
+    action: dict[str, Any],
+    *,
+    chunk_id: str,
+    unit_ids: list[str],
+) -> dict[str, Any]:
+    repaired_unit_ids = stable_critic_repair_unit_ids(unit_ids)
+    if not repaired_unit_ids:
+        return {"status": "not_repaired", "reason": "no evidence units provided"}
+    with connection(paths.sqlite_path) as conn:
+        row = conn.execute("SELECT text FROM chunks WHERE id = ?", (chunk_id,)).fetchone()
+    if row is None:
+        return {"status": "not_repaired", "reason": "repair chunk no longer exists"}
+    resolved = resolve_evidence_unit_ids(
+        str(row["text"] or ""),
+        chunk_id=chunk_id,
+        unit_ids=repaired_unit_ids,
+    )
+    if resolved["missing_unit_ids"] or not resolved["source_spans"]:
+        return {
+            "status": "not_repaired",
+            "reason": "repaired unit ids did not resolve to exact source spans",
+        }
+    evidence = dict(action.get("evidence_json") or {})
+    payload = dict(evidence.get("payload") or {})
+    fact = dict(payload.get("fact") or {})
+    metadata = dict(fact.get("metadata") or {})
+    fact["source_ids"] = stable_unique_strings(
+        [*(fact.get("source_ids") or []), *resolved["source_ids"]]
+    )
+    fact["source_spans"] = [
+        span
+        for span in fact.get("source_spans") or []
+        if not isinstance(span, dict) or str(span.get("chunk_id") or "") != chunk_id
+    ] + resolved["source_spans"]
+    fact["evidence_quote"] = "\n...\n".join(resolved["quotes"])[:1000]
+    fact["evidence_unit_ids"] = repaired_unit_ids
+    metadata["evidence_units"] = resolved["evidence_units"]
+    metadata["critic_evidence_repaired"] = True
+    fact["metadata"] = metadata
+    payload["fact"] = fact
+    evidence["payload"] = payload
+    action["evidence_json"] = evidence
+    return {
+        "status": "repaired",
+        "chunk_id": chunk_id,
+        "repaired_evidence_unit_ids": repaired_unit_ids,
+        "repaired_source_spans": resolved["source_spans"],
+    }
 
 
 def critic_provider_label(provider: LLMProvider | None) -> str:
@@ -403,13 +949,29 @@ def critic_provider_label(provider: LLMProvider | None) -> str:
 
 
 def evidence_with_critic_review(
-    action: dict[str, Any], review: dict[str, str]
+    action: dict[str, Any], review: dict[str, Any]
 ) -> dict[str, Any]:
     evidence = dict(action.get("evidence_json") or {})
     evidence["critic_review"] = {
         "critic_by": review.get("critic_by"),
         "decision": review.get("decision"),
         "rationale": review.get("rationale") or "",
+    }
+    return evidence
+
+
+def evidence_with_critic_repair(
+    action: dict[str, Any],
+    *,
+    initial_review: dict[str, Any],
+    repair: dict[str, Any],
+    final_review: dict[str, Any],
+) -> dict[str, Any]:
+    evidence = dict(action.get("evidence_json") or {})
+    evidence["critic_evidence_repair"] = {
+        "initial_review": initial_review,
+        "repair": repair,
+        "final_review": final_review,
     }
     return evidence
 
@@ -427,7 +989,11 @@ def handle_critic_disagreement(
 
 
 def apply_action(
-    paths: BrainPaths, action_id: str, *, applied_status: str = "applied"
+    paths: BrainPaths,
+    action_id: str,
+    *,
+    applied_status: str = "applied",
+    allow_llm_entity_resolution: bool = True,
 ) -> dict[str, Any]:
     with connection(paths.sqlite_path) as conn:
         action = load_action(conn, action_id)
@@ -458,7 +1024,12 @@ def apply_action(
         target_page_paths = list(action.get("target_page_paths") or [])
 
         if action["action_type"] == "fact_upsert":
-            fact_id, inverse = apply_fact_upsert(conn, payload, paths=paths)
+            fact_id, inverse = apply_fact_upsert(
+                conn,
+                payload,
+                paths=paths,
+                allow_llm_entity_resolution=allow_llm_entity_resolution,
+            )
             target_fact_ids = stable_unique([*target_fact_ids, fact_id])
         elif action["action_type"] in {"fact_supersede", "resolve_conflict"}:
             fact_ids, inverse = apply_fact_updates(conn, payload)
@@ -485,7 +1056,9 @@ def apply_action(
             page_hint, inverse = apply_synthesize_page(conn, payload)
             target_page_paths = stable_unique([*target_page_paths, page_hint])
         elif action["action_type"] == "page_merge":
-            fact_ids, contract_ids, page_hints, inverse = apply_page_merge(conn, payload)
+            fact_ids, contract_ids, page_hints, inverse = apply_page_merge(
+                conn, payload
+            )
             target_fact_ids = stable_unique([*target_fact_ids, *fact_ids])
             target_contract_ids = stable_unique([*target_contract_ids, *contract_ids])
             target_page_paths = stable_unique([*target_page_paths, *page_hints])
@@ -494,11 +1067,17 @@ def apply_action(
             target_fact_ids = stable_unique([*target_fact_ids, *fact_ids])
             target_page_paths = stable_unique([*target_page_paths, *page_hints])
         elif action["action_type"] == "rename_page":
-            fact_ids, contract_ids, page_hints, inverse = apply_rename_page(conn, payload)
+            fact_ids, contract_ids, page_hints, inverse = apply_rename_page(
+                conn, payload
+            )
             target_fact_ids = stable_unique([*target_fact_ids, *fact_ids])
             target_contract_ids = stable_unique([*target_contract_ids, *contract_ids])
             target_page_paths = stable_unique([*target_page_paths, *page_hints])
-        elif action["action_type"] in {"canonicalize_page", "archive_page", "revert_page_snapshot"}:
+        elif action["action_type"] in {
+            "canonicalize_page",
+            "archive_page",
+            "revert_page_snapshot",
+        }:
             page_hint = str(payload.get("page_hint") or "")
             if page_hint:
                 target_page_paths = stable_unique([*target_page_paths, page_hint])
@@ -509,7 +1088,9 @@ def apply_action(
                 ("failed", action_id),
             )
             conn.commit()
-            raise ValueError(f"unsupported implemented action type: {action['action_type']}")
+            raise ValueError(
+                f"unsupported implemented action type: {action['action_type']}"
+            )
 
         state_hash = target_state_hash(
             conn,
@@ -535,6 +1116,11 @@ def apply_action(
                 now_iso(),
                 action_id,
             ),
+        )
+        retire_open_candidate_siblings(
+            conn,
+            action,
+            reason=f"candidate resolved by {applied_status} action",
         )
     return get_action(paths, action_id)
 
@@ -575,6 +1161,178 @@ def revert_action(paths: BrainPaths, action_id: str) -> dict[str, Any]:
     return get_action(paths, action_id)
 
 
+def audit_action_reviewability(conn: Any, action: dict[str, Any]) -> dict[str, Any]:
+    if str(action.get("audit_status") or "") != "sampled_bad":
+        return {
+            "reviewable": False,
+            "revertible": False,
+            "revert_mode": None,
+            "reason": "audit_not_flagged",
+        }
+    if str(action.get("status") or "") not in APPLIED_STATUSES:
+        return {
+            "reviewable": False,
+            "revertible": False,
+            "revert_mode": None,
+            "reason": "action_no_longer_applied",
+        }
+    inverse = action.get("inverse_action_json")
+    meaningful_inverse = isinstance(inverse, dict) and any(
+        key != "noop" and bool(value) for key, value in inverse.items()
+    )
+    expected = str(action.get("applied_state_hash") or "").strip()
+    if expected:
+        current = target_state_hash(
+            conn,
+            target_fact_ids=action.get("target_fact_ids") or [],
+            target_contract_ids=action.get("target_contract_ids") or [],
+            target_page_paths=action.get("target_page_paths") or [],
+        )
+        if current != expected:
+            fact_id = audited_active_fact_id(conn, action)
+            if fact_id:
+                return {
+                    "reviewable": True,
+                    "revertible": True,
+                    "revert_mode": "reject_current_fact",
+                    "fact_id": fact_id,
+                    "reason": "audited_fact_still_active_after_related_drift",
+                }
+            return {
+                "reviewable": False,
+                "revertible": False,
+                "revert_mode": None,
+                "reason": "applied_state_drifted",
+            }
+    result = {
+        "reviewable": True,
+        "revertible": meaningful_inverse,
+        "revert_mode": "action" if meaningful_inverse else None,
+        "reason": "current_applied_state",
+    }
+    fact_id = audited_active_fact_id(conn, action)
+    if fact_id:
+        result["fact_id"] = fact_id
+    return result
+
+
+def audited_active_fact_id(conn: Any, action: dict[str, Any]) -> str | None:
+    if str(action.get("action_type") or "") != "fact_upsert":
+        return None
+    payload = action_payload(action)
+    fact = payload.get("fact") if isinstance(payload, dict) else None
+    if not isinstance(fact, dict):
+        return None
+    statement = " ".join(str(fact.get("statement") or "").split())
+    fact_ids = [
+        str(fact_id)
+        for fact_id in [fact.get("id"), *(action.get("target_fact_ids") or [])]
+        if str(fact_id or "").strip()
+    ]
+    fact_ids = list(dict.fromkeys(fact_ids))
+    if not fact_ids or not statement:
+        return None
+    placeholders = ",".join("?" for _ in fact_ids)
+    for current in conn.execute(
+        f"SELECT id, statement, status FROM facts WHERE id IN ({placeholders})",
+        fact_ids,
+    ):
+        if (
+            str(current["status"] or "") in {"active", "contested"}
+            and " ".join(str(current["statement"] or "").split()) == statement
+        ):
+            return str(current["id"])
+    return None
+
+
+def reviewable_bad_audit_actions(conn: Any) -> list[dict[str, Any]]:
+    actions = [
+        row_to_action(row)
+        for row in conn.execute(
+            """
+            SELECT *
+            FROM cos_actions
+            WHERE audit_status = 'sampled_bad'
+            ORDER BY COALESCE(applied_at, created_at) DESC, id DESC
+            """
+        )
+    ]
+    return [
+        action
+        for action in actions
+        if audit_action_reviewability(conn, action)["reviewable"]
+    ]
+
+
+def repair_refused_fact_audit_revert(
+    paths: BrainPaths, action_id: str
+) -> dict[str, Any]:
+    timestamp = now_iso()
+    with connection(paths.sqlite_path) as conn:
+        action = load_action(conn, action_id)
+        if (
+            action.get("action_type") != "fact_upsert"
+            or action.get("status") != "failed"
+            or action.get("audit_status") != "sampled_bad"
+        ):
+            raise ValueError("action is not a failed sampled-bad fact revert")
+        fact_id = audited_active_fact_id(conn, action)
+        if not fact_id:
+            raise ValueError("audited fact is no longer active")
+        residue_rows = list(
+            conn.execute(
+                """
+                SELECT id
+                FROM open_questions
+                WHERE action_id = ?
+                  AND kind = 'revert_drift'
+                  AND status IN ('open', 'needs_human')
+                """,
+                (action_id,),
+            )
+        )
+        if not residue_rows:
+            raise ValueError("action has no active refused-revert residue")
+        evidence = dict(action.get("evidence_json") or {})
+        evidence["audit_queue_reconciliation"] = {
+            "version": "audit-queue-v1",
+            "outcome": "restored_applied_status_after_refused_revert",
+            "fact_id": fact_id,
+            "residue_question_ids": [str(row["id"]) for row in residue_rows],
+            "reconciled_at": timestamp,
+        }
+        conn.execute(
+            "UPDATE cos_actions SET status = 'applied', evidence_json = ? WHERE id = ?",
+            (dumps(evidence), action_id),
+        )
+        conn.execute(
+            """
+            UPDATE open_questions
+            SET status = 'auto_resolved', answer = ?, answered_at = ?,
+                decided_by = 'audit_queue_reconciliation_v1'
+            WHERE action_id = ?
+              AND kind = 'revert_drift'
+              AND status IN ('open', 'needs_human')
+            """,
+            (
+                dumps(
+                    {
+                        "decision": "restored_audit_review",
+                        "action_id": action_id,
+                        "fact_id": fact_id,
+                    }
+                ),
+                timestamp,
+                action_id,
+            ),
+        )
+    return {
+        "status": "repaired",
+        "action": get_action(paths, action_id),
+        "resolved_question_ids": [str(row["id"]) for row in residue_rows],
+    }
+
+
 def record_action_audit(
     paths: BrainPaths,
     action_id: str,
@@ -586,7 +1344,9 @@ def record_action_audit(
         action = load_action(conn, action_id)
         evidence = dict(action.get("evidence_json") or {})
         audits = list(evidence.get("audits") or [])
-        audits.append({"status": audit_status, "metadata": metadata or {}, "at": now_iso()})
+        audits.append(
+            {"status": audit_status, "metadata": metadata or {}, "at": now_iso()}
+        )
         evidence["audits"] = audits
         conn.execute(
             """
@@ -672,6 +1432,11 @@ def reject_action(
                 action_id,
             ),
         )
+        retire_open_candidate_siblings(
+            conn,
+            action,
+            reason="candidate rejected by policy",
+        )
     return get_action(paths, action_id)
 
 
@@ -680,6 +1445,7 @@ def apply_fact_upsert(
     payload: dict[str, Any],
     *,
     paths: BrainPaths | None = None,
+    allow_llm_entity_resolution: bool = True,
 ) -> tuple[str, dict[str, Any]]:
     from .wiki_facts import rebuild_fact_retrieval_index, row_to_fact
 
@@ -691,7 +1457,13 @@ def apply_fact_upsert(
         if existing
         else {"delete_fact_ids": [fact_id]}
     )
-    fact, entity_links = fact_with_entity_links(conn, fact, existing, paths=paths)
+    fact, entity_links = fact_with_entity_links(
+        conn,
+        fact,
+        existing,
+        paths=paths,
+        allow_llm_entity_resolution=allow_llm_entity_resolution,
+    )
     values = fact_values(fact, fact_id, existing)
     if existing:
         update_values = (*values[1:14], values[15], *values[16:], fact_id)
@@ -733,12 +1505,15 @@ def fact_with_entity_links(
     existing: Any | None,
     *,
     paths: BrainPaths | None = None,
+    allow_llm_entity_resolution: bool = True,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     existing_get = existing_value_getter(existing)
     mentions = fact_entity_mentions(fact)
     primary_mention = first_primary_entity_mention(mentions)
     admit_kinds = entity_admit_kinds(paths)
-    entity_id = str(fact.get("entity_id") or existing_get("entity_id", "") or "").strip()
+    entity_id = str(
+        fact.get("entity_id") or existing_get("entity_id", "") or ""
+    ).strip()
     links: list[dict[str, Any]] = []
     if entity_id and entity_exists(conn, entity_id):
         links.append(
@@ -760,12 +1535,16 @@ def fact_with_entity_links(
         primary_resolution = resolve_entity(
             conn,
             mention_text,
-            type_hint=primary_mention.get("entity_type") if primary_mention else fact.get("entity_type"),
+            type_hint=primary_mention.get("entity_type")
+            if primary_mention
+            else fact.get("entity_type"),
             source_ids=source_ids_from_fact(fact),
             create=True,
-            mention_kind=primary_mention.get("mention_kind") if primary_mention else "named",
+            mention_kind=primary_mention.get("mention_kind")
+            if primary_mention
+            else "named",
             admit_kinds=admit_kinds,
-            paths=paths,
+            paths=paths if allow_llm_entity_resolution else None,
             context=entity_resolution_context(fact),
         )
         if primary_resolution is not None:
@@ -789,12 +1568,14 @@ def fact_with_entity_links(
             create=True,
             mention_kind=mention.get("mention_kind"),
             admit_kinds=admit_kinds,
-            paths=paths,
+            paths=paths if allow_llm_entity_resolution else None,
             context=entity_resolution_context(fact),
         )
         if resolution is None:
             continue
-        links.append(entity_link_from_resolution(resolution, mention, fact, is_primary=False))
+        links.append(
+            entity_link_from_resolution(resolution, mention, fact, is_primary=False)
+        )
     if not entity_id and links:
         links[0]["is_primary"] = True
         entity_id = str(links[0]["entity_id"])
@@ -824,7 +1605,9 @@ def fact_entity_mentions(fact: dict[str, Any]) -> list[dict[str, Any]]:
             "is_primary": True,
             "mention_span": None,
             "mention_kind": "named",
-            "confidence": optional_float(fact.get("truth_confidence") or fact.get("confidence")),
+            "confidence": optional_float(
+                fact.get("truth_confidence") or fact.get("confidence")
+            ),
         }
     ]
 
@@ -847,7 +1630,9 @@ def normalize_fact_entity_mentions(raw_mentions: Any) -> list[dict[str, Any]]:
         if not surface:
             continue
         entity_type = normalize_entity_type(raw.get("entity_type") or raw.get("type"))
-        mention_kind = normalize_mention_kind(raw.get("mention_kind") or raw.get("kind"))
+        mention_kind = normalize_mention_kind(
+            raw.get("mention_kind") or raw.get("kind")
+        )
         is_primary = bool(raw.get("is_primary")) and not primary_seen
         if is_primary:
             primary_seen = True
@@ -856,7 +1641,9 @@ def normalize_fact_entity_mentions(raw_mentions: Any) -> list[dict[str, Any]]:
                 "surface": surface,
                 "entity_type": entity_type,
                 "is_primary": is_primary,
-                "mention_span": raw.get("mention_span") if isinstance(raw.get("mention_span"), dict) else None,
+                "mention_span": raw.get("mention_span")
+                if isinstance(raw.get("mention_span"), dict)
+                else None,
                 "mention_kind": mention_kind,
                 "confidence": optional_float(raw.get("confidence")),
             }
@@ -866,10 +1653,14 @@ def normalize_fact_entity_mentions(raw_mentions: Any) -> list[dict[str, Any]]:
     return mentions
 
 
-def first_primary_entity_mention(mentions: list[dict[str, Any]]) -> dict[str, Any] | None:
+def first_primary_entity_mention(
+    mentions: list[dict[str, Any]],
+) -> dict[str, Any] | None:
     if not mentions:
         return None
-    return next((mention for mention in mentions if mention.get("is_primary")), mentions[0])
+    return next(
+        (mention for mention in mentions if mention.get("is_primary")), mentions[0]
+    )
 
 
 def entity_link_from_existing(
@@ -882,7 +1673,9 @@ def entity_link_from_existing(
     return {
         "entity_id": entity_id,
         "is_primary": is_primary,
-        "mention_text": str((mention or {}).get("surface") or primary_entity_mention(fact) or ""),
+        "mention_text": str(
+            (mention or {}).get("surface") or primary_entity_mention(fact) or ""
+        ),
         "mention_span": (mention or {}).get("mention_span"),
         "mention_kind": (mention or {}).get("mention_kind"),
         "resolution_method": "exact",
@@ -953,10 +1746,15 @@ def source_ids_from_fact(fact: dict[str, Any]) -> list[str]:
 
 
 def entity_exists(conn: Any, entity_id: str) -> bool:
-    return conn.execute("SELECT 1 FROM entities WHERE id = ?", (entity_id,)).fetchone() is not None
+    return (
+        conn.execute("SELECT 1 FROM entities WHERE id = ?", (entity_id,)).fetchone()
+        is not None
+    )
 
 
-def fact_values(fact: dict[str, Any], fact_id: str, existing: Any | None) -> tuple[Any, ...]:
+def fact_values(
+    fact: dict[str, Any], fact_id: str, existing: Any | None
+) -> tuple[Any, ...]:
     timestamp = now_iso()
     existing_get = existing_value_getter(existing)
     confidence = float(fact.get("confidence", existing_get("confidence", 0.0)) or 0.0)
@@ -1045,7 +1843,9 @@ def apply_rehome_fact(conn: Any, payload: dict[str, Any]) -> tuple[str, dict[str
     )
 
 
-def apply_fact_updates(conn: Any, payload: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
+def apply_fact_updates(
+    conn: Any, payload: dict[str, Any]
+) -> tuple[list[str], dict[str, Any]]:
     from .wiki_facts import rebuild_fact_retrieval_index, row_to_fact
 
     updates = payload.get("updates") if isinstance(payload.get("updates"), list) else []
@@ -1074,12 +1874,20 @@ def apply_fact_updates(conn: Any, payload: dict[str, Any]) -> tuple[list[str], d
     return stable_unique(fact_ids), {"restore_facts": old_facts}
 
 
-def apply_fact_merge(conn: Any, payload: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
+def apply_fact_merge(
+    conn: Any, payload: dict[str, Any]
+) -> tuple[list[str], dict[str, Any]]:
     from .wiki_facts import rebuild_fact_retrieval_index, row_to_fact
 
-    keeper = payload.get("keeper_fact") if isinstance(payload.get("keeper_fact"), dict) else {}
+    keeper = (
+        payload.get("keeper_fact")
+        if isinstance(payload.get("keeper_fact"), dict)
+        else {}
+    )
     keeper_id = str(keeper.get("id") or "")
-    superseded_fact_ids = [str(item) for item in payload.get("superseded_fact_ids") or [] if item]
+    superseded_fact_ids = [
+        str(item) for item in payload.get("superseded_fact_ids") or [] if item
+    ]
     fact_ids = stable_unique([keeper_id, *superseded_fact_ids])
     if not keeper_id or not superseded_fact_ids:
         raise ValueError("fact_merge requires keeper_fact.id and superseded_fact_ids")
@@ -1089,7 +1897,9 @@ def apply_fact_merge(conn: Any, payload: dict[str, Any]) -> tuple[list[str], dic
         if not row:
             raise ValueError(f"fact not found: {fact_id}")
         old_facts.append(row_to_fact(row))
-    apply_fact_upsert(conn, {"fact": {**keeper, "status": keeper.get("status") or "active"}})
+    apply_fact_upsert(
+        conn, {"fact": {**keeper, "status": keeper.get("status") or "active"}}
+    )
     for fact_id in superseded_fact_ids:
         old = next(fact for fact in old_facts if fact["id"] == fact_id)
         apply_fact_upsert(
@@ -1127,7 +1937,9 @@ def apply_display_contested(
             raise ValueError(f"fact not found: {fact_id}")
         fact = row_to_fact(row)
         old_facts.append(fact)
-        facts.append({**fact, "status": "conflicted", "conflict_group_id": conflict_group_id})
+        facts.append(
+            {**fact, "status": "conflicted", "conflict_group_id": conflict_group_id}
+        )
         apply_fact_upsert(
             conn,
             {
@@ -1148,7 +1960,9 @@ def apply_display_contested(
     return fact_ids, inverse
 
 
-def apply_entity_merge(conn: Any, payload: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
+def apply_entity_merge(
+    conn: Any, payload: dict[str, Any]
+) -> tuple[list[str], dict[str, Any]]:
     from .wiki_facts import rebuild_fact_retrieval_index
 
     canonical_id = str(
@@ -1159,7 +1973,9 @@ def apply_entity_merge(conn: Any, payload: dict[str, Any]) -> tuple[list[str], d
     ).strip()
     source_ids = entity_merge_source_ids(payload, canonical_id)
     if not canonical_id or not source_ids:
-        raise ValueError("entity_merge requires canonical_entity_id and merged_entity_ids")
+        raise ValueError(
+            "entity_merge requires canonical_entity_id and merged_entity_ids"
+        )
     entity_ids = stable_unique([canonical_id, *source_ids])
     entity_rows = entity_rows_by_id(conn, entity_ids)
     missing = [entity_id for entity_id in entity_ids if entity_id not in entity_rows]
@@ -1167,9 +1983,31 @@ def apply_entity_merge(conn: Any, payload: dict[str, Any]) -> tuple[list[str], d
         raise ValueError(f"entity_merge entity not found: {', '.join(missing)}")
     canonical = entity_rows[canonical_id]
     require_active_entity(canonical, role="canonical")
+    pending_source_ids: list[str] = []
     for source_id in source_ids:
-        require_active_entity(entity_rows[source_id], role="merged")
-    guard_entity_merge_types(canonical, [entity_rows[source_id] for source_id in source_ids])
+        source = entity_rows[source_id]
+        source_status = str(source["status"] or "active")
+        if source_status == "active":
+            pending_source_ids.append(source_id)
+            continue
+        if (
+            source_status == "merged"
+            and str(source["merged_into"] or "") == canonical_id
+        ):
+            continue
+        require_active_entity(source, role="merged")
+    if not pending_source_ids:
+        return [], {
+            "noop": True,
+            "already_applied": {
+                "canonical_entity_id": canonical_id,
+                "merged_entity_ids": source_ids,
+            },
+        }
+    source_ids = pending_source_ids
+    guard_entity_merge_types(
+        canonical, [entity_rows[source_id] for source_id in source_ids]
+    )
 
     link_rows = fact_entity_rows_for_entity_ids(conn, source_ids)
     denorm_rows = fact_denorm_rows_for_entity_ids(conn, source_ids)
@@ -1183,7 +2021,8 @@ def apply_entity_merge(conn: Any, payload: dict[str, Any]) -> tuple[list[str], d
         "restore_entities": [dict(entity_rows[entity_id]) for entity_id in entity_ids],
         "restore_fact_entity_links": [dict(row) for row in link_rows],
         "restore_fact_entity_denorms": [
-            {"fact_id": str(row["id"]), "entity_id": row["entity_id"]} for row in denorm_rows
+            {"fact_id": str(row["id"]), "entity_id": row["entity_id"]}
+            for row in denorm_rows
         ],
     }
 
@@ -1225,7 +2064,9 @@ def apply_entity_merge(conn: Any, payload: dict[str, Any]) -> tuple[list[str], d
     return affected_fact_ids, inverse
 
 
-def apply_entity_split(conn: Any, payload: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
+def apply_entity_split(
+    conn: Any, payload: dict[str, Any]
+) -> tuple[list[str], dict[str, Any]]:
     restore_payload = entity_split_restore_payload(payload)
     if not entity_restore_payload_has_content(restore_payload):
         raise ValueError("entity_split requires merge_inverse or restore_* payload")
@@ -1244,7 +2085,11 @@ def entity_merge_source_ids(payload: dict[str, Any], canonical_id: str) -> list[
     if not isinstance(raw, list):
         raw = [raw]
     return stable_unique(
-        [str(item).strip() for item in raw if str(item or "").strip() and str(item).strip() != canonical_id]
+        [
+            str(item).strip()
+            for item in raw
+            if str(item or "").strip() and str(item).strip() != canonical_id
+        ]
     )
 
 
@@ -1351,21 +2196,33 @@ def fact_denorm_rows_for_fact_ids(conn: Any, fact_ids: list[str]) -> list[Any]:
     )
 
 
-def merged_canonical_entity_updates(canonical: Any, source_rows: list[Any]) -> dict[str, Any]:
-    aliases = [str(item) for item in loads(canonical["aliases"], []) if str(item or "").strip()]
+def merged_canonical_entity_updates(
+    canonical: Any, source_rows: list[Any]
+) -> dict[str, Any]:
+    aliases = [
+        str(item) for item in loads(canonical["aliases"], []) if str(item or "").strip()
+    ]
     alias_norms = {normalize_entity_name(alias) for alias in aliases}
     canonical_norm = normalize_entity_name(canonical["name"])
     for source in source_rows:
         for candidate in [source["name"], *loads(source["aliases"], [])]:
             text = str(candidate or "").strip()
             normalized = normalize_entity_name(text)
-            if not text or not normalized or normalized in {canonical_norm, *alias_norms}:
+            if (
+                not text
+                or not normalized
+                or normalized in {canonical_norm, *alias_norms}
+            ):
                 continue
             aliases.append(text)
             alias_norms.add(normalized)
     source_ids = stable_unique(
         [
-            *[str(item) for item in loads(canonical["source_ids"], []) if str(item or "").strip()],
+            *[
+                str(item)
+                for item in loads(canonical["source_ids"], [])
+                if str(item or "").strip()
+            ],
             *[
                 str(item)
                 for source in source_rows
@@ -1408,7 +2265,9 @@ def entity_restore_payload_has_content(payload: dict[str, Any]) -> bool:
     )
 
 
-def capture_entity_restore_state(conn: Any, restore_payload: dict[str, Any]) -> dict[str, Any]:
+def capture_entity_restore_state(
+    conn: Any, restore_payload: dict[str, Any]
+) -> dict[str, Any]:
     entity_ids = [
         str(row.get("id") or "")
         for row in restore_payload.get("restore_entities") or []
@@ -1425,8 +2284,12 @@ def capture_entity_restore_state(conn: Any, restore_payload: dict[str, Any]) -> 
         if isinstance(row, dict) and row.get("fact_id")
     ]
     return {
-        "restore_entities": [dict(row) for row in entity_rows_by_id(conn, entity_ids).values()],
-        "restore_fact_entity_links": [dict(row) for row in fact_entity_rows_for_link_ids(conn, link_ids)],
+        "restore_entities": [
+            dict(row) for row in entity_rows_by_id(conn, entity_ids).values()
+        ],
+        "restore_fact_entity_links": [
+            dict(row) for row in fact_entity_rows_for_link_ids(conn, link_ids)
+        ],
         "restore_fact_entity_denorms": [
             {"fact_id": str(row["id"]), "entity_id": row["entity_id"]}
             for row in fact_denorm_rows_for_fact_ids(conn, fact_ids)
@@ -1437,12 +2300,18 @@ def capture_entity_restore_state(conn: Any, restore_payload: dict[str, Any]) -> 
 def restore_entity_merge_inverse(conn: Any, inverse: dict[str, Any]) -> list[str]:
     from .wiki_facts import rebuild_fact_retrieval_index
 
-    entity_rows = [row for row in inverse.get("restore_entities") or [] if isinstance(row, dict)]
+    entity_rows = [
+        row for row in inverse.get("restore_entities") or [] if isinstance(row, dict)
+    ]
     link_rows = [
-        row for row in inverse.get("restore_fact_entity_links") or [] if isinstance(row, dict)
+        row
+        for row in inverse.get("restore_fact_entity_links") or []
+        if isinstance(row, dict)
     ]
     denorm_rows = [
-        row for row in inverse.get("restore_fact_entity_denorms") or [] if isinstance(row, dict)
+        row
+        for row in inverse.get("restore_fact_entity_denorms") or []
+        if isinstance(row, dict)
     ]
     for row in entity_rows:
         restore_entity_row(conn, row)
@@ -1472,7 +2341,9 @@ def restore_entity_row(conn: Any, row: dict[str, Any]) -> None:
     entity_id = str(row.get("id") or "")
     if not entity_id:
         return
-    existing = conn.execute("SELECT 1 FROM entities WHERE id = ?", (entity_id,)).fetchone()
+    existing = conn.execute(
+        "SELECT 1 FROM entities WHERE id = ?", (entity_id,)
+    ).fetchone()
     values = (
         row.get("name") or "Unknown Entity",
         normalize_entity_type(row.get("entity_type")),
@@ -1508,7 +2379,9 @@ def restore_fact_entity_link(conn: Any, row: dict[str, Any]) -> None:
     link_id = str(row.get("id") or "")
     if not link_id:
         return
-    existing = conn.execute("SELECT 1 FROM fact_entities WHERE id = ?", (link_id,)).fetchone()
+    existing = conn.execute(
+        "SELECT 1 FROM fact_entities WHERE id = ?", (link_id,)
+    ).fetchone()
     values = (
         row.get("fact_id"),
         row.get("entity_id"),
@@ -1543,8 +2416,14 @@ def restore_fact_entity_link(conn: Any, row: dict[str, Any]) -> None:
     )
 
 
-def apply_edit_contract(conn: Any, payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    contract = payload.get("contract") if isinstance(payload.get("contract"), dict) else payload
+def apply_edit_contract(
+    conn: Any, payload: dict[str, Any]
+) -> tuple[str, dict[str, Any]]:
+    contract = (
+        payload.get("contract")
+        if isinstance(payload.get("contract"), dict)
+        else payload
+    )
     contract_id = str(contract.get("id") or new_id("contract"))
     existing = conn.execute(
         "SELECT * FROM page_contracts WHERE id = ?", (contract_id,)
@@ -1558,13 +2437,29 @@ def apply_edit_contract(conn: Any, payload: dict[str, Any]) -> tuple[str, dict[s
     values = (
         contract_id,
         str(contract.get("page_hint") or (existing["page_hint"] if existing else "")),
-        contract.get("canonical_entity", existing["canonical_entity"] if existing else None),
+        contract.get(
+            "canonical_entity", existing["canonical_entity"] if existing else None
+        ),
         contract.get("page_scope", existing["page_scope"] if existing else None),
-        contract.get("retrieval_purpose", existing["retrieval_purpose"] if existing else None),
-        contract.get("what_belongs_here", existing["what_belongs_here"] if existing else None),
-        contract.get("what_does_not_belong_here", existing["what_does_not_belong_here"] if existing else None),
-        contract.get("freshness_policy", existing["freshness_policy"] if existing else None),
-        dumps(contract.get("related_pages", loads(existing["related_pages"], []) if existing else [])),
+        contract.get(
+            "retrieval_purpose", existing["retrieval_purpose"] if existing else None
+        ),
+        contract.get(
+            "what_belongs_here", existing["what_belongs_here"] if existing else None
+        ),
+        contract.get(
+            "what_does_not_belong_here",
+            existing["what_does_not_belong_here"] if existing else None,
+        ),
+        contract.get(
+            "freshness_policy", existing["freshness_policy"] if existing else None
+        ),
+        dumps(
+            contract.get(
+                "related_pages",
+                loads(existing["related_pages"], []) if existing else [],
+            )
+        ),
         int(contract.get("version", existing["version"] if existing else 1)),
         str(contract.get("status", existing["status"] if existing else "active")),
         existing["created_at"] if existing else timestamp,
@@ -1585,8 +2480,14 @@ def apply_edit_contract(conn: Any, payload: dict[str, Any]) -> tuple[str, dict[s
     return contract_id, inverse
 
 
-def apply_synthesize_page(conn: Any, payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    synthesis = payload.get("synthesis") if isinstance(payload.get("synthesis"), dict) else payload
+def apply_synthesize_page(
+    conn: Any, payload: dict[str, Any]
+) -> tuple[str, dict[str, Any]]:
+    synthesis = (
+        payload.get("synthesis")
+        if isinstance(payload.get("synthesis"), dict)
+        else payload
+    )
     synthesis_id = str(synthesis.get("id") or new_id("synthesis"))
     page_hint = str(synthesis.get("page_hint") or "")
     if not page_hint:
@@ -1617,17 +2518,23 @@ def apply_synthesize_page(conn: Any, payload: dict[str, Any]) -> tuple[str, dict
     return page_hint, {"delete_synthesis_ids": [synthesis_id]}
 
 
-def apply_page_merge(conn: Any, payload: dict[str, Any]) -> tuple[list[str], list[str], list[str], dict[str, Any]]:
+def apply_page_merge(
+    conn: Any, payload: dict[str, Any]
+) -> tuple[list[str], list[str], list[str], dict[str, Any]]:
     from .wiki_facts import rebuild_fact_retrieval_index
 
     topology = topology_payload(payload)
-    page_hints = stable_unique([str(item) for item in topology.get("page_hints") or [] if item])
+    page_hints = stable_unique(
+        [str(item) for item in topology.get("page_hints") or [] if item]
+    )
     destination = str(topology.get("destination_page_hint") or "")
     if not destination:
         destination = choose_merge_destination(conn, page_hints)
     source_pages = [page_hint for page_hint in page_hints if page_hint != destination]
     if not destination or not source_pages:
-        raise ValueError("page_merge requires at least one source page and one destination page")
+        raise ValueError(
+            "page_merge requires at least one source page and one destination page"
+        )
 
     old_facts = facts_for_page_hints(conn, source_pages)
     old_contracts = contracts_for_page_hints(conn, page_hints)
@@ -1643,7 +2550,13 @@ def apply_page_merge(conn: Any, payload: dict[str, Any]) -> tuple[list[str], lis
             """,
             (
                 destination,
-                dumps(topology_metadata(fact.get("metadata"), "page_merge", old_page_hint=fact.get("page_hint"))),
+                dumps(
+                    topology_metadata(
+                        fact.get("metadata"),
+                        "page_merge",
+                        old_page_hint=fact.get("page_hint"),
+                    )
+                ),
                 timestamp,
                 fact["id"],
             ),
@@ -1668,7 +2581,9 @@ def apply_page_merge(conn: Any, payload: dict[str, Any]) -> tuple[list[str], lis
     )
 
 
-def apply_page_split(conn: Any, payload: dict[str, Any]) -> tuple[list[str], list[str], dict[str, Any]]:
+def apply_page_split(
+    conn: Any, payload: dict[str, Any]
+) -> tuple[list[str], list[str], dict[str, Any]]:
     from .wiki_facts import rebuild_fact_retrieval_index
 
     topology = topology_payload(payload)
@@ -1684,7 +2599,8 @@ def apply_page_split(conn: Any, payload: dict[str, Any]) -> tuple[list[str], lis
     movable = [
         fact
         for fact in facts
-        if normalized_section(str(fact.get("section_hint") or "")) not in {"", "summary", "unsectioned"}
+        if normalized_section(str(fact.get("section_hint") or ""))
+        not in {"", "summary", "unsectioned"}
     ]
     if not movable:
         raise ValueError("page_split requires active non-summary facts to move")
@@ -1692,7 +2608,9 @@ def apply_page_split(conn: Any, payload: dict[str, Any]) -> tuple[list[str], lis
     moved_pages: list[str] = []
     timestamp = now_iso()
     for fact in movable:
-        destination = split_destination_page_hint(page_hint, str(fact.get("section_hint") or "section"))
+        destination = split_destination_page_hint(
+            page_hint, str(fact.get("section_hint") or "section")
+        )
         moved_pages.append(destination)
         conn.execute(
             """
@@ -1702,7 +2620,11 @@ def apply_page_split(conn: Any, payload: dict[str, Any]) -> tuple[list[str], lis
             """,
             (
                 destination,
-                dumps(topology_metadata(fact.get("metadata"), "page_split", old_page_hint=page_hint)),
+                dumps(
+                    topology_metadata(
+                        fact.get("metadata"), "page_split", old_page_hint=page_hint
+                    )
+                ),
                 timestamp,
                 fact["id"],
             ),
@@ -1721,12 +2643,24 @@ def apply_page_split(conn: Any, payload: dict[str, Any]) -> tuple[list[str], lis
     )
 
 
-def apply_rename_page(conn: Any, payload: dict[str, Any]) -> tuple[list[str], list[str], list[str], dict[str, Any]]:
+def apply_rename_page(
+    conn: Any, payload: dict[str, Any]
+) -> tuple[list[str], list[str], list[str], dict[str, Any]]:
     from .wiki_facts import rebuild_fact_retrieval_index
 
     topology = topology_payload(payload)
-    source = str(topology.get("from_page_hint") or topology.get("source_page_hint") or topology.get("old_page_hint") or "")
-    destination = str(topology.get("to_page_hint") or topology.get("destination_page_hint") or topology.get("new_page_hint") or "")
+    source = str(
+        topology.get("from_page_hint")
+        or topology.get("source_page_hint")
+        or topology.get("old_page_hint")
+        or ""
+    )
+    destination = str(
+        topology.get("to_page_hint")
+        or topology.get("destination_page_hint")
+        or topology.get("new_page_hint")
+        or ""
+    )
     if not source or not destination:
         raise ValueError("rename_page requires source and destination page hints")
     old_facts = facts_for_page_hints(conn, [source])
@@ -1747,11 +2681,24 @@ def apply_rename_page(conn: Any, payload: dict[str, Any]) -> tuple[list[str], li
         ),
     )
     for fact in old_facts:
-        merged_metadata = topology_metadata(fact.get("metadata"), "rename_page", old_page_hint=source)
-        conn.execute("UPDATE facts SET metadata = ? WHERE id = ?", (dumps(merged_metadata), fact["id"]))
-    conn.execute("UPDATE page_contracts SET page_hint = ?, updated_at = ? WHERE page_hint = ?", (destination, timestamp, source))
-    conn.execute("UPDATE wiki_page_syntheses SET page_hint = ?, stale = 1 WHERE page_hint = ?", (destination, source))
-    conn.execute("UPDATE wiki_page_syntheses SET stale = 1 WHERE page_hint = ?", (destination,))
+        merged_metadata = topology_metadata(
+            fact.get("metadata"), "rename_page", old_page_hint=source
+        )
+        conn.execute(
+            "UPDATE facts SET metadata = ? WHERE id = ?",
+            (dumps(merged_metadata), fact["id"]),
+        )
+    conn.execute(
+        "UPDATE page_contracts SET page_hint = ?, updated_at = ? WHERE page_hint = ?",
+        (destination, timestamp, source),
+    )
+    conn.execute(
+        "UPDATE wiki_page_syntheses SET page_hint = ?, stale = 1 WHERE page_hint = ?",
+        (destination, source),
+    )
+    conn.execute(
+        "UPDATE wiki_page_syntheses SET stale = 1 WHERE page_hint = ?", (destination,)
+    )
     conn.execute("UPDATE wiki_pages SET path = ? WHERE path = ?", (destination, source))
     rebuild_fact_retrieval_index(conn)
     return (
@@ -1768,7 +2715,9 @@ def apply_rename_page(conn: Any, payload: dict[str, Any]) -> tuple[list[str], li
 
 
 def topology_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    candidate = payload.get("candidate") if isinstance(payload.get("candidate"), dict) else None
+    candidate = (
+        payload.get("candidate") if isinstance(payload.get("candidate"), dict) else None
+    )
     return candidate or payload
 
 
@@ -1913,12 +2862,16 @@ def mark_syntheses_stale(conn: Any, page_hints: list[str]) -> None:
     )
 
 
-def topology_metadata(metadata: Any, operation: str, *, old_page_hint: Any) -> dict[str, Any]:
+def topology_metadata(
+    metadata: Any, operation: str, *, old_page_hint: Any
+) -> dict[str, Any]:
     base = loads(metadata, {}) if isinstance(metadata, str) else metadata
     if not isinstance(base, dict):
         base = {}
     history = list(base.get("topology_history") or [])
-    history.append({"operation": operation, "old_page_hint": old_page_hint, "at": now_iso()})
+    history.append(
+        {"operation": operation, "old_page_hint": old_page_hint, "at": now_iso()}
+    )
     return {**base, "topology_history": history}
 
 
@@ -2328,7 +3281,9 @@ def recent_actions(paths: BrainPaths, *, limit: int = 50) -> list[dict[str, Any]
 
 
 def load_action(conn: Any, action_id: str) -> dict[str, Any]:
-    row = conn.execute("SELECT * FROM cos_actions WHERE id = ?", (action_id,)).fetchone()
+    row = conn.execute(
+        "SELECT * FROM cos_actions WHERE id = ?", (action_id,)
+    ).fetchone()
     if not row:
         raise ValueError(f"cos action not found: {action_id}")
     return row_to_action(row)

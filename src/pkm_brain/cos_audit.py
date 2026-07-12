@@ -59,6 +59,7 @@ def run_sampled_audit(
             "sampled": len(actions),
             "audited": [],
             "bad_action_ids": [],
+            "unscoped_bad_action_ids": [],
             "missing_action_ids": [action["id"] for action in actions],
             "demoted_policy_version": None,
             "reverted": [],
@@ -109,8 +110,14 @@ def run_sampled_audit(
             bad_action_ids.append(action["id"])
     demoted_version = None
     demotion_evidence: list[dict[str, Any]] = []
+    unscoped_bad_action_ids: list[str] = []
     if bad_action_ids:
         with connection(paths.sqlite_path) as conn:
+            unscoped_bad_action_ids = [
+                str(action["id"])
+                for action in load_actions_for_audit_ids(conn, bad_action_ids)
+                if not action.get("policy_id") or action.get("policy_version") is None
+            ]
             demotion_evidence = demotion_threshold_breaches(conn, bad_action_ids)
             if demotion_evidence:
                 demoted_version = demote_policy_version(
@@ -119,6 +126,7 @@ def run_sampled_audit(
                         f"{len(bad_action_ids)} sampled actions were bad; "
                         f"{len(demotion_evidence)} policy group(s) exceeded demotion threshold"
                     ),
+                    policy_groups=demotion_evidence,
                 )
     reverted: list[dict[str, Any]] = []
     if auto_revert_bad:
@@ -131,6 +139,7 @@ def run_sampled_audit(
         "sampled": len(actions),
         "audited": audited,
         "bad_action_ids": bad_action_ids,
+        "unscoped_bad_action_ids": unscoped_bad_action_ids,
         "missing_action_ids": missing_action_ids,
         "demotion_evidence": demotion_evidence,
         "demoted_policy_version": demoted_version,
@@ -204,6 +213,7 @@ def demotion_threshold_breaches(conn: Any, bad_action_ids: list[str]) -> list[di
     policy_groups = {
         (action.get("policy_id"), action.get("policy_version"))
         for action in bad_actions
+        if action.get("policy_id") and action.get("policy_version") is not None
     }
     breaches: list[dict[str, Any]] = []
     for policy_id, policy_version in sorted(policy_groups, key=lambda item: str(item)):

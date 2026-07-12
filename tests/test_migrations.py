@@ -7,7 +7,7 @@ from pkm_brain.db import connection, init_db
 from pkm_brain.migrations import run_migrations
 
 
-EXPECTED_MIGRATIONS = list(range(1, 21))
+EXPECTED_MIGRATIONS = list(range(1, 22))
 
 
 def test_fresh_db_applies_registered_migrations(tmp_path: Path) -> None:
@@ -74,6 +74,8 @@ def test_fresh_db_applies_registered_migrations(tmp_path: Path) -> None:
 
     assert versions == EXPECTED_MIGRATIONS
     assert "relations" not in tables
+    assert "review_admissions" in tables
+    assert "review_admission_meta" in tables
     assert {
         "id",
         "source_type",

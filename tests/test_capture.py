@@ -16,9 +16,14 @@ from pkm_brain.automation import (
     run_nightly_maintenance,
     validate_nightly_launch_agent_plist,
 )
-from pkm_brain.capture import AgentLogCapture, redact_text
+from pkm_brain.capture import AgentLogCapture, redact_text, render_hyprnote_transcript
 from pkm_brain.db import connection
-from pkm_brain.llm import CODEX_DEFAULT_MODEL, DEFAULT_LLM_PROVIDER, provider_status
+from pkm_brain.llm import (
+    CODEX_DEFAULT_FALLBACK_MODELS,
+    CODEX_DEFAULT_MODEL,
+    DEFAULT_LLM_PROVIDER,
+    provider_status,
+)
 from pkm_brain.paths import BrainPaths
 from pkm_brain.service import BrainService
 from pkm_brain.sync_config import SecondaryConfig, SyncConfig, write_sync_config
@@ -35,8 +40,10 @@ def make_codex_fixture(tmp_path: Path) -> Path:
     state = tmp_path / "codex-state.sqlite"
     rollout = tmp_path / "rollout.jsonl"
     rollout.write_text(
-        json.dumps({"type": "user", "text": "Build ingestion automation"}) + "\n"
-        + json.dumps({"type": "assistant", "text": "Implemented capture adapters"}) + "\n",
+        json.dumps({"type": "user", "text": "Build ingestion automation"})
+        + "\n"
+        + json.dumps({"type": "assistant", "text": "Implemented capture adapters"})
+        + "\n",
         encoding="utf-8",
     )
     conn = sqlite3.connect(state)
@@ -56,7 +63,16 @@ def make_codex_fixture(tmp_path: Path) -> Path:
     )
     conn.execute(
         "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        ("codex-session-1", str(rollout), "/repo", "Codex Capture", "gpt-test", "high", 1, 2),
+        (
+            "codex-session-1",
+            str(rollout),
+            "/repo",
+            "Codex Capture",
+            "gpt-test",
+            "high",
+            1,
+            2,
+        ),
     )
     conn.commit()
     conn.close()
@@ -66,10 +82,12 @@ def make_codex_fixture(tmp_path: Path) -> Path:
 def make_codex_provider_fixture(tmp_path: Path) -> Path:
     state = tmp_path / "codex-provider-state.sqlite"
     rollout = tmp_path / "codex-provider-rollout.jsonl"
-    prompt = f"{CODEX_PROVIDER_PROMPT_PREFIX}\nReturn only valid JSON.\n\n{{\"task\": \"propose wiki changes\"}}"
+    prompt = f'{CODEX_PROVIDER_PROMPT_PREFIX}\nReturn only valid JSON.\n\n{{"task": "propose wiki changes"}}'
     rollout.write_text(
-        json.dumps({"type": "user", "text": prompt}) + "\n"
-        + json.dumps({"type": "assistant", "text": "{\"changes\": []}"}) + "\n",
+        json.dumps({"type": "user", "text": prompt})
+        + "\n"
+        + json.dumps({"type": "assistant", "text": '{"changes": []}'})
+        + "\n",
         encoding="utf-8",
     )
     conn = sqlite3.connect(state)
@@ -89,7 +107,16 @@ def make_codex_provider_fixture(tmp_path: Path) -> Path:
     )
     conn.execute(
         "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        ("codex-provider-session", str(rollout), "/repo", prompt, "gpt-test", "high", 1, 2),
+        (
+            "codex-provider-session",
+            str(rollout),
+            "/repo",
+            prompt,
+            "gpt-test",
+            "high",
+            1,
+            2,
+        ),
     )
     conn.commit()
     conn.close()
@@ -101,11 +128,28 @@ def make_claude_fixture(tmp_path: Path) -> Path:
     projects.mkdir(parents=True)
     session = projects / "claude-session.jsonl"
     session.write_text(
-        json.dumps({"type": "ai-title", "sessionId": "claude-session-1", "aiTitle": "Claude Capture"}) + "\n"
-        + json.dumps({"type": "user", "sessionId": "claude-session-1", "message": {"content": "Review plan"}})
+        json.dumps(
+            {
+                "type": "ai-title",
+                "sessionId": "claude-session-1",
+                "aiTitle": "Claude Capture",
+            }
+        )
         + "\n"
         + json.dumps(
-            {"type": "assistant", "sessionId": "claude-session-1", "message": {"content": "Plan reviewed"}}
+            {
+                "type": "user",
+                "sessionId": "claude-session-1",
+                "message": {"content": "Review plan"},
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "type": "assistant",
+                "sessionId": "claude-session-1",
+                "message": {"content": "Plan reviewed"},
+            }
         )
         + "\n",
         encoding="utf-8",
@@ -154,14 +198,32 @@ def make_opencode_fixture(tmp_path: Path) -> Path:
         """
     )
     conn.execute("INSERT INTO project VALUES (?, ?, ?)", ("global", "/repo", "Repo"))
-    conn.execute("INSERT INTO session VALUES (?, ?, ?, ?, ?, ?, ?)", ("opencode-session-1", "global", "OpenCode Capture", "/repo", "1", 1, 2))
+    conn.execute(
+        "INSERT INTO session VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("opencode-session-1", "global", "OpenCode Capture", "/repo", "1", 1, 2),
+    )
     conn.execute(
         "INSERT INTO message VALUES (?, ?, ?, ?, ?)",
-        ("msg-user", "opencode-session-1", 1, 1, json.dumps({"role": "user", "model": {"providerID": "opencode", "modelID": "test"}})),
+        (
+            "msg-user",
+            "opencode-session-1",
+            1,
+            1,
+            json.dumps(
+                {"role": "user", "model": {"providerID": "opencode", "modelID": "test"}}
+            ),
+        ),
     )
     conn.execute(
         "INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)",
-        ("part-user", "msg-user", "opencode-session-1", 1, 1, json.dumps({"type": "text", "text": "Use LaunchAgent"})),
+        (
+            "part-user",
+            "msg-user",
+            "opencode-session-1",
+            1,
+            1,
+            json.dumps({"type": "text", "text": "Use LaunchAgent"}),
+        ),
     )
     conn.commit()
     conn.close()
@@ -188,8 +250,12 @@ def make_hyprnote_fixture(tmp_path: Path) -> Path:
         ),
         encoding="utf-8",
     )
-    (session / "_summary.md").write_text("# Summary\n\n- Discussed Ketch integration.", encoding="utf-8")
-    (session / "_memo.md").write_text("Follow up on deletion workflow.", encoding="utf-8")
+    (session / "_summary.md").write_text(
+        "# Summary\n\n- Discussed Ketch integration.", encoding="utf-8"
+    )
+    (session / "_memo.md").write_text(
+        "Follow up on deletion workflow.", encoding="utf-8"
+    )
     (session / "transcript.json").write_text(
         json.dumps(
             {
@@ -229,7 +295,10 @@ def test_capture_agents_writes_markdown_and_skips_unchanged(tmp_path: Path) -> N
     assert first.captured == 3
     artifacts = list((svc.paths.inbox / "agent_logs").glob("**/*.md"))
     assert len(artifacts) == 3
-    assert all("source_type: \"agent_session_log\"" in path.read_text(encoding="utf-8") for path in artifacts)
+    assert all(
+        'source_type: "agent_session_log"' in path.read_text(encoding="utf-8")
+        for path in artifacts
+    )
 
     second = capture.capture()
     assert second.skipped == 3
@@ -268,11 +337,20 @@ def test_captured_agent_logs_ingest_as_agent_session_logs(tmp_path: Path) -> Non
 
     assert result.changed == 3
     with connection(svc.paths.sqlite_path) as conn:
-        source_types = [row["source_type"] for row in conn.execute("SELECT source_type FROM documents")]
-    assert source_types == ["agent_session_log", "agent_session_log", "agent_session_log"]
+        source_types = [
+            row["source_type"]
+            for row in conn.execute("SELECT source_type FROM documents")
+        ]
+    assert source_types == [
+        "agent_session_log",
+        "agent_session_log",
+        "agent_session_log",
+    ]
 
 
-def test_capture_hyprnote_writes_meeting_markdown_and_skips_unchanged(tmp_path: Path) -> None:
+def test_capture_hyprnote_writes_meeting_markdown_and_skips_unchanged(
+    tmp_path: Path,
+) -> None:
     svc = make_service(tmp_path)
     capture = AgentLogCapture(
         svc.paths,
@@ -298,6 +376,86 @@ def test_capture_hyprnote_writes_meeting_markdown_and_skips_unchanged(tmp_path: 
     second = capture.capture(agent="hyprnote")
     assert second.skipped == 1
     assert second.captured == 0
+
+
+def test_render_hyprnote_transcript_restores_chronology_and_speaker_turns(
+    tmp_path: Path,
+) -> None:
+    transcript_path = tmp_path / "transcript.json"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "transcripts": [
+                    {
+                        "started_at": 1_000_000,
+                        "words": [
+                            {
+                                "id": "local-1",
+                                "channel": 0,
+                                "start_ms": 2000,
+                                "end_ms": 2200,
+                                "text": " Local",
+                            },
+                            {
+                                "id": "local-2",
+                                "channel": 0,
+                                "start_ms": 2250,
+                                "end_ms": 2500,
+                                "text": " follows.",
+                            },
+                            {
+                                "id": "remote-1",
+                                "channel": 1,
+                                "start_ms": 1000,
+                                "end_ms": 1200,
+                                "text": " Remote",
+                            },
+                            {
+                                "id": "remote-2",
+                                "channel": 1,
+                                "start_ms": 1250,
+                                "end_ms": 1500,
+                                "text": " starts.",
+                            },
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rendered = render_hyprnote_transcript(transcript_path)
+
+    assert rendered == "Speaker 1: Remote starts.\n\nSpeaker 2: Local follows."
+
+
+def test_render_hyprnote_transcript_groups_synthetic_overlapping_tracks(
+    tmp_path: Path,
+) -> None:
+    transcript_path = tmp_path / "transcript.json"
+    words = []
+    for channel, prefix in ((0, "Local"), (1, "Remote")):
+        words.extend(
+            {
+                "id": f"{channel}-{index}",
+                "channel": channel,
+                "start_ms": index * 400,
+                "end_ms": (index + 1) * 400,
+                "text": f" {prefix}{index}",
+            }
+            for index in range(8)
+        )
+    transcript_path.write_text(
+        json.dumps({"transcripts": [{"started_at": 1_000_000, "words": words}]}),
+        encoding="utf-8",
+    )
+
+    rendered = render_hyprnote_transcript(transcript_path)
+
+    assert rendered.startswith("[Transcript note:")
+    assert rendered.index("Speaker 1: Local0") < rendered.index("Speaker 2: Remote0")
+    assert "Local0 Remote0" not in rendered
 
 
 def test_capture_all_does_not_include_hyprnote_unless_opted_in(tmp_path: Path) -> None:
@@ -390,7 +548,9 @@ def test_nightly_maintenance_runs_self_healing_tasks(tmp_path: Path) -> None:
     assert result.summary["memory_audit"]["errors"] == []
     assert "wiki_synthesize" not in result.summary
     with connection(svc.paths.sqlite_path) as conn:
-        row = conn.execute("SELECT * FROM automation_runs WHERE job_name = ?", ("nightly-maintenance",)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM automation_runs WHERE job_name = ?", ("nightly-maintenance",)
+        ).fetchone()
     assert row is not None
     assert row["status"] == "success"
 
@@ -430,12 +590,16 @@ def test_nightly_memory_audit_errors_are_warning_tier(tmp_path: Path) -> None:
     assert result.summary["memory_audit"]["errors"]
     assert result.summary["memory_audit"]["nightly_severity"] == "warning"
     with connection(svc.paths.sqlite_path) as conn:
-        row = conn.execute("SELECT status, error FROM automation_runs WHERE id = ?", (result.run_id,)).fetchone()
+        row = conn.execute(
+            "SELECT status, error FROM automation_runs WHERE id = ?", (result.run_id,)
+        ).fetchone()
     assert row["status"] == "success"
     assert row["error"] is None
 
 
-def test_nightly_maintenance_secondary_skips_cos_mutation_capable_stages(tmp_path: Path) -> None:
+def test_nightly_maintenance_secondary_skips_cos_mutation_capable_stages(
+    tmp_path: Path,
+) -> None:
     svc = make_service(tmp_path)
     write_sync_config(
         svc.paths,
@@ -470,26 +634,36 @@ def test_automation_run_persistence_caps_error_payloads(tmp_path: Path) -> None:
     svc = make_service(tmp_path)
     run_id = "automation_large_error"
     large_error = "provider failed\n" + ("prompt payload " * 2000)
-    record_automation_start(svc.paths, run_id, "nightly-maintenance", "2026-05-20T00:00:00+00:00")
+    record_automation_start(
+        svc.paths, run_id, "nightly-maintenance", "2026-05-20T00:00:00+00:00"
+    )
 
     record_automation_finish(
         svc.paths,
         run_id,
         "failed",
         "2026-05-20T00:01:00+00:00",
-        {"cos_extraction_shadow": {"error": large_error}, "normal": {"text": large_error}},
+        {
+            "cos_extraction_shadow": {"error": large_error},
+            "normal": {"text": large_error},
+        },
         large_error,
     )
 
     with connection(svc.paths.sqlite_path) as conn:
-        row = conn.execute("SELECT summary, error FROM automation_runs WHERE id = ?", (run_id,)).fetchone()
+        row = conn.execute(
+            "SELECT summary, error FROM automation_runs WHERE id = ?", (run_id,)
+        ).fetchone()
     summary = json.loads(row["summary"])
 
     assert len(row["error"]) <= MAX_STORED_ERROR_CHARS + 100
     assert "sha256=" in row["error"]
-    assert len(summary["cos_extraction_shadow"]["error"]) <= MAX_STORED_ERROR_CHARS + 100
+    assert (
+        len(summary["cos_extraction_shadow"]["error"]) <= MAX_STORED_ERROR_CHARS + 100
+    )
     assert "sha256=" in summary["cos_extraction_shadow"]["error"]
-    assert summary["normal"]["text"] == large_error
+    assert len(summary["normal"]["text"]) <= MAX_STORED_ERROR_CHARS + 100
+    assert "sha256=" in summary["normal"]["text"]
 
 
 def test_nightly_maintenance_skips_when_not_due(tmp_path: Path) -> None:
@@ -511,7 +685,12 @@ def test_nightly_maintenance_skips_when_not_due(tmp_path: Path) -> None:
 
 def test_doctor_reports_last_nightly_success_age(tmp_path: Path) -> None:
     svc = make_service(tmp_path)
-    record_automation_start(svc.paths, "automation_recent_success", "nightly-maintenance", "2026-05-20T00:00:00+00:00")
+    record_automation_start(
+        svc.paths,
+        "automation_recent_success",
+        "nightly-maintenance",
+        "2026-05-20T00:00:00+00:00",
+    )
     record_automation_finish(
         svc.paths,
         "automation_recent_success",
@@ -527,7 +706,9 @@ def test_doctor_reports_last_nightly_success_age(tmp_path: Path) -> None:
     assert status["nightly"]["last_success_age_hours"] is not None
 
 
-def test_nightly_memory_proposals_fail_without_configured_default_provider(tmp_path: Path, monkeypatch) -> None:
+def test_nightly_memory_proposals_fail_without_configured_default_provider(
+    tmp_path: Path, monkeypatch
+) -> None:
     svc = make_service(tmp_path)
     monkeypatch.delenv("PKM_BRAIN_LLM_PROVIDER", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -546,12 +727,16 @@ def test_nightly_memory_proposals_fail_without_configured_default_provider(tmp_p
     assert result.status == "failed"
     assert "codex login" in str(result.error)
 
-    due_check = run_nightly_maintenance(svc.paths, if_due=True, with_llm_memory_proposals=True)
+    due_check = run_nightly_maintenance(
+        svc.paths, if_due=True, with_llm_memory_proposals=True
+    )
     assert due_check.status == "failed"
     assert "codex login" in str(due_check.error)
 
 
-def test_nightly_memory_proposal_flag_creates_only_proposed_memories(tmp_path: Path, monkeypatch) -> None:
+def test_nightly_memory_proposal_flag_creates_only_proposed_memories(
+    tmp_path: Path, monkeypatch
+) -> None:
     svc = make_service(tmp_path)
     session_id = svc.write_agent_session(
         "Nightly run found a repeated failure pattern.",
@@ -574,8 +759,13 @@ def test_nightly_memory_proposal_flag_creates_only_proposed_memories(tmp_path: P
                 "]}"
             )
 
-    monkeypatch.setattr("pkm_brain.automation.get_provider", lambda provider_name=None: FakeProvider())
-    monkeypatch.setattr("pkm_brain.memory_proposals.get_provider", lambda provider_name=None: FakeProvider())
+    monkeypatch.setattr(
+        "pkm_brain.automation.get_provider", lambda provider_name=None: FakeProvider()
+    )
+    monkeypatch.setattr(
+        "pkm_brain.memory_proposals.get_provider",
+        lambda provider_name=None: FakeProvider(),
+    )
 
     result = run_nightly_maintenance(
         svc.paths,
@@ -615,7 +805,7 @@ def test_codex_provider_status_uses_local_cli() -> None:
 
     assert status["provider"] == "codex"
     assert status["model"] == CODEX_DEFAULT_MODEL
-    assert "gpt-5.2" in status["fallback_models"]
+    assert status["fallback_models"] == list(CODEX_DEFAULT_FALLBACK_MODELS)
     assert "ChatGPT plan" in status["cost_source"]
     assert isinstance(status["configured"], bool)
 
@@ -684,19 +874,24 @@ def test_nightly_launch_agent_plist_render() -> None:
 
     assert decoded["Label"] == "com.pkm-brain.nightly-maintenance"
     assert decoded["StartInterval"] == 3600
-    assert "brain automation nightly --if-due --due-after-hours 20" in decoded["ProgramArguments"][-1]
+    assert (
+        "brain automation nightly --if-due --due-after-hours 20"
+        in decoded["ProgramArguments"][-1]
+    )
     assert decoded["StandardOutPath"].endswith("nightly-maintenance.out.log")
 
 
-def test_nightly_launch_agent_plist_validation_flags_stale_options(tmp_path: Path) -> None:
+def test_nightly_launch_agent_plist_validation_flags_stale_options(
+    tmp_path: Path,
+) -> None:
     plist_path = tmp_path / "com.pkm-brain.nightly-maintenance.plist"
     plist = {
         "Label": "com.pkm-brain.nightly-maintenance",
         "ProgramArguments": [
             "/bin/zsh",
             "-lc",
-            "cd /Users/Peter/pkm-brain && /opt/homebrew/bin/uv run brain automation nightly "
-            "--if-due --due-after-hours 20 --with-llm-wiki-proposals --home /Users/Peter/brain",
+            "cd /Users/example/pkm-brain && /opt/homebrew/bin/uv run brain automation nightly "
+            "--if-due --due-after-hours 20 --with-llm-wiki-proposals --home /Users/example/brain",
         ],
     }
     plist_path.write_bytes(plistlib.dumps(plist))
@@ -708,7 +903,9 @@ def test_nightly_launch_agent_plist_validation_flags_stale_options(tmp_path: Pat
     assert validation["unknown_flags"] == ["--with-llm-wiki-proposals"]
 
 
-def test_nightly_launch_agent_plist_render_quotes_paths_with_spaces(tmp_path: Path) -> None:
+def test_nightly_launch_agent_plist_render_quotes_paths_with_spaces(
+    tmp_path: Path,
+) -> None:
     repo_path = tmp_path / "repo with space"
     brain_home = tmp_path / "brain with space"
     plist = render_nightly_launch_agent(
@@ -724,7 +921,9 @@ def test_nightly_launch_agent_plist_render_quotes_paths_with_spaces(tmp_path: Pa
     assert f"--home {shlex.quote(str(brain_home))}" in command
 
 
-def test_nightly_launch_agent_plist_render_uses_codex_as_default_llm_provider(monkeypatch) -> None:
+def test_nightly_launch_agent_plist_render_uses_codex_as_default_llm_provider(
+    monkeypatch,
+) -> None:
     monkeypatch.setenv("PKM_BRAIN_CODEX_BIN", "/opt/homebrew/bin/codex")
     repo_path = Path.home() / "pkm-brain"
     brain_home = Path.home() / "brain"
@@ -742,10 +941,15 @@ def test_nightly_launch_agent_plist_render_uses_codex_as_default_llm_provider(mo
     assert "--with-llm-memory-proposals" in command
     assert "--provider codex" in command
     assert decoded["EnvironmentVariables"]["PKM_BRAIN_LLM_PROVIDER"] == "codex"
-    assert decoded["EnvironmentVariables"]["PKM_BRAIN_CODEX_BIN"] == "/opt/homebrew/bin/codex"
+    assert (
+        decoded["EnvironmentVariables"]["PKM_BRAIN_CODEX_BIN"]
+        == "/opt/homebrew/bin/codex"
+    )
 
 
-def test_nightly_launch_agent_plist_render_sets_codex_bin_for_wiki_synthesis(monkeypatch) -> None:
+def test_nightly_launch_agent_plist_render_sets_codex_bin_for_wiki_synthesis(
+    monkeypatch,
+) -> None:
     monkeypatch.setenv("PKM_BRAIN_CODEX_BIN", "/opt/homebrew/bin/codex")
     repo_path = Path.home() / "pkm-brain"
     brain_home = Path.home() / "brain"
@@ -760,11 +964,16 @@ def test_nightly_launch_agent_plist_render_sets_codex_bin_for_wiki_synthesis(mon
 
     assert "--with-llm-memory-proposals" not in decoded["ProgramArguments"][-1]
     assert "PKM_BRAIN_LLM_PROVIDER" not in decoded["EnvironmentVariables"]
-    assert decoded["EnvironmentVariables"]["PKM_BRAIN_CODEX_BIN"] == "/opt/homebrew/bin/codex"
+    assert (
+        decoded["EnvironmentVariables"]["PKM_BRAIN_CODEX_BIN"]
+        == "/opt/homebrew/bin/codex"
+    )
     assert decoded["EnvironmentVariables"]["PKM_BRAIN_CODEX_CWD"] == str(repo_path)
 
 
-def test_nightly_launch_agent_plist_render_with_codex_memory_proposals(monkeypatch) -> None:
+def test_nightly_launch_agent_plist_render_with_codex_memory_proposals(
+    monkeypatch,
+) -> None:
     monkeypatch.setenv("PKM_BRAIN_CODEX_BIN", "/opt/homebrew/bin/codex")
     repo_path = Path.home() / "pkm-brain"
     brain_home = Path.home() / "brain"

@@ -24,8 +24,16 @@ from .db import connection, dumps
 from .extraction import extract_recent_documents
 from .gardener import generate_gardener_candidates
 from .indexes import lancedb_stats, optimize_vectors, should_optimize_vectors
-from .llm import CODEX_DEFAULT_MODEL, DEFAULT_LLM_PROVIDER, OPENAI_DEFAULT_MODEL, get_provider
-from .memory_proposals import propose_failure_memories_from_sources, propose_memories_from_lineage
+from .llm import (
+    CODEX_DEFAULT_MODEL,
+    DEFAULT_LLM_PROVIDER,
+    OPENAI_DEFAULT_MODEL,
+    get_provider,
+)
+from .memory_proposals import (
+    propose_failure_memories_from_sources,
+    propose_memories_from_lineage,
+)
 from .paths import BrainPaths
 from .queue_summary import review_queue_summary
 from .service import BrainService
@@ -40,8 +48,15 @@ NIGHTLY_LAUNCH_AGENT_LABEL = "com.pkm-brain.nightly-maintenance"
 NIGHTLY_JOB_NAME = "nightly-maintenance"
 MAX_STORED_ERROR_CHARS = 4000
 MAX_STORED_ERROR_LIST_ITEMS = 20
+MAX_STORED_SUMMARY_CHARS = 4000
+MAX_STORED_SUMMARY_LIST_ITEMS = 50
+MAX_STORED_SUMMARY_DICT_ITEMS = 100
+MAX_STORED_SUMMARY_DEPTH = 10
+MAX_STORED_SUMMARY_BYTES = 256_000
 ERROR_FIELD_NAMES = {"error", "errors", "stderr", "traceback"}
-COS_SECONDARY_SKIP_REASON = "secondary role skips CoS mutation-capable stages by default"
+COS_SECONDARY_SKIP_REASON = (
+    "secondary role skips CoS mutation-capable stages by default"
+)
 TRUTH_RESIDUE_KINDS = {"conflict"}
 NIGHTLY_AUTOMATION_FLAGS = {
     "--agent",
@@ -125,8 +140,16 @@ def run_agent_log_ingest(
         try:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            return AutomationResult(now_iso(), {}, None, skipped=True, reason="another run is already active")
-        connector_ids = connector_ids_for_agent(agent, include_hyprnote=include_hyprnote)
+            return AutomationResult(
+                now_iso(),
+                {},
+                None,
+                skipped=True,
+                reason="another run is already active",
+            )
+        connector_ids = connector_ids_for_agent(
+            agent, include_hyprnote=include_hyprnote
+        )
         explicit_agent = agent != "all"
         capture_result = run_connector_capture(
             paths,
@@ -165,8 +188,17 @@ def run_secondary_tick(
         try:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            return SecondaryTickResult(now_iso(), {}, None, None, skipped=True, reason="another secondary tick is already active")
-        connector_ids = connector_ids_for_agent(agent, include_hyprnote=include_hyprnote)
+            return SecondaryTickResult(
+                now_iso(),
+                {},
+                None,
+                None,
+                skipped=True,
+                reason="another secondary tick is already active",
+            )
+        connector_ids = connector_ids_for_agent(
+            agent, include_hyprnote=include_hyprnote
+        )
         explicit_agent = agent != "all"
         capture_result = run_connector_capture(
             paths,
@@ -263,7 +295,9 @@ def run_nightly_maintenance(
         error: str | None = None
         try:
             cos_role = cos_role_status(paths)
-            connector_ids = connector_ids_for_agent(agent, include_hyprnote=include_hyprnote)
+            connector_ids = connector_ids_for_agent(
+                agent, include_hyprnote=include_hyprnote
+            )
             explicit_agent = agent != "all"
             capture_result = run_connector_capture(
                 paths,
@@ -284,17 +318,23 @@ def run_nightly_maintenance(
 
             summary["cos_role"] = cos_role
 
-            summary["cos_extraction"] = run_cos_extraction(paths, cos_role, run_id=run_id)
+            summary["cos_extraction"] = run_cos_extraction(
+                paths, cos_role, run_id=run_id
+            )
             summary["cos_extraction_shadow"] = summary["cos_extraction"]
 
             summary["cos_gardener"] = run_cos_gardener(paths, cos_role)
             summary["cos_gardener_shadow"] = summary["cos_gardener"]
 
-            summary["cos_synthesis"] = run_cos_synthesis(paths, cos_role, enabled=llm_wiki)
+            summary["cos_synthesis"] = run_cos_synthesis(
+                paths, cos_role, enabled=llm_wiki
+            )
             summary["cos_synthesis_shadow"] = summary["cos_synthesis"]
 
             summary["index_status"] = index_status(paths, service)
-            summary["telemetry_retention"] = service.compact_retrieval_events(dry_run=False)
+            summary["telemetry_retention"] = service.compact_retrieval_events(
+                dry_run=False
+            )
             summary["index_maintenance"] = run_index_maintenance(paths)
             summary["cos_timeout_sweep"] = run_cos_timeout_sweep(paths)
             summary["cos_audit"] = run_cos_audit(paths, cos_role)
@@ -302,8 +342,12 @@ def run_nightly_maintenance(
             summary["provenance_check"] = provenance_check(paths)
             summary["wiki_lint"] = lint_wiki(paths)
             if with_llm_memory_proposals:
-                summary["memory_proposals"] = propose_failure_memories_from_sources(paths, provider_name=provider)
-                summary["lineage_memory_proposals"] = propose_memories_from_lineage(paths, provider_name=provider)
+                summary["memory_proposals"] = propose_failure_memories_from_sources(
+                    paths, provider_name=provider
+                )
+                summary["lineage_memory_proposals"] = propose_memories_from_lineage(
+                    paths, provider_name=provider
+                )
             summary["memory_audit"] = audit_memories(paths)
             if summary["memory_audit"].get("errors"):
                 summary["memory_audit"]["nightly_severity"] = "warning"
@@ -371,7 +415,9 @@ def cos_role_status(paths: BrainPaths) -> dict[str, Any]:
     }
 
 
-def cos_stage_skipped(stage: str, role_status: dict[str, Any], *, mode: str) -> dict[str, Any]:
+def cos_stage_skipped(
+    stage: str, role_status: dict[str, Any], *, mode: str
+) -> dict[str, Any]:
     return {
         "stage": stage,
         "status": "skipped",
@@ -381,7 +427,9 @@ def cos_stage_skipped(stage: str, role_status: dict[str, Any], *, mode: str) -> 
     }
 
 
-def run_cos_extraction(paths: BrainPaths, role_status: dict[str, Any], *, run_id: str | None = None) -> dict[str, Any]:
+def run_cos_extraction(
+    paths: BrainPaths, role_status: dict[str, Any], *, run_id: str | None = None
+) -> dict[str, Any]:
     if not role_status.get("can_run_mutation_capable_stages"):
         return cos_stage_skipped("cos_extraction", role_status, mode="policy")
     result = extract_recent_documents(paths, limit=10, shadow=False, run_id=run_id)
@@ -410,7 +458,9 @@ def run_cos_gardener(paths: BrainPaths, role_status: dict[str, Any]) -> dict[str
     }
 
 
-def run_cos_synthesis(paths: BrainPaths, role_status: dict[str, Any], *, enabled: bool) -> dict[str, Any]:
+def run_cos_synthesis(
+    paths: BrainPaths, role_status: dict[str, Any], *, enabled: bool
+) -> dict[str, Any]:
     if not enabled:
         return {
             "stage": "cos_synthesis",
@@ -449,7 +499,9 @@ def run_cos_once(paths: BrainPaths, *, llm_wiki: bool = True) -> dict[str, Any]:
     }
 
 
-def run_cos_timeout_sweep(paths: BrainPaths, *, now: str | None = None, limit: int = 100) -> dict[str, Any]:
+def run_cos_timeout_sweep(
+    paths: BrainPaths, *, now: str | None = None, limit: int = 100
+) -> dict[str, Any]:
     service = BrainService(paths)
     service.init_workspace()
     sweep_at = now or now_iso()
@@ -480,7 +532,10 @@ def run_cos_timeout_sweep(paths: BrainPaths, *, now: str | None = None, limit: i
                 "action_id": question.get("action_id"),
                 "action_type": action_type,
             }
-            if str(question["kind"]) in TRUTH_RESIDUE_KINDS or action_type in TRUTH_ACTION_TYPES:
+            if (
+                str(question["kind"]) in TRUTH_RESIDUE_KINDS
+                or action_type in TRUTH_ACTION_TYPES
+            ):
                 skipped_truth.append(summary)
                 continue
             if action_type and action_type not in TIMEOUT_TO_UNCERTAINTY_ACTION_TYPES:
@@ -551,14 +606,18 @@ def run_cos_audit(paths: BrainPaths, role_status: dict[str, Any]) -> dict[str, A
     }
 
 
-def index_status(paths: BrainPaths, service: BrainService | None = None) -> dict[str, Any]:
+def index_status(
+    paths: BrainPaths, service: BrainService | None = None
+) -> dict[str, Any]:
     service = service or BrainService(paths)
     service.init_workspace()
     with connection(paths.sqlite_path) as conn:
         docs = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
         chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
         fts = conn.execute("SELECT COUNT(*) FROM chunk_fts").fetchone()[0]
-        run = conn.execute("SELECT * FROM ingestion_runs ORDER BY started_at DESC LIMIT 1").fetchone()
+        run = conn.execute(
+            "SELECT * FROM ingestion_runs ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()
     lancedb_exists = paths.lancedb_path.exists() and any(paths.lancedb_path.iterdir())
     lancedb = lancedb_stats(paths.lancedb_path)
     return {
@@ -585,9 +644,13 @@ def run_index_maintenance(paths: BrainPaths) -> dict[str, Any]:
                 "errors": [],
             }
         else:
-            vector_result = optimize_vectors(paths.lancedb_path, cleanup_older_than_days=1)
+            vector_result = optimize_vectors(
+                paths.lancedb_path, cleanup_older_than_days=1
+            )
         return {
-            "status": "ok" if vector_result.get("status") == "ok" or fts_result.get("status") == "ok" else "skipped",
+            "status": "ok"
+            if vector_result.get("status") == "ok" or fts_result.get("status") == "ok"
+            else "skipped",
             "vectors": vector_result,
             "fts": fts_result,
             "errors": [],
@@ -601,7 +664,9 @@ def nightly_due(paths: BrainPaths, due_after_hours: int) -> bool:
     if not last_success:
         return True
     finished_at = parse_iso_datetime(last_success)
-    return datetime.now(finished_at.tzinfo) - finished_at >= timedelta(hours=due_after_hours)
+    return datetime.now(finished_at.tzinfo) - finished_at >= timedelta(
+        hours=due_after_hours
+    )
 
 
 def last_successful_automation_run(paths: BrainPaths, job_name: str) -> str | None:
@@ -623,7 +688,9 @@ def parse_iso_datetime(value: str) -> datetime:
     return datetime.fromisoformat(value)
 
 
-def record_automation_start(paths: BrainPaths, run_id: str, job_name: str, started_at: str) -> None:
+def record_automation_start(
+    paths: BrainPaths, run_id: str, job_name: str, started_at: str
+) -> None:
     with connection(paths.sqlite_path) as conn:
         conn.execute(
             """
@@ -642,7 +709,7 @@ def record_automation_finish(
     summary: dict[str, Any],
     error: str | None,
 ) -> None:
-    compacted_summary = compact_automation_errors(summary)
+    compacted_summary = bounded_automation_summary(summary)
     compacted_error = compact_error_text(error) if error is not None else None
     with connection(paths.sqlite_path) as conn:
         conn.execute(
@@ -669,11 +736,57 @@ def compact_automation_errors(value: Any) -> Any:
     return value
 
 
+def bounded_automation_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    compacted = compact_automation_summary(compact_automation_errors(summary))
+    serialized = dumps(compacted)
+    byte_count = len(serialized.encode("utf-8"))
+    if byte_count <= MAX_STORED_SUMMARY_BYTES:
+        return compacted
+    fallback = {
+        "truncated": True,
+        "original_bytes": byte_count,
+        "keys": sorted(str(key) for key in summary)[:MAX_STORED_SUMMARY_DICT_ITEMS],
+    }
+    for key in ("status", "reason", "queue_summary", "telemetry_retention", "errors"):
+        if key in compacted:
+            fallback[key] = compacted[key]
+    return fallback
+
+
+def compact_automation_summary(value: Any, *, depth: int = 0) -> Any:
+    if depth >= MAX_STORED_SUMMARY_DEPTH:
+        return "[maximum summary depth reached]"
+    if isinstance(value, dict):
+        items = list(value.items())
+        output = {
+            str(key): compact_automation_summary(nested, depth=depth + 1)
+            for key, nested in items[:MAX_STORED_SUMMARY_DICT_ITEMS]
+        }
+        omitted = len(items) - len(output)
+        if omitted > 0:
+            output["_omitted_keys"] = omitted
+        return output
+    if isinstance(value, list):
+        output = [
+            compact_automation_summary(item, depth=depth + 1)
+            for item in value[:MAX_STORED_SUMMARY_LIST_ITEMS]
+        ]
+        omitted = len(value) - len(output)
+        if omitted > 0:
+            output.append({"_omitted_items": omitted})
+        return output
+    if isinstance(value, str):
+        return compact_error_text(value, max_chars=MAX_STORED_SUMMARY_CHARS)
+    return value
+
+
 def compact_error_value(value: Any) -> Any:
     if isinstance(value, str):
         return compact_error_text(value)
     if isinstance(value, list):
-        output = [compact_error_value(item) for item in value[:MAX_STORED_ERROR_LIST_ITEMS]]
+        output = [
+            compact_error_value(item) for item in value[:MAX_STORED_ERROR_LIST_ITEMS]
+        ]
         omitted = len(value) - len(output)
         if omitted > 0:
             output.append(f"[omitted {omitted} additional error item(s)]")
@@ -706,7 +819,10 @@ def launch_agent_path() -> Path:
 
 
 def nightly_launch_agent_path() -> Path:
-    return Path("~/Library/LaunchAgents").expanduser() / f"{NIGHTLY_LAUNCH_AGENT_LABEL}.plist"
+    return (
+        Path("~/Library/LaunchAgents").expanduser()
+        / f"{NIGHTLY_LAUNCH_AGENT_LABEL}.plist"
+    )
 
 
 def render_launch_agent(
@@ -765,7 +881,9 @@ def render_nightly_launch_agent(
         args.append("--with-llm-memory-proposals")
     if not llm_wiki:
         args.append("--no-llm-wiki")
-    llm_provider = provider or (DEFAULT_LLM_PROVIDER if with_llm_memory_proposals else None)
+    llm_provider = provider or (
+        DEFAULT_LLM_PROVIDER if with_llm_memory_proposals else None
+    )
     if with_llm_memory_proposals:
         if llm_provider:
             args.extend(["--provider", llm_provider])
@@ -784,13 +902,21 @@ def render_nightly_launch_agent(
         if llm_provider:
             environment["PKM_BRAIN_LLM_PROVIDER"] = llm_provider
         if llm_provider == "openai":
-            environment["PKM_BRAIN_OPENAI_MODEL"] = os.environ.get("PKM_BRAIN_OPENAI_MODEL", OPENAI_DEFAULT_MODEL)
+            environment["PKM_BRAIN_OPENAI_MODEL"] = os.environ.get(
+                "PKM_BRAIN_OPENAI_MODEL", OPENAI_DEFAULT_MODEL
+            )
             if os.environ.get("PKM_BRAIN_OPENAI_MODEL_FALLBACKS"):
-                environment["PKM_BRAIN_OPENAI_MODEL_FALLBACKS"] = os.environ["PKM_BRAIN_OPENAI_MODEL_FALLBACKS"]
+                environment["PKM_BRAIN_OPENAI_MODEL_FALLBACKS"] = os.environ[
+                    "PKM_BRAIN_OPENAI_MODEL_FALLBACKS"
+                ]
         if llm_provider == "codex":
-            environment["PKM_BRAIN_CODEX_MODEL"] = os.environ.get("PKM_BRAIN_CODEX_MODEL", CODEX_DEFAULT_MODEL)
+            environment["PKM_BRAIN_CODEX_MODEL"] = os.environ.get(
+                "PKM_BRAIN_CODEX_MODEL", CODEX_DEFAULT_MODEL
+            )
             if os.environ.get("PKM_BRAIN_CODEX_MODEL_FALLBACKS"):
-                environment["PKM_BRAIN_CODEX_MODEL_FALLBACKS"] = os.environ["PKM_BRAIN_CODEX_MODEL_FALLBACKS"]
+                environment["PKM_BRAIN_CODEX_MODEL_FALLBACKS"] = os.environ[
+                    "PKM_BRAIN_CODEX_MODEL_FALLBACKS"
+                ]
             codex_bin = os.environ.get("PKM_BRAIN_CODEX_BIN") or shutil.which("codex")
             if codex_bin:
                 environment["PKM_BRAIN_CODEX_BIN"] = codex_bin
@@ -813,7 +939,9 @@ def install_launch_agent(
     include_hyprnote: bool = False,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    plist = render_launch_agent(repo_path, brain_home, uv_path, interval, include_hyprnote=include_hyprnote)
+    plist = render_launch_agent(
+        repo_path, brain_home, uv_path, interval, include_hyprnote=include_hyprnote
+    )
     path = launch_agent_path()
     if dry_run:
         return {"path": str(path), "plist": plist, "installed": False}
@@ -821,9 +949,16 @@ def install_launch_agent(
     brain_home.joinpath("logs").mkdir(parents=True, exist_ok=True)
     path.write_bytes(plistlib.dumps(plist, sort_keys=False))
     uid = subprocess.check_output(["id", "-u"], text=True).strip()
-    subprocess.run(["launchctl", "bootout", f"gui/{uid}", str(path)], check=False, capture_output=True, text=True)
+    subprocess.run(
+        ["launchctl", "bootout", f"gui/{uid}", str(path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
     subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(path)], check=True)
-    subprocess.run(["launchctl", "enable", f"gui/{uid}/{LAUNCH_AGENT_LABEL}"], check=True)
+    subprocess.run(
+        ["launchctl", "enable", f"gui/{uid}/{LAUNCH_AGENT_LABEL}"], check=True
+    )
     return {"path": str(path), "plist": plist, "installed": True}
 
 
@@ -855,16 +990,28 @@ def install_nightly_launch_agent(
     brain_home.joinpath("logs").mkdir(parents=True, exist_ok=True)
     path.write_bytes(plistlib.dumps(plist, sort_keys=False))
     uid = subprocess.check_output(["id", "-u"], text=True).strip()
-    subprocess.run(["launchctl", "bootout", f"gui/{uid}", str(path)], check=False, capture_output=True, text=True)
+    subprocess.run(
+        ["launchctl", "bootout", f"gui/{uid}", str(path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
     subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(path)], check=True)
-    subprocess.run(["launchctl", "enable", f"gui/{uid}/{NIGHTLY_LAUNCH_AGENT_LABEL}"], check=True)
+    subprocess.run(
+        ["launchctl", "enable", f"gui/{uid}/{NIGHTLY_LAUNCH_AGENT_LABEL}"], check=True
+    )
     return {"path": str(path), "plist": plist, "installed": True}
 
 
 def uninstall_launch_agent() -> dict[str, Any]:
     path = launch_agent_path()
     uid = subprocess.check_output(["id", "-u"], text=True).strip()
-    subprocess.run(["launchctl", "bootout", f"gui/{uid}", str(path)], check=False, capture_output=True, text=True)
+    subprocess.run(
+        ["launchctl", "bootout", f"gui/{uid}", str(path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
     if path.exists():
         path.unlink()
     return {"path": str(path), "installed": False}
@@ -873,7 +1020,12 @@ def uninstall_launch_agent() -> dict[str, Any]:
 def uninstall_nightly_launch_agent() -> dict[str, Any]:
     path = nightly_launch_agent_path()
     uid = subprocess.check_output(["id", "-u"], text=True).strip()
-    subprocess.run(["launchctl", "bootout", f"gui/{uid}", str(path)], check=False, capture_output=True, text=True)
+    subprocess.run(
+        ["launchctl", "bootout", f"gui/{uid}", str(path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
     if path.exists():
         path.unlink()
     return {"path": str(path), "installed": False}
@@ -947,7 +1099,9 @@ def validate_nightly_launch_agent_plist(path: Path) -> dict[str, Any]:
             "status": "invalid",
             "valid": False,
             "unknown_flags": [],
-            "warnings": ["ProgramArguments does not contain `brain automation nightly`"],
+            "warnings": [
+                "ProgramArguments does not contain `brain automation nightly`"
+            ],
             "command": command,
         }
     command_tokens = tokens[nightly_index + 3 :]
@@ -955,7 +1109,8 @@ def validate_nightly_launch_agent_plist(path: Path) -> dict[str, Any]:
         {
             token.split("=", 1)[0]
             for token in command_tokens
-            if token.startswith("--") and token.split("=", 1)[0] not in NIGHTLY_AUTOMATION_FLAGS
+            if token.startswith("--")
+            and token.split("=", 1)[0] not in NIGHTLY_AUTOMATION_FLAGS
         }
     )
     warnings = [f"unknown nightly flag: {flag}" for flag in unknown_flags]
@@ -975,5 +1130,7 @@ def find_nightly_command_index(tokens: list[str]) -> int | None:
     return None
 
 
-def as_jsonable(result: AutomationResult | NightlyMaintenanceResult | SecondaryTickResult) -> dict[str, Any]:
+def as_jsonable(
+    result: AutomationResult | NightlyMaintenanceResult | SecondaryTickResult,
+) -> dict[str, Any]:
     return json.loads(json.dumps(result.__dict__))

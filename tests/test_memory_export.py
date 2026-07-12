@@ -47,9 +47,9 @@ def test_export_all_removes_stale_export_after_scope_change(tmp_path: Path) -> N
     memory_id = svc.propose_memory("FactMemory", "global", "Migrated memory.", [], 0.8)
     svc.approve_memory(memory_id)
     with connection(svc.paths.sqlite_path) as conn:
-        conn.execute("UPDATE memories SET scope = ? WHERE id = ?", ("user:Peter", memory_id))
+        conn.execute("UPDATE memories SET scope = ? WHERE id = ?", ("user:Alex", memory_id))
     svc.export_all_memories()
-    stale_path = svc.paths.memory / "user:Peter" / f"{memory_id}.md"
+    stale_path = svc.paths.memory / "user:Alex" / f"{memory_id}.md"
     assert stale_path.exists()
 
     with connection(svc.paths.sqlite_path) as conn:

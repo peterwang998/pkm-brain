@@ -6,6 +6,7 @@ import os
 import re
 import secrets
 import threading
+from datetime import datetime, timezone
 from importlib import resources
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -26,17 +27,24 @@ from .connectors import (
     update_connector_settings,
 )
 from .cos_actions import (
+    action_candidate_key,
+    audit_action_reviewability,
+    action_payload,
     apply_action,
     decide_action,
     load_action,
     propose_action,
     recent_actions,
     record_action_audit,
+    reviewable_bad_audit_actions,
+    retire_open_candidate_siblings,
     revert_action,
     row_to_action,
+    split_destination_page_hint,
 )
 from .cos_audit import COS_AUDIT_CONFIGURED_NOTE, COS_AUDIT_STUB_NOTE, run_sampled_audit
 from .cos_policy import active_policy_rules, active_policy_version, human_policy_reason
+from .curation_settings import load_curation_settings, update_curation_settings
 from .db import connection, dumps
 from .gardener import (
     deterministic_entity_candidates,
@@ -49,7 +57,17 @@ from .app_migration import (
     retire_launch_agents,
 )
 from .mcp_tools import MCP_TOOL_NAMES, call_mcp_tool
+from .maintenance import managed_storage_inventory
 from .paths import BrainPaths
+from .routing_coherence import (
+    coherence_bonus,
+    fact_document_id,
+    load_document_route_priors,
+)
+from .review_admission import (
+    load_review_admission_states,
+    reconcile_review_admissions,
+)
 from .scheduler.launchd import LaunchdScheduler
 from .service import BrainService, row_to_memory
 from .setup_wizard import build_setup_plan
@@ -58,6 +76,8 @@ from .wiki import (
     ALLOWED_PAGE_TYPES,
     ALLOWED_STATUSES,
     GENERATED_MARKER,
+    NON_ROUTABLE_PAGE_TYPES,
+    is_routable_wiki_page,
     lint_wiki,
     parse_frontmatter,
 )
@@ -91,6 +111,7 @@ class BrainUIServer(ThreadingHTTPServer):
     token: str
     serve_static: bool
     daemon_version: str | None
+    daemon_runtime_id: str | None
     daemon_started_at: str | None
     daemon_scheduler: Any | None
     daemon_shutdown_enabled: bool
@@ -206,8 +227,12 @@ class BrainUIHandler(BaseHTTPRequestHandler):
                 self.write_json(ui_cos_contracts(self.server.paths))
             elif path == "/api/cos/audit":
                 self.write_json(ui_cos_audit_status(self.server.paths))
+            elif path == "/api/settings/curation":
+                self.write_json(ui_curation_settings(self.server.paths))
             elif path == "/api/ops/runs":
                 self.write_json(ui_ops_runs(self.server.paths))
+            elif path == "/api/ops/storage":
+                self.write_json(ui_ops_storage(self.server.paths))
             else:
                 self.write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
         except BadRequestError as exc:
@@ -246,7 +271,11 @@ class BrainUIHandler(BaseHTTPRequestHandler):
                 self.write_json(ui_scheduler_pause(self.server, payload))
             elif parts == ["scheduler", "resume"]:
                 self.write_json(ui_scheduler_resume(self.server))
-            elif len(parts) == 4 and parts[:2] == ["scheduler", "jobs"] and parts[3] in {"enable", "disable"}:
+            elif (
+                len(parts) == 4
+                and parts[:2] == ["scheduler", "jobs"]
+                and parts[3] in {"enable", "disable"}
+            ):
                 self.write_json(
                     ui_scheduler_enable(
                         self.server,
@@ -254,7 +283,11 @@ class BrainUIHandler(BaseHTTPRequestHandler):
                         enabled=parts[3] == "enable",
                     )
                 )
-            elif len(parts) == 3 and parts[0] == "connectors" and parts[2] in {"enable", "disable"}:
+            elif (
+                len(parts) == 3
+                and parts[0] == "connectors"
+                and parts[2] in {"enable", "disable"}
+            ):
                 self.write_json(
                     set_connector_enabled(
                         self.server.paths,
@@ -285,9 +318,17 @@ class BrainUIHandler(BaseHTTPRequestHandler):
                 self.write_json(ui_entities_merge(self.server.paths, payload))
             elif len(parts) == 3 and parts[0] == "actions" and parts[2] == "revert":
                 self.write_json(ui_revert_action(self.server.paths, parts[1]))
-            elif len(parts) == 4 and parts[:2] == ["wiki", "facts"] and parts[3] == "confirm":
+            elif (
+                len(parts) == 4
+                and parts[:2] == ["wiki", "facts"]
+                and parts[3] == "confirm"
+            ):
                 self.write_json(ui_confirm_fact(self.server.paths, parts[2]))
-            elif len(parts) == 4 and parts[:2] == ["wiki", "facts"] and parts[3] == "flag":
+            elif (
+                len(parts) == 4
+                and parts[:2] == ["wiki", "facts"]
+                and parts[3] == "flag"
+            ):
                 payload = self.read_json_body()
                 self.write_json(ui_flag_fact(self.server.paths, parts[2], payload))
             elif parts == ["wiki", "page"]:
@@ -350,8 +391,18 @@ class BrainUIHandler(BaseHTTPRequestHandler):
             parts = [part for part in path.removeprefix("/api/").split("/") if part]
             if len(parts) == 3 and parts[0] == "connectors" and parts[2] == "settings":
                 payload = self.read_json_body()
-                settings = payload.get("settings") if isinstance(payload.get("settings"), dict) else payload
-                self.write_json(update_connector_settings(self.server.paths, parts[1], settings))
+                settings = (
+                    payload.get("settings")
+                    if isinstance(payload.get("settings"), dict)
+                    else payload
+                )
+                self.write_json(
+                    update_connector_settings(self.server.paths, parts[1], settings)
+                )
+                return
+            if parts == ["settings", "curation"]:
+                payload = self.read_json_body()
+                self.write_json(ui_update_curation_settings(self.server.paths, payload))
                 return
             self.write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
         except BadRequestError as exc:
@@ -383,7 +434,9 @@ class BrainUIHandler(BaseHTTPRequestHandler):
             return
         if len(parts) == 4 and parts[3] == "dismiss":
             payload = self.read_json_body()
-            self.write_json(ui_dismiss_cos_question(self.server.paths, parts[2], payload))
+            self.write_json(
+                ui_dismiss_cos_question(self.server.paths, parts[2], payload)
+            )
             return
         self.write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
@@ -445,14 +498,6 @@ class BrainUIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
-    def write_html(self, body: str, status: HTTPStatus = HTTPStatus.OK) -> None:
-        encoded = body.encode("utf-8")
-        self.send_response(status.value)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(encoded)))
-        self.end_headers()
-        self.wfile.write(encoded)
-
     def write_json(
         self, payload: dict[str, Any] | list[Any], status: HTTPStatus = HTTPStatus.OK
     ) -> None:
@@ -478,6 +523,7 @@ def create_ui_server(
     server.token = token
     server.serve_static = serve_static
     server.daemon_version = None
+    server.daemon_runtime_id = None
     server.daemon_started_at = None
     server.daemon_scheduler = None
     server.daemon_shutdown_enabled = False
@@ -489,6 +535,7 @@ def ui_health(server: BrainUIServer) -> dict[str, Any]:
     return {
         "ok": True,
         "version": server.daemon_version or package_version(),
+        "runtime_id": server.daemon_runtime_id,
         "home": str(server.paths.home),
         "pid": os.getpid(),
         "host": str(host),
@@ -501,6 +548,7 @@ def ui_health(server: BrainUIServer) -> dict[str, Any]:
 def ui_version(server: BrainUIServer) -> dict[str, Any]:
     return {
         "version": server.daemon_version or package_version(),
+        "runtime_id": server.daemon_runtime_id,
         "schema_version": current_schema_version(),
     }
 
@@ -522,7 +570,9 @@ def ui_scheduler_run(server: BrainUIServer, payload: dict[str, Any]) -> dict[str
     return scheduler.run_now(job_id)
 
 
-def ui_scheduler_pause(server: BrainUIServer, payload: dict[str, Any]) -> dict[str, Any]:
+def ui_scheduler_pause(
+    server: BrainUIServer, payload: dict[str, Any]
+) -> dict[str, Any]:
     scheduler = server.daemon_scheduler
     if scheduler is None:
         raise BadRequestError("scheduler is not available")
@@ -537,7 +587,9 @@ def ui_scheduler_resume(server: BrainUIServer) -> dict[str, Any]:
     return scheduler.resume()
 
 
-def ui_scheduler_enable(server: BrainUIServer, job_id: str, *, enabled: bool) -> dict[str, Any]:
+def ui_scheduler_enable(
+    server: BrainUIServer, job_id: str, *, enabled: bool
+) -> dict[str, Any]:
     scheduler = server.daemon_scheduler
     if scheduler is None:
         raise BadRequestError("scheduler is not available")
@@ -547,11 +599,15 @@ def ui_scheduler_enable(server: BrainUIServer, job_id: str, *, enabled: bool) ->
 def ui_shutdown(server: BrainUIServer) -> dict[str, Any]:
     if not server.daemon_shutdown_enabled:
         raise BadRequestError("shutdown is only available for brain daemon")
-    threading.Thread(target=server.shutdown, name="brain-daemon-shutdown", daemon=True).start()
+    threading.Thread(
+        target=server.shutdown, name="brain-daemon-shutdown", daemon=True
+    ).start()
     return {"ok": True, "shutting_down": True}
 
 
-def ui_mcp_tool(paths: BrainPaths, tool_name: str, payload: dict[str, Any]) -> dict[str, Any] | list[Any]:
+def ui_mcp_tool(
+    paths: BrainPaths, tool_name: str, payload: dict[str, Any]
+) -> dict[str, Any] | list[Any]:
     if tool_name not in MCP_TOOL_NAMES:
         raise NotFoundError(f"unknown MCP tool: {tool_name}")
     result = call_mcp_tool(service(paths), tool_name, payload)
@@ -569,11 +625,15 @@ def ui_migration_plan(paths: BrainPaths, query: dict[str, list[str]]) -> dict[st
 
 
 def ui_migration_backup(paths: BrainPaths, payload: dict[str, Any]) -> dict[str, Any]:
-    return create_runtime_backup(paths, app_support_dir=path_from_payload(payload, "app_support_dir"))
+    return create_runtime_backup(
+        paths, app_support_dir=path_from_payload(payload, "app_support_dir")
+    )
 
 
 def ui_migration_shims(payload: dict[str, Any]) -> dict[str, Any]:
-    return install_runtime_shims(app_support_dir=path_from_payload(payload, "app_support_dir"))
+    return install_runtime_shims(
+        app_support_dir=path_from_payload(payload, "app_support_dir")
+    )
 
 
 def ui_migration_retire_launch_agents(payload: dict[str, Any]) -> dict[str, Any]:
@@ -656,7 +716,9 @@ def ui_status(paths: BrainPaths) -> dict[str, Any]:
 
 
 def retrieval_surface_status(paths: BrainPaths) -> list[dict[str, Any]]:
-    wiki_pages = sum(1 for path in paths.wiki.rglob("*.md")) if paths.wiki.exists() else 0
+    wiki_pages = (
+        sum(1 for path in paths.wiki.rglob("*.md")) if paths.wiki.exists() else 0
+    )
     with connection(paths.sqlite_path) as conn:
         chunk_rows = scalar_count(conn, "SELECT COUNT(*) FROM chunks")
         fact_index_rows = scalar_count(
@@ -675,12 +737,18 @@ def retrieval_surface_status(paths: BrainPaths) -> list[dict[str, Any]]:
             table="facts",
         )
         active_memories = scalar_count(
-            conn, "SELECT COUNT(*) FROM memories WHERE status = 'active'", table="memories"
+            conn,
+            "SELECT COUNT(*) FROM memories WHERE status = 'active'",
+            table="memories",
         )
         proposed_memories = scalar_count(
-            conn, "SELECT COUNT(*) FROM memories WHERE status = 'proposed'", table="memories"
+            conn,
+            "SELECT COUNT(*) FROM memories WHERE status = 'proposed'",
+            table="memories",
         )
-        actions = scalar_count(conn, "SELECT COUNT(*) FROM cos_actions", table="cos_actions")
+        actions = scalar_count(
+            conn, "SELECT COUNT(*) FROM cos_actions", table="cos_actions"
+        )
     return [
         {
             "surface": "Fact ledger",
@@ -744,7 +812,9 @@ def ui_table_exists(conn: Any, table: str) -> bool:
 def ui_column_exists(conn: Any, table: str, column: str) -> bool:
     if not ui_table_exists(conn, table):
         return False
-    return column in {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})")}
+    return column in {
+        str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})")
+    }
 
 
 def row_to_plain_dict(row: Any) -> dict[str, Any]:
@@ -797,6 +867,7 @@ def enrich_memory_detail(paths: BrainPaths, memory: dict[str, Any]) -> dict[str,
 
 
 def ui_digest(paths: BrainPaths, query: dict[str, list[str]]) -> dict[str, Any]:
+    request_as_of = queue_freshness_timestamp()
     svc = service(paths)
     svc.init_workspace()
     since = first(query, "since")
@@ -805,17 +876,25 @@ def ui_digest(paths: BrainPaths, query: dict[str, list[str]]) -> dict[str, Any]:
     sync = safe_call(svc.sync_status)
     audit = ui_cos_audit_status(paths)
     with connection(paths.sqlite_path) as conn:
-        latest_run = compact_run_event(latest_row(conn, "automation_runs", "started_at"))
+        latest_run = compact_run_event(
+            latest_row(conn, "automation_runs", "started_at")
+        )
         facts_by_page = digest_facts_by_page(conn, since)
         reverts = digest_reverts(conn, since)
         demotions = digest_demotions(conn, since)
         eval_transitions = digest_eval_transitions(conn, since)
-        counts = queue_counts(conn)
+        raw_counts = queue_counts(conn)
+        queue_summary = build_queue_summary(
+            paths, conn, raw_counts=raw_counts, as_of=request_as_of
+        )
+        counts = legacy_queue_counts(queue_summary)
     pulse = [
         pulse_chip(
             "nightly",
             latest_run.get("status") if latest_run else None,
-            latest_run.get("finished_at") or latest_run.get("started_at") if latest_run else None,
+            latest_run.get("finished_at") or latest_run.get("started_at")
+            if latest_run
+            else None,
             href="#/ops/runs",
             bad_statuses={"failed", "error", "crashed"},
         ),
@@ -858,7 +937,7 @@ def ui_digest(paths: BrainPaths, query: dict[str, list[str]]) -> dict[str, Any]:
             }
         )
     return {
-        "generated_at": now_iso(),
+        "generated_at": queue_summary["as_of"],
         "since": since,
         "pulse": pulse,
         "latest_run": latest_run,
@@ -866,6 +945,7 @@ def ui_digest(paths: BrainPaths, query: dict[str, list[str]]) -> dict[str, Any]:
         "reverts": reverts,
         "demotions": demotions,
         "eval_transitions": eval_transitions,
+        "queue_summary": queue_summary,
         "queue_counts": counts,
         "raw": {
             "index": index,
@@ -1013,8 +1093,7 @@ def compact_action_event(action: dict[str, Any]) -> dict[str, Any]:
         "target_fact_ids": action.get("target_fact_ids") or [],
         "target_page_paths": action.get("target_page_paths") or [],
         "reason": compact_text(
-            (metadata or {}).get("rationale")
-            or evidence.get("reason")
+            (metadata or {}).get("rationale") or evidence.get("reason")
             if isinstance(evidence, dict)
             else "",
             240,
@@ -1082,19 +1161,36 @@ def digest_eval_transitions(conn: Any, since: str | None) -> list[dict[str, Any]
 def queue_counts(conn: Any) -> dict[str, Any]:
     counts: dict[str, int] = {}
     raw: dict[str, int] = {}
+    topology_identities: set[str] = set()
+    question_action_ids: set[str] = set()
     if ui_table_exists(conn, "open_questions"):
-        for row in conn.execute(
-            """
-            SELECT kind, COUNT(*) AS count
-            FROM open_questions
-            WHERE status IN ('open', 'needs_human')
-            GROUP BY kind
-            """
-        ):
+        question_rows = list(
+            conn.execute(
+                """
+                SELECT kind, action_id
+                FROM open_questions
+                WHERE status IN ('open', 'needs_human')
+                """
+            )
+        )
+        question_action_ids = {
+            str(row["action_id"])
+            for row in question_rows
+            if str(row["action_id"] or "").strip()
+        }
+        actions = actions_for_ids(conn, question_action_ids)
+        for row in question_rows:
             kind = str(row["kind"])
-            count = int(row["count"])
-            raw[kind] = count
-            counts[queue_group_for_kind(kind)] = counts.get(queue_group_for_kind(kind), 0) + count
+            raw[kind] = raw.get(kind, 0) + 1
+            action_id = str(row["action_id"] or "").strip()
+            action = actions.get(action_id)
+            action_type = str((action or {}).get("action_type") or "")
+            group = queue_group_for_kind(kind, action_type)
+            if group == "topology" and action is not None:
+                if not entity_merge_action_already_applied(conn, action):
+                    topology_identities.add(topology_action_identity(action))
+                continue
+            counts[group] = counts.get(group, 0) + 1
     if ui_table_exists(conn, "memories"):
         count = scalar_count(
             conn,
@@ -1105,24 +1201,152 @@ def queue_counts(conn: Any) -> dict[str, Any]:
             counts["memories"] = counts.get("memories", 0) + count
             raw["proposed_memory"] = count
     if ui_table_exists(conn, "cos_actions"):
-        question_action_ids = active_question_action_ids(conn)
-        proposed = queue_action_count(conn, exclude_action_ids=question_action_ids)
-        if proposed:
-            counts["topology"] = counts.get("topology", 0) + proposed
-            raw["proposed_action"] = proposed
+        direct_actions = queue_open_topology_actions(
+            conn, exclude_action_ids=question_action_ids
+        )
+        for action in direct_actions:
+            topology_identities.add(topology_action_identity(action))
+        if topology_identities:
+            counts["topology"] = len(topology_identities)
+            raw["proposed_action"] = len(direct_actions)
         audit = queue_audit_count(conn)
         if audit:
             counts["audit"] = counts.get("audit", 0) + audit
             raw["audit_flagged"] = audit
     total = sum(counts.values())
-    return {"total": total, "by_kind": dict(sorted(counts.items())), "raw": dict(sorted(raw.items()))}
+    return {
+        "total": total,
+        "by_kind": dict(sorted(counts.items())),
+        "raw": dict(sorted(raw.items())),
+    }
+
+
+def build_queue_summary(
+    paths: BrainPaths,
+    conn: Any,
+    *,
+    raw_counts: dict[str, Any] | None = None,
+    as_of: str | None = None,
+) -> dict[str, Any]:
+    raw_counts = raw_counts or queue_counts(conn)
+    candidate_total = max(
+        int(raw_counts.get("total") or 0),
+        sum(int(value) for value in (raw_counts.get("raw") or {}).values()),
+    )
+    items = queue_items(
+        paths,
+        conn,
+        kind_filter="all",
+        sort_mode="priority",
+        limit=max(candidate_total, 1),
+        cursor=0,
+        candidate_total=candidate_total,
+        include_popularity=False,
+        include_route_candidates=False,
+        apply_admission=False,
+    )
+    admission = reconcile_review_admissions(conn, items)
+    admission_states = dict(admission["states"])
+    by_kind: dict[str, int] = {}
+    blocked_by_kind: dict[str, int] = {}
+    deferred_by_kind: dict[str, int] = {}
+    active_by_raw_kind: dict[str, int] = {}
+    blocked_by_raw_kind: dict[str, int] = {}
+    deferred_by_raw_kind: dict[str, int] = {}
+    for item in items:
+        group = str(item.get("group") or "other")
+        raw_kind = str(item.get("kind") or "other")
+        if admission_states.get(str(item.get("id") or "")) == "deferred":
+            deferred_by_kind[group] = deferred_by_kind.get(group, 0) + 1
+            deferred_by_raw_kind[raw_kind] = deferred_by_raw_kind.get(raw_kind, 0) + 1
+            continue
+        by_kind[group] = by_kind.get(group, 0) + 1
+        active_by_raw_kind[raw_kind] = active_by_raw_kind.get(raw_kind, 0) + 1
+        if item.get("approvable") is not True:
+            blocked_by_kind[group] = blocked_by_kind.get(group, 0) + 1
+            blocked_by_raw_kind[raw_kind] = blocked_by_raw_kind.get(raw_kind, 0) + 1
+    blocked_total = sum(blocked_by_kind.values())
+    deferred_total = sum(deferred_by_kind.values())
+    active_total = len(items) - deferred_total
+    return {
+        "as_of": as_of or queue_freshness_timestamp(),
+        "server_pid": os.getpid(),
+        "home": str(paths.home),
+        "active_total": active_total,
+        "actionable_total": max(0, active_total - blocked_total),
+        "blocked_total": blocked_total,
+        "deferred_total": deferred_total,
+        "active_limit": int(admission["active_limit"]),
+        "daily_admission_limit": int(admission["daily_limit"]),
+        "admitted_today": int(admission["admitted_today"]),
+        "by_kind": dict(sorted(by_kind.items())),
+        "blocked_by_kind": dict(sorted(blocked_by_kind.items())),
+        "deferred_by_kind": dict(sorted(deferred_by_kind.items())),
+        "active_by_raw_kind": dict(sorted(active_by_raw_kind.items())),
+        "blocked_by_raw_kind": dict(sorted(blocked_by_raw_kind.items())),
+        "deferred_by_raw_kind": dict(sorted(deferred_by_raw_kind.items())),
+        "raw": dict(sorted((raw_counts.get("raw") or {}).items())),
+    }
+
+
+def legacy_queue_counts(summary: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "total": int(summary.get("active_total") or 0),
+        "by_kind": dict(summary.get("by_kind") or {}),
+        "raw": dict(summary.get("raw") or {}),
+    }
+
+
+def queue_counts_for_state(
+    summary: dict[str, Any], review_state: str
+) -> dict[str, Any]:
+    normalized = normalize_queue_state(review_state)
+    if normalized == "all":
+        return legacy_queue_counts(summary)
+    active_by_kind = dict(summary.get("by_kind") or {})
+    blocked_by_kind = dict(summary.get("blocked_by_kind") or {})
+    deferred_by_kind = dict(summary.get("deferred_by_kind") or {})
+    active_by_raw = dict(summary.get("active_by_raw_kind") or {})
+    blocked_by_raw = dict(summary.get("blocked_by_raw_kind") or {})
+    deferred_by_raw = dict(summary.get("deferred_by_raw_kind") or {})
+    if normalized == "blocked":
+        by_kind = blocked_by_kind
+        raw = blocked_by_raw
+    elif normalized == "deferred":
+        by_kind = deferred_by_kind
+        raw = deferred_by_raw
+    else:
+        by_kind = {
+            kind: max(0, int(count) - int(blocked_by_kind.get(kind) or 0))
+            for kind, count in active_by_kind.items()
+        }
+        raw = {
+            kind: max(0, int(count) - int(blocked_by_raw.get(kind) or 0))
+            for kind, count in active_by_raw.items()
+        }
+    by_kind = {kind: count for kind, count in by_kind.items() if count}
+    raw = {kind: count for kind, count in raw.items() if count}
+    return {
+        "total": sum(by_kind.values()),
+        "by_kind": dict(sorted(by_kind.items())),
+        "raw": dict(sorted(raw.items())),
+    }
+
+
+def current_queue_summary(paths: BrainPaths) -> dict[str, Any]:
+    with connection(paths.sqlite_path) as conn:
+        return build_queue_summary(paths, conn)
+
+
+def queue_freshness_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 def queue_group_for_kind(kind: str, action_type: str | None = None) -> str:
     normalized = str(kind or "").strip()
     if normalized in {"fact_conflict_review", "conflict"}:
         return "conflicts"
-    if normalized == "unrouted_fact":
+    if normalized in {"unrouted_fact", "unrouted_inbox_batch"}:
         return "unrouted"
     if normalized == "document_extraction_anomaly":
         return "anomalies"
@@ -1134,7 +1358,26 @@ def queue_group_for_kind(kind: str, action_type: str | None = None) -> str:
         return "topology"
     if normalized == "policy_escalation" and action_type in TOPOLOGY_ACTION_TYPES:
         return "topology"
+    if normalized == "policy_escalation":
+        return "policy"
     return normalized or "other"
+
+
+def actions_for_ids(conn: Any, action_ids: set[str]) -> dict[str, dict[str, Any]]:
+    if not action_ids or not ui_table_exists(conn, "cos_actions"):
+        return {}
+    placeholders = ",".join("?" for _ in action_ids)
+    return {
+        str(row["id"]): row_to_action(row)
+        for row in conn.execute(
+            f"SELECT * FROM cos_actions WHERE id IN ({placeholders})",
+            sorted(action_ids),
+        )
+    }
+
+
+def topology_action_identity(action: dict[str, Any]) -> str:
+    return action_candidate_key(action) or f"action:{action.get('id')}"
 
 
 TOPOLOGY_ACTION_TYPES = {
@@ -1151,14 +1394,21 @@ TOPOLOGY_ACTION_TYPES = {
 
 
 class QueueBuildContext:
-    def __init__(self, paths: BrainPaths, conn: Any):
+    def __init__(
+        self, paths: BrainPaths, conn: Any, *, include_popularity: bool = True
+    ):
         self.paths = paths
         self.conn = conn
+        self.include_popularity = include_popularity
         self._active_pages: list[dict[str, Any]] | None = None
         self._action_cache: dict[str, dict[str, Any]] = {}
         self._fact_cache: dict[str, dict[str, Any]] = {}
         self._entity_cache: dict[str, dict[str, Any] | None] = {}
         self._source_document_cache: dict[str, dict[str, Any] | None] = {}
+        self._chunk_document_cache: dict[str, str | None] = {}
+        self._document_route_prior_cache: dict[str, list[dict[str, Any]]] = {}
+        self._fact_retrieval_events: dict[str, dict[str, str]] | None = None
+        self._entity_retrieval_events: dict[str, dict[str, str]] | None = None
 
     def active_pages(self) -> list[dict[str, Any]]:
         if self._active_pages is None:
@@ -1189,7 +1439,9 @@ class QueueBuildContext:
 
     def entities(self, entity_ids: list[str]) -> dict[str, dict[str, Any]]:
         requested = [entity_id for entity_id in entity_ids if entity_id]
-        missing = [entity_id for entity_id in requested if entity_id not in self._entity_cache]
+        missing = [
+            entity_id for entity_id in requested if entity_id not in self._entity_cache
+        ]
         if missing and ui_table_exists(self.conn, "entities"):
             placeholders = ",".join("?" for _ in missing)
             rows = self.conn.execute(
@@ -1210,12 +1462,43 @@ class QueueBuildContext:
         }
 
     def source_documents(self, source_ids: list[str]) -> list[dict[str, Any]]:
-        document_ids = [
-            str(source_id).removeprefix("document:")
-            for source_id in source_ids
-            if str(source_id).startswith("document:")
-            and str(source_id).removeprefix("document:")
+        normalized = [str(source_id) for source_id in source_ids if source_id]
+        chunk_ids = [
+            source_id.removeprefix("chunk:")
+            for source_id in normalized
+            if source_id.startswith("chunk:") and source_id.removeprefix("chunk:")
         ]
+        missing_chunks = [
+            chunk_id
+            for chunk_id in chunk_ids
+            if chunk_id not in self._chunk_document_cache
+        ]
+        if missing_chunks and ui_table_exists(self.conn, "chunks"):
+            placeholders = ",".join("?" for _ in missing_chunks)
+            rows = self.conn.execute(
+                f"SELECT id, document_id FROM chunks WHERE id IN ({placeholders})",
+                missing_chunks,
+            )
+            found = {str(row["id"]): str(row["document_id"]) for row in rows}
+            for chunk_id in missing_chunks:
+                self._chunk_document_cache[chunk_id] = found.get(chunk_id)
+
+        document_ids: list[str] = []
+        references: dict[str, list[str]] = {}
+        for source_id in normalized:
+            document_id = ""
+            if source_id.startswith("document:"):
+                document_id = source_id.removeprefix("document:")
+            elif source_id.startswith("chunk:"):
+                document_id = str(
+                    self._chunk_document_cache.get(source_id.removeprefix("chunk:"))
+                    or ""
+                )
+            if not document_id:
+                continue
+            if document_id not in document_ids:
+                document_ids.append(document_id)
+            references.setdefault(document_id, []).append(source_id)
         missing = [
             document_id
             for document_id in document_ids
@@ -1225,7 +1508,8 @@ class QueueBuildContext:
             placeholders = ",".join("?" for _ in missing)
             rows = self.conn.execute(
                 f"""
-                SELECT id, title, source_type, source_path, raw_path, ingested_at
+                SELECT id, title, source_type, source_path, raw_path,
+                       created_at, ingested_at
                 FROM documents
                 WHERE id IN ({placeholders})
                 """,
@@ -1247,10 +1531,170 @@ class QueueBuildContext:
                     "source_type": row["source_type"],
                     "source_path": row["source_path"],
                     "raw_path": row["raw_path"],
+                    "created_at": row["created_at"],
                     "ingested_at": row["ingested_at"],
+                    "source_refs": references.get(document_id, []),
                 }
             )
         return documents
+
+    def fact_popularity(self, fact_ids: list[str]) -> dict[str, Any]:
+        if self._fact_retrieval_events is None:
+            self._fact_retrieval_events = fact_retrieval_event_index(self.conn)
+        return popularity_for_ids(self._fact_retrieval_events, fact_ids)
+
+    def document_route_priors(self, document_id: str) -> list[dict[str, Any]]:
+        normalized = str(document_id or "").strip()
+        if normalized not in self._document_route_prior_cache:
+            self._document_route_prior_cache[normalized] = (
+                load_document_route_priors(self.conn, normalized) if normalized else []
+            )
+        return self._document_route_prior_cache[normalized]
+
+    def descriptor_popularity(self, descriptor: dict[str, Any]) -> dict[str, Any]:
+        if self._fact_retrieval_events is None:
+            self._fact_retrieval_events = fact_retrieval_event_index(self.conn)
+        if self._entity_retrieval_events is None:
+            self._entity_retrieval_events = entity_retrieval_event_index(self.conn)
+        fact_ids: set[str] = set()
+        entity_ids: set[str] = set()
+        collect_popularity_target_ids(descriptor.get("item"), fact_ids, entity_ids)
+        if descriptor.get("source_type") == "question":
+            action_id = str(
+                (descriptor.get("item") or {}).get("action_id") or ""
+            ).strip()
+            if action_id:
+                try:
+                    collect_popularity_target_ids(
+                        self.action(action_id), fact_ids, entity_ids
+                    )
+                except ValueError:
+                    pass
+        fact = popularity_for_ids(self._fact_retrieval_events, sorted(fact_ids))
+        entity = popularity_for_ids(self._entity_retrieval_events, sorted(entity_ids))
+        event_timestamps = {
+            **popularity_events_for_ids(self._fact_retrieval_events, sorted(fact_ids)),
+            **popularity_events_for_ids(
+                self._entity_retrieval_events, sorted(entity_ids)
+            ),
+        }
+        return {
+            "retrieval_count": len(event_timestamps),
+            "last_retrieved_at": max(event_timestamps.values())
+            if event_timestamps
+            else None,
+            "fact_retrieval_count": fact["retrieval_count"],
+            "entity_retrieval_count": entity["retrieval_count"],
+        }
+
+
+FACT_ID_KEYS = {"fact_id", "supersedes_id"}
+FACT_IDS_KEYS = {"fact_ids", "target_fact_ids", "counterpart_fact_ids"}
+ENTITY_ID_KEYS = {
+    "entity_id",
+    "canonical_entity_id",
+    "target_entity_id",
+    "destination_entity_id",
+}
+ENTITY_IDS_KEYS = {"entity_ids", "merged_entity_ids", "source_entity_ids"}
+
+
+def fact_retrieval_event_index(conn: Any) -> dict[str, dict[str, str]]:
+    if not ui_table_exists(conn, "context_lineage_events"):
+        return {}
+    rows = conn.execute(
+        """
+        SELECT target_id, retrieval_event_id, created_at
+        FROM context_lineage_events
+        WHERE target_type = 'fact'
+          AND event_type = 'exposed'
+          AND retrieval_event_id IS NOT NULL
+        """
+    )
+    index: dict[str, dict[str, str]] = {}
+    for row in rows:
+        index.setdefault(str(row["target_id"]), {})[str(row["retrieval_event_id"])] = (
+            str(row["created_at"] or "")
+        )
+    return index
+
+
+def entity_retrieval_event_index(conn: Any) -> dict[str, dict[str, str]]:
+    if not ui_table_exists(conn, "context_lineage_events") or not ui_table_exists(
+        conn, "fact_entities"
+    ):
+        return {}
+    rows = conn.execute(
+        """
+        SELECT fe.entity_id, cle.retrieval_event_id, cle.created_at
+        FROM fact_entities fe
+        JOIN context_lineage_events cle
+          ON cle.target_type = 'fact'
+         AND cle.target_id = fe.fact_id
+         AND cle.event_type = 'exposed'
+         AND cle.retrieval_event_id IS NOT NULL
+        """
+    )
+    index: dict[str, dict[str, str]] = {}
+    for row in rows:
+        index.setdefault(str(row["entity_id"]), {})[str(row["retrieval_event_id"])] = (
+            str(row["created_at"] or "")
+        )
+    return index
+
+
+def popularity_events_for_ids(
+    index: dict[str, dict[str, str]], target_ids: list[str]
+) -> dict[str, str]:
+    events: dict[str, str] = {}
+    for target_id in target_ids:
+        for event_id, created_at in index.get(str(target_id), {}).items():
+            if created_at >= events.get(event_id, ""):
+                events[event_id] = created_at
+    return events
+
+
+def popularity_for_ids(
+    index: dict[str, dict[str, str]], target_ids: list[str]
+) -> dict[str, Any]:
+    events = popularity_events_for_ids(index, target_ids)
+    return {
+        "retrieval_count": len(events),
+        "last_retrieved_at": max(events.values()) if events else None,
+    }
+
+
+def collect_popularity_target_ids(
+    value: Any, fact_ids: set[str], entity_ids: set[str]
+) -> None:
+    if isinstance(value, list):
+        for item in value:
+            collect_popularity_target_ids(item, fact_ids, entity_ids)
+        return
+    if not isinstance(value, dict):
+        return
+    for key, item in value.items():
+        if key in FACT_ID_KEYS:
+            if str(item or "").strip():
+                fact_ids.add(str(item).strip())
+            continue
+        if key in FACT_IDS_KEYS:
+            values = item if isinstance(item, list) else [item]
+            fact_ids.update(
+                str(target).strip() for target in values if str(target or "").strip()
+            )
+            continue
+        if key in ENTITY_ID_KEYS:
+            if str(item or "").strip():
+                entity_ids.add(str(item).strip())
+            continue
+        if key in ENTITY_IDS_KEYS:
+            values = item if isinstance(item, list) else [item]
+            entity_ids.update(
+                str(target).strip() for target in values if str(target or "").strip()
+            )
+            continue
+        collect_popularity_target_ids(item, fact_ids, entity_ids)
 
 
 def queue_context_paths(context: BrainPaths | QueueBuildContext) -> BrainPaths:
@@ -1279,6 +1723,14 @@ def active_question_action_ids(conn: Any) -> set[str]:
 def queue_action_rows(
     conn: Any, *, exclude_action_ids: set[str], limit: int
 ) -> list[dict[str, Any]]:
+    return queue_open_topology_actions(conn, exclude_action_ids=exclude_action_ids)[
+        :limit
+    ]
+
+
+def queue_open_topology_actions(
+    conn: Any, *, exclude_action_ids: set[str]
+) -> list[dict[str, Any]]:
     if not ui_table_exists(conn, "cos_actions"):
         return []
     placeholders = ",".join("?" for _ in exclude_action_ids)
@@ -1293,62 +1745,80 @@ def queue_action_rows(
           {exclude}
         ORDER BY
           CASE risk_tier WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
-          created_at DESC
-        LIMIT ?
-        """,
-        [*TOPOLOGY_ACTION_TYPES, *params, limit],
-    )
-    return [row_to_action(row) for row in rows]
-
-
-def queue_action_count(conn: Any, *, exclude_action_ids: set[str]) -> int:
-    if not ui_table_exists(conn, "cos_actions"):
-        return 0
-    placeholders = ",".join("?" for _ in exclude_action_ids)
-    exclude = f"AND id NOT IN ({placeholders})" if exclude_action_ids else ""
-    params: list[Any] = list(exclude_action_ids)
-    row = conn.execute(
-        f"""
-        SELECT COUNT(*)
-        FROM cos_actions
-        WHERE status IN ('proposed', 'needs_human')
-          AND action_type IN ({",".join("?" for _ in TOPOLOGY_ACTION_TYPES)})
-          {exclude}
+          created_at DESC,
+          id DESC
         """,
         [*TOPOLOGY_ACTION_TYPES, *params],
-    ).fetchone()
-    return int(row[0] if row else 0)
+    )
+    actions: list[dict[str, Any]] = []
+    seen_candidate_keys: set[str] = set()
+    for row in rows:
+        action = row_to_action(row)
+        if entity_merge_action_already_applied(conn, action):
+            continue
+        candidate_key = action_candidate_key(action)
+        if candidate_key and candidate_key in seen_candidate_keys:
+            continue
+        if candidate_key:
+            seen_candidate_keys.add(candidate_key)
+        actions.append(action)
+    return actions
+
+
+def entity_merge_action_already_applied(conn: Any, action: dict[str, Any]) -> bool:
+    if action.get("action_type") != "entity_merge":
+        return False
+    payload = action_payload(action)
+    canonical_id = str(
+        payload.get("canonical_entity_id")
+        or payload.get("target_entity_id")
+        or payload.get("destination_entity_id")
+        or ""
+    ).strip()
+    raw_sources = (
+        payload.get("merged_entity_ids")
+        or payload.get("source_entity_ids")
+        or payload.get("entity_ids")
+        or []
+    )
+    if not isinstance(raw_sources, list):
+        raw_sources = [raw_sources]
+    source_ids = [
+        str(value).strip()
+        for value in raw_sources
+        if str(value or "").strip() and str(value).strip() != canonical_id
+    ]
+    if not canonical_id or not source_ids or not ui_table_exists(conn, "entities"):
+        return False
+    placeholders = ",".join("?" for _ in [canonical_id, *source_ids])
+    entities = {
+        str(row["id"]): row
+        for row in conn.execute(
+            f"SELECT id, status, merged_into FROM entities WHERE id IN ({placeholders})",
+            [canonical_id, *source_ids],
+        )
+    }
+    canonical = entities.get(canonical_id)
+    if canonical is None or str(canonical["status"] or "active") != "active":
+        return False
+    return all(
+        source_id in entities
+        and str(entities[source_id]["status"] or "") == "merged"
+        and str(entities[source_id]["merged_into"] or "") == canonical_id
+        for source_id in source_ids
+    )
 
 
 def queue_audit_rows(conn: Any, *, limit: int) -> list[dict[str, Any]]:
     if not ui_table_exists(conn, "cos_actions"):
         return []
-    rows = conn.execute(
-        """
-        SELECT *
-        FROM cos_actions
-        WHERE audit_status = 'sampled_bad'
-          AND status NOT IN ('reverted', 'rejected', 'dismissed')
-        ORDER BY COALESCE(applied_at, created_at) DESC
-        LIMIT ?
-        """,
-        (limit,),
-    )
-    return [row_to_action(row) for row in rows]
+    return reviewable_bad_audit_actions(conn)[:limit]
 
 
 def queue_audit_count(conn: Any) -> int:
     if not ui_table_exists(conn, "cos_actions"):
         return 0
-    row = conn.execute(
-        """
-        SELECT COUNT(*)
-        FROM cos_actions
-        WHERE audit_status = 'sampled_bad'
-          AND status NOT IN ('reverted', 'rejected', 'dismissed')
-        """
-    ).fetchone()
-    return int(row[0] if row else 0)
+    return len(reviewable_bad_audit_actions(conn))
 
 
 def queue_memory_rows(conn: Any, *, limit: int) -> list[dict[str, Any]]:
@@ -1368,16 +1838,44 @@ def queue_memory_rows(conn: Any, *, limit: int) -> list[dict[str, Any]]:
 
 
 def ui_queue(paths: BrainPaths, query: dict[str, list[str]]) -> dict[str, Any]:
+    request_as_of = queue_freshness_timestamp()
     kind_filter = first(query, "kind") or "all"
+    review_state = normalize_queue_state(first(query, "state") or "actionable")
+    sort_mode = normalize_queue_sort(first(query, "sort") or "priority")
     limit = bounded_int(first(query, "limit"), default=200, minimum=1, maximum=500)
     cursor = bounded_int(first(query, "cursor"), default=0, minimum=0, maximum=100_000)
     with connection(paths.sqlite_path) as conn:
-        counts = queue_counts(conn)
+        raw_counts = queue_counts(conn)
+        queue_summary = build_queue_summary(
+            paths, conn, raw_counts=raw_counts, as_of=request_as_of
+        )
+        counts = queue_counts_for_state(queue_summary, review_state)
         total = queue_total_from_counts(counts, kind_filter)
-        items = queue_items(paths, conn, kind_filter=kind_filter, limit=limit, cursor=cursor)
+        items = queue_items(
+            paths,
+            conn,
+            kind_filter=kind_filter,
+            sort_mode=sort_mode,
+            limit=limit,
+            cursor=cursor,
+            candidate_total=max(
+                int(queue_summary.get("active_total") or 0)
+                + int(queue_summary.get("deferred_total") or 0),
+                sum(
+                    int(value)
+                    for value in (
+                        queue_summary.get("active_by_raw_kind") or {}
+                    ).values()
+                ),
+            ),
+            review_state=review_state,
+        )
     next_cursor = cursor + limit if cursor + limit < total else None
     return {
         "kind": kind_filter,
+        "state": review_state,
+        "sort": sort_mode,
+        "queue_summary": queue_summary,
         "counts": counts,
         "total": total,
         "cursor": cursor,
@@ -1391,14 +1889,25 @@ def queue_items(
     conn: Any,
     *,
     kind_filter: str,
+    sort_mode: str,
     limit: int,
     cursor: int,
+    candidate_total: int,
+    review_state: str = "all",
+    include_popularity: bool = True,
+    include_route_candidates: bool = True,
+    apply_admission: bool = True,
 ) -> list[dict[str, Any]]:
     fetch_limit = cursor + limit
     descriptors: list[dict[str, Any]] = []
     if fetch_limit <= 0:
         return []
-    descriptors.extend(queue_question_descriptors(conn, kind_filter, fetch_limit))
+    normalized_state = normalize_queue_state(review_state)
+    if normalized_state != "all" or sort_mode in {"retrieval", "newest"}:
+        descriptor_limit = max(fetch_limit, candidate_total)
+    else:
+        descriptor_limit = max(fetch_limit, min(2_000, fetch_limit * 4))
+    descriptors.extend(queue_question_descriptors(conn, kind_filter, descriptor_limit))
     if queue_filter_matches(kind_filter, "proposed_action", "topology"):
         question_action_ids = active_question_action_ids(conn)
         descriptors.extend(
@@ -1406,9 +1915,10 @@ def queue_items(
                 "source_type": "action",
                 "item": action,
                 "sort": queue_item_sort_key(queue_action_stub(action)),
+                "dedupe_key": f"topology:{topology_action_identity(action)}",
             }
             for action in queue_action_rows(
-                conn, exclude_action_ids=question_action_ids, limit=fetch_limit
+                conn, exclude_action_ids=question_action_ids, limit=descriptor_limit
             )
         )
     if queue_filter_matches(kind_filter, "audit_flagged", "audit"):
@@ -1418,7 +1928,7 @@ def queue_items(
                 "item": action,
                 "sort": queue_item_sort_key(queue_audit_stub(action)),
             }
-            for action in queue_audit_rows(conn, limit=fetch_limit)
+            for action in queue_audit_rows(conn, limit=descriptor_limit)
         )
     if queue_filter_matches(kind_filter, "proposed_memory", "memories"):
         descriptors.extend(
@@ -1427,14 +1937,68 @@ def queue_items(
                 "item": memory,
                 "sort": queue_item_sort_key(queue_memory_stub(memory)),
             }
-            for memory in queue_memory_rows(conn, limit=fetch_limit)
+            for memory in queue_memory_rows(conn, limit=descriptor_limit)
         )
-    descriptors.sort(key=lambda descriptor: descriptor["sort"])
-    ctx = QueueBuildContext(paths, conn)
-    return [
-        queue_item_from_descriptor(ctx, descriptor)
-        for descriptor in descriptors[cursor : cursor + limit]
-    ]
+    descriptors.sort(
+        key=lambda descriptor: str(descriptor["sort"][2] or ""), reverse=True
+    )
+    descriptors.sort(key=lambda descriptor: descriptor["sort"][:2])
+    descriptors = dedupe_queue_descriptors(descriptors)
+    ctx = QueueBuildContext(paths, conn, include_popularity=include_popularity)
+    if include_popularity:
+        for descriptor in descriptors:
+            descriptor["popularity"] = ctx.descriptor_popularity(descriptor)
+    if sort_mode == "retrieval":
+        descriptors.sort(
+            key=lambda descriptor: int(
+                (descriptor.get("popularity") or {}).get("retrieval_count") or 0
+            ),
+            reverse=True,
+        )
+    elif sort_mode == "newest":
+        descriptors.sort(
+            key=lambda descriptor: str(descriptor["sort"][2] or ""),
+            reverse=True,
+        )
+    if normalized_state == "all" and not apply_admission:
+        return [
+            queue_item_from_descriptor(
+                ctx, descriptor, include_route_candidates=include_route_candidates
+            )
+            for descriptor in descriptors[cursor : cursor + limit]
+        ]
+
+    admission_states = (
+        load_review_admission_states(
+            conn,
+            {
+                str(descriptor["item"].get("id") or "")
+                for descriptor in descriptors
+            },
+        )
+        if apply_admission
+        else {}
+    )
+    matching: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for descriptor in descriptors:
+        card = queue_item_from_descriptor(
+            ctx, descriptor, include_route_candidates=False
+        )
+        admission_state = admission_states.get(str(card.get("id") or ""), "admitted")
+        card["admission_state"] = admission_state
+        if queue_item_matches_state(card, normalized_state, admission_state):
+            matching.append((descriptor, card))
+    selected = matching[cursor : cursor + limit]
+    if not include_route_candidates:
+        return [card for _, card in selected]
+    items = []
+    for descriptor, card in selected:
+        complete = queue_item_from_descriptor(
+            ctx, descriptor, include_route_candidates=True
+        )
+        complete["admission_state"] = card["admission_state"]
+        items.append(complete)
+    return items
 
 
 def queue_question_descriptors(
@@ -1456,9 +2020,10 @@ def queue_question_descriptors(
             WHEN 'fact_conflict_review' THEN 0
             WHEN 'conflict' THEN 1
             WHEN 'unrouted_fact' THEN 2
-            WHEN 'document_extraction_anomaly' THEN 3
-            WHEN 'policy_escalation' THEN 4
-            ELSE 5
+            WHEN 'unrouted_inbox_batch' THEN 3
+            WHEN 'document_extraction_anomaly' THEN 4
+            WHEN 'policy_escalation' THEN 5
+            ELSE 6
           END,
           CASE risk_tier WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
           created_at DESC
@@ -1473,29 +2038,261 @@ def queue_question_descriptors(
         if queue_filter_matches(
             kind_filter, str(stub.get("kind") or ""), str(stub.get("group") or "")
         ):
-            descriptors.append(
-                {
-                    "source_type": "question",
-                    "item": question,
-                    "sort": queue_item_sort_key(stub),
-                }
-            )
+            descriptor = {
+                "source_type": "question",
+                "item": question,
+                "sort": queue_item_sort_key(stub),
+            }
+            if stub.get("group") == "topology" and question.get("action_id"):
+                action = actions_for_ids(conn, {str(question["action_id"])}).get(
+                    str(question["action_id"])
+                )
+                if action is None or entity_merge_action_already_applied(conn, action):
+                    continue
+                descriptor["dedupe_key"] = (
+                    f"topology:{topology_action_identity(action)}"
+                )
+            descriptors.append(descriptor)
     return descriptors
 
 
+def dedupe_queue_descriptors(
+    descriptors: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    deduped = []
+    for descriptor in descriptors:
+        key = str(descriptor.get("dedupe_key") or "")
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        deduped.append(descriptor)
+    return deduped
+
+
 def queue_item_from_descriptor(
-    ctx: QueueBuildContext, descriptor: dict[str, Any]
+    ctx: QueueBuildContext,
+    descriptor: dict[str, Any],
+    *,
+    include_route_candidates: bool = True,
 ) -> dict[str, Any]:
     source_type = str(descriptor["source_type"])
     if source_type == "question":
-        return queue_item_for_question(ctx, descriptor["item"])
-    if source_type == "action":
-        return queue_item_for_action(ctx, descriptor["item"])
-    if source_type == "audit":
-        return queue_item_for_audit_action(ctx, descriptor["item"])
-    if source_type == "memory":
-        return queue_item_for_memory(ctx, descriptor["item"])
-    raise ValueError(f"unsupported queue source: {source_type}")
+        item = queue_item_for_question(
+            ctx,
+            descriptor["item"],
+            include_route_candidates=include_route_candidates,
+        )
+    elif source_type == "action":
+        item = queue_item_for_action(ctx, descriptor["item"])
+    elif source_type == "audit":
+        item = queue_item_for_audit_action(ctx, descriptor["item"])
+    elif source_type == "memory":
+        item = queue_item_for_memory(ctx, descriptor["item"])
+    else:
+        raise ValueError(f"unsupported queue source: {source_type}")
+    item["popularity"] = descriptor.get("popularity") or {
+        "retrieval_count": 0,
+        "last_retrieved_at": None,
+        "fact_retrieval_count": 0,
+        "entity_retrieval_count": 0,
+    }
+    item.update(validate_queue_card(item))
+    return item
+
+
+def validate_queue_card(item: dict[str, Any]) -> dict[str, Any]:
+    group = str(item.get("group") or "")
+    kind = str(item.get("kind") or "")
+
+    def blocked(code: str, reason: str) -> dict[str, Any]:
+        return {
+            "approvable": False,
+            "blocking_code": code,
+            "blocking_reason": reason,
+        }
+
+    def fact_problem(fact: Any, label: str) -> dict[str, Any] | None:
+        if not isinstance(fact, dict):
+            return blocked("missing_fact", f"{label} fact payload is unavailable.")
+        if not str(fact.get("statement") or "").strip():
+            return blocked("missing_statement", f"{label} fact has no statement.")
+        evidence = str(fact.get("evidence_quote") or fact.get("quote") or "").strip()
+        if (
+            not evidence
+            and not fact.get("source_ids")
+            and not fact.get("source_documents")
+        ):
+            return blocked(
+                "missing_evidence", f"{label} fact has no quote or source evidence."
+            )
+        if not str(fact.get("source_date") or "").strip():
+            return blocked(
+                "missing_source_date", f"{label} fact has no auditable source date."
+            )
+        return None
+
+    def topology_problem() -> dict[str, Any] | None:
+        action = item.get("action") if isinstance(item.get("action"), dict) else {}
+        action_type = str(action.get("action_type") or "")
+        topology = (
+            item.get("topology") if isinstance(item.get("topology"), dict) else {}
+        )
+        if not action_type:
+            return blocked(
+                "missing_action", "The linked topology action is unavailable."
+            )
+        entity_ids = [value for value in topology.get("entity_ids") or [] if value]
+        page_hints = [value for value in topology.get("page_hints") or [] if value]
+        if not entity_ids and not page_hints:
+            return blocked(
+                "missing_topology_target",
+                "The topology action does not identify the entity or page it changes.",
+            )
+        if action_type == "page_split":
+            preview = topology.get("split_preview")
+            if not isinstance(preview, dict) or preview.get("approvable") is not True:
+                return blocked(
+                    "incomplete_split_preview",
+                    "The page split has no complete resulting-page preview.",
+                )
+        if action_type == "page_merge" and len(page_hints) < 2:
+            return blocked(
+                "incomplete_merge_target",
+                "The page merge must show every source page and its destination.",
+            )
+        if action_type == "entity_merge":
+            labels = [value for value in topology.get("entity_labels") or [] if value]
+            statuses = topology.get("entity_statuses") or {}
+            if (
+                len(entity_ids) < 2
+                or len(labels) < 2
+                or any(statuses.get(entity_id) != "active" for entity_id in entity_ids)
+            ):
+                return blocked(
+                    "incomplete_merge_target",
+                    "The entity merge must show both active entities and its direction.",
+                )
+        return None
+
+    if group == "conflicts":
+        if item.get("comparison_mode") == "alternatives":
+            alternatives = item.get("alternatives") or []
+            if len(alternatives) < 2:
+                return blocked(
+                    "missing_alternatives",
+                    "The historical comparison has fewer than two facts.",
+                )
+            for index, alternative in enumerate(alternatives, start=1):
+                problem = fact_problem(alternative, f"Historical fact {index}")
+                if problem:
+                    return problem
+        else:
+            problem = fact_problem(item.get("candidate"), "Candidate")
+            if problem:
+                return problem
+            counterparts = item.get("counterparts") or []
+            if not counterparts:
+                return blocked(
+                    "missing_counterpart",
+                    "The conflict has no existing fact to compare.",
+                )
+            for index, counterpart in enumerate(counterparts, start=1):
+                problem = fact_problem(counterpart, f"Existing {index}")
+                if problem:
+                    return problem
+            orientation = (
+                item.get("orientation")
+                if isinstance(item.get("orientation"), dict)
+                else {}
+            )
+            if not str(orientation.get("relation") or "").strip():
+                return blocked(
+                    "missing_relation",
+                    "The candidate/existing relation is unavailable.",
+                )
+
+    elif group == "unrouted":
+        if kind == "unrouted_inbox_batch":
+            question = (
+                item.get("question") if isinstance(item.get("question"), dict) else {}
+            )
+            context = (
+                question.get("context")
+                if isinstance(question.get("context"), dict)
+                else {}
+            )
+            if not context.get("source_question_ids"):
+                return blocked(
+                    "missing_batch_members", "The inbox batch has no source questions."
+                )
+        else:
+            problem = fact_problem(item.get("candidate"), "Unrouted")
+            if problem:
+                return problem
+
+    elif kind == "policy_escalation":
+        action = item.get("action")
+        if not isinstance(action, dict):
+            return blocked("missing_action", "The linked policy action is unavailable.")
+        if not str(item.get("summary") or "").strip():
+            return blocked("missing_policy_reason", "The policy reason is unavailable.")
+        if str(action.get("action_type") or "") in TOPOLOGY_ACTION_TYPES:
+            problem = topology_problem()
+            if problem:
+                return problem
+        elif (
+            item.get("candidate") is not None
+            or str(action.get("action_type") or "") == "fact_upsert"
+        ):
+            problem = fact_problem(item.get("candidate"), "Candidate")
+            if problem:
+                return problem
+
+    elif group == "topology":
+        problem = topology_problem()
+        if problem:
+            return problem
+
+    elif group == "memories":
+        memory = item.get("memory") if isinstance(item.get("memory"), dict) else {}
+        if not str(memory.get("content") or "").strip():
+            return blocked("missing_memory", "The proposed memory has no content.")
+        if not memory.get("source_ids") and not memory.get("source_documents"):
+            return blocked("missing_evidence", "The proposed memory has no provenance.")
+
+    elif group == "audit":
+        action = item.get("action") if isinstance(item.get("action"), dict) else {}
+        if not action:
+            return blocked("missing_action", "The audited action is unavailable.")
+        if not str(item.get("summary") or "").strip():
+            return blocked("missing_audit_finding", "The audit finding is unavailable.")
+        if str(action.get("action_type") or "") in TOPOLOGY_ACTION_TYPES:
+            problem = topology_problem()
+            if problem:
+                return problem
+        elif action.get("action_type") == "fact_upsert":
+            problem = fact_problem(item.get("candidate"), "Applied")
+            if problem:
+                return problem
+
+    elif group == "anomalies":
+        anomaly = item.get("anomaly") if isinstance(item.get("anomaly"), dict) else {}
+        if not str(anomaly.get("document_id") or "").strip():
+            return blocked(
+                "missing_document", "The extraction alert has no source document."
+            )
+        if int(anomaly.get("reviewed_count") or 0) <= 0:
+            return blocked(
+                "missing_anomaly_sample",
+                "The extraction alert has no reviewed fact sample.",
+            )
+
+    elif not str(item.get("summary") or item.get("title") or "").strip():
+        return blocked("missing_summary", "The review item has no decision context.")
+
+    return {"approvable": True, "blocking_code": None, "blocking_reason": None}
 
 
 def queue_question_filter_sql(kind_filter: str) -> tuple[str | None, list[Any]]:
@@ -1505,15 +2302,31 @@ def queue_question_filter_sql(kind_filter: str) -> tuple[str | None, list[Any]]:
     if normalized == "conflicts":
         return "AND kind IN ('fact_conflict_review', 'conflict')", []
     if normalized == "unrouted":
-        return "AND kind = 'unrouted_fact'", []
+        return "AND kind IN ('unrouted_fact', 'unrouted_inbox_batch')", []
     if normalized == "anomalies":
         return "AND kind = 'document_extraction_anomaly'", []
     if normalized == "topology":
-        return "AND kind = 'policy_escalation'", []
+        action_types = sorted(TOPOLOGY_ACTION_TYPES)
+        placeholders = ",".join("?" for _ in action_types)
+        return (
+            "AND kind = 'policy_escalation' "
+            f"AND action_id IN (SELECT id FROM cos_actions WHERE action_type IN ({placeholders}))",
+            action_types,
+        )
+    if normalized == "policy":
+        action_types = sorted(TOPOLOGY_ACTION_TYPES)
+        placeholders = ",".join("?" for _ in action_types)
+        return (
+            "AND kind = 'policy_escalation' "
+            "AND (action_id IS NULL OR action_id NOT IN "
+            f"(SELECT id FROM cos_actions WHERE action_type IN ({placeholders})))",
+            action_types,
+        )
     question_kinds = {
         "fact_conflict_review",
         "conflict",
         "unrouted_fact",
+        "unrouted_inbox_batch",
         "document_extraction_anomaly",
         "policy_escalation",
     }
@@ -1551,8 +2364,53 @@ def normalize_queue_filter(kind_filter: str) -> str:
         "proposed_memory": "memories",
         "audit-flagged": "audit",
         "audit_flagged": "audit",
+        "policy_escalation": "policy",
     }
     return aliases.get(normalized, normalized)
+
+
+def normalize_queue_state(value: str) -> str:
+    normalized = str(value or "actionable").strip().lower().replace("-", "_")
+    aliases = {
+        "review": "actionable",
+        "repair": "blocked",
+        "needs_repair": "blocked",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"actionable", "blocked", "deferred", "all"}:
+        raise BadRequestError(
+            "state must be one of: actionable, blocked, deferred, all"
+        )
+    return normalized
+
+
+def queue_item_matches_state(
+    item: dict[str, Any], review_state: str, admission_state: str = "admitted"
+) -> bool:
+    normalized = normalize_queue_state(review_state)
+    blocked = item.get("approvable") is not True
+    deferred = not blocked and admission_state == "deferred"
+    if normalized == "blocked":
+        return blocked
+    if normalized == "deferred":
+        return deferred
+    if normalized == "all":
+        return blocked or not deferred
+    return not blocked and not deferred
+
+
+def normalize_queue_sort(value: str) -> str:
+    normalized = str(value or "priority").strip().lower()
+    aliases = {
+        "impact": "retrieval",
+        "popular": "retrieval",
+        "popularity": "retrieval",
+        "recent": "newest",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"priority", "retrieval", "newest"}:
+        raise BadRequestError("sort must be one of: priority, retrieval, newest")
+    return normalized
 
 
 def queue_item_sort_key(item: dict[str, Any]) -> tuple[int, int, str]:
@@ -1573,7 +2431,9 @@ def queue_item_sort_key(item: dict[str, Any]) -> tuple[int, int, str]:
 
 
 def queue_question_stub(question: dict[str, Any]) -> dict[str, Any]:
-    action_type = str((question.get("recommended_action") or {}).get("action_type") or "")
+    action_type = str(
+        (question.get("recommended_action") or {}).get("action_type") or ""
+    )
     group = queue_group_for_kind(str(question.get("kind") or ""), action_type)
     return {
         "kind": question.get("kind"),
@@ -1611,14 +2471,39 @@ def queue_memory_stub(memory: dict[str, Any]) -> dict[str, Any]:
 
 
 def queue_item_for_question(
-    context: BrainPaths | QueueBuildContext, question: dict[str, Any]
+    context: BrainPaths | QueueBuildContext,
+    question: dict[str, Any],
+    *,
+    include_route_candidates: bool = True,
 ) -> dict[str, Any]:
-    action_type = str((question.get("recommended_action") or {}).get("action_type") or "")
+    action_type = str(
+        (question.get("recommended_action") or {}).get("action_type") or ""
+    )
     group = queue_group_for_kind(str(question.get("kind") or ""), action_type)
-    candidate = question_candidate_fact(context, question)
-    counterparts = question_counterpart_facts(context, question)
+    comparison_mode = (
+        "alternatives" if is_alternative_fact_comparison(question) else None
+    )
+    alternatives = (
+        question_alternative_facts(context, question)
+        if comparison_mode == "alternatives"
+        else []
+    )
+    candidate = (
+        None
+        if comparison_mode == "alternatives"
+        else question_candidate_fact(context, question)
+    )
+    counterparts = (
+        []
+        if comparison_mode == "alternatives"
+        else question_counterpart_facts(context, question)
+    )
     summary = readable_question_summary(context, question)
-    orientation = queue_fact_orientation(context, question, candidate, counterparts)
+    orientation = (
+        queue_alternative_orientation(question, alternatives)
+        if comparison_mode == "alternatives"
+        else queue_fact_orientation(context, question, candidate, counterparts)
+    )
     title = compact_text(
         orientation.get("title")
         or (candidate or {}).get("statement")
@@ -1644,13 +2529,61 @@ def queue_item_for_question(
         "question": question,
         "candidate": candidate,
         "counterparts": counterparts,
+        "comparison_mode": comparison_mode,
+        "alternatives": alternatives,
         "orientation": orientation,
         "options": question.get("options") or [],
         "raw": question,
     }
-    if group == "unrouted" and candidate:
+    if question.get("kind") == "document_extraction_anomaly":
+        anomaly = extraction_anomaly_summary(question)
+        item["anomaly"] = anomaly
+        item["title"] = compact_text(
+            f"Extraction quality: {anomaly.get('document_title') or 'Unknown document'}",
+            120,
+        )
+    if group == "unrouted" and candidate and include_route_candidates:
         item["route_candidates"] = route_candidates_for_fact(context, candidate)
+    if question.get("kind") == "policy_escalation" and question.get("action_id"):
+        try:
+            action = get_action_for_queue(context, str(question["action_id"]))
+            item["action"] = action
+            if str(action.get("action_type") or "") in TOPOLOGY_ACTION_TYPES:
+                payload = (action.get("evidence_json") or {}).get("payload")
+                item["topology"] = action_topology(context, action, payload)
+                item["title"] = action_title(context, action, payload)
+                item["summary"] = action_summary(action, payload)
+        except ValueError:
+            pass
     return item
+
+
+def extraction_anomaly_summary(question: dict[str, Any]) -> dict[str, Any]:
+    context = (
+        question.get("context") if isinstance(question.get("context"), dict) else {}
+    )
+    reviewed_action_ids = [
+        str(action_id)
+        for action_id in context.get("reviewed_action_ids") or []
+        if str(action_id or "").strip()
+    ]
+    blocked_action_ids = [
+        str(action_id)
+        for action_id in context.get("blocked_action_ids") or []
+        if str(action_id or "").strip()
+    ]
+    reviewed_count = len(reviewed_action_ids)
+    blocked_count = len(blocked_action_ids)
+    block_rate = context.get("block_rate")
+    if block_rate is None and reviewed_count:
+        block_rate = blocked_count / reviewed_count
+    return {
+        "document_id": context.get("document_id"),
+        "document_title": context.get("title"),
+        "reviewed_count": reviewed_count,
+        "blocked_count": blocked_count,
+        "block_rate": block_rate,
+    }
 
 
 def readable_question_summary(
@@ -1732,8 +2665,12 @@ def queue_fact_orientation(
         ]
     )
     temporal_scope = infer_fact_temporal_scope(candidate or primary)
-    existing_temporal_scope = infer_fact_temporal_scope(counterparts[0]) if counterparts else ""
-    currentness = fact_currentness_label(str(relation.get("relation") or ""), temporal_scope)
+    existing_temporal_scope = (
+        infer_fact_temporal_scope(counterparts[0]) if counterparts else ""
+    )
+    currentness = fact_currentness_label(
+        str(relation.get("relation") or ""), temporal_scope
+    )
     return {
         "title": orientation_title(entity_label, section_hint),
         "entity_label": entity_label,
@@ -1748,6 +2685,39 @@ def queue_fact_orientation(
         "relation": relation.get("relation") or "",
         "relation_confidence": relation.get("confidence"),
         "relation_rationale": relation.get("rationale") or "",
+    }
+
+
+def queue_alternative_orientation(
+    question: dict[str, Any], alternatives: list[dict[str, Any]]
+) -> dict[str, Any]:
+    primary = alternatives[0] if alternatives else {}
+    page_hint = first_nonempty(
+        question.get("page_hint"),
+        *[fact.get("page_hint") for fact in alternatives],
+    )
+    section_hint = first_nonempty(
+        *[fact.get("section_hint") for fact in alternatives], "Summary"
+    )
+    entity_key = first_nonempty(
+        question.get("entity_key"),
+        *[fact.get("entity_key") for fact in alternatives],
+    )
+    entity_label = fact_entity_label(entity_key, page_hint)
+    return {
+        "title": orientation_title(entity_label, section_hint),
+        "entity_label": entity_label,
+        "entity_key": entity_key,
+        "page_hint": page_hint,
+        "section_hint": section_hint,
+        "candidate_observed_at": None,
+        "existing_observed_at": None,
+        "temporal_scope": infer_fact_temporal_scope(primary),
+        "existing_temporal_scope": None,
+        "currentness": "Keep every fact that should remain active.",
+        "relation": "contested",
+        "relation_confidence": None,
+        "relation_rationale": str(question.get("question") or ""),
     }
 
 
@@ -1769,13 +2739,20 @@ def queue_relation_context(
     except ValueError:
         return {}
     features = action.get("action_features") or {}
+    resolver = (action.get("evidence_json") or {}).get("resolver_precheck") or {}
+    resolver_judgment = resolver.get("resolver_judgment") or {}
+    if resolver_judgment.get("decision") == "no_conflict":
+        return {
+            "relation": "no conflict",
+            "confidence": None,
+            "rationale": resolver_judgment.get("rationale") or "",
+        }
     if features.get("relation"):
         return {
             "relation": features.get("relation"),
             "confidence": features.get("relation_confidence"),
             "rationale": features.get("relation_rationale") or "",
         }
-    resolver = (action.get("evidence_json") or {}).get("resolver_precheck") or {}
     classifications = resolver.get("relation_classifications") or []
     if not isinstance(classifications, list):
         return {}
@@ -1860,7 +2837,16 @@ def fact_entity_label(entity_key: Any, page_hint: Any) -> str:
     useful_parts = [
         part
         for part in key_parts
-        if part not in {"summary", "overview", "details", "concepts", "people", "projects", "career"}
+        if part
+        not in {
+            "summary",
+            "overview",
+            "details",
+            "concepts",
+            "people",
+            "projects",
+            "career",
+        }
     ]
     if useful_parts:
         return humanize_slug(useful_parts[0])
@@ -1910,13 +2896,48 @@ def question_candidate_fact(
     return None
 
 
+def is_alternative_fact_comparison(question: dict[str, Any]) -> bool:
+    if question.get("kind") != "conflict":
+        return False
+    return not any(
+        isinstance(option, dict) and option.get("option_type") == "candidate_fact"
+        for option in question.get("options") or []
+    )
+
+
+def question_alternative_facts(
+    context: BrainPaths | QueueBuildContext, question: dict[str, Any]
+) -> list[dict[str, Any]]:
+    options = [
+        option for option in question.get("options") or [] if isinstance(option, dict)
+    ]
+    option_by_id = {
+        str(option.get("id") or option.get("fact_id")): option
+        for option in options
+        if str(option.get("id") or option.get("fact_id") or "").strip()
+    }
+    fact_ids = stable_unique_strings(
+        [
+            *[option.get("id") or option.get("fact_id") for option in options],
+            *(question.get("fact_ids") or []),
+        ]
+    )
+    canonical = facts_by_id(context, fact_ids)
+    alternatives: list[dict[str, Any]] = []
+    for fact_id in fact_ids:
+        fact = merge_nonempty(canonical.get(fact_id, {}), option_by_id.get(fact_id, {}))
+        if fact:
+            alternatives.append(enrich_fact_like(context, fact))
+    return alternatives
+
+
 def question_counterpart_facts(
     context: BrainPaths | QueueBuildContext, question: dict[str, Any]
 ) -> list[dict[str, Any]]:
     counterparts: list[dict[str, Any]] = []
     for option in question.get("options") or []:
         if isinstance(option, dict) and option.get("option_type") == "existing_fact":
-            counterparts.append(enrich_fact_like(context, option))
+            counterparts.append(dict(option))
     question_context = question.get("context") or {}
     fact_ids = [
         str(fact_id)
@@ -1924,13 +2945,34 @@ def question_counterpart_facts(
         if str(fact_id or "").strip()
     ]
     if not fact_ids and question.get("kind") == "conflict":
-        fact_ids = [str(fact_id) for fact_id in question.get("fact_ids") or [] if fact_id]
+        fact_ids = [
+            str(fact_id) for fact_id in question.get("fact_ids") or [] if fact_id
+        ]
     if fact_ids:
-        known = {str(item.get("id") or item.get("fact_id") or "") for item in counterparts}
-        for fact in facts_by_id(context, fact_ids).values():
-            if fact["id"] not in known:
-                counterparts.append(enrich_fact_like(context, fact))
-    return counterparts
+        canonical = facts_by_id(context, fact_ids)
+        hydrated: list[dict[str, Any]] = []
+        known: set[str] = set()
+        for counterpart in counterparts:
+            fact_id = str(counterpart.get("id") or counterpart.get("fact_id") or "")
+            base = canonical.get(fact_id, {})
+            hydrated.append(
+                enrich_fact_like(context, merge_nonempty(base, counterpart))
+            )
+            if fact_id:
+                known.add(fact_id)
+        for fact_id, fact in canonical.items():
+            if fact_id not in known:
+                hydrated.append(enrich_fact_like(context, fact))
+        return hydrated
+    return [enrich_fact_like(context, counterpart) for counterpart in counterparts]
+
+
+def merge_nonempty(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in overlay.items():
+        if value not in (None, "", [], {}):
+            merged[key] = value
+    return merged
 
 
 def queue_item_for_action(
@@ -1959,23 +3001,152 @@ def queue_item_for_action(
 def queue_item_for_audit_action(
     context: BrainPaths | QueueBuildContext, action: dict[str, Any]
 ) -> dict[str, Any]:
+    payload = action_payload(action)
+    topology = action_topology(context, action, payload)
+    audit = audit_action_detail(context, action, latest_action_audit(action))
+    raw_fact = payload.get("fact") if isinstance(payload.get("fact"), dict) else None
+    current_fact = None
+    if raw_fact:
+        candidate_ids = [
+            str(fact_id)
+            for fact_id in [raw_fact.get("id"), *(action.get("target_fact_ids") or [])]
+            if str(fact_id or "").strip()
+        ]
+        current_facts = facts_by_id(context, list(dict.fromkeys(candidate_ids)))
+        statement = " ".join(str(raw_fact.get("statement") or "").split())
+        current_fact = next(
+            (
+                fact
+                for fact in current_facts.values()
+                if " ".join(str(fact.get("statement") or "").split()) == statement
+            ),
+            None,
+        )
+    candidate = (
+        enrich_fact_like(context, current_fact or raw_fact)
+        if current_fact or raw_fact
+        else None
+    )
+    action_type = str(action.get("action_type") or "action")
+    statement = str((candidate or {}).get("statement") or "").strip()
+    title = (
+        f"Audit finding: {compact_text(statement, 96)}"
+        if statement
+        else audit_action_title(action_type, topology)
+    )
     return {
         "id": action["id"],
         "source_type": "audit",
         "kind": "audit_flagged",
         "group": "audit",
-        "title": f"Audit flagged {action.get('action_type')}",
-        "summary": compact_text(
-            (action.get("evidence_json") or {}).get("audit", {}).get("rationale")
-            or (action.get("evidence_json") or {}).get("reason")
-            or action.get("audit_status"),
-            220,
-        ),
+        "title": title,
+        "summary": compact_text(audit.get("rationale"), 500),
         "created_at": action.get("applied_at") or action.get("created_at"),
         "status": action.get("status"),
         "risk_tier": action.get("risk_tier"),
+        "candidate": candidate,
+        "audit": audit,
+        "topology": topology,
         "action": action,
+        "proposal": payload,
         "raw": action,
+    }
+
+
+def audit_action_title(
+    action_type: str, topology: dict[str, Any] | None
+) -> str:
+    if action_type == "page_merge" and topology:
+        destination = str(topology.get("merge_destination_label") or "").strip()
+        sources = [
+            str(value)
+            for value in topology.get("merge_source_labels") or []
+            if str(value).strip()
+        ]
+        if destination and sources:
+            return f"Audit finding: Merge {compact_text(', '.join(sources), 48)} into {compact_text(destination, 48)}"
+    return f"Audit finding: {humanize_slug(action_type)}"
+
+
+def audit_action_detail(
+    context: BrainPaths | QueueBuildContext,
+    action: dict[str, Any],
+    audit: dict[str, Any],
+) -> dict[str, Any]:
+    if isinstance(context, QueueBuildContext):
+        reviewability = audit_action_reviewability(context.conn, action)
+    else:
+        with connection(context.sqlite_path) as conn:
+            reviewability = audit_action_reviewability(conn, action)
+    fact_ids = [
+        str(fact_id)
+        for fact_id in action.get("target_fact_ids") or []
+        if str(fact_id).strip()
+    ]
+    if action.get("action_type") == "fact_upsert" and reviewability.get("fact_id"):
+        fact_ids = [str(reviewability["fact_id"])]
+    inverse = (
+        action.get("inverse_action_json")
+        if isinstance(action.get("inverse_action_json"), dict)
+        else {}
+    )
+    if not fact_ids:
+        inverse_facts: list[dict[str, Any]] = []
+        for key in ("restore_facts", "restore_fact"):
+            value = inverse.get(key)
+            if isinstance(value, dict):
+                inverse_facts.append(value)
+            elif isinstance(value, list):
+                inverse_facts.extend(item for item in value if isinstance(item, dict))
+        fact_ids = [
+            str(fact.get("id"))
+            for fact in inverse_facts
+            if str(fact.get("id") or "").strip()
+        ]
+    fact_ids = list(dict.fromkeys(fact_ids))
+    fact_rows = facts_by_id(context, fact_ids[:3])
+    affected_facts = [
+        enrich_fact_like(context, fact_rows[fact_id])
+        for fact_id in fact_ids[:3]
+        if fact_id in fact_rows
+    ]
+    return {
+        **audit,
+        "affected_fact_count": len(fact_ids),
+        "affected_page_count": len(action.get("target_page_paths") or []),
+        "affected_contract_count": len(action.get("target_contract_ids") or []),
+        "affected_facts": affected_facts,
+        "revertible": bool(reviewability["revertible"]),
+        "revert_mode": reviewability.get("revert_mode"),
+        "reviewability_reason": reviewability["reason"],
+    }
+
+
+def latest_action_audit(action: dict[str, Any]) -> dict[str, Any]:
+    raw_evidence = action.get("evidence_json") or {}
+    evidence = raw_evidence if isinstance(raw_evidence, dict) else {}
+    records = evidence.get("audits")
+    valid = [record for record in records or [] if isinstance(record, dict)]
+    record = valid[-1] if valid else {}
+    metadata = (
+        record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    )
+    legacy = evidence.get("audit") if isinstance(evidence.get("audit"), dict) else {}
+    rationale = first_nonempty(
+        metadata.get("rationale"),
+        metadata.get("reason"),
+        legacy.get("rationale"),
+        evidence.get("reason"),
+        action.get("audit_status"),
+    )
+    return {
+        "status": record.get("status") or action.get("audit_status"),
+        "rationale": rationale,
+        "provider": metadata.get("provider"),
+        "model": metadata.get("model"),
+        "audited_at": record.get("at"),
+        "action_type": action.get("action_type"),
+        "action_status": action.get("status"),
     }
 
 
@@ -2004,11 +3175,23 @@ def action_title(
     action_type = str(action.get("action_type") or "action")
     if isinstance(payload, dict):
         if action_type == "entity_merge":
-            ids = [payload.get("canonical_entity_id"), *(payload.get("merged_entity_ids") or [])]
+            ids = [
+                payload.get("canonical_entity_id"),
+                *(payload.get("merged_entity_ids") or []),
+            ]
             surfaces = entity_surfaces(context, ids, payload.get("entity_names"))
+            if len(surfaces) >= 2:
+                return f"Merge {', '.join(surfaces[1:])} into {surfaces[0]}"
             return f"Merge entities: {', '.join(surfaces)}"
         if payload.get("candidate") and isinstance(payload["candidate"], dict):
             return action_title(context, action, payload["candidate"])
+        page_hints = topology_page_hints(payload)
+        if action_type == "page_split" and page_hints:
+            return f"Split page: {page_hints[0]}"
+        if action_type == "page_merge" and page_hints:
+            return f"Merge pages: {' + '.join(page_hints)}"
+        if page_hints:
+            return f"{humanize_slug(action_type)}: {', '.join(page_hints)}"
         for key in ("page_hint", "destination_page_hint", "target_path"):
             if payload.get(key):
                 return f"{action_type}: {payload[key]}"
@@ -2025,26 +3208,143 @@ def action_topology(
         payload = candidate
     action_type = str(action.get("action_type") or "action")
     entity_ids = topology_entity_ids(action_type, payload)
-    page_hints = topology_page_hints(payload)
+    page_hints = topology_page_hints(payload) or [
+        str(page_hint)
+        for page_hint in action.get("target_page_paths") or []
+        if str(page_hint).strip()
+    ]
     labels = entity_surfaces(context, entity_ids, payload.get("entity_names"))
+    entity_rows = entities_by_id(context, entity_ids)
+    entity_statuses = {
+        entity_id: str(entity_rows.get(entity_id, {}).get("status") or "")
+        for entity_id in entity_ids
+    }
+    page_statuses = action_page_contract_statuses(context, action, page_hints)
     fallback_label = topology_fallback_label(payload)
     if not labels and fallback_label:
         labels = [fallback_label]
     if not entity_ids and not labels and not page_hints:
         return None
-    return {
+    topology = {
         "entity_ids": entity_ids,
         "entity_labels": labels,
+        "entity_statuses": entity_statuses,
         "page_hints": page_hints,
+        "page_statuses": page_statuses,
         "target_label": ", ".join(labels) if labels else "",
     }
+    if action_type == "entity_merge" and len(labels) >= 2:
+        topology["merge_destination_label"] = labels[0]
+        topology["merge_source_labels"] = labels[1:]
+        topology["target_label"] = f"{', '.join(labels[1:])} into {labels[0]}"
+    if action_type == "page_merge" and len(page_hints) >= 2:
+        destination, sources = page_merge_direction(
+            context, action, payload, page_hints
+        )
+        if destination and sources:
+            topology["merge_destination_label"] = destination
+            topology["merge_source_labels"] = sources
+            topology["target_label"] = f"{', '.join(sources)} into {destination}"
+    if action_type == "page_split" and page_hints:
+        topology["split_preview"] = page_split_preview(context, page_hints[0])
+    return topology
+
+
+def page_merge_direction(
+    context: BrainPaths | QueueBuildContext,
+    action: dict[str, Any],
+    payload: dict[str, Any],
+    page_hints: list[str],
+) -> tuple[str | None, list[str]]:
+    destination = str(payload.get("destination_page_hint") or "").strip()
+    fact_ids = [
+        str(fact_id)
+        for fact_id in action.get("target_fact_ids") or []
+        if str(fact_id).strip()
+    ]
+    if not destination and fact_ids:
+        current_facts = facts_by_id(context, fact_ids)
+        current_pages = {
+            str(fact.get("page_hint") or "").strip()
+            for fact in current_facts.values()
+            if str(fact.get("page_hint") or "").strip() in page_hints
+        }
+        if len(current_pages) == 1:
+            destination = next(iter(current_pages))
+    if not destination:
+        page_statuses = action_page_contract_statuses(
+            context, action, page_hints
+        )
+        active_pages = [
+            page for page in page_hints if page_statuses.get(page) == "active"
+        ]
+        if len(active_pages) == 1:
+            destination = active_pages[0]
+    inverse = (
+        action.get("inverse_action_json")
+        if isinstance(action.get("inverse_action_json"), dict)
+        else {}
+    )
+    restore_facts = inverse.get("restore_facts")
+    restored_source_pages = {
+        str(fact.get("page_hint") or "").strip()
+        for fact in restore_facts or []
+        if isinstance(fact, dict) and str(fact.get("page_hint") or "").strip()
+    }
+    if not destination and restored_source_pages:
+        remaining = [page for page in page_hints if page not in restored_source_pages]
+        if len(remaining) == 1:
+            destination = remaining[0]
+    sources = [page for page in page_hints if page != destination]
+    return (destination or None), sources
+
+
+def action_page_contract_statuses(
+    context: BrainPaths | QueueBuildContext,
+    action: dict[str, Any],
+    page_hints: list[str],
+) -> dict[str, str]:
+    contract_ids = [
+        str(contract_id)
+        for contract_id in action.get("target_contract_ids") or []
+        if str(contract_id).strip()
+    ]
+    if not contract_ids and not page_hints:
+        return {}
+    if contract_ids:
+        placeholders = ",".join("?" for _ in contract_ids)
+        query = f"SELECT page_hint, status, updated_at, id FROM page_contracts WHERE id IN ({placeholders}) ORDER BY updated_at DESC, id DESC"
+        params = contract_ids
+    else:
+        placeholders = ",".join("?" for _ in page_hints)
+        query = f"SELECT page_hint, status, updated_at, id FROM page_contracts WHERE page_hint IN ({placeholders}) ORDER BY updated_at DESC, id DESC"
+        params = page_hints
+    if isinstance(context, QueueBuildContext):
+        rows = context.conn.execute(query, params)
+        return first_page_contract_statuses(rows, page_hints)
+    with connection(context.sqlite_path) as conn:
+        return first_page_contract_statuses(conn.execute(query, params), page_hints)
+
+
+def first_page_contract_statuses(
+    rows: Any, page_hints: list[str]
+) -> dict[str, str]:
+    allowed = set(page_hints)
+    statuses: dict[str, str] = {}
+    for row in rows:
+        page_hint = str(row["page_hint"] or "")
+        if page_hint in allowed and page_hint not in statuses:
+            statuses[page_hint] = str(row["status"] or "")
+    return statuses
 
 
 def topology_entity_ids(action_type: str, payload: dict[str, Any]) -> list[str]:
     ids: list[str] = []
     if action_type == "entity_merge":
         ids.append(str(payload.get("canonical_entity_id") or "").strip())
-        ids.extend(str(value or "").strip() for value in payload.get("merged_entity_ids") or [])
+        ids.extend(
+            str(value or "").strip() for value in payload.get("merged_entity_ids") or []
+        )
     for key in ("entity_id", "canonical_entity_id", "canonical_entity"):
         ids.append(str(payload.get(key) or "").strip())
     contract = payload.get("contract")
@@ -2068,6 +3368,7 @@ def topology_page_hints(payload: dict[str, Any]) -> list[str]:
     contract = payload.get("contract")
     if isinstance(contract, dict):
         values.append(contract.get("page_hint"))
+    values.extend(payload.get("page_hints") or [])
     seen: set[str] = set()
     hints = []
     for value in values:
@@ -2082,18 +3383,28 @@ def topology_fallback_label(payload: dict[str, Any]) -> str:
     contract = payload.get("contract")
     if isinstance(contract, dict):
         return humanize_entity_id(str(contract.get("canonical_entity") or ""))
-    return humanize_entity_id(str(payload.get("canonical_entity") or payload.get("entity_id") or ""))
+    return humanize_entity_id(
+        str(payload.get("canonical_entity") or payload.get("entity_id") or "")
+    )
 
 
 def entity_surfaces(
-    context: BrainPaths | QueueBuildContext, entity_ids: list[Any], embedded_names: Any = None
+    context: BrainPaths | QueueBuildContext,
+    entity_ids: list[Any],
+    embedded_names: Any = None,
 ) -> list[str]:
-    ids = [str(entity_id or "").strip() for entity_id in entity_ids if str(entity_id or "").strip()]
+    ids = [
+        str(entity_id or "").strip()
+        for entity_id in entity_ids
+        if str(entity_id or "").strip()
+    ]
     names = embedded_names if isinstance(embedded_names, dict) else {}
     rows = entities_by_id(context, ids)
     surfaces = []
     for entity_id in ids:
-        surface = str(names.get(entity_id) or rows.get(entity_id, {}).get("name") or "").strip()
+        surface = str(
+            names.get(entity_id) or rows.get(entity_id, {}).get("name") or ""
+        ).strip()
         surfaces.append(surface or humanize_entity_id(entity_id) or entity_id)
     return surfaces
 
@@ -2111,6 +3422,9 @@ def humanize_entity_id(entity_id: str) -> str:
 
 def action_summary(action: dict[str, Any], payload: Any) -> str:
     if isinstance(payload, dict):
+        candidate = payload.get("candidate")
+        if isinstance(candidate, dict):
+            return action_summary(action, candidate)
         return compact_text(
             payload.get("reason")
             or payload.get("candidate_signal")
@@ -2118,6 +3432,68 @@ def action_summary(action: dict[str, Any], payload: Any) -> str:
             240,
         )
     return compact_text((action.get("evidence_json") or {}).get("reason"), 240)
+
+
+def page_split_preview(
+    context: BrainPaths | QueueBuildContext, page_hint: str
+) -> dict[str, Any]:
+    if isinstance(context, QueueBuildContext):
+        rows = list(
+            context.conn.execute(
+                """
+                SELECT *
+                FROM facts
+                WHERE page_hint = ? AND status = 'active'
+                ORDER BY section_hint, created_at, id
+                """,
+                (page_hint,),
+            )
+        )
+    else:
+        with connection(context.sqlite_path) as conn:
+            rows = list(
+                conn.execute(
+                    """
+                    SELECT *
+                    FROM facts
+                    WHERE page_hint = ? AND status = 'active'
+                    ORDER BY section_hint, created_at, id
+                    """,
+                    (page_hint,),
+                )
+            )
+    sections: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        fact = row_to_fact(row)
+        section = str(fact.get("section_hint") or "").strip()
+        if section.lower() in {"", "summary", "unsectioned"}:
+            continue
+        sections.setdefault(section, []).append(fact)
+    children = []
+    for section, facts in sorted(sections.items()):
+        children.append(
+            {
+                "section": section,
+                "page_hint": split_destination_page_hint(page_hint, section),
+                "fact_count": len(facts),
+                "representative_facts": [
+                    {
+                        "id": fact.get("id"),
+                        "statement": fact.get("statement"),
+                        "evidence_quote": fact.get("evidence_quote"),
+                    }
+                    for fact in facts[:3]
+                ],
+            }
+        )
+    return {
+        "source_page_hint": page_hint,
+        "source_page_retained": True,
+        "resulting_page_count": len(children) + 1,
+        "movable_fact_count": sum(child["fact_count"] for child in children),
+        "children": children,
+        "approvable": bool(children),
+    }
 
 
 def enrich_fact_like(
@@ -2130,10 +3506,84 @@ def enrich_fact_like(
     if isinstance(source_ids, str):
         source_ids = json_loads(source_ids, [])
     output["source_ids"] = [str(source_id) for source_id in source_ids if source_id]
-    output["source_documents"] = queue_source_document_summaries(
-        context, output["source_ids"]
+    source_references = fact_source_references(output)
+    resolved_documents = queue_source_document_summaries(context, source_references)
+    output["source_documents"] = merge_source_documents(
+        resolved_documents, output.get("source_documents")
     )
+    output["source_date"], output["source_date_basis"] = derive_fact_source_date(
+        output, output["source_documents"]
+    )
+    fact_id = str(output.get("id") or output.get("fact_id") or "").strip()
+    if (
+        isinstance(context, QueueBuildContext)
+        and context.include_popularity
+        and fact_id
+    ):
+        popularity = context.fact_popularity([fact_id])
+        output["retrieval_count"] = popularity["retrieval_count"]
+        output["last_retrieved_at"] = popularity["last_retrieved_at"]
     return output
+
+
+def fact_source_references(fact: dict[str, Any]) -> list[str]:
+    references = [str(source_id) for source_id in fact.get("source_ids") or []]
+    source_spans = fact.get("source_spans") or []
+    if isinstance(source_spans, str):
+        source_spans = json_loads(source_spans, [])
+    for span in source_spans if isinstance(source_spans, list) else []:
+        if not isinstance(span, dict):
+            continue
+        source_id = str(span.get("source_id") or "").strip()
+        chunk_id = str(span.get("chunk_id") or "").strip()
+        if source_id:
+            references.append(source_id)
+        if chunk_id:
+            references.append(
+                chunk_id if chunk_id.startswith("chunk:") else f"chunk:{chunk_id}"
+            )
+    return list(dict.fromkeys(reference for reference in references if reference))
+
+
+def merge_source_documents(
+    resolved: list[dict[str, Any]], embedded: Any
+) -> list[dict[str, Any]]:
+    documents = [dict(document) for document in resolved]
+    positions = {
+        str(document.get("source_id") or document.get("id") or ""): index
+        for index, document in enumerate(documents)
+    }
+    for raw in embedded if isinstance(embedded, list) else []:
+        if not isinstance(raw, dict):
+            continue
+        document = dict(raw)
+        key = str(document.get("source_id") or document.get("id") or "")
+        if key and key in positions:
+            documents[positions[key]] = merge_nonempty(
+                documents[positions[key]], document
+            )
+        else:
+            documents.append(document)
+            if key:
+                positions[key] = len(documents) - 1
+    return documents
+
+
+def derive_fact_source_date(
+    fact: dict[str, Any], documents: list[dict[str, Any]]
+) -> tuple[str | None, str | None]:
+    observed_at = str(fact.get("observed_at") or "").strip()
+    if observed_at:
+        return observed_at, "observed_at"
+    for field in ("captured_at", "created_at", "ingested_at"):
+        values = [
+            str(document.get(field) or "").strip()
+            for document in documents
+            if str(document.get(field) or "").strip()
+        ]
+        if values:
+            return max(values), f"source_{field}"
+    return None, None
 
 
 def enrich_memory_detail_for_queue(
@@ -2216,40 +3666,83 @@ def route_candidates_for_fact(
         if isinstance(context, QueueBuildContext)
         else wiki_pages_from_index(context, page_type=None, status="active")
     )
-    terms = {term.casefold() for term in query.replace("-", " ").split() if len(term) > 2}
-    scored: list[tuple[int, dict[str, Any]]] = []
+    terms = {
+        term.casefold() for term in query.replace("-", " ").split() if len(term) > 2
+    }
+    document_id = route_candidate_document_id(context, fact)
+    if isinstance(context, QueueBuildContext):
+        priors = context.document_route_priors(document_id)
+    else:
+        with connection(context.sqlite_path) as conn:
+            priors = load_document_route_priors(conn, document_id)
+    priors_by_page = {
+        str(prior.get("page_hint") or ""): prior
+        for prior in priors
+        if prior.get("page_hint")
+    }
+    scored: list[tuple[float, int, dict[str, Any], dict[str, Any]]] = []
     for page in pages:
+        if not is_routable_wiki_page(
+            page_type=page.get("page_type"),
+            relative_path=page.get("relative_path"),
+            title=page.get("title"),
+        ):
+            continue
         haystack = " ".join(
             [str(page.get("title") or ""), str(page.get("relative_path") or "")]
         ).casefold()
-        score = sum(1 for term in terms if term in haystack)
+        lexical_score = sum(1 for term in terms if term in haystack)
+        prior = priors_by_page.get(str(page.get("relative_path") or "")) or {}
+        score = float(lexical_score) + coherence_bonus(prior)
         if page.get("relative_path") == page_hint:
             score += 10
         if score:
-            scored.append((score, page))
-    scored.sort(key=lambda item: (-item[0], item[1].get("relative_path") or ""))
+            scored.append((score, int(prior.get("fact_count") or 0), page, prior))
+    scored.sort(
+        key=lambda item: (
+            -item[0],
+            -item[1],
+            item[2].get("relative_path") or "",
+        )
+    )
     return [
         {
             "page_hint": page["relative_path"],
-            "title": page["title"],
-            "score": score,
+            "title": compact_text(page["title"], 120),
+            "score": round(score, 4),
             "page_type": page.get("page_type"),
+            "document_coherence_count": int(prior.get("fact_count") or 0),
+            "document_coherence_share": float(prior.get("share") or 0.0),
         }
-        for score, page in scored[:5]
+        for score, _count, page, prior in scored[:5]
     ]
+
+
+def route_candidate_document_id(
+    context: BrainPaths | QueueBuildContext, fact: dict[str, Any]
+) -> str:
+    document_id = fact_document_id(fact)
+    if document_id:
+        return document_id
+    documents = queue_source_document_summaries(context, fact.get("source_ids") or [])
+    return str(documents[0].get("id") or "") if len(documents) == 1 else ""
 
 
 def queue_active_pages(paths: BrainPaths, conn: Any) -> list[dict[str, Any]]:
     if not ui_table_exists(conn, "wiki_pages"):
         return []
     pages = []
+    non_routable_types = sorted(NON_ROUTABLE_PAGE_TYPES)
+    placeholders = ", ".join("?" for _ in non_routable_types)
     rows = conn.execute(
-        """
+        f"""
         SELECT title, page_type, path
         FROM wiki_pages
         WHERE status = 'active'
+          AND lower(page_type) NOT IN ({placeholders})
         ORDER BY page_type, title
-        """
+        """,
+        non_routable_types,
     )
     wiki_root = paths.wiki.resolve()
     for row in rows:
@@ -2259,13 +3752,13 @@ def queue_active_pages(paths: BrainPaths, conn: Any) -> list[dict[str, Any]]:
             safe_wiki_path(paths, relative_path, must_exist=False)
         except (ValueError, BadRequestError, NotFoundError, OSError):
             continue
-        pages.append(
-            {
-                "title": row["title"],
-                "relative_path": relative_path,
-                "page_type": row["page_type"],
-            }
-        )
+        page = {
+            "title": row["title"],
+            "relative_path": relative_path,
+            "page_type": row["page_type"],
+        }
+        if is_routable_wiki_page(**page):
+            pages.append(page)
     return pages
 
 
@@ -2283,16 +3776,16 @@ def compact_text(value: Any, limit: int = 160) -> str:
     text = " ".join(str(value or "").split())
     if len(text) <= limit:
         return text
-    return f"{text[: max(0, limit - 1)].rstrip()}..."
+    if limit <= 3:
+        return text[: max(0, limit)]
+    return f"{text[: limit - 3].rstrip()}..."
 
 
 def short_id(value: str) -> str:
     return value[:10]
 
 
-def bounded_int(
-    value: str | None, *, default: int, minimum: int, maximum: int
-) -> int:
+def bounded_int(value: str | None, *, default: int, minimum: int, maximum: int) -> int:
     if value is None:
         return default
     try:
@@ -2310,16 +3803,39 @@ def ui_queue_decision(
     if not decision:
         raise BadRequestError("decision is required")
     existing = find_queue_target(paths, item_id)
+    normalized_decision = decision.replace("-", "_")
+    if normalized_decision not in {"skip", "unsure", "skip_later", "escalate"}:
+        card = queue_card_for_target(paths, existing)
+        if card.get("approvable") is not True:
+            reason = str(
+                card.get("blocking_reason") or "The review card is incomplete."
+            )
+            raise BadRequestError(f"Review item is not approvable: {reason}")
     source_type = existing["source_type"]
     if source_type == "question":
-        return decide_queue_question(paths, existing["item"], decision, payload)
-    if source_type == "memory":
-        return decide_queue_memory(paths, existing["item"], decision, payload)
-    if source_type == "action":
-        return decide_queue_action(paths, existing["item"], decision, payload)
-    if source_type == "audit":
-        return decide_queue_audit(paths, existing["item"], decision, payload)
-    raise NotFoundError(f"queue item not found: {item_id}")
+        result = decide_queue_question(paths, existing["item"], decision, payload)
+    elif source_type == "memory":
+        result = decide_queue_memory(paths, existing["item"], decision, payload)
+    elif source_type == "action":
+        result = decide_queue_action(paths, existing["item"], decision, payload)
+    elif source_type == "audit":
+        result = decide_queue_audit(paths, existing["item"], decision, payload)
+    else:
+        raise NotFoundError(f"queue item not found: {item_id}")
+    result["queue_summary"] = current_queue_summary(paths)
+    return result
+
+
+def queue_card_for_target(paths: BrainPaths, target: dict[str, Any]) -> dict[str, Any]:
+    with connection(paths.sqlite_path) as conn:
+        ctx = QueueBuildContext(paths, conn, include_popularity=False)
+        descriptor = {
+            "source_type": target["source_type"],
+            "item": target["item"],
+        }
+        return queue_item_from_descriptor(
+            ctx, descriptor, include_route_candidates=False
+        )
 
 
 def find_queue_target(paths: BrainPaths, item_id: str) -> dict[str, Any]:
@@ -2331,9 +3847,14 @@ def find_queue_target(paths: BrainPaths, item_id: str) -> dict[str, Any]:
             if row:
                 return {"source_type": "question", "item": row_to_question(row)}
         if ui_table_exists(conn, "memories"):
-            row = conn.execute("SELECT * FROM memories WHERE id = ?", (item_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM memories WHERE id = ?", (item_id,)
+            ).fetchone()
             if row:
-                return {"source_type": "memory", "item": service(paths).get_memory(item_id)}
+                return {
+                    "source_type": "memory",
+                    "item": service(paths).get_memory(item_id),
+                }
         if ui_table_exists(conn, "cos_actions"):
             row = conn.execute(
                 "SELECT * FROM cos_actions WHERE id = ?", (item_id,)
@@ -2341,6 +3862,8 @@ def find_queue_target(paths: BrainPaths, item_id: str) -> dict[str, Any]:
             if row:
                 action = row_to_action(row)
                 if action.get("audit_status") == "sampled_bad":
+                    if not audit_action_reviewability(conn, action)["reviewable"]:
+                        raise NotFoundError(f"queue item not found: {item_id}")
                     return {"source_type": "audit", "item": action}
                 return {"source_type": "action", "item": action}
     raise NotFoundError(f"queue item not found: {item_id}")
@@ -2353,6 +3876,25 @@ def decide_queue_question(
     payload: dict[str, Any],
 ) -> dict[str, Any]:
     normalized = decision.replace("-", "_")
+    if question.get("kind") == "unrouted_inbox_batch":
+        return decide_unrouted_inbox_batch(paths, question, normalized, payload)
+    if question.get("kind") == "document_extraction_anomaly":
+        return decide_extraction_anomaly(paths, question, normalized, payload)
+    alternative_comparison = is_alternative_fact_comparison(question)
+    if alternative_comparison and normalized not in {
+        "skip",
+        "escalate",
+        "unsure",
+        "skip_later",
+        "both_true",
+        "contested",
+        "select_facts",
+        "select_fact",
+        "keep_fact",
+    }:
+        raise BadRequestError(
+            "historical comparisons require selecting one or more facts to keep"
+        )
     if normalized in {"skip", "escalate"}:
         return {
             "status": "skipped",
@@ -2369,6 +3911,52 @@ def decide_queue_question(
             "item_id": question["id"],
             "result": {"question": question},
             "undo_handle": None,
+        }
+    if alternative_comparison and normalized in {
+        "both_true",
+        "contested",
+        "select_facts",
+        "select_fact",
+        "keep_fact",
+    }:
+        if normalized in {"both_true", "contested"}:
+            selected_fact_ids = [
+                str(fact_id)
+                for fact_id in question.get("fact_ids") or []
+                if str(fact_id or "").strip()
+            ]
+        elif normalized in {"select_fact", "keep_fact"}:
+            selected_fact_id = str(payload.get("selected_fact_id") or "").strip()
+            if not selected_fact_id:
+                raise BadRequestError("selected_fact_id is required")
+            selected_fact_ids = [selected_fact_id]
+        else:
+            raw_selected = payload.get("selected_fact_ids")
+            if not isinstance(raw_selected, list):
+                raise BadRequestError("selected_fact_ids must be an array")
+            selected_fact_ids = [
+                str(fact_id).strip()
+                for fact_id in raw_selected
+                if str(fact_id or "").strip()
+            ]
+            if not selected_fact_ids:
+                raise BadRequestError(
+                    "selected_fact_ids must contain at least one fact"
+                )
+        action_states = linked_question_action_states(paths, question)
+        result = ui_answer_wiki_question(
+            paths, question["id"], {"selected_fact_ids": selected_fact_ids}
+        )
+        return {
+            "status": "decided",
+            "item_id": question["id"],
+            "result": result,
+            "undo_handle": {
+                "kind": "question_actions",
+                "question": previous,
+                "action_ids": action_ids_from_result(result),
+                "actions": action_states,
+            },
         }
     if normalized in {"both_true", "contested"}:
         return contest_question_candidate(paths, question, previous)
@@ -2400,29 +3988,101 @@ def decide_queue_question(
             "undo_handle": {
                 "kind": "question_reject",
                 "question": previous,
-                "action": action_undo_state(paths, str(question.get("action_id") or "")),
-            },
-        }
-    if normalized in {"select_fact", "keep_fact"}:
-        selected_fact_id = str(payload.get("selected_fact_id") or "").strip()
-        if not selected_fact_id:
-            raise BadRequestError("selected_fact_id is required")
-        action_states = linked_question_action_states(paths, question)
-        result = ui_answer_wiki_question(
-            paths, question["id"], {"selected_fact_id": selected_fact_id}
-        )
-        return {
-            "status": "decided",
-            "item_id": question["id"],
-            "result": result,
-            "undo_handle": {
-                "kind": "question_actions",
-                "question": previous,
-                "action_ids": action_ids_from_result(result),
-                "actions": action_states,
+                "action": action_undo_state(
+                    paths, str(question.get("action_id") or "")
+                ),
             },
         }
     raise BadRequestError(f"unsupported queue decision: {decision}")
+
+
+def decide_extraction_anomaly(
+    paths: BrainPaths,
+    question: dict[str, Any],
+    decision: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    if decision in {"skip", "unsure", "skip_later"}:
+        return {
+            "status": "skipped",
+            "item_id": question["id"],
+            "result": {"question": question},
+            "undo_handle": None,
+        }
+    if decision in {"approve", "accept", "acknowledge", "reviewed"}:
+        status = "answered"
+        answer_decision = "acknowledged"
+    elif decision in {"reject", "dismiss"}:
+        status = "dismissed"
+        answer_decision = "dismissed"
+    else:
+        raise BadRequestError(f"unsupported extraction alert decision: {decision}")
+    previous = question_undo_state(question)
+    anomaly = extraction_anomaly_summary(question)
+    mark_review_question_decided(
+        paths,
+        question["id"],
+        status=status,
+        answer={
+            "decision": answer_decision,
+            "document_id": anomaly.get("document_id"),
+            "block_rate": anomaly.get("block_rate"),
+            "note": str(payload.get("note") or "").strip(),
+        },
+        action_id=None,
+    )
+    return {
+        "status": "decided",
+        "item_id": question["id"],
+        "result": {"question": get_review_question(paths, question["id"])},
+        "undo_handle": {
+            "kind": "question_reject",
+            "question": previous,
+            "action": {},
+        },
+    }
+
+
+def decide_unrouted_inbox_batch(
+    paths: BrainPaths,
+    question: dict[str, Any],
+    decision: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    if decision in {"skip", "unsure", "skip_later"}:
+        return {
+            "status": "skipped",
+            "item_id": question["id"],
+            "result": {"question": question},
+            "undo_handle": None,
+        }
+    if decision not in {"approve", "accept", "reviewed", "reject", "dismiss"}:
+        raise BadRequestError(f"unsupported Inbox batch decision: {decision}")
+    previous = question_undo_state(question)
+    accepted = decision in {"approve", "accept", "reviewed"}
+    resolved_status = "answered" if accepted else "dismissed"
+    answer = {
+        "decision": "reviewed" if accepted else "dismiss",
+        "reason": str(payload.get("reason") or "").strip(),
+        "page_hint": question.get("page_hint"),
+    }
+    mark_review_question_decided(
+        paths,
+        question["id"],
+        status=resolved_status,
+        answer=answer,
+        action_id=None,
+    )
+    return {
+        "status": "decided",
+        "item_id": question["id"],
+        "result": {"question": get_review_question(paths, question["id"])},
+        "undo_handle": {
+            "kind": "question_reject",
+            "question": previous,
+            "action": {},
+        },
+    }
 
 
 def apply_question_candidate(
@@ -2551,7 +4211,9 @@ def temporal_update_question_candidate(
     if not counterpart_ids:
         raise BadRequestError("temporal_update requires existing fact ids")
     action_states = linked_question_action_states(paths, question)
-    temporal_candidate = temporal_update_fact(candidate, counterpart_ids, question["id"])
+    temporal_candidate = temporal_update_fact(
+        candidate, counterpart_ids, question["id"]
+    )
     candidate_action = apply_action(
         paths,
         propose_action(
@@ -2627,7 +4289,9 @@ def supported_existing_fact(
     existing: dict[str, Any], candidate: dict[str, Any], question_id: str
 ) -> dict[str, Any]:
     timestamp = now_iso()
-    metadata = existing.get("metadata") if isinstance(existing.get("metadata"), dict) else {}
+    metadata = (
+        existing.get("metadata") if isinstance(existing.get("metadata"), dict) else {}
+    )
     support_records = metadata.get("supporting_candidates")
     if not isinstance(support_records, list):
         support_records = []
@@ -2660,7 +4324,9 @@ def temporal_update_fact(
     candidate: dict[str, Any], counterpart_ids: list[str], question_id: str
 ) -> dict[str, Any]:
     timestamp = now_iso()
-    metadata = candidate.get("metadata") if isinstance(candidate.get("metadata"), dict) else {}
+    metadata = (
+        candidate.get("metadata") if isinstance(candidate.get("metadata"), dict) else {}
+    )
     fact_id = str(candidate.get("id") or new_id("fact"))
     return {
         **candidate,
@@ -2769,7 +4435,9 @@ def contest_question_candidate(
     if action_id:
         applied = apply_action(paths, action_id)
         applied_ids.append(applied["id"])
-        candidate_fact_ids.extend(str(item) for item in applied.get("target_fact_ids") or [])
+        candidate_fact_ids.extend(
+            str(item) for item in applied.get("target_fact_ids") or []
+        )
     candidate = question_candidate_fact(paths, question)
     if candidate and candidate.get("id"):
         candidate_fact_ids.append(str(candidate["id"]))
@@ -2812,7 +4480,9 @@ def contest_question_candidate(
     )
     result = {
         "question": get_review_question(paths, question["id"]),
-        "actions": [get_action_for_queue(paths, action_id) for action_id in applied_ids],
+        "actions": [
+            get_action_for_queue(paths, action_id) for action_id in applied_ids
+        ],
     }
     return {
         "status": "decided",
@@ -2827,7 +4497,9 @@ def contest_question_candidate(
     }
 
 
-def first_counterpart_fact_id(paths: BrainPaths, question: dict[str, Any]) -> str | None:
+def first_counterpart_fact_id(
+    paths: BrainPaths, question: dict[str, Any]
+) -> str | None:
     for fact in question_counterpart_facts(paths, question):
         fact_id = str(fact.get("id") or fact.get("fact_id") or "").strip()
         if fact_id:
@@ -2907,8 +4579,49 @@ def decide_queue_audit(
     normalized = decision.replace("-", "_")
     previous = action_undo_state(paths, action["id"])
     if normalized in {"revert", "v"}:
-        result = revert_action(paths, action["id"])
-        undo = {"kind": "action_revert", "action": previous}
+        with connection(paths.sqlite_path) as conn:
+            reviewability = audit_action_reviewability(conn, action)
+        if not reviewability["revertible"]:
+            raise BadRequestError(
+                "audited action no longer has a safe direct revert; review the current fact or topology state"
+            )
+        if reviewability.get("revert_mode") == "reject_current_fact":
+            fact_id = str(reviewability.get("fact_id") or "")
+            correction = apply_fact_status_action(
+                paths,
+                "fact_supersede",
+                [
+                    {
+                        "fact_id": fact_id,
+                        "status": "rejected",
+                        "conflict_group_id": None,
+                    }
+                ],
+                proposed_by="ui_audit_reject_current_fact",
+                risk_tier="medium",
+            )
+            if not correction.get("id"):
+                raise BadRequestError("audited fact is no longer active")
+            result = record_action_audit(
+                paths,
+                action["id"],
+                "remediated",
+                metadata={
+                    "ui_rejected_current_fact": True,
+                    "fact_id": fact_id,
+                    "correction_action_id": correction["id"],
+                },
+            )
+            result_payload = {"action": result, "correction_action": correction}
+            undo = {
+                "kind": "audit_fact_remediation",
+                "action": previous,
+                "correction_action_id": correction["id"],
+            }
+        else:
+            result = revert_action(paths, action["id"])
+            result_payload = {"action": result}
+            undo = {"kind": "action_revert", "action": previous}
     elif normalized in {"ok", "mark_ok", "mark_good"}:
         result = record_action_audit(
             paths,
@@ -2916,13 +4629,14 @@ def decide_queue_audit(
             "sampled_ok",
             metadata={"ui_marked_ok": True, "note": payload.get("note") or ""},
         )
+        result_payload = {"action": result}
         undo = {"kind": "action_status", "action": previous}
     else:
         raise BadRequestError(f"unsupported audit decision: {decision}")
     return {
         "status": "decided",
         "item_id": action["id"],
-        "result": {"action": result},
+        "result": result_payload,
         "undo_handle": undo,
     }
 
@@ -2961,11 +4675,20 @@ def ui_queue_undo(paths: BrainPaths, payload: dict[str, Any]) -> dict[str, Any]:
         if action_id:
             apply_action(paths, action_id)
         restore_action_state(paths, action_state)
+    elif kind == "audit_fact_remediation":
+        correction_action_id = str(handle.get("correction_action_id") or "")
+        if correction_action_id:
+            revert_action(paths, correction_action_id)
+        restore_action_state(paths, handle.get("action") or {})
     elif kind == "action_status":
         restore_action_state(paths, handle.get("action") or {})
     else:
         raise BadRequestError(f"unsupported undo handle: {kind}")
-    return {"status": "undone", "undo_handle": handle}
+    return {
+        "status": "undone",
+        "undo_handle": handle,
+        "queue_summary": current_queue_summary(paths),
+    }
 
 
 def question_undo_state(question: dict[str, Any]) -> dict[str, Any]:
@@ -3237,7 +4960,9 @@ def ui_wiki_page(paths: BrainPaths, query: dict[str, list[str]]) -> dict[str, An
         "source_documents": source_document_summaries(paths, source_ids),
         "facts": facts_for_page(paths, target.relative_to(paths.wiki).as_posix()),
         "contract": contract_for_page(paths, target.relative_to(paths.wiki).as_posix()),
-        "snapshots": snapshots_for_page(paths, target.relative_to(paths.wiki).as_posix()),
+        "snapshots": snapshots_for_page(
+            paths, target.relative_to(paths.wiki).as_posix()
+        ),
         "related": list(frontmatter.get("related") or []),
     }
 
@@ -3296,7 +5021,9 @@ def snapshots_for_page(paths: BrainPaths, relative_path: str) -> list[dict[str, 
 
 def ui_save_wiki_page(paths: BrainPaths, payload: dict[str, Any]) -> dict[str, Any]:
     service(paths).init_workspace()
-    relative_path = str(payload.get("path") or payload.get("relative_path") or "").strip()
+    relative_path = str(
+        payload.get("path") or payload.get("relative_path") or ""
+    ).strip()
     markdown = str(payload.get("markdown") or "")
     target = safe_wiki_path(paths, relative_path, must_exist=True)
     existing = target.read_text(encoding="utf-8", errors="replace")
@@ -3404,9 +5131,16 @@ def ui_entities(paths: BrainPaths, query: dict[str, list[str]]) -> dict[str, Any
     entity_type = first(query, "type")
     q = (first(query, "q") or "").casefold()
     show_inactive = first(query, "inactive") in {"1", "true", "yes"}
+    sort_mode = normalize_entity_sort(first(query, "sort") or "retrieval")
+    order_by = {
+        "retrieval": "retrieval_count DESC, last_retrieved_at DESC, fact_count DESC, e.name COLLATE NOCASE",
+        "facts": "fact_count DESC, retrieval_count DESC, e.name COLLATE NOCASE",
+        "name": "e.name COLLATE NOCASE, retrieval_count DESC",
+        "recent": "last_observed_at DESC, retrieval_count DESC, e.name COLLATE NOCASE",
+    }[sort_mode]
     with connection(paths.sqlite_path) as conn:
         if not ui_table_exists(conn, "entities"):
-            return {"entities": [], "count": 0, "types": []}
+            return {"entities": [], "count": 0, "types": [], "sort": sort_mode}
         where = "WHERE 1=1"
         params: list[Any] = []
         if entity_type:
@@ -3418,16 +5152,36 @@ def ui_entities(paths: BrainPaths, query: dict[str, list[str]]) -> dict[str, Any
             row_to_plain_dict(row)
             for row in conn.execute(
                 f"""
+                WITH fact_stats AS (
+                  SELECT fe.entity_id,
+                         COUNT(DISTINCT f.id) AS fact_count,
+                         MAX(COALESCE(f.observed_at, f.created_at)) AS last_observed_at
+                  FROM fact_entities fe
+                  JOIN facts f ON f.id = fe.fact_id
+                    AND f.status IN ('active', 'conflicted')
+                  GROUP BY fe.entity_id
+                ), entity_popularity AS (
+                  SELECT fe.entity_id,
+                         COUNT(DISTINCT cle.retrieval_event_id) AS retrieval_count,
+                         MAX(cle.created_at) AS last_retrieved_at
+                  FROM fact_entities fe
+                  JOIN context_lineage_events cle
+                    ON cle.target_type = 'fact'
+                   AND cle.target_id = fe.fact_id
+                   AND cle.event_type = 'exposed'
+                   AND cle.retrieval_event_id IS NOT NULL
+                  GROUP BY fe.entity_id
+                )
                 SELECT e.*,
-                       COUNT(DISTINCT f.id) AS fact_count,
-                       MAX(COALESCE(f.observed_at, f.created_at)) AS last_observed_at
+                       COALESCE(fs.fact_count, 0) AS fact_count,
+                       fs.last_observed_at,
+                       COALESCE(ep.retrieval_count, 0) AS retrieval_count,
+                       ep.last_retrieved_at
                 FROM entities e
-                LEFT JOIN fact_entities fe ON fe.entity_id = e.id
-                LEFT JOIN facts f ON f.id = fe.fact_id
-                  AND f.status IN ('active', 'conflicted')
+                LEFT JOIN fact_stats fs ON fs.entity_id = e.id
+                LEFT JOIN entity_popularity ep ON ep.entity_id = e.id
                 {where}
-                GROUP BY e.id
-                ORDER BY fact_count DESC, e.name
+                ORDER BY {order_by}
                 LIMIT 1000
                 """,
                 params,
@@ -3450,7 +5204,8 @@ def ui_entities(paths: BrainPaths, query: dict[str, list[str]]) -> dict[str, Any
         entities = [
             entity
             for entity in entities
-            if q in " ".join(
+            if q
+            in " ".join(
                 [
                     str(entity.get("name") or ""),
                     str(entity.get("entity_type") or ""),
@@ -3458,7 +5213,26 @@ def ui_entities(paths: BrainPaths, query: dict[str, list[str]]) -> dict[str, Any
                 ]
             ).casefold()
         ]
-    return {"entities": entities, "count": len(entities), "types": types}
+    return {
+        "entities": entities,
+        "count": len(entities),
+        "types": types,
+        "sort": sort_mode,
+    }
+
+
+def normalize_entity_sort(value: str) -> str:
+    normalized = str(value or "retrieval").strip().lower()
+    aliases = {
+        "popular": "retrieval",
+        "popularity": "retrieval",
+        "fact_count": "facts",
+        "newest": "recent",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"retrieval", "facts", "name", "recent"}:
+        raise BadRequestError("sort must be one of: retrieval, facts, name, recent")
+    return normalized
 
 
 def entity_index_card(row: dict[str, Any]) -> dict[str, Any]:
@@ -3472,6 +5246,8 @@ def entity_index_card(row: dict[str, Any]) -> dict[str, Any]:
         "status": row.get("status") or "active",
         "merged_into": row.get("merged_into"),
         "fact_count": int(row.get("fact_count") or 0),
+        "retrieval_count": int(row.get("retrieval_count") or 0),
+        "last_retrieved_at": row.get("last_retrieved_at"),
         "last_observed_at": row.get("last_observed_at"),
         "created_at": row.get("created_at"),
     }
@@ -3480,10 +5256,19 @@ def entity_index_card(row: dict[str, Any]) -> dict[str, Any]:
 def ui_entity_detail(paths: BrainPaths, entity_id: str) -> dict[str, Any]:
     service(paths).init_workspace()
     with connection(paths.sqlite_path) as conn:
-        row = conn.execute("SELECT * FROM entities WHERE id = ?", (entity_id,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM entities WHERE id = ?", (entity_id,)
+        ).fetchone()
         if not row:
             raise NotFoundError(f"entity not found: {entity_id}")
-        entity = entity_index_card({**row_to_plain_dict(row), "fact_count": 0})
+        popularity = popularity_for_ids(entity_retrieval_event_index(conn), [entity_id])
+        entity = entity_index_card(
+            {
+                **row_to_plain_dict(row),
+                "fact_count": 0,
+                **popularity,
+            }
+        )
         facts = entity_facts(conn, entity_id)
         co_mentions = entity_co_mentions(conn, entity_id)
     enriched_facts = [enrich_fact_like(paths, fact) for fact in facts]
@@ -3512,17 +5297,36 @@ def entity_facts(conn: Any, entity_id: str) -> list[dict[str, Any]]:
         return []
     rows = conn.execute(
         """
-        SELECT DISTINCT f.*
+        WITH fact_popularity AS (
+          SELECT target_id AS fact_id,
+                 COUNT(DISTINCT retrieval_event_id) AS retrieval_count,
+                 MAX(created_at) AS last_retrieved_at
+          FROM context_lineage_events
+          WHERE target_type = 'fact'
+            AND event_type = 'exposed'
+            AND retrieval_event_id IS NOT NULL
+          GROUP BY target_id
+        )
+        SELECT DISTINCT f.*,
+               COALESCE(fp.retrieval_count, 0) AS retrieval_count,
+               fp.last_retrieved_at
         FROM facts f
         JOIN fact_entities fe ON fe.fact_id = f.id
+        LEFT JOIN fact_popularity fp ON fp.fact_id = f.id
         WHERE fe.entity_id = ?
           AND f.status IN ('active', 'conflicted')
-        ORDER BY COALESCE(f.observed_at, f.created_at) DESC
+        ORDER BY retrieval_count DESC, COALESCE(f.observed_at, f.created_at) DESC
         LIMIT 500
         """,
         (entity_id,),
     )
-    return [row_to_fact(row) for row in rows]
+    facts = []
+    for row in rows:
+        fact = row_to_fact(row)
+        fact["retrieval_count"] = int(row["retrieval_count"] or 0)
+        fact["last_retrieved_at"] = row["last_retrieved_at"]
+        facts.append(fact)
+    return facts
 
 
 def entity_co_mentions(conn: Any, entity_id: str) -> list[dict[str, Any]]:
@@ -3585,7 +5389,9 @@ def ui_entities_merge(paths: BrainPaths, payload: dict[str, Any]) -> dict[str, A
             target_fact_ids=features["target_fact_ids"],
             proposed_by="ui_entities",
             confidence=float(payload.get("confidence") or 1.0),
-            risk_tier=str(payload.get("risk_tier") or features.get("risk_tier") or "medium"),
+            risk_tier=str(
+                payload.get("risk_tier") or features.get("risk_tier") or "medium"
+            ),
         )["id"],
     )
     return {"action": action}
@@ -3664,6 +5470,13 @@ def ui_ops_runs(paths: BrainPaths) -> dict[str, Any]:
     return {"automation_runs": automation, "ingestion_runs": ingestion}
 
 
+def ui_ops_storage(paths: BrainPaths) -> dict[str, Any]:
+    service(paths).init_workspace()
+    configured = str(os.environ.get("PKM_BRAIN_APP_SUPPORT") or "").strip()
+    app_support = Path(configured).expanduser() if configured else None
+    return managed_storage_inventory(paths, app_support=app_support)
+
+
 def ui_wiki_fact_dashboard(paths: BrainPaths) -> dict[str, Any]:
     service(paths).init_workspace()
     return wiki_fact_dashboard(paths)
@@ -3679,6 +5492,32 @@ def ui_cos_policy(paths: BrainPaths) -> dict[str, Any]:
         rule["match_predicate"] = json_loads(rule.get("match_predicate"), {})
         rule["auto_revert_signals"] = json_loads(rule.get("auto_revert_signals"), [])
     return {"version": version, "rules": rules}
+
+
+def ui_curation_settings(paths: BrainPaths) -> dict[str, Any]:
+    service(paths).init_workspace()
+    return load_curation_settings(paths)
+
+
+def ui_update_curation_settings(
+    paths: BrainPaths, payload: dict[str, Any]
+) -> dict[str, Any]:
+    service(paths).init_workspace()
+    if not any(
+        key in payload
+        for key in ("strictness", "merge_aggressiveness", "split_aggressiveness")
+    ):
+        raise BadRequestError("at least one curation setting is required")
+    strictness = optional_str(payload.get("strictness"))
+    try:
+        return update_curation_settings(
+            paths,
+            strictness,
+            merge_aggressiveness=payload.get("merge_aggressiveness"),
+            split_aggressiveness=payload.get("split_aggressiveness"),
+        )
+    except ValueError as exc:
+        raise BadRequestError(str(exc)) from exc
 
 
 def ui_cos_actions(paths: BrainPaths, query: dict[str, list[str]]) -> dict[str, Any]:
@@ -3818,13 +5657,17 @@ def ui_cos_audit_status(paths: BrainPaths) -> dict[str, Any]:
     return {
         "status": "ok" if has_configured_audits else "stub",
         "mode": "configured" if has_configured_audits else "stub",
-        "note": COS_AUDIT_CONFIGURED_NOTE if has_configured_audits else COS_AUDIT_STUB_NOTE,
+        "note": COS_AUDIT_CONFIGURED_NOTE
+        if has_configured_audits
+        else COS_AUDIT_STUB_NOTE,
         "counts": counts,
         "failures": failures,
     }
 
 
-def ui_generate_cos_contracts(paths: BrainPaths, payload: dict[str, Any]) -> dict[str, Any]:
+def ui_generate_cos_contracts(
+    paths: BrainPaths, payload: dict[str, Any]
+) -> dict[str, Any]:
     service(paths).init_workspace()
     return generate_initial_contracts(
         paths,
@@ -3860,11 +5703,23 @@ def ui_answer_wiki_question(
     paths: BrainPaths, question_id: str, payload: dict[str, Any]
 ) -> dict[str, Any]:
     service(paths).init_workspace()
+    raw_selected_fact_ids = payload.get("selected_fact_ids")
+    if raw_selected_fact_ids is not None and not isinstance(
+        raw_selected_fact_ids, list
+    ):
+        raise BadRequestError("selected_fact_ids must be an array")
     try:
         return answer_open_question(
             paths,
             question_id,
             selected_fact_id=optional_str(payload.get("selected_fact_id")),
+            selected_fact_ids=[
+                str(fact_id).strip()
+                for fact_id in raw_selected_fact_ids or []
+                if str(fact_id or "").strip()
+            ]
+            if raw_selected_fact_ids is not None
+            else None,
             answer=optional_str(payload.get("answer")),
             overwrite_existing=bool(payload.get("overwrite_existing", False)),
         )
@@ -3997,6 +5852,11 @@ def reject_linked_review_action(
             """,
             (dumps(evidence), action_id),
         )
+        retire_open_candidate_siblings(
+            conn,
+            action,
+            reason="candidate rejected by human review",
+        )
     with connection(paths.sqlite_path) as conn:
         return load_action(conn, action_id)
 
@@ -4069,43 +5929,10 @@ def ui_create_wiki_fact_correction(
 def source_document_summaries(
     paths: BrainPaths, source_ids: list[str]
 ) -> list[dict[str, Any]]:
-    document_ids = []
-    for source_id in source_ids:
-        value = str(source_id)
-        if value.startswith("document:"):
-            document_id = value.removeprefix("document:")
-            if document_id:
-                document_ids.append(document_id)
-    if not document_ids:
-        return []
-    placeholders = ",".join("?" for _ in document_ids)
     with connection(paths.sqlite_path) as conn:
-        found = conn.execute(
-            f"""
-            SELECT id, title, source_type, source_path, raw_path, ingested_at
-            FROM documents
-            WHERE id IN ({placeholders})
-            """,
-            document_ids,
-        )
-        rows_by_id = {row["id"]: dict(row) for row in found}
-    documents = []
-    for document_id in document_ids:
-        row = rows_by_id.get(document_id)
-        if not row:
-            continue
-        documents.append(
-            {
-                "id": row["id"],
-                "source_id": f"document:{row['id']}",
-                "title": row["title"],
-                "source_type": row["source_type"],
-                "source_path": row["source_path"],
-                "raw_path": row["raw_path"],
-                "ingested_at": row["ingested_at"],
-            }
-        )
-    return documents
+        return QueueBuildContext(
+            paths, conn, include_popularity=False
+        ).source_documents(source_ids)
 
 
 def safe_wiki_path(

@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from .wiki_facts import fact_similarity_signals, facts_directly_conflict, facts_should_merge
+from .wiki_facts import fact_tokens, facts_directly_conflict, facts_should_merge
 
 
 RELATION_VALUES = {
@@ -53,6 +53,19 @@ PROGRESSION_WORDS = {
     "updated",
 }
 NEGATION_WORDS = {"not", "no", "never", "without"}
+CLAIM_LOW_SIGNAL_TOKENS = {
+    "also",
+    "believ",
+    "expect",
+    "he",
+    "mention",
+    "say",
+    "said",
+    "she",
+    "think",
+    "they",
+    "while",
+}
 
 
 @dataclass(frozen=True)
@@ -61,7 +74,7 @@ class FactRelation:
     confidence: float
     rationale: str
     compatible: bool
-    classifier_version: str = "deterministic-v1"
+    classifier_version: str = "deterministic-v2"
     existing_fact_id: str | None = None
     candidate_fact_id: str | None = None
 
@@ -99,13 +112,13 @@ def classify_fact_relation(
     existing_tokens = statement_tokens(existing_statement)
     overlap = token_overlap(candidate_tokens, existing_tokens)
     jaccard = token_jaccard(candidate_tokens, existing_tokens)
-    signals = fact_similarity_signals(candidate_statement, existing_statement)
     negation_conflict = asymmetric_negation(candidate_tokens, existing_tokens)
-    contradiction_signal = (
-        bool(signals.get("contradiction"))
-        or facts_directly_conflict(existing, candidate)
-        or negation_conflict
-    )
+    # Material words, numbers, or negation are only candidate-pair signals. A
+    # contradiction verdict also requires the statements to share claim-level
+    # anchors; otherwise two attributes on a broad entity become false conflicts.
+    contradiction_signal = facts_directly_conflict(
+        existing, candidate
+    ) and claims_overlap_for_verdict(candidate_statement, existing_statement)
 
     if normalize_statement(candidate_statement) == normalize_statement(existing_statement):
         if disjoint_sources(candidate, existing):
@@ -242,12 +255,15 @@ def facts_share_entity(candidate: dict[str, Any], existing: dict[str, Any]) -> b
     existing_entity_id = str(existing.get("entity_id") or "").strip()
     if candidate_entity_id and existing_entity_id:
         return candidate_entity_id == existing_entity_id
+    compared = False
     for key in ("entity_key", "page_hint"):
-        left = str(candidate.get(key) or "").strip()
-        right = str(existing.get(key) or "").strip()
+        left = str(candidate.get(key) or "").strip().lower()
+        right = str(existing.get(key) or "").strip().lower()
+        if left and right:
+            compared = True
         if left and right and left == right:
             return True
-    return True
+    return not compared
 
 
 def normalize_statement(value: str) -> str:
@@ -273,6 +289,17 @@ def token_jaccard(left: list[str], right: list[str]) -> float:
     if not union:
         return 0.0
     return len(left_set & right_set) / len(union)
+
+
+def claims_overlap_for_verdict(left: str, right: str) -> bool:
+    left_tokens = set(fact_tokens(left)) - CLAIM_LOW_SIGNAL_TOKENS
+    right_tokens = set(fact_tokens(right)) - CLAIM_LOW_SIGNAL_TOKENS
+    if not left_tokens or not right_tokens:
+        return False
+    shared = left_tokens & right_tokens
+    overlap = len(shared) / min(len(left_tokens), len(right_tokens))
+    jaccard = len(shared) / len(left_tokens | right_tokens)
+    return overlap >= 0.35 and jaccard >= 0.25
 
 
 def disjoint_sources(candidate: dict[str, Any], existing: dict[str, Any]) -> bool:

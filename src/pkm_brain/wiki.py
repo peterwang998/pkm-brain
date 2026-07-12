@@ -7,6 +7,7 @@ import yaml
 
 from .db import connection
 from .paths import BrainPaths
+from .title_utils import is_codex_provider_prompt
 
 
 ALLOWED_PAGE_TYPES = {
@@ -19,6 +20,9 @@ ALLOWED_PAGE_TYPES = {
     "timeline",
     "reference",
 }
+NON_ROUTABLE_PAGE_TYPES = frozenset({"index", "reference"})
+NON_ROUTABLE_PAGE_FILENAMES = frozenset({"index.md", "log.md"})
+NON_ROUTABLE_PAGE_PREFIXES = ("references/", "agent_session_log/")
 ALLOWED_STATUSES = {"draft", "active", "stale", "superseded", "archived"}
 COMMON_SECTIONS = ["Summary", "Key Points", "Source Evidence", "Related Pages", "Open Questions"]
 TYPE_SECTIONS = {
@@ -31,6 +35,23 @@ TYPE_SECTIONS = {
     "reference": ["Notes", "Extracted Facts", "Source Evidence"],
 }
 GENERATED_MARKER = "<!-- generated-by: pkm-brain wiki-synthesis v1 -->"
+
+
+def is_routable_wiki_page(
+    *, page_type: str | None, relative_path: str | None, title: str | None
+) -> bool:
+    normalized_type = str(page_type or "").strip().casefold()
+    normalized_path = str(relative_path or "").strip().replace("\\", "/").casefold()
+    normalized_title = str(title or "").strip()
+    if normalized_type not in ALLOWED_PAGE_TYPES:
+        return False
+    if normalized_type in NON_ROUTABLE_PAGE_TYPES:
+        return False
+    if not normalized_path or normalized_path.rsplit("/", 1)[-1] in NON_ROUTABLE_PAGE_FILENAMES:
+        return False
+    if any(normalized_path.startswith(prefix) for prefix in NON_ROUTABLE_PAGE_PREFIXES):
+        return False
+    return bool(normalized_title) and not is_codex_provider_prompt(normalized_title)
 
 
 def lint_wiki(paths: BrainPaths) -> dict[str, Any]:

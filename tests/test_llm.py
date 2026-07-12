@@ -16,6 +16,11 @@ from pkm_brain.paths import BrainPaths
 runner = CliRunner()
 
 
+def test_codex_defaults_use_current_sol_and_luna_tiers() -> None:
+    assert llm.CODEX_DEFAULT_MODEL == "gpt-5.6-sol"
+    assert llm.CODEX_DEFAULT_FALLBACK_MODELS == ("gpt-5.6-luna",)
+
+
 def test_openai_provider_falls_back_on_model_selection_error(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("PKM_BRAIN_OPENAI_MODEL", "missing-model")

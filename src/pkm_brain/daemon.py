@@ -382,6 +382,9 @@ class BrainDaemon:
     start_scheduler: bool = True
     host: str = "127.0.0.1"
     version: str = field(default_factory=package_version)
+    runtime_id: str | None = field(
+        default_factory=lambda: os.environ.get("PKM_BRAIN_RUNTIME_ID") or None
+    )
 
     def __post_init__(self) -> None:
         self.token = secrets.token_urlsafe(32)
@@ -404,6 +407,7 @@ class BrainDaemon:
             serve_static=self.serve_web,
         )
         self.server.daemon_version = self.version
+        self.server.daemon_runtime_id = self.runtime_id
         self.server.daemon_started_at = self.started_at
         self.server.daemon_scheduler = self.scheduler
         self.server.daemon_shutdown_enabled = True
@@ -413,6 +417,7 @@ class BrainDaemon:
             "port": int(actual_port),
             "token": self.token,
             "version": self.version,
+            "runtime_id": self.runtime_id,
             "home": str(self.paths.home),
             "started_at": self.started_at,
             "host": str(host),

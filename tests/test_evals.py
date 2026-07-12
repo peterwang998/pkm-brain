@@ -3,27 +3,23 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from pkm_brain.evals import run_eval
-from pkm_brain.db import connection
+from pkm_brain.evals import purge_retrieval_eval_telemetry, run_eval
+from pkm_brain.db import connection, dumps
 from pkm_brain.paths import BrainPaths
 from pkm_brain.retrieval_fixtures import load_retrieval_golden_cases
 from pkm_brain.retrieval_fixtures import RETRIEVAL_GOLDEN_CASES
 from pkm_brain.service import BrainService
 
 
-def test_retrieval_fixture_base_is_stratified() -> None:
+def test_packaged_retrieval_fixture_base_is_portable() -> None:
     kinds = {}
     for case in RETRIEVAL_GOLDEN_CASES:
         kinds[case["kind"]] = kinds.get(case["kind"], 0) + 1
 
-    assert len(RETRIEVAL_GOLDEN_CASES) >= 70
-    assert kinds["historical_session_query"] >= 20
-    assert kinds["agent_history_query"] >= 6
-    assert kinds["historical_session_query"] + kinds["agent_history_query"] >= 30
-    assert kinds["source_document_query"] >= 10
-    assert kinds["fact_query"] >= 10
-    assert kinds["paraphrase_query"] >= 3
-    assert kinds["negative_control"] >= 15
+    assert len(RETRIEVAL_GOLDEN_CASES) >= 3
+    assert kinds["public_contract_probe"] >= 2
+    assert kinds["negative_control"] >= 1
+    assert all(not case["expected_source_ids"] for case in RETRIEVAL_GOLDEN_CASES)
 
 
 def test_eval_run_writes_rebuildable_report(tmp_path: Path) -> None:
@@ -53,7 +49,7 @@ def test_eval_run_writes_rebuildable_report(tmp_path: Path) -> None:
     assert report_path.name.endswith(f"{result['id']}.json")
     report_json = json.loads(report_path.read_text(encoding="utf-8"))
     assert report_json["id"] == result["id"]
-    assert report_json["package_version"] == "0.1.0"
+    assert report_json["package_version"] == "0.1.1"
     assert report_json["generated_date"] == result["generated_at"][:10]
 
 
@@ -76,7 +72,10 @@ def test_retrieval_eval_reads_local_golden_queries(tmp_path: Path) -> None:
     svc = BrainService(paths)
     svc.init_workspace()
     note = paths.inbox / "sqlite-decision.md"
-    note.write_text("# SQLite Decision\n\nSQLite stores retrieval metadata locally.\n", encoding="utf-8")
+    note.write_text(
+        "# SQLite Decision\n\nSQLite stores retrieval metadata locally.\n",
+        encoding="utf-8",
+    )
     svc.ingest()
     with connection(paths.sqlite_path) as conn:
         document_id = conn.execute("SELECT id FROM documents LIMIT 1").fetchone()["id"]
@@ -103,6 +102,95 @@ def test_retrieval_eval_reads_local_golden_queries(tmp_path: Path) -> None:
     assert report["metrics"]["metrics_by_origin"]["local"]["fixture_count"] == 1
     assert local_case["origin"] == "local"
     assert local_case["source_hit"] is True
+    with connection(paths.sqlite_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM retrieval_events").fetchone()[0] == 0
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM context_lineage_events WHERE retrieval_event_id IS NOT NULL"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_purge_retrieval_eval_telemetry_preserves_real_retrievals(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    golden_query = str(RETRIEVAL_GOLDEN_CASES[0]["query"])
+    with connection(paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO facts(
+              id, statement, entity_key, source_ids, observed_at, confidence,
+              status, metadata, created_at
+            ) VALUES ('fact_eval', 'Eval-exposed fact', 'topic:test', '[]',
+                      '2026-01-01T00:00:00Z', 0.9, 'active', '{}',
+                      '2026-01-01T00:00:00Z')
+            """
+        )
+        for event_id, query in (
+            ("retrieval_eval", golden_query),
+            ("retrieval_real", "A real user query"),
+        ):
+            conn.execute(
+                """
+                INSERT INTO retrieval_events(
+                  id, query, timestamp, caller, returned_chunk_ids,
+                  selected_chunk_ids, citation_snapshots, debug
+                ) VALUES (?, ?, '2026-01-01T00:00:00Z', 'retrieve_context',
+                          '[]', '[]', '[]', '{}')
+                """,
+                (event_id, query),
+            )
+            conn.execute(
+                """
+                INSERT INTO context_lineage_events(
+                  id, target_type, target_id, event_type, retrieval_event_id,
+                  query, weight, metadata, created_at
+                ) VALUES (?, 'fact', 'fact_eval', 'exposed', ?, ?, 1.0, ?,
+                          '2026-01-01T00:00:00Z')
+                """,
+                (f"lineage_{event_id}", event_id, query, dumps({"rank": 1})),
+            )
+
+    preview = purge_retrieval_eval_telemetry(paths)
+
+    assert preview["status"] == "dry_run"
+    assert preview["matched_retrieval_event_count"] == 1
+    assert preview["removed_lineage_event_count"] == 1
+    assert preview["affected_fact_count"] == 1
+    with connection(paths.sqlite_path) as conn:
+        assert (
+            conn.execute("SELECT COUNT(*) FROM context_lineage_events").fetchone()[0]
+            == 2
+        )
+
+    result = purge_retrieval_eval_telemetry(paths, dry_run=False)
+
+    assert result["status"] == "applied"
+    with connection(paths.sqlite_path) as conn:
+        callers = {
+            row["id"]: row["caller"]
+            for row in conn.execute("SELECT id, caller FROM retrieval_events")
+        }
+        lineage_ids = {
+            row["retrieval_event_id"]
+            for row in conn.execute(
+                "SELECT retrieval_event_id FROM context_lineage_events"
+            )
+        }
+    assert callers == {
+        "retrieval_eval": "eval:retrieval_legacy",
+        "retrieval_real": "retrieve_context",
+    }
+    assert lineage_ids == {"retrieval_real"}
+    assert (
+        purge_retrieval_eval_telemetry(paths, dry_run=False)[
+            "matched_retrieval_event_count"
+        ]
+        == 0
+    )
 
 
 def test_topology_eval_uses_real_candidate_fixture_metrics(tmp_path: Path) -> None:
@@ -173,7 +261,9 @@ def test_extraction_eval_excludes_legacy_facts_from_span_gate(tmp_path: Path) ->
     assert report["metrics"]["legacy_excluded_count"] == 1
 
 
-def test_extraction_eval_fails_when_llm_fact_lacks_span_coverage(tmp_path: Path) -> None:
+def test_extraction_eval_fails_when_llm_fact_lacks_span_coverage(
+    tmp_path: Path,
+) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
     BrainService(paths).init_workspace()
     with connection(paths.sqlite_path) as conn:
@@ -262,7 +352,9 @@ def test_extraction_eval_label_fixture_allows_clean_auto_slice(tmp_path: Path) -
     assert report["metrics"]["fallback_auto_eligible_count"] == 0
 
 
-def test_extraction_eval_label_fixture_blocks_fallback_auto_eligible_fact(tmp_path: Path) -> None:
+def test_extraction_eval_label_fixture_blocks_fallback_auto_eligible_fact(
+    tmp_path: Path,
+) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
     BrainService(paths).init_workspace()
     paths.evals.mkdir(parents=True, exist_ok=True)
@@ -289,4 +381,6 @@ def test_extraction_eval_label_fixture_blocks_fallback_auto_eligible_fact(tmp_pa
     assert result["passed"] is False
     assert report["passed"] is False
     assert report["metrics"]["fallback_auto_eligible_count"] == 1
-    assert report["metrics"]["fallback_auto_eligible_case_ids"] == ["bad_fallback_auto_fact"]
+    assert report["metrics"]["fallback_auto_eligible_case_ids"] == [
+        "bad_fallback_auto_fact"
+    ]

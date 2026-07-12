@@ -6,6 +6,7 @@ from typing import Any
 from .cos_actions import apply_action, propose_action
 from .cos_policy import evaluate_policy, promote_policy_for_autonomy
 from .db import connection, dumps, loads, rows
+from .evals import run_eval
 from .fact_relations import classify_fact_relation
 from .paths import BrainPaths
 from .queue_summary import review_queue_summary
@@ -18,6 +19,9 @@ SYNTHESIZE_DRAIN_STATUSES = {"needs_human", "proposed"}
 FALLBACK_PAGE_HINTS = {"concepts/extracted-facts.md"}
 W2A_REPORT_VERSION = "w2a-v1"
 W2B_REPORT_VERSION = "w2b-v1"
+W2A_AUTO_RELATIONS = {"duplicate", "supports", "refines", "complementary", "unrelated"}
+W2A_SURVIVOR_RELATIONS = {"updates", "contradicts", "unsure"}
+W2A_APPROVER = "Peter"
 
 
 def reconcile_backlog_w2b_dry_run(
@@ -113,16 +117,8 @@ def reconcile_backlog_w2a_dry_run(
         samples_by_relation.setdefault(relation, [])
         if len(samples_by_relation[relation]) < sample_limit:
             samples_by_relation[relation].append(w2a_sample(item))
-    auto_resolvable = [
-        item
-        for item in classified
-        if item["relation"] not in {"contradicts", "unsure"}
-    ]
-    survivors = [
-        item
-        for item in classified
-        if item["relation"] in {"contradicts", "unsure"}
-    ]
+    auto_resolvable = [item for item in classified if is_w2a_auto_resolvable(item)]
+    survivors = [item for item in classified if not is_w2a_auto_resolvable(item)]
     return {
         "status": "dry_run",
         "scope": "w2a",
@@ -130,13 +126,19 @@ def reconcile_backlog_w2a_dry_run(
         "generated_at": generated_at,
         "acceptance_boundary": {
             "requires_approval_before_apply": True,
-            "apply_supported_by_this_command": False,
-            "reason": "W2a applies classifier-dependent fact resolutions only after Peter reviews this dry-run report.",
+            "apply_supported_by_this_command": True,
+            "required_flag": "--approved-by-peter",
+            "reason": "W2a applies classifier-dependent fact resolutions only after Peter approves the gated dry-run report.",
         },
         "before": before,
         "candidate_count": len(classified),
         "auto_resolvable_count": len(auto_resolvable),
         "survivor_count": len(survivors),
+        "projected_after": {
+            "raw_queue_total": max(0, int(before.get("total") or 0) - len(auto_resolvable)),
+            "resolved_question_count": len(auto_resolvable),
+            "note": "The native/browser queue may be lower because active reads deduplicate historical topology proposals.",
+        },
         "by_relation": dict(sorted(by_relation.items())),
         "samples_by_relation": {
             relation: samples_by_relation[relation]
@@ -148,7 +150,108 @@ def reconcile_backlog_w2a_dry_run(
         "affected_action_ids": sorted(
             str(item["action_id"]) for item in classified if item.get("action_id")
         ),
-        "next_step": "Review per-relation samples, then approve W2a --apply separately if the compatible classes look safe.",
+        "next_step": "Review per-relation samples, then run W2a --apply --approved-by-peter after the relations eval gate passes.",
+    }
+
+
+def reconcile_backlog_w2a_apply(
+    paths: BrainPaths,
+    *,
+    approved_by: str,
+    sample_limit: int = 20,
+) -> dict[str, Any]:
+    if approved_by.strip().lower() != W2A_APPROVER.lower():
+        raise ValueError("W2a apply requires explicit approval from Peter")
+    eval_result = run_eval(paths, suite="relations")
+    if not eval_result.get("passed"):
+        raise ValueError(
+            f"W2a apply blocked by failing relations eval: {eval_result.get('report_path')}"
+        )
+
+    generated_at = now_iso()
+    before = review_queue_summary(paths)
+    approval = {
+        "approved_by": W2A_APPROVER,
+        "approval_flag": "--approved-by-peter",
+        "approved_at": generated_at,
+        "eval_id": eval_result.get("id"),
+        "eval_report_path": eval_result.get("report_path"),
+    }
+    with connection(paths.sqlite_path) as conn:
+        items = w2a_candidate_items(conn)
+    classified = [classify_w2a_item(item) for item in items]
+    applied: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    survivors: list[dict[str, Any]] = []
+
+    for item in classified:
+        if not is_w2a_auto_resolvable(item):
+            annotate_w2a_survivor(paths, item, approval=approval)
+            survivors.append(w2a_sample(item))
+            continue
+        try:
+            applied.append(apply_w2a_item(paths, item, approval=approval))
+        except Exception as exc:
+            failed.append(
+                {
+                    **w2a_sample(item),
+                    "reason": "apply_failed",
+                    "error": str(exc)[:500],
+                }
+            )
+
+    after = review_queue_summary(paths)
+    audit = audit_w2a_apply(paths, applied, sample_limit=sample_limit)
+    return {
+        "status": "ok" if not failed else "partial",
+        "scope": "w2a",
+        "report_version": W2A_REPORT_VERSION,
+        "generated_at": generated_at,
+        "approval": approval,
+        "relation_eval": relation_eval_summary(eval_result),
+        "before": before,
+        "after": after,
+        "candidate_count": len(classified),
+        "applied_count": len(applied),
+        "failed_count": len(failed),
+        "survivor_count": len(survivors) + len(failed),
+        "by_relation": count_values(classified, "relation"),
+        "applied_by_relation": count_values(applied, "relation"),
+        "applied_samples": applied[:sample_limit],
+        "survivor_samples": survivors[:sample_limit],
+        "failed": failed[:sample_limit],
+        "mechanical_audit": audit,
+        "rollback_action_ids": [
+            str(item["applied_action_id"])
+            for item in applied
+            if item.get("applied_action_id")
+        ],
+        "rollback": "Revert applied_action_id values in reverse order with revert_action; the pre-apply runtime backup restores the full question/action state if a batch rollback is required.",
+    }
+
+
+def is_w2a_auto_resolvable(item: dict[str, Any]) -> bool:
+    relation = str(item.get("relation") or "")
+    return relation in W2A_AUTO_RELATIONS and relation not in W2A_SURVIVOR_RELATIONS
+
+
+def count_values(items: list[dict[str, Any]], key: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in items:
+        value = str(item.get(key) or "unknown")
+        counts[value] = counts.get(value, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def relation_eval_summary(result: dict[str, Any]) -> dict[str, Any]:
+    report = (result.get("reports") or [{}])[0]
+    metrics = report.get("metrics") if isinstance(report, dict) else {}
+    return {
+        "id": result.get("id"),
+        "passed": bool(result.get("passed")),
+        "report_path": result.get("report_path"),
+        "contradiction_recall": (metrics or {}).get("contradiction_recall"),
+        "false_conflict_rate": (metrics or {}).get("false_conflict_rate"),
     }
 
 
@@ -171,7 +274,11 @@ def w2a_candidate_items(conn: Any) -> list[dict[str, Any]]:
         LEFT JOIN cos_actions a ON a.id = q.action_id
         WHERE q.status IN ('open', 'needs_human')
           AND (
-            q.kind = 'fact_conflict_review'
+            (
+              q.kind = 'fact_conflict_review'
+              AND a.action_type = 'fact_upsert'
+              AND a.status IN ('needs_human', 'proposed')
+            )
             OR (
               q.kind = 'policy_escalation'
               AND a.action_type = 'fact_upsert'
@@ -237,13 +344,28 @@ def load_counterpart_facts(conn: Any, question: Any, action: dict[str, Any] | No
 def classify_w2a_item(item: dict[str, Any]) -> dict[str, Any]:
     candidate = item.get("candidate")
     counterpart_facts = item.get("counterpart_facts") or []
+    action = item.get("action")
+    if not isinstance(action, dict) or action.get("action_type") != "fact_upsert":
+        return {
+            **item,
+            "relation": "unsure",
+            "confidence": 0.0,
+            "rationale": "missing applicable fact_upsert action",
+            "classifier_version": "w2a-v1",
+            "classifications": [],
+            "selected_classification": None,
+            "selected_counterpart": None,
+        }
     if not isinstance(candidate, dict):
         return {
             **item,
             "relation": "unsure",
             "confidence": 0.0,
             "rationale": "missing candidate fact payload",
+            "classifier_version": "w2a-v1",
             "classifications": [],
+            "selected_classification": None,
+            "selected_counterpart": None,
         }
     if not counterpart_facts:
         return {
@@ -251,19 +373,34 @@ def classify_w2a_item(item: dict[str, Any]) -> dict[str, Any]:
             "relation": "unrelated",
             "confidence": 0.7,
             "rationale": "no counterpart facts supplied; routine fact_upsert policy escalation",
+            "classifier_version": "policy-no-counterpart-v1",
             "classifications": [],
+            "selected_classification": None,
+            "selected_counterpart": None,
         }
     classifications = [
         classify_fact_relation(candidate, counterpart).as_dict()
         for counterpart in counterpart_facts
     ]
     selected = select_w2a_classification(classifications)
+    selected_id = str(selected.get("existing_fact_id") or "")
+    selected_counterpart = next(
+        (
+            fact
+            for fact in counterpart_facts
+            if str(fact.get("id") or fact.get("fact_id") or "") == selected_id
+        ),
+        None,
+    )
     return {
         **item,
         "relation": selected["relation"],
         "confidence": selected["confidence"],
         "rationale": selected["rationale"],
+        "classifier_version": selected.get("classifier_version") or "deterministic-v2",
         "classifications": classifications,
+        "selected_classification": selected,
+        "selected_counterpart": selected_counterpart,
     }
 
 
@@ -291,6 +428,11 @@ def select_w2a_classification(classifications: list[dict[str, Any]]) -> dict[str
 
 def w2a_sample(item: dict[str, Any]) -> dict[str, Any]:
     candidate = item.get("candidate") if isinstance(item.get("candidate"), dict) else {}
+    counterpart = (
+        item.get("selected_counterpart")
+        if isinstance(item.get("selected_counterpart"), dict)
+        else {}
+    )
     return {
         "question_id": item.get("question_id"),
         "action_id": item.get("action_id"),
@@ -298,11 +440,394 @@ def w2a_sample(item: dict[str, Any]) -> dict[str, Any]:
         "relation": item.get("relation"),
         "confidence": item.get("confidence"),
         "rationale": item.get("rationale"),
+        "classifier_version": item.get("classifier_version"),
         "candidate_statement": str(candidate.get("statement") or "")[:220],
+        "selected_counterpart_fact_id": counterpart.get("id") or counterpart.get("fact_id"),
+        "selected_counterpart_statement": str(counterpart.get("statement") or "")[:220],
         "counterpart_fact_ids": [
             str(fact.get("id") or "") for fact in item.get("counterpart_facts") or []
         ],
         "classification_count": len(item.get("classifications") or []),
+        "planned_mechanic": w2a_resolution_mechanic(str(item.get("relation") or "unsure")),
+    }
+
+
+def w2a_resolution_mechanic(relation: str) -> str:
+    if relation in {"duplicate", "supports"}:
+        return "merge_provenance_into_selected_existing_fact"
+    if relation in {"refines", "complementary", "unrelated"}:
+        return "apply_candidate_fact_and_keep_existing_facts"
+    return "leave_for_human_review"
+
+
+def apply_w2a_item(
+    paths: BrainPaths,
+    item: dict[str, Any],
+    *,
+    approval: dict[str, Any],
+) -> dict[str, Any]:
+    relation = str(item.get("relation") or "")
+    if relation not in W2A_AUTO_RELATIONS:
+        raise ValueError(f"W2a relation is not auto-resolvable: {relation}")
+    old_action_id = str(item.get("action_id") or "").strip()
+    question_id = str(item.get("question_id") or "").strip()
+    if not old_action_id or not question_id:
+        raise ValueError("W2a item is missing a question or action id")
+
+    record = w2a_resolution_record(item, approval=approval, outcome="auto_resolved")
+    annotate_w2a_action(
+        paths,
+        old_action_id,
+        record,
+        attach_to_candidate=relation not in {"duplicate", "supports"},
+    )
+    if relation in {"duplicate", "supports"}:
+        counterpart = item.get("selected_counterpart")
+        candidate = item.get("candidate")
+        if not isinstance(counterpart, dict) or not isinstance(candidate, dict):
+            raise ValueError(f"{relation} resolution requires candidate and counterpart facts")
+        counterpart_id = str(counterpart.get("id") or counterpart.get("fact_id") or "").strip()
+        if not counterpart_id:
+            raise ValueError(f"{relation} resolution requires a counterpart fact id")
+        merged = w2a_supported_existing_fact(
+            counterpart,
+            candidate,
+            question_id=question_id,
+            relation=relation,
+            record=record,
+        )
+        proposed = propose_action(
+            paths,
+            "fact_upsert",
+            action_payload={"fact": merged},
+            action_features={
+                "human_confirmed": True,
+                "w2a_approved_batch": True,
+                "truth_mutation": False,
+                "reversible": True,
+                "affected_fact_count": 1,
+                "relation": relation,
+                "candidate_key": f"w2a:{question_id}:{counterpart_id}:{relation}",
+            },
+            target_fact_ids=[counterpart_id],
+            target_page_paths=[str(merged.get("page_hint") or "")]
+            if merged.get("page_hint")
+            else [],
+            proposed_by="w2a_reconcile",
+            confidence=float(item.get("confidence") or 0.0),
+            risk_tier="low",
+            evidence={"w2a_reconciliation": record},
+        )
+        annotate_w2a_action(
+            paths,
+            str(proposed["id"]),
+            record,
+            attach_to_candidate=False,
+        )
+        applied = apply_action(
+            paths,
+            str(proposed["id"]),
+            applied_status="auto_applied",
+            allow_llm_entity_resolution=False,
+        )
+        replaced_original = True
+    else:
+        applied = apply_action(
+            paths,
+            old_action_id,
+            applied_status="auto_applied",
+            allow_llm_entity_resolution=False,
+        )
+        replaced_original = False
+
+    applied_action_id = str(applied["id"])
+    finalize_w2a_question(
+        paths,
+        question_id=question_id,
+        old_action_id=old_action_id,
+        applied_action_id=applied_action_id,
+        record=record,
+        replaced_original=replaced_original,
+    )
+    return {
+        **w2a_sample(item),
+        "old_action_id": old_action_id,
+        "applied_action_id": applied_action_id,
+        "applied_action_status": applied.get("status"),
+        "target_fact_ids": applied.get("target_fact_ids") or [],
+        "inverse_action_json": applied.get("inverse_action_json") or {},
+        "replaced_original_action": replaced_original,
+    }
+
+
+def w2a_resolution_record(
+    item: dict[str, Any],
+    *,
+    approval: dict[str, Any],
+    outcome: str,
+) -> dict[str, Any]:
+    selected = item.get("selected_classification")
+    selected_id = (
+        selected.get("existing_fact_id") if isinstance(selected, dict) else None
+    )
+    return {
+        "outcome": outcome,
+        "question_id": item.get("question_id"),
+        "old_action_id": item.get("action_id"),
+        "relation": item.get("relation"),
+        "relation_confidence": item.get("confidence"),
+        "relation_rationale": item.get("rationale"),
+        "classifier_version": item.get("classifier_version"),
+        "selected_counterpart_fact_id": selected_id,
+        "mechanic": w2a_resolution_mechanic(str(item.get("relation") or "unsure")),
+        "approval": approval,
+        "decided_at": now_iso(),
+    }
+
+
+def annotate_w2a_action(
+    paths: BrainPaths,
+    action_id: str,
+    record: dict[str, Any],
+    *,
+    attach_to_candidate: bool,
+    approved_application: bool = True,
+) -> None:
+    with connection(paths.sqlite_path) as conn:
+        action = conn.execute("SELECT * FROM cos_actions WHERE id = ?", (action_id,)).fetchone()
+        if action is None:
+            raise ValueError(f"W2a action not found: {action_id}")
+        evidence = loads(action["evidence_json"], {})
+        evidence["w2a_reconciliation"] = record
+        if attach_to_candidate:
+            payload = evidence.get("payload") if isinstance(evidence.get("payload"), dict) else None
+            fact = payload.get("fact") if isinstance(payload, dict) else None
+            if isinstance(fact, dict):
+                metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
+                payload = dict(payload)
+                payload["fact"] = {
+                    **fact,
+                    "metadata": {**metadata, "w2a_reconciliation": record},
+                }
+                evidence["payload"] = payload
+        features = loads(action["action_features"], {})
+        features.update(
+            {
+                "relation": record.get("relation"),
+                "relation_confidence": record.get("relation_confidence"),
+                "relation_rationale": record.get("relation_rationale"),
+                "classifier_version": record.get("classifier_version"),
+            }
+        )
+        if approved_application:
+            features.update(
+                {
+                    "human_confirmed": True,
+                    "w2a_approved_batch": True,
+                    "reversible": True,
+                }
+            )
+            conn.execute(
+                """
+                UPDATE cos_actions
+                SET action_features = ?, evidence_json = ?,
+                    policy_decision = 'w2a_approved_batch', autonomy_level = 'L2'
+                WHERE id = ?
+                """,
+                (dumps(features), dumps(evidence), action_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE cos_actions SET action_features = ?, evidence_json = ? WHERE id = ?",
+                (dumps(features), dumps(evidence), action_id),
+            )
+
+
+def finalize_w2a_question(
+    paths: BrainPaths,
+    *,
+    question_id: str,
+    old_action_id: str,
+    applied_action_id: str,
+    record: dict[str, Any],
+    replaced_original: bool,
+) -> None:
+    timestamp = now_iso()
+    answer = {
+        "decision": "w2a_auto_resolve",
+        "resolution": record.get("relation"),
+        "relation": record.get("relation"),
+        "relation_confidence": record.get("relation_confidence"),
+        "relation_rationale": record.get("relation_rationale"),
+        "classifier_version": record.get("classifier_version"),
+        "selected_counterpart_fact_id": record.get("selected_counterpart_fact_id"),
+        "old_action_id": old_action_id,
+        "applied_action_id": applied_action_id,
+        "mechanic": record.get("mechanic"),
+        "approval": record.get("approval"),
+    }
+    with connection(paths.sqlite_path) as conn:
+        if replaced_original:
+            conn.execute(
+                """
+                UPDATE cos_actions
+                SET status = 'rejected', policy_decision = 'w2a_replaced_by_provenance_merge'
+                WHERE id = ? AND status IN ('proposed', 'needs_human')
+                """,
+                (old_action_id,),
+            )
+        conn.execute(
+            """
+            UPDATE open_questions
+            SET status = 'auto_resolved', answer = ?, answered_at = ?,
+                action_id = ?, decided_by = 'w2a_reconcile'
+            WHERE id = ?
+            """,
+            (dumps(answer), timestamp, applied_action_id, question_id),
+        )
+
+
+def w2a_supported_existing_fact(
+    existing: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    question_id: str,
+    relation: str,
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    timestamp = now_iso()
+    metadata = existing.get("metadata") if isinstance(existing.get("metadata"), dict) else {}
+    support_records = metadata.get("supporting_candidates")
+    if not isinstance(support_records, list):
+        support_records = []
+    support_records = [
+        value
+        for value in support_records
+        if not isinstance(value, dict) or value.get("question_id") != question_id
+    ]
+    support_records.append(
+        {
+            "question_id": question_id,
+            "relation": relation,
+            "statement": candidate.get("statement"),
+            "evidence_quote": candidate.get("evidence_quote") or candidate.get("quote"),
+            "source_ids": list_value(candidate.get("source_ids")),
+            "observed_at": candidate.get("observed_at"),
+            "attached_at": timestamp,
+            "w2a_reconciliation": record,
+        }
+    )
+    return {
+        **existing,
+        "source_ids": stable_unique_strings(
+            [
+                *list_value(existing.get("source_ids")),
+                *list_value(candidate.get("source_ids")),
+            ]
+        ),
+        "source_spans": [
+            *list_value(existing.get("source_spans")),
+            *list_value(candidate.get("source_spans")),
+        ],
+        "metadata": {**metadata, "supporting_candidates": support_records[-25:]},
+        "last_seen_at": candidate.get("observed_at") or timestamp,
+    }
+
+
+def list_value(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        parsed = loads(value, None)
+        if isinstance(parsed, list):
+            return parsed
+        return [value] if value.strip() else []
+    return []
+
+
+def annotate_w2a_survivor(
+    paths: BrainPaths,
+    item: dict[str, Any],
+    *,
+    approval: dict[str, Any],
+) -> None:
+    action_id = str(item.get("action_id") or "").strip()
+    question_id = str(item.get("question_id") or "").strip()
+    record = w2a_resolution_record(item, approval=approval, outcome="needs_human")
+    if action_id:
+        annotate_w2a_action(
+            paths,
+            action_id,
+            record,
+            attach_to_candidate=False,
+            approved_application=False,
+        )
+    if not question_id:
+        return
+    with connection(paths.sqlite_path) as conn:
+        question = conn.execute(
+            "SELECT context FROM open_questions WHERE id = ?", (question_id,)
+        ).fetchone()
+        if question is None:
+            return
+        context = loads(question["context"], {})
+        context["w2a_classification"] = record
+        conn.execute(
+            "UPDATE open_questions SET context = ? WHERE id = ?",
+            (dumps(context), question_id),
+        )
+
+
+def audit_w2a_apply(
+    paths: BrainPaths,
+    applied: list[dict[str, Any]],
+    *,
+    sample_limit: int,
+) -> dict[str, Any]:
+    sample = applied[:sample_limit]
+    checks: list[dict[str, Any]] = []
+    with connection(paths.sqlite_path) as conn:
+        for item in sample:
+            question = conn.execute(
+                "SELECT status, decided_by FROM open_questions WHERE id = ?",
+                (item["question_id"],),
+            ).fetchone()
+            action = conn.execute(
+                "SELECT status, inverse_action_json FROM cos_actions WHERE id = ?",
+                (item["applied_action_id"],),
+            ).fetchone()
+            old_action = conn.execute(
+                "SELECT status FROM cos_actions WHERE id = ?",
+                (item["old_action_id"],),
+            ).fetchone()
+            expected_old_status = (
+                "rejected" if item.get("replaced_original_action") else "auto_applied"
+            )
+            passed = bool(
+                question
+                and question["status"] == "auto_resolved"
+                and question["decided_by"] == "w2a_reconcile"
+                and action
+                and action["status"] == "auto_applied"
+                and loads(action["inverse_action_json"], {})
+                and old_action
+                and old_action["status"] == expected_old_status
+            )
+            checks.append(
+                {
+                    "question_id": item["question_id"],
+                    "applied_action_id": item["applied_action_id"],
+                    "relation": item["relation"],
+                    "passed": passed,
+                }
+            )
+    passed_count = sum(1 for item in checks if item["passed"])
+    return {
+        "sampled_count": len(checks),
+        "passed_count": passed_count,
+        "failed_count": len(checks) - passed_count,
+        "pass_rate": round(passed_count / len(checks), 3) if checks else 1.0,
+        "checks": checks,
     }
 
 

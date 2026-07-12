@@ -10,7 +10,13 @@ from .util import new_id, now_iso
 
 
 AUTONOMY_ORDER = {"L0": 0, "L1": 1, "L2": 2, "L3": 3}
-TOPOLOGY_ACTION_TYPES = {"page_merge", "page_split", "rename_page", "entity_merge", "entity_split"}
+TOPOLOGY_ACTION_TYPES = {
+    "page_merge",
+    "page_split",
+    "rename_page",
+    "entity_merge",
+    "entity_split",
+}
 HIGH_CERTAINTY_ENTITY_MERGE_SIGNALS = {
     "same_normalized_name_or_alias",
     "same_compact_name_or_alias",
@@ -26,6 +32,29 @@ MEDIUM_AUTONOMY_ACTION_TYPES = {
     *LOW_AUTONOMY_ACTION_TYPES,
     *TOPOLOGY_ACTION_TYPES,
     "display_contested",
+}
+ENTITY_FACT_ACTION_TYPES = {
+    "fact_upsert",
+    "fact_merge",
+    "fact_supersede",
+    "rehome_fact",
+    "display_contested",
+    "entity_merge",
+    "entity_split",
+}
+CURATION_STRICTNESS_PROFILES = {
+    "strict": {
+        "label": "Review First",
+        "minimum_auto_confidence": 0.95,
+    },
+    "balanced": {
+        "label": "Balanced",
+        "minimum_auto_confidence": 0.80,
+    },
+    "lenient": {
+        "label": "More Autonomy",
+        "minimum_auto_confidence": 0.60,
+    },
 }
 
 
@@ -162,7 +191,11 @@ def eval_gate_satisfied(conn: Any, eval_gate: Any) -> tuple[bool, str]:
     if not suite:
         return False, "eval_gate.suite is required"
     report_path = eval_gate.get("report_path")
-    report = load_eval_report(Path(str(report_path)).expanduser()) if report_path else latest_eval_report(conn, suite)
+    report = (
+        load_eval_report(Path(str(report_path)).expanduser())
+        if report_path
+        else latest_eval_report(conn, suite)
+    )
     if report is None:
         return False, f"no eval report found for suite {suite}"
     suite_report = report_for_suite(report, suite)
@@ -174,9 +207,15 @@ def eval_gate_satisfied(conn: Any, eval_gate: Any) -> tuple[bool, str]:
         return False, f"suite {suite} did not pass"
     if eval_gate.get("requires_labels"):
         metrics = suite_report.get("metrics", {})
-        if metrics.get("label_policy") != "labeled" or int(metrics.get("label_case_count") or 0) <= 0:
+        if (
+            metrics.get("label_policy") != "labeled"
+            or int(metrics.get("label_case_count") or 0) <= 0
+        ):
             return False, f"suite {suite} does not include labeled extraction fixtures"
-    return True, f"suite {suite} passed in {report.get('id') or report.get('report_path') or 'report'}"
+    return (
+        True,
+        f"suite {suite} passed in {report.get('id') or report.get('report_path') or 'report'}",
+    )
 
 
 def latest_eval_report(conn: Any, suite: str) -> dict[str, Any] | None:
@@ -235,12 +274,16 @@ def predicate_matches(predicate: dict[str, Any], features: dict[str, Any]) -> bo
     if "all" in predicate:
         values = predicate["all"]
         return isinstance(values, list) and all(
-            predicate_matches(item, features) for item in values if isinstance(item, dict)
+            predicate_matches(item, features)
+            for item in values
+            if isinstance(item, dict)
         )
     if "any" in predicate:
         values = predicate["any"]
         return isinstance(values, list) and any(
-            predicate_matches(item, features) for item in values if isinstance(item, dict)
+            predicate_matches(item, features)
+            for item in values
+            if isinstance(item, dict)
         )
     for op in ("eq", "in", "lt", "lte", "gt", "gte", "exists"):
         comparisons = predicate.get(op)
@@ -310,13 +353,21 @@ def classify_action_risk(
     affected_fact_count = int_or_zero(features.get("affected_fact_count"))
     affected_page_count = int_or_zero(features.get("affected_page_count"))
     if action_type == "fact_upsert":
-        if bool(features.get("fallback_route")) or not bool(features.get("quote_backed")):
+        if bool(features.get("fallback_route")) or not bool(
+            features.get("quote_backed")
+        ):
             return "high"
-        if bool(features.get("truth_contradiction")) or str(features.get("resolver_precheck") or "") == "residue":
+        if (
+            bool(features.get("truth_contradiction"))
+            or str(features.get("resolver_precheck") or "") == "residue"
+        ):
             return "high"
         if features.get("fact_upsert_resolution") == "exact_duplicate_source_union":
             return "low"
-        if bool(features.get("clean_fact_upsert")) and features.get("fact_upsert_resolution") == "new_clean_fact":
+        if (
+            bool(features.get("clean_fact_upsert"))
+            and features.get("fact_upsert_resolution") == "new_clean_fact"
+        ):
             return "medium"
         return "high"
     if action_type == "entity_merge" and high_certainty_entity_merge(features):
@@ -331,7 +382,8 @@ def classify_action_risk(
             or bool(features.get("type_mismatch"))
             or affected_fact_count >= large_topology_fact_threshold
             or affected_page_count >= large_topology_fact_threshold
-            or int_or_zero(features.get("merged_entity_count")) >= large_topology_fact_threshold
+            or int_or_zero(features.get("merged_entity_count"))
+            >= large_topology_fact_threshold
         )
         if large:
             return "high"
@@ -352,9 +404,13 @@ def classify_action_risk(
         return "low"
     if action_type == "synthesize_page":
         return "low"
-    if action_type == "edit_contract" and not any(features.get("contracts_present") or []):
+    if action_type == "edit_contract" and not any(
+        features.get("contracts_present") or []
+    ):
         return "low"
-    if action_type == "fact_merge" and str(features.get("merge_reason") or "").startswith("exact_"):
+    if action_type == "fact_merge" and str(
+        features.get("merge_reason") or ""
+    ).startswith("exact_"):
         return "low"
     if action_type in MEDIUM_AUTONOMY_ACTION_TYPES:
         return "medium"
@@ -389,11 +445,25 @@ def promote_policy_for_autonomy(
     *,
     reason: str,
     large_topology_fact_threshold: int = 8,
+    strictness: str = "balanced",
+    minimum_auto_confidence: float | None = None,
 ) -> int:
+    normalized_strictness = normalize_curation_strictness(strictness)
+    if (
+        minimum_auto_confidence is not None
+        and not 0.0 <= minimum_auto_confidence <= 1.0
+    ):
+        raise ValueError("minimum_auto_confidence must be between 0 and 1")
     current = active_policy_version(conn) or 0
     new_version = current + 1
     created_at = now_iso()
-    rows_to_insert = autonomy_policy_rows(new_version, created_at, large_topology_fact_threshold)
+    rows_to_insert = autonomy_policy_rows(
+        new_version,
+        created_at,
+        large_topology_fact_threshold,
+        strictness=normalized_strictness,
+        minimum_auto_confidence=minimum_auto_confidence,
+    )
     conn.executemany(
         """
         INSERT INTO cos_policy(
@@ -419,7 +489,14 @@ def promote_policy_for_autonomy(
             new_version,
             0,
             '["*"]',
-            dumps({"eq": {"policy_promotion_marker": True}}),
+            dumps(
+                {
+                    "eq": {
+                        "policy_promotion_marker": True,
+                        "curation_strictness": normalized_strictness,
+                    }
+                }
+            ),
             "L3",
             0,
             0,
@@ -447,6 +524,8 @@ def promote_policy_for_autonomy(
                 {
                     "policy_version": new_version,
                     "large_topology_fact_threshold": large_topology_fact_threshold,
+                    "strictness": normalized_strictness,
+                    "minimum_auto_confidence": minimum_auto_confidence,
                     "reason": reason,
                 }
             ),
@@ -457,9 +536,20 @@ def promote_policy_for_autonomy(
 
 
 def autonomy_policy_rows(
-    version: int, created_at: str, large_topology_fact_threshold: int
+    version: int,
+    created_at: str,
+    large_topology_fact_threshold: int,
+    *,
+    strictness: str = "balanced",
+    minimum_auto_confidence: float | None = None,
 ) -> list[tuple[Any, ...]]:
-    return [
+    normalized_strictness = normalize_curation_strictness(strictness)
+    low_action_types = set(LOW_AUTONOMY_ACTION_TYPES)
+    medium_action_types = set(MEDIUM_AUTONOMY_ACTION_TYPES)
+    if normalized_strictness == "strict":
+        low_action_types -= ENTITY_FACT_ACTION_TYPES
+        medium_action_types -= ENTITY_FACT_ACTION_TYPES
+    rows = [
         policy_row(
             version,
             "high_risk_l3",
@@ -497,23 +587,28 @@ def autonomy_policy_rows(
             "entity_merge_high_certainty_l1",
             10,
             ["entity_merge"],
-            {
-                "all": [
-                    {
-                        "eq": {
-                            "risk_tier": "low",
-                            "cross_entity_merge": False,
-                            "cross_type_merge": False,
-                            "type_mismatch": False,
-                        }
-                    },
-                    {
-                        "in": {
-                            "merge_signal": sorted(HIGH_CERTAINTY_ENTITY_MERGE_SIGNALS)
-                        }
-                    },
-                ]
-            },
+            confidence_bound_predicate(
+                {
+                    "all": [
+                        {
+                            "eq": {
+                                "risk_tier": "low",
+                                "cross_entity_merge": False,
+                                "cross_type_merge": False,
+                                "type_mismatch": False,
+                            }
+                        },
+                        {
+                            "in": {
+                                "merge_signal": sorted(
+                                    HIGH_CERTAINTY_ENTITY_MERGE_SIGNALS
+                                )
+                            }
+                        },
+                    ]
+                },
+                minimum_auto_confidence,
+            ),
             "L1",
             False,
             0.25,
@@ -535,14 +630,17 @@ def autonomy_policy_rows(
             "fact_upsert_exact_l1",
             25,
             ["fact_upsert"],
-            {
-                "eq": {
-                    "risk_tier": "low",
-                    "fact_upsert_resolution": "exact_duplicate_source_union",
-                    "quote_backed": True,
-                    "fallback_route": False,
-                }
-            },
+            confidence_bound_predicate(
+                {
+                    "eq": {
+                        "risk_tier": "low",
+                        "fact_upsert_resolution": "exact_duplicate_source_union",
+                        "quote_backed": True,
+                        "fallback_route": False,
+                    }
+                },
+                minimum_auto_confidence,
+            ),
             "L1",
             False,
             0.25,
@@ -553,16 +651,19 @@ def autonomy_policy_rows(
             "fact_upsert_clean_l2",
             28,
             ["fact_upsert"],
-            {
-                "eq": {
-                    "risk_tier": "medium",
-                    "clean_fact_upsert": True,
-                    "fact_upsert_resolution": "new_clean_fact",
-                    "quote_backed": True,
-                    "fallback_route": False,
-                    "resolver_precheck": "passed",
-                }
-            },
+            confidence_bound_predicate(
+                {
+                    "eq": {
+                        "risk_tier": "medium",
+                        "clean_fact_upsert": True,
+                        "fact_upsert_resolution": "new_clean_fact",
+                        "quote_backed": True,
+                        "fallback_route": False,
+                        "resolver_precheck": "passed",
+                    }
+                },
+                minimum_auto_confidence,
+            ),
             "L2",
             True,
             1.0,
@@ -583,8 +684,10 @@ def autonomy_policy_rows(
             version,
             "low_l1_critic",
             30,
-            sorted(LOW_AUTONOMY_ACTION_TYPES),
-            {"eq": {"risk_tier": "low"}},
+            sorted(low_action_types),
+            confidence_bound_predicate(
+                {"eq": {"risk_tier": "low"}}, minimum_auto_confidence
+            ),
             "L1",
             True,
             0.25,
@@ -594,8 +697,10 @@ def autonomy_policy_rows(
             version,
             "medium_l2_audit",
             40,
-            sorted(MEDIUM_AUTONOMY_ACTION_TYPES),
-            {"eq": {"risk_tier": "medium"}},
+            sorted(medium_action_types),
+            confidence_bound_predicate(
+                {"eq": {"risk_tier": "medium"}}, minimum_auto_confidence
+            ),
             "L2",
             True,
             1.0,
@@ -613,6 +718,45 @@ def autonomy_policy_rows(
             created_at,
         ),
     ]
+    if normalized_strictness == "strict":
+        rows.append(
+            policy_row(
+                version,
+                "entity_fact_review_l3",
+                27,
+                sorted(ENTITY_FACT_ACTION_TYPES),
+                {},
+                "L3",
+                False,
+                1.0,
+                created_at,
+            )
+        )
+        rows.sort(key=lambda row: (int(row[2]), str(row[0])))
+    return rows
+
+
+def normalize_curation_strictness(value: str) -> str:
+    normalized = str(value or "balanced").strip().lower()
+    if normalized not in CURATION_STRICTNESS_PROFILES:
+        raise ValueError(
+            "strictness must be one of: "
+            + ", ".join(sorted(CURATION_STRICTNESS_PROFILES))
+        )
+    return normalized
+
+
+def confidence_bound_predicate(
+    predicate: dict[str, Any], minimum_auto_confidence: float | None
+) -> dict[str, Any]:
+    if minimum_auto_confidence is None:
+        return predicate
+    return {
+        "all": [
+            predicate,
+            {"gte": {"confidence": float(minimum_auto_confidence)}},
+        ]
+    }
 
 
 def policy_row(
@@ -645,12 +789,28 @@ def policy_row(
 
 
 def demote_policy_version(
-    conn: Any, *, reason: str, demote_to: str = "L3"
-) -> int:
+    conn: Any,
+    *,
+    reason: str,
+    policy_groups: list[dict[str, Any]],
+    demote_to: str = "L3",
+) -> int | None:
     current = active_policy_version(conn) or 0
+    current_rules = active_policy_rules(conn)
+    target_rule_ids = demotion_target_rule_ids(conn, current_rules, policy_groups)
+    changed_rule_ids = {
+        str(rule["id"])
+        for rule in current_rules
+        if str(rule["id"]) in target_rule_ids
+        and AUTONOMY_ORDER.get(str(rule["autonomy_level"]), 3)
+        < AUTONOMY_ORDER.get(demote_to, 3)
+    }
+    if not changed_rule_ids:
+        return None
     new_version = current + 1
     created_at = now_iso()
-    for rule in active_policy_rules(conn):
+    for rule in current_rules:
+        is_demoted = str(rule["id"]) in changed_rule_ids
         conn.execute(
             """
             INSERT INTO cos_policy(
@@ -666,14 +826,17 @@ def demote_policy_version(
                 int(rule["priority"]),
                 rule["match_action_types"],
                 rule["match_predicate"],
-                demote_to
-                if AUTONOMY_ORDER.get(str(rule["autonomy_level"]), 3)
-                < AUTONOMY_ORDER.get(demote_to, 3)
-                else rule["autonomy_level"],
-                0 if demote_to == "L3" else int(rule["critic_required"]),
-                0 if demote_to == "L3" else int(rule["timeout_allowed"]),
-                None if demote_to == "L3" else rule["timeout_after_seconds"],
-                max(float(rule["audit_sample_rate"] or 0.0), 1.0),
+                demote_to if is_demoted else rule["autonomy_level"],
+                0
+                if is_demoted and demote_to == "L3"
+                else int(rule["critic_required"]),
+                0
+                if is_demoted and demote_to == "L3"
+                else int(rule["timeout_allowed"]),
+                None
+                if is_demoted and demote_to == "L3"
+                else rule["timeout_after_seconds"],
+                1.0 if is_demoted else float(rule["audit_sample_rate"] or 0.0),
                 rule["demotion_threshold"],
                 rule["auto_revert_signals"],
                 1,
@@ -693,7 +856,14 @@ def demote_policy_version(
             new_version,
             0,
             '["*"]',
-            dumps({"eq": {"policy_demoted": True}}),
+            dumps(
+                {
+                    "all": [
+                        {"eq": {"policy_demoted": True}},
+                        {"eq": {"demotion_reason": reason}},
+                    ]
+                }
+            ),
             "L3",
             0,
             0,
@@ -704,3 +874,77 @@ def demote_policy_version(
         ),
     )
     return new_version
+
+
+def demotion_target_rule_ids(
+    conn: Any,
+    current_rules: list[Any],
+    policy_groups: list[dict[str, Any]],
+) -> set[str]:
+    targets: set[str] = set()
+    for group in policy_groups:
+        policy_id = group.get("policy_id")
+        policy_version = group.get("policy_version")
+        if not policy_id or policy_version is None:
+            continue
+        source = conn.execute(
+            "SELECT * FROM cos_policy WHERE id = ? AND version = ?",
+            (str(policy_id), int(policy_version)),
+        ).fetchone()
+        if source is None:
+            continue
+        targets.update(matching_policy_rule_ids(source, current_rules))
+    return targets
+
+
+def matching_policy_rule_ids(source: Any, current_rules: list[Any]) -> set[str]:
+    source_id = str(source["id"])
+    for rule in current_rules:
+        if str(rule["id"]) == source_id:
+            return {source_id}
+
+    source_slug = canonical_policy_rule_slug(source_id)
+    if source_slug:
+        slug_matches = {
+            str(rule["id"])
+            for rule in current_rules
+            if canonical_policy_rule_slug(str(rule["id"])) == source_slug
+        }
+        if slug_matches:
+            return slug_matches
+
+    source_signature = policy_rule_signature(source)
+    signature_matches = {
+        str(rule["id"])
+        for rule in current_rules
+        if policy_rule_signature(rule) == source_signature
+    }
+    if signature_matches:
+        return signature_matches
+
+    priority_matches = {
+        str(rule["id"])
+        for rule in current_rules
+        if int(rule["priority"]) == int(source["priority"])
+    }
+    return priority_matches if len(priority_matches) == 1 else set()
+
+
+def canonical_policy_rule_slug(policy_id: str) -> str | None:
+    parts = policy_id.split("_", 2)
+    if (
+        len(parts) == 3
+        and parts[0] == "policy"
+        and parts[1].startswith("v")
+        and parts[1][1:].isdigit()
+    ):
+        return parts[2]
+    return None
+
+
+def policy_rule_signature(rule: Any) -> tuple[int, str, str]:
+    return (
+        int(rule["priority"]),
+        dumps(sorted(loads(rule["match_action_types"], ["*"]))),
+        dumps(loads(rule["match_predicate"], {})),
+    )

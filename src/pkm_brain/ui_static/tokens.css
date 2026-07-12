@@ -1,4 +1,4 @@
-/* Brain UI v2 — design tokens. AUTHORITATIVE per docs/brain-ui-v2-spec.md §4.
+/* Brain UI fallback design tokens. Contract: docs/specs/app-and-operations.md.
    Near-monochrome slate + one indigo accent. Semantic colors for status only.
    Both themes ship; OS decides. No other colors may be introduced in views. */
 

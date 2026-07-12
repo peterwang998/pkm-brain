@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -24,9 +25,12 @@ def prune_runtime_artifacts(
     actions: list[dict[str, Any]] = []
     manual_review: list[dict[str, Any]] = []
     actions.extend(stale_db_backup_actions(paths))
-    actions.extend(runtime_backup_actions(paths, cutoff=cutoff, keep=keep_runtime_backups))
+    actions.extend(
+        runtime_backup_actions(paths, cutoff=cutoff, keep=keep_runtime_backups)
+    )
     actions.extend(log_rotation_actions(paths, max_log_bytes=max_log_bytes))
     manual_review.extend(experiment_home_reports(paths))
+    manual_review.extend(user_backup_reports(paths))
     if commit:
         for action in actions:
             apply_prune_action(action, keep_log_rotations=keep_log_rotations)
@@ -41,7 +45,9 @@ def prune_runtime_artifacts(
             "keep_log_rotations": keep_log_rotations,
         },
         "action_count": len(actions),
-        "total_bytes_reclaimable": sum(int(action.get("bytes") or 0) for action in actions),
+        "total_bytes_reclaimable": sum(
+            int(action.get("bytes") or 0) for action in actions
+        ),
         "actions": actions,
         "manual_review": manual_review,
     }
@@ -56,7 +62,9 @@ def stale_db_backup_actions(paths: BrainPaths) -> list[dict[str, Any]]:
     ]
 
 
-def runtime_backup_actions(paths: BrainPaths, *, cutoff: datetime, keep: int) -> list[dict[str, Any]]:
+def runtime_backup_actions(
+    paths: BrainPaths, *, cutoff: datetime, keep: int
+) -> list[dict[str, Any]]:
     candidates: list[Path] = []
     for root in runtime_backup_roots(paths):
         if root.exists():
@@ -66,11 +74,19 @@ def runtime_backup_actions(paths: BrainPaths, *, cutoff: datetime, keep: int) ->
     for index, path in enumerate(ordered):
         modified = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
         if index >= keep and modified < cutoff:
-            stale.append(action("delete_tree", path, reason="runtime backup outside retention window"))
+            stale.append(
+                action(
+                    "delete_tree",
+                    path,
+                    reason="runtime backup outside retention window",
+                )
+            )
     return stale
 
 
-def log_rotation_actions(paths: BrainPaths, *, max_log_bytes: int) -> list[dict[str, Any]]:
+def log_rotation_actions(
+    paths: BrainPaths, *, max_log_bytes: int
+) -> list[dict[str, Any]]:
     if not paths.logs.exists():
         return []
     return [
@@ -94,8 +110,111 @@ def experiment_home_reports(paths: BrainPaths) -> list[dict[str, Any]]:
     return reports
 
 
+def user_backup_reports(paths: BrainPaths) -> list[dict[str, Any]]:
+    root = paths.home / "backups"
+    if not root.exists():
+        return []
+    return [
+        {
+            "path": str(path),
+            "bytes": path_size(path),
+            "reason": "user/checkpoint backup; never deleted automatically",
+        }
+        for path in sorted(root.iterdir())
+    ]
+
+
 def runtime_backup_roots(paths: BrainPaths) -> list[Path]:
-    return [paths.home / "backups", paths.home.parent / "brain-runtime-backups"]
+    return [paths.home.parent / "brain-runtime-backups"]
+
+
+def managed_storage_inventory(
+    paths: BrainPaths,
+    *,
+    app_support: Path | None = None,
+) -> dict[str, Any]:
+    support = (
+        app_support or Path.home() / "Library" / "Application Support" / "PKM Brain"
+    )
+    roots = [
+        storage_entry("brain_home", paths.home, policy="managed"),
+        storage_entry(
+            "runtime_backups",
+            paths.home.parent / "brain-runtime-backups",
+            policy="managed_retention",
+        ),
+        storage_entry(
+            "app_runtimes",
+            support / "runtime",
+            policy="process_aware_retention",
+            item_count=managed_runtime_count(support / "runtime"),
+        ),
+        storage_entry(
+            "app_migration",
+            support / "migration",
+            policy="manual_review",
+        ),
+    ]
+    details = [
+        storage_entry("sqlite", paths.sqlite_path, policy="telemetry_budget"),
+        storage_entry("indexes", paths.indexes, policy="rebuildable"),
+        storage_entry("logs", paths.logs, policy="managed_retention"),
+        storage_entry("user_backups", paths.home / "backups", policy="manual_review"),
+    ]
+    return {
+        "generated_at": now_iso(),
+        "roots": roots,
+        "details": details,
+        "managed_root_bytes": sum(int(item["bytes"]) for item in roots),
+    }
+
+
+def storage_entry(
+    key: str,
+    path: Path,
+    *,
+    policy: str,
+    item_count: int | None = None,
+) -> dict[str, Any]:
+    entry = {
+        "key": key,
+        "path": str(path),
+        "exists": path.exists(),
+        "bytes": disk_usage_bytes(path) if path.exists() else 0,
+        "policy": policy,
+    }
+    if item_count is not None:
+        entry["item_count"] = item_count
+    return entry
+
+
+def disk_usage_bytes(path: Path) -> int:
+    du = shutil.which("du")
+    if du:
+        try:
+            completed = subprocess.run(
+                [du, "-sk", str(path)],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            return int(completed.stdout.split()[0]) * 1024
+        except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+            pass
+    return path_size(path)
+
+
+def managed_runtime_count(root: Path) -> int:
+    if not root.exists():
+        return 0
+    return sum(
+        1
+        for path in root.iterdir()
+        if path.name not in {"current", "dev"}
+        and path.is_dir()
+        and not path.is_symlink()
+    )
 
 
 def action(kind: str, path: Path, *, reason: str) -> dict[str, Any]:
@@ -103,7 +222,9 @@ def action(kind: str, path: Path, *, reason: str) -> dict[str, Any]:
         "kind": kind,
         "path": str(path),
         "bytes": path_size(path),
-        "modified_at": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(),
+        "modified_at": datetime.fromtimestamp(
+            path.stat().st_mtime, timezone.utc
+        ).isoformat(),
         "reason": reason,
     }
 

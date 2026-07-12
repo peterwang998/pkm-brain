@@ -687,6 +687,38 @@ def _migration_020_document_source_stats(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "documents", "source_size", "INTEGER")
 
 
+def _migration_021_review_admission(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS review_admissions (
+          item_key TEXT PRIMARY KEY,
+          item_kind TEXT NOT NULL,
+          group_name TEXT NOT NULL,
+          state TEXT NOT NULL CHECK(state IN ('admitted', 'deferred')),
+          priority INTEGER NOT NULL,
+          admission_reason TEXT NOT NULL,
+          first_seen_at TEXT NOT NULL,
+          admitted_at TEXT,
+          updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_review_admissions_state_priority
+        ON review_admissions(state, priority, first_seen_at)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS review_admission_meta (
+          singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+          initialized_at TEXT NOT NULL
+        )
+        """
+    )
+
+
 MIGRATIONS: list[Migration] = [
     (1, "add_origin_identity", _migration_001_add_origin_identity),
     (2, "create_sync_runs", _migration_002_create_sync_runs),
@@ -712,6 +744,7 @@ MIGRATIONS: list[Migration] = [
     (18, "entity_identity", _migration_018_entity_identity),
     (19, "fact_entity_mention_kind", _migration_019_fact_entity_mention_kind),
     (20, "document_source_stats", _migration_020_document_source_stats),
+    (21, "review_admission", _migration_021_review_admission),
 ]
 
 

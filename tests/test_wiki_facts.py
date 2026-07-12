@@ -38,7 +38,7 @@ def test_facts_directly_conflict_requires_shared_topic() -> None:
     assert not facts_directly_conflict(
         {
             "statement": (
-                "Before Catch, Peter was at Elation for six and a half years."
+                "Before Catch, Alex was at Elation for six and a half years."
             )
         },
         {
@@ -51,13 +51,13 @@ def test_facts_directly_conflict_requires_shared_topic() -> None:
     assert not facts_directly_conflict(
         {
             "statement": (
-                "The interviewer said Hightouch starts pulling data from the warehouse "
+                "The interviewer said DataBridge starts pulling data from the warehouse "
                 "to Meta immediately after a sync is finalized."
             )
         },
         {
             "statement": (
-                "Josh said Hightouch is targeting roughly doubling the business this "
+                "Josh said DataBridge is targeting roughly doubling the business this "
                 "year after reaching the $100M ARR milestone."
             )
         },
@@ -78,8 +78,8 @@ def test_wiki_fact_dashboard_surfaces_needs_human_questions(tmp_path: Path) -> N
             (
                 "question_review",
                 "fact_conflict_review",
-                "companies:sierra",
-                "companies/sierra.md",
+                "companies:northwind",
+                "companies/northwind.md",
                 json.dumps(["fact_candidate", "fact_existing"]),
                 "Candidate appears to contradict an existing nearby fact.",
                 "[]",
@@ -218,9 +218,9 @@ def test_managed_page_routes_each_fact_to_one_section() -> None:
     facts = [
         {
             "id": "fact_summary",
-            "statement": "CloudZero sharing should be framed as role-aware collaboration, not broad dashboard distribution.",
+            "statement": "Atlas Cloud sharing should be framed as role-aware collaboration, not broad dashboard distribution.",
             "section_hint": "Summary",
-            "source_ids": ["document:doc_cloudzero"],
+            "source_ids": ["document:doc_atlas_cloud"],
             "observed_at": "2026-05-30T08:03:04+00:00",
             "created_at": "2026-05-30T08:03:04+00:00",
         },
@@ -228,7 +228,7 @@ def test_managed_page_routes_each_fact_to_one_section() -> None:
             "id": "fact_definition",
             "statement": "A useful access model distinguishes inherited identity groups from custom FinOps administrator groups.",
             "section_hint": "Definition",
-            "source_ids": ["document:doc_cloudzero"],
+            "source_ids": ["document:doc_atlas_cloud"],
             "observed_at": "2026-05-30T09:03:04+00:00",
             "created_at": "2026-05-30T09:03:04+00:00",
         },
@@ -236,15 +236,15 @@ def test_managed_page_routes_each_fact_to_one_section() -> None:
             "id": "fact_why",
             "statement": "This matters because cross-functional leaders need curated cost visibility without full administrative control.",
             "section_hint": "Why It Matters",
-            "source_ids": ["document:doc_cloudzero"],
+            "source_ids": ["document:doc_atlas_cloud"],
             "observed_at": "2026-05-30T10:03:04+00:00",
             "created_at": "2026-05-30T10:03:04+00:00",
         },
     ]
 
-    markdown = render_managed_page("concepts/cloudzero-sharing.md", facts)
+    markdown = render_managed_page("concepts/atlas_cloud-sharing.md", facts)
 
-    assert duplicate_fact_projection_errors("concepts/cloudzero-sharing.md", markdown) == []
+    assert duplicate_fact_projection_errors("concepts/atlas_cloud-sharing.md", markdown) == []
     assert markdown.count("role-aware collaboration") == 1
     assert markdown.count("inherited identity groups") == 1
     assert markdown.count("curated cost visibility") == 1
@@ -280,42 +280,42 @@ def test_managed_page_suppresses_near_duplicate_facts_across_sections() -> None:
     facts = [
         {
             "id": "fact_old",
-            "statement": "The Hightouch interview introduced an alternative PM role focused on a major AI and data initiative around the CDP experience.",
+            "statement": "The DataBridge interview introduced an alternative PM role focused on a major AI and data initiative around the CDP experience.",
             "section_hint": "Why It Matters",
-            "source_ids": ["document:doc_hightouch"],
+            "source_ids": ["document:doc_databridge"],
             "confidence": 0.7,
             "observed_at": "2026-05-29T08:00:00+00:00",
             "created_at": "2026-05-29T08:00:00+00:00",
         },
         {
             "id": "fact_new",
-            "statement": "During the May 29, 2026 Hightouch interview process, the team introduced an alternate PM opportunity focused on a major AI and data initiative around the CDP experience.",
+            "statement": "During the May 29, 2026 DataBridge interview process, the team introduced an alternate PM opportunity focused on a major AI and data initiative around the CDP experience.",
             "section_hint": "How It Works",
-            "source_ids": ["document:doc_hightouch"],
+            "source_ids": ["document:doc_databridge"],
             "confidence": 0.86,
             "observed_at": "2026-05-30T08:00:00+00:00",
             "created_at": "2026-05-30T08:00:00+00:00",
         },
     ]
 
-    markdown = render_managed_page("concepts/hightouch.md", facts)
+    markdown = render_managed_page("concepts/databridge.md", facts)
 
     assert "fact_old" in markdown
     assert "fact_new" in markdown
     assert markdown.count("major AI and data initiative around the CDP experience") == 1
-    assert duplicate_fact_projection_errors("concepts/hightouch.md", markdown) == []
+    assert duplicate_fact_projection_errors("concepts/databridge.md", markdown) == []
 
 
 def test_compact_statement_preserves_legacy_inline_heading_prefixed_facts() -> None:
     statement = compact_statement(
         "## May 2026 Interview Notes ### Product Vision Discussed "
-        "In the Hightouch process, Peter framed a staged evolution from campaign intelligence to agentic lifecycle marketing."
+        "In the DataBridge process, Alex framed a staged evolution from campaign intelligence to agentic lifecycle marketing."
     )
 
     assert statement
     assert "##" not in statement
     assert "###" not in statement
-    assert "Hightouch process" in statement
+    assert "DataBridge process" in statement
 
 
 def test_migration_fact_extraction_cleans_markdown_noise() -> None:

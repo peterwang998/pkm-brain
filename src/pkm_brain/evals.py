@@ -20,7 +20,14 @@ from .util import new_id, now_iso
 from .wiki_facts import fact_is_auto_winner, fact_similarity_signals, facts_should_merge
 
 
-EVAL_SUITES = {"extraction", "routing", "topology", "conflict", "relations", "retrieval"}
+EVAL_SUITES = {
+    "extraction",
+    "routing",
+    "topology",
+    "conflict",
+    "relations",
+    "retrieval",
+}
 VERDICT_VALUES = {"no_strong_match": 0.0, "partial": 0.5, "found": 1.0}
 EXTRACTION_LABELS_FILENAME = "extraction_labels.jsonl"
 EXTRACTION_FALLBACK_PAGE_HINTS = {"concepts/extracted-facts.md"}
@@ -51,7 +58,9 @@ def run_eval(
     output_dir = report_dir or paths.home / "reports" / "evals"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / eval_report_filename(result)
-    output_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    output_path.write_text(
+        json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     result["report_path"] = str(output_path)
     return result
 
@@ -65,8 +74,12 @@ def current_package_version() -> str:
 
 def eval_report_filename(result: dict[str, Any]) -> str:
     suite = safe_filename_part(str(result.get("suite") or "all"))
-    package_version = safe_filename_part(str(result.get("package_version") or "unknown"))
-    generated_date = safe_filename_part(str(result.get("generated_date") or str(result.get("generated_at") or "")[:10]))
+    package_version = safe_filename_part(
+        str(result.get("package_version") or "unknown")
+    )
+    generated_date = safe_filename_part(
+        str(result.get("generated_date") or str(result.get("generated_at") or "")[:10])
+    )
     eval_id = safe_filename_part(str(result.get("id") or new_id("eval")))
     return f"eval-{suite}-v{package_version}-{generated_date}-{eval_id}.json"
 
@@ -113,7 +126,9 @@ def extraction_eval(paths: BrainPaths) -> dict[str, Any]:
             """
         ).fetchone()[0]
     label_cases = load_extraction_label_cases(paths)
-    label_metrics, label_reports, label_passed = evaluate_extraction_label_cases(label_cases)
+    label_metrics, label_reports, label_passed = evaluate_extraction_label_cases(
+        label_cases
+    )
     threshold = {
         "span_coverage": 0.8,
         "auto_support_precision": 1.0,
@@ -161,7 +176,9 @@ def load_extraction_label_cases(paths: BrainPaths) -> list[dict[str, Any]]:
     if not label_path.exists():
         return []
     cases: list[dict[str, Any]] = []
-    for line_number, raw_line in enumerate(label_path.read_text(encoding="utf-8").splitlines(), start=1):
+    for line_number, raw_line in enumerate(
+        label_path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
@@ -177,17 +194,27 @@ def evaluate_extraction_label_cases(
     cases: list[dict[str, Any]],
 ) -> tuple[dict[str, Any], list[dict[str, Any]], bool]:
     if not cases:
-        return {
-            "label_policy": "unlabeled",
-            "label_case_count": 0,
-            "label_file": f"evals/{EXTRACTION_LABELS_FILENAME}",
-        }, [], False
+        return (
+            {
+                "label_policy": "unlabeled",
+                "label_case_count": 0,
+                "label_file": f"evals/{EXTRACTION_LABELS_FILENAME}",
+            },
+            [],
+            False,
+        )
     reports = [evaluate_extraction_label_case(case) for case in cases]
     auto_reports = [report for report in reports if report["auto_eligible"]]
     keep_reports = [report for report in reports if report["keep"]]
-    unsupported_auto = [report["id"] for report in auto_reports if not report["supported_by_quote"]]
-    route_mismatch_auto = [report["id"] for report in auto_reports if not report["route_correct"]]
-    fallback_auto = [report["id"] for report in auto_reports if report["fallback_route"]]
+    unsupported_auto = [
+        report["id"] for report in auto_reports if not report["supported_by_quote"]
+    ]
+    route_mismatch_auto = [
+        report["id"] for report in auto_reports if not report["route_correct"]
+    ]
+    fallback_auto = [
+        report["id"] for report in auto_reports if report["fallback_route"]
+    ]
     metrics = {
         "label_policy": "labeled",
         "label_file": f"evals/{EXTRACTION_LABELS_FILENAME}",
@@ -197,7 +224,9 @@ def evaluate_extraction_label_cases(
         "keep_precision": round(ratio(len(keep_reports), len(reports)), 3),
         "auto_support_precision": round(
             ratio(
-                len([report for report in auto_reports if report["supported_by_quote"]]),
+                len(
+                    [report for report in auto_reports if report["supported_by_quote"]]
+                ),
                 len(auto_reports),
             ),
             3,
@@ -229,19 +258,26 @@ def evaluate_extraction_label_case(case: dict[str, Any]) -> dict[str, Any]:
     page_hint = canonical_label_page_hint(case.get("page_hint"))
     expected_page_hint = canonical_label_page_hint(case.get("expected_page_hint"))
     fallback_route = page_hint in EXTRACTION_FALLBACK_PAGE_HINTS
-    keep = label_bool(case, "keep", default=label_bool(case, "expected_keep", default=True))
+    keep = label_bool(
+        case, "keep", default=label_bool(case, "expected_keep", default=True)
+    )
     supported_by_quote = label_bool(case, "supported_by_quote", default=keep)
     if expected_page_hint:
         route_correct = page_hint == expected_page_hint
     else:
-        route_correct = label_bool(case, "route_correct", default=keep and not fallback_route)
+        route_correct = label_bool(
+            case, "route_correct", default=keep and not fallback_route
+        )
     auto_eligible = label_bool(
         case,
         "auto_eligible",
         default=label_bool(
             case,
             "expected_auto_eligible",
-            default=keep and supported_by_quote and route_correct and not fallback_route,
+            default=keep
+            and supported_by_quote
+            and route_correct
+            and not fallback_route,
         ),
     )
     return {
@@ -316,11 +352,7 @@ def topology_eval(paths: BrainPaths) -> dict[str, Any]:
     false_negative = expected_keys - actual
     precision = len(true_positive) / len(actual) if actual else 1.0
     recall = len(true_positive) / len(expected_keys) if expected_keys else 1.0
-    f1 = (
-        (2 * precision * recall) / (precision + recall)
-        if precision + recall
-        else 0.0
-    )
+    f1 = (2 * precision * recall) / (precision + recall) if precision + recall else 0.0
     threshold = {"merge_split_f1": 0.75, "candidate_precision": 0.8}
     return suite_report(
         "topology",
@@ -340,7 +372,9 @@ def topology_eval(paths: BrainPaths) -> dict[str, Any]:
     )
 
 
-def topology_fixture() -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], set[str]]:
+def topology_fixture() -> tuple[
+    list[dict[str, Any]], dict[str, dict[str, Any]], set[str]
+]:
     pages = [
         topology_page(
             "concepts/alpha-payment.md",
@@ -537,12 +571,20 @@ def conflict_eval(paths: BrainPaths) -> dict[str, Any]:
         for case in case_reports
         if case["actual_auto_supersede"] and not case["expected_auto_supersede"]
     ]
-    contradiction_recall = ratio(len(contradiction_true_positive), len(contradiction_cases))
-    contradiction_precision = ratio(len(contradiction_true_positive), len(predicted_contradictions))
+    contradiction_recall = ratio(
+        len(contradiction_true_positive), len(contradiction_cases)
+    )
+    contradiction_precision = ratio(
+        len(contradiction_true_positive), len(predicted_contradictions)
+    )
     merge_recall = ratio(len(merge_true_positive), len(expected_merges))
     merge_precision = ratio(len(merge_true_positive), len(actual_merges))
-    auto_supersede_recall = ratio(len(auto_supersede_true_positive), len(expected_auto_supersede))
-    auto_supersede_precision = ratio(len(auto_supersede_true_positive), len(actual_auto_supersede))
+    auto_supersede_recall = ratio(
+        len(auto_supersede_true_positive), len(expected_auto_supersede)
+    )
+    auto_supersede_precision = ratio(
+        len(auto_supersede_true_positive), len(actual_auto_supersede)
+    )
     threshold = {
         "false_truth_resolutions": 0,
         "false_auto_merge_count": 0,
@@ -614,13 +656,13 @@ def conflict_fixture_cases() -> list[dict[str, Any]]:
         },
         {
             "id": "material_value_contradiction_not_merge",
-            "left": "The CloudZero monthly budget cap is 500 dollars.",
-            "right": "The CloudZero monthly budget cap is 750 dollars.",
+            "left": "The Atlas Cloud monthly budget cap is 500 dollars.",
+            "right": "The Atlas Cloud monthly budget cap is 750 dollars.",
             "expected_merge": False,
             "expected_contradiction": True,
             "newer_fact": conflict_fact(
                 "fact_value_change",
-                "The CloudZero monthly budget cap is 750 dollars.",
+                "The Atlas Cloud monthly budget cap is 750 dollars.",
                 confidence=0.91,
             ),
             "expected_auto_supersede": True,
@@ -686,7 +728,9 @@ def evaluate_conflict_fixture_case(case: dict[str, Any]) -> dict[str, Any]:
 def relations_eval(paths: BrainPaths) -> dict[str, Any]:
     fixture_cases = relation_fixture_cases()
     mined_cases = mine_answered_relation_cases(paths)
-    case_reports = [evaluate_relation_case(case) for case in [*fixture_cases, *mined_cases]]
+    case_reports = [
+        evaluate_relation_case(case) for case in [*fixture_cases, *mined_cases]
+    ]
     contradiction_cases = [
         case for case in case_reports if case["expected_relation"] == "contradicts"
     ]
@@ -712,7 +756,9 @@ def relations_eval(paths: BrainPaths) -> dict[str, Any]:
         for case in case_reports
         if case["expected_relation"] == case["actual_relation"]
     ]
-    contradiction_recall = ratio(len(contradiction_true_positive), len(contradiction_cases))
+    contradiction_recall = ratio(
+        len(contradiction_true_positive), len(contradiction_cases)
+    )
     false_conflict_rate = ratio(len(false_conflicts), len(non_contradiction_cases))
     relation_accuracy = ratio(len(exact_relation_matches), len(case_reports))
     threshold = {
@@ -731,8 +777,8 @@ def relations_eval(paths: BrainPaths) -> dict[str, Any]:
         "false_conflict_count": len(false_conflicts),
         "false_conflict_case_ids": [case["id"] for case in false_conflicts],
         "relation_accuracy": round(relation_accuracy, 3),
-        "classifier_mode": "deterministic_eval_only",
-        "activation": "disabled",
+        "classifier_mode": "deterministic_gated",
+        "activation": "approval_gated_w2a",
     }
     passed = (
         bool(case_reports)
@@ -782,35 +828,35 @@ def relation_fixture_cases() -> list[dict[str, Any]]:
         ),
         relation_case(
             "temporal_update",
-            "As of 2026-06-01, the CloudZero monthly budget cap is 500 dollars.",
-            "As of 2026-07-09, the CloudZero monthly budget cap is 750 dollars.",
+            "As of 2026-06-01, the Atlas Cloud monthly budget cap is 500 dollars.",
+            "As of 2026-07-09, the Atlas Cloud monthly budget cap is 750 dollars.",
             "updates",
             existing={
-                "entity_key": "account:cloudzero:budget",
-                "page_hint": "tools/cloudzero.md",
+                "entity_key": "account:atlas_cloud:budget",
+                "page_hint": "tools/atlas_cloud.md",
                 "observed_at": "2026-06-01T00:00:00+00:00",
-                "source_ids": ["document:cloudzero-june"],
+                "source_ids": ["document:atlas_cloud-june"],
             },
             candidate={
-                "entity_key": "account:cloudzero:budget",
-                "page_hint": "tools/cloudzero.md",
+                "entity_key": "account:atlas_cloud:budget",
+                "page_hint": "tools/atlas_cloud.md",
                 "observed_at": "2026-07-09T00:00:00+00:00",
-                "source_ids": ["document:cloudzero-july"],
+                "source_ids": ["document:atlas_cloud-july"],
             },
         ),
         relation_case(
             "both_true_progression",
-            "Peter had one interview scheduled for the role.",
-            "Peter is now in final rounds for the role.",
+            "Alex had one interview scheduled for the role.",
+            "Alex is now in final rounds for the role.",
             "complementary",
             existing={
-                "entity_key": "person:peter:career",
-                "page_hint": "career/peter.md",
+                "entity_key": "person:alex:career",
+                "page_hint": "career/alex.md",
                 "source_ids": ["document:career-a"],
             },
             candidate={
-                "entity_key": "person:peter:career",
-                "page_hint": "career/peter.md",
+                "entity_key": "person:alex:career",
+                "page_hint": "career/alex.md",
                 "source_ids": ["document:career-b"],
             },
         ),
@@ -821,6 +867,20 @@ def relation_fixture_cases() -> list[dict[str, Any]]:
             "contradicts",
             existing={**base},
             candidate={**base},
+        ),
+        relation_case(
+            "same_entity_different_negated_attribute",
+            "Northwind's 401(k) match was 100% on contributions up to 1% of base salary.",
+            "Northwind offers a $10,000 lifetime fertility benefit with no annual cap.",
+            "unrelated",
+            existing={
+                "entity_key": "company:northwind",
+                "page_hint": "companies/northwind.md",
+            },
+            candidate={
+                "entity_key": "company:northwind",
+                "page_hint": "companies/northwind.md",
+            },
         ),
         relation_case(
             "unrelated_different_entity",
@@ -863,7 +923,9 @@ def relation_case(
     }
 
 
-def mine_answered_relation_cases(paths: BrainPaths, *, limit: int = 100) -> list[dict[str, Any]]:
+def mine_answered_relation_cases(
+    paths: BrainPaths, *, limit: int = 100
+) -> list[dict[str, Any]]:
     if not paths.sqlite_path.exists():
         return []
     with connection(paths.sqlite_path) as conn:
@@ -930,22 +992,28 @@ def relation_from_answer(answer: Any) -> str | None:
     decision = str(answer.get("decision") or "").strip()
     if decision == "both_true":
         return "complementary"
-    if decision in {"dismiss", "reject", "keep_existing"}:
-        return "contradicts"
+    if decision in {"supports", "supports_existing", "merge_evidence"}:
+        return "supports"
+    if decision in {"temporal_update", "updates", "current_state"}:
+        return "updates"
     reason = str(answer.get("reason") or "").strip().lower()
     if "duplicate alternatives merged" in reason:
         return "duplicate"
     return None
 
 
-def option_fact_pair(options: list[Any]) -> tuple[dict[str, Any], dict[str, Any]] | None:
+def option_fact_pair(
+    options: list[Any],
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
     facts = [fact for option in options if (fact := option_to_fact(option)) is not None]
     if len(facts) < 2:
         return None
     return facts[0], facts[1]
 
 
-def first_option_fact(options: list[Any], option_type: str | None) -> dict[str, Any] | None:
+def first_option_fact(
+    options: list[Any], option_type: str | None
+) -> dict[str, Any] | None:
     for option in options:
         if not isinstance(option, dict):
             continue
@@ -1002,6 +1070,162 @@ def eval_table_exists(conn: Any, table: str) -> bool:
     )
 
 
+def purge_retrieval_eval_telemetry(
+    paths: BrainPaths,
+    *,
+    dry_run: bool = True,
+    sample_limit: int = 20,
+) -> dict[str, Any]:
+    """Remove lineage written by legacy retrieval eval runs.
+
+    Older retrieval evals used the normal ``retrieve_context`` caller and therefore
+    inflated production popularity. Exact golden-query matching is the narrowest
+    reliable discriminator available for those historical rows. Retrieval events
+    remain available for audit under a dedicated caller label; only their lineage
+    contribution is removed.
+    """
+    golden_queries = sorted(
+        {
+            str(case.get("query") or "").strip()
+            for case in load_retrieval_golden_cases(paths)
+            if str(case.get("query") or "").strip()
+        }
+    )
+    if not golden_queries:
+        return {
+            "status": "dry_run" if dry_run else "applied",
+            "golden_query_count": 0,
+            "matched_retrieval_event_count": 0,
+            "removed_lineage_event_count": 0,
+            "affected_fact_count": 0,
+            "queries": [],
+            "affected_facts": [],
+        }
+
+    placeholders = ",".join("?" for _ in golden_queries)
+    with connection(paths.sqlite_path) as conn:
+        if not eval_table_exists(conn, "retrieval_events") or not eval_table_exists(
+            conn, "context_lineage_events"
+        ):
+            return {
+                "status": "dry_run" if dry_run else "applied",
+                "golden_query_count": len(golden_queries),
+                "matched_retrieval_event_count": 0,
+                "removed_lineage_event_count": 0,
+                "affected_fact_count": 0,
+                "queries": [],
+                "affected_facts": [],
+            }
+        matching_events = [
+            dict(row)
+            for row in conn.execute(
+                f"""
+                SELECT id, query, timestamp
+                FROM retrieval_events
+                WHERE caller = 'retrieve_context'
+                  AND query IN ({placeholders})
+                ORDER BY timestamp, id
+                """,
+                golden_queries,
+            )
+        ]
+        retrieval_event_ids = [str(row["id"]) for row in matching_events]
+        query_counts: dict[str, int] = {}
+        for event in matching_events:
+            query = str(event["query"])
+            query_counts[query] = query_counts.get(query, 0) + 1
+
+        lineage_event_count = 0
+        target_counts: list[dict[str, Any]] = []
+        affected_facts: list[dict[str, Any]] = []
+        if retrieval_event_ids:
+            event_placeholders = ",".join("?" for _ in retrieval_event_ids)
+            lineage_event_count = int(
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM context_lineage_events
+                    WHERE retrieval_event_id IN ({event_placeholders})
+                    """,
+                    retrieval_event_ids,
+                ).fetchone()[0]
+            )
+            target_counts = [
+                {
+                    "target_type": str(row["target_type"]),
+                    "lineage_event_count": int(row["lineage_event_count"]),
+                    "distinct_target_count": int(row["distinct_target_count"]),
+                }
+                for row in conn.execute(
+                    f"""
+                    SELECT target_type,
+                           COUNT(*) AS lineage_event_count,
+                           COUNT(DISTINCT target_id) AS distinct_target_count
+                    FROM context_lineage_events
+                    WHERE retrieval_event_id IN ({event_placeholders})
+                    GROUP BY target_type
+                    ORDER BY lineage_event_count DESC, target_type
+                    """,
+                    retrieval_event_ids,
+                )
+            ]
+            affected_facts = [
+                {
+                    "fact_id": str(row["fact_id"]),
+                    "statement": str(row["statement"] or ""),
+                    "eval_retrieval_count": int(row["eval_retrieval_count"]),
+                }
+                for row in conn.execute(
+                    f"""
+                    SELECT lineage.target_id AS fact_id,
+                           facts.statement AS statement,
+                           COUNT(DISTINCT lineage.retrieval_event_id)
+                             AS eval_retrieval_count
+                    FROM context_lineage_events AS lineage
+                    LEFT JOIN facts ON facts.id = lineage.target_id
+                    WHERE lineage.retrieval_event_id IN ({event_placeholders})
+                      AND lineage.target_type = 'fact'
+                      AND lineage.event_type = 'exposed'
+                    GROUP BY lineage.target_id, facts.statement
+                    ORDER BY eval_retrieval_count DESC, lineage.target_id
+                    """,
+                    retrieval_event_ids,
+                )
+            ]
+            if not dry_run:
+                conn.execute(
+                    f"""
+                    DELETE FROM context_lineage_events
+                    WHERE retrieval_event_id IN ({event_placeholders})
+                    """,
+                    retrieval_event_ids,
+                )
+                conn.execute(
+                    f"""
+                    UPDATE retrieval_events
+                    SET caller = 'eval:retrieval_legacy'
+                    WHERE id IN ({event_placeholders})
+                    """,
+                    retrieval_event_ids,
+                )
+
+    return {
+        "status": "dry_run" if dry_run else "applied",
+        "golden_query_count": len(golden_queries),
+        "matched_retrieval_event_count": len(matching_events),
+        "removed_lineage_event_count": lineage_event_count,
+        "affected_fact_count": len(affected_facts),
+        "target_counts": target_counts,
+        "queries": [
+            {"query": query, "event_count": count}
+            for query, count in sorted(
+                query_counts.items(), key=lambda item: (-item[1], item[0])
+            )[:sample_limit]
+        ],
+        "affected_facts": affected_facts[:sample_limit],
+    }
+
+
 def ratio(numerator: int, denominator: int) -> float:
     if denominator == 0:
         return 1.0
@@ -1056,18 +1280,26 @@ def retrieval_eval(paths: BrainPaths) -> dict[str, Any]:
     calibration_rows: list[tuple[float, float]] = []
 
     for case in golden_cases:
-        result = svc.retrieve_context(str(case["query"]), debug=True)
+        result = svc.retrieve_context(
+            str(case["query"]), debug=True, record_telemetry=False
+        )
         case_kind = str(case.get("kind") or "uncategorized")
         case_count_by_kind[case_kind] = case_count_by_kind.get(case_kind, 0) + 1
         actual_verdict = str(result.get("retrieval_verdict") or "")
         expected_verdict = str(case["expected_verdict"])
         verdict_match = actual_verdict == expected_verdict
         verdict_matches += int(verdict_match)
-        verdict_matches_by_kind[case_kind] = verdict_matches_by_kind.get(case_kind, 0) + int(verdict_match)
+        verdict_matches_by_kind[case_kind] = verdict_matches_by_kind.get(
+            case_kind, 0
+        ) + int(verdict_match)
 
         expected_sources = set(case.get("expected_source_ids") or [])
         returned_sources = retrieval_result_source_ids(paths, result)
-        source_hit = bool(expected_sources.intersection(returned_sources)) if expected_sources else None
+        source_hit = (
+            bool(expected_sources.intersection(returned_sources))
+            if expected_sources
+            else None
+        )
         if expected_sources:
             source_expected += 1
             source_hits += int(bool(source_hit))
@@ -1077,7 +1309,9 @@ def retrieval_eval(paths: BrainPaths) -> dict[str, Any]:
         noisy_count = sum(1 for chunk in chunks if chunk.get("retrieval_noise_reasons"))
         noisy_chunks += noisy_count
         total_chunks += len(chunks)
-        fact_relevant_count = sum(1 for fact in facts if retrieval_fact_is_relevant(fact))
+        fact_relevant_count = sum(
+            1 for fact in facts if retrieval_fact_is_relevant(fact)
+        )
         total_facts += len(facts)
         relevant_facts += fact_relevant_count
 
@@ -1096,8 +1330,12 @@ def retrieval_eval(paths: BrainPaths) -> dict[str, Any]:
             fanout = (result.get("retrieval_debug") or {}).get("fanout") or {}
             lexical_rows = fanout.get("lexical") or []
             vector_rows = fanout.get("vector") or []
-            semantic_lexical_rank = first_fanout_source_rank(lexical_rows, semantic_expected_sources)
-            semantic_vector_rank = first_fanout_source_rank(vector_rows, semantic_expected_sources)
+            semantic_lexical_rank = first_fanout_source_rank(
+                lexical_rows, semantic_expected_sources
+            )
+            semantic_vector_rank = first_fanout_source_rank(
+                vector_rows, semantic_expected_sources
+            )
             semantic_lexical_source_hit = semantic_lexical_rank is not None
             semantic_vector_source_hit = semantic_vector_rank is not None
             semantic_probe_count += 1
@@ -1201,7 +1439,9 @@ def retrieval_eval(paths: BrainPaths) -> dict[str, Any]:
     )
 
 
-def first_fanout_source_rank(rows: list[dict[str, Any]], expected_sources: set[str]) -> int | None:
+def first_fanout_source_rank(
+    rows: list[dict[str, Any]], expected_sources: set[str]
+) -> int | None:
     for rank, row in enumerate(rows, start=1):
         document_id = str(row.get("document_id") or "")
         if document_id and f"document:{document_id}" in expected_sources:
@@ -1209,7 +1449,9 @@ def first_fanout_source_rank(rows: list[dict[str, Any]], expected_sources: set[s
     return None
 
 
-def count_cases_by_field(case_reports: list[dict[str, Any]], field: str) -> dict[str, int]:
+def count_cases_by_field(
+    case_reports: list[dict[str, Any]], field: str
+) -> dict[str, int]:
     counts: dict[str, int] = {}
     for report in case_reports:
         value = str(report.get(field) or "unknown")
@@ -1217,10 +1459,16 @@ def count_cases_by_field(case_reports: list[dict[str, Any]], field: str) -> dict
     return dict(sorted(counts.items()))
 
 
-def retrieval_metrics_by_origin(case_reports: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+def retrieval_metrics_by_origin(
+    case_reports: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
     return {
         origin: retrieval_case_report_metrics(
-            [report for report in case_reports if str(report.get("origin") or "unknown") == origin]
+            [
+                report
+                for report in case_reports
+                if str(report.get("origin") or "unknown") == origin
+            ]
         )
         for origin in count_cases_by_field(case_reports, "origin")
     }
@@ -1237,35 +1485,59 @@ def retrieval_case_report_metrics(case_reports: list[dict[str, Any]]) -> dict[st
             "semantic_probe_count": 0,
             "semantic_probe_vector_source_hit_rate": 1.0,
         }
-    source_expected_reports = [report for report in case_reports if report.get("expected_source_ids")]
-    negative_reports = [report for report in case_reports if report.get("kind") == "negative_control"]
-    semantic_reports = [report for report in case_reports if report.get("semantic_expected_source_ids")]
+    source_expected_reports = [
+        report for report in case_reports if report.get("expected_source_ids")
+    ]
+    negative_reports = [
+        report for report in case_reports if report.get("kind") == "negative_control"
+    ]
+    semantic_reports = [
+        report for report in case_reports if report.get("semantic_expected_source_ids")
+    ]
     negative_passes = [
         report
         for report in negative_reports
-        if report.get("actual_verdict") == "no_strong_match" and not int(report.get("facts") or 0)
+        if report.get("actual_verdict") == "no_strong_match"
+        and not int(report.get("facts") or 0)
     ]
     return {
         "fixture_count": len(case_reports),
         "verdict_accuracy": round(
-            ratio(len([report for report in case_reports if report.get("verdict_match")]), len(case_reports)),
+            ratio(
+                len([report for report in case_reports if report.get("verdict_match")]),
+                len(case_reports),
+            ),
             3,
         ),
         "source_hit_rate": round(
             ratio(
-                len([report for report in source_expected_reports if report.get("source_hit")]),
+                len(
+                    [
+                        report
+                        for report in source_expected_reports
+                        if report.get("source_hit")
+                    ]
+                ),
                 len(source_expected_reports),
             ),
             3,
         ),
-        "negative_control_pass_rate": round(ratio(len(negative_passes), len(negative_reports)), 3),
+        "negative_control_pass_rate": round(
+            ratio(len(negative_passes), len(negative_reports)), 3
+        ),
         "negative_control_fact_leak_count": len(
             [report for report in negative_reports if int(report.get("facts") or 0) > 0]
         ),
         "semantic_probe_count": len(semantic_reports),
         "semantic_probe_vector_source_hit_rate": round(
             ratio(
-                len([report for report in semantic_reports if report.get("semantic_vector_source_hit")]),
+                len(
+                    [
+                        report
+                        for report in semantic_reports
+                        if report.get("semantic_vector_source_hit")
+                    ]
+                ),
                 len(semantic_reports),
             ),
             3,

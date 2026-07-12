@@ -10,6 +10,8 @@ from typing import Any
 
 from .contracts import active_page_contracts, validate_fact_against_contract
 from .cos_actions import propose_action
+from .cos_policy import classify_action_risk
+from .curation_settings import load_curation_settings
 from .db import connection, loads
 from .entities import normalize_entity_name, normalize_entity_type
 from .llm import (
@@ -36,6 +38,7 @@ PAGE_SPLIT_FACT_FLOOR = 5
 PAGE_SPLIT_SECTION_FLOOR = 3
 REHOME_DESTINATION_SCORE_FLOOR = 0.35
 SUPPRESSED_GARDENER_STATUSES = ("failed", "reverted", "rejected", "dismissed")
+OPEN_GARDENER_STATUSES = ("proposed", "needs_human")
 DEFAULT_GARDENER_JUDGMENT_CANDIDATE_LIMIT = 100
 DEFAULT_GARDENER_JUDGMENT_WORKERS = 4
 DEFAULT_GARDENER_JUDGMENT_TIMEOUT_SECONDS = 120
@@ -85,6 +88,75 @@ GARDENER_JUDGMENT_SCHEMA = {
 }
 
 
+def normalize_aggressiveness(value: float) -> float:
+    parsed = float(value)
+    if not 0.0 <= parsed <= 1.0:
+        raise ValueError("topology aggressiveness must be between 0 and 1")
+    return round(parsed, 2)
+
+
+def merge_admission_thresholds(aggressiveness: float) -> dict[str, float]:
+    normalized = normalize_aggressiveness(aggressiveness)
+    offset = normalized - 0.5
+    conservatism = max(0.0, (0.5 - normalized) * 2)
+    return {
+        "path_similarity_floor": round(
+            min(0.96, max(0.76, MERGE_PATH_SIMILARITY_FLOOR - (0.2 * offset))),
+            4,
+        ),
+        "evidence_overlap_floor": round(
+            min(0.35, max(0.15, MERGE_EVIDENCE_OVERLAP_FLOOR - (0.2 * offset))),
+            4,
+        ),
+        "evidence_only_path_floor": round(
+            min(
+                0.70,
+                max(0.50, MERGE_EVIDENCE_ONLY_PATH_FLOOR - (0.2 * offset)),
+            ),
+            4,
+        ),
+        "strong_evidence_overlap_floor": round(
+            min(
+                0.55,
+                max(
+                    0.35,
+                    MERGE_STRONG_EVIDENCE_OVERLAP_FLOOR - (0.2 * offset),
+                ),
+            ),
+            4,
+        ),
+        "entity_name_similarity_floor": round(
+            min(
+                0.96,
+                max(0.80, ENTITY_NAME_SIMILARITY_FLOOR - (0.16 * offset)),
+            ),
+            4,
+        ),
+        "entity_evidence_overlap_floor": round(
+            min(0.25, max(0.15, 0.2 - (0.1 * offset))), 4
+        ),
+        "entity_containment_similarity_floor": round(
+            0.72 + (0.24 * conservatism), 4
+        ),
+        "entity_containment_evidence_floor": round(0.3 * conservatism, 4),
+    }
+
+
+def split_admission_thresholds(aggressiveness: float) -> dict[str, int]:
+    normalized = normalize_aggressiveness(aggressiveness)
+    if normalized < 0.25:
+        minimum_facts_per_section = 3
+    elif normalized < 0.5:
+        minimum_facts_per_section = 2
+    else:
+        minimum_facts_per_section = 1
+    return {
+        "fact_floor": max(3, min(12, round(12 - (14 * normalized)))),
+        "section_floor": max(2, min(5, round(5 - (4 * normalized)))),
+        "minimum_facts_per_section": minimum_facts_per_section,
+    }
+
+
 def generate_gardener_candidates(
     paths: BrainPaths,
     *,
@@ -93,14 +165,25 @@ def generate_gardener_candidates(
     llm_provider: LLMProvider | None = None,
     provider: str | None = None,
 ) -> dict[str, Any]:
+    curation = load_curation_settings(paths)
+    merge_aggressiveness = float(curation["merge_aggressiveness"])
+    split_aggressiveness = float(curation["split_aggressiveness"])
     pages = enrich_gardener_pages(paths, managed_fact_page_summaries(paths))
     contracts = {contract["page_hint"]: contract for contract in active_page_contracts(paths)}
     suppressed_keys = recent_suppressed_candidate_keys(paths)
     candidates = deterministic_topology_candidates(
-        pages, contracts, suppressed_candidate_keys=suppressed_keys
+        pages,
+        contracts,
+        suppressed_candidate_keys=suppressed_keys,
+        merge_aggressiveness=merge_aggressiveness,
+        split_aggressiveness=split_aggressiveness,
     )
     candidates.extend(
-        deterministic_entity_candidates(paths, suppressed_candidate_keys=suppressed_keys)
+        deterministic_entity_candidates(
+            paths,
+            suppressed_candidate_keys=suppressed_keys,
+            merge_aggressiveness=merge_aggressiveness,
+        )
     )
     candidates.sort(key=candidate_sort_key)
     deterministic_candidate_count = len(candidates)
@@ -115,9 +198,13 @@ def generate_gardener_candidates(
         provider=provider,
     )
     judged_candidates = llm_result["candidates"]
-    candidates = judged_candidates[:max_candidates]
-    truncated_kept_candidates = judged_candidates[max_candidates:]
+    prioritized_candidates, arbitration = prioritize_topology_candidates(
+        judged_candidates
+    )
+    candidates = prioritized_candidates[:max_candidates]
+    truncated_kept_candidates = prioritized_candidates[max_candidates:]
     llm_summary = dict(llm_result["summary"])
+    llm_summary["topology_arbitration"] = arbitration
     llm_summary["truncated_kept_candidate_count"] = len(truncated_kept_candidates)
     llm_summary["truncated_kept_candidates"] = [
         gardener_candidate_audit_card(
@@ -129,7 +216,7 @@ def generate_gardener_candidates(
     actions: list[dict[str, Any]] = []
     if not shadow:
         for candidate in candidates:
-            actions.append(propose_gardener_action(paths, candidate))
+            actions.append(propose_gardener_action(paths, candidate, decide=True))
     return {
         "status": "ok",
         "shadow": shadow,
@@ -137,6 +224,10 @@ def generate_gardener_candidates(
         "deterministic_candidate_count": deterministic_candidate_count,
         "judgment_candidate_count": len(judgment_candidates),
         "suppressed_candidate_count": len(suppressed_keys),
+        "topology_settings": {
+            "merge_aggressiveness": merge_aggressiveness,
+            "split_aggressiveness": split_aggressiveness,
+        },
         "llm_judgment": llm_summary,
         "candidates": candidates,
         "actions": actions,
@@ -148,6 +239,8 @@ def deterministic_topology_candidates(
     contracts: dict[str, dict[str, Any]],
     *,
     suppressed_candidate_keys: set[str] | None = None,
+    merge_aggressiveness: float = 0.5,
+    split_aggressiveness: float = 0.5,
 ) -> list[dict[str, Any]]:
     suppressed_candidate_keys = suppressed_candidate_keys or set()
     candidates: list[dict[str, Any]] = []
@@ -155,7 +248,12 @@ def deterministic_topology_candidates(
         for right in pages[index + 1 :]:
             append_candidate(
                 candidates,
-                merge_candidate(left, right, contracts),
+                merge_candidate(
+                    left,
+                    right,
+                    contracts,
+                    merge_aggressiveness=merge_aggressiveness,
+                ),
                 suppressed_candidate_keys,
             )
     for page in pages:
@@ -167,12 +265,15 @@ def deterministic_topology_candidates(
                 rehome_candidate(page, pages, contracts),
                 suppressed_candidate_keys,
             )
-        if active_count >= PAGE_SPLIT_FACT_FLOOR:
-            append_candidate(
-                candidates,
-                page_split_candidate(page, contracts),
-                suppressed_candidate_keys,
-            )
+        append_candidate(
+            candidates,
+            page_split_candidate(
+                page,
+                contracts,
+                split_aggressiveness=split_aggressiveness,
+            ),
+            suppressed_candidate_keys,
+        )
         if active_count >= 2 and has_contract:
             append_candidate(
                 candidates,
@@ -193,6 +294,7 @@ def deterministic_entity_candidates(
     paths: BrainPaths,
     *,
     suppressed_candidate_keys: set[str] | None = None,
+    merge_aggressiveness: float = 0.5,
 ) -> list[dict[str, Any]]:
     suppressed_candidate_keys = suppressed_candidate_keys or set()
     entities = load_entity_gardener_evidence(paths)
@@ -201,7 +303,9 @@ def deterministic_entity_candidates(
         for right in entities[index + 1 :]:
             append_candidate(
                 candidates,
-                entity_merge_candidate(left, right),
+                entity_merge_candidate(
+                    left, right, merge_aggressiveness=merge_aggressiveness
+                ),
                 suppressed_candidate_keys,
             )
     candidates.sort(key=candidate_sort_key)
@@ -313,6 +417,8 @@ def load_entity_gardener_evidence(paths: BrainPaths) -> list[dict[str, Any]]:
 def entity_merge_candidate(
     left: dict[str, Any],
     right: dict[str, Any],
+    *,
+    merge_aggressiveness: float = 0.5,
 ) -> dict[str, Any] | None:
     left_type = normalize_entity_type(left.get("entity_type"))
     right_type = normalize_entity_type(right.get("entity_type"))
@@ -321,7 +427,9 @@ def entity_merge_candidate(
     if not (left.get("fact_ids") or right.get("fact_ids")):
         return None
 
-    signal = entity_merge_signal(left, right)
+    signal = entity_merge_signal(
+        left, right, merge_aggressiveness=merge_aggressiveness
+    )
     if signal is None:
         return None
     canonical, merged = choose_canonical_entity(left, right)
@@ -373,10 +481,17 @@ def entity_merge_candidate(
         "cross_type_merge": False,
         "type_mismatch": False,
         "risk_tier": risk_tier,
+        "merge_aggressiveness": normalize_aggressiveness(merge_aggressiveness),
     }
 
 
-def entity_merge_signal(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any] | None:
+def entity_merge_signal(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    *,
+    merge_aggressiveness: float = 0.5,
+) -> dict[str, Any] | None:
+    thresholds = merge_admission_thresholds(merge_aggressiveness)
     left_name_keys = set(left.get("name_keys") or [])
     right_name_keys = set(right.get("name_keys") or [])
     left_compact = set(left.get("compact_keys") or [])
@@ -405,6 +520,17 @@ def entity_merge_signal(left: dict[str, Any], right: dict[str, Any]) -> dict[str
             "risk_tier": "low",
         }
     if entity_name_containment(left_name_keys, right_name_keys):
+        normalized = normalize_aggressiveness(merge_aggressiveness)
+        containment_evidence_floor = thresholds[
+            "entity_containment_evidence_floor"
+        ]
+        if normalized < 0.5 and (
+            similarity < thresholds["entity_containment_similarity_floor"]
+            or not (
+                shared_sources or fact_overlap >= containment_evidence_floor
+            )
+        ):
+            return None
         score = round(min(0.9, max(0.72, similarity, 0.62 + (0.2 * fact_overlap))), 4)
         return {
             "score": score,
@@ -413,7 +539,9 @@ def entity_merge_signal(left: dict[str, Any], right: dict[str, Any]) -> dict[str
             "reason": "one entity name contains the other",
             "risk_tier": "medium",
         }
-    if similarity >= ENTITY_NAME_SIMILARITY_FLOOR and (shared_sources or fact_overlap >= 0.2):
+    if similarity >= thresholds["entity_name_similarity_floor"] and (
+        shared_sources or fact_overlap >= thresholds["entity_evidence_overlap_floor"]
+    ):
         score = round(min(0.9, max(similarity, 0.65 + (0.25 * fact_overlap))), 4)
         return {
             "score": score,
@@ -470,7 +598,27 @@ def compact_entity_key(value: Any) -> str:
     return re.sub(r"[^0-9a-z]+", "", normalize_entity_name(value))
 
 
-def propose_gardener_action(paths: BrainPaths, candidate: dict[str, Any]) -> dict[str, Any]:
+def propose_gardener_action(
+    paths: BrainPaths, candidate: dict[str, Any], *, decide: bool = False
+) -> dict[str, Any]:
+    spec = gardener_action_spec(candidate)
+    return propose_action(
+        paths,
+        spec["action_type"],
+        action_payload=spec["action_payload"],
+        evidence=spec["evidence"],
+        action_features=spec["action_features"],
+        target_fact_ids=spec["target_fact_ids"],
+        target_page_paths=spec["target_page_paths"],
+        target_contract_ids=spec["target_contract_ids"],
+        proposed_by=spec["proposed_by"],
+        confidence=spec["confidence"],
+        risk_tier=spec["risk_tier"],
+        decide=decide,
+    )
+
+
+def gardener_action_spec(candidate: dict[str, Any]) -> dict[str, Any]:
     action_type = str(candidate["action_type"])
     contract = candidate.get("contract") if isinstance(candidate.get("contract"), dict) else None
     target_fact_ids = (
@@ -490,27 +638,97 @@ def propose_gardener_action(paths: BrainPaths, candidate: dict[str, Any]) -> dic
         "cross_entity_merge": candidate.get("cross_entity_merge"),
         "cross_type_merge": candidate.get("cross_type_merge"),
         "type_mismatch": candidate.get("type_mismatch"),
+        "merge_signal": candidate.get("merge_signal"),
+        "merge_aggressiveness": candidate.get("merge_aggressiveness"),
+        "split_aggressiveness": candidate.get("split_aggressiveness"),
+        "admission_thresholds": candidate.get("admission_thresholds"),
         "reversible": True,
     }
     if action_type != "entity_merge":
-        action_features["eval_gate"] = {"suite": "topology", "passed": False}
-    return propose_action(
-        paths,
+        action_features["eval_gate"] = {"suite": "topology"}
+    confidence = float(candidate.get("score") or candidate.get("similarity") or 0.0)
+    action_features.update(
+        {
+            "confidence": confidence,
+            "target_fact_ids": target_fact_ids,
+            "target_page_paths": [
+                str(path) for path in candidate.get("page_hints") or []
+            ],
+            "target_contract_ids": target_contract_ids,
+        }
+    )
+    risk_tier = classify_action_risk(
         action_type,
-        action_payload=gardener_action_payload(candidate),
-        evidence={
+        action_features,
+        explicit_risk_tier=str(candidate.get("risk_tier") or "medium"),
+    )
+    action_features["risk_tier"] = risk_tier
+    return {
+        "action_type": action_type,
+        "action_payload": gardener_action_payload(candidate),
+        "evidence": {
             "gardener_judgment": candidate.get("llm_judgment"),
         }
         if candidate.get("llm_judgment")
         else None,
-        action_features=action_features,
-        target_fact_ids=target_fact_ids,
-        target_page_paths=[str(path) for path in candidate.get("page_hints") or []],
-        target_contract_ids=target_contract_ids,
-        proposed_by="gardener_llm" if candidate.get("llm_judgment") else "gardener",
-        confidence=float(candidate.get("score") or candidate.get("similarity") or 0.0),
-        risk_tier=str(candidate.get("risk_tier") or "medium"),
-    )
+        "action_features": action_features,
+        "target_fact_ids": target_fact_ids,
+        "target_page_paths": action_features["target_page_paths"],
+        "target_contract_ids": target_contract_ids,
+        "proposed_by": (
+            "gardener_llm" if candidate.get("llm_judgment") else "gardener"
+        ),
+        "confidence": confidence,
+        "risk_tier": risk_tier,
+    }
+
+
+def prioritize_topology_candidates(
+    candidates: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    ordered = sorted(candidates, key=candidate_sort_key)
+    selected: list[dict[str, Any]] = []
+    reserved_pages: set[str] = set()
+    reserved_entities: set[str] = set()
+    suppressed: Counter[str] = Counter()
+
+    for candidate in ordered:
+        action_type = str(candidate.get("action_type") or "")
+        if action_type == "page_merge":
+            pages = {str(item) for item in candidate.get("page_hints") or [] if item}
+            if pages & reserved_pages:
+                suppressed["overlapping_page_merge"] += 1
+                continue
+            reserved_pages.update(pages)
+            selected.append(candidate)
+            continue
+        if action_type == "entity_merge":
+            entity_ids = {
+                str(item) for item in candidate.get("entity_ids") or [] if item
+            }
+            if entity_ids & reserved_entities:
+                suppressed["overlapping_entity_merge"] += 1
+                continue
+            reserved_entities.update(entity_ids)
+            selected.append(candidate)
+            continue
+        selected.append(candidate)
+
+    output: list[dict[str, Any]] = []
+    for candidate in selected:
+        if str(candidate.get("action_type") or "") == "page_split":
+            pages = {str(item) for item in candidate.get("page_hints") or [] if item}
+            if pages & reserved_pages:
+                suppressed["split_conflicts_with_preferred_merge"] += 1
+                continue
+        output.append(candidate)
+    output.sort(key=candidate_sort_key)
+    return output, {
+        "input_count": len(candidates),
+        "selected_count": len(output),
+        "suppressed_count": len(candidates) - len(output),
+        "suppressed_by_reason": dict(sorted(suppressed.items())),
+    }
 
 
 def page_similarity(left: str, right: str) -> float:
@@ -1004,7 +1222,9 @@ def gardener_judgment_prompt(
         "Candidates may be page topology changes or entity merges. "
         "You may only keep or drop existing candidate_key values; do not invent new candidates, page_hints, fact_ids, or entity_ids. "
         "Drop candidates that violate contracts, merge unrelated scopes, or lack enough evidence. "
-        "Return JSON judgments with candidate_key, decision keep/drop, rationale, optional score_adjustment, optional risk_tier.\n\n"
+        "Return exactly one JSON object shaped as {\"judgments\": [{\"candidate_key\": \"...\", \"decision\": \"keep\" or \"drop\", \"rationale\": \"...\"}]}. "
+        "The top-level judgments array is required even when reviewing one candidate. "
+        "Each judgment may also include score_adjustment and risk_tier.\n\n"
         f"Candidates:\n{candidate_cards}\n\nPages:\n{page_cards}\n\nEntities:\n{entity_cards}\n\nContracts:\n{contract_cards}"
     )
 
@@ -1103,7 +1323,10 @@ def merge_candidate(
     left: dict[str, Any],
     right: dict[str, Any],
     contracts: dict[str, dict[str, Any]],
+    *,
+    merge_aggressiveness: float = 0.5,
 ) -> dict[str, Any] | None:
+    thresholds = merge_admission_thresholds(merge_aggressiveness)
     left_hint = str(left["relative_path"])
     right_hint = str(right["relative_path"])
     contract_check = merge_contract_check(left, right, contracts)
@@ -1121,16 +1344,19 @@ def merge_candidate(
         0.35 if shared_sources else 0.0,
     )
     path_and_evidence = (
-        path_similarity >= MERGE_PATH_SIMILARITY_FLOOR
-        and evidence_overlap >= MERGE_EVIDENCE_OVERLAP_FLOOR
+        path_similarity >= thresholds["path_similarity_floor"]
+        and evidence_overlap >= thresholds["evidence_overlap_floor"]
     )
     strong_evidence = (
-        path_similarity >= MERGE_EVIDENCE_ONLY_PATH_FLOOR
-        and evidence_overlap >= MERGE_STRONG_EVIDENCE_OVERLAP_FLOOR
+        path_similarity >= thresholds["evidence_only_path_floor"]
+        and evidence_overlap >= thresholds["strong_evidence_overlap_floor"]
     )
     if not (path_and_evidence or strong_evidence):
         return None
     page_hints = sorted([left_hint, right_hint])
+    affected_fact_count = int(left.get("active_fact_count") or 0) + int(
+        right.get("active_fact_count") or 0
+    )
     score = round(min(1.0, max(path_similarity, 0.55 + (0.4 * evidence_overlap))), 4)
     return {
         "action_type": "page_merge",
@@ -1148,7 +1374,11 @@ def merge_candidate(
             left_hint in contracts,
             right_hint in contracts,
         ],
+        "affected_fact_count": affected_fact_count,
+        "large_topology": affected_fact_count >= 8,
         "risk_tier": "medium",
+        "merge_aggressiveness": normalize_aggressiveness(merge_aggressiveness),
+        "admission_thresholds": thresholds,
     }
 
 
@@ -1225,17 +1455,28 @@ def best_rehome_destination(
 
 
 def page_split_candidate(
-    page: dict[str, Any], contracts: dict[str, dict[str, Any]]
+    page: dict[str, Any],
+    contracts: dict[str, dict[str, Any]],
+    *,
+    split_aggressiveness: float = 0.5,
 ) -> dict[str, Any] | None:
+    thresholds = split_admission_thresholds(split_aggressiveness)
     page_hint = str(page["relative_path"])
     section_counts = {
         str(section): int(count)
         for section, count in (page.get("section_counts") or {}).items()
         if section and str(section).lower() not in {"summary", "unsectioned"}
     }
-    if len(section_counts) < PAGE_SPLIT_SECTION_FLOOR:
-        return None
+    substantial_sections = {
+        section: count
+        for section, count in section_counts.items()
+        if count >= thresholds["minimum_facts_per_section"]
+    }
     active_count = int(page.get("active_fact_count") or 0)
+    if active_count < thresholds["fact_floor"] or len(substantial_sections) < thresholds[
+        "section_floor"
+    ]:
+        return None
     score = round(min(0.95, 0.45 + (active_count / 25.0) + (len(section_counts) * 0.05)), 4)
     return {
         "action_type": "page_split",
@@ -1245,8 +1486,13 @@ def page_split_candidate(
         "similarity": 0.0,
         "reason": "dense page has active facts across multiple sections",
         "section_counts": dict(sorted(section_counts.items())),
+        "substantial_section_counts": dict(sorted(substantial_sections.items())),
         "contracts_present": [page_hint in contracts],
+        "affected_fact_count": active_count,
+        "large_topology": active_count >= 8,
         "risk_tier": "medium",
+        "split_aggressiveness": normalize_aggressiveness(split_aggressiveness),
+        "admission_thresholds": thresholds,
     }
 
 
@@ -1472,7 +1718,18 @@ def recent_suppressed_candidate_keys(paths: BrainPaths) -> set[str]:
     placeholders = ",".join("?" for _ in SUPPRESSED_GARDENER_STATUSES)
     keys: set[str] = set()
     with connection(paths.sqlite_path) as conn:
-        for row in conn.execute(
+        open_placeholders = ",".join("?" for _ in OPEN_GARDENER_STATUSES)
+        open_rows = conn.execute(
+            f"""
+            SELECT action_features, evidence_json
+            FROM cos_actions
+            WHERE proposed_by IN ('gardener', 'gardener_llm')
+              AND status IN ({open_placeholders})
+            ORDER BY created_at DESC
+            """,
+            OPEN_GARDENER_STATUSES,
+        )
+        suppressed_rows = conn.execute(
             f"""
             SELECT action_features, evidence_json
             FROM cos_actions
@@ -1482,7 +1739,8 @@ def recent_suppressed_candidate_keys(paths: BrainPaths) -> set[str]:
             LIMIT 200
             """,
             SUPPRESSED_GARDENER_STATUSES,
-        ):
+        )
+        for row in [*open_rows, *suppressed_rows]:
             features = loads(row["action_features"], {})
             if isinstance(features, dict) and features.get("candidate_key"):
                 keys.add(str(features["candidate_key"]))
