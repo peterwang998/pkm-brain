@@ -449,6 +449,22 @@ def test_action_risk_classification_large_topology_overrides_medium() -> None:
         )
         == "high"
     )
+    assert (
+        classify_action_risk(
+            "page_merge",
+            {"affected_fact_count": 20, "topology_review_threshold": 32},
+            explicit_risk_tier="medium",
+        )
+        == "medium"
+    )
+    assert (
+        classify_action_risk(
+            "page_merge",
+            {"affected_fact_count": 33, "topology_review_threshold": 32},
+            explicit_risk_tier="medium",
+        )
+        == "high"
+    )
     assert classify_action_risk("synthesize_page", {"affected_fact_count": 3}) == "low"
     assert (
         classify_action_risk(

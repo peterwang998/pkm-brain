@@ -350,6 +350,10 @@ def classify_action_risk(
 ) -> str:
     explicit = normalize_risk_tier(explicit_risk_tier)
     features = action_features or {}
+    topology_threshold = (
+        int_or_zero(features.get("topology_review_threshold"))
+        or large_topology_fact_threshold
+    )
     affected_fact_count = int_or_zero(features.get("affected_fact_count"))
     affected_page_count = int_or_zero(features.get("affected_page_count"))
     if action_type == "fact_upsert":
@@ -380,10 +384,9 @@ def classify_action_risk(
             or bool(features.get("cross_entity_merge"))
             or bool(features.get("cross_type_merge"))
             or bool(features.get("type_mismatch"))
-            or affected_fact_count >= large_topology_fact_threshold
-            or affected_page_count >= large_topology_fact_threshold
-            or int_or_zero(features.get("merged_entity_count"))
-            >= large_topology_fact_threshold
+            or affected_fact_count >= topology_threshold
+            or affected_page_count >= topology_threshold
+            or int_or_zero(features.get("merged_entity_count")) >= topology_threshold
         )
         if large:
             return "high"

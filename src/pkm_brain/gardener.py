@@ -11,7 +11,7 @@ from typing import Any
 from .contracts import active_page_contracts, validate_fact_against_contract
 from .cos_actions import propose_action
 from .cos_policy import classify_action_risk
-from .curation_settings import load_curation_settings
+from .curation_settings import load_curation_settings, normalize_topology_review_threshold
 from .db import connection, loads
 from .entities import normalize_entity_name, normalize_entity_type
 from .llm import (
@@ -168,6 +168,7 @@ def generate_gardener_candidates(
     curation = load_curation_settings(paths)
     merge_aggressiveness = float(curation["merge_aggressiveness"])
     split_aggressiveness = float(curation["split_aggressiveness"])
+    topology_review_threshold = int(curation["topology_review_threshold"])
     pages = enrich_gardener_pages(paths, managed_fact_page_summaries(paths))
     contracts = {contract["page_hint"]: contract for contract in active_page_contracts(paths)}
     suppressed_keys = recent_suppressed_candidate_keys(paths)
@@ -177,12 +178,14 @@ def generate_gardener_candidates(
         suppressed_candidate_keys=suppressed_keys,
         merge_aggressiveness=merge_aggressiveness,
         split_aggressiveness=split_aggressiveness,
+        topology_review_threshold=topology_review_threshold,
     )
     candidates.extend(
         deterministic_entity_candidates(
             paths,
             suppressed_candidate_keys=suppressed_keys,
             merge_aggressiveness=merge_aggressiveness,
+            topology_review_threshold=topology_review_threshold,
         )
     )
     candidates.sort(key=candidate_sort_key)
@@ -227,6 +230,7 @@ def generate_gardener_candidates(
         "topology_settings": {
             "merge_aggressiveness": merge_aggressiveness,
             "split_aggressiveness": split_aggressiveness,
+            "topology_review_threshold": topology_review_threshold,
         },
         "llm_judgment": llm_summary,
         "candidates": candidates,
@@ -241,6 +245,7 @@ def deterministic_topology_candidates(
     suppressed_candidate_keys: set[str] | None = None,
     merge_aggressiveness: float = 0.5,
     split_aggressiveness: float = 0.5,
+    topology_review_threshold: int = 8,
 ) -> list[dict[str, Any]]:
     suppressed_candidate_keys = suppressed_candidate_keys or set()
     candidates: list[dict[str, Any]] = []
@@ -253,6 +258,7 @@ def deterministic_topology_candidates(
                     right,
                     contracts,
                     merge_aggressiveness=merge_aggressiveness,
+                    topology_review_threshold=topology_review_threshold,
                 ),
                 suppressed_candidate_keys,
             )
@@ -271,6 +277,7 @@ def deterministic_topology_candidates(
                 page,
                 contracts,
                 split_aggressiveness=split_aggressiveness,
+                topology_review_threshold=topology_review_threshold,
             ),
             suppressed_candidate_keys,
         )
@@ -295,6 +302,7 @@ def deterministic_entity_candidates(
     *,
     suppressed_candidate_keys: set[str] | None = None,
     merge_aggressiveness: float = 0.5,
+    topology_review_threshold: int = 8,
 ) -> list[dict[str, Any]]:
     suppressed_candidate_keys = suppressed_candidate_keys or set()
     entities = load_entity_gardener_evidence(paths)
@@ -304,7 +312,10 @@ def deterministic_entity_candidates(
             append_candidate(
                 candidates,
                 entity_merge_candidate(
-                    left, right, merge_aggressiveness=merge_aggressiveness
+                    left,
+                    right,
+                    merge_aggressiveness=merge_aggressiveness,
+                    topology_review_threshold=topology_review_threshold,
                 ),
                 suppressed_candidate_keys,
             )
@@ -419,6 +430,7 @@ def entity_merge_candidate(
     right: dict[str, Any],
     *,
     merge_aggressiveness: float = 0.5,
+    topology_review_threshold: int = 8,
 ) -> dict[str, Any] | None:
     left_type = normalize_entity_type(left.get("entity_type"))
     right_type = normalize_entity_type(right.get("entity_type"))
@@ -447,7 +459,10 @@ def entity_merge_candidate(
         ]
     )
     affected_fact_count = len(all_fact_ids)
-    large_topology = affected_fact_count >= 8
+    topology_review_threshold = normalize_topology_review_threshold(
+        topology_review_threshold
+    )
+    large_topology = affected_fact_count >= topology_review_threshold
     risk_tier = (
         signal["risk_tier"]
         if signal["merge_signal"] in HIGH_CERTAINTY_ENTITY_MERGE_SIGNALS
@@ -477,6 +492,7 @@ def entity_merge_candidate(
         "affected_fact_count": affected_fact_count,
         "merged_entity_count": 2,
         "large_topology": large_topology,
+        "topology_review_threshold": topology_review_threshold,
         "cross_entity_merge": False,
         "cross_type_merge": False,
         "type_mismatch": False,
@@ -641,6 +657,7 @@ def gardener_action_spec(candidate: dict[str, Any]) -> dict[str, Any]:
         "merge_signal": candidate.get("merge_signal"),
         "merge_aggressiveness": candidate.get("merge_aggressiveness"),
         "split_aggressiveness": candidate.get("split_aggressiveness"),
+        "topology_review_threshold": candidate.get("topology_review_threshold"),
         "admission_thresholds": candidate.get("admission_thresholds"),
         "reversible": True,
     }
@@ -1325,6 +1342,7 @@ def merge_candidate(
     contracts: dict[str, dict[str, Any]],
     *,
     merge_aggressiveness: float = 0.5,
+    topology_review_threshold: int = 8,
 ) -> dict[str, Any] | None:
     thresholds = merge_admission_thresholds(merge_aggressiveness)
     left_hint = str(left["relative_path"])
@@ -1357,6 +1375,9 @@ def merge_candidate(
     affected_fact_count = int(left.get("active_fact_count") or 0) + int(
         right.get("active_fact_count") or 0
     )
+    topology_review_threshold = normalize_topology_review_threshold(
+        topology_review_threshold
+    )
     score = round(min(1.0, max(path_similarity, 0.55 + (0.4 * evidence_overlap))), 4)
     return {
         "action_type": "page_merge",
@@ -1375,7 +1396,8 @@ def merge_candidate(
             right_hint in contracts,
         ],
         "affected_fact_count": affected_fact_count,
-        "large_topology": affected_fact_count >= 8,
+        "large_topology": affected_fact_count >= topology_review_threshold,
+        "topology_review_threshold": topology_review_threshold,
         "risk_tier": "medium",
         "merge_aggressiveness": normalize_aggressiveness(merge_aggressiveness),
         "admission_thresholds": thresholds,
@@ -1459,6 +1481,7 @@ def page_split_candidate(
     contracts: dict[str, dict[str, Any]],
     *,
     split_aggressiveness: float = 0.5,
+    topology_review_threshold: int = 8,
 ) -> dict[str, Any] | None:
     thresholds = split_admission_thresholds(split_aggressiveness)
     page_hint = str(page["relative_path"])
@@ -1473,6 +1496,9 @@ def page_split_candidate(
         if count >= thresholds["minimum_facts_per_section"]
     }
     active_count = int(page.get("active_fact_count") or 0)
+    topology_review_threshold = normalize_topology_review_threshold(
+        topology_review_threshold
+    )
     if active_count < thresholds["fact_floor"] or len(substantial_sections) < thresholds[
         "section_floor"
     ]:
@@ -1489,7 +1515,8 @@ def page_split_candidate(
         "substantial_section_counts": dict(sorted(substantial_sections.items())),
         "contracts_present": [page_hint in contracts],
         "affected_fact_count": active_count,
-        "large_topology": active_count >= 8,
+        "large_topology": active_count >= topology_review_threshold,
+        "topology_review_threshold": topology_review_threshold,
         "risk_tier": "medium",
         "split_aggressiveness": normalize_aggressiveness(split_aggressiveness),
         "admission_thresholds": thresholds,

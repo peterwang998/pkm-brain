@@ -791,7 +791,7 @@ private struct QueueDetail: View {
     let tally: QueueSessionTally
     @Binding var routePageHint: String
     @Binding var selectedAlternativeIDs: Set<String>
-    @FocusState private var routeFieldFocused: Bool
+    @State private var routeFieldFocused = false
     let onDecision: (String, [String: JSONValue]) -> Void
 
     var body: some View {
@@ -1130,30 +1130,12 @@ private struct QueueDetail: View {
                     )
                     .help("\(index + 1) - Route to \(route.title ?? route.page_hint)")
                 }
-                HStack(spacing: 8) {
-                    TextField("concepts/topic.md", text: $routePageHint)
-                        .textFieldStyle(.roundedBorder)
-                        .focused($routeFieldFocused)
-                        .onSubmit {
-                            submitManualRoute()
-                        }
-                    Button {
-                        submitManualRoute()
-                    } label: {
-                        Label {
-                            HStack(spacing: 7) {
-                                Text("Route")
-                                ShortcutBadge(key: manualRouteKey)
-                            }
-                        } icon: {
-                            Image(systemName: "arrow.turn.down.right")
-                        }
-                    }
-                    .queueKeyboardShortcut(
-                        routeFieldFocused ? "" : manualRouteKey
-                    )
-                    .disabled(manualRoutePageHint.isEmpty)
-                }
+                RoutePathAutocompleteField(
+                    pageHint: $routePageHint,
+                    isFocused: $routeFieldFocused,
+                    shortcutKey: manualRouteKey,
+                    onSubmit: submitManualRoute
+                )
             }
             DecisionBar {
                 DecisionButton(
@@ -1405,14 +1387,20 @@ private struct TopologyTargetPanel: View {
             }
             return "\(page) \(status)"
         }
-        return [
-            topology.merge_destination_label.map { "destination \($0)" },
-            topology.merge_source_labels.map { "sources \($0.joined(separator: ", "))" },
-            statuses.isEmpty ? nil : statuses.joined(separator: ", "),
-            pageStatuses.isEmpty ? nil : pageStatuses.joined(separator: ", "),
-            ids.isEmpty ? nil : "ids \(ids.joined(separator: ", "))",
-            pages.isEmpty ? nil : "pages \(pages.joined(separator: ", "))",
+        var values: [String?] = [
+            topology.merge_destination_label.map { "destination \($0)" }
         ]
+        values += (topology.merge_source_labels ?? []).map { "source \($0)" }
+        values += statuses
+        if statuses.isEmpty {
+            values += ids.map { "id \(shortID($0))" }
+        }
+        let pageValues = pageStatuses.isEmpty ? pages.map { "page \($0)" } : pageStatuses
+        values += pageValues.prefix(6).map { $0 }
+        if pageValues.count > 6 {
+            values.append("+\(pageValues.count - 6) more pages")
+        }
+        return values
     }
 }
 
@@ -1647,10 +1635,14 @@ struct MetadataRow: View {
             }, id: \.self) { value in
                 Text(value)
                     .font(.caption)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: 360, alignment: .leading)
                     .padding(.horizontal, 7)
                     .padding(.vertical, 3)
                     .background(Color.secondary.opacity(0.10))
                     .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .help(value)
             }
         }
     }
@@ -1744,7 +1736,7 @@ private struct DecisionButton: View {
     }
 }
 
-private extension View {
+extension View {
     @ViewBuilder
     func queueKeyboardShortcut(_ key: String) -> some View {
         switch key.lowercased() {

@@ -1131,6 +1131,60 @@ def test_v2_queue_topology_audit_shows_applied_change_and_hides_after_drift(
     assert current["audit_status"] == "sampled_bad"
 
 
+def test_v2_queue_applied_entity_merge_audit_accepts_expected_post_state(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    with connection(paths.sqlite_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO entities(id, name, entity_type, aliases, status, source_ids, created_at)
+            VALUES (?, ?, 'organization', '[]', 'active', '[]', ?)
+            """,
+            [
+                ("entity_brain", "Brain", "2026-07-12T10:00:00+00:00"),
+                ("entity_pkm_brain", "PKM Brain", "2026-07-12T10:00:00+00:00"),
+            ],
+        )
+    action = apply_action(
+        paths,
+        propose_action(
+            paths,
+            "entity_merge",
+            action_payload={
+                "canonical_entity_id": "entity_brain",
+                "merged_entity_ids": ["entity_pkm_brain"],
+            },
+            action_features={"reversible": True},
+            proposed_by="test",
+            risk_tier="medium",
+        )["id"],
+    )
+    record_action_audit(
+        paths,
+        action["id"],
+        "sampled_bad",
+        metadata={"rationale": "The applied merge needs identity review."},
+    )
+
+    with running_ui(paths) as (host, port, token):
+        status, queue = request_json(host, port, token, "GET", "/api/queue?kind=audit")
+
+    assert status == 200
+    assert queue["total"] == 1
+    item = queue["items"][0]
+    assert item["title"] == "Audit finding: Merge PKM Brain into Brain"
+    assert item["topology"]["target_label"] == "PKM Brain into Brain"
+    assert item["topology"]["entity_statuses"] == {
+        "entity_brain": "active",
+        "entity_pkm_brain": "merged",
+    }
+    assert item["audit"]["revertible"] is True
+    assert item["approvable"] is True
+    assert item["blocking_code"] is None
+
+
 def test_v2_queue_contract_only_merge_audit_shows_direction_and_contract_state(
     tmp_path: Path,
 ) -> None:
@@ -1648,6 +1702,9 @@ def test_v2_queue_route_candidates_exclude_internal_and_nonsemantic_pages(
         status, queue = request_json(
             host, port, token, "GET", "/api/queue?kind=unrouted"
         )
+        route_status, route_pages = request_json(
+            host, port, token, "GET", "/api/wiki/pages?routable=1"
+        )
 
     assert status == 200, queue
     candidates = queue["items"][0]["route_candidates"]
@@ -1657,6 +1714,10 @@ def test_v2_queue_route_candidates_exclude_internal_and_nonsemantic_pages(
     assert direct_candidates == candidates
     assert len(candidates[0]["title"]) <= 120
     assert not candidates[0]["title"].startswith(CODEX_PROVIDER_PROMPT_PREFIX)
+    assert route_status == 200
+    assert [page["relative_path"] for page in route_pages["pages"]] == [
+        "concepts/review-workflow.md"
+    ]
 
 
 def test_v2_queue_route_candidates_favor_confident_same_document_routes(
@@ -1802,7 +1863,9 @@ def test_v2_queue_review_commands_use_numeric_keys() -> None:
     assert "Applied Change" in source
     assert "Representative Affected Facts" in source
     assert "No reversible applied change is available" in source
-    assert "<kbd>${keys.newPage}</kbd>new page..." in source
+    assert '<input id="manual-route"' in source
+    assert "<kbd>${keys.newPage}</kbd>route" in source
+    assert 'ctx.api("/api/wiki/pages?routable=1")' in source
     assert 'item.comparison_mode === "alternatives"' in source
     assert 'data-alternative-id="${esc(factId)}"' in source
     assert 'doDecision(el, ctx, state, "select_facts"' in source
@@ -1818,18 +1881,24 @@ def test_v2_queue_review_commands_use_numeric_keys() -> None:
 
 
 def test_native_unrouted_route_buttons_register_displayed_shortcuts() -> None:
-    source = (
-        Path(__file__).parents[1] / "app/Sources/Views/Queue/QueueView.swift"
+    root = Path(__file__).parents[1]
+    source = (root / "app/Sources/Views/Queue/QueueView.swift").read_text(
+        encoding="utf-8"
+    )
+    autocomplete = (
+        root / "app/Sources/Views/Queue/RoutePathAutocompleteField.swift"
     ).read_text(encoding="utf-8")
     unrouted_card = source.split("private var unroutedCard", 1)[1].split(
         "private var memoryCard", 1
     )[0]
 
     assert 'routeFieldFocused ? "" : String(index + 1)' in unrouted_card
-    assert 'routeFieldFocused ? "" : manualRouteKey' in unrouted_card
+    assert "RoutePathAutocompleteField(" in unrouted_card
     assert "shortcutEnabled: !routeFieldFocused" in unrouted_card
-    assert ".focused($routeFieldFocused)" in unrouted_card
-    assert ".onSubmit" in unrouted_card
+    assert "client.routableWikiPages()" in autocomplete
+    assert "RoutePathMatcher.suggestions" in autocomplete
+    assert ".focused($fieldFocused)" in autocomplete
+    assert ".onSubmit(onSubmit)" in autocomplete
 
 
 def test_anomaly_controls_name_the_recorded_dispositions_clearly() -> None:
@@ -2577,6 +2646,7 @@ def test_curation_settings_promote_future_only_policy_profiles(tmp_path: Path) -
     assert default_settings["strictness"] == "balanced"
     assert default_settings["merge_aggressiveness"] == 0.5
     assert default_settings["split_aggressiveness"] == 0.5
+    assert default_settings["topology_review_threshold"] == 8
     assert default_settings["topology_applies_to"] == "future_gardener_runs_only"
     assert default_settings["updated_at"] is not None
     assert "." not in default_settings["updated_at"]
@@ -2638,6 +2708,22 @@ def test_curation_settings_promote_future_only_policy_profiles(tmp_path: Path) -
             "/api/settings/curation",
             {"split_aggressiveness": 1.2},
         )
+        threshold_status, threshold = request_json(
+            host,
+            port,
+            token,
+            "PUT",
+            "/api/settings/curation",
+            {"topology_review_threshold": 32},
+        )
+        invalid_threshold_status, invalid_threshold = request_json(
+            host,
+            port,
+            token,
+            "PUT",
+            "/api/settings/curation",
+            {"topology_review_threshold": 32.5},
+        )
     assert topology_status == 200
     assert topology["strictness"] == "strict"
     assert topology["merge_aggressiveness"] == 0.8
@@ -2646,9 +2732,38 @@ def test_curation_settings_promote_future_only_policy_profiles(tmp_path: Path) -
     assert topology["updated_at"] >= strict["updated_at"]
     assert invalid_status == 400
     assert "split_aggressiveness must be between 0 and 1" in invalid["error"]
+    assert threshold_status == 200
+    assert threshold["topology_review_threshold"] == 32
+    assert threshold["policy_version"] == strict["policy_version"] + 1
+    assert invalid_threshold_status == 400
+    assert "must be an integer" in invalid_threshold["error"]
     config_text = paths.config_file.read_text(encoding="utf-8")
     assert "merge_aggressiveness: 0.8" in config_text
     assert "split_aggressiveness: 0.2" in config_text
+    assert "topology_review_threshold: 32" in config_text
+    with connection(paths.sqlite_path) as conn:
+        below_topology_threshold = evaluate_policy(
+            conn,
+            "page_split",
+            {
+                "risk_tier": "medium",
+                "confidence": 0.99,
+                "affected_fact_count": 20,
+                "large_topology": False,
+            },
+        )
+        above_topology_threshold = evaluate_policy(
+            conn,
+            "page_split",
+            {
+                "risk_tier": "medium",
+                "confidence": 0.99,
+                "affected_fact_count": 33,
+                "large_topology": False,
+            },
+        )
+    assert below_topology_threshold.autonomy_level == "L2"
+    assert above_topology_threshold.autonomy_level == "L3"
 
     with running_ui(paths) as (host, port, token):
         lenient_status, lenient = request_json(

@@ -46,10 +46,7 @@ from .cos_audit import COS_AUDIT_CONFIGURED_NOTE, COS_AUDIT_STUB_NOTE, run_sampl
 from .cos_policy import active_policy_rules, active_policy_version, human_policy_reason
 from .curation_settings import load_curation_settings, update_curation_settings
 from .db import connection, dumps
-from .gardener import (
-    deterministic_entity_candidates,
-    propose_gardener_action,
-)
+from .gardener import deterministic_entity_candidates, propose_gardener_action
 from .app_migration import (
     build_migration_plan,
     create_runtime_backup,
@@ -1380,17 +1377,10 @@ def topology_action_identity(action: dict[str, Any]) -> str:
     return action_candidate_key(action) or f"action:{action.get('id')}"
 
 
-TOPOLOGY_ACTION_TYPES = {
-    "page_merge",
-    "page_split",
-    "rename_page",
-    "archive_page",
-    "rehome_fact",
-    "edit_contract",
-    "entity_merge",
-    "entity_split",
-    "synthesize_page",
-}
+TOPOLOGY_ACTION_TYPES = set(
+    "page_merge page_split rename_page archive_page rehome_fact edit_contract "
+    "entity_merge entity_split synthesize_page".split()
+)
 
 
 class QueueBuildContext:
@@ -2168,11 +2158,15 @@ def validate_queue_card(item: dict[str, Any]) -> dict[str, Any]:
             if (
                 len(entity_ids) < 2
                 or len(labels) < 2
-                or any(statuses.get(entity_id) != "active" for entity_id in entity_ids)
+                or any(
+                    statuses.get(entity_id)
+                    != ("merged" if group == "audit" and index else "active")
+                    for index, entity_id in enumerate(entity_ids)
+                )
             ):
                 return blocked(
                     "incomplete_merge_target",
-                    "The entity merge must show both active entities and its direction.",
+                    "The entity merge must show its direction and expected entity states.",
                 )
         return None
 
@@ -3056,7 +3050,7 @@ def queue_item_for_audit_action(
 def audit_action_title(
     action_type: str, topology: dict[str, Any] | None
 ) -> str:
-    if action_type == "page_merge" and topology:
+    if action_type in {"entity_merge", "page_merge"} and topology:
         destination = str(topology.get("merge_destination_label") or "").strip()
         sources = [
             str(value)
@@ -4843,6 +4837,10 @@ def ui_wiki_pages(paths: BrainPaths, query: dict[str, list[str]]) -> dict[str, A
         raise BadRequestError(f"invalid wiki page type: {page_type}")
     if status and status not in ALLOWED_STATUSES:
         raise BadRequestError(f"invalid wiki page status: {status}")
+    if first(query, "routable") == "1":
+        with connection(paths.sqlite_path) as conn:
+            pages = queue_active_pages(paths, conn)
+        return {"pages": pages, "count": len(pages)}
     q = first(query, "q")
     if q:
         pages = []
@@ -5503,11 +5501,6 @@ def ui_update_curation_settings(
     paths: BrainPaths, payload: dict[str, Any]
 ) -> dict[str, Any]:
     service(paths).init_workspace()
-    if not any(
-        key in payload
-        for key in ("strictness", "merge_aggressiveness", "split_aggressiveness")
-    ):
-        raise BadRequestError("at least one curation setting is required")
     strictness = optional_str(payload.get("strictness"))
     try:
         return update_curation_settings(
@@ -5515,6 +5508,7 @@ def ui_update_curation_settings(
             strictness,
             merge_aggressiveness=payload.get("merge_aggressiveness"),
             split_aggressiveness=payload.get("split_aggressiveness"),
+            topology_review_threshold=payload.get("topology_review_threshold"),
         )
     except ValueError as exc:
         raise BadRequestError(str(exc)) from exc

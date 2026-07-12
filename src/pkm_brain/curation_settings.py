@@ -21,6 +21,9 @@ from .util import new_id, now_iso
 DEFAULT_CURATION_STRICTNESS = "balanced"
 DEFAULT_MERGE_AGGRESSIVENESS = 0.5
 DEFAULT_SPLIT_AGGRESSIVENESS = 0.5
+DEFAULT_TOPOLOGY_REVIEW_THRESHOLD = 8
+MIN_TOPOLOGY_REVIEW_THRESHOLD = 4
+MAX_TOPOLOGY_REVIEW_THRESHOLD = 200
 
 
 def load_curation_settings(paths: BrainPaths) -> dict[str, Any]:
@@ -37,12 +40,16 @@ def load_curation_settings(paths: BrainPaths) -> dict[str, Any]:
         raw.get("split_aggressiveness", DEFAULT_SPLIT_AGGRESSIVENESS),
         "split_aggressiveness",
     )
+    topology_review_threshold = normalize_topology_review_threshold(
+        raw.get("topology_review_threshold", DEFAULT_TOPOLOGY_REVIEW_THRESHOLD)
+    )
     with connection(paths.sqlite_path) as conn:
         policy_version = active_policy_version(conn)
     return curation_settings_payload(
         strictness,
         merge_aggressiveness=merge_aggressiveness,
         split_aggressiveness=split_aggressiveness,
+        topology_review_threshold=topology_review_threshold,
         policy_version=policy_version,
         updated_at=curation_updated_at(paths.config_file, raw),
         configured=bool(raw.get("strictness")),
@@ -56,7 +63,18 @@ def update_curation_settings(
     *,
     merge_aggressiveness: Any = None,
     split_aggressiveness: Any = None,
+    topology_review_threshold: Any = None,
 ) -> dict[str, Any]:
+    if all(
+        value is None
+        for value in (
+            strictness,
+            merge_aggressiveness,
+            split_aggressiveness,
+            topology_review_threshold,
+        )
+    ):
+        raise ValueError("at least one curation setting is required")
     config = load_local_config(paths.config_file)
     curation = (
         config.get("curation") if isinstance(config.get("curation"), dict) else {}
@@ -73,6 +91,9 @@ def update_curation_settings(
         curation.get("split_aggressiveness", DEFAULT_SPLIT_AGGRESSIVENESS),
         "split_aggressiveness",
     )
+    current_topology_threshold = normalize_topology_review_threshold(
+        curation.get("topology_review_threshold", DEFAULT_TOPOLOGY_REVIEW_THRESHOLD)
+    )
     normalized = normalize_curation_strictness(strictness or current_strictness)
     normalized_merge = normalize_topology_aggressiveness(
         current_merge if merge_aggressiveness is None else merge_aggressiveness,
@@ -82,21 +103,34 @@ def update_curation_settings(
         current_split if split_aggressiveness is None else split_aggressiveness,
         "split_aggressiveness",
     )
+    normalized_topology_threshold = normalize_topology_review_threshold(
+        current_topology_threshold
+        if topology_review_threshold is None
+        else topology_review_threshold
+    )
     strictness_changed = current_strictness != normalized
     merge_changed = current_merge != normalized_merge
     split_changed = current_split != normalized_split
+    topology_threshold_changed = (
+        current_topology_threshold != normalized_topology_threshold
+    )
     if currently_configured and not any(
-        (strictness_changed, merge_changed, split_changed)
+        (strictness_changed, merge_changed, split_changed, topology_threshold_changed)
     ):
         return load_curation_settings(paths)
 
     with connection(paths.sqlite_path) as conn:
-        if strictness_changed or not curation.get("strictness"):
+        if (
+            strictness_changed
+            or topology_threshold_changed
+            or not curation.get("strictness")
+        ):
             profile = CURATION_STRICTNESS_PROFILES[normalized]
             minimum_auto_confidence = float(profile["minimum_auto_confidence"])
             policy_version = promote_policy_for_autonomy(
                 conn,
-                reason=f"curation autonomy changed to {normalized} in Settings",
+                reason="curation autonomy or topology review threshold changed in Settings",
+                large_topology_fact_threshold=normalized_topology_threshold,
                 strictness=normalized,
                 minimum_auto_confidence=minimum_auto_confidence,
             )
@@ -111,6 +145,7 @@ def update_curation_settings(
     updated_curation["minimum_auto_confidence"] = minimum_auto_confidence
     updated_curation["merge_aggressiveness"] = normalized_merge
     updated_curation["split_aggressiveness"] = normalized_split
+    updated_curation["topology_review_threshold"] = normalized_topology_threshold
     updated_curation["updated_at"] = now_iso()
     config["curation"] = updated_curation
     write_local_config(paths.config_file, config)
@@ -118,6 +153,7 @@ def update_curation_settings(
         normalized,
         merge_aggressiveness=normalized_merge,
         split_aggressiveness=normalized_split,
+        topology_review_threshold=normalized_topology_threshold,
         policy_version=policy_version,
         updated_at=str(updated_curation["updated_at"]),
         configured=True,
@@ -130,6 +166,7 @@ def curation_settings_payload(
     *,
     merge_aggressiveness: float,
     split_aggressiveness: float,
+    topology_review_threshold: int,
     policy_version: int | None,
     updated_at: str | None,
     configured: bool,
@@ -142,6 +179,7 @@ def curation_settings_payload(
         "minimum_auto_confidence": profile["minimum_auto_confidence"],
         "merge_aggressiveness": merge_aggressiveness,
         "split_aggressiveness": split_aggressiveness,
+        "topology_review_threshold": topology_review_threshold,
         "policy_version": policy_version,
         "updated_at": updated_at,
         "configured": configured,
@@ -160,7 +198,8 @@ def curation_settings_payload(
         "hard_review_boundaries": [
             "truth_contradiction",
             "missing_quote_or_fallback_route",
-            "cross_type_or_large_topology",
+            "cross_type_topology",
+            "topology_above_review_threshold",
             "failed_eval_gate",
         ],
     }
@@ -187,6 +226,22 @@ def normalize_topology_aggressiveness(value: Any, field: str) -> float:
     if not 0.0 <= parsed <= 1.0:
         raise ValueError(f"{field} must be between 0 and 1")
     return round(parsed, 2)
+
+
+def normalize_topology_review_threshold(value: Any) -> int:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("topology_review_threshold must be an integer") from exc
+    if not numeric.is_integer():
+        raise ValueError("topology_review_threshold must be an integer")
+    parsed = int(numeric)
+    if not MIN_TOPOLOGY_REVIEW_THRESHOLD <= parsed <= MAX_TOPOLOGY_REVIEW_THRESHOLD:
+        raise ValueError(
+            "topology_review_threshold must be between "
+            f"{MIN_TOPOLOGY_REVIEW_THRESHOLD} and {MAX_TOPOLOGY_REVIEW_THRESHOLD}"
+        )
+    return parsed
 
 
 def load_local_config(path: Path) -> dict[str, Any]:

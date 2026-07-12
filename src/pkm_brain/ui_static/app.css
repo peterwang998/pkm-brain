@@ -154,6 +154,8 @@ details.raw pre { background: var(--panel-2); border: 1px solid var(--line); bor
 .detail-head, .entity-head { display: flex; justify-content: space-between; gap: var(--s4); align-items: start; margin-bottom: var(--s4); }
 .route-list { display: grid; gap: var(--s2); }
 .route-list button { display: flex; gap: var(--s2); justify-content: space-between; text-align: left; }
+.route-manual { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--s2); margin-top: var(--s3); }
+.route-manual input { min-width: 0; }
 .wiki-layout { grid-template-columns: minmax(240px, 300px) minmax(0, 1fr) minmax(220px, 280px); }
 .tree-list { display: grid; gap: 2px; margin-top: var(--s3); }
 .tree-list a { display: grid; gap: 1px; padding: var(--s2); border-radius: var(--radius-s); text-decoration: none; }

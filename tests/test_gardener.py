@@ -149,6 +149,12 @@ def test_high_certainty_entity_merge_stays_low_risk_despite_many_facts() -> None
     assert candidate["affected_fact_count"] == 21
     assert candidate["risk_tier"] == "low"
     assert gardener_candidate_reasoning_effort(candidate) == "low"
+    raised_threshold = entity_merge_candidate(
+        left, right, topology_review_threshold=32
+    )
+    assert raised_threshold is not None
+    assert raised_threshold["large_topology"] is False
+    assert raised_threshold["topology_review_threshold"] == 32
 
 
 def test_conservative_merge_bias_suppresses_fuzzy_entity_containment() -> None:
@@ -309,6 +315,28 @@ def test_split_aggressiveness_suppresses_weak_page_split_candidates() -> None:
         "minimum_facts_per_section": 1,
     }
     assert conservative is None
+
+
+def test_topology_review_threshold_changes_size_classification_not_admission() -> None:
+    page = {
+        "relative_path": "concepts/dense-topic.md",
+        "active_fact_count": 20,
+        "section_counts": {"Architecture": 7, "Evaluation": 7, "Operations": 6},
+    }
+
+    default = page_split_candidate(page, {}, split_aggressiveness=0.5)
+    raised = page_split_candidate(
+        page,
+        {},
+        split_aggressiveness=0.5,
+        topology_review_threshold=32,
+    )
+
+    assert default is not None
+    assert raised is not None
+    assert default["large_topology"] is True
+    assert raised["large_topology"] is False
+    assert raised["affected_fact_count"] == default["affected_fact_count"] == 20
 
 
 def test_topology_arbitration_prefers_merge_over_split_for_the_same_page() -> None:
