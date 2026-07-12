@@ -1,7 +1,7 @@
 # Capture And Knowledge
 
 **Status:** canonical living feature spec
-**Last verified:** 2026-07-11 against public release `0.1.1` code snapshot `b3ba211`
+**Last verified:** 2026-07-12 against public release `0.1.2` code snapshot `7e48ac5`
 **Owns:** connectors, ingest, source normalization, extraction, facts, entities, routing, gardener topology, and wiki projection
 
 ## Feature Boundary
@@ -213,7 +213,8 @@ Current safeguards:
 - effort is selected per candidate: low for high-certainty exact/compact entity merges, medium for ordinary medium-risk work, and xhigh for fuzzy, cross-type, or large topology;
 - local `merge_aggressiveness` independently adjusts fuzzy entity/page-merge admission, while exact normalized/compact-name identity signals remain eligible;
 - local `split_aggressiveness` adjusts page-split fact, section, and per-section density floors; there is no automatic entity-split generator;
-- both topology settings are read when a future gardener run starts and never rewrite already-proposed actions;
+- local `topology_review_threshold` sets the affected-fact/page size at which otherwise-safe future candidates become large-topology L3 work; each candidate records the threshold used;
+- all topology settings are read when a future gardener run starts and never rewrite already-proposed actions;
 - commit remains deterministic and reversible through `cos_actions`.
 
 The verified local gardener model is `gpt-5.6-luna`. Page/entity candidate volume is still bounded before proposal; expanding judgment coverage is future, eval-gated work.
