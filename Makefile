@@ -8,4 +8,3 @@ app-test:
 
 app-run:
 	PKM_BRAIN_REPO_PATH=$(CURDIR) swift run --package-path app PKMBrainApp
-

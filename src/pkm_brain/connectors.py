@@ -673,4 +673,3 @@ def connector_due(state: dict[str, Any]) -> bool:
         last = last.replace(tzinfo=timezone.utc)
     cadence = int(state.get("cadence_s") or 600)
     return datetime.now(timezone.utc) - last >= timedelta(seconds=cadence)
-
