@@ -1,16 +1,14 @@
 import XCTest
 
 final class PKMBrainUITests: XCTestCase {
-    private var app: XCUIApplication!
-
-    override func setUpWithError() throws {
-        continueAfterFailure = false
+    @MainActor
+    private func launchApp() throws -> XCUIApplication {
         let configURL = URL(fileURLWithPath: "/private/tmp/pkm-brain-ui-acceptance.json")
         let config = try JSONDecoder().decode(
             AcceptanceConfig.self,
             from: Data(contentsOf: configURL)
         )
-        app = XCUIApplication()
+        let app = XCUIApplication()
         app.launchEnvironment["PKM_BRAIN_HOME"] = config.home
         app.launchEnvironment["PKM_BRAIN_DEV_BRAIN_BIN"] = config.brain
         app.launchEnvironment["PKM_BRAIN_APP_SUPPORT"] = config.appSupport
@@ -22,15 +20,15 @@ final class PKMBrainUITests: XCTestCase {
             app.typeKey("n", modifierFlags: [.command])
         }
         XCTAssertTrue(app.windows.firstMatch.waitForExistence(timeout: 20))
-    }
-
-    override func tearDownWithError() throws {
-        app?.terminate()
-        app = nil
+        return app
     }
 
     @MainActor
     func testAllDestinationsRenderAndRemainNavigable() throws {
+        continueAfterFailure = false
+        let app = try launchApp()
+        defer { app.terminate() }
+
         for destination in ["Today", "Queue", "Wiki", "Entities", "Ask", "Ops", "Settings"] {
             let navigationLabel = app.staticTexts[destination].firstMatch
             XCTAssertTrue(navigationLabel.waitForExistence(timeout: 10), "Missing navigation label \(destination)")
