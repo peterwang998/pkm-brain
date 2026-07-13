@@ -1,7 +1,7 @@
 # Implementation Stream History
 
 **Status:** compact historical summary
-**Last verified:** 2026-07-13 against release `0.1.2` snapshot `42c44c7`
+**Last verified:** 2026-07-13 against release `0.1.3` snapshot `10cf00d`
 
 This file preserves the durable outcomes of earlier implementation-stream specs without retaining thousands of lines of completed phase instructions. Full prior documents remain in git history.
 

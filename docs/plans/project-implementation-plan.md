@@ -1,7 +1,7 @@
 # Project Improvement Implementation Plan
 
 **Status:** execution in progress; R1-R4 complete, R5/R6 partially complete in release `0.1.3`
-**Last verified:** 2026-07-13 against release `0.1.2` code snapshot `42c44c7`
+**Last verified:** 2026-07-13 against release `0.1.3` code snapshot `10cf00d`
 **Inputs:** [Project Audit](../audits/project-audit-2026-07-10.md) and the six [canonical feature specs](../README.md)
 
 ## Objective

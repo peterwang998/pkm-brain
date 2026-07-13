@@ -1,7 +1,7 @@
 # Curation And Review
 
 **Status:** canonical living feature spec
-**Last verified:** 2026-07-13 against release `0.1.2` code snapshot `42c44c7`
+**Last verified:** 2026-07-13 against release `0.1.3` code snapshot `10cf00d`
 **Owns:** Chief-of-Staff roles, action/policy/audit flow, fact relations, review Queue, autonomy settings, and review-volume controls
 
 ## Operating Model
