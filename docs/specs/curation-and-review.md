@@ -1,7 +1,7 @@
 # Curation And Review
 
 **Status:** canonical living feature spec
-**Last verified:** 2026-07-12 against public release `0.1.2` code snapshot `b5a4920`
+**Last verified:** 2026-07-13 against public release `0.1.2` code snapshot `dab0883`
 **Owns:** Chief-of-Staff roles, action/policy/audit flow, fact relations, review Queue, autonomy settings, and review-volume controls
 
 ## Operating Model
@@ -202,6 +202,8 @@ The current working tree implements `approvable`, `blocking_code`, and `blocking
 
 Blocked does not mean disposable. Missing payload, provenance, relation, or topology context remains inspectable under Needs Repair and cannot mutate knowledge. A maintenance flow may close a blocked item only when it records proof that the item is obsolete, already handled, or deterministically repaired; the default Queue never deletes it merely to reduce the visible count.
 
+A fully hydrated entity-merge proposal remains Queue-relevant only while every referenced entity is active. If its source or destination has since merged or otherwise become inactive, the proposal is stale and is excluded from Queue rows and counts rather than resurfacing under Needs Repair. Missing entity rows or malformed direction still fail visibly as incomplete context.
+
 ### Ordering And Confidence
 
 Server-side sorts run before pagination:
@@ -257,7 +259,7 @@ The native Settings surface does not expose the internal policy version. Its hea
 
 Hard boundaries do not move: contradictions, missing quote, invalid/fallback route, failed eval, and cross-type topology remain review work.
 
-Topology size has a separate `topology_review_threshold`, validated from 4 through 200 affected facts/pages and defaulting to 8. At or above the configured threshold, ordinary page/entity topology is classified high risk and forced to L3 review. Raising the threshold lets confidence-qualified, reversible, same-type topology below that size continue through the normal L1/L2 critic and sampled-audit path; it does not bypass contradictions, cross-type work, failed gates, critic rejection, or minimum-confidence policy. Each future gardener candidate records the threshold used so its risk decision remains auditable.
+Topology size has a separate `topology_review_threshold`, validated from 4 through 200 affected facts/pages and defaulting to 8. At or above the configured threshold, ordinary page/entity topology is classified high risk and forced to L3 review. Raising the threshold lets confidence-qualified, reversible, same-type topology below that size continue through the normal L1/L2 critic and sampled-audit path; it does not bypass contradictions, cross-type work, failed gates, critic rejection, or minimum-confidence policy. Low-risk reversible topology has an explicit L2 critic rule so it cannot fall through to the default L3 rule merely because its gardener risk is lower than the older medium-risk topology rule. Each future gardener candidate records the threshold used so its risk decision remains auditable.
 
 The same endpoint exposes independent `merge_aggressiveness` and `split_aggressiveness` values from 0.0 through 1.0. The native Settings view combines them into one Topology Bias slider: Prefer Splits on the left, Balanced in the center, and Prefer Merges on the right. Moving right raises merge admission and lowers split admission by the same amount; moving left does the inverse. Existing non-complementary API/config values are summarized into a bias for display and are not rewritten until the reviewer moves and applies the control. These values change deterministic candidate admission only, not whether an admitted action may auto-apply.
 
@@ -280,7 +282,7 @@ Changing the topology review threshold writes local config and appends a policy 
 
 New gardener runs use the same sequence. Deterministic admission is followed by per-candidate gardener judgment and merge-first overlap arbitration; `shadow=False` proposals are policy-decided instead of being left as unclassified `proposed` rows. Page topology actions use a report-backed `{"suite": "topology"}` eval gate rather than a caller-supplied failed gate.
 
-The live setting verified after installing `0.1.2` is More Autonomy, floor 0.60, merge admission 0.80, split admission 0.20, and a topology review threshold of 32. The internal policy version remains diagnostic state rather than a user-facing setting.
+The live setting verified on `0.1.2` is More Autonomy, floor 0.60, merge admission 0.80, split admission 0.20, and a topology review threshold of 32. The internal policy version remains diagnostic state rather than a user-facing setting.
 
 ## Review Volume
 

@@ -1,7 +1,7 @@
 # Implementation Stream History
 
 **Status:** compact historical summary
-**Last verified:** 2026-07-11 against public release `0.1.1` snapshot `71a6462`
+**Last verified:** 2026-07-13 against public release `0.1.2` snapshot `dab0883`
 
 This file preserves the durable outcomes of earlier implementation-stream specs without retaining thousands of lines of completed phase instructions. Full prior documents remain in git history.
 
@@ -66,6 +66,13 @@ This file preserves the durable outcomes of earlier implementation-stream specs 
 - Public CI run `29184839657` passed 472 Python tests, 17 Swift tests, the release build, and seven-destination XCUITest on macOS 15/Xcode 16.4. The runner exposed and verified the fix for a notification completion handler that had inherited main-actor isolation on a private callback queue.
 - Native Wiki moved to `swift-markdown` with evidence and fact actions; Entities gained policy-gated merge proposals; Ask gained debug/source navigation; Ops gained scheduler, runs, connectors, and storage; Settings gained rollback-safe home switching.
 - A line-count ratchet now prevents growth in the six largest Python/Swift modules. `PlaceholderView`, `BrainUIHandler.write_html`, and `queue_action_count` were removed as confirmed orphans.
+
+### July 12-13 - Topology Control And Queue Follow-Through
+
+- Settings gained a future-job topology review threshold, while native/browser Inbox custom routes gained substring autocomplete over the sanitized routable-page pool.
+- Applied entity-merge audits now recognize active-destination/merged-source state; unapplied merge proposals whose targets later become inactive are excluded as stale rather than shown as blocked.
+- A missing low-risk topology policy rule had caused safe sub-threshold merges to fall through to default L3. Policy v14 added explicit L2 critic coverage without weakening size, cross-type, confidence, critic, or eval boundaries.
+- A dry-run-first live reconciliation inspected 26 merge candidates, closed 6 stale candidates, suppressed 1 overlap, rejected 2 through fresh gardener judgment, applied 13 through L2 critic review, retained 4 L3 decisions, and completed with zero failures. The resulting live Queue contained 65 total items.
 
 ## Superseded Audit Items
 

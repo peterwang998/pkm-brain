@@ -1,7 +1,7 @@
 # Project Improvement Implementation Plan
 
 **Status:** execution in progress; R1-R4 complete, R5/R6 partially complete in release `0.1.2`
-**Last verified:** 2026-07-12 against public release `0.1.2` code snapshot `b5a4920`
+**Last verified:** 2026-07-13 against public release `0.1.2` code snapshot `dab0883`
 **Inputs:** [Project Audit](../audits/project-audit-2026-07-10.md) and the six [canonical feature specs](../README.md)
 
 ## Objective
@@ -152,7 +152,7 @@ Artifact: `artifacts/baselines/<date>/summary.json` or another gitignored report
 
 ## R1 - Trustworthy Review Surface
 
-Implementation checkpoint, 2026-07-10:
+Implementation checkpoint, 2026-07-13:
 
 - implemented: PID/home-bound freshness summary in digest, Queue, decision, and undo responses;
 - implemented: native/browser reconciliation, active/actionable/blocked counts, complete-card validation, and direct POST gating;
@@ -167,6 +167,7 @@ Implementation checkpoint, 2026-07-10:
 - implemented: focus-independent native number shortcuts for Inbox route candidates, with text-entry focus protection and Return submission for custom page paths;
 - implemented: native/browser custom Inbox routes autocomplete substring matches from the active routable Wiki-page pool while retaining manual new-path entry;
 - implemented: a future-job topology review threshold replaces the hidden eight-fact L3 boundary, is candidate-stamped, and promotes one policy version without rewriting the current Queue;
+- implemented: confidence-qualified, reversible low-risk topology below that threshold has explicit L2 critic coverage rather than falling through to default L3;
 - implemented: immediate native Queue transition loading plus request identities so late group/state/sort responses cannot display or mutate stale cards;
 - implemented: sampled audit can demote only an attributed policy rule whose own threshold is breached; unscoped findings cannot demote, and unrelated active rules retain their autonomy/critic/sample settings;
 - implemented: dry-run-first Policy escalation reconciliation that re-decides current L0-L2 actions through the critic/action ledger and retains current L3 work;
@@ -174,6 +175,7 @@ Implementation checkpoint, 2026-07-10:
 - implemented: Settings hides internal policy versions and reports a persisted human-readable last-saved timestamp;
 - implemented: state-aware sampled-audit admission shared by Queue counts, rows, and decisions; topology cards now show merge direction, current page/contract state, affected counts, and representative facts, while drifted fact findings use targeted ledgered correction and obsolete drifted topology findings are excluded;
 - implemented: applied entity-merge audit completeness recognizes the expected active-destination/merged-source post-state instead of blocking a valid reversible finding;
+- implemented: stale unapplied entity merges with a now-inactive source or destination are excluded from Queue rows/counts instead of resurfacing under Needs Repair;
 - implemented: Hyprnote capture restores true multi-channel chronology with stable speaker labels, explicitly groups legacy synthetic-clock tracks, suppresses metadata-only placeholders, and carries speaker identity through evidence units;
 - implemented: fact critic review distinguishes unsupported statements from incomplete evidence packets, performs one bounded citation union plus fresh review, falls back from malformed entity disambiguation, and isolates parallel action failures;
 - verified: the incremental approved W2a pass resolved 19 later candidates with zero failures and annotated 51 survivors, leaving the live deduplicated Queue at 230 actionable and 0 blocked;
@@ -181,9 +183,11 @@ Implementation checkpoint, 2026-07-10:
 - verified: restored More Autonomy policy v12 reclassified all 167 active Policy questions as L2; normal critic/ledger reconciliation applied 104 facts plus one synthesis, rejected 62 candidates, left zero Policy questions, and passed SQLite integrity with an exact +104 fact delta;
 - hardened after live contention: reconciliation parallelizes critic calls but serializes ledger writes with reusable verdicts and bounded whole-operation SQLite retry;
 - verified: topology reconciliation reduced 205 open merge/split rows / 104 candidates to 11 L3 candidates, applied 2 small merges, critic-rejected 3 actions, retired 101 duplicate rows, and passed SQLite integrity with zero reconciliation failures;
+- verified: after policy v14 corrected low-risk topology coverage, a July 13 reconciliation inspected 26 current merge candidates, closed 6 stale candidates, suppressed 1 overlap, gardener-rejected 2, applied 13 through L2 critic review, retained 4 L3 decisions, and recorded zero failures; the live Queue then measured 65 total;
 - verified: audit reconciliation restored one refused fact-audit revert, auto-resolved its generic drift residue, excluded two stale page-merge findings, and left 12 actionable audit findings in a 79-item live Queue; both live SQLite and the pre-repair backup passed integrity checks;
 - verified: targeted reprocessing closed all nine legacy extraction anomalies; 50/72 rebuilt critic-reviewed facts applied, 22 unsupported or over-broad facts were rejected, three genuine review tasks were created and only one remained after concurrent manual review, and the final restarted live Queue measured 58 actionable with zero blocked items and zero extraction anomalies;
 - verified: 465 Python tests, 15 Swift tests, full Ruff, signed build, healthy embedded daemon restart, and live dark-mode Queue screenshot inspection;
+- verified: the `0.1.2` follow-up passes 475 Python tests, 17 Swift tests, and full Ruff before release rebuild;
 - remaining in R1: maintenance audit/report, historical comparison migration, automated overlap/state tests, and the full signed keyboard/light/dark/minimum-width acceptance matrix.
 
 ### TRUST-1 - One Queue Summary Contract

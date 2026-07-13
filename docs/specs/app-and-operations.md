@@ -1,7 +1,7 @@
 # App And Operations
 
 **Status:** canonical living feature spec; native app is primary and browser UI is an off-by-default fallback
-**Last verified:** 2026-07-12 against public release `0.1.2` code snapshot `b5a4920`
+**Last verified:** 2026-07-13 against public release `0.1.2` code snapshot `dab0883`
 **Owns:** daemon, scheduler, connector operations, native/browser UI, settings, provisioning, packaging, migration, and operational retention
 
 ## Product Shape
@@ -126,7 +126,7 @@ Native requirements:
 
 Current implementation includes the split pane, paging, sorting, filters, decision/undo paths, page-split previews, policy cards, popularity, confidence bands, labeled fact source dates, extraction-anomaly alerts, sampled-audit findings, and Review/Needs Repair/Deferred modes. Anomaly cards expose document/block-rate context and alert-only decisions. Native and browser audit cards expose the auditor rationale plus an Applied Change panel: topology direction, current page/contract status, affected fact/page/contract counts, and representative facts. Current actions offer guarded Revert/Keep effects; a drifted but still-active audited fact offers targeted Reject Applied Fact, while obsolete drifted topology findings are absent. The default Review mode contains only approvable admitted work; blocked cards remain inspectable with disabled controls under Needs Repair, and excess future work remains inspectable under Deferred. The Queue summary is PID/home-bound across digest, Queue load, decision, undo, and daemon replacement.
 
-Resolved in the current implementation through 2026-07-12:
+Resolved in the current implementation through 2026-07-13:
 
 - sidebar/menu/Today authority now uses the freshest server Queue summary instead of the independent digest integer;
 - candidate-less or otherwise incomplete cards remain visible with a reason but cannot be submitted through either client or a direct mutation POST;
@@ -136,6 +136,7 @@ Resolved in the current implementation through 2026-07-12:
 - Queue group/state/sort transitions now carry a request identity, cover stale list/detail content with a loading state, reject out-of-order responses, and block stale mouse/keyboard decisions while loading.
 - sampled-audit rendering and admission now share the applied-state guard: topology findings include complete current context, stale topology findings disappear, and drifted fact findings use a reversible targeted correction only while the exact audited fact remains active.
 - applied entity-merge audit cards validate the expected post-state (active destination, merged sources) rather than incorrectly requiring both entities to remain active.
+- unapplied entity-merge proposals disappear from Queue rows and counts once any fully hydrated target entity becomes inactive, instead of reappearing as a disabled Needs Repair card after later topology changes.
 - native Inbox route-candidate number badges are registered as window shortcuts instead of depending on hidden-view focus. Candidate, Reject, and Skip shortcuts suspend while the custom page-path field is focused; Return submits a nonempty custom path. Native and browser custom-route fields autocomplete substring matches from the active routable Wiki-page pool.
 
 Remaining acceptance gaps:
