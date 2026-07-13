@@ -11,7 +11,7 @@ from pkm_brain.util import now_iso
 
 def test_sync_conflicts_lists_logical_sources_seen_under_multiple_origins(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
-    BrainService(paths, prefer_model_embeddings=False).init_workspace()
+    BrainService(paths).init_workspace()
     timestamp = now_iso()
     with connection(paths.sqlite_path) as conn:
         for document_id, origin in [("doc_primary", "primary"), ("doc_secondary", "secondary")]:

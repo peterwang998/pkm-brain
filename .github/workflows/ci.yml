@@ -5,7 +5,7 @@ on:
   pull_request:
 
 jobs:
-  test:
+  python:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -13,3 +13,24 @@ jobs:
       - run: uv sync --dev
       - run: uv run ruff check .
       - run: uv run pytest
+
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: brew install xcodegen
+      - run: uv sync --dev
+      - run: swift test --package-path app
+      - run: scripts/build-app.sh
+      - name: Run rendered UI acceptance
+        run: scripts/ui-acceptance.sh "$RUNNER_TEMP/pkm-brain-ui-acceptance"
+      - name: Upload UI acceptance diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-ui-acceptance-diagnostics
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/pkm-brain-ui-acceptance
+            ~/Library/Logs/DiagnosticReports

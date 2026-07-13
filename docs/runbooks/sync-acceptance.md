@@ -1,128 +1,191 @@
 # Primary/Secondary Sync Acceptance Runbook
 
-Use this runbook before tagging V1. Unit and fake-transport tests do not cover
-real SSH host-key behavior, real rsync behavior, filesystem permissions, or
-time skew between machines.
+**Status:** current operational runbook
+**Last verified:** 2026-07-10 against commit `e43e9c1e1287`; last real two-machine pass completed 2026-07-08
+**Spec:** [Sync And Topology](../specs/sync-and-topology.md)
 
-## Preflight
+Run this before a sync/topology release or after changing SSH, paths, manifests, scheduler behavior, migration, or app runtimes. Unit/fake-transport tests do not prove real host-key, rsync, permission, sleep/wake, or time-skew behavior.
 
-Record the machines and versions used for the acceptance run:
+## Command Selection
+
+Normal app-managed install:
+
+```bash
+brain --version
+brain sync status --home ~/brain
+```
+
+Repository development:
+
+```bash
+uv run brain --version
+uv run brain sync status --home ~/brain
+```
+
+Use one command prefix consistently in a run and record it below.
+
+## Run Record
 
 | Field | Value |
-| --- | --- |
+|---|---|
 | Date | |
-| Primary hostname | |
-| Primary node_id | |
-| Secondary hostname/IP | |
-| Secondary node_id | |
-| PKM Brain commit | |
+| Command/runtime path | |
+| Primary hostname and `node_id` | |
+| Child hostname/IP and `node_id` | |
+| PKM Brain version/commit | |
 | Python version | |
-| rsync version on Primary | |
-| rsync version on Secondary | |
+| rsync versions | |
+| Primary app/daemon PID | |
+| Child app/daemon PID | |
 
-Run local validation on the Primary:
+## Local Preflight
+
+On the primary:
 
 ```bash
-uv run pytest -q
 uv run ruff check .
-sqlite3 ~/brain/db/brain.sqlite "SELECT version, applied_at FROM schema_migrations ORDER BY version;"
-sqlite3 ~/brain/db/brain.sqlite "PRAGMA table_info(sync_runs);"
-uv run brain sync acceptance --home ~/brain --peer <secondary-node-id> --json
+uv run pytest -q
+swift test --package-path app
+brain doctor --home ~/brain
+brain sync doctor --home ~/brain --json
+brain sync acceptance --home ~/brain --peer <child-node-id> --json
 ```
 
-Expected schema state:
+Schema expectations:
 
-- `schema_migrations` includes versions `1` and `2`.
-- `sync_runs` has 13 columns: `id`, `peer_node_id`, `direction`,
-  `started_at`, `finished_at`, `status`, `files_pulled`, `files_pushed`,
-  `bytes_pulled`, `bytes_pushed`, `primary_ingest_run_id`,
-  `remote_ingest_status`, and `errors`.
+- `schema_migrations` contains every version 1 through 20;
+- migration 20 is `document_source_stats`;
+- `sync_runs` contains peer/direction/timing/status/file/byte/ingest/remote-status/error fields;
+- `PRAGMA integrity_check` returns `ok`;
+- no migration is pending on either node.
 
-## Setup
-
-On the Primary:
+Inspect without running concurrent long live-DB queries:
 
 ```bash
-uv run brain setup
-uv run brain sync doctor --home ~/brain --json
+sqlite3 ~/brain/db/brain.sqlite \
+  "SELECT version, applied_at FROM schema_migrations ORDER BY version;"
+sqlite3 ~/brain/db/brain.sqlite "PRAGMA integrity_check;"
 ```
 
-On the Secondary:
+## Role And Security Checks
+
+On both nodes:
+
+1. `brain sync doctor --json` reports the expected role and node ID.
+2. Brain home paths are the intended distinct local paths.
+3. App daemon is healthy and uses the expected runtime version.
+4. No legacy pkm-brain LaunchAgent is active after app migration.
+
+From primary to child:
 
 ```bash
-uv run brain setup
-uv run brain sync doctor --home ~/brain --json
+brain sync test-connection <child-node-id> --home ~/brain
 ```
 
-Confirm SSH from Primary to Secondary works without a password prompt for the
-configured identity, then validate Brain-level reachability:
-
-```bash
-uv run brain sync test-connection <secondary-node-id> --home ~/brain
-```
-
-Record the result:
+Record:
 
 | Check | Result |
-| --- | --- |
-| Primary sync doctor ready | |
-| Secondary sync doctor ready | |
-| SSH BatchMode probe | |
-| Remote `brain sync doctor` probe | |
-| Outbox read/write/delete probe | |
-| Local and remote rsync probes | |
-| Host-key fingerprint pinned | |
+|---|---|
+| SSH BatchMode | |
+| pinned host fingerprint | |
+| remote role/node identity | |
+| remote Brain home | |
+| remote command version | |
+| outbox read/write/delete probe | |
+| local/remote rsync probes | |
 
-## Acceptance Flow
+Never accept a changed host key automatically during acceptance.
 
-Complete each step and paste the key command output or observation into the
-Result column.
+## Source Round Trip
 
-| Step | Command or observation | Result |
-| --- | --- | --- |
-| 1 | Configure laptop as Primary. | |
-| 2 | Configure LAN-only secondary machine as Secondary. | |
-| 3 | `uv run brain sync test-connection <secondary-node-id> --home ~/brain` | |
-| 4 | Start a Codex run on the Secondary, including a Codex Mobile-triggered run. | |
-| 5 | `uv run brain automation secondary-tick --home ~/brain` on Secondary. | |
-| 6 | `uv run brain sync run <secondary-node-id> --home ~/brain` on Primary. | |
-| 7 | Confirm Primary has Secondary files under `~/brain/inbox/external/<secondary-node-id>/`. | |
-| 8 | Confirm Primary ingest result has no errors. | |
-| 9 | `uv run brain retrieve-context --home ~/brain --task "<unique Secondary session phrase>"` finds the Secondary session. | |
-| 10 | Confirm push mirrored canonical `raw/`, `wiki/`, `memory/`, and `config/shared/` content to Secondary. | |
-| 11 | Confirm Secondary retrieval sees the pushed source after rebuild/remote ingest. | |
+Use a unique phrase that contains no secrets and will be easy to remove later.
 
-The automated portion can run the connection test, real sync, and Primary
-retrieval verification in one report:
+1. On the child, create/capture one agent session containing the phrase.
+2. Run `brain automation secondary-tick --home <child-home>` or the app's run-now equivalent.
+3. Verify the child outbox artifact and `manifest.jsonl` row.
+4. On the primary, run:
 
 ```bash
-uv run brain sync acceptance \
+brain sync run <child-node-id> --home ~/brain
+```
+
+5. Verify pull landed under `inbox/external/<child-node-id>/` through staging.
+6. Verify primary ingest succeeded and retrieval finds the phrase.
+7. Verify push mirrored `raw/`, `wiki/`, `memory/`, and `config/shared/`.
+8. Verify no `db/`, `indexes/`, `logs/`, `config/local/`, `config/sync.yaml`, or outbox content was overwritten.
+9. Verify remote rebuild succeeded and child retrieval finds the phrase.
+10. Verify manifest/hash parity and `mirror_current=true`.
+
+Automated report:
+
+```bash
+brain sync acceptance \
   --home ~/brain \
-  --peer <secondary-node-id> \
+  --peer <child-node-id> \
   --run-sync \
-  --retrieval-phrase "<unique Secondary session phrase>" \
+  --retrieval-phrase "<unique phrase>" \
   --json
 ```
 
-`complete: true` means the automated checks passed. The table above should
-still be filled in with the observed real-machine setup and Secondary-side
-retrieval result.
+`complete: true` means the automated checks passed. It does not replace the observed child-side retrieval and app/scheduler checks.
+
+## Scheduler Checks
+
+Primary:
+
+- one `sync:<child-node-id>` job exists per configured child;
+- each job reports its own cadence, due time, status, and no-op reason;
+- pausing one child does not affect another;
+- offline `--if-reachable` records a skip, not failure.
+
+Child:
+
+- `secondary_tick` exists and advances capture/outbox state;
+- mutation-capable CoS stages report role-gated skip;
+- no child-initiated primary sync job exists.
+
+For two configured children, run the three-home acceptance harness and verify both origin namespaces/mirrors independently.
 
 ## Failure Checks
 
-Run at least the non-destructive failure checks:
+Run non-destructive cases:
 
 | Scenario | Expected | Result |
-| --- | --- | --- |
-| Secondary offline with `--if-reachable` | `sync_runs.status = skipped`, no push. | |
-| Wrong remote role or node ID | `test-connection` fails before rsync. | |
-| Bad or changed host key | Connection hard-fails; do not auto-trust. | |
+|---|---|---|
+| child offline with `--if-reachable` | skipped, no push | |
+| wrong remote role/node ID | fail before rsync | |
+| bad/changed host key | hard fail | |
+| malformed/path-traversal manifest | reject/quarantine, no live inbox mutation | |
+| pull rsync partial/failure | staging preserved, live inbox untouched | |
+| primary ingest failure | push blocked | |
+| push partial/failure | remote rebuild blocked, mirror degraded | |
+| remote runtime/version mismatch | actionable failure | |
+
+## Secondary Write Warning
+
+Confirm the app explains that Queue/MCP writes on a child modify only the child's local derived DB and do not sync to the primary in V1. Only outbox source captures flow back.
+
+## Last Completed Real Run
+
+Recorded 2026-07-08 after app migration:
+
+- primary `sync:Peters-Mac-mini` status `ok`;
+- 37 files pulled;
+- 976 files pushed;
+- primary ingest and remote ingest `ok`;
+- matching manifest hash `659ae5b786e220104e3175fca05b6247be7a9633834e8c4a8a3772ff4e8d7f46`;
+- `mirror_current=true`;
+- no sync warnings;
+- child app runtime and `secondary_tick` healthy.
+
+This record proves that release only. Re-run after relevant transport/runtime changes.
 
 ## Sign-Off
 
-V1 acceptance is complete only when:
+Acceptance is complete only when:
 
-- Full tests and Ruff pass on the acceptance commit.
-- The real upgraded Primary DB shows migrations `1` and `2`.
-- The 11-step acceptance flow passes on real machines.
-- Any observed failures are either fixed or logged as explicit post-V1 issues.
+- Ruff, Python, Swift, and release app gates pass;
+- schema 1-20 and integrity checks pass on both nodes;
+- role/security, source round trip, scheduler, and required failure checks pass;
+- mirror parity and retrieval succeed on both nodes;
+- any failure is fixed or recorded as a release blocker with owner and rollback.

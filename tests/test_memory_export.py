@@ -8,7 +8,7 @@ from pkm_brain.service import BrainService
 
 
 def service_for(path: Path) -> BrainService:
-    return BrainService(BrainPaths.from_value(path), prefer_model_embeddings=False)
+    return BrainService(BrainPaths.from_value(path))
 
 
 def test_approve_writes_memory_export_and_export_all_is_idempotent(tmp_path: Path) -> None:
@@ -44,9 +44,12 @@ def test_approve_writes_memory_export_and_export_all_is_idempotent(tmp_path: Pat
 def test_export_all_removes_stale_export_after_scope_change(tmp_path: Path) -> None:
     svc = service_for(tmp_path / "brain")
     svc.init_workspace()
-    memory_id = svc.propose_memory("FactMemory", "user", "Migrated memory.", [], 0.8)
+    memory_id = svc.propose_memory("FactMemory", "global", "Migrated memory.", [], 0.8)
     svc.approve_memory(memory_id)
-    stale_path = svc.paths.memory / "user" / f"{memory_id}.md"
+    with connection(svc.paths.sqlite_path) as conn:
+        conn.execute("UPDATE memories SET scope = ? WHERE id = ?", ("user:Alex", memory_id))
+    svc.export_all_memories()
+    stale_path = svc.paths.memory / "user:Alex" / f"{memory_id}.md"
     assert stale_path.exists()
 
     with connection(svc.paths.sqlite_path) as conn:

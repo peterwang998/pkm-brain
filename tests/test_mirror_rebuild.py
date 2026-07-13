@@ -9,7 +9,7 @@ from pkm_brain.service import BrainService
 
 def test_rebuild_mirror_index_indexes_raw_without_copying_raw(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "secondary")
-    svc = BrainService(paths, prefer_model_embeddings=False)
+    svc = BrainService(paths)
     svc.init_workspace()
     raw_file = paths.raw / "agent_session_log" / "2026" / "05" / "session.md"
     raw_file.parent.mkdir(parents=True)
@@ -44,7 +44,7 @@ def test_rebuild_mirror_index_indexes_raw_without_copying_raw(tmp_path: Path) ->
 
 def test_rebuild_mirror_index_rebuilds_vectors_after_source_changes(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "secondary")
-    svc = BrainService(paths, prefer_model_embeddings=False)
+    svc = BrainService(paths)
     svc.init_workspace()
     raw_file = paths.raw / "markdown_note" / "2026" / "05" / "note.md"
     raw_file.parent.mkdir(parents=True)

@@ -1,11 +1,24 @@
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
+from pkm_brain.cli import app
 from pkm_brain import llm
-from pkm_brain.llm import CodexProvider, LLMProviderError, OpenAIProvider
+from pkm_brain.llm import CodexProvider, LLMConfigurationError, LLMProviderError, OpenAIProvider
+from pkm_brain.paths import BrainPaths
+
+
+runner = CliRunner()
+
+
+def test_codex_defaults_use_current_sol_and_luna_tiers() -> None:
+    assert llm.CODEX_DEFAULT_MODEL == "gpt-5.6-sol"
+    assert llm.CODEX_DEFAULT_FALLBACK_MODELS == ("gpt-5.6-luna",)
 
 
 def test_openai_provider_falls_back_on_model_selection_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -49,6 +62,7 @@ def test_codex_provider_falls_back_on_model_selection_error(monkeypatch: pytest.
     monkeypatch.setenv("PKM_BRAIN_CODEX_BIN", str(tmp_path / "codex"))
     monkeypatch.setenv("PKM_BRAIN_CODEX_MODEL", "missing-model")
     monkeypatch.setenv("PKM_BRAIN_CODEX_MODEL_FALLBACKS", "gpt-5.4-mini,gpt-5")
+    monkeypatch.setenv("PKM_BRAIN_CODEX_REASONING_EFFORT", "medium")
     calls = []
 
     class Completed:
@@ -60,8 +74,15 @@ def test_codex_provider_falls_back_on_model_selection_error(monkeypatch: pytest.
     def fake_run(command: list[str], **kwargs: object) -> Completed:
         if command[1:3] == ["login", "status"]:
             return Completed(0, stdout="Logged in")
-        assert command[1:4] == ["--ask-for-approval", "never", "exec"]
+        assert command[1:5] == [
+            "--ask-for-approval",
+            "never",
+            "-c",
+            'model_reasoning_effort="medium"',
+        ]
+        assert command[5] == "exec"
         assert "--ask-for-approval" not in command[4:]
+        assert "--skip-git-repo-check" in command
         model = command[command.index("--model") + 1]
         calls.append(model)
         if model == "missing-model":
@@ -113,3 +134,142 @@ def test_role_specific_provider_model_overrides_global(monkeypatch: pytest.Monke
     assert provider.model == "critic-model"
     assert provider.models == ["critic-model", "critic-fallback"]
     assert llm.provider_status(role="critic")["model"] == "critic-model"
+
+
+def test_cos_role_provider_status_uses_default_and_role_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    clear_cos_llm_env(monkeypatch)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    paths.config_local.mkdir(parents=True)
+    (paths.config_local / "cos_llm.yaml").write_text(
+        """
+default:
+  provider: ollama
+  model: llama3
+  model_fallbacks:
+    - llama3.1
+roles:
+  auditor:
+    provider: openai
+    model: gpt-audit
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    report = llm.cos_provider_status(paths)
+    roles = {row["role"]: row for row in report["roles"]}
+
+    assert roles["extractor"]["role_configured"] is True
+    assert roles["extractor"]["configured"] is True
+    assert roles["extractor"]["provider"] == "ollama"
+    assert roles["extractor"]["provider_source"] == "config:default.provider"
+    assert roles["extractor"]["model"] == "llama3"
+    assert roles["extractor"]["fallback_models"] == ["llama3.1"]
+    assert roles["auditor"]["provider"] == "openai"
+    assert roles["auditor"]["model"] == "gpt-audit"
+    assert "OPENAI_API_KEY" in roles["auditor"]["missing"]
+
+
+def test_cos_role_provider_status_warns_on_reviewer_proposer_overlap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    clear_cos_llm_env(monkeypatch)
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    paths.config_local.mkdir(parents=True)
+    (paths.config_local / "cos_llm.yaml").write_text(
+        """
+default:
+  provider: ollama
+  model: shared-model
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    report = llm.cos_provider_status(paths)
+
+    assert any("auditor uses the same provider/model as extractor" in warning for warning in report["warnings"])
+    assert any("critic uses the same provider/model as resolver" in warning for warning in report["warnings"])
+
+
+def test_complete_json_resolves_provider_from_cos_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    clear_cos_llm_env(monkeypatch)
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    paths.config_local.mkdir(parents=True)
+    (paths.config_local / "cos_llm.yaml").write_text(
+        """
+default:
+  provider: codex
+  model: llama3
+roles:
+  extractor:
+    model: extractor-model
+    reasoning_effort: medium
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    calls: list[tuple[str | None, str | None, str | None]] = []
+
+    class FakeProvider:
+        name = "fake"
+        model = "fake-model"
+
+        def complete(self, prompt: str) -> str:
+            return json.dumps({"ok": True})
+
+    def fake_get_provider(provider: str | None = None, *, role: str | None = None) -> FakeProvider:
+        calls.append((provider, role, os.environ.get("PKM_BRAIN_CODEX_MODEL")))
+        assert os.environ.get("PKM_BRAIN_CODEX_REASONING_EFFORT") == "medium"
+        return FakeProvider()
+
+    monkeypatch.setattr(llm, "get_provider", fake_get_provider)
+
+    assert llm.complete_json("return ok", role="extractor", paths=paths) == {"ok": True}
+    assert calls == [("codex", "extractor", "extractor-model")]
+
+
+def test_complete_json_with_unconfigured_cos_role_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    clear_cos_llm_env(monkeypatch)
+    paths = BrainPaths.from_value(tmp_path / "brain")
+
+    with pytest.raises(LLMConfigurationError, match="No CoS LLM provider configured"):
+        llm.complete_json("return ok", role="extractor", paths=paths)
+
+
+def test_cos_providers_cli_reports_json(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    clear_cos_llm_env(monkeypatch)
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    paths.config_local.mkdir(parents=True)
+    (paths.config_local / "cos_llm.yaml").write_text(
+        """
+default:
+  provider: ollama
+  model: llama3
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["cos", "providers", "--json", "--home", str(paths.home)])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    roles = {row["role"]: row for row in payload["roles"]}
+    assert payload["config_exists"] is True
+    assert roles["gardener"]["provider"] == "ollama"
+    assert roles["gardener"]["model"] == "llama3"
+
+
+def clear_cos_llm_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("PKM_BRAIN_LLM_PROVIDER", raising=False)
+    for role in llm.LLM_ROLE_ORDER:
+        for suffix in ("PROVIDER", "MODEL", "MODEL_FALLBACKS", "BASE_URL", "REASONING_EFFORT"):
+            monkeypatch.delenv(llm.role_env(role, suffix), raising=False)

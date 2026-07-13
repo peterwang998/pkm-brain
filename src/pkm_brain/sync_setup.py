@@ -10,7 +10,7 @@ from .sync_ssh import HostKeyCandidate, fingerprint, write_pinned_host_key
 
 def init_primary(paths: BrainPaths, node_id: str, force: bool = False) -> dict[str, object]:
     ensure_can_write_sync_config(paths, force)
-    BrainService(paths, prefer_model_embeddings=False).init_workspace()
+    BrainService(paths).init_workspace()
     (paths.inbox / "external").mkdir(parents=True, exist_ok=True)
     write_local_node_id(paths, node_id)
     config = SyncConfig(
@@ -31,7 +31,7 @@ def init_secondary(
     force: bool = False,
 ) -> dict[str, object]:
     ensure_can_write_sync_config(paths, force)
-    BrainService(paths, prefer_model_embeddings=False).init_workspace()
+    BrainService(paths).init_workspace()
     resolved_outbox = (outbox_path or (paths.outbox / node_id)).expanduser().resolve()
     resolved_outbox.mkdir(parents=True, exist_ok=True)
     write_local_node_id(paths, node_id)

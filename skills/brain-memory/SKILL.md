@@ -51,7 +51,7 @@ Skip Brain for trivial commands, purely mechanical local edits, or questions ful
 
 ## Writing Back
 
-Do not silently create approved memories or approved wiki pages. Agents may propose memories, including `AgentFailurePatternMemory`, but must not approve, reject, archive, or otherwise activate them.
+Do not silently create approved memories or modify wiki pages. Agents may propose memories, including `AgentFailurePatternMemory`, but must not approve, reject, archive, or otherwise activate them.
 
 Use MCP `propose_memory` only when:
 
@@ -60,13 +60,19 @@ Use MCP `propose_memory` only when:
 - there is source evidence or clear user confirmation
 - failure-pattern memories are actionable lessons from concrete agent failures, not generic advice
 
-Use MCP `propose_wiki_update` only for unapproved wiki proposals. Keep proposals source-backed and scoped to the evidence.
+Do not use legacy wiki proposal tools. The current MCP surface does not expose wiki mutation; report source-backed wiki-change recommendations to the user instead.
 
 Use MCP `write_agent_session` at the end of substantial work when the session produced reusable context, touched important files, made decisions, or left open issues.
 
 ## CLI Fallback
 
-If MCP is unavailable, use the local CLI from the pkm-brain repo:
+If MCP is unavailable after the macOS app migration, prefer the app-managed shim:
+
+```bash
+~/Library/Application\ Support/PKM\ Brain/bin/brain retrieve-context --task "<task>" --mode default --home ~/brain
+```
+
+For development checkouts before migration, use the local CLI from the pkm-brain repo:
 
 ```bash
 uv run brain retrieve-context --task "<task>" --mode default --home ~/brain

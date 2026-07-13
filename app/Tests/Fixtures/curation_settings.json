@@ -1,0 +1,39 @@
+{
+  "strictness": "balanced",
+  "label": "Balanced",
+  "minimum_auto_confidence": 0.8,
+  "merge_aggressiveness": 0.7,
+  "split_aggressiveness": 0.2,
+  "topology_review_threshold": 32,
+  "policy_version": 7,
+  "updated_at": "2026-07-11T16:30:00+00:00",
+  "configured": true,
+  "changed": false,
+  "applies_to": "future_actions_only",
+  "existing_queue_unchanged": true,
+  "topology_applies_to": "future_gardener_runs_only",
+  "profiles": [
+    {
+      "id": "strict",
+      "label": "Review First",
+      "minimum_auto_confidence": 0.95
+    },
+    {
+      "id": "balanced",
+      "label": "Balanced",
+      "minimum_auto_confidence": 0.8
+    },
+    {
+      "id": "lenient",
+      "label": "More Autonomy",
+      "minimum_auto_confidence": 0.6
+    }
+  ],
+  "hard_review_boundaries": [
+    "truth_contradiction",
+    "missing_quote_or_fallback_route",
+    "cross_type_topology",
+    "topology_above_review_threshold",
+    "failed_eval_gate"
+  ]
+}

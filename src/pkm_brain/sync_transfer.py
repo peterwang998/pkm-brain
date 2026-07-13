@@ -64,7 +64,7 @@ def sync_pull(
     run_ingest: bool = True,
     record: bool = True,
 ) -> SyncPullResult:
-    service = BrainService(paths, prefer_model_embeddings=False)
+    service = BrainService(paths)
     service.init_workspace()
     peer = load_primary_peer(paths, peer_node_id)
     transport = transport or ProductionTransport()
@@ -150,7 +150,7 @@ def sync_pull(
 
 
 def sync_push(paths: BrainPaths, peer_node_id: str, transport: Transport | None = None, record: bool = True) -> SyncPushResult:
-    service = BrainService(paths, prefer_model_embeddings=False)
+    service = BrainService(paths)
     service.init_workspace()
     service.export_all_memories()
     peer = load_primary_peer(paths, peer_node_id)
@@ -198,7 +198,7 @@ def sync_run(
     remote_ingest: bool = True,
     if_reachable: bool = False,
 ) -> SyncRunResult:
-    service = BrainService(paths, prefer_model_embeddings=False)
+    service = BrainService(paths)
     service.init_workspace()
     transport = transport or ProductionTransport()
     peer = load_primary_peer(paths, peer_node_id)

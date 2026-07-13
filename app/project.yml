@@ -1,0 +1,61 @@
+name: PKM Brain
+options:
+  deploymentTarget:
+    macOS: "15.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+packages:
+  Markdown:
+    url: https://github.com/swiftlang/swift-markdown.git
+    from: 0.8.0
+targets:
+  PKMBrainKit:
+    type: framework
+    platform: macOS
+    sources:
+      - Sources/Kit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.pkm-brain.kit
+        GENERATE_INFOPLIST_FILE: YES
+  PKM Brain:
+    type: application
+    platform: macOS
+    sources:
+      - Sources/App
+      - Sources/Views
+    resources:
+      - Resources
+    dependencies:
+      - target: PKMBrainKit
+      - package: Markdown
+    settings:
+      base:
+        PKM_BRAIN_APP_BUNDLE_ID: com.pkm-brain.app
+        PRODUCT_BUNDLE_IDENTIFIER: $(PKM_BRAIN_APP_BUNDLE_ID)
+        PRODUCT_NAME: PKM Brain
+        INFOPLIST_FILE: Sources/App/Info.plist
+        CODE_SIGN_STYLE: Automatic
+  PKMBrainKitTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - Tests
+    resources:
+      - Tests/Fixtures
+    dependencies:
+      - target: PKMBrainKit
+  PKM BrainUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    sources:
+      - UITests
+    dependencies:
+      - target: PKM Brain
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.pkm-brain.app-uitests
+        TEST_TARGET_NAME: PKM Brain
+        GENERATE_INFOPLIST_FILE: YES

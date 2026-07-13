@@ -1,0 +1,44 @@
+{
+  "pages": [
+    {
+      "title": "PKM Brain",
+      "page_type": "project",
+      "status": "active",
+      "relative_path": "projects/pkm-brain.md",
+      "source_ids": ["doc_1"],
+      "source_count": 1,
+      "updated_at": "2026-07-09T12:00:00+00:00",
+      "generated": true,
+      "related": ["concepts/retrieval.md"],
+      "score": 1.25,
+      "summary": "Native app work for PKM Brain."
+    },
+    {
+      "title": "Databricks Severance Discussions",
+      "page_type": "topic",
+      "status": "active",
+      "relative_path": "career/databricks-severance-discussions.md",
+      "source_ids": ["doc_2"],
+      "source_count": 1,
+      "updated_at": "2026-07-10T12:00:00+00:00",
+      "generated": true,
+      "related": [],
+      "score": 1.0,
+      "summary": "Employment and severance decision context."
+    },
+    {
+      "title": "Agent Product Work",
+      "page_type": "concept",
+      "status": "active",
+      "relative_path": "concepts/agent-product-work.md",
+      "source_ids": ["doc_3"],
+      "source_count": 1,
+      "updated_at": "2026-07-10T12:00:00+00:00",
+      "generated": true,
+      "related": [],
+      "score": 0.9,
+      "summary": "Agent product management work."
+    }
+  ],
+  "count": 3
+}

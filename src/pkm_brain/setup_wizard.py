@@ -147,7 +147,7 @@ def run_setup_plan(
     if dry_run:
         return result
 
-    svc = BrainService(paths, prefer_model_embeddings=False)
+    svc = BrainService(paths)
     svc.init_workspace()
     result["results"]["doctor"] = svc.doctor()
 
@@ -177,7 +177,7 @@ def run_setup_plan(
         )
 
     if role in {"primary", "secondary"}:
-        sync_doctor = BrainService(paths, prefer_model_embeddings=False).sync_doctor()
+        sync_doctor = BrainService(paths).sync_doctor()
         result["results"]["sync_doctor"] = sync_doctor
         if not sync_doctor["ready"]:
             result["scheduler_install_blocked"] = True

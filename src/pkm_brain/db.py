@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS documents (
   content_hash TEXT NOT NULL,
   origin_node_id TEXT,
   logical_source_key TEXT,
+  source_mtime_ns INTEGER,
+  source_size INTEGER,
   created_at TEXT NOT NULL,
   ingested_at TEXT NOT NULL,
   project TEXT,
@@ -70,18 +72,35 @@ CREATE TABLE IF NOT EXISTS entities (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   entity_type TEXT,
+  aliases TEXT NOT NULL DEFAULT '[]',
+  status TEXT NOT NULL DEFAULT 'active',
+  merged_into TEXT,
+  description TEXT,
   source_ids TEXT NOT NULL DEFAULT '[]',
   created_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS relations (
+CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name);
+CREATE INDEX IF NOT EXISTS idx_entities_status ON entities(status);
+
+CREATE TABLE IF NOT EXISTS fact_entities (
   id TEXT PRIMARY KEY,
-  subject_id TEXT NOT NULL,
-  predicate TEXT NOT NULL,
-  object_id TEXT NOT NULL,
-  source_ids TEXT NOT NULL DEFAULT '[]',
+  fact_id TEXT NOT NULL REFERENCES facts(id) ON DELETE CASCADE,
+  entity_id TEXT NOT NULL REFERENCES entities(id),
+  is_primary INTEGER NOT NULL DEFAULT 0,
+  mention_text TEXT,
+  mention_span TEXT,
+  mention_kind TEXT,
+  resolution_method TEXT,
+  confidence REAL,
   created_at TEXT NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_fact_entities_fact ON fact_entities(fact_id);
+CREATE INDEX IF NOT EXISTS idx_fact_entities_entity ON fact_entities(entity_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fact_entities_primary
+ON fact_entities(fact_id)
+WHERE is_primary = 1;
 
 CREATE TABLE IF NOT EXISTS memories (
   id TEXT PRIMARY KEY,
@@ -114,6 +133,8 @@ CREATE TABLE IF NOT EXISTS wiki_pages (
   updated_at TEXT
 );
 
+-- Archived compatibility tables for pre-CoS wiki proposal history. New code
+-- reads/writes facts, actions, entities, and managed wiki pages instead.
 CREATE TABLE IF NOT EXISTS wiki_change_batches (
   id TEXT PRIMARY KEY,
   title TEXT NOT NULL,
@@ -152,6 +173,7 @@ ON wiki_change_items(batch_id);
 CREATE INDEX IF NOT EXISTS idx_wiki_change_items_status_target
 ON wiki_change_items(status, target_path);
 
+-- Archived compatibility table for pre-CoS wiki review interviews.
 CREATE TABLE IF NOT EXISTS wiki_interviews (
   id TEXT PRIMARY KEY,
   batch_id TEXT NOT NULL REFERENCES wiki_change_batches(id) ON DELETE CASCADE,
@@ -373,6 +395,14 @@ def init_db(db_path: Path) -> None:
             ensure_column(
                 conn, "wiki_change_items", "status", "TEXT NOT NULL DEFAULT 'pending'"
             )
+        entities_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='entities'"
+        ).fetchone()
+        if entities_table:
+            ensure_column(conn, "entities", "aliases", "TEXT NOT NULL DEFAULT '[]'")
+            ensure_column(conn, "entities", "status", "TEXT NOT NULL DEFAULT 'active'")
+            ensure_column(conn, "entities", "merged_into", "TEXT")
+            ensure_column(conn, "entities", "description", "TEXT")
         conn.executescript(SCHEMA)
         ensure_column(conn, "memories", "reviewed_at", "TEXT")
         ensure_column(conn, "memories", "review_reason", "TEXT")

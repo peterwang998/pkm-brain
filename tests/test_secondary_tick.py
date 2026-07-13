@@ -38,15 +38,15 @@ def test_secondary_tick_exports_outbox_and_ingests_locally(tmp_path: Path) -> No
     assert row["origin_node_id"] == "secondary"
 
 
-def test_secondary_tick_uses_non_model_embedding_preference(tmp_path: Path, monkeypatch) -> None:
+def test_secondary_tick_uses_default_hash_embedding_config(tmp_path: Path, monkeypatch) -> None:
     paths = BrainPaths.from_value(tmp_path / "secondary")
     init_secondary(paths, "secondary", "primary")
-    seen: list[bool] = []
+    seen: list[str] = []
     original_init = BrainService.__init__
 
-    def spy_init(self, paths, prefer_model_embeddings=False):
-        seen.append(prefer_model_embeddings)
-        original_init(self, paths, prefer_model_embeddings=prefer_model_embeddings)
+    def spy_init(self, paths):
+        original_init(self, paths)
+        seen.append(self.embedding_provider.provider)
 
     monkeypatch.setattr(BrainService, "__init__", spy_init)
 
@@ -59,4 +59,4 @@ def test_secondary_tick_uses_non_model_embedding_preference(tmp_path: Path, monk
     )
 
     assert seen
-    assert seen[0] is False
+    assert seen[0] == "hash"

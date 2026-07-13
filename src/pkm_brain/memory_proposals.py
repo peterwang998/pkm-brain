@@ -45,6 +45,7 @@ def propose_failure_memories_from_sources(
     service = BrainService(paths)
     existing_signatures = [memory_signature(memory["content"]) for memory in existing]
     created: list[dict[str, Any]] = []
+    skipped: list[dict[str, str]] = []
     skipped_duplicates: list[str] = []
     seen_signatures: list[str] = []
     for proposal in proposals:
@@ -62,7 +63,11 @@ def propose_failure_memories_from_sources(
             continue
         scope = str(proposal.get("scope") or "agent:codex").strip() or "agent:codex"
         confidence = float(proposal.get("confidence", 0.7))
-        memory_id = service.propose_memory(FAILURE_MEMORY_TYPE, scope, content, source_ids, confidence)
+        try:
+            memory_id = service.propose_memory(FAILURE_MEMORY_TYPE, scope, content, source_ids, confidence)
+        except ValueError as exc:
+            skipped.append({"content": content, "reason": str(exc)})
+            continue
         created.append({"memory_id": memory_id, "content": content, "scope": scope, "source_ids": source_ids, "confidence": confidence})
         seen_signatures.append(signature)
 
@@ -71,6 +76,7 @@ def propose_failure_memories_from_sources(
         "created_count": len(created),
         "memory_ids": [item["memory_id"] for item in created],
         "memories": created,
+        "skipped": skipped,
         "skipped_duplicates": skipped_duplicates,
         "provider": provider.name,
         "model": provider.model,
@@ -135,7 +141,11 @@ def propose_memories_from_lineage(
             skipped.append({"cluster_id": cluster_id, "reason": "missing source_ids"})
             continue
         confidence = max(0.0, min(float(proposal.get("confidence", 0.7)), 1.0))
-        memory_id = service.propose_memory(memory_type, scope, content, source_ids, confidence)
+        try:
+            memory_id = service.propose_memory(memory_type, scope, content, source_ids, confidence)
+        except ValueError as exc:
+            skipped.append({"cluster_id": cluster_id, "reason": str(exc)})
+            continue
         rationale = str(proposal.get("rationale") or cluster.get("rationale") or "")
         record_memory_proposed_from_lineage(paths, memory_id, cluster, rationale)
         created.append(

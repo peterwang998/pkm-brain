@@ -1,0 +1,31 @@
+{
+  "jobs": [
+    {
+      "cadence_s": 600,
+      "enabled": true,
+      "id": "capture_tick",
+      "last_error": null,
+      "last_run_at": null,
+      "last_status": null,
+      "next_due_at": "2026-07-08T08:10:00+00:00",
+      "queued": false,
+      "running": false
+    },
+    {
+      "cadence_s": 3600,
+      "enabled": true,
+      "id": "nightly",
+      "last_error": "last successful nightly run is less than 20 hours old",
+      "last_result": {
+        "reason": "last successful nightly run is less than 20 hours old",
+        "status": "skipped"
+      },
+      "last_run_at": "2026-07-08T07:30:00+00:00",
+      "last_status": "skipped",
+      "next_due_at": "2026-07-09T03:30:00+00:00",
+      "queued": false,
+      "running": false
+    }
+  ],
+  "paused_until": null
+}

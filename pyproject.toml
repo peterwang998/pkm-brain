@@ -1,6 +1,6 @@
 [project]
 name = "pkm-brain"
-version = "0.1.0"
+version = "0.1.2"
 description = "Local-first personal knowledge management and agent memory for MCP-aware coding agents"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -37,13 +37,18 @@ dependencies = [
     "mcp>=1.27.0",
     "pyyaml>=6.0.3",
     "rich>=15.0.0",
-    "sentence-transformers>=5.4.1",
     "typer>=0.25.1",
+]
+
+[project.optional-dependencies]
+embeddings = [
+    "sentence-transformers>=5.4.1",
 ]
 
 [project.scripts]
 brain = "pkm_brain:main"
 pkm-brain = "pkm_brain:main"
+brain-mcp = "pkm_brain.mcp_proxy:main"
 
 [project.urls]
 Homepage = "https://github.com/peterwang998/pkm-brain"

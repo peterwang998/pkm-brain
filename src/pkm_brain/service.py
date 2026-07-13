@@ -5,20 +5,36 @@ import json
 import re
 import shutil
 import traceback
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from .chunking import DEFAULT_OVERLAP_TOKENS, DEFAULT_TARGET_TOKENS, chunk_text, prepare_text_for_indexing, sanitize_agent_session_log
+from .audit import valid_memory_scope
+from .chunking import (
+    DEFAULT_OVERLAP_TOKENS,
+    DEFAULT_TARGET_TOKENS,
+    chunk_text,
+    prepare_text_for_indexing,
+    sanitize_agent_session_log,
+)
 from .db import connection, dumps, init_db, loads, rows
-from .embeddings import get_embedding_provider
+from .embeddings import (
+    EmbeddingProviderUnavailable,
+    HASH_PROVIDER,
+    load_embedding_config,
+    passage_embedding_text,
+    resolve_embedding_provider,
+)
 from .indexes import (
+    VectorIndexUnavailable,
     delete_vectors,
+    embedding_stamp_report,
     lancedb_stats,
     optimize_vectors,
+    path_size,
     search_vectors,
     should_optimize_vectors,
     upsert_vectors,
@@ -39,9 +55,41 @@ class IngestResult:
     embeddings_created: int
     errors: list[str]
     documents_replaced: int = 0
+    vector_writes: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
+
+
+def chunk_row_id(row: Any) -> str:
+    keys = row.keys()
+    if "id" in keys:
+        return str(row["id"])
+    return str(row["chunk_id"])
+
+
+def automation_run_summary(row: Any | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return {
+        "id": row["id"],
+        "started_at": row["started_at"],
+        "finished_at": row["finished_at"],
+        "status": row["status"],
+        "error": row["error"],
+    }
+
+
+def parse_doctor_timestamp(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 GENERIC_CONTEXT_TERMS = {
@@ -104,30 +152,34 @@ GENERIC_BUSINESS_TERMS = {
     "value",
 }
 
-BROAD_RETRIEVAL_TERMS = GENERIC_CONTEXT_TERMS | GENERIC_BUSINESS_TERMS | {
-    "access",
-    "architecture",
-    "decision",
-    "decisions",
-    "deployment",
-    "engineering",
-    "hardware",
-    "maintenance",
-    "model",
-    "network",
-    "personal",
-    "pipeline",
-    "pipelines",
-    "rollout",
-    "sensor",
-    "status",
-    "timeline",
-    "user",
-    "users",
-    "vendor",
-    "vendors",
-    "venture",
-}
+BROAD_RETRIEVAL_TERMS = (
+    GENERIC_CONTEXT_TERMS
+    | GENERIC_BUSINESS_TERMS
+    | {
+        "access",
+        "architecture",
+        "decision",
+        "decisions",
+        "deployment",
+        "engineering",
+        "hardware",
+        "maintenance",
+        "model",
+        "network",
+        "personal",
+        "pipeline",
+        "pipelines",
+        "rollout",
+        "sensor",
+        "status",
+        "timeline",
+        "user",
+        "users",
+        "vendor",
+        "vendors",
+        "venture",
+    }
+)
 
 AGENT_QUERY_TERMS = {
     "agent",
@@ -160,11 +212,25 @@ RECENCY_MAX_BOOST = 2.0
 RECENCY_HALF_LIFE_DAYS = 30.0
 LINEAGE_HALF_LIFE_DAYS = 90.0
 LINEAGE_MAX_ABS_BOOST = 2.0
+CONTEXT_PACKET_MAX_BYTES = {
+    "compact": 16_000,
+    "default": 32_000,
+    "broad": 48_000,
+    "inspect": 96_000,
+}
+NON_DEBUG_CITATION_LIMIT = 8
+NON_DEBUG_CITATION_TEXT_CHARS = 320
+DEBUG_CITATION_LIMIT = 24
+DEBUG_CITATION_TEXT_CHARS = 800
+RETRIEVAL_EVENT_QUERY_MAX_CHARS = 4_000
+RETRIEVAL_EVENT_ID_LIMIT = 200
+RETRIEVAL_EVENT_DEBUG_MAX_BYTES = 64_000
 SEARCH_RESULT_SCORE_FLOOR = 12.0
 CONTEXT_CHUNK_SCORE_FLOOR = 12.0
 WIKI_PAGE_SCORE_FLOOR = 12.0
 FOUND_CHUNK_SCORE = 24.0
 FOUND_WIKI_SCORE = 24.0
+FOUND_FACT_SCORE = 18.0
 MEMORY_ACTIVE_SCORE_FLOOR = 1
 MEMORY_CANDIDATE_SCORE_FLOOR = 2
 FACT_SCORE_FLOOR = 12.0
@@ -173,6 +239,31 @@ FACT_FTS_SCORE_CAP = 12.0
 FACT_CANDIDATE_MULTIPLIER = 4
 FACT_KNEE_DROP = 10.0
 FACT_KNEE_MIN_RANK = 3
+NEGATIVE_CONTROL_CONTEXT_MARKERS = (
+    "negative control",
+    "negative-control",
+    "fake topic",
+    "fake topics",
+    "absent topic",
+    "absent topics",
+    "likely absent",
+    "should not be in brain",
+    "no_strong_match",
+)
+NEGATIVE_CONTROL_QUERY_TERMS = {
+    "absent",
+    "control",
+    "controls",
+    "eval",
+    "evaluation",
+    "fake",
+    "fixture",
+    "fixtures",
+    "negative",
+    "retrieval",
+    "topic",
+    "topics",
+}
 MAX_CHUNKS_PER_DOCUMENT = 2
 MANAGED_WIKI_BOOST = 8.0
 SEMANTIC_WIKI_BOOST = 3.0
@@ -213,10 +304,31 @@ class RetrievalPolicy:
     include_full_text: bool = False
 
 
+class ReadOnlyModeError(RuntimeError):
+    pass
+
+
 class BrainService:
-    def __init__(self, paths: BrainPaths, prefer_model_embeddings: bool = False) -> None:
+    def __init__(self, paths: BrainPaths, *, read_only: bool = False) -> None:
         self.paths = paths
-        self.embedding_provider = get_embedding_provider(prefer_model_embeddings)
+        self.read_only = read_only
+        self.embedding_config = load_embedding_config(paths)
+        self.embedding_provider = resolve_embedding_provider(self.embedding_config)
+
+    def _ensure_workspace(self) -> None:
+        if self.read_only:
+            if not self.paths.sqlite_path.exists():
+                raise ReadOnlyModeError(
+                    f"brain database is not available for read-only access: {self.paths.sqlite_path}"
+                )
+            return
+        self.init_workspace()
+
+    def _ensure_writable(self) -> None:
+        if self.read_only:
+            raise ReadOnlyModeError(
+                "PKM Brain app is not available; write declined. Launch the app and retry."
+            )
 
     def init_workspace(self) -> None:
         for directory in self.paths.directories():
@@ -224,26 +336,129 @@ class BrainService:
         init_db(self.paths.sqlite_path)
         if not self.paths.config_file.exists():
             self.paths.config_file.write_text(
-                "brain_home: ~/brain\nembedding_model: BAAI/bge-small-en-v1.5\n",
+                "embedding:\n"
+                "  provider: hash\n"
+                "  model: BAAI/bge-small-en-v1.5\n"
+                '  query_instruction: ""\n',
                 encoding="utf-8",
             )
         if not self.paths.golden_queries_file.exists():
             self.paths.golden_queries_file.write_text("[]\n", encoding="utf-8")
 
     def doctor(self) -> dict[str, Any]:
+        embedding_status = self.embedding_provider.status(check_available=False)
         return {
             "home": str(self.paths.home),
-            "directories": {path.name: path.exists() for path in self.paths.directories()},
+            "directories": {
+                path.name: path.exists() for path in self.paths.directories()
+            },
             "sqlite": self.paths.sqlite_path.exists(),
             "lancedb": self.paths.lancedb_path.exists(),
             "embedding_provider": self.embedding_provider.name,
+            "embedding": embedding_status,
+            "nightly": self.nightly_doctor(),
         }
+
+    def nightly_doctor(
+        self, due_after_hours: int = 20, slack_hours: int = 4
+    ) -> dict[str, Any]:
+        if not self.paths.sqlite_path.exists():
+            return {
+                "job_name": "nightly-maintenance",
+                "status": "unknown",
+                "due_after_hours": due_after_hours,
+                "slack_hours": slack_hours,
+                "last_success": None,
+                "last_failure": None,
+                "last_success_age_hours": None,
+                "warning": "SQLite database is missing",
+            }
+        with connection(self.paths.sqlite_path) as conn:
+            last_success = conn.execute(
+                """
+                SELECT id, started_at, finished_at, status, error
+                FROM automation_runs
+                WHERE job_name = 'nightly-maintenance'
+                  AND status = 'success'
+                  AND finished_at IS NOT NULL
+                ORDER BY finished_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            last_failure = conn.execute(
+                """
+                SELECT id, started_at, finished_at, status, error
+                FROM automation_runs
+                WHERE job_name = 'nightly-maintenance'
+                  AND status = 'failed'
+                ORDER BY COALESCE(finished_at, started_at) DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        success = automation_run_summary(last_success)
+        failure = automation_run_summary(last_failure)
+        age_hours = None
+        warning = None
+        status = "ok"
+        if success and success.get("finished_at"):
+            finished_at = parse_doctor_timestamp(str(success["finished_at"]))
+            if finished_at:
+                now = datetime.now(finished_at.tzinfo or timezone.utc)
+                age_hours = round((now - finished_at).total_seconds() / 3600, 2)
+                if age_hours > due_after_hours + slack_hours:
+                    status = "warning"
+                    warning = (
+                        f"last successful nightly run was {age_hours:.1f}h ago; "
+                        f"threshold is {due_after_hours + slack_hours}h"
+                    )
+        else:
+            status = "warning"
+            warning = "no successful nightly run recorded"
+        return {
+            "job_name": "nightly-maintenance",
+            "status": status,
+            "due_after_hours": due_after_hours,
+            "slack_hours": slack_hours,
+            "last_success": success,
+            "last_failure": failure,
+            "last_success_age_hours": age_hours,
+            "warning": warning,
+        }
+
+    def download_embedding_model(self) -> dict[str, Any]:
+        provider = resolve_embedding_provider(self.embedding_config, cache_only=False)
+        if provider.provider != "sentence-transformer":
+            return {
+                "status": "skipped",
+                "reason": "configured embedding provider is not sentence-transformer",
+                "embedding": provider.status(check_available=False),
+            }
+        try:
+            provider.embed(["health check"])
+        except EmbeddingProviderUnavailable as exc:
+            embedding = provider.status(check_available=False)
+            embedding["available"] = False
+            embedding["reason"] = str(exc)
+            return {
+                "status": "failed",
+                "reason": str(exc),
+                "embedding": embedding,
+            }
+        return {"status": "ok", "embedding": provider.status(check_available=False)}
 
     def index_doctor(self) -> dict[str, Any]:
         self.init_workspace()
         with connection(self.paths.sqlite_path) as conn:
-            sqlite_chunk_ids = {row["id"] for row in conn.execute("SELECT id FROM chunks")}
+            sqlite_chunk_ids = {
+                row["id"] for row in conn.execute("SELECT id FROM chunks")
+            }
         stats = lancedb_stats(self.paths.lancedb_path)
+        stamp_report = embedding_stamp_report(
+            self.paths.lancedb_path,
+            self.embedding_provider,
+            table_exists=bool(stats["table_exists"]),
+        )
+        embedding_status = self.embedding_provider.status(check_available=False)
         try:
             lancedb_chunk_ids = vector_chunk_ids(self.paths.lancedb_path)
             vector_error = None
@@ -258,6 +473,14 @@ class BrainService:
         if vector_error:
             status = "rebuild_recommended"
             reasons.append(f"could not enumerate LanceDB vectors: {vector_error}")
+        if not embedding_status["available"]:
+            status = "rebuild_recommended"
+            reasons.append(
+                f"embedding provider unavailable: {embedding_status['reason']}"
+            )
+        if stamp_report.get("reason"):
+            status = "rebuild_recommended"
+            reasons.append(str(stamp_report["reason"]))
         if sqlite_chunk_ids and not stats["table_exists"]:
             status = "rebuild_recommended"
             reasons.append("SQLite has chunks but LanceDB table is missing")
@@ -266,13 +489,17 @@ class BrainService:
             reasons.append("LanceDB chunk ids differ from SQLite chunks")
         elif should_optimize_vectors(stats):
             status = "optimize_recommended"
-            reasons.append("LanceDB table has accumulated versions, data files, or bytes above maintenance thresholds")
+            reasons.append(
+                "LanceDB table has accumulated versions, data files, or bytes above maintenance thresholds"
+            )
 
         return {
             "status": status,
             "reasons": reasons,
             "sqlite_chunks": len(sqlite_chunk_ids),
             "lancedb": stats,
+            "embedding": embedding_status,
+            "embedding_stamp": stamp_report,
             "missing_vector_count": len(missing_vectors),
             "stale_vector_count": len(stale_vectors),
             "missing_vector_sample": missing_vectors[:20],
@@ -281,38 +508,256 @@ class BrainService:
 
     def optimize_indexes(self, cleanup_older_than_days: int = 1) -> dict[str, Any]:
         self.init_workspace()
-        return optimize_vectors(self.paths.lancedb_path, cleanup_older_than_days=cleanup_older_than_days)
+        return optimize_vectors(
+            self.paths.lancedb_path, cleanup_older_than_days=cleanup_older_than_days
+        )
 
-    def rebuild_vector_index(self, delete_backup: bool = False, batch_size: int = 128) -> dict[str, Any]:
+    def optimize_fts_indexes(self) -> dict[str, Any]:
+        self.init_workspace()
+        before = sqlite_storage_report(self.paths.sqlite_path)
+        optimized: list[str] = []
+        with connection(self.paths.sqlite_path) as conn:
+            for table in ("chunk_fts", "retrieval_fts"):
+                if not sqlite_table_exists(conn, table):
+                    continue
+                conn.execute(f"INSERT INTO {table}({table}) VALUES ('optimize')")
+                optimized.append(table)
+        after = sqlite_storage_report(self.paths.sqlite_path)
+        return {
+            "status": "ok" if optimized else "skipped",
+            "optimized_tables": optimized,
+            "before": before,
+            "after": after,
+            "bytes_freed": max(
+                0,
+                int(before["sqlite_related_bytes"])
+                - int(after["sqlite_related_bytes"]),
+            ),
+            "errors": [],
+        }
+
+    def compact_retrieval_events(
+        self,
+        older_than_days: int = 90,
+        *,
+        automation_summary_older_than_days: int = 180,
+        dry_run: bool = True,
+        vacuum: bool = False,
+    ) -> dict[str, Any]:
+        if older_than_days < 0:
+            raise ValueError("--older-than-days must be >= 0")
+        if automation_summary_older_than_days < 0:
+            raise ValueError("--automation-summary-older-than-days must be >= 0")
+        self.init_workspace()
+        retrieval_cutoff = retention_cutoff_iso(older_than_days)
+        automation_cutoff = retention_cutoff_iso(automation_summary_older_than_days)
+        before = sqlite_storage_report(self.paths.sqlite_path)
+        with connection(self.paths.sqlite_path) as conn:
+            retrieval_rows = rows(
+                conn,
+                """
+                SELECT id, citation_snapshots, debug
+                FROM retrieval_events
+                WHERE timestamp < ?
+                  AND (citation_snapshots != '[]' OR debug != '{}')
+                ORDER BY timestamp
+                """,
+                (retrieval_cutoff,),
+            )
+            automation_rows = rows(
+                conn,
+                """
+                SELECT id, summary
+                FROM automation_runs
+                WHERE COALESCE(finished_at, started_at) < ?
+                  AND summary != '{}'
+                ORDER BY COALESCE(finished_at, started_at)
+                """,
+                (automation_cutoff,),
+            )
+            retrieval_reclaimable = sum(
+                max(0, len(str(row["citation_snapshots"] or "")) - len("[]"))
+                + max(0, len(str(row["debug"] or "")) - len("{}"))
+                for row in retrieval_rows
+            )
+            automation_reclaimable = sum(
+                max(0, len(str(row["summary"] or "")) - len("{}"))
+                for row in automation_rows
+            )
+            if not dry_run:
+                conn.execute(
+                    """
+                    UPDATE retrieval_events
+                    SET citation_snapshots = '[]',
+                        debug = '{}'
+                    WHERE timestamp < ?
+                      AND (citation_snapshots != '[]' OR debug != '{}')
+                    """,
+                    (retrieval_cutoff,),
+                )
+                conn.execute(
+                    """
+                    UPDATE automation_runs
+                    SET summary = '{}'
+                    WHERE COALESCE(finished_at, started_at) < ?
+                      AND summary != '{}'
+                    """,
+                    (automation_cutoff,),
+                )
+        vacuum_result: dict[str, Any] | None = None
+        if vacuum and not dry_run:
+            vacuum_before = sqlite_storage_report(self.paths.sqlite_path)
+            with connection(self.paths.sqlite_path) as conn:
+                conn.execute("VACUUM")
+            vacuum_after = sqlite_storage_report(self.paths.sqlite_path)
+            vacuum_result = {
+                "before": vacuum_before,
+                "after": vacuum_after,
+                "bytes_freed": max(
+                    0,
+                    int(vacuum_before["sqlite_related_bytes"])
+                    - int(vacuum_after["sqlite_related_bytes"]),
+                ),
+            }
+        after = sqlite_storage_report(self.paths.sqlite_path)
+        return {
+            "status": "dry_run" if dry_run else "ok",
+            "dry_run": dry_run,
+            "retrieval_cutoff": retrieval_cutoff,
+            "automation_summary_cutoff": automation_cutoff,
+            "retrieval_events": {
+                "eligible_rows": len(retrieval_rows),
+                "payload_bytes_reclaimable": retrieval_reclaimable,
+                "sample_ids": [str(row["id"]) for row in retrieval_rows[:10]],
+            },
+            "automation_runs": {
+                "eligible_rows": len(automation_rows),
+                "summary_bytes_reclaimable": automation_reclaimable,
+                "sample_ids": [str(row["id"]) for row in automation_rows[:10]],
+            },
+            "total_payload_bytes_reclaimable": retrieval_reclaimable
+            + automation_reclaimable,
+            "before": before,
+            "after": after,
+            "vacuum": vacuum_result,
+            "stale_db_backups": self.stale_db_backup_report(),
+            "errors": [],
+        }
+
+    def stale_db_backup_report(self) -> dict[str, Any]:
+        backups = (
+            sorted(self.paths.db_dir.glob("*.bak.gz"))
+            if self.paths.db_dir.exists()
+            else []
+        )
+        files = [
+            {
+                "path": str(path),
+                "bytes": path_size(path),
+                "modified_at": datetime.fromtimestamp(
+                    path.stat().st_mtime, timezone.utc
+                ).isoformat(),
+            }
+            for path in backups
+        ]
+        return {
+            "status": "human_review_required" if files else "ok",
+            "count": len(files),
+            "total_bytes": sum(int(item["bytes"]) for item in files),
+            "files": files[:20],
+            "note": "Flag only; pkm-brain does not delete db/*.bak.gz backups automatically.",
+        }
+
+    def _vector_rows_for_chunks(
+        self, chunk_rows: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        if not chunk_rows:
+            return []
+        texts = [
+            str(row["text"])
+            if self.embedding_provider.provider == HASH_PROVIDER
+            else passage_embedding_text(
+                str(row["text"]),
+                str(row["heading_path"] if "heading_path" in row.keys() else ""),
+            )
+            for row in chunk_rows
+        ]
+        vectors = self.embedding_provider.embed(texts)
+        return [
+            {
+                "chunk_id": chunk_row_id(row),
+                "document_id": row["document_id"],
+                "text": row["text"],
+                "vector": vector,
+            }
+            for row, vector in zip(chunk_rows, vectors)
+        ]
+
+    def rebuild_vector_index(
+        self,
+        delete_backup: bool = False,
+        batch_size: int = 128,
+        missing_only: bool = False,
+    ) -> dict[str, Any]:
         self.init_workspace()
         before = lancedb_stats(self.paths.lancedb_path)
+        embedding_status = self.embedding_provider.status(check_available=True)
         with connection(self.paths.sqlite_path) as conn:
-            chunk_rows = rows(conn, "SELECT id, document_id, text FROM chunks ORDER BY document_id, chunk_index")
+            chunk_rows = rows(
+                conn,
+                "SELECT id, document_id, text, heading_path FROM chunks ORDER BY document_id, chunk_index",
+            )
+
+        if not embedding_status["available"]:
+            return {
+                "status": "skipped",
+                "reason": f"embedding provider unavailable: {embedding_status['reason']}",
+                "sqlite_chunks": len(chunk_rows),
+                "vectors_written": 0,
+                "before": before,
+                "after": lancedb_stats(self.paths.lancedb_path),
+                "embedding": embedding_status,
+            }
+
+        if missing_only:
+            try:
+                existing_ids = vector_chunk_ids(self.paths.lancedb_path)
+                target_rows = [
+                    row for row in chunk_rows if row["id"] not in existing_ids
+                ]
+            except Exception as exc:
+                return {
+                    "status": "failed",
+                    "error": str(exc),
+                    "sqlite_chunks": len(chunk_rows),
+                    "vectors_written": 0,
+                    "before": before,
+                    "after": lancedb_stats(self.paths.lancedb_path),
+                    "embedding": embedding_status,
+                }
+        else:
+            target_rows = chunk_rows
 
         backup_path = None
         failed_path = None
-        if self.paths.lancedb_path.exists():
+        if not missing_only and self.paths.lancedb_path.exists():
             backup_path = unique_backup_path(self.paths.indexes, "lancedb.backup")
             shutil.move(str(self.paths.lancedb_path), str(backup_path))
 
         try:
             embedded = 0
-            for offset in range(0, len(chunk_rows), batch_size):
-                batch = chunk_rows[offset : offset + batch_size]
-                vectors = self.embedding_provider.embed([row["text"] for row in batch])
-                vector_rows = [
-                    {
-                        "chunk_id": row["id"],
-                        "document_id": row["document_id"],
-                        "text": row["text"],
-                        "vector": vector,
-                    }
-                    for row, vector in zip(batch, vectors)
-                ]
-                embedded += upsert_vectors(self.paths.lancedb_path, vector_rows)
+            for offset in range(0, len(target_rows), batch_size):
+                batch = target_rows[offset : offset + batch_size]
+                embedded += upsert_vectors(
+                    self.paths.lancedb_path,
+                    self._vector_rows_for_chunks(batch),
+                    self.embedding_provider,
+                )
             after = lancedb_stats(self.paths.lancedb_path)
             if int(after["rows"]) != len(chunk_rows):
-                raise RuntimeError(f"rebuilt LanceDB row count {after['rows']} did not match SQLite chunks {len(chunk_rows)}")
+                raise RuntimeError(
+                    f"rebuilt LanceDB row count {after['rows']} did not match SQLite chunks {len(chunk_rows)}"
+                )
             if delete_backup and backup_path and backup_path.exists():
                 shutil.rmtree(backup_path)
                 backup_retained = False
@@ -324,14 +769,16 @@ class BrainService:
                 "vectors_written": embedded,
                 "before": before,
                 "after": after,
+                "embedding": embedding_status,
+                "missing_only": missing_only,
                 "backup_path": str(backup_path) if backup_path else None,
                 "backup_retained": backup_retained,
             }
         except Exception as exc:
-            if self.paths.lancedb_path.exists():
+            if not missing_only and self.paths.lancedb_path.exists():
                 failed_path = unique_backup_path(self.paths.indexes, "lancedb.failed")
                 shutil.move(str(self.paths.lancedb_path), str(failed_path))
-            if backup_path and backup_path.exists():
+            if not missing_only and backup_path and backup_path.exists():
                 shutil.move(str(backup_path), str(self.paths.lancedb_path))
             return {
                 "status": "failed",
@@ -339,6 +786,8 @@ class BrainService:
                 "sqlite_chunks": len(chunk_rows),
                 "before": before,
                 "after": lancedb_stats(self.paths.lancedb_path),
+                "embedding": embedding_status,
+                "missing_only": missing_only,
                 "backup_path": str(backup_path) if backup_path else None,
                 "failed_path": str(failed_path) if failed_path else None,
             }
@@ -389,7 +838,9 @@ class BrainService:
         reset_at = now_iso()
         chunks_created = 0
         with connection(self.paths.sqlite_path) as conn:
-            retrieval_events_deleted = conn.execute("DELETE FROM retrieval_events").rowcount
+            retrieval_events_deleted = conn.execute(
+                "DELETE FROM retrieval_events"
+            ).rowcount
             lineage_events_deleted = conn.execute(
                 "DELETE FROM context_lineage_events WHERE retrieval_event_id IS NOT NULL"
             ).rowcount
@@ -447,7 +898,20 @@ class BrainService:
                 self.paths.lancedb_path.unlink()
         vector_rebuild = self.rebuild_vector_index(delete_backup=True)
         doctor = self.index_doctor()
-        status = "ok" if vector_rebuild["status"] == "ok" and doctor["status"] in {"ok", "optimize_recommended"} else "failed"
+        vector_rebuild_skipped = vector_rebuild[
+            "status"
+        ] == "skipped" and "embedding provider unavailable" in str(
+            vector_rebuild.get("reason") or ""
+        )
+        status = (
+            "ok"
+            if (
+                vector_rebuild["status"] == "ok"
+                and doctor["status"] in {"ok", "optimize_recommended"}
+            )
+            or vector_rebuild_skipped
+            else "failed"
+        )
         return {
             "status": status,
             "documents": len(document_rows),
@@ -457,7 +921,10 @@ class BrainService:
             "retrieval_lineage_events_deleted": lineage_events_deleted,
             "vector_rebuild": vector_rebuild,
             "index_doctor": doctor,
-            "errors": [] if status == "ok" else vector_rebuild.get("errors", []) or [vector_rebuild.get("error", "index reset failed")],
+            "errors": []
+            if status == "ok"
+            else vector_rebuild.get("errors", [])
+            or [vector_rebuild.get("error", "index reset failed")],
         }
 
     def reindex_chunks(
@@ -501,7 +968,9 @@ class BrainService:
                 document = dict(row)
                 source_path = document_text_path(document)
                 if source_path is None:
-                    errors.append(f"{document['id']}: no readable raw_path or source_path")
+                    errors.append(
+                        f"{document['id']}: no readable raw_path or source_path"
+                    )
                     continue
                 text = source_path.read_text(encoding="utf-8", errors="replace")
                 projected_chunks = chunk_text(
@@ -510,7 +979,9 @@ class BrainService:
                     target_tokens=target_tokens,
                     overlap_tokens=overlap_tokens,
                 )
-                projected_max_tokens = max((chunk.token_count for chunk in projected_chunks), default=0)
+                projected_max_tokens = max(
+                    (chunk.token_count for chunk in projected_chunks), default=0
+                )
                 plan = {
                     "document_id": document["id"],
                     "title": document["title"],
@@ -530,7 +1001,10 @@ class BrainService:
                 total_projected_chunks += len(projected_chunks)
                 max_projected_tokens = max(max_projected_tokens, projected_max_tokens)
 
-            public_documents = [{key: value for key, value in plan.items() if key != "_chunks"} for plan in plans]
+            public_documents = [
+                {key: value for key, value in plan.items() if key != "_chunks"}
+                for plan in plans
+            ]
             summary = {
                 "status": "dry_run" if dry_run else "ok",
                 "dry_run": dry_run,
@@ -606,7 +1080,10 @@ class BrainService:
         doctor = self.index_doctor()
         summary.update(
             {
-                "status": "ok" if rebuild["status"] == "ok" and doctor["status"] in {"ok", "optimize_recommended"} else "rebuild_recommended",
+                "status": "ok"
+                if rebuild["status"] == "ok"
+                and doctor["status"] in {"ok", "optimize_recommended"}
+                else "rebuild_recommended",
                 "rewritten_chunks": rewritten_chunks,
                 "index_rebuild": rebuild,
                 "index_doctor": doctor,
@@ -706,7 +1183,9 @@ class BrainService:
             candidates = sorted(
                 path
                 for path in source.rglob("*")
-                if path.is_file() and not path.name.startswith(".") and not reserved_ingest_path(path)
+                if path.is_file()
+                and not path.name.startswith(".")
+                and not reserved_ingest_path(path)
             )
         run_id = new_id("run")
         started = now_iso()
@@ -715,7 +1194,7 @@ class BrainService:
         skipped = 0
         chunks_created = 0
         documents_replaced = 0
-        vector_rows: list[dict[str, Any]] = []
+        vector_source_rows: list[dict[str, Any]] = []
         stale_vector_chunk_ids: list[str] = []
 
         if dry_run:
@@ -732,13 +1211,15 @@ class BrainService:
                     if not source_type:
                         skipped += 1
                         continue
-                    content_hash = file_sha256(path)
-                    text = path.read_text(encoding="utf-8", errors="replace")
-                    title = document_title_for_text(text, path)
-                    origin, logical_source_key = self._origin_identity_for_path(path, origin_node_id)
+                    stat = path.stat()
+                    source_mtime_ns = int(stat.st_mtime_ns)
+                    source_size = int(stat.st_size)
+                    origin, logical_source_key = self._origin_identity_for_path(
+                        path, origin_node_id
+                    )
                     existing = conn.execute(
                         """
-                        SELECT id, source_type, title, content_hash, raw_path
+                        SELECT id, source_type, title, content_hash, raw_path, source_mtime_ns, source_size
                         FROM documents
                         WHERE origin_node_id = ? AND logical_source_key = ?
                         ORDER BY ingested_at DESC
@@ -746,6 +1227,36 @@ class BrainService:
                         """,
                         (origin, logical_source_key),
                     ).fetchone()
+                    if existing and existing_document_matches_source_stats(
+                        existing,
+                        source_mtime_ns=source_mtime_ns,
+                        source_size=source_size,
+                    ):
+                        if source_type == "agent_session_log":
+                            replaced = remove_superseded_agent_session_snapshots(
+                                conn,
+                                path,
+                                origin_node_id=origin,
+                                keep_document_id=existing["id"],
+                            )
+                            stale_vector_chunk_ids.extend(replaced.chunk_ids)
+                            documents_replaced += replaced.documents
+                        refresh_existing_document_metadata(
+                            conn,
+                            existing["id"],
+                            source_type,
+                            str(existing["title"]),
+                            path,
+                            origin,
+                            logical_source_key,
+                            source_mtime_ns=source_mtime_ns,
+                            source_size=source_size,
+                        )
+                        skipped += 1
+                        continue
+                    content_hash = file_sha256(path)
+                    text = path.read_text(encoding="utf-8", errors="replace")
+                    title = document_title_for_text(text, path)
                     if existing:
                         if existing["content_hash"] == content_hash:
                             if source_type == "agent_session_log":
@@ -765,12 +1276,16 @@ class BrainService:
                                 path,
                                 origin,
                                 logical_source_key,
+                                source_mtime_ns=source_mtime_ns,
+                                source_size=source_size,
                             )
                             skipped += 1
                             continue
                         replaced = remove_documents(conn, [dict(existing)])
                         if source_type == "agent_session_log":
-                            superseded = remove_superseded_agent_session_snapshots(conn, path, origin_node_id=origin)
+                            superseded = remove_superseded_agent_session_snapshots(
+                                conn, path, origin_node_id=origin
+                            )
                             replaced = ReplacedDocuments(
                                 replaced.documents + superseded.documents,
                                 replaced.chunk_ids + superseded.chunk_ids,
@@ -781,17 +1296,21 @@ class BrainService:
                     document_id = new_id("doc")
                     ingested_at = now_iso()
                     if source_type == "agent_session_log":
-                        replaced = remove_superseded_agent_session_snapshots(conn, path, origin_node_id=origin)
+                        replaced = remove_superseded_agent_session_snapshots(
+                            conn, path, origin_node_id=origin
+                        )
                         stale_vector_chunk_ids.extend(replaced.chunk_ids)
                         documents_replaced += replaced.documents
-                    raw_path = self._copy_raw(path, source_type, ingested_at, content_hash)
+                    raw_path = self._copy_raw(
+                        path, source_type, ingested_at, content_hash
+                    )
                     conn.execute(
                         """
                         INSERT INTO documents(
                           id, source_type, title, source_path, raw_path, content_hash,
-                          origin_node_id, logical_source_key, created_at, ingested_at,
-                          project, tags, version, status
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                          origin_node_id, logical_source_key, source_mtime_ns, source_size,
+                          created_at, ingested_at, project, tags, version, status
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             document_id,
@@ -802,6 +1321,8 @@ class BrainService:
                             content_hash,
                             origin,
                             logical_source_key,
+                            source_mtime_ns,
+                            source_size,
                             ingested_at,
                             ingested_at,
                             None,
@@ -843,12 +1364,12 @@ class BrainService:
                             project="",
                             tags="",
                         )
-                        vector_rows.append(
+                        vector_source_rows.append(
                             {
                                 "chunk_id": chunk_id,
                                 "document_id": document_id,
                                 "text": chunk.text,
-                                "vector": self.embedding_provider.embed([chunk.text])[0],
+                                "heading_path": chunk.heading_path,
                             }
                         )
                     if source_type == "agent_session_log":
@@ -856,18 +1377,40 @@ class BrainService:
                             conn,
                             text=prepare_text_for_indexing(text, source_type),
                             document_id=document_id,
-                            agent_session_id=markdown_frontmatter_value(text, "session_id"),
+                            agent_session_id=markdown_frontmatter_value(
+                                text, "session_id"
+                            ),
                             created_at=ingested_at,
                         )
                     changed += 1
                     chunks_created += len(doc_chunks)
                 except Exception as exc:
                     if self._quarantine_external_ingest_failure(path, exc):
-                        errors.append(f"{path}: quarantined after ingest failure: {exc}")
+                        errors.append(
+                            f"{path}: quarantined after ingest failure: {exc}"
+                        )
                     else:
                         errors.append(f"{path}: {exc}")
             delete_vectors(self.paths.lancedb_path, stale_vector_chunk_ids)
-            embeddings_created = upsert_vectors(self.paths.lancedb_path, vector_rows)
+            embeddings_created = 0
+            vector_writes = {
+                "status": "ok",
+                "reason": None,
+                "attempted": len(vector_source_rows),
+            }
+            try:
+                vector_rows = self._vector_rows_for_chunks(vector_source_rows)
+                embeddings_created = upsert_vectors(
+                    self.paths.lancedb_path, vector_rows, self.embedding_provider
+                )
+                vector_writes["written"] = embeddings_created
+            except (EmbeddingProviderUnavailable, VectorIndexUnavailable) as exc:
+                vector_writes = {
+                    "status": "skipped",
+                    "reason": str(exc),
+                    "attempted": len(vector_source_rows),
+                    "written": 0,
+                }
             conn.execute(
                 """
                 UPDATE ingestion_runs
@@ -887,7 +1430,17 @@ class BrainService:
                 ),
             )
 
-        return IngestResult(run_id, len(candidates), changed, skipped, chunks_created, embeddings_created, errors, documents_replaced)
+        return IngestResult(
+            run_id,
+            len(candidates),
+            changed,
+            skipped,
+            chunks_created,
+            embeddings_created,
+            errors,
+            documents_replaced,
+            vector_writes,
+        )
 
     def rebuild_mirror_index(self) -> dict[str, Any]:
         self.init_workspace()
@@ -895,7 +1448,9 @@ class BrainService:
         candidates = sorted(
             path
             for path in self.paths.raw.rglob("*")
-            if path.is_file() and not path.name.startswith(".") and not reserved_ingest_path(path)
+            if path.is_file()
+            and not path.name.startswith(".")
+            and not reserved_ingest_path(path)
         )
         run_id = new_id("run")
         started = now_iso()
@@ -950,7 +1505,10 @@ class BrainService:
                     )
                     doc_chunks = chunk_text(text, source_type)
                     for chunk in doc_chunks:
-                        chunk_id = deterministic_mirror_id("chunk", f"{relative_path}:{chunk.chunk_index}:{chunk.content_hash}")
+                        chunk_id = deterministic_mirror_id(
+                            "chunk",
+                            f"{relative_path}:{chunk.chunk_index}:{chunk.content_hash}",
+                        )
                         conn.execute(
                             """
                             INSERT INTO chunks(
@@ -986,7 +1544,9 @@ class BrainService:
                             conn,
                             text=prepare_text_for_indexing(text, source_type),
                             document_id=document_id,
-                            agent_session_id=markdown_frontmatter_value(text, "session_id"),
+                            agent_session_id=markdown_frontmatter_value(
+                                text, "session_id"
+                            ),
                             created_at=ingested_at,
                         )
                     indexed += 1
@@ -995,8 +1555,12 @@ class BrainService:
                     errors.append(f"{path}: {exc}")
 
         vector_rebuild = self.rebuild_vector_index(delete_backup=True)
-        embeddings_created = int(vector_rebuild.get("vectors_written") or 0) if vector_rebuild["status"] == "ok" else 0
-        if vector_rebuild["status"] != "ok":
+        embeddings_created = (
+            int(vector_rebuild.get("vectors_written") or 0)
+            if vector_rebuild["status"] == "ok"
+            else 0
+        )
+        if vector_rebuild["status"] not in {"ok", "skipped"}:
             errors.append(str(vector_rebuild.get("error") or "vector rebuild failed"))
 
         with connection(self.paths.sqlite_path) as conn:
@@ -1036,17 +1600,25 @@ class BrainService:
             "memories": memories,
         }
 
-    def _copy_raw(self, source: Path, source_type: str, ingested_at: str, content_hash: str) -> Path:
+    def _copy_raw(
+        self, source: Path, source_type: str, ingested_at: str, content_hash: str
+    ) -> Path:
         date = ingested_at[:10].split("-")
         target_dir = self.paths.raw / source_type / date[0] / date[1]
         target_dir.mkdir(parents=True, exist_ok=True)
-        target = target_dir / f"{slugify(source.stem)}-{content_hash[:12]}{source.suffix}"
+        target = (
+            target_dir / f"{slugify(source.stem)}-{content_hash[:12]}{source.suffix}"
+        )
         shutil.copy2(source, target)
         return target
 
-    def _origin_identity_for_path(self, path: Path, origin_node_id: str | None = None) -> tuple[str, str]:
+    def _origin_identity_for_path(
+        self, path: Path, origin_node_id: str | None = None
+    ) -> tuple[str, str]:
         try:
-            external_relative = path.resolve().relative_to((self.paths.inbox / "external").resolve())
+            external_relative = path.resolve().relative_to(
+                (self.paths.inbox / "external").resolve()
+            )
         except ValueError:
             external_relative = None
         origin = origin_node_id or local_node_id(self.paths)
@@ -1064,7 +1636,11 @@ class BrainService:
         for quarantine_root in sorted(external_root.glob("*/_quarantine")):
             peer_root = quarantine_root.parent
             for path in sorted(quarantine_root.rglob("*")):
-                if not path.is_file() or path.name.endswith(".error.json") or path.name.startswith("."):
+                if (
+                    not path.is_file()
+                    or path.name.endswith(".error.json")
+                    or path.name.startswith(".")
+                ):
                     continue
                 relative_path = path.relative_to(quarantine_root)
                 target = peer_root / relative_path
@@ -1082,7 +1658,11 @@ class BrainService:
         if info is None:
             return False
         peer_root, relative_path = info
-        if relative_path.parts and relative_path.parts[0] in {"_staging", "_quarantine", "_rejected"}:
+        if relative_path.parts and relative_path.parts[0] in {
+            "_staging",
+            "_quarantine",
+            "_rejected",
+        }:
             return False
         if not path.exists():
             return False
@@ -1095,22 +1675,42 @@ class BrainService:
             "source_path": str(path),
             "quarantined_path": str(target),
             "error": str(exc),
-            "traceback": "".join(traceback.format_exception_only(type(exc), exc)).strip(),
+            "traceback": "".join(
+                traceback.format_exception_only(type(exc), exc)
+            ).strip(),
         }
-        error_path.write_text(json.dumps(error_payload, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        error_path.write_text(
+            json.dumps(error_payload, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+        )
         return True
 
-    def search(self, query: str, limit: int = 10, debug: bool = False, caller: str = "cli") -> dict[str, Any]:
-        self.init_workspace()
+    def search(
+        self,
+        query: str,
+        limit: int = 10,
+        debug: bool = False,
+        caller: str = "cli",
+        *,
+        record_telemetry: bool = True,
+    ) -> dict[str, Any]:
+        self._ensure_workspace()
         fanout_limit = max(60, limit * 6)
-        chunk_candidates, fanout_debug = self._fanout_chunk_candidates(query, limit=fanout_limit)
+        chunk_candidates, fanout_debug = self._fanout_chunk_candidates(
+            query, limit=fanout_limit
+        )
         lineage_scores = self._lineage_scores_for_chunks(chunk_candidates)
-        reranked_chunks = rerank_chunks(query, chunk_candidates, fanout_debug, lineage_scores=lineage_scores)
+        reranked_chunks = rerank_chunks(
+            query, chunk_candidates, fanout_debug, lineage_scores=lineage_scores
+        )
         selected = select_search_results(reranked_chunks, limit=limit)
         wiki_pages = self.select_wiki_pages(query, selected, limit=min(limit, 5))
         selected_ids = [row["chunk_id"] for row in selected]
-        citation_snapshots = chunk_citation_snapshots(selected) + wiki_page_citation_snapshots(wiki_pages)
-        search_debug = build_search_debug(fanout_debug, selected, reranked_chunks, debug=debug)
+        citation_snapshots = chunk_citation_snapshots(
+            selected
+        ) + wiki_page_citation_snapshots(wiki_pages)
+        search_debug = build_search_debug(
+            fanout_debug, selected, reranked_chunks, debug=debug
+        )
         search_debug["selected_wiki_reasons"] = [
             {
                 "relative_path": page.get("relative_path"),
@@ -1121,25 +1721,37 @@ class BrainService:
         ]
         assessment = retrieval_assessment(selected, wiki_pages, [], [])
         search_debug["assessment"] = assessment
-        event_id = new_id("retrieval")
-        with connection(self.paths.sqlite_path) as conn:
-            conn.execute(
-                """
-                INSERT INTO retrieval_events(
-                  id, query, timestamp, caller, returned_chunk_ids, selected_chunk_ids, citation_snapshots, debug
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event_id,
-                    query,
-                    now_iso(),
-                    caller,
-                    dumps(fanout_debug["candidate_ids"]),
-                    dumps(selected_ids),
-                    dumps(citation_snapshots),
-                    dumps(search_debug) if debug else "{}",
-                ),
+        if fanout_debug.get("vector_unavailable_reason"):
+            assessment["reasons"].append(
+                f"vector_search unavailable: {fanout_debug['vector_unavailable_reason']}"
             )
+        event_id = None
+        if not self.read_only and record_telemetry:
+            event_id = new_id("retrieval")
+            with connection(self.paths.sqlite_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO retrieval_events(
+                      id, query, timestamp, caller, returned_chunk_ids, selected_chunk_ids, citation_snapshots, debug
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event_id,
+                        truncate_for_packet(query, RETRIEVAL_EVENT_QUERY_MAX_CHARS),
+                        now_iso(),
+                        caller,
+                        dumps(
+                            list(fanout_debug["candidate_ids"])[
+                                :RETRIEVAL_EVENT_ID_LIMIT
+                            ]
+                        ),
+                        dumps(selected_ids[:RETRIEVAL_EVENT_ID_LIMIT]),
+                        dumps(
+                            stored_citation_snapshots(citation_snapshots, debug=debug)
+                        ),
+                        stored_retrieval_debug(search_debug) if debug else "{}",
+                    ),
+                )
         return {
             "event_id": event_id,
             "query": query,
@@ -1148,7 +1760,6 @@ class BrainService:
             "retrieval_reasons": assessment["reasons"],
             "results": selected,
             "relevant_wiki_pages": wiki_pages,
-            "citations": citation_snapshots,
             "citation_snapshots": citation_snapshots,
             "debug": search_debug if debug else None,
         }
@@ -1160,19 +1771,26 @@ class BrainService:
         budget: int | None = None,
         mode: str = DEFAULT_RETRIEVAL_MODE,
         debug: bool = False,
+        *,
+        record_telemetry: bool = True,
     ) -> dict[str, Any]:
+        self._ensure_workspace()
         policy = retrieval_policy(mode, budget)
         query = f"{project or ''} {task}".strip()
         chunk_candidates, fanout_debug = self._fanout_chunk_candidates(query, limit=60)
         lineage_scores = self._lineage_scores_for_chunks(chunk_candidates)
-        reranked_chunks = rerank_chunks(query, chunk_candidates, fanout_debug, lineage_scores=lineage_scores)
+        reranked_chunks = rerank_chunks(
+            query, chunk_candidates, fanout_debug, lineage_scores=lineage_scores
+        )
         relevant_facts = self.search_facts(query, limit=min(8, policy.max_chunks))
         supporting_chunks = select_context_chunks(
             suppress_chunks_covered_by_facts(reranked_chunks, relevant_facts),
             query=query,
             policy=policy,
         )
-        wiki_pages = self.select_wiki_pages(query, supporting_chunks, limit=policy.max_wiki_pages)
+        wiki_pages = self.select_wiki_pages(
+            query, supporting_chunks, limit=policy.max_wiki_pages
+        )
         memories = relevant_memories_for_query(
             self.active_memories(project),
             query,
@@ -1185,13 +1803,20 @@ class BrainService:
             limit=min(policy.max_memories, 3),
             score_floor=MEMORY_CANDIDATE_SCORE_FLOOR,
         )
+        open_questions = self.relevant_open_questions(query, limit=5)
         citation_snapshots = (
             fact_citation_snapshots(relevant_facts)
             + chunk_citation_snapshots(supporting_chunks)
             + wiki_page_citation_snapshots(wiki_pages)
         )
-        assessment = retrieval_assessment(supporting_chunks, wiki_pages, memories, candidate_memories)
-        event_id = new_id("retrieval")
+        assessment = retrieval_assessment(
+            supporting_chunks,
+            wiki_pages,
+            memories,
+            candidate_memories,
+            relevant_facts,
+        )
+        event_id = None
         retrieval_debug = build_retrieval_debug(
             query,
             fanout_debug,
@@ -1201,33 +1826,45 @@ class BrainService:
             debug=debug,
         )
         retrieval_debug["assessment"] = assessment
-        with connection(self.paths.sqlite_path) as conn:
-            conn.execute(
-                """
-                INSERT INTO retrieval_events(
-                  id, query, timestamp, caller, returned_chunk_ids, selected_chunk_ids, citation_snapshots, debug
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event_id,
-                    query,
-                    now_iso(),
-                    "retrieve_context",
-                    dumps(fanout_debug["fused"]),
-                    dumps([row["chunk_id"] for row in supporting_chunks]),
-                    dumps(citation_snapshots),
-                    dumps(retrieval_debug),
-                ),
+        if fanout_debug.get("vector_unavailable_reason"):
+            assessment["reasons"].append(
+                f"vector_search unavailable: {fanout_debug['vector_unavailable_reason']}"
             )
-            self._record_retrieval_exposures(
-                conn,
-                retrieval_event_id=event_id,
-                query=query,
-                supporting_chunks=supporting_chunks,
-                relevant_facts=relevant_facts,
-                wiki_pages=wiki_pages,
-                active_memories=memories,
-            )
+        if not self.read_only and record_telemetry:
+            event_id = new_id("retrieval")
+            with connection(self.paths.sqlite_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO retrieval_events(
+                      id, query, timestamp, caller, returned_chunk_ids, selected_chunk_ids, citation_snapshots, debug
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event_id,
+                        truncate_for_packet(query, RETRIEVAL_EVENT_QUERY_MAX_CHARS),
+                        now_iso(),
+                        "retrieve_context",
+                        dumps(list(fanout_debug["fused"])[:RETRIEVAL_EVENT_ID_LIMIT]),
+                        dumps(
+                            [row["chunk_id"] for row in supporting_chunks][
+                                :RETRIEVAL_EVENT_ID_LIMIT
+                            ]
+                        ),
+                        dumps(
+                            stored_citation_snapshots(citation_snapshots, debug=debug)
+                        ),
+                        stored_retrieval_debug(retrieval_debug) if debug else "{}",
+                    ),
+                )
+                self._record_retrieval_exposures(
+                    conn,
+                    retrieval_event_id=event_id,
+                    query=query,
+                    supporting_chunks=supporting_chunks,
+                    relevant_facts=relevant_facts,
+                    wiki_pages=wiki_pages,
+                    active_memories=memories,
+                )
         result = {
             "task": task,
             "project": project,
@@ -1241,9 +1878,8 @@ class BrainService:
             "relevant_wiki_pages": wiki_pages,
             "relevant_facts": relevant_facts,
             "supporting_chunks": supporting_chunks,
-            "citations": citation_snapshots,
             "citation_snapshots": citation_snapshots,
-            "open_questions": [],
+            "open_questions": open_questions,
             "omitted_due_to_budget": [
                 {
                     "chunk_id": row.get("chunk_id"),
@@ -1267,7 +1903,65 @@ class BrainService:
                 "include_full_text": policy.include_full_text,
             }
             result["retrieval_debug"] = retrieval_debug
+        else:
+            result = slim_retrieve_context_packet(result, policy)
         return result
+
+    def relevant_open_questions(
+        self, query: str, limit: int = 5
+    ) -> list[dict[str, Any]]:
+        terms = important_query_terms(query)
+        specific_terms = specific_query_terms(query)
+        if not terms or limit <= 0:
+            return []
+        with connection(self.paths.sqlite_path) as conn:
+            candidates = rows(
+                conn,
+                """
+                SELECT *
+                FROM open_questions
+                WHERE status IN ('open', 'needs_human')
+                ORDER BY created_at DESC
+                LIMIT 100
+                """,
+            )
+        scored: list[dict[str, Any]] = []
+        for row in candidates:
+            question = open_question_row_to_context(row)
+            haystack = " ".join(
+                [
+                    str(question.get("kind") or ""),
+                    str(question.get("entity_key") or ""),
+                    str(question.get("page_hint") or ""),
+                    str(question.get("question") or ""),
+                    json.dumps(question.get("context") or {}, sort_keys=True),
+                    json.dumps(
+                        question.get("recommended_action") or {}, sort_keys=True
+                    ),
+                    " ".join(
+                        str(fact_id) for fact_id in question.get("fact_ids") or []
+                    ),
+                ]
+            )
+            matches = terms_in_text(terms, haystack)
+            specific_matches = terms_in_text(specific_terms, haystack)
+            if not matches:
+                continue
+            score = len(matches) + len(specific_matches)
+            if specific_terms and not specific_matches and score < 2:
+                continue
+            question["question_relevance_score"] = score
+            question["matched_query_terms"] = matches
+            question["matched_specific_query_terms"] = specific_matches
+            scored.append(question)
+        scored.sort(
+            key=lambda item: (
+                -int(item.get("question_relevance_score") or 0),
+                _descending_text_sort_key(str(item.get("created_at") or "")),
+                str(item.get("id") or ""),
+            )
+        )
+        return scored[:limit]
 
     def record_context_feedback(
         self,
@@ -1276,8 +1970,11 @@ class BrainService:
         useful: bool,
         note: str | None = None,
     ) -> dict[str, Any]:
+        self._ensure_writable()
         self.init_workspace()
-        normalized_type, normalized_id = normalize_lineage_target(target_type, target_id)
+        normalized_type, normalized_id = normalize_lineage_target(
+            target_type, target_id
+        )
         event_type = "explicit_useful" if useful else "explicit_not_useful"
         weight = LINEAGE_EVENT_WEIGHTS[event_type]
         metadata = {"note": note} if note else {}
@@ -1306,19 +2003,37 @@ class BrainService:
             "created_at": created_at,
         }
 
-    def _lineage_scores_for_chunks(self, chunks: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-        chunk_ids = sorted({str(chunk.get("chunk_id") or "") for chunk in chunks if chunk.get("chunk_id")})
-        document_ids = sorted({str(chunk.get("document_id") or "") for chunk in chunks if chunk.get("document_id")})
+    def _lineage_scores_for_chunks(
+        self, chunks: list[dict[str, Any]]
+    ) -> dict[str, dict[str, Any]]:
+        chunk_ids = sorted(
+            {
+                str(chunk.get("chunk_id") or "")
+                for chunk in chunks
+                if chunk.get("chunk_id")
+            }
+        )
+        document_ids = sorted(
+            {
+                str(chunk.get("document_id") or "")
+                for chunk in chunks
+                if chunk.get("document_id")
+            }
+        )
         if not chunk_ids and not document_ids:
             return {}
 
         clauses: list[str] = []
         params: list[Any] = []
         if chunk_ids:
-            clauses.append(f"(target_type = 'chunk' AND target_id IN ({','.join('?' for _ in chunk_ids)}))")
+            clauses.append(
+                f"(target_type = 'chunk' AND target_id IN ({','.join('?' for _ in chunk_ids)}))"
+            )
             params.extend(chunk_ids)
         if document_ids:
-            clauses.append(f"(target_type = 'document' AND target_id IN ({','.join('?' for _ in document_ids)}))")
+            clauses.append(
+                f"(target_type = 'document' AND target_id IN ({','.join('?' for _ in document_ids)}))"
+            )
             params.extend(document_ids)
         with connection(self.paths.sqlite_path) as conn:
             lineage_rows = rows(
@@ -1326,7 +2041,7 @@ class BrainService:
                 f"""
                 SELECT *
                 FROM context_lineage_events
-                WHERE {' OR '.join(clauses)}
+                WHERE {" OR ".join(clauses)}
                 ORDER BY created_at DESC
                 """,
                 params,
@@ -1340,7 +2055,9 @@ class BrainService:
                 chunk_ids_by_document.setdefault(document_id, []).append(chunk_id)
 
         score_by_chunk: dict[str, float] = {chunk_id: 0.0 for chunk_id in chunk_ids}
-        reasons_by_chunk: dict[str, dict[str, float | int]] = {chunk_id: {} for chunk_id in chunk_ids}
+        reasons_by_chunk: dict[str, dict[str, float | int]] = {
+            chunk_id: {} for chunk_id in chunk_ids
+        }
         seen_agent_references: set[tuple[str, str, str]] = set()
         now = datetime.now(timezone.utc)
 
@@ -1356,19 +2073,29 @@ class BrainService:
                 if agent_session_id:
                     seen_agent_references.add(dedupe_key)
 
-            base_weight = float(lineage["weight"] or LINEAGE_EVENT_WEIGHTS.get(event_type, 0.0))
+            base_weight = float(
+                lineage["weight"] or LINEAGE_EVENT_WEIGHTS.get(event_type, 0.0)
+            )
             if base_weight == 0.0:
                 continue
             decay = lineage_decay(str(lineage["created_at"]), now)
             weighted = base_weight * decay
-            affected_chunk_ids = [target_id] if target_type == "chunk" else chunk_ids_by_document.get(target_id, [])
+            affected_chunk_ids = (
+                [target_id]
+                if target_type == "chunk"
+                else chunk_ids_by_document.get(target_id, [])
+            )
             for chunk_id in affected_chunk_ids:
                 if chunk_id not in score_by_chunk:
                     continue
                 score_by_chunk[chunk_id] += weighted
                 reason_counts = reasons_by_chunk[chunk_id]
-                reason_counts[event_type] = float(reason_counts.get(event_type, 0.0)) + weighted
-                reason_counts[f"{event_type}:count"] = int(reason_counts.get(f"{event_type}:count", 0)) + 1
+                reason_counts[event_type] = (
+                    float(reason_counts.get(event_type, 0.0)) + weighted
+                )
+                reason_counts[f"{event_type}:count"] = (
+                    int(reason_counts.get(f"{event_type}:count", 0)) + 1
+                )
 
         output: dict[str, dict[str, Any]] = {}
         for chunk_id, score in score_by_chunk.items():
@@ -1377,7 +2104,9 @@ class BrainService:
                 continue
             output[chunk_id] = {
                 "boost": round(capped, 4),
-                "reasons": lineage_reason_strings(reasons_by_chunk.get(chunk_id, {}), capped),
+                "reasons": lineage_reason_strings(
+                    reasons_by_chunk.get(chunk_id, {}), capped
+                ),
             }
         return output
 
@@ -1427,7 +2156,10 @@ class BrainService:
                 agent_session_id=None,
                 query=query,
                 weight=0.0,
-                metadata={"document_id": chunk.get("document_id"), "source_type": chunk.get("source_type")},
+                metadata={
+                    "document_id": chunk.get("document_id"),
+                    "source_type": chunk.get("source_type"),
+                },
                 created_at=created_at,
             )
         for page in wiki_pages:
@@ -1444,7 +2176,10 @@ class BrainService:
                 agent_session_id=None,
                 query=query,
                 weight=0.0,
-                metadata={"title": page.get("title"), "page_type": page.get("page_type")},
+                metadata={
+                    "title": page.get("title"),
+                    "page_type": page.get("page_type"),
+                },
                 created_at=created_at,
             )
         for memory in active_memories:
@@ -1461,13 +2196,25 @@ class BrainService:
                 agent_session_id=None,
                 query=query,
                 weight=0.0,
-                metadata={"memory_type": memory.get("memory_type"), "scope": memory.get("scope")},
+                metadata={
+                    "memory_type": memory.get("memory_type"),
+                    "scope": memory.get("scope"),
+                },
                 created_at=created_at,
             )
 
-    def _fanout_chunk_candidates(self, query: str, limit: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    def _fanout_chunk_candidates(
+        self, query: str, limit: int
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         lexical = self._search_fts(query, limit)
-        vector = search_vectors(self.paths.lancedb_path, self.embedding_provider, query, limit)
+        vector_unavailable_reason = None
+        try:
+            vector = search_vectors(
+                self.paths.lancedb_path, self.embedding_provider, query, limit
+            )
+        except (EmbeddingProviderUnavailable, VectorIndexUnavailable) as exc:
+            vector = []
+            vector_unavailable_reason = str(exc)
         vector_debug = [
             {
                 "chunk_id": row.get("chunk_id"),
@@ -1484,6 +2231,7 @@ class BrainService:
         return self._chunks_by_ids(candidate_ids), {
             "lexical": lexical,
             "vector": vector_debug,
+            "vector_unavailable_reason": vector_unavailable_reason,
             "fused": fused_ids,
             "candidate_ids": candidate_ids,
         }
@@ -1531,7 +2279,13 @@ class BrainService:
                     "score": score,
                 }
             )
-        results.sort(key=lambda page: (-page["score"], page["page_type"] == "reference", page["title"]))
+        results.sort(
+            key=lambda page: (
+                -page["score"],
+                page["page_type"] == "reference",
+                page["title"],
+            )
+        )
         return results[:limit]
 
     def search_facts(self, query: str, limit: int = 8) -> list[dict[str, Any]]:
@@ -1554,7 +2308,9 @@ class BrainService:
                 (fts_query, candidate_limit),
             )
             fact_ids = [str(row["fact_id"]) for row in found if row["fact_id"]]
-            fts_scores = {str(row["fact_id"]): float(row["score"] or 0.0) for row in found}
+            fts_scores = {
+                str(row["fact_id"]): float(row["score"] or 0.0) for row in found
+            }
             if not fact_ids:
                 return []
             placeholders = ",".join("?" for _ in fact_ids)
@@ -1588,7 +2344,8 @@ class BrainService:
                 {
                     str(fact.get("conflict_group_id") or "")
                     for fact in facts_by_id.values()
-                    if fact.get("status") == "conflicted" and fact.get("conflict_group_id")
+                    if fact.get("status") == "conflicted"
+                    and fact.get("conflict_group_id")
                 }
             )
             contested_by_group: dict[str, list[dict[str, Any]]] = {}
@@ -1611,8 +2368,12 @@ class BrainService:
                         0.0,
                         fts_score=fts_scores.get(fact_id, 0.0),
                     )
-                    contested_by_group.setdefault(str(row["conflict_group_id"]), []).append(fact)
-            ordered = [facts_by_id[fact_id] for fact_id in fact_ids if fact_id in facts_by_id]
+                    contested_by_group.setdefault(
+                        str(row["conflict_group_id"]), []
+                    ).append(fact)
+            ordered = [
+                facts_by_id[fact_id] for fact_id in fact_ids if fact_id in facts_by_id
+            ]
             ordered.sort(
                 key=lambda fact: (
                     -float(fact.get("retrieval_score") or 0.0),
@@ -1663,7 +2424,11 @@ class BrainService:
             relative_path = str(path.relative_to(self.paths.wiki))
             is_agent_reference = "agent_session_log" in relative_path
             tags = list(frontmatter.get("tags") or [])
-            managed = bool(frontmatter.get("managed")) or "managed" in tags or str(frontmatter.get("id") or "").startswith("managed-")
+            managed = (
+                bool(frontmatter.get("managed"))
+                or "managed" in tags
+                or str(frontmatter.get("id") or "").startswith("managed-")
+            )
             semantic_page = page_type not in {"index", "reference"}
             if status == "archived":
                 continue
@@ -1678,14 +2443,26 @@ class BrainService:
             body_haystack = body.lower()
             title_hits = terms_in_text(terms, title_haystack)
             body_hits = terms_in_text(terms, body_haystack)
-            specific_hits = sorted(set(terms_in_text(specific_terms, title_haystack)).union(terms_in_text(specific_terms, body_haystack)))
+            specific_hits = sorted(
+                set(terms_in_text(specific_terms, title_haystack)).union(
+                    terms_in_text(specific_terms, body_haystack)
+                )
+            )
             source_overlap = sorted(selected_sources.intersection(source_ids))
 
-            if not title_hits and not (page_type == "reference" and source_overlap) and len(body_hits) < 2:
+            if (
+                not title_hits
+                and not (page_type == "reference" and source_overlap)
+                and len(body_hits) < 2
+            ):
                 continue
             if is_agent_reference and not agent_query and not source_overlap:
                 continue
-            if required_specific_hits and len(specific_hits) < required_specific_hits and not source_overlap:
+            if (
+                required_specific_hits
+                and len(specific_hits) < required_specific_hits
+                and not source_overlap
+            ):
                 continue
 
             score = 0.0
@@ -1693,7 +2470,9 @@ class BrainService:
             if title_hits:
                 boost = 5.0 * len(title_hits)
                 score += boost
-                reasons.append(f"title/path matched {', '.join(title_hits)} (+{boost:g})")
+                reasons.append(
+                    f"title/path matched {', '.join(title_hits)} (+{boost:g})"
+                )
             if body_hits:
                 boost = float(min(len(body_hits), 6))
                 score += boost
@@ -1737,7 +2516,14 @@ class BrainService:
                 }
             )
 
-        results.sort(key=lambda page: (-page["score"], not page.get("managed", False), page["page_type"] == "reference", page["title"]))
+        results.sort(
+            key=lambda page: (
+                -page["score"],
+                not page.get("managed", False),
+                page["page_type"] == "reference",
+                page["title"],
+            )
+        )
         return results[:limit]
 
     def active_memories(self, project: str | None = None) -> list[dict[str, Any]]:
@@ -1753,7 +2539,7 @@ class BrainService:
         memory_type: str | None = None,
         project: str | None = None,
     ) -> list[dict[str, Any]]:
-        self.init_workspace()
+        self._ensure_workspace()
         with connection(self.paths.sqlite_path) as conn:
             query = "SELECT * FROM memories WHERE 1=1"
             params: list[Any] = []
@@ -1773,9 +2559,11 @@ class BrainService:
             return [row_to_memory(row) for row in conn.execute(query, params)]
 
     def get_memory(self, memory_id: str) -> dict[str, Any]:
-        self.init_workspace()
+        self._ensure_workspace()
         with connection(self.paths.sqlite_path) as conn:
-            row = conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM memories WHERE id = ?", (memory_id,)
+            ).fetchone()
         if not row:
             raise ValueError(f"memory not found: {memory_id}")
         return row_to_memory(row)
@@ -1788,7 +2576,15 @@ class BrainService:
         sources: list[str],
         confidence: float,
     ) -> str:
+        self._ensure_writable()
         self.init_workspace()
+        normalized_scope = scope.strip()
+        if not valid_memory_scope(normalized_scope):
+            raise ValueError(
+                "invalid memory scope "
+                f"{scope!r}; expected 'global' or a non-empty scope prefixed by "
+                "project:, repo:, agent:, topic:, or user:"
+            )
         memory_id = new_id("mem")
         timestamp = now_iso()
         with connection(self.paths.sqlite_path) as conn:
@@ -1797,7 +2593,17 @@ class BrainService:
                 INSERT INTO memories(id, memory_type, scope, content, confidence, source_ids, status, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (memory_id, memory_type, scope, content, confidence, dumps(sources), "proposed", timestamp, timestamp),
+                (
+                    memory_id,
+                    memory_type,
+                    normalized_scope,
+                    content,
+                    confidence,
+                    dumps(sources),
+                    "proposed",
+                    timestamp,
+                    timestamp,
+                ),
             )
         return memory_id
 
@@ -1817,9 +2623,18 @@ class BrainService:
         written: list[str] = []
         removed: list[str] = []
         with connection(self.paths.sqlite_path) as conn:
-            all_memories = [row_to_memory(row) for row in conn.execute("SELECT * FROM memories ORDER BY id")]
-        active_ids = {memory["id"] for memory in all_memories if memory["status"] == "active"}
-        active_paths = {memory["id"]: memory_export_path(self.paths, memory) for memory in all_memories if memory["status"] == "active"}
+            all_memories = [
+                row_to_memory(row)
+                for row in conn.execute("SELECT * FROM memories ORDER BY id")
+            ]
+        active_ids = {
+            memory["id"] for memory in all_memories if memory["status"] == "active"
+        }
+        active_paths = {
+            memory["id"]: memory_export_path(self.paths, memory)
+            for memory in all_memories
+            if memory["status"] == "active"
+        }
         for memory in all_memories:
             if memory["status"] == "active":
                 written.append(str(write_memory_export(self.paths, memory)))
@@ -1828,13 +2643,19 @@ class BrainService:
                 if path.exists():
                     path.unlink()
                     removed.append(str(path))
-        for path in self.paths.memory.rglob("*.md") if self.paths.memory.exists() else []:
-            if path.stem.startswith("mem_") and (path.stem not in active_ids or path != active_paths.get(path.stem)):
+        for path in (
+            self.paths.memory.rglob("*.md") if self.paths.memory.exists() else []
+        ):
+            if path.stem.startswith("mem_") and (
+                path.stem not in active_ids or path != active_paths.get(path.stem)
+            ):
                 path.unlink()
                 removed.append(str(path))
         return {"written": written, "removed": sorted(set(removed))}
 
-    def import_memories(self, source_dir: Path, allow_missing_sources: bool = False) -> dict[str, Any]:
+    def import_memories(
+        self, source_dir: Path, allow_missing_sources: bool = False
+    ) -> dict[str, Any]:
         self.init_workspace()
         source_dir = source_dir.expanduser().resolve()
         imported: list[str] = []
@@ -1842,17 +2663,22 @@ class BrainService:
         if not source_dir.exists():
             raise ValueError(f"memory import directory not found: {source_dir}")
         with connection(self.paths.sqlite_path) as conn:
-            document_ids = {row["id"] for row in conn.execute("SELECT id FROM documents")}
+            document_ids = {
+                row["id"] for row in conn.execute("SELECT id FROM documents")
+            }
             for path in sorted(source_dir.rglob("*.md")):
                 try:
                     memory = read_memory_export(path)
                     missing = [
                         source_id
                         for source_id in memory["source_ids"]
-                        if source_id.startswith("document:") and source_id.removeprefix("document:") not in document_ids
+                        if source_id.startswith("document:")
+                        and source_id.removeprefix("document:") not in document_ids
                     ]
                     if missing and not allow_missing_sources:
-                        errors.append(f"{path}: missing source documents: {', '.join(missing)}")
+                        errors.append(
+                            f"{path}: missing source documents: {', '.join(missing)}"
+                        )
                         continue
                     timestamp = now_iso()
                     conn.execute(
@@ -1893,7 +2719,9 @@ class BrainService:
                     errors.append(f"{path}: {exc}")
         return {"imported": imported, "errors": errors}
 
-    def _set_memory_status(self, memory_id: str, status: str, reason: str | None = None) -> dict[str, Any]:
+    def _set_memory_status(
+        self, memory_id: str, status: str, reason: str | None = None
+    ) -> dict[str, Any]:
         timestamp = now_iso()
         with connection(self.paths.sqlite_path) as conn:
             result = conn.execute(
@@ -1906,7 +2734,9 @@ class BrainService:
             )
             if result.rowcount == 0:
                 raise ValueError(f"memory not found: {memory_id}")
-            row = conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM memories WHERE id = ?", (memory_id,)
+            ).fetchone()
         if not row:
             raise ValueError(f"memory not found: {memory_id}")
         memory = row_to_memory(row)
@@ -1926,6 +2756,7 @@ class BrainService:
         outcome: str,
         unresolved_issues: list[str],
     ) -> str:
+        self._ensure_writable()
         self.init_workspace()
         session_id = new_id("session")
         with connection(self.paths.sqlite_path) as conn:
@@ -2004,7 +2835,9 @@ class BrainService:
 
 def reserved_ingest_path(path: Path) -> bool:
     reserved = {"_staging", "_quarantine", "_rejected", ".rsync-partial"}
-    return bool(set(path.parts).intersection(reserved)) or path.name.endswith(".error.json")
+    return bool(set(path.parts).intersection(reserved)) or path.name.endswith(
+        ".error.json"
+    )
 
 
 def external_inbox_path_info(paths: BrainPaths, path: Path) -> tuple[Path, Path] | None:
@@ -2070,8 +2903,12 @@ def write_memory_export(paths: BrainPaths, memory: dict[str, Any]) -> Path:
         "last_seen_at": memory.get("last_seen_at"),
         "review_reason": memory.get("review_reason"),
     }
-    serialized = yaml.safe_dump(frontmatter, sort_keys=True, allow_unicode=False).strip()
-    path.write_text(f"---\n{serialized}\n---\n\n{memory['content'].rstrip()}\n", encoding="utf-8")
+    serialized = yaml.safe_dump(
+        frontmatter, sort_keys=True, allow_unicode=False
+    ).strip()
+    path.write_text(
+        f"---\n{serialized}\n---\n\n{memory['content'].rstrip()}\n", encoding="utf-8"
+    )
     return path
 
 
@@ -2233,7 +3070,13 @@ def rerank_chunks(
         text_hits = terms_in_text(terms, text_lower)
         source_type = str(candidate.get("source_type") or "")
         if source_type == "agent_session_log" and not agent_query:
-            title_boost_hits = sorted({term for term in title_hits if term in heading_hits or term in text_hits})
+            title_boost_hits = sorted(
+                {
+                    term
+                    for term in title_hits
+                    if term in heading_hits or term in text_hits
+                }
+            )
         else:
             title_boost_hits = title_hits
         anchor_hits = sorted(
@@ -2246,17 +3089,26 @@ def rerank_chunks(
             }
         )
         title_heading_anchor_hits = sorted(
-            {term for term in anchors if contains_query_term(title, term) or contains_query_term(heading, term)}
+            {
+                term
+                for term in anchors
+                if contains_query_term(title, term)
+                or contains_query_term(heading, term)
+            }
         )
         local_term_hits = sorted(set(heading_hits).union(text_hits))
-        local_specific_hits = sorted({term for term in specific_terms if term in local_term_hits})
+        local_specific_hits = sorted(
+            {term for term in specific_terms if term in local_term_hits}
+        )
         if title_boost_hits:
             boost = 4.0 * len(title_boost_hits)
             score += boost
             reasons.append(f"title matched {', '.join(title_boost_hits)} (+{boost:g})")
         ignored_title_hits = sorted(set(title_hits) - set(title_boost_hits))
         if ignored_title_hits:
-            reasons.append(f"title-only matches ignored {', '.join(ignored_title_hits)}")
+            reasons.append(
+                f"title-only matches ignored {', '.join(ignored_title_hits)}"
+            )
         if heading_hits:
             boost = 2.5 * len(heading_hits)
             score += boost
@@ -2264,15 +3116,21 @@ def rerank_chunks(
         if text_hits and terms:
             boost = 6.0 * (len(text_hits) / len(terms))
             score += boost
-            reasons.append(f"text covered {len(text_hits)}/{len(terms)} important terms (+{boost:.2f})")
+            reasons.append(
+                f"text covered {len(text_hits)}/{len(terms)} important terms (+{boost:.2f})"
+            )
         if anchors:
             if anchor_hits:
                 boost = 3.0 * len(anchor_hits)
                 score += boost
-                reasons.append(f"entity anchor matched {', '.join(anchor_hits)} (+{boost:g})")
+                reasons.append(
+                    f"entity anchor matched {', '.join(anchor_hits)} (+{boost:g})"
+                )
                 if not title_heading_anchor_hits:
                     score -= 6.0
-                    reasons.append(f"entity anchor absent from title/heading {', '.join(anchors)} (-6)")
+                    reasons.append(
+                        f"entity anchor absent from title/heading {', '.join(anchors)} (-6)"
+                    )
             else:
                 score -= 8.0
                 reasons.append(f"missed entity anchor {', '.join(anchors)} (-8)")
@@ -2285,13 +3143,22 @@ def rerank_chunks(
             reasons.append(f"source_type {source_type} ({source_weight:+g})")
 
         noise_reasons = chunk_noise_reasons(candidate)
+        if retrieval_negative_control_fixture_mention(
+            text_lower, terms, local_specific_hits
+        ):
+            noise_reasons.append("retrieval negative-control fixture")
+            noise_reasons = dedupe_preserve_order(noise_reasons)
         if noise_reasons:
             if agent_query:
                 penalty = 2.0
                 score -= penalty
                 reasons.append(f"minor noise penalty ({-penalty:g})")
             else:
-                strong_noise = [reason for reason in noise_reasons if reason != "raw transcript chunk"]
+                strong_noise = [
+                    reason
+                    for reason in noise_reasons
+                    if reason != "raw transcript chunk"
+                ]
                 penalty = 4.0 if not strong_noise else 12.0 + (2.0 * len(strong_noise))
                 score -= penalty
                 reasons.append(f"noise penalty ({-penalty:g})")
@@ -2307,7 +3174,9 @@ def rerank_chunks(
             if recency_boost:
                 if recency_intent:
                     recency_boost *= 2
-                    recency_reason = recency_reason.replace("recency boost", "recency intent boost")
+                    recency_reason = recency_reason.replace(
+                        "recency boost", "recency intent boost"
+                    )
                 score += recency_boost
                 reasons.append(recency_reason)
 
@@ -2315,7 +3184,10 @@ def rerank_chunks(
         lineage_boost = float(lineage.get("boost") or 0.0)
         if lineage_boost:
             score += lineage_boost
-            reasons.extend(lineage.get("reasons") or [f"lineage tie-breaker ({lineage_boost:+.2f})"])
+            reasons.extend(
+                lineage.get("reasons")
+                or [f"lineage tie-breaker ({lineage_boost:+.2f})"]
+            )
 
         candidate["retrieval_score"] = round(score, 4)
         candidate["raw_context"] = raw_context_links(candidate)
@@ -2335,14 +3207,26 @@ def rerank_chunks(
         candidate["required_specific_hit_count"] = required_specific_hits
         scored.append(candidate)
 
-    scored.sort(key=lambda row: (row.get("suppressed", False), -float(row["retrieval_score"]), row["chunk_index"]))
+    scored.sort(
+        key=lambda row: (
+            row.get("suppressed", False),
+            -float(row["retrieval_score"]),
+            row["chunk_index"],
+        )
+    )
     return scored
 
 
-def select_context_chunks(reranked_chunks: list[dict[str, Any]], query: str, policy: RetrievalPolicy) -> list[dict[str, Any]]:
+def select_context_chunks(
+    reranked_chunks: list[dict[str, Any]], query: str, policy: RetrievalPolicy
+) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
     remaining = max(policy.total_budget, 1)
-    eligible = [row for row in reranked_chunks if chunk_passes_relevance_floor(row, CONTEXT_CHUNK_SCORE_FLOOR)]
+    eligible = [
+        row
+        for row in reranked_chunks
+        if chunk_passes_relevance_floor(row, CONTEXT_CHUNK_SCORE_FLOOR)
+    ]
     anchored = [row for row in eligible if row.get("entity_anchor_title_heading_match")]
     if anchored:
         eligible = anchored
@@ -2372,7 +3256,9 @@ def select_context_chunks(reranked_chunks: list[dict[str, Any]], query: str, pol
     return selected
 
 
-def select_search_results(reranked_chunks: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+def select_search_results(
+    reranked_chunks: list[dict[str, Any]], limit: int
+) -> list[dict[str, Any]]:
     if limit <= 0:
         return []
     selected: list[dict[str, Any]] = []
@@ -2381,7 +3267,10 @@ def select_search_results(reranked_chunks: list[dict[str, Any]], limit: int) -> 
         if not chunk_passes_relevance_floor(row, SEARCH_RESULT_SCORE_FLOOR):
             continue
         document_id = str(row.get("document_id") or "")
-        if document_id and document_counts.get(document_id, 0) >= MAX_CHUNKS_PER_DOCUMENT:
+        if (
+            document_id
+            and document_counts.get(document_id, 0) >= MAX_CHUNKS_PER_DOCUMENT
+        ):
             continue
         selected.append(row)
         if document_id:
@@ -2443,8 +3332,298 @@ def relevant_memories_for_query(
         row["matched_query_terms"] = matches
         row["matched_specific_query_terms"] = specific_matches
         scored.append(row)
-    scored.sort(key=lambda row: (-int(row.get("memory_relevance_score") or 0), -float(row.get("confidence") or 0.0), row.get("id") or ""))
+    scored.sort(
+        key=lambda row: (
+            -int(row.get("memory_relevance_score") or 0),
+            -float(row.get("confidence") or 0.0),
+            row.get("id") or "",
+        )
+    )
     return scored[:limit]
+
+
+def slim_retrieve_context_packet(
+    result: dict[str, Any], policy: RetrievalPolicy
+) -> dict[str, Any]:
+    packet = dict(result)
+    packet["retrieval_reasons"] = list(packet.get("retrieval_reasons") or [])[:5]
+    packet["active_memories"] = [
+        slim_memory_for_context(row) for row in packet.get("active_memories") or []
+    ]
+    packet["candidate_memories"] = [
+        slim_memory_for_context(row) for row in packet.get("candidate_memories") or []
+    ]
+    packet["relevant_wiki_pages"] = [
+        slim_wiki_page_for_context(row)
+        for row in packet.get("relevant_wiki_pages") or []
+    ]
+    packet["relevant_facts"] = [
+        slim_fact_for_context(row) for row in packet.get("relevant_facts") or []
+    ]
+    packet["supporting_chunks"] = [
+        slim_chunk_for_context(row) for row in packet.get("supporting_chunks") or []
+    ]
+    packet["open_questions"] = [
+        slim_open_question_for_context(row)
+        for row in packet.get("open_questions") or []
+    ]
+    packet["citation_snapshots"] = slim_citation_snapshots(
+        packet.get("citation_snapshots") or []
+    )
+    return trim_context_packet_to_serialized_limit(packet, policy)
+
+
+def slim_memory_for_context(memory: dict[str, Any]) -> dict[str, Any]:
+    return keep_present(
+        {
+            "id": memory.get("id"),
+            "memory_type": memory.get("memory_type"),
+            "scope": memory.get("scope"),
+            "content": truncate_for_packet(str(memory.get("content") or ""), 1200),
+            "confidence": memory.get("confidence"),
+            "source_ids": list(memory.get("source_ids") or [])[:3],
+            "status": memory.get("status"),
+            "created_at": memory.get("created_at"),
+            "updated_at": memory.get("updated_at"),
+            "reviewed_at": memory.get("reviewed_at"),
+            "memory_relevance_score": memory.get("memory_relevance_score"),
+        }
+    )
+
+
+def slim_wiki_page_for_context(page: dict[str, Any]) -> dict[str, Any]:
+    return keep_present(
+        {
+            "title": page.get("title"),
+            "page_type": page.get("page_type"),
+            "path": page.get("path"),
+            "relative_path": page.get("relative_path"),
+            "source_ids": list(page.get("source_ids") or [])[:3],
+            "source_count": page.get("source_count"),
+            "summary": truncate_for_packet(str(page.get("summary") or ""), 800),
+            "score": page.get("score"),
+            "managed": page.get("managed"),
+        }
+    )
+
+
+def slim_fact_for_context(fact: dict[str, Any]) -> dict[str, Any]:
+    output = keep_present(
+        {
+            "id": fact.get("id"),
+            "statement": fact.get("statement"),
+            "entity_key": fact.get("entity_key"),
+            "page_hint": fact.get("page_hint"),
+            "section_hint": fact.get("section_hint"),
+            "source_ids": list(fact.get("source_ids") or [])[:3],
+            "observed_at": fact.get("observed_at"),
+            "confidence": fact.get("confidence"),
+            "source_spans": fact.get("source_spans"),
+            "evidence_quote": truncate_for_packet(
+                str(fact.get("evidence_quote") or ""), 1200
+            ),
+            "extraction_method": fact.get("extraction_method"),
+            "extractor_model": fact.get("extractor_model"),
+            "truth_confidence": fact.get("truth_confidence"),
+            "status": fact.get("status"),
+            "retrieval_score": fact.get("retrieval_score"),
+            "authoritative": fact.get("authoritative"),
+            "contested": fact.get("contested"),
+            "conflict_group_id": fact.get("conflict_group_id"),
+        }
+    )
+    contested = fact.get("contested_facts")
+    if isinstance(contested, list):
+        output["contested_facts"] = [
+            slim_fact_for_context(row) for row in contested[:3] if isinstance(row, dict)
+        ]
+    return output
+
+
+def slim_chunk_for_context(chunk: dict[str, Any]) -> dict[str, Any]:
+    return keep_present(
+        {
+            "chunk_id": chunk.get("chunk_id"),
+            "document_id": chunk.get("document_id"),
+            "origin_node_id": chunk.get("origin_node_id"),
+            "logical_source_key": chunk.get("logical_source_key"),
+            "source_type": chunk.get("source_type"),
+            "title": chunk.get("title"),
+            "heading_path": chunk.get("heading_path"),
+            "text": chunk.get("text"),
+            "retrieval_score": chunk.get("retrieval_score"),
+            "score": chunk.get("retrieval_score"),
+            "raw_context": chunk.get("raw_context"),
+            "original_token_count": chunk.get("original_token_count"),
+            "returned_token_count": chunk.get("returned_token_count"),
+            "omitted_tokens": chunk.get("omitted_tokens"),
+            "excerpted": chunk.get("excerpted"),
+            "retrieval_mode": chunk.get("retrieval_mode"),
+            "source_token_cap": chunk.get("source_token_cap"),
+        }
+    )
+
+
+def slim_open_question_for_context(question: dict[str, Any]) -> dict[str, Any]:
+    output = {
+        key: question.get(key)
+        for key in [
+            "id",
+            "kind",
+            "entity_key",
+            "page_hint",
+            "fact_ids",
+            "question",
+            "status",
+            "risk_tier",
+            "created_at",
+            "answered_at",
+        ]
+    }
+    options = question.get("options")
+    if isinstance(options, list):
+        output["options"] = options[:3]
+    return keep_present(output)
+
+
+def slim_citation_snapshots(
+    snapshots: list[dict[str, Any]],
+    *,
+    limit: int = NON_DEBUG_CITATION_LIMIT,
+    text_chars: int = NON_DEBUG_CITATION_TEXT_CHARS,
+) -> list[dict[str, Any]]:
+    slimmed: list[dict[str, Any]] = []
+    for snapshot in snapshots[:limit]:
+        if not isinstance(snapshot, dict):
+            continue
+        entry = dict(snapshot)
+        if "text" in entry:
+            entry["text"] = truncate_for_packet(
+                str(entry.get("text") or ""), text_chars
+            )
+        if isinstance(entry.get("source_ids"), list):
+            entry["source_ids"] = entry["source_ids"][:3]
+        slimmed.append(keep_present(entry))
+    return slimmed
+
+
+def stored_citation_snapshots(
+    snapshots: list[dict[str, Any]], *, debug: bool
+) -> list[dict[str, Any]]:
+    if debug:
+        return slim_citation_snapshots(
+            snapshots,
+            limit=DEBUG_CITATION_LIMIT,
+            text_chars=DEBUG_CITATION_TEXT_CHARS,
+        )
+    return slim_citation_snapshots(snapshots)
+
+
+def stored_retrieval_debug(payload: dict[str, Any]) -> str:
+    serialized = dumps(payload)
+    byte_count = len(serialized.encode("utf-8"))
+    if byte_count <= RETRIEVAL_EVENT_DEBUG_MAX_BYTES:
+        return serialized
+    candidate_ids = payload.get("candidate_ids")
+    fused = payload.get("fused")
+    summary = {
+        "truncated": True,
+        "original_bytes": byte_count,
+        "keys": sorted(str(key) for key in payload),
+        "assessment": payload.get("assessment"),
+        "vector_unavailable_reason": payload.get("vector_unavailable_reason"),
+        "candidate_count": len(candidate_ids)
+        if isinstance(candidate_ids, list)
+        else len(fused)
+        if isinstance(fused, list)
+        else None,
+    }
+    return dumps(keep_present(summary))
+
+
+def trim_context_packet_to_serialized_limit(
+    packet: dict[str, Any], policy: RetrievalPolicy
+) -> dict[str, Any]:
+    limit = CONTEXT_PACKET_MAX_BYTES.get(
+        policy.mode, CONTEXT_PACKET_MAX_BYTES["default"]
+    )
+    if serialized_packet_size(packet) <= limit:
+        return packet
+
+    packet["citation_snapshots"] = []
+    if serialized_packet_size(packet) <= limit:
+        return packet
+
+    for key in [
+        "supporting_chunks",
+        "relevant_wiki_pages",
+        "candidate_memories",
+        "active_memories",
+        "relevant_facts",
+        "open_questions",
+    ]:
+        while serialized_packet_size(packet) > limit and len(packet.get(key) or []) > 1:
+            packet[key].pop()
+        if serialized_packet_size(packet) <= limit:
+            return packet
+
+    for token_limit in [900, 600, 350, 180]:
+        for chunk in packet.get("supporting_chunks") or []:
+            text = str(chunk.get("text") or "")
+            if estimate_tokens(text) > token_limit:
+                chunk["text"] = trim_to_token_budget(text, token_limit)
+                chunk["returned_token_count"] = estimate_tokens(chunk["text"])
+                original = int(
+                    chunk.get("original_token_count") or chunk["returned_token_count"]
+                )
+                chunk["omitted_tokens"] = max(
+                    0, original - int(chunk["returned_token_count"])
+                )
+                chunk["excerpted"] = chunk["omitted_tokens"] > 0
+        if serialized_packet_size(packet) <= limit:
+            return packet
+
+    for char_limit in [800, 400, 200]:
+        trim_packet_strings(packet, char_limit)
+        if serialized_packet_size(packet) <= limit:
+            return packet
+
+    return packet
+
+
+def serialized_packet_size(packet: dict[str, Any]) -> int:
+    return len(dumps(packet).encode("utf-8"))
+
+
+def keep_present(values: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in values.items() if value is not None}
+
+
+def truncate_for_packet(value: str, max_chars: int) -> str:
+    if len(value) <= max_chars:
+        return value
+    if max_chars <= 16:
+        return value[:max_chars]
+    suffix = " ... [truncated]"
+    return value[: max_chars - len(suffix)].rstrip() + suffix
+
+
+def trim_packet_strings(value: Any, max_chars: int) -> None:
+    if isinstance(value, dict):
+        for key, child in list(value.items()):
+            if isinstance(child, str) and key in {
+                "content",
+                "evidence_quote",
+                "question",
+                "summary",
+                "text",
+            }:
+                value[key] = truncate_for_packet(child, max_chars)
+            else:
+                trim_packet_strings(child, max_chars)
+    elif isinstance(value, list):
+        for child in value:
+            trim_packet_strings(child, max_chars)
 
 
 def retrieval_assessment(
@@ -2452,27 +3631,52 @@ def retrieval_assessment(
     wiki_pages: list[dict[str, Any]],
     active_memories: list[dict[str, Any]],
     candidate_memories: list[dict[str, Any]],
+    relevant_facts: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    top_chunk_score = max((float(row.get("retrieval_score") or 0.0) for row in chunks), default=0.0)
-    top_wiki_score = max((float(row.get("score") or 0.0) for row in wiki_pages), default=0.0)
-    top_active_memory_score = max((int(row.get("memory_relevance_score") or 0) for row in active_memories), default=0)
-    top_candidate_memory_score = max((int(row.get("memory_relevance_score") or 0) for row in candidate_memories), default=0)
-    signal = max(top_chunk_score, top_wiki_score, float(top_active_memory_score * 8), float(top_candidate_memory_score * 6))
+    relevant_facts = relevant_facts or []
+    top_chunk_score = max(
+        (float(row.get("retrieval_score") or 0.0) for row in chunks), default=0.0
+    )
+    top_wiki_score = max(
+        (float(row.get("score") or 0.0) for row in wiki_pages), default=0.0
+    )
+    top_fact_score = max(
+        (float(row.get("retrieval_score") or 0.0) for row in relevant_facts),
+        default=0.0,
+    )
+    top_active_memory_score = max(
+        (int(row.get("memory_relevance_score") or 0) for row in active_memories),
+        default=0,
+    )
+    top_candidate_memory_score = max(
+        (int(row.get("memory_relevance_score") or 0) for row in candidate_memories),
+        default=0,
+    )
+    signal = max(
+        top_chunk_score,
+        top_wiki_score,
+        top_fact_score,
+        float(top_active_memory_score * 8),
+        float(top_candidate_memory_score * 6),
+    )
     reasons = [
         f"top chunk score {top_chunk_score:.1f}",
         f"top wiki score {top_wiki_score:.1f}",
+        f"top fact score {top_fact_score:.1f} across {len(relevant_facts)} relevant facts",
         f"top active memory hits {top_active_memory_score}",
         f"top candidate memory hits {top_candidate_memory_score}",
     ]
     if (
         top_chunk_score >= FOUND_CHUNK_SCORE
         or top_wiki_score >= FOUND_WIKI_SCORE
+        or top_fact_score >= FOUND_FACT_SCORE
         or top_active_memory_score >= 2
     ):
         verdict = "found"
     elif (
         top_chunk_score >= CONTEXT_CHUNK_SCORE_FLOOR
         or top_wiki_score >= WIKI_PAGE_SCORE_FLOOR
+        or top_fact_score >= FACT_SCORE_FLOOR
         or top_active_memory_score >= MEMORY_ACTIVE_SCORE_FLOOR
         or top_candidate_memory_score >= MEMORY_CANDIDATE_SCORE_FLOOR
     ):
@@ -2566,15 +3770,23 @@ def focused_excerpt(text: str, query: str, max_tokens: int) -> str:
         lowered = block.lower()
         hits = sum(1 for term in terms if contains_query_term(lowered, term))
         section_bonus = 0
-        if any(marker in lowered for marker in ["## user requests", "## summary", "## assistant responses"]):
+        if any(
+            marker in lowered
+            for marker in ["## user requests", "## summary", "## assistant responses"]
+        ):
             section_bonus = 2
         if hits or section_bonus:
             scored.append((hits + section_bonus, index, block))
     if not scored:
         return trim_to_token_budget(text, max_tokens)
 
-    selected_indexes = {index for _, index, _ in sorted(scored, key=lambda item: (-item[0], item[1]))[:8]}
-    selected_blocks = [block for index, block in enumerate(blocks) if index in selected_indexes]
+    selected_indexes = {
+        index
+        for _, index, _ in sorted(scored, key=lambda item: (-item[0], item[1]))[:8]
+    }
+    selected_blocks = [
+        block for index, block in enumerate(blocks) if index in selected_indexes
+    ]
     return pack_blocks(selected_blocks, max_tokens, terms)
 
 
@@ -2618,7 +3830,9 @@ def trim_to_token_budget(text: str, max_tokens: int) -> str:
     return " ".join(words[: max_tokens - 3] + ["...", "[truncated]"])
 
 
-def trim_to_token_budget_around_terms(text: str, max_tokens: int, terms: set[str]) -> str:
+def trim_to_token_budget_around_terms(
+    text: str, max_tokens: int, terms: set[str]
+) -> str:
     words = re.findall(r"\S+", text)
     if len(words) <= max_tokens:
         return text.strip()
@@ -2655,7 +3869,9 @@ def chunk_noise_reasons(chunk: dict[str, Any]) -> list[str]:
             reasons.append("session metadata")
         if "you are codex" in text_lower or "<permissions instructions>" in text_lower:
             reasons.append("system prompt text")
-        trace_markers = text_lower.count("event_msg") + text_lower.count("response_item")
+        trace_markers = text_lower.count("event_msg") + text_lower.count(
+            "response_item"
+        )
         if trace_markers >= 2:
             reasons.append("tool/session trace")
     if looks_frontmatter_only(text):
@@ -2667,12 +3883,31 @@ def chunk_noise_reasons(chunk: dict[str, Any]) -> list[str]:
     return dedupe_preserve_order(reasons)
 
 
+def retrieval_negative_control_fixture_mention(
+    text_lower: str, terms: list[str], local_specific_hits: list[str]
+) -> bool:
+    if not terms:
+        return False
+    if set(terms) & NEGATIVE_CONTROL_QUERY_TERMS:
+        return False
+    if not any(marker in text_lower for marker in NEGATIVE_CONTROL_CONTEXT_MARKERS):
+        return False
+    required_hits = max(3, len(terms) if len(terms) <= 4 else len(terms) - 1)
+    return len(set(local_specific_hits)) >= required_hits
+
+
 def recency_score(chunk: dict[str, Any]) -> tuple[float, str]:
-    timestamp = parse_iso_timestamp(str(chunk.get("document_created_at") or chunk.get("document_ingested_at") or ""))
+    timestamp = parse_iso_timestamp(
+        str(chunk.get("document_created_at") or chunk.get("document_ingested_at") or "")
+    )
     if not timestamp:
         return 0.0, ""
-    age_days = max(0.0, (datetime.now(timezone.utc) - timestamp).total_seconds() / 86400.0)
-    boost = RECENCY_MAX_BOOST * (RECENCY_HALF_LIFE_DAYS / (RECENCY_HALF_LIFE_DAYS + age_days))
+    age_days = max(
+        0.0, (datetime.now(timezone.utc) - timestamp).total_seconds() / 86400.0
+    )
+    boost = RECENCY_MAX_BOOST * (
+        RECENCY_HALF_LIFE_DAYS / (RECENCY_HALF_LIFE_DAYS + age_days)
+    )
     if boost < 0.05:
         return 0.0, ""
     return round(boost, 4), f"recency boost age {age_days:.1f}d (+{boost:.2f})"
@@ -2714,7 +3949,9 @@ def chunk_citation_snapshots(chunks: list[dict[str, Any]]) -> list[dict[str, Any
                 "chunk_id": str(chunk.get("chunk_id") or ""),
                 "document_id": str(chunk.get("document_id") or ""),
                 "origin_node_id": chunk.get("origin_node_id"),
-                "logical_source_key": str(chunk.get("logical_source_key") or chunk.get("source_path") or ""),
+                "logical_source_key": str(
+                    chunk.get("logical_source_key") or chunk.get("source_path") or ""
+                ),
                 "content_hash": str(chunk.get("content_hash") or ""),
                 "heading_path": chunk.get("heading_path") or "",
                 "text": str(chunk.get("text") or ""),
@@ -2723,7 +3960,9 @@ def chunk_citation_snapshots(chunks: list[dict[str, Any]]) -> list[dict[str, Any
     return snapshots
 
 
-def wiki_page_citation_snapshots(wiki_pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def wiki_page_citation_snapshots(
+    wiki_pages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     snapshots: list[dict[str, Any]] = []
     for page in wiki_pages:
         snapshots.append(
@@ -2774,7 +4013,9 @@ def build_retrieval_debug(
     }
     if debug:
         payload["fanout"] = fanout_debug
-        payload["reranked_candidates"] = summarize_ranked_chunks(reranked_chunks, limit=30)
+        payload["reranked_candidates"] = summarize_ranked_chunks(
+            reranked_chunks, limit=30
+        )
     else:
         payload["fanout_counts"] = {
             "lexical": len(fanout_debug.get("lexical", [])),
@@ -2798,7 +4039,9 @@ def build_search_debug(
             "fused": len(fanout_debug.get("fused", [])),
             "candidates": len(fanout_debug.get("candidate_ids", [])),
         },
-        "selected_chunk_reasons": summarize_ranked_chunks(selected_chunks, limit=len(selected_chunks)),
+        "selected_chunk_reasons": summarize_ranked_chunks(
+            selected_chunks, limit=len(selected_chunks)
+        ),
         "suppressed_chunk_reasons": summarize_ranked_chunks(
             [row for row in reranked_chunks if row.get("suppressed")],
             limit=8,
@@ -2806,11 +4049,15 @@ def build_search_debug(
     }
     if debug:
         payload["fanout"] = fanout_debug
-        payload["reranked_candidates"] = summarize_ranked_chunks(reranked_chunks, limit=30)
+        payload["reranked_candidates"] = summarize_ranked_chunks(
+            reranked_chunks, limit=30
+        )
     return payload
 
 
-def summarize_ranked_chunks(chunks: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+def summarize_ranked_chunks(
+    chunks: list[dict[str, Any]], limit: int
+) -> list[dict[str, Any]]:
     return [
         {
             "chunk_id": row.get("chunk_id"),
@@ -2836,7 +4083,9 @@ def normalize_lineage_target(target_type: str, target_id: str) -> tuple[str, str
     normalized_type = target_type.strip().lower()
     normalized_id = target_id.strip()
     if normalized_type not in {"memory", "chunk", "document", "wiki_page", "fact"}:
-        raise ValueError("target_type must be one of memory, chunk, document, wiki_page, or fact")
+        raise ValueError(
+            "target_type must be one of memory, chunk, document, wiki_page, or fact"
+        )
     if normalized_type == "document" and normalized_id.startswith("document:"):
         normalized_id = normalized_id.split(":", 1)[1]
     if not normalized_id:
@@ -2920,7 +4169,50 @@ def sqlite_table_exists(conn: Any, table: str) -> bool:
     )
 
 
-def row_to_retrieval_fact(row: Any, score: float, *, fts_score: float | None = None) -> dict[str, Any]:
+def retention_cutoff_iso(older_than_days: int) -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
+
+
+def sqlite_storage_report(sqlite_path: Path) -> dict[str, Any]:
+    related_paths = [
+        sqlite_path,
+        sqlite_path.with_name(f"{sqlite_path.name}-wal"),
+        sqlite_path.with_name(f"{sqlite_path.name}-shm"),
+    ]
+    report: dict[str, Any] = {
+        "sqlite_path": str(sqlite_path),
+        "sqlite_related_bytes": sum(path_size(path) for path in related_paths),
+        "files": {
+            path.name: path_size(path) for path in related_paths if path.exists()
+        },
+        "page_size": None,
+        "page_count": None,
+        "freelist_count": None,
+        "freelist_bytes": None,
+    }
+    if not sqlite_path.exists():
+        return report
+    try:
+        with connection(sqlite_path) as conn:
+            page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+            page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+            freelist_count = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+        report.update(
+            {
+                "page_size": page_size,
+                "page_count": page_count,
+                "freelist_count": freelist_count,
+                "freelist_bytes": page_size * freelist_count,
+            }
+        )
+    except Exception as exc:
+        report["error"] = str(exc)
+    return report
+
+
+def row_to_retrieval_fact(
+    row: Any, score: float, *, fts_score: float | None = None
+) -> dict[str, Any]:
     from .wiki_facts import row_to_fact
 
     fact = row_to_fact(row)
@@ -2961,10 +4253,9 @@ def score_retrieval_fact_for_query(
         return None
     if specific_terms and not specific_matches and len(matches) < 2:
         return None
-    if (
-        legacy_wiki_backfill_fact_without_spans(fact)
-        and len(matches) < legacy_wiki_backfill_required_match_count(terms)
-    ):
+    if legacy_wiki_backfill_fact_without_spans(fact) and len(
+        matches
+    ) < legacy_wiki_backfill_required_match_count(terms):
         return None
 
     confidence = float(fact.get("truth_confidence") or fact.get("confidence") or 0.0)
@@ -3046,6 +4337,43 @@ def suppress_chunks_covered_by_facts(
     ]
 
 
+def open_question_row_to_context(row: Any) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "kind": row["kind"],
+        "entity_key": row["entity_key"],
+        "page_hint": row["page_hint"],
+        "fact_ids": loads(row["fact_ids"], []),
+        "question": row["question"],
+        "options": loads(row["options"], []),
+        "status": row["status"],
+        "answer": loads(row["answer"], None),
+        "context": loads(row["context"], {}),
+        "action_id": row_value(row, "action_id"),
+        "recommended_action": loads(row_value(row, "recommended_action"), {}),
+        "auto_resolve_after": row_value(row, "auto_resolve_after"),
+        "risk_tier": row_value(row, "risk_tier"),
+        "resolver": row_value(row, "resolver"),
+        "decided_by": row_value(row, "decided_by"),
+        "created_at": row["created_at"],
+        "answered_at": row["answered_at"],
+    }
+
+
+def row_value(row: Any, key: str, default: Any = None) -> Any:
+    try:
+        if hasattr(row, "keys") and key not in row.keys():
+            return default
+        value = row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+    return default if value is None else value
+
+
+def _descending_text_sort_key(value: str) -> tuple[int, ...]:
+    return tuple(-ord(char) for char in value)
+
+
 def fact_citation_snapshots(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     snapshots: list[dict[str, Any]] = []
     for fact in facts:
@@ -3109,7 +4437,9 @@ def lineage_decay(created_at: str, now: datetime) -> float:
     return 0.5 ** (age_days / LINEAGE_HALF_LIFE_DAYS)
 
 
-def lineage_reason_strings(reason_values: dict[str, float | int], capped_boost: float) -> list[str]:
+def lineage_reason_strings(
+    reason_values: dict[str, float | int], capped_boost: float
+) -> list[str]:
     reasons: list[str] = []
     for event_type in ["explicit_useful", "explicit_not_useful", "agent_referenced_id"]:
         value = float(reason_values.get(event_type, 0.0))
@@ -3118,7 +4448,14 @@ def lineage_reason_strings(reason_values: dict[str, float | int], capped_boost: 
             continue
         label = event_type.replace("_", " ")
         reasons.append(f"lineage {label} x{count} ({value:+.2f})")
-    total = sum(float(reason_values.get(event_type, 0.0)) for event_type in ["explicit_useful", "explicit_not_useful", "agent_referenced_id"])
+    total = sum(
+        float(reason_values.get(event_type, 0.0))
+        for event_type in [
+            "explicit_useful",
+            "explicit_not_useful",
+            "agent_referenced_id",
+        ]
+    )
     if abs(total - capped_boost) > 0.01:
         reasons.append(f"lineage capped tie-breaker ({capped_boost:+.2f})")
     return reasons or [f"lineage tie-breaker ({capped_boost:+.2f})"]
@@ -3146,7 +4483,9 @@ def document_text_path(document: dict[str, Any]) -> Path | None:
 def remove_mirror_index_documents(conn: Any, raw_root: Path) -> list[str]:
     raw_root = raw_root.resolve()
     stale_documents = []
-    for row in conn.execute("SELECT id, source_path FROM documents WHERE origin_node_id = 'mirror'"):
+    for row in conn.execute(
+        "SELECT id, source_path FROM documents WHERE origin_node_id = 'mirror'"
+    ):
         try:
             Path(str(row["source_path"])).resolve().relative_to(raw_root)
         except ValueError:
@@ -3169,7 +4508,9 @@ def remove_mirror_index_documents(conn: Any, raw_root: Path) -> list[str]:
     return stale_chunk_ids
 
 
-def remove_documents(conn: Any, document_rows: list[dict[str, Any]]) -> ReplacedDocuments:
+def remove_documents(
+    conn: Any, document_rows: list[dict[str, Any]]
+) -> ReplacedDocuments:
     if not document_rows:
         return ReplacedDocuments(0, [])
     document_ids = [row["id"] for row in document_rows]
@@ -3222,11 +4563,19 @@ def detect_source_type(path: Path) -> str | None:
     suffix = path.suffix.lower()
     if suffix == ".md":
         text = path.read_text(encoding="utf-8", errors="replace")[:2000].lower()
-        if re.search(r"source_type:\s*['\"]?hyprnote_meeting", text) or "/documents/hyprnote/" in str(path):
+        if re.search(
+            r"source_type:\s*['\"]?hyprnote_meeting", text
+        ) or "/documents/hyprnote/" in str(path):
             return "hyprnote_meeting"
-        if re.search(r"source_type:\s*['\"]?agent_session_log", text) or "/agent_logs/" in str(path):
+        if re.search(
+            r"source_type:\s*['\"]?agent_session_log", text
+        ) or "/agent_logs/" in str(path):
             return "agent_session_log"
-        return "agent_session_log" if "commands" in text and "outcome" in text else "markdown_note"
+        return (
+            "agent_session_log"
+            if "commands" in text and "outcome" in text
+            else "markdown_note"
+        )
     if suffix == ".txt":
         return "meeting_transcript"
     if suffix in {".json", ".jsonl"}:
@@ -3260,7 +4609,9 @@ def stable_lineage_references(text: str) -> list[tuple[str, str, str]]:
     for chunk_id in re.findall(r"\bchunk_[A-Za-z0-9_]+\b", text):
         references.append(("chunk", chunk_id, chunk_id))
     for document_source_id in re.findall(r"\bdocument:doc_[A-Za-z0-9_]+\b", text):
-        references.append(("document", document_source_id.split(":", 1)[1], document_source_id))
+        references.append(
+            ("document", document_source_id.split(":", 1)[1], document_source_id)
+        )
     for document_id in re.findall(r"\bdoc_[A-Za-z0-9_]+\b", text):
         references.append(("document", document_id, document_id))
     wiki_pattern = re.compile(
@@ -3317,7 +4668,11 @@ def record_agent_log_lineage_references(
             agent_session_id=session_id,
             query=None,
             weight=LINEAGE_EVENT_WEIGHTS["agent_referenced_id"],
-            metadata={"document_id": document_id, "source_id": f"document:{document_id}", "referenced_id": original},
+            metadata={
+                "document_id": document_id,
+                "source_id": f"document:{document_id}",
+                "referenced_id": original,
+            },
             created_at=created_at,
         )
         created += 1
@@ -3332,16 +4687,43 @@ def refresh_existing_document_metadata(
     path: Path,
     origin_node_id: str,
     logical_source_key: str,
+    *,
+    source_mtime_ns: int | None = None,
+    source_size: int | None = None,
 ) -> None:
     conn.execute(
         """
         UPDATE documents
-        SET source_type = ?, title = ?, source_path = ?, origin_node_id = ?, logical_source_key = ?
+        SET source_type = ?, title = ?, source_path = ?, origin_node_id = ?, logical_source_key = ?,
+            source_mtime_ns = ?, source_size = ?
         WHERE id = ?
         """,
-        (source_type, title, str(path), origin_node_id, logical_source_key, document_id),
+        (
+            source_type,
+            title,
+            str(path),
+            origin_node_id,
+            logical_source_key,
+            source_mtime_ns,
+            source_size,
+            document_id,
+        ),
     )
     update_chunk_retrieval_title(conn, document_id, title)
+
+
+def existing_document_matches_source_stats(
+    document: Any,
+    *,
+    source_mtime_ns: int,
+    source_size: int,
+) -> bool:
+    return (
+        document["source_mtime_ns"] is not None
+        and document["source_size"] is not None
+        and int(document["source_mtime_ns"]) == source_mtime_ns
+        and int(document["source_size"]) == source_size
+    )
 
 
 def reciprocal_rank_fusion(*rankings: list[str], k: int = 60) -> list[str]:
@@ -3349,7 +4731,12 @@ def reciprocal_rank_fusion(*rankings: list[str], k: int = 60) -> list[str]:
     for ranking in rankings:
         for rank, chunk_id in enumerate(ranking, start=1):
             scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (k + rank)
-    return [chunk_id for chunk_id, _ in sorted(scores.items(), key=lambda item: item[1], reverse=True)]
+    return [
+        chunk_id
+        for chunk_id, _ in sorted(
+            scores.items(), key=lambda item: item[1], reverse=True
+        )
+    ]
 
 
 def build_fts_query(query: str) -> str:
@@ -3433,7 +4820,11 @@ def important_query_terms(query: str) -> list[str]:
 
 
 def specific_query_terms(query: str) -> list[str]:
-    return [term for term in important_query_terms(query) if term not in BROAD_RETRIEVAL_TERMS]
+    return [
+        term
+        for term in important_query_terms(query)
+        if term not in BROAD_RETRIEVAL_TERMS
+    ]
 
 
 def required_specific_hit_count(specific_terms: list[str]) -> int:
@@ -3448,7 +4839,10 @@ def contains_query_term(haystack: str, term: str) -> bool:
     if not haystack or not term:
         return False
     if len(term) <= 3:
-        return re.search(rf"(?<![A-Za-z0-9_]){re.escape(term)}(?![A-Za-z0-9_])", haystack) is not None
+        return (
+            re.search(rf"(?<![A-Za-z0-9_]){re.escape(term)}(?![A-Za-z0-9_])", haystack)
+            is not None
+        )
     return term in haystack
 
 
@@ -3457,7 +4851,9 @@ def terms_in_text(terms: list[str], haystack: str) -> list[str]:
     return sorted({term for term in terms if contains_query_term(lowered, term)})
 
 
-def anchor_query_terms(terms: list[str], chunks: list[dict[str, Any]], agent_query: bool = False) -> list[str]:
+def anchor_query_terms(
+    terms: list[str], chunks: list[dict[str, Any]], agent_query: bool = False
+) -> list[str]:
     anchors: list[str] = []
     for term in terms:
         if term in GENERIC_BUSINESS_TERMS or len(term) < 4:
@@ -3487,13 +4883,18 @@ def is_agent_query(terms: list[str]) -> bool:
 def has_recency_intent(query: str, terms: list[str]) -> bool:
     lowered = query.lower()
     raw_terms = {term.lower() for term in re.findall(r"[A-Za-z0-9_]+", query)}
-    return bool(set(terms).intersection(RECENCY_INTENT_TERMS) or raw_terms.intersection(RECENCY_INTENT_TERMS)) or any(
-        phrase in lowered for phrase in ["this week", "last week", "last month"]
-    )
+    return bool(
+        set(terms).intersection(RECENCY_INTENT_TERMS)
+        or raw_terms.intersection(RECENCY_INTENT_TERMS)
+    ) or any(phrase in lowered for phrase in ["this week", "last week", "last month"])
 
 
 def first_section(markdown: str, heading: str) -> str:
-    match = re.search(rf"^##\s+{re.escape(heading)}\s*\n+(.*?)(?=^##\s+|\Z)", markdown, flags=re.MULTILINE | re.DOTALL)
+    match = re.search(
+        rf"^##\s+{re.escape(heading)}\s*\n+(.*?)(?=^##\s+|\Z)",
+        markdown,
+        flags=re.MULTILINE | re.DOTALL,
+    )
     if not match:
         return ""
     return re.sub(r"\s+", " ", match.group(1)).strip()
