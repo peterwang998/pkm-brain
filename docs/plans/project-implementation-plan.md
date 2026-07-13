@@ -1,7 +1,7 @@
 # Project Improvement Implementation Plan
 
-**Status:** execution in progress; R1-R4 complete, R5/R6 partially complete in release `0.1.3`
-**Last verified:** 2026-07-13 against release `0.1.3` code snapshot `10cf00d`
+**Status:** execution in progress; R1-R4 complete, R5/R6 partially complete in release `0.1.4`
+**Last verified:** 2026-07-13 against release `0.1.4` code snapshot `f89c70d`
 **Inputs:** [Project Audit](../audits/project-audit-2026-07-10.md) and the six [canonical feature specs](../README.md)
 
 ## Objective
@@ -179,6 +179,8 @@ Implementation checkpoint, 2026-07-13:
 - implemented: stale unapplied entity merges with a now-inactive source or destination are excluded from Queue rows/counts instead of resurfacing under Needs Repair;
 - implemented: Hyprnote capture restores true multi-channel chronology with stable speaker labels, explicitly groups legacy synthetic-clock tracks, suppresses metadata-only placeholders, and carries speaker identity through evidence units;
 - implemented: fact critic review distinguishes unsupported statements from incomplete evidence packets, performs one bounded citation union plus fresh review, falls back from malformed entity disambiguation, and isolates parallel action failures;
+- implemented: compatible gardener-confirmed near-duplicate page merges use a size-independent L2 critic/full-audit rule outside Review First, while failed/high-risk judgments and all hard boundaries remain L3;
+- implemented: provider-level token accounting records timestamped extractor/evaluator/auditor and gardener usage, cached input, reasoning output, retries/fallbacks, and unreported requests; nightly, CoS, CLI, and topology-maintenance summaries share run IDs;
 - verified: the incremental approved W2a pass resolved 19 later candidates with zero failures and annotated 51 survivors, leaving the live deduplicated Queue at 230 actionable and 0 blocked;
 - verified: the pairwise-v2 apply released all 82 active fact-conflict cards, including 6 resolver-confirmed coexistence cases, and found no missing candidate payloads; the audit-demoted L3 policy retained the released candidates as Policy reviews rather than allowing a policy bypass;
 - verified: restored More Autonomy policy v12 reclassified all 167 active Policy questions as L2; normal critic/ledger reconciliation applied 104 facts plus one synthesis, rejected 62 candidates, left zero Policy questions, and passed SQLite integrity with an exact +104 fact delta;
@@ -194,6 +196,9 @@ Implementation checkpoint, 2026-07-13:
 - implemented: critic calls remain parallel while policy/fact writes finalize serially, malformed extractor windows remain retryable without aborting nightly, and Sol auditor cards/requests have explicit size and batch ceilings with isolated failure;
 - verified: `0.1.3` production nightly `automation_7b91433093b14d52` completed successfully; all 25 sampled audits recorded (16 OK, 9 bad), only one remained currently reviewable, and the live Queue contained eight actionable items with zero Inbox residue;
 - verified: final `0.1.3` gates pass 495 Python tests, 17 Swift tests, full Ruff, release build/install, embedded runtime `0.1.3-762bf645-d32ae09d`, and dark-mode Today screenshot inspection;
+- verified: policy v17 rechecked five remaining duplicate-page proposals, gardener-rejected two false duplicates, critic-routed three L2 actions, applied two and rejected one, left zero open topology proposals, and completed with zero failures;
+- verified: the first instrumented topology pass recorded 11 Luna-medium requests and 138,773 total tokens (98,560 cached input): evaluator 75,888 across six requests and gardener 62,885 across five requests;
+- verified: `0.1.4` gates pass 500 Python tests, 17 Swift tests, the module-growth ratchet, full Ruff, release build/install, and healthy schema-21 runtime `0.1.4-762bf645-828bfe17`;
 - remaining in R1: maintenance audit/report, historical comparison migration, automated overlap/state tests, and the full signed keyboard/light/dark/minimum-width acceptance matrix.
 
 ### TRUST-1 - One Queue Summary Contract

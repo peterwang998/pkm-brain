@@ -1,7 +1,7 @@
 # Implementation Stream History
 
 **Status:** compact historical summary
-**Last verified:** 2026-07-13 against release `0.1.3` snapshot `10cf00d`
+**Last verified:** 2026-07-13 against release `0.1.4` snapshot `f89c70d`
 
 This file preserves the durable outcomes of earlier implementation-stream specs without retaining thousands of lines of completed phase instructions. Full prior documents remain in git history.
 
@@ -85,6 +85,8 @@ This file preserves the durable outcomes of earlier implementation-stream specs 
 - Fresh topology reconciliation dropped the old Decagon Labs/Decagon name-containment proposal after finding plausible distinct scope, retained one high-risk Peter page merge, and produced no deferred topology residue.
 - Production acceptance exposed and fixed three independent nightly faults: a 1.79-million-character auditor request, parallel critic workers competing during fact writes, and one malformed extractor window aborting the stage. Auditor cards now cap at 48,000 characters and batches at eight actions/180,000 characters; critic calls remain parallel but writes finalize serially; malformed provider output records an invalid retryable watermark.
 - Nightly run `automation_7b91433093b14d52` then completed successfully. Sol-medium audited all 25 samples in four batches (16 OK, 9 bad), state-aware review retained one applicable finding, and the live Queue measured eight actionable items with zero Inbox residue.
+- Policy v17 added a narrow L2 critic/full-audit path for compatible gardener-confirmed duplicate-page merges, without weakening Review First, cross-type, contract, truth-mutation, failed-judgment, or critic boundaries. Reconciliation rechecked five remaining proposals, gardener-rejected two false duplicates, applied two of three critic-routed actions, rejected one, and left zero open topology proposals.
+- Release `0.1.4` added append-only provider token accounting in `logs/llm-usage.log`, per-cycle/role CLI and automation summaries, cached/uncached token separation, and explicit unreported-request counts. The first measured topology pass used 138,773 total tokens across 11 Luna-medium requests: 75,888 evaluator tokens and 62,885 gardener tokens, with 98,560 input tokens served from cache.
 
 ## Superseded Audit Items
 

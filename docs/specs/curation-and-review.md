@@ -1,7 +1,7 @@
 # Curation And Review
 
 **Status:** canonical living feature spec
-**Last verified:** 2026-07-13 against release `0.1.3` code snapshot `10cf00d`
+**Last verified:** 2026-07-13 against release `0.1.4` code snapshot `f89c70d`
 **Owns:** Chief-of-Staff roles, action/policy/audit flow, fact relations, review Queue, autonomy settings, and review-volume controls
 
 ## Operating Model
@@ -51,6 +51,14 @@ These are deployment settings, not hard-coded product requirements. Role config 
 The provider doctor reports same-provider/model warnings for the current critic versus all Luna proposer roles. Critic separation is therefore role/prompt/process-level, not model-independent. The Sol auditor remains model-separated. This is an explicit cost/independence tradeoff to resolve before claiming independent critic judgment.
 
 Model/effort changes require provider smoke tests and the owning eval suite, not a fact rebuild by default.
+
+### LLM Usage Accounting
+
+Every configured provider request records best-available token usage in `<brain-home>/logs/llm-usage.log` as append-only JSONL. Each event carries start/finish time, duration, cycle/run ID, pipeline stage, role, provider, model, reasoning effort, status, and reported input, cached-input, uncached-input, output, reasoning-output, and total tokens. The user-facing `evaluator` category aggregates the internal `critic` role. Extractor and auditor retain their role names; gardener and other instrumented roles are also reported.
+
+Codex runs use `codex exec --json` and parse the CLI's final token event. OpenAI, Anthropic, and Ollama use their response usage fields. A timeout or provider response without usage still records an unreported request so request counts do not silently look complete. Telemetry write or parse failure never blocks curation.
+
+`brain llm usage --home <brain-home> [--limit N] [--cycle-id ID]` returns selected-window totals, role totals, and individual cycles. Nightly and explicit `brain cos run` summaries include the same `llm_usage` object. One top-level run ID groups extractor, evaluator, gardener, and auditor calls from a cycle; direct topology reconciliation also creates and returns a shared maintenance run ID.
 
 ## Deterministic Mechanics, Gated Judgment
 
@@ -270,6 +278,8 @@ Hard boundaries do not move: contradictions, missing quote, invalid/fallback rou
 
 Topology size has a separate `topology_review_threshold`, validated from 4 through 200 affected facts/pages and defaulting to 8. At or above the configured threshold, ordinary page/entity topology is classified high risk and forced to L3 review. Raising the threshold lets confidence-qualified, reversible, same-type topology below that size continue through the normal L1/L2 critic and sampled-audit path; it does not bypass contradictions, cross-type work, failed gates, critic rejection, or minimum-confidence policy. Low-risk reversible topology has an explicit L2 critic rule so it cannot fall through to the default L3 rule merely because its gardener risk is lower than the older medium-risk topology rule. Each future gardener candidate records the threshold used so its risk decision remains auditable.
 
+One deliberately narrow exception handles the exact `near-duplicate page hints with overlapping fact evidence` merge signal in Balanced or More Autonomy mode. It is eligible for L2 regardless of size only when contracts are compatible, no cross-type/entity or truth-mutation flag is present, the operation is reversible, and a successful gardener judgment explicitly keeps it at low or medium risk. It still requires critic agreement and 100% sampled audit. Review First, malformed/failed gardener output, high-risk gardener judgment, incompatible contracts, and any hard-boundary flag remain L3. Gardener JSON gets one bounded repair attempt before a failed judgment is surfaced.
+
 The same endpoint exposes independent `merge_aggressiveness` and `split_aggressiveness` values from 0.0 through 1.0. The native Settings view combines them into one Topology Bias slider: Prefer Splits on the left, Balanced in the center, and Prefer Merges on the right. Moving right raises merge admission and lowers split admission by the same amount; moving left does the inverse. Existing non-complementary API/config values are summarized into a bias for display and are not rewritten until the reviewer moves and applies the control. These values change deterministic candidate admission only, not whether an admitted action may auto-apply.
 
 Anchor behavior is:
@@ -287,11 +297,11 @@ Applying the topology-bias control writes the underlying merge/split values to l
 
 Changing the topology review threshold writes local config and appends a policy version carrying the new size boundary. It affects only candidates proposed/decided by future gardener jobs and does not rerun the gardener or reclassify the existing Queue. Changing mode, bias, and threshold together creates at most one new policy version for the mode/threshold state.
 
-`brain cos reconcile-topology` is the explicit repair path for old merge/split proposals; it remains separate from the Settings write. Dry-run mode groups open rows by deterministic `candidate_key`, reports duplicates, and compares each unique candidate with current page/entity evidence and current topology settings. Apply mode retires no-longer-admitted candidates, reruns gardener judgment for survivors, prefers non-overlapping merges over splits touching the same page, refreshes one canonical action per candidate, dismisses duplicate rows, and sends every survivor through the current policy and critic path. Topology at or above the configured review threshold remains L3 human-review work.
+`brain cos reconcile-topology` is the explicit repair path for old merge/split proposals; it remains separate from the Settings write. Dry-run mode groups open rows by deterministic `candidate_key`, reports duplicates, and compares each unique candidate with current page/entity evidence and current topology settings. Apply mode retires no-longer-admitted candidates, reruns gardener judgment for survivors, prefers non-overlapping merges over splits touching the same page, refreshes one canonical action per candidate, dismisses duplicate rows, and sends every survivor through the current policy and critic path. Apply mode creates one maintenance run ID, stamps refreshed actions with it, and returns that cycle's LLM usage summary. Ordinary topology at or above the configured review threshold remains L3 human-review work; only the confirmed duplicate-page exception above may remain L2.
 
 New gardener runs use the same sequence. Deterministic admission is followed by per-candidate gardener judgment and merge-first overlap arbitration; `shadow=False` proposals are policy-decided instead of being left as unclassified `proposed` rows. Page topology actions use a report-backed `{"suite": "topology"}` eval gate rather than a caller-supplied failed gate.
 
-The live setting verified for `0.1.3` is More Autonomy, floor 0.60, merge admission 0.80, split admission 0.20, and a topology review threshold of 32. Policy v16 includes the reversible resolver-validated rehome rule; the internal policy version remains diagnostic state rather than a user-facing setting.
+The live setting verified for `0.1.4` is More Autonomy, floor 0.60, merge admission 0.80, split admission 0.20, and a topology review threshold of 32. Policy v17 retains the reversible resolver-validated rehome rule and adds the confirmed duplicate-page L2 rule; the internal policy version remains diagnostic state rather than a user-facing setting.
 
 ## Review Volume
 
@@ -313,7 +323,7 @@ Queue summaries expose active/actionable/blocked/deferred totals, per-group/raw-
 
 The July 13 legacy Inbox migration judged all 209 W2b facts with source identity, sibling routes, and active destinations; 187 used existing pages, one fuzzy-snapped to an existing page, and 21 proposed canonical pages. All 209 rehomes auto-applied under policy v16, the 11 opaque batch cards closed, and no synthetic or human routing residue remained. A complete route audit then corrected one cross-company semantic error and consolidated avoidable Snowflake, Greylock, and Orchid fragmentation through reversible rehomes before Wiki projection. The repaired resolver subsequently routed the final standalone Maestro/Dagobah fact to its same-source Netflix data-product page, where the critic agreed. A genuinely absent durable destination remains eligible for one canonical-page proposal, as in the Netflix PM interview preparation case; it is not forced into an unrelated existing page.
 
-Final `0.1.3` live acceptance completed nightly run `automation_7b91433093b14d52` successfully. Its Sol-medium auditor judged all 25 sampled actions in four bounded batches (16 OK, 9 bad); state-aware admission retained only one applicable audit finding. The actionable Queue measured eight items: one audit and seven high-risk topology/rehome decisions, with zero Inbox residue.
+The latest live acceptance chronology, including the policy-v17 topology reconciliation and first measured token totals, lives in [Implementation Stream History](../archive/implementation-stream-history.md).
 
 ## Pending Controls
 

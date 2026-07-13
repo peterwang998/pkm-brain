@@ -1,7 +1,7 @@
 # App And Operations
 
 **Status:** canonical living feature spec; native app is primary and browser UI is an off-by-default fallback
-**Last verified:** 2026-07-13 against release `0.1.2` code snapshot `42c44c7`
+**Last verified:** 2026-07-13 against release `0.1.4` code snapshot `f89c70d`
 **Owns:** daemon, scheduler, connector operations, native/browser UI, settings, provisioning, packaging, migration, and operational retention
 
 ## Product Shape
@@ -205,6 +205,8 @@ Target Ops consolidates:
 - runtime versions, diagnostics, and prune dry-run.
 
 Current native Ops has segmented Scheduler, Runs, Connectors, and Storage views. It supports job run-now, pause/resume, automation/ingestion history, connector enable/disable/run, active/deferred review counts, and managed/runtime/backup storage inventory through `GET /api/ops/storage`. Action-ledger revert, policy/audit/contracts, index doctor, sync, and logs still require native sections.
+
+Provider usage accounting is available operationally before the native Logs section: request events append to `<brain-home>/logs/llm-usage.log`, nightly/CoS summaries include cycle usage, and `brain llm usage` reports timestamped per-cycle and per-role totals. The report distinguishes extractor, evaluator (internal critic), auditor, and any additional instrumented role, including cached versus uncached input and requests whose provider did not report tokens.
 
 In-app explanatory copy should not substitute for controls or status. The final Ops view should expose the action directly and keep raw JSON/log detail behind disclosure.
 
