@@ -74,7 +74,7 @@ class PolicyDecision:
 def evaluate_policy(
     conn: Any, action_type: str, action_features: dict[str, Any] | None
 ) -> PolicyDecision:
-    features = action_features or {}
+    features = inferred_policy_features(action_features or {})
     flat = flatten_features(features)
     for rule in active_policy_rules(conn):
         action_types = loads(rule["match_action_types"], ["*"])
@@ -341,6 +341,20 @@ def flatten_features(
     return result
 
 
+def inferred_policy_features(features: dict[str, Any]) -> dict[str, Any]:
+    inferred = dict(features)
+    inferred.setdefault(
+        "confidence_defaulted",
+        str(inferred.get("candidate_signal") or "") == "source_extraction"
+        and bool(inferred.get("clean_fact_upsert"))
+        and bool(inferred.get("quote_backed"))
+        and inferred.get("extraction_confidence") is None
+        and inferred.get("truth_confidence") == 0.5
+        and inferred.get("confidence") == 0.5,
+    )
+    return inferred
+
+
 def classify_action_risk(
     action_type: str,
     action_features: dict[str, Any] | None,
@@ -349,7 +363,7 @@ def classify_action_risk(
     large_topology_fact_threshold: int = 8,
 ) -> str:
     explicit = normalize_risk_tier(explicit_risk_tier)
-    features = action_features or {}
+    features = inferred_policy_features(action_features or {})
     topology_threshold = (
         int_or_zero(features.get("topology_review_threshold"))
         or large_topology_fact_threshold
@@ -553,6 +567,33 @@ def autonomy_policy_rows(
         low_action_types -= ENTITY_FACT_ACTION_TYPES
         medium_action_types -= ENTITY_FACT_ACTION_TYPES
     rows = [
+        *(
+            [
+                policy_row(
+                    version,
+                    "fact_upsert_legacy_confidence_l2",
+                    4,
+                    ["fact_upsert"],
+                    {
+                        "eq": {
+                            "confidence_defaulted": True,
+                            "clean_fact_upsert": True,
+                            "quote_backed": True,
+                            "fallback_route": False,
+                            "resolver_precheck": "passed",
+                            "reversible": True,
+                            "truth_mutation": False,
+                        }
+                    },
+                    "L2",
+                    True,
+                    1.0,
+                    created_at,
+                )
+            ]
+            if normalized_strictness != "strict"
+            else []
+        ),
         policy_row(
             version,
             "high_risk_l3",
@@ -627,6 +668,33 @@ def autonomy_policy_rows(
             False,
             0.05,
             created_at,
+        ),
+        *(
+            [
+                policy_row(
+                    version,
+                    "validated_rehome_l1",
+                    24,
+                    ["rehome_fact"],
+                    confidence_bound_predicate(
+                        {
+                            "eq": {
+                                "risk_tier": "low",
+                                "route_resolution_validated": True,
+                                "reversible": True,
+                                "truth_mutation": False,
+                            }
+                        },
+                        minimum_auto_confidence,
+                    ),
+                    "L1",
+                    False,
+                    0.25,
+                    created_at,
+                )
+            ]
+            if normalized_strictness != "strict"
+            else []
         ),
         policy_row(
             version,

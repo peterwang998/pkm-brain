@@ -1688,6 +1688,12 @@ def test_v2_queue_route_candidates_exclude_internal_and_nonsemantic_pages(
         title=CODEX_PROVIDER_PROMPT_PREFIX + " Review workflow routing details.",
         page_type="concept",
     )
+    write_routing_page(
+        paths,
+        relative_path="inbox/review-workflow.md",
+        title="Review Workflow Inbox Residue",
+        page_type="concept",
+    )
     lint_wiki(paths)
     insert_unrouted_question(
         paths,
@@ -3364,6 +3370,12 @@ def test_chief_of_staff_page_review_correction_and_revert_endpoint(
     assert applied["curation"]["pages"][0]["snapshot_id"].startswith("wikisnap_")
     assert review_status == 200
     assert review["snapshots"]
+    reviewed_fact = next(
+        fact for fact in review["facts"] if fact["id"] == "fact_ui_original"
+    )
+    assert reviewed_fact["source_date"] == "2026-05-25T00:00:00+00:00"
+    assert reviewed_fact["source_date_basis"] == "source_created_at"
+    assert reviewed_fact["source_documents"][0]["title"] == "Source Evidence"
     assert correction_status == 200
     assert correction["fact"]["confirmed_by_user"] is True
     assert correction["action"]["action_type"] == "fact_upsert"

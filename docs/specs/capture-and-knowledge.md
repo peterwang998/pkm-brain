@@ -154,6 +154,8 @@ Watermarks distinguish:
 
 Both `ok` and `extracted_empty` suppress unchanged re-extraction. `invalid` remains retryable.
 
+Each source window is an independent provider boundary. If the extractor still returns malformed or schema-incomplete JSON after its bounded retries, that window records an `extractor_provider_error`, contributes no candidates, and leaves the document watermark `invalid`; other windows and downstream nightly stages continue. Programming errors still fail the run rather than being mislabeled as model output.
+
 The v6 speaker-context prompt accepts terminal v5 watermarks for the same normalized content and extractor model. This preserves existing completed documents and prevents a prompt rollout from becoming an implicit whole-library rebuild; changed/new documents and explicit document-ID repair runs record v6 watermarks.
 
 ## Fact Ledger
@@ -190,12 +192,18 @@ Routing hints are selected per source window by relevance. Valid automatic desti
 - allow a new canonical path only after a duplicate check;
 - convert invalid/fallback destinations into unrouted residue.
 
+An invalid or fallback candidate receives one bounded second-stage resolver pass before it becomes human residue. The resolver sees source identity/date, ranked active destinations, routed sibling examples, and same-source route shares. It should prefer a plausible coherent sibling route, may create one concise canonical page when the source clearly establishes a missing durable topic, and uses human review only for material route ambiguity or insufficient topic/identity context. Route acceptance uses the active future-job autonomy floor: 0.95 in Review First, 0.80 in Balanced, and 0.60 in More Autonomy. Invalid paths, reference/inbox destinations, unknown claimed existing pages, omitted decisions, and malformed output still fail closed.
+
+Resolver model calls use compact batch-local indexes and resend the complete prompt after malformed JSON; schema-repair truncation may not remove routing cards. A named organization cannot be routed to another organization's company page, and a genuinely new organization subtopic collapses to the canonical company path unless an active topical/company namespace already exists. These deterministic checks constrain model judgment without forcing a same-source route when the fact clearly changes topic.
+
 After all windows for one document are extracted, high-confidence sibling routes provide a bounded document-coherence prior. Only facts routed at confidence 0.75 or greater contribute. The prior may reroute an invalid, fallback, or explicitly uncertain candidate below 0.65 when either:
 
 - at least two siblings and 60% of eligible sibling facts favor the page and the candidate has lexical support for it; or
 - a strong document prior has at least three siblings and a 75% share.
 
 The coherence bonus is capped at 6 ranking points. It is a preference, not an absolute rule: a valid high-confidence outlier remains on its own route, split-topic documents do not force a majority, and a fact may still route outside the document's dominant topic when its evidence says so. Reclaim and Inbox candidate ranking use the same active-fact prior, resolving source documents through fact metadata or chunk provenance. The UI identifies routes supported by sibling facts from the same source.
+
+Future extractor payloads must report extraction, routing, and truth confidence explicitly. Missing confidence is a validation failure with a bounded retry rather than a silent `0.5` assignment. Source time also comes from source provenance: event start, source creation, capture, and document-ledger dates precede any fact-level fallback, so extraction or reconciliation time cannot masquerade as the source date.
 
 The July 2 corrected shadow run routed 218 of 234 accepted facts to canonical pages, left 16 unrouted, and produced no reference/log destinations.
 

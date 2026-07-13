@@ -44,7 +44,7 @@ Provider roles are independently configured under `config/local/cos_llm.yaml`:
 | gardener | dispose page/entity topology candidates | `gpt-5.6-luna`, medium base; low/medium/xhigh per candidate |
 | synthesizer | optional derived page prose | `gpt-5.6-luna`, medium |
 | critic | independent pre-apply review | `gpt-5.6-luna`, medium |
-| auditor | sampled post-apply review | `gpt-5.6-sol`, xhigh; Luna fallback |
+| auditor | sampled post-apply review | `gpt-5.6-sol`, medium; Luna fallback |
 
 These are deployment settings, not hard-coded product requirements. Role config may select another supported provider. An unconfigured role skips cleanly.
 
@@ -80,7 +80,11 @@ The critic sees the source document identity, current citation, up to four adjac
 
 An `evidence_incomplete` result may name up to five omitted or replacement unit IDs from the repairable context. Deterministic code unions omitted IDs with the current citation, reconstructs exact spans and quote text, and runs one fresh critic review. Only a final `agree` may apply; a second incomplete result becomes disagreement. Repair metadata and both reviews remain in `evidence_json`.
 
-Fact application falls back to deterministic entity resolution when optional LLM entity disambiguation returns invalid output. Parallel critic batches isolate an unhandled worker failure to that action and mark it `failed` with diagnostic evidence rather than aborting unrelated settled actions.
+Fact application falls back to deterministic entity resolution when optional LLM entity disambiguation returns invalid output. Batch evaluation parallelizes read-only critic calls, then finalizes policy records and fact mutations serially so multiple workers cannot hold competing SQLite write transactions. A preparation or finalization failure is isolated to that action and recorded with diagnostic evidence rather than aborting unrelated settled actions.
+
+For non-fact actions, the critic receives the matched policy card as the authorization record. It judges whether evidence, targets, risk features, and payload satisfy that policy; it must not reject an action merely because the payload does not duplicate policy fields.
+
+Extractor confidence is explicit input, not a synthetic process default. Future LLM responses must include extraction, routing, and truth confidence; omission fails deterministic validation and receives a bounded retry. Historical quote-backed facts whose omitted confidence was previously stored as `0.5` are identified separately from genuinely low-confidence model output and may proceed only through the active legacy-confidence rule and critic.
 
 ## Policy And Risk
 
@@ -141,7 +145,8 @@ The Queue aggregates existing state; it is not another persistence layer. Source
 - policy-gated topology actions;
 - proposed memories;
 - sampled-bad audit actions;
-- batched unrouted inbox work.
+- individual unresolved routing residue;
+- legacy batched unrouted work until the batch reconciliation retires it.
 
 Every decision dispatches to the owning action, question, memory, or routing primitive and returns an undo/reopen handle when supported.
 
@@ -165,17 +170,21 @@ A reviewer must not leave the card to decide.
 - Entity merge: both names, aliases, statuses, fact counts, and merge direction before IDs.
 - Memory/audit/anomaly: content, scope/type, provenance, finding, and exact proposed effect. A topology audit also shows merge direction, current page/contract statuses, affected counts, and representative facts, including an explicit zero-fact state.
 
-Every fact card shows a labeled source date. `source_date` is the fact's `observed_at` when present; otherwise it is the newest source-document `captured_at`, `created_at`, or `ingested_at` timestamp in that order. The raw ISO timestamp remains inspectable, chunk provenance resolves to the owning document, and a missing date is shown explicitly rather than silently replaced with the Queue item's creation date.
+Every fact card shows a labeled source date. For a sourced fact, `source_date` prefers source-native `event_started_at`, then source-frontmatter `created_at`, then `captured_at`, then the document ledger's `created_at` and `ingested_at`. Fact `observed_at` is used only when no owning source date exists. Extraction stamps omitted `observed_at` from this same source-native hierarchy rather than the job clock. The raw ISO timestamp remains inspectable, chunk provenance resolves to the owning document, and a missing date is shown explicitly rather than silently replaced with the Queue item's creation date.
 
 A candidate-less candidate-versus-existing decision is invalid UI state. The server must either hydrate the candidate or mark the card non-approvable. Legacy `kind=conflict` groups are an explicit exception because they are symmetric comparisons: the Queue hydrates their untyped options and fact IDs into `alternatives`, labels the orientation `contested`, and never renders an empty Candidate panel.
 
 Unrouted route choices include only active semantic Wiki pages. `reference` and `index` page types, `references/*` and `agent_session_log/*` paths, `index.md` and `log.md`, malformed page types, and titles containing the internal Codex-provider prompt are excluded both when loading the route pool and when scoring final candidates. Returned route labels are whitespace-compacted and bounded to 120 characters. The native and browser custom-route fields load this same routable pool and offer substring matches over page titles and `.md` paths while preserving manual entry for a genuinely new destination.
+
+Before an unrouted fact reaches the Queue, deterministic full-pool matching runs first and a resolver then judges the remaining candidates in bounded batches. Coherent routes already used by facts from the same source are a strong but non-absolute prior. The resolver chooses an existing page, proposes one canonical new page for a clearly missing durable topic, or returns human residue only when materially different destinations remain equally plausible or source context cannot identify a safe topic. Its acceptance floor is the active future-job autonomy setting rather than a separate hard-coded threshold. Compact local indexes, complete-prompt retries, output-artifact rejection, cross-company mention guards, and canonical new-organization paths prevent transport failures or a fluent but contradictory company route from becoming human work or an automatic mutation. Resolver-confirmed or deterministic rehomes preserve the fact ID through reversible `rehome_fact` actions. Legacy W2b batch cards are reconciled through this same path and replaced only by individual true residue or policy review.
 
 ### Anomaly And Audit Semantics
 
 A `document_extraction_anomaly` is a document-level quality alert, not a proposed knowledge mutation. It identifies the source document, reviewed sample size, blocked count, and block rate. The default alert requires at least five critic-reviewed facts, avoiding noisy 3/3 samples; the local threshold remains configurable. Because it has no linked action, its valid decisions are Confirm Quality Issue, False Positive, and Later; the generic Approve path must never be shown or dispatched. Confirm Quality Issue records the compatible `acknowledged` disposition, while False Positive records `dismissed`; neither mutates facts or reruns extraction.
 
 An `audit_flagged` Queue item means the post-apply auditor sampled an already-applied action and marked it `sampled_bad`. The underlying action type remains visible for provenance. In particular, `audit_flagged fact_upsert` means an applied fact insert/update failed sampled audit; it is not a new fact proposal. The card shows the auditor rationale, the applied change, affected object counts, and enough current evidence to evaluate that change without opening another screen.
+
+Auditor input is explicitly bounded. Action cards are compacted to at most 48,000 characters, each request contains at most eight actions and 180,000 prompt characters, and a failed batch leaves only its actions unaudited while the audit returns `incomplete`. Successful batches continue and record normally; a provider transport failure cannot fail the entire nightly job.
 
 Audit admission is state-aware and is shared by Queue rows, Queue counts, and direct decision lookup:
 
@@ -282,7 +291,7 @@ Changing the topology review threshold writes local config and appends a policy 
 
 New gardener runs use the same sequence. Deterministic admission is followed by per-candidate gardener judgment and merge-first overlap arbitration; `shadow=False` proposals are policy-decided instead of being left as unclassified `proposed` rows. Page topology actions use a report-backed `{"suite": "topology"}` eval gate rather than a caller-supplied failed gate.
 
-The live setting verified on `0.1.2` is More Autonomy, floor 0.60, merge admission 0.80, split admission 0.20, and a topology review threshold of 32. The internal policy version remains diagnostic state rather than a user-facing setting.
+The live setting verified for `0.1.3` is More Autonomy, floor 0.60, merge admission 0.80, split admission 0.20, and a topology review threshold of 32. Policy v16 includes the reversible resolver-validated rehome rule; the internal policy version remains diagnostic state rather than a user-facing setting.
 
 ## Review Volume
 
@@ -301,6 +310,10 @@ Schema migration 21 adds a durable `review_admissions` ledger and bootstrap mark
 Admission priority currently orders group/risk deterministically. Retrieval popularity remains a user-selectable Queue sort, but an `impact x uncertainty` score is not yet persisted as the admission priority.
 
 Queue summaries expose active/actionable/blocked/deferred totals, per-group/raw-kind deferred counts, active limit, daily limit, and admissions used today. Today, menu bar, Queue, Ops, native, and browser clients consume the same server summary.
+
+The July 13 legacy Inbox migration judged all 209 W2b facts with source identity, sibling routes, and active destinations; 187 used existing pages, one fuzzy-snapped to an existing page, and 21 proposed canonical pages. All 209 rehomes auto-applied under policy v16, the 11 opaque batch cards closed, and no synthetic or human routing residue remained. A complete route audit then corrected one cross-company semantic error and consolidated avoidable Snowflake, Greylock, and Orchid fragmentation through reversible rehomes before Wiki projection. The repaired resolver subsequently routed the final standalone Maestro/Dagobah fact to its same-source Netflix data-product page, where the critic agreed. A genuinely absent durable destination remains eligible for one canonical-page proposal, as in the Netflix PM interview preparation case; it is not forced into an unrelated existing page.
+
+Final `0.1.3` live acceptance completed nightly run `automation_7b91433093b14d52` successfully. Its Sol-medium auditor judged all 25 sampled actions in four bounded batches (16 OK, 9 bad); state-aware admission retained only one applicable audit finding. The actionable Queue measured eight items: one audit and seven high-risk topology/rehome decisions, with zero Inbox residue.
 
 ## Pending Controls
 

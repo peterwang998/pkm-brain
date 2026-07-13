@@ -604,8 +604,8 @@ def critic_prompt(
         "when the statement remains unsupported, over-broad, misattributed, or contradictory after "
         "considering context. Document titles and participant lists are context, not proof of a substantive "
         "claim. Speaker identity context may establish attribution but cannot establish the claim itself. "
-        "For non-fact actions, require the "
-        "payload, targets, policy, and risk features to support safe application. Do not rewrite the action.\n\n"
+        "For non-fact actions, require the payload, targets, policy, and risk features to support safe application. "
+        "The Policy card is the matched authorization record; do not require the action payload to repeat policy fields or invent another requirement. Judge whether the evidence and targets satisfy it. Do not rewrite the action.\n\n"
         f"Action:\n{action_card}\n\nSource context:\n{source_context_card}\n\nPolicy:\n{policy_card}"
     )
 
@@ -698,9 +698,7 @@ def critic_fact_source_context(
     units_by_id = {str(unit["unit_id"]): unit for unit in units}
     cited_unit_ids = critic_fact_evidence_unit_ids(fact)
     cited_units = [
-        units_by_id[unit_id]
-        for unit_id in cited_unit_ids
-        if unit_id in units_by_id
+        units_by_id[unit_id] for unit_id in cited_unit_ids if unit_id in units_by_id
     ]
     cited_indexes = [int(unit["unit_index"]) for unit in cited_units]
     if cited_indexes:
@@ -759,11 +757,7 @@ def critic_fact_evidence_unit_ids(fact: dict[str, Any]) -> list[str]:
     if not isinstance(evidence_units, list):
         return []
     return stable_critic_repair_unit_ids(
-        [
-            unit.get("unit_id")
-            for unit in evidence_units
-            if isinstance(unit, dict)
-        ]
+        [unit.get("unit_id") for unit in evidence_units if isinstance(unit, dict)]
     )
 
 
@@ -851,7 +845,9 @@ def repair_fact_action_evidence(
     if not context or not context.get("available"):
         return {
             "status": "not_repaired",
-            "reason": str((context or {}).get("reason") or "source context unavailable"),
+            "reason": str(
+                (context or {}).get("reason") or "source context unavailable"
+            ),
         }
     original_unit_ids = critic_fact_evidence_unit_ids(
         (action_payload(action).get("fact") or {})
@@ -864,7 +860,9 @@ def repair_fact_action_evidence(
         for unit in context.get("repairable_units") or []
         if isinstance(unit, dict)
     }
-    invalid_ids = [unit_id for unit_id in repaired_unit_ids if unit_id not in repairable_ids]
+    invalid_ids = [
+        unit_id for unit_id in repaired_unit_ids if unit_id not in repairable_ids
+    ]
     if invalid_ids:
         return {
             "status": "not_repaired",
@@ -898,7 +896,9 @@ def rebuild_fact_action_evidence(
     if not repaired_unit_ids:
         return {"status": "not_repaired", "reason": "no evidence units provided"}
     with connection(paths.sqlite_path) as conn:
-        row = conn.execute("SELECT text FROM chunks WHERE id = ?", (chunk_id,)).fetchone()
+        row = conn.execute(
+            "SELECT text FROM chunks WHERE id = ?", (chunk_id,)
+        ).fetchone()
     if row is None:
         return {"status": "not_repaired", "reason": "repair chunk no longer exists"}
     resolved = resolve_evidence_unit_ids(

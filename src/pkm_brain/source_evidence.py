@@ -9,6 +9,37 @@ SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 TOKEN_SPAN_RE = re.compile(r"\S+")
 SPEAKER_LABEL_RE = re.compile(r"(?m)^(?P<speaker>Speaker \d+):[ \t]*")
 HEADING_RE = re.compile(r"(?m)^#{1,6}\s+")
+EXTRACTION_CONFIDENCE_FIELDS = (
+    "extraction_confidence",
+    "routing_confidence",
+    "truth_confidence",
+)
+
+
+def extraction_confidence_values(
+    item: dict[str, Any], *, require_all: bool
+) -> tuple[dict[str, float | None], list[str]]:
+    values: dict[str, float | None] = {}
+    errors: list[str] = []
+    for field in EXTRACTION_CONFIDENCE_FIELDS:
+        if field not in item:
+            if require_all:
+                errors.append(f"missing {field}")
+            legacy = item.get("confidence") if field == "truth_confidence" else None
+            values[field] = float(legacy) if legacy is not None else None
+            continue
+        try:
+            value = float(item[field])
+        except (TypeError, ValueError):
+            errors.append(f"{field} must be a number between 0 and 1")
+            values[field] = None
+            continue
+        if not 0.0 <= value <= 1.0:
+            errors.append(f"{field} must be between 0 and 1")
+        values[field] = value
+    if values["truth_confidence"] is None:
+        values["truth_confidence"] = 0.5
+    return values, errors
 
 
 def evidence_units_for_text(

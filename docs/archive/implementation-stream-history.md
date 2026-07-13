@@ -74,6 +74,18 @@ This file preserves the durable outcomes of earlier implementation-stream specs 
 - A missing low-risk topology policy rule had caused safe sub-threshold merges to fall through to default L3. Policy v14 added explicit L2 critic coverage without weakening size, cross-type, confidence, critic, or eval boundaries.
 - A dry-run-first live reconciliation inspected 26 merge candidates, closed 6 stale candidates, suppressed 1 overlap, rejected 2 through fresh gardener judgment, applied 13 through L2 critic review, retained 4 L3 decisions, and completed with zero failures. The resulting live Queue contained 65 total items.
 
+### July 13 - Source Dates And Inbox Autonomy
+
+- Queue fact dates now prefer source-native event start, source creation, capture, and document-ledger time before fact observation, preventing a July reprocessing timestamp from appearing as the date of an April Hightouch meeting.
+- Future extraction requires explicit extraction, routing, and truth confidence; historical clean quote-backed `0.5` defaults are handled by a separate critic-required policy rule rather than treated as genuine model uncertainty.
+- The second-stage route resolver gained same-source context, canonical-page creation, active autonomy floors, compact-index/full-prompt retries, malformed-output rejection, and named-organization route guards.
+- Policy v15 reconciled 22 historical confidence escalations: 12 applied and 10 were rejected by the normal critic path with no failures. Policy v16 then applied 209 reversible fact rehomes from 11 legacy Inbox batches, leaving no batch or individual routing residue.
+- A complete audit of the 209 routes corrected one Snowflake-to-Databricks semantic error and consolidated avoidable Snowflake, Greylock, and Orchid page fragmentation. Managed Wiki projection archived the superseded empty Snowflake culture page.
+- The repaired resolver then reclaimed the final standalone Maestro/Dagobah card into the same-source Netflix data-product page; critic review agreed, leaving the live actionable Queue with only two Peter/Peter-Wang topology merges.
+- Fresh topology reconciliation dropped the old Decagon Labs/Decagon name-containment proposal after finding plausible distinct scope, retained one high-risk Peter page merge, and produced no deferred topology residue.
+- Production acceptance exposed and fixed three independent nightly faults: a 1.79-million-character auditor request, parallel critic workers competing during fact writes, and one malformed extractor window aborting the stage. Auditor cards now cap at 48,000 characters and batches at eight actions/180,000 characters; critic calls remain parallel but writes finalize serially; malformed provider output records an invalid retryable watermark.
+- Nightly run `automation_7b91433093b14d52` then completed successfully. Sol-medium audited all 25 samples in four batches (16 OK, 9 bad), state-aware review retained one applicable finding, and the live Queue measured eight actionable items with zero Inbox residue.
+
 ## Superseded Audit Items
 
 The July 7 audit correctly identified packet bloat, duplicate citation fields, failed-nightly visibility, dead golden-query configuration, shallow memory audit, source re-hashing, monolithic modules, storage growth, and documentation sprawl.

@@ -1,6 +1,6 @@
 # Project Improvement Implementation Plan
 
-**Status:** execution in progress; R1-R4 complete, R5/R6 partially complete in release `0.1.2`
+**Status:** execution in progress; R1-R4 complete, R5/R6 partially complete in release `0.1.3`
 **Last verified:** 2026-07-13 against release `0.1.2` code snapshot `42c44c7`
 **Inputs:** [Project Audit](../audits/project-audit-2026-07-10.md) and the six [canonical feature specs](../README.md)
 
@@ -76,7 +76,7 @@ Relative sizes:
 | Rank | Build | Priority | Size | Definition of hit |
 |---:|---|---|---|---|
 | 1 | Queue truth and card safety | P0 | L | all count surfaces agree; no incomplete card is approvable; blocked repair work does not compete with the default backlog; historical conflicts support subset selection |
-| 2 | Fact source dates in review UI | P0 | S | every fact card shows its observed source date or an explicit provenance-date fallback |
+| 2 | Fact source dates in review UI | P0 | S | every fact card shows its source-native event/create/capture date, with fact observation only as a final fallback |
 | 3 | Native rendered acceptance harness | P0 | L | seven destinations, keyboard Queue, light/dark, accessibility run in CI |
 | 4 | Unified retention manager | P0 | M | every product-owned GB is classified; current+rollback retained; dry-run/commit proven |
 | 5 | Telemetry storage budget | P0 | L | payloads bounded, popularity/lineage preserved, copied DB materially shrinks |
@@ -161,7 +161,8 @@ Implementation checkpoint, 2026-07-13:
 - implemented: extraction anomalies use explicit Confirm Quality Issue / False Positive dispositions, and sampled-bad audits show the applied fact, auditor rationale, and explicit revert/keep effects;
 - implemented: one topology-bias control over inverse merge/page-split candidate admission for future gardener runs, with a balanced midpoint and no current-Queue rewrite;
 - implemented: pairwise contradiction plus resolver confirmation before conflict admission, with dry-run/apply reconciliation for historical conflict cards;
-- implemented: bounded same-document route coherence for uncertain extraction, reclaim, and Inbox suggestions without overriding explicit high-confidence outliers;
+- implemented: bounded same-document route coherence plus a second-stage route resolver that may choose an existing sibling destination or create a missing canonical topic without overriding explicit high-confidence outliers;
+- implemented: resolver acceptance follows the active future-job autonomy floor, retries complete compact-index prompts, rejects output artifacts and cross-company semantic mismatches, and canonicalizes genuinely new organization pages without rewriting established topical pages;
 - implemented: retrieval eval and sync-acceptance telemetry isolation plus an idempotent legacy eval-lineage purge;
 - implemented: focus-independent native number shortcuts for historical fact toggles and a real Return-key binding for Keep Selected;
 - implemented: focus-independent native number shortcuts for Inbox route candidates, with text-entry focus protection and Return submission for custom page paths;
@@ -188,6 +189,11 @@ Implementation checkpoint, 2026-07-13:
 - verified: targeted reprocessing closed all nine legacy extraction anomalies; 50/72 rebuilt critic-reviewed facts applied, 22 unsupported or over-broad facts were rejected, three genuine review tasks were created and only one remained after concurrent manual review, and the final restarted live Queue measured 58 actionable with zero blocked items and zero extraction anomalies;
 - verified: 465 Python tests, 15 Swift tests, full Ruff, signed build, healthy embedded daemon restart, and live dark-mode Queue screenshot inspection;
 - verified: the `0.1.2` follow-up passes 475 Python tests, 17 Swift tests, and full Ruff before release rebuild;
+- verified: policy v16 reconciled all 209 facts from 11 legacy Inbox batches with zero residue or failures; a full route audit corrected one cross-company error and consolidated avoidable Snowflake, Greylock, and Orchid fragmentation before managed-page projection;
+- verified: the final standalone Maestro/Dagobah Inbox fact routed to the same-source Netflix data-product page and passed critic review, leaving two actionable topology merges and no Inbox work;
+- implemented: critic calls remain parallel while policy/fact writes finalize serially, malformed extractor windows remain retryable without aborting nightly, and Sol auditor cards/requests have explicit size and batch ceilings with isolated failure;
+- verified: `0.1.3` production nightly `automation_7b91433093b14d52` completed successfully; all 25 sampled audits recorded (16 OK, 9 bad), only one remained currently reviewable, and the live Queue contained eight actionable items with zero Inbox residue;
+- verified: final `0.1.3` gates pass 495 Python tests, 17 Swift tests, full Ruff, release build/install, embedded runtime `0.1.3-762bf645-d32ae09d`, and dark-mode Today screenshot inspection;
 - remaining in R1: maintenance audit/report, historical comparison migration, automated overlap/state tests, and the full signed keyboard/light/dark/minimum-width acceptance matrix.
 
 ### TRUST-1 - One Queue Summary Contract
@@ -251,7 +257,7 @@ Implementation:
 1. Add a server-side `validate_queue_card(item)` contract by kind.
 2. Return `approvable`, `blocking_code`, and human `blocking_reason`.
 3. Hydrate candidate/counterpart/action/source rows before validation.
-4. Return `source_date` on every fact, preferring `observed_at` and then the newest captured/created/ingested source-document timestamp; keep the raw timestamp inspectable.
+4. Return `source_date` on every fact, preferring source-native event start, source creation, capture, and document-ledger dates before fact observation; keep the raw timestamp inspectable.
 5. Resolve both direct document IDs and chunk-backed provenance so source title and date survive into the review card.
 6. Convert unambiguous historical candidate-less questions into the correct comparison representation.
 7. Classify unrecoverable active items as blocked; exclude them from the default actionable backlog while retaining them under `state=blocked` for repair. Do not silently delete them.

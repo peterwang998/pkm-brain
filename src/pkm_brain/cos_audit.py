@@ -4,16 +4,25 @@ import hashlib
 import json
 from typing import Any
 
-from .cos_actions import action_payload, record_action_audit, revert_action, row_to_action
+from .cos_actions import (
+    action_payload,
+    record_action_audit,
+    revert_action,
+    row_to_action,
+)
 from .cos_policy import demote_policy_version
 from .db import connection, loads
-from .llm import LLMProvider, complete_json, cos_role_provider_configured, get_cos_role_provider
+from .llm import (
+    LLMProvider,
+    LLMProviderError,
+    complete_json,
+    cos_role_provider_configured,
+    get_cos_role_provider,
+)
 from .paths import BrainPaths
 
 
-COS_AUDIT_STUB_NOTE = (
-    "Sampled audit is not executed; no independent critic/auditor provider is configured."
-)
+COS_AUDIT_STUB_NOTE = "Sampled audit is not executed; no independent critic/auditor provider is configured."
 COS_AUDIT_CONFIGURED_NOTE = "Independent auditor configured; sampled actions are judged before audit status is recorded."
 AUDITOR_SCHEMA = {
     "type": "object",
@@ -39,6 +48,10 @@ BAD_DECISIONS = {
     "policy_violation",
     "sampled_bad",
 }
+AUDITOR_MAX_ACTIONS_PER_BATCH = 8
+AUDITOR_MAX_BATCH_CHARS = 180_000
+AUDITOR_MAX_CARD_CHARS = 48_000
+AUDITOR_MAX_PAYLOAD_CHARS = 16_000
 
 
 def run_sampled_audit(
@@ -61,6 +74,8 @@ def run_sampled_audit(
             "bad_action_ids": [],
             "unscoped_bad_action_ids": [],
             "missing_action_ids": [action["id"] for action in actions],
+            "batch_count": 0,
+            "audit_errors": [],
             "demoted_policy_version": None,
             "reverted": [],
         }
@@ -68,19 +83,35 @@ def run_sampled_audit(
     audited: list[dict[str, Any]] = []
     bad_action_ids: list[str] = []
     missing_action_ids: list[str] = []
+    audit_errors: list[dict[str, Any]] = []
+    batch_count = 0
     audit_provider = llm_provider
     if actions:
-        audit_provider = get_cos_role_provider(paths, "auditor", provider=provider, llm_provider=llm_provider)
-        cards = build_auditor_cards(paths, actions)
-        parsed = complete_json(
-            auditor_prompt(cards),
-            schema=AUDITOR_SCHEMA,
-            provider=provider,
-            role="auditor",
-            llm_provider=audit_provider,
-            paths=paths,
+        audit_provider = get_cos_role_provider(
+            paths, "auditor", provider=provider, llm_provider=llm_provider
         )
-        judgments = auditor_judgments_by_action_id(parsed)
+        cards = build_auditor_cards(paths, actions)
+        judgments: dict[str, dict[str, Any]] = {}
+        for batch in auditor_card_batches(cards):
+            batch_count += 1
+            try:
+                parsed = complete_json(
+                    auditor_prompt(batch),
+                    schema=AUDITOR_SCHEMA,
+                    provider=provider,
+                    role="auditor",
+                    llm_provider=audit_provider,
+                    paths=paths,
+                )
+            except LLMProviderError as exc:
+                audit_errors.append(
+                    {
+                        "action_ids": [str(card["action_id"]) for card in batch],
+                        "error": clipped(exc, 1000),
+                    }
+                )
+                continue
+            judgments.update(auditor_judgments_by_action_id(parsed))
     else:
         judgments = {}
     for action in actions:
@@ -101,7 +132,9 @@ def run_sampled_audit(
                     "rationale": judgment["rationale"],
                     "confidence": judgment.get("confidence"),
                     "risk_tier": judgment.get("risk_tier"),
-                    "provider": auditor_provider_name(paths, llm_provider=audit_provider, provider=provider),
+                    "provider": auditor_provider_name(
+                        paths, llm_provider=audit_provider, provider=provider
+                    ),
                     "model": getattr(audit_provider, "model", None),
                 },
             )
@@ -141,6 +174,8 @@ def run_sampled_audit(
         "bad_action_ids": bad_action_ids,
         "unscoped_bad_action_ids": unscoped_bad_action_ids,
         "missing_action_ids": missing_action_ids,
+        "batch_count": batch_count,
+        "audit_errors": audit_errors,
         "demotion_evidence": demotion_evidence,
         "demoted_policy_version": demoted_version,
         "reverted": reverted,
@@ -208,7 +243,9 @@ def action_audit_sample_rate(conn: Any, action: dict[str, Any]) -> float:
     return min(1.0, max(0.0, float(row["audit_sample_rate"])))
 
 
-def demotion_threshold_breaches(conn: Any, bad_action_ids: list[str]) -> list[dict[str, Any]]:
+def demotion_threshold_breaches(
+    conn: Any, bad_action_ids: list[str]
+) -> list[dict[str, Any]]:
     bad_actions = load_actions_for_audit_ids(conn, bad_action_ids)
     policy_groups = {
         (action.get("policy_id"), action.get("policy_version"))
@@ -225,7 +262,9 @@ def demotion_threshold_breaches(conn: Any, bad_action_ids: list[str]) -> list[di
     return breaches
 
 
-def load_actions_for_audit_ids(conn: Any, action_ids: list[str]) -> list[dict[str, Any]]:
+def load_actions_for_audit_ids(
+    conn: Any, action_ids: list[str]
+) -> list[dict[str, Any]]:
     if not action_ids:
         return []
     placeholders = ",".join("?" for _ in action_ids)
@@ -302,7 +341,9 @@ def auditor_configured(
     llm_provider: LLMProvider | None,
     provider: str | None,
 ) -> bool:
-    return cos_role_provider_configured(paths, "auditor", llm_provider=llm_provider, provider=provider)
+    return cos_role_provider_configured(
+        paths, "auditor", llm_provider=llm_provider, provider=provider
+    )
 
 
 def auditor_provider_name(
@@ -316,14 +357,167 @@ def auditor_provider_name(
     if provider:
         return provider
     configured_provider = get_cos_role_provider(paths, "auditor")
-    return getattr(configured_provider, "name", None) if configured_provider is not None else None
+    return (
+        getattr(configured_provider, "name", None)
+        if configured_provider is not None
+        else None
+    )
 
 
 def build_auditor_cards(
     paths: BrainPaths, actions: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
     with connection(paths.sqlite_path) as conn:
-        return [auditor_candidate_card(conn, action) for action in actions]
+        return [
+            bounded_auditor_card(auditor_candidate_card(conn, action))
+            for action in actions
+        ]
+
+
+def auditor_card_batches(
+    cards: list[dict[str, Any]],
+) -> list[list[dict[str, Any]]]:
+    batches: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for card in cards:
+        candidate = [*current, card]
+        if current and (
+            len(candidate) > AUDITOR_MAX_ACTIONS_PER_BATCH
+            or len(auditor_prompt(candidate)) > AUDITOR_MAX_BATCH_CHARS
+        ):
+            batches.append(current)
+            current = [card]
+        else:
+            current = candidate
+    if current:
+        batches.append(current)
+    return batches
+
+
+def bounded_auditor_card(card: dict[str, Any]) -> dict[str, Any]:
+    compact = compact_audit_value(card)
+    if json_size(compact) <= AUDITOR_MAX_CARD_CHARS:
+        return compact
+
+    target_state = card.get("target_state") or {}
+    bounded = {
+        "action_id": card.get("action_id"),
+        "action_type": card.get("action_type"),
+        "status": card.get("status"),
+        "proposed_by": card.get("proposed_by"),
+        "confidence": card.get("confidence"),
+        "risk_tier": card.get("risk_tier"),
+        "policy": compact_audit_value(card.get("policy")),
+        "critic": compact_audit_value(card.get("critic")),
+        "features": compact_audit_value(card.get("features")),
+        "payload": bounded_auditor_payload(card.get("payload")),
+        "targets": compact_audit_value(card.get("targets")),
+        "target_state": {
+            "facts": compact_audit_value(list(target_state.get("facts") or [])[:12]),
+            "contracts": compact_audit_value(
+                list(target_state.get("contracts") or [])[:8]
+            ),
+            "syntheses": compact_audit_value(
+                list(target_state.get("syntheses") or [])[:4]
+            ),
+            "counts": {
+                key: len(list(target_state.get(key) or []))
+                for key in ("facts", "contracts", "syntheses")
+            },
+        },
+        "inverse_action": compact_audit_value(card.get("inverse_action")),
+        "applied_state_hash": card.get("applied_state_hash"),
+        "card_truncated": True,
+    }
+    if json_size(bounded) <= AUDITOR_MAX_CARD_CHARS:
+        return bounded
+
+    bounded["target_state"] = {
+        "counts": bounded["target_state"]["counts"],
+        "note": "Target state omitted to fit the auditor input budget.",
+    }
+    bounded["payload"] = bounded_auditor_payload(card.get("payload"), max_chars=8_000)
+    if json_size(bounded) <= AUDITOR_MAX_CARD_CHARS:
+        return bounded
+
+    return {
+        "action_id": card.get("action_id"),
+        "action_type": card.get("action_type"),
+        "status": card.get("status"),
+        "risk_tier": card.get("risk_tier"),
+        "policy": compact_audit_value(card.get("policy")),
+        "critic": compact_audit_value(card.get("critic")),
+        "applied_state_hash": card.get("applied_state_hash"),
+        "details_excerpt": clipped(
+            json.dumps(bounded, ensure_ascii=True, sort_keys=True), 32_000
+        ),
+        "card_truncated": True,
+        "note": "Action details truncated to fit the auditor input budget.",
+    }
+
+
+def bounded_auditor_payload(
+    payload: Any, *, max_chars: int = AUDITOR_MAX_PAYLOAD_CHARS
+) -> Any:
+    compact = compact_audit_value(payload)
+    if json_size(compact) <= max_chars:
+        return compact
+    if isinstance(payload, dict) and isinstance(payload.get("fact"), dict):
+        fact = payload["fact"]
+        return {
+            "fact": {
+                key: compact_audit_value(fact.get(key))
+                for key in (
+                    "id",
+                    "statement",
+                    "entity_key",
+                    "page_hint",
+                    "section_hint",
+                    "source_ids",
+                    "source_spans",
+                    "evidence_quote",
+                    "evidence_unit_ids",
+                    "confidence",
+                    "truth_confidence",
+                    "extraction_confidence",
+                    "routing_confidence",
+                    "extraction_method",
+                    "extractor_model",
+                )
+                if fact.get(key) is not None
+            },
+            "truncated": True,
+            "note": "Nonessential fact metadata omitted to fit the auditor input budget.",
+        }
+    serialized = json.dumps(compact, ensure_ascii=True, sort_keys=True)
+    return {
+        "json_excerpt": clipped(serialized, max_chars),
+        "truncated": True,
+    }
+
+
+def compact_audit_value(value: Any, *, depth: int = 0) -> Any:
+    if isinstance(value, str):
+        return clipped(value, 4_000)
+    if isinstance(value, list):
+        items = [compact_audit_value(item, depth=depth + 1) for item in value[:40]]
+        if len(value) > 40:
+            items.append({"omitted_item_count": len(value) - 40})
+        return items
+    if isinstance(value, dict):
+        items = list(value.items())
+        compact = {
+            str(key): compact_audit_value(item, depth=depth + 1)
+            for key, item in items[:60]
+        }
+        if len(items) > 60:
+            compact["_omitted_key_count"] = len(items) - 60
+        return compact
+    return value
+
+
+def json_size(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=True, sort_keys=True))
 
 
 def auditor_candidate_card(conn: Any, action: dict[str, Any]) -> dict[str, Any]:
@@ -437,7 +631,9 @@ def load_contract_cards(conn: Any, contract_ids: list[str]) -> list[dict[str, An
             "page_scope": clipped(row["page_scope"], 800),
             "retrieval_purpose": clipped(row["retrieval_purpose"], 800),
             "what_belongs_here": clipped(row["what_belongs_here"], 1000),
-            "what_does_not_belong_here": clipped(row["what_does_not_belong_here"], 1000),
+            "what_does_not_belong_here": clipped(
+                row["what_does_not_belong_here"], 1000
+            ),
             "related_pages": loads(row["related_pages"], []),
             "version": row["version"],
             "status": row["status"],

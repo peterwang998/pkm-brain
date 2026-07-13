@@ -21,7 +21,7 @@ from pkm_brain.cos_actions import (
     repair_refused_fact_audit_revert,
     revert_action,
 )
-from pkm_brain.cos_audit import run_sampled_audit
+from pkm_brain.cos_audit import AUDITOR_MAX_BATCH_CHARS, run_sampled_audit
 from pkm_brain.cos_policy import (
     PolicyDecision,
     classify_action_risk,
@@ -44,6 +44,7 @@ from pkm_brain.extraction import (
     reclaim_unrouted_facts,
     reconcile_fact_conflict_reviews,
     resolver_precheck_conflict,
+    validate_extraction_payload,
     validate_extracted_facts,
     validate_extracted_facts_with_report,
 )
@@ -81,8 +82,7 @@ def test_extraction_prompt_requires_direct_entailment_for_clean_facts() -> None:
 
 def test_evidence_units_propagate_speaker_identity_across_sentences() -> None:
     units = evidence_units_for_text(
-        "Speaker 1: First sentence. Second sentence.\n\n"
-        "Speaker 2: Different speaker."
+        "Speaker 1: First sentence. Second sentence.\n\nSpeaker 2: Different speaker."
     )
 
     assert [unit.get("speaker") for unit in units] == [
@@ -179,9 +179,7 @@ def test_extraction_document_id_filter_isolates_target_document(
         llm_provider=provider,
     )
 
-    assert [document["document_id"] for document in result["documents"]] == [
-        target_id
-    ]
+    assert [document["document_id"] for document in result["documents"]] == [target_id]
     assert [candidate["statement"] for candidate in result["candidates"]] == [
         "Targeted extraction marker is present."
     ]
@@ -400,6 +398,36 @@ def test_policy_promotion_matches_low_medium_and_large_topology(tmp_path: Path) 
                 "quote_backed": True,
                 "fallback_route": False,
                 "resolver_precheck": "passed",
+                "confidence": 0.9,
+            },
+        )
+        legacy_clean_fact = evaluate_policy(
+            conn,
+            "fact_upsert",
+            {
+                "candidate_signal": "source_extraction",
+                "risk_tier": "medium",
+                "clean_fact_upsert": True,
+                "fact_upsert_resolution": "new_clean_fact",
+                "quote_backed": True,
+                "fallback_route": False,
+                "resolver_precheck": "passed",
+                "reversible": True,
+                "truth_mutation": False,
+                "confidence": 0.5,
+                "extraction_confidence": None,
+                "truth_confidence": 0.5,
+            },
+        )
+        validated_rehome = evaluate_policy(
+            conn,
+            "rehome_fact",
+            {
+                "risk_tier": "low",
+                "route_resolution_validated": True,
+                "reversible": True,
+                "truth_mutation": False,
+                "confidence": 0.9,
             },
         )
         entity_medium = evaluate_policy(
@@ -445,6 +473,10 @@ def test_policy_promotion_matches_low_medium_and_large_topology(tmp_path: Path) 
     assert low_topology.audit_sample_rate == 1.0
     assert clean_fact.autonomy_level == "L2"
     assert clean_fact.critic_required is True
+    assert legacy_clean_fact.autonomy_level == "L2"
+    assert legacy_clean_fact.critic_required is True
+    assert validated_rehome.autonomy_level == "L1"
+    assert validated_rehome.critic_required is False
     assert entity_medium.autonomy_level == "L2"
     assert entity_high_certainty.autonomy_level == "L1"
     assert entity_high_certainty.critic_required is False
@@ -799,9 +831,10 @@ def test_repair_refused_fact_audit_revert_restores_reviewable_action(
     assert repaired["status"] == "repaired"
     assert repaired["action"]["status"] == "applied"
     assert repaired["action"]["audit_status"] == "sampled_bad"
-    assert repaired["action"]["evidence_json"]["audit_queue_reconciliation"][
-        "outcome"
-    ] == "restored_applied_status_after_refused_revert"
+    assert (
+        repaired["action"]["evidence_json"]["audit_queue_reconciliation"]["outcome"]
+        == "restored_applied_status_after_refused_revert"
+    )
     with connection(svc.paths.sqlite_path) as conn:
         residue = conn.execute(
             "SELECT status, decided_by FROM open_questions WHERE action_id = ?",
@@ -1191,6 +1224,28 @@ def test_extraction_does_not_mark_all_invalid_batch_ok(tmp_path: Path) -> None:
         ).fetchone()
     assert watermark["status"] == "invalid"
     assert json.loads(watermark["metadata"])["validation"]["rejected_count"] == 1
+
+
+def test_extraction_isolates_malformed_provider_response(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "source.md"
+    note.write_text("# Source\n\nMalformed response marker.", encoding="utf-8")
+    svc.ingest()
+    provider = MissingFactsExtractorProvider()
+
+    result = extract_recent_documents(svc.paths, shadow=True, llm_provider=provider)
+
+    assert result["status"] == "ok"
+    assert result["candidates"] == []
+    validation = result["document_validations"][0]
+    assert "missing required keys: facts" in validation["schema_errors"][0]
+    assert validation["windows"][0]["provider_error"]
+    with connection(svc.paths.sqlite_path) as conn:
+        watermark = conn.execute(
+            "SELECT status FROM cos_stage_watermarks WHERE stage = 'extractor'"
+        ).fetchone()
+    assert watermark["status"] == "invalid"
 
 
 def test_extraction_skips_agent_session_logs_by_default(tmp_path: Path) -> None:
@@ -1702,6 +1757,37 @@ def test_extraction_truncates_excess_evidence_unit_ids(tmp_path: Path) -> None:
         "kept_count": 5,
         "truncated_count": 2,
     }
+
+
+def test_llm_extraction_requires_explicit_confidence_fields(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "source.md"
+    note.write_text(
+        "# Source\n\nExplicit confidence marker is present.", encoding="utf-8"
+    )
+    svc.ingest()
+    with connection(svc.paths.sqlite_path) as conn:
+        chunk = conn.execute("SELECT id, text FROM chunks LIMIT 1").fetchone()
+    fact = {
+        "statement": "Explicit confidence marker is present.",
+        "chunk_id": chunk["id"],
+        "evidence_unit_ids": evidence_unit_ids_containing(chunk["text"], "Explicit"),
+        "claim_class": "factual_update",
+    }
+
+    missing = validate_extraction_payload(svc.paths, {"facts": [fact]})
+    accepted = validate_extraction_payload(
+        svc.paths, {"facts": [{**fact, **valid_extraction_confidences()}]}
+    )
+
+    assert missing["accepted_count"] == 0
+    assert {
+        "missing extraction_confidence",
+        "missing routing_confidence",
+        "missing truth_confidence",
+    }.issubset(set(missing["rejections"][0]["reasons"]))
+    assert accepted["accepted_count"] == 1
 
 
 def test_extraction_accepts_structured_entity_mentions(tmp_path: Path) -> None:
@@ -2873,6 +2959,68 @@ def test_sampled_audit_records_auditor_ok(tmp_path: Path) -> None:
     assert "fake-auditor" == audit["metadata"]["provider"]
 
 
+def test_sampled_audit_bounds_large_cards_and_batches_requests(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    actions = [
+        apply_action(
+            svc.paths,
+            propose_action(
+                svc.paths,
+                "canonicalize_page",
+                action_payload={
+                    "page_hint": f"concepts/test-{index}.md",
+                    "oversized_context": "x" * 200_000,
+                },
+                target_page_paths=[f"concepts/test-{index}.md"],
+            )["id"],
+        )
+        for index in range(9)
+    ]
+    provider = BoundedAuditorProvider()
+
+    result = run_sampled_audit(
+        svc.paths,
+        limit=9,
+        llm_provider=provider,
+    )
+
+    assert result["status"] == "ok"
+    assert result["batch_count"] == 2
+    assert result["audit_errors"] == []
+    assert len(result["audited"]) == 9
+    assert len(provider.prompts) == 2
+    assert all(
+        len(prompt) < AUDITOR_MAX_BATCH_CHARS + 5_000 for prompt in provider.prompts
+    )
+    assert {action["id"] for action in actions} == set(provider.action_ids)
+
+
+def test_sampled_audit_isolates_failed_batch(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    action = apply_action(
+        svc.paths,
+        propose_action(
+            svc.paths,
+            "canonicalize_page",
+            action_payload={"page_hint": "concepts/test.md"},
+            target_page_paths=["concepts/test.md"],
+        )["id"],
+    )
+
+    result = run_sampled_audit(
+        svc.paths,
+        llm_provider=UnavailableAuditorProvider(),
+    )
+
+    assert result["status"] == "incomplete"
+    assert result["audited"] == []
+    assert result["missing_action_ids"] == [action["id"]]
+    assert result["audit_errors"][0]["action_ids"] == [action["id"]]
+    assert get_action(svc.paths, action["id"])["audit_status"] == "unaudited"
+
+
 def test_sampled_audit_respects_zero_policy_sample_rate(tmp_path: Path) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()
@@ -3422,18 +3570,41 @@ def test_decide_policy_actions_parallel_preserves_order(
 ) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()
-    calls: list[str] = []
+    review_calls: list[str] = []
+    decision_calls: list[str] = []
+
+    def fake_prepare_policy_action_review(
+        paths: BrainPaths,
+        action_id: str,
+        *,
+        critic_timeout_seconds: int | None,
+    ) -> dict[str, object]:
+        assert paths == svc.paths
+        assert critic_timeout_seconds == 1
+        time.sleep(0.05)
+        review_calls.append(action_id)
+        return {
+            "critic_by": "test-critic",
+            "critic_decision": "agree",
+            "critic_rationale": "supported",
+        }
 
     def fake_decide_action(
         paths: BrainPaths, action_id: str, **kwargs: object
     ) -> dict[str, object]:
         assert paths == svc.paths
         assert kwargs["critic_disagreement_mode"] == "reject"
-        time.sleep(0.05)
-        calls.append(action_id)
+        assert kwargs["critic_decision"] == "agree"
+        decision_calls.append(action_id)
         return {"id": action_id}
 
-    monkeypatch.setattr("pkm_brain.extraction.decide_action", fake_decide_action)
+    monkeypatch.setattr(
+        "pkm_brain.policy_action_batch.prepare_policy_action_review",
+        fake_prepare_policy_action_review,
+    )
+    monkeypatch.setattr(
+        "pkm_brain.policy_action_batch.decide_action", fake_decide_action
+    )
 
     started = time.perf_counter()
     decided = decide_policy_actions(
@@ -3453,7 +3624,8 @@ def test_decide_policy_actions_parallel_preserves_order(
         "action_3",
         "action_4",
     ]
-    assert sorted(calls) == ["action_1", "action_2", "action_3", "action_4"]
+    assert sorted(review_calls) == ["action_1", "action_2", "action_3", "action_4"]
+    assert decision_calls == ["action_1", "action_2", "action_3", "action_4"]
 
 
 def test_decide_policy_actions_isolates_worker_failure(
@@ -3478,7 +3650,13 @@ def test_decide_policy_actions_isolates_worker_failure(
             raise RuntimeError("isolated decision failure")
         return {"id": action_id, "status": "applied"}
 
-    monkeypatch.setattr("pkm_brain.extraction.decide_action", fake_decide_action)
+    monkeypatch.setattr(
+        "pkm_brain.policy_action_batch.prepare_policy_action_review",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        "pkm_brain.policy_action_batch.decide_action", fake_decide_action
+    )
 
     decided = decide_policy_actions(
         svc.paths,
@@ -3490,9 +3668,7 @@ def test_decide_policy_actions_isolates_worker_failure(
         },
     )
 
-    assert [action["id"] for action in decided] == [
-        action["id"] for action in actions
-    ]
+    assert [action["id"] for action in decided] == [action["id"] for action in actions]
     assert decided[0]["status"] == "failed"
     assert (
         decided[0]["evidence_json"]["decision_failure"]["message"]
@@ -3803,6 +3979,8 @@ def test_critic_prompt_for_fact_upsert_is_narrow_entailment_review() -> None:
 
     assert "directly entailed by the cited evidence" in prompt
     assert "even if the fact is mundane" in prompt
+    assert "Policy card is the matched authorization record" in prompt
+    assert "do not require the action payload to repeat policy fields" in prompt
     assert "should be human-reviewed" not in prompt
 
 
@@ -3816,6 +3994,14 @@ def first_evidence_ref_from_prompt(
             if marker is None or marker in unit["text"]:
                 return chunk["chunk_id"], [unit["unit_id"]]
     return "missing", ["u0"]
+
+
+def valid_extraction_confidences() -> dict[str, float]:
+    return {
+        "extraction_confidence": 0.95,
+        "routing_confidence": 0.9,
+        "truth_confidence": 0.95,
+    }
 
 
 class FakeExtractorProvider:
@@ -3839,6 +4025,7 @@ class FakeExtractorProvider:
                         "chunk_id": chunk_id,
                         "evidence_unit_ids": unit_ids,
                         "claim_class": "factual_update",
+                        **valid_extraction_confidences(),
                     }
                 ]
             }
@@ -3863,6 +4050,7 @@ class RetryExtractorProvider:
                             "chunk_id": "missing",
                             "evidence_unit_ids": ["u0"],
                             "claim_class": "factual_update",
+                            **valid_extraction_confidences(),
                         }
                     ]
                 }
@@ -3882,6 +4070,7 @@ class RetryExtractorProvider:
                         "chunk_id": chunk_id,
                         "evidence_unit_ids": unit_ids,
                         "claim_class": "factual_update",
+                        **valid_extraction_confidences(),
                     }
                 ]
             }
@@ -3905,10 +4094,19 @@ class AlwaysInvalidExtractorProvider:
                         "chunk_id": "missing",
                         "evidence_unit_ids": ["u0"],
                         "claim_class": "factual_update",
+                        **valid_extraction_confidences(),
                     }
                 ]
             }
         )
+
+
+class MissingFactsExtractorProvider:
+    name = "fake-extractor"
+    model = "fake-extractor-model"
+
+    def complete(self, prompt: str) -> str:
+        return json.dumps({"summary": "facts key omitted"})
 
 
 class NonClaimExtractorProvider:
@@ -3931,6 +4129,7 @@ class NonClaimExtractorProvider:
                         "chunk_id": chunk_id,
                         "evidence_unit_ids": unit_ids,
                         "claim_class": "event_metadata",
+                        **valid_extraction_confidences(),
                     }
                 ]
             }
@@ -3955,6 +4154,7 @@ class UnsupportedNumberExtractorProvider:
                         "chunk_id": chunk_id,
                         "evidence_unit_ids": unit_ids,
                         "claim_class": "factual_update",
+                        **valid_extraction_confidences(),
                     }
                 ]
             }
@@ -4052,6 +4252,7 @@ class ConcurrentWindowExtractorProvider:
                             "page_hint": "concepts/parallel.md",
                             "section_hint": "Summary",
                             "entity_key": "parallel",
+                            **valid_extraction_confidences(),
                         }
                     ]
                 }
@@ -4359,6 +4560,41 @@ class FakeAuditorProvider:
                 ]
             }
         )
+
+
+class BoundedAuditorProvider:
+    name = "bounded-auditor"
+    model = "fake-model"
+
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+        self.action_ids: list[str] = []
+
+    def complete(self, prompt: str) -> str:
+        self.prompts.append(prompt)
+        cards = json.loads(prompt.rsplit("Action cards:\n", 1)[-1])
+        action_ids = [str(card["action_id"]) for card in cards]
+        self.action_ids.extend(action_ids)
+        return json.dumps(
+            {
+                "audits": [
+                    {
+                        "action_id": action_id,
+                        "decision": "ok",
+                        "rationale": "Bounded audit card is adequately supported.",
+                    }
+                    for action_id in action_ids
+                ]
+            }
+        )
+
+
+class UnavailableAuditorProvider:
+    name = "unavailable-auditor"
+    model = "fake-model"
+
+    def complete(self, prompt: str) -> str:
+        raise LLMProviderError("temporary auditor failure")
 
 
 class FailingAuditorProvider:

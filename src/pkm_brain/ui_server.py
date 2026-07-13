@@ -68,6 +68,7 @@ from .review_admission import (
 from .scheduler.launchd import LaunchdScheduler
 from .service import BrainService, row_to_memory
 from .setup_wizard import build_setup_plan
+from .source_dates import derive_fact_source_date, document_source_date_metadata
 from .util import new_id, now_iso
 from .wiki import (
     ALLOWED_PAGE_TYPES,
@@ -1505,7 +1506,11 @@ class QueueBuildContext:
                 """,
                 missing,
             )
-            found = {str(row["id"]): dict(row) for row in rows}
+            found = {}
+            for row in rows:
+                document = dict(row)
+                document.update(document_source_date_metadata(document))
+                found[str(row["id"])] = document
             for document_id in missing:
                 self._source_document_cache[document_id] = found.get(document_id)
         documents = []
@@ -1523,6 +1528,8 @@ class QueueBuildContext:
                     "raw_path": row["raw_path"],
                     "created_at": row["created_at"],
                     "ingested_at": row["ingested_at"],
+                    "source_date": row.get("source_date"),
+                    "source_date_basis": row.get("source_date_basis"),
                     "source_refs": references.get(document_id, []),
                 }
             )
@@ -3559,23 +3566,6 @@ def merge_source_documents(
             if key:
                 positions[key] = len(documents) - 1
     return documents
-
-
-def derive_fact_source_date(
-    fact: dict[str, Any], documents: list[dict[str, Any]]
-) -> tuple[str | None, str | None]:
-    observed_at = str(fact.get("observed_at") or "").strip()
-    if observed_at:
-        return observed_at, "observed_at"
-    for field in ("captured_at", "created_at", "ingested_at"):
-        values = [
-            str(document.get(field) or "").strip()
-            for document in documents
-            if str(document.get(field) or "").strip()
-        ]
-        if values:
-            return max(values), f"source_{field}"
-    return None, None
 
 
 def enrich_memory_detail_for_queue(
@@ -5686,9 +5676,20 @@ def ui_wiki_fact_page_review(
     if not page_hint:
         raise BadRequestError("path is required")
     try:
-        return managed_fact_page_review(paths, page_hint)
+        review = managed_fact_page_review(paths, page_hint)
     except ValueError as exc:
         raise BadRequestError(str(exc)) from exc
+    with connection(paths.sqlite_path) as conn:
+        context = QueueBuildContext(paths, conn)
+        for key in ("facts", "active_facts"):
+            values = review.get(key)
+            if isinstance(values, list):
+                review[key] = [
+                    enrich_fact_like(context, fact)
+                    for fact in values
+                    if isinstance(fact, dict)
+                ]
+    return review
 
 
 def ui_answer_wiki_question(

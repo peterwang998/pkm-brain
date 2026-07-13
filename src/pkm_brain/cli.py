@@ -85,6 +85,7 @@ from .sync_transfer import sync_pull as run_sync_pull
 from .sync_transfer import sync_push as run_sync_push
 from .sync_transfer import sync_run as run_sync_run
 from .topology_reconciliation import reconcile_topology_proposals
+from .unrouted_reconciliation import reconcile_unrouted_inbox_batches
 from .ui_server import (
     create_ui_server,
     ensure_ui_token,
@@ -1360,6 +1361,49 @@ def cos_reclaim_unrouted(
         limit=limit,
         min_score=min_score,
         min_overlap=min_overlap,
+        critic_review=review,
+    )
+    console.print_json(json.dumps(result))
+
+
+@cos_app.command("reconcile-unrouted-batches")
+def cos_reconcile_unrouted_batches(
+    dry_run: bool = typer.Option(
+        True,
+        "--dry-run/--apply",
+        help="Preview by default; --apply replaces legacy batch cards with automatic routes and individual residue.",
+    ),
+    limit: Optional[int] = typer.Option(
+        None, "--limit", min=1, help="Maximum legacy batch questions to inspect."
+    ),
+    critic_disagreement_mode: str = typer.Option(
+        "reject",
+        "--critic-disagreement-mode",
+        help="How critic disagreement is handled for route actions.",
+    ),
+    critic_workers: Optional[int] = typer.Option(
+        None, "--critic-workers", min=1, help="Parallel critic workers for apply mode."
+    ),
+    critic_timeout_seconds: Optional[int] = typer.Option(
+        None,
+        "--critic-timeout-seconds",
+        min=1,
+        help="Per-action critic timeout for apply mode.",
+    ),
+    home: Optional[Path] = typer.Option(None, help="Brain home directory."),
+) -> None:
+    paths = BrainPaths.from_value(home)
+    BrainService(paths).init_workspace()
+    review = critic_review_config(
+        {},
+        disagreement_mode=critic_disagreement_mode,
+        max_workers=critic_workers,
+        timeout_seconds=critic_timeout_seconds,
+    )
+    result = reconcile_unrouted_inbox_batches(
+        paths,
+        dry_run=dry_run,
+        limit=limit,
         critic_review=review,
     )
     console.print_json(json.dumps(result))

@@ -10,7 +10,6 @@ from typing import Any
 
 from .cos_actions import (
     apply_action,
-    decide_action,
     get_action,
     mark_action_residue,
     mark_simple_autonomy_applied,
@@ -29,12 +28,14 @@ from .entities import (
 from .fact_relations import classify_fact_relation
 from .llm import (
     LLMProvider,
+    LLMProviderError,
     complete_json,
     cos_role_provider_configured,
     get_cos_role_provider,
     load_cos_llm_config,
 )
 from .paths import BrainPaths
+from .policy_action_batch import decide_policy_actions
 from .routing_coherence import (
     coherence_bonus,
     fact_document_id,
@@ -44,7 +45,16 @@ from .routing_coherence import (
 )
 from .source_evidence import (
     evidence_units_for_text,
+    extraction_confidence_values,
     resolve_evidence_unit_ids,
+)
+from .source_dates import document_source_date_metadata, stamp_candidate_source_context
+from .unrouted_resolution import (
+    candidate_requires_route_resolution,
+    candidate_route_metadata,
+    fact_route_reclaim_query,
+    reclaim_route_record,
+    resolve_unrouted_candidate_routes,
 )
 from .util import new_id, now_iso
 from .wiki import NON_ROUTABLE_PAGE_TYPES
@@ -71,6 +81,9 @@ EXTRACTION_SCHEMA = {
                     "chunk_id",
                     "evidence_unit_ids",
                     "claim_class",
+                    "extraction_confidence",
+                    "routing_confidence",
+                    "truth_confidence",
                 ],
             },
         }
@@ -391,7 +404,7 @@ def extract_document_windows(
     worker_count = min(max(1, max_workers), len(jobs))
     if worker_count == 1:
         results = [
-            extract_window_job(
+            extract_window_job_safely(
                 paths,
                 job,
                 routing_hint_pool=routing_hint_pool,
@@ -409,7 +422,7 @@ def extract_document_windows(
         ) as executor:
             futures = [
                 executor.submit(
-                    extract_window_job,
+                    extract_window_job_safely,
                     paths,
                     job,
                     routing_hint_pool=routing_hint_pool,
@@ -429,6 +442,43 @@ def extract_document_windows(
         output["candidates"].extend(result["candidates"])
         output["window_validations"].append(result["window_validation"])
     return outputs
+
+
+def extract_window_job_safely(
+    paths: BrainPaths,
+    job: tuple[int, int, dict[str, Any], dict[str, Any]],
+    **kwargs: Any,
+) -> dict[str, Any]:
+    started = time.perf_counter()
+    try:
+        return extract_window_job(paths, job, **kwargs)
+    except LLMProviderError as exc:
+        document_index, window_index, _document, window = job
+        message = str(exc)[:1000]
+        return {
+            "document_index": document_index,
+            "window_index": window_index,
+            "candidates": [],
+            "window_validation": {
+                "window_id": window["window_id"],
+                "window_index": window.get("window_index"),
+                "chunk_ids": [
+                    chunk["chunk_id"] for chunk in window.get("chunks") or []
+                ],
+                "routing_hint_count": 0,
+                "routing_hint_page_hints": [],
+                "raw_fact_count": 0,
+                "accepted_count": 0,
+                "rejected_count": 0,
+                "dropped_count": 0,
+                "attempt_count": 0,
+                "duration_ms": elapsed_ms(started),
+                "schema_errors": [f"extractor_provider_error: {message}"],
+                "rejections": [],
+                "dropped": [],
+                "provider_error": message,
+            },
+        }
 
 
 def extract_window_job(
@@ -455,8 +505,7 @@ def extract_window_job(
         extractor_model=extractor_model,
     )
     for candidate in extraction_result["candidates"]:
-        candidate.setdefault("metadata", {})["document_id"] = document["document_id"]
-        candidate["metadata"]["window_id"] = window["window_id"]
+        stamp_candidate_source_context(candidate, document, window["window_id"])
     return {
         "document_index": document_index,
         "window_index": window_index,
@@ -670,6 +719,7 @@ def recent_source_cards(
                     "title": document["title"],
                     "source_type": document["source_type"],
                     "source_id": f"document:{document['id']}",
+                    **document_source_date_metadata(dict(document)),
                     "content_hash": normalized_content_hash,
                     "raw_content_hash": document["content_hash"],
                     "normalized_content_empty": not bool(normalized_content),
@@ -906,6 +956,9 @@ def propose_policy_gated_candidates(
     run_id: str | None,
     critic_review: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    candidates = resolve_unrouted_candidate_routes(
+        paths, candidates, load_extraction_route_targets(paths)
+    )
     actions: list[dict[str, Any]] = []
     pending_decisions: list[tuple[int, str]] = []
     review = critic_review or default_critic_review_config()
@@ -956,81 +1009,6 @@ def propose_policy_gated_candidates(
     if review.get("block_rate_anomaly_threshold") is not None:
         record_critic_block_rate_anomalies(paths, actions, critic_review=review)
     return actions
-
-
-def decide_policy_actions(
-    paths: BrainPaths,
-    action_ids: list[str],
-    *,
-    critic_review: dict[str, Any],
-) -> list[dict[str, Any]]:
-    if not action_ids:
-        return []
-    max_workers = min(
-        normalize_extraction_max_workers(critic_review.get("max_workers")),
-        len(action_ids),
-    )
-    kwargs = {
-        "critic_timeout_seconds": critic_review.get("timeout_seconds"),
-        "critic_disagreement_mode": str(
-            critic_review.get("disagreement_mode") or "needs_human"
-        ),
-    }
-    if max_workers <= 1:
-        return [
-            decide_policy_action_safely(paths, action_id, kwargs=kwargs)
-            for action_id in action_ids
-        ]
-    results: dict[int, dict[str, Any]] = {}
-    with ThreadPoolExecutor(
-        max_workers=max_workers, thread_name_prefix="brain-critic"
-    ) as executor:
-        futures = {
-            executor.submit(
-                decide_policy_action_safely,
-                paths,
-                action_id,
-                kwargs=kwargs,
-            ): index
-            for index, action_id in enumerate(action_ids)
-        }
-        for future in as_completed(futures):
-            results[futures[future]] = future.result()
-    return [results[index] for index in range(len(action_ids))]
-
-
-def decide_policy_action_safely(
-    paths: BrainPaths,
-    action_id: str,
-    *,
-    kwargs: dict[str, Any],
-) -> dict[str, Any]:
-    try:
-        return decide_action(paths, action_id, **kwargs)
-    except Exception as exc:
-        return mark_policy_action_decision_failure(paths, action_id, exc)
-
-
-def mark_policy_action_decision_failure(
-    paths: BrainPaths,
-    action_id: str,
-    error: Exception,
-) -> dict[str, Any]:
-    action = get_action(paths, action_id)
-    if action.get("status") in {"applied", "auto_applied"}:
-        return action
-    evidence = dict(action.get("evidence_json") or {})
-    evidence["decision_failure"] = {
-        "error_type": type(error).__name__,
-        "message": str(error)[:1000],
-        "at": now_iso(),
-    }
-    with connection(paths.sqlite_path) as conn:
-        conn.execute(
-            "UPDATE cos_actions SET status = 'failed', evidence_json = ? WHERE id = ?",
-            (dumps(evidence), action_id),
-        )
-    return get_action(paths, action_id)
 
 
 def record_critic_block_rate_anomalies(
@@ -1269,39 +1247,6 @@ def earned_fact_action_features(
             decision.get("target_fact_ids") or []
         )
     return features
-
-
-def candidate_route_metadata(candidate: dict[str, Any]) -> dict[str, Any]:
-    metadata = candidate.get("metadata")
-    if not isinstance(metadata, dict):
-        return {}
-    routing = metadata.get("routing")
-    return routing if isinstance(routing, dict) else {}
-
-
-def fact_route_reclaim_query(candidate: dict[str, Any]) -> str:
-    metadata = (
-        candidate.get("metadata") if isinstance(candidate.get("metadata"), dict) else {}
-    )
-    mention_surfaces = []
-    for mention in (
-        metadata.get("model_entity_mentions") or candidate.get("entity_mentions") or []
-    ):
-        if isinstance(mention, dict) and mention.get("surface"):
-            mention_surfaces.append(str(mention["surface"]))
-    return "\n".join(
-        part
-        for part in (
-            str(candidate.get("statement") or ""),
-            str(candidate.get("entity_key") or ""),
-            str(candidate.get("entity_mention") or ""),
-            str(metadata.get("model_entity_key") or ""),
-            " ".join(mention_surfaces),
-            str(candidate.get("section_hint") or ""),
-            str(candidate.get("evidence_quote") or ""),
-        )
-        if part.strip()
-    )
 
 
 RECLAIM_ROUTE_EXTRA_STOP_TOKENS = {
@@ -1610,6 +1555,7 @@ def reclaim_unrouted_facts(
         )
     reclaimable: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
+    unresolved: list[tuple[Any, dict[str, Any], dict[str, Any]]] = []
     document_prior_cache: dict[str, list[dict[str, Any]]] = {}
     for question in question_rows:
         action_id = str(question["action_id"] or "")
@@ -1654,30 +1600,24 @@ def reclaim_unrouted_facts(
             document_priors=document_prior_cache[document_id],
         )
         if rerouted is None:
+            unresolved.append((question, action, candidate))
+            continue
+        reclaimable.append(reclaim_route_record(question, action, candidate, rerouted))
+    llm_routed = resolve_unrouted_candidate_routes(
+        paths, [item[2] for item in unresolved], route_targets
+    )
+    for (question, action, candidate), rerouted in zip(unresolved, llm_routed):
+        if candidate_requires_route_resolution(rerouted):
             skipped.append(
                 {
                     "question_id": question["id"],
-                    "action_id": action_id,
-                    "reason": "no_confident_route",
+                    "action_id": question["action_id"],
+                    "reason": "resolver_requires_human",
                     "statement": str(candidate.get("statement") or "")[:180],
-                    "page_hint": candidate.get("page_hint"),
                 }
             )
             continue
-        routing = candidate_route_metadata(rerouted)
-        reclaimable.append(
-            {
-                "question_id": question["id"],
-                "old_action_id": action_id,
-                "old_evidence_json": action.get("evidence_json") or {},
-                "candidate": rerouted,
-                "old_page_hint": candidate.get("page_hint"),
-                "new_page_hint": rerouted.get("page_hint"),
-                "route_score": routing.get("reclaim_route_score"),
-                "route_overlap": routing.get("reclaim_route_overlap") or [],
-                "statement": str(rerouted.get("statement") or "")[:220],
-            }
-        )
+        reclaimable.append(reclaim_route_record(question, action, candidate, rerouted))
     preview = [
         {
             key: value
@@ -2582,9 +2522,7 @@ def merge_candidate_into_existing_fact(
 ) -> dict[str, Any]:
     metadata = dict(existing.get("metadata") or {})
     candidate_metadata = (
-        candidate.get("metadata")
-        if isinstance(candidate.get("metadata"), dict)
-        else {}
+        candidate.get("metadata") if isinstance(candidate.get("metadata"), dict) else {}
     )
     for key in ("document_id", "window_id", "evidence_units"):
         if candidate_metadata.get(key) is not None:
@@ -3275,6 +3213,7 @@ def validate_extraction_payload(
         paths,
         raw_facts,
         extractor_model=extractor_model,
+        require_model_confidence=True,
     )
 
 
@@ -3283,6 +3222,7 @@ def validate_extracted_facts_with_report(
     raw_facts: list[Any],
     *,
     extractor_model: str | None = None,
+    require_model_confidence: bool = False,
 ) -> dict[str, Any]:
     chunk_context_by_id = load_chunk_contexts(paths)
     route_targets = load_extraction_route_targets(paths)
@@ -3329,6 +3269,10 @@ def validate_extracted_facts_with_report(
                 }
             )
             continue
+        confidence_values, confidence_errors = extraction_confidence_values(
+            item, require_all=require_model_confidence
+        )
+        reasons.extend(confidence_errors)
         reasons.extend(evidence_ref_errors)
         if reasons:
             rejections.append(
@@ -3413,15 +3357,12 @@ def validate_extracted_facts_with_report(
             if valid_quotes
             else None,
             "evidence_unit_ids": [unit["unit_id"] for unit in evidence_unit_refs],
-            "observed_at": item.get("observed_at") or now_iso(),
+            "observed_at": item.get("observed_at"),
             "effective_at": item.get("effective_at"),
-            "confidence": float(
-                item.get("truth_confidence") or item.get("confidence") or 0.5
-            ),
-            "extraction_confidence": optional_float(item.get("extraction_confidence")),
-            "routing_confidence": optional_float(item.get("routing_confidence")),
-            "truth_confidence": optional_float(item.get("truth_confidence"))
-            or float(item.get("confidence") or 0.5),
+            "confidence": confidence_values["truth_confidence"],
+            "extraction_confidence": confidence_values["extraction_confidence"],
+            "routing_confidence": confidence_values["routing_confidence"],
+            "truth_confidence": confidence_values["truth_confidence"],
             "extraction_method": "llm",
             "extractor_model": item.get("extractor_model") or extractor_model,
             "metadata": {
@@ -4303,13 +4244,13 @@ def extraction_watermark_status(
     validation: dict[str, Any],
     candidates: list[dict[str, Any]],
 ) -> str:
-    if candidates:
-        return "ok"
     if (
         validation.get("schema_errors")
         or int(validation.get("rejected_count") or 0) > 0
     ):
         return "invalid"
+    if candidates:
+        return "ok"
     return "extracted_empty"
 
 

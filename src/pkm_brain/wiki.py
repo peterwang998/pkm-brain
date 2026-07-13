@@ -22,7 +22,7 @@ ALLOWED_PAGE_TYPES = {
 }
 NON_ROUTABLE_PAGE_TYPES = frozenset({"index", "reference"})
 NON_ROUTABLE_PAGE_FILENAMES = frozenset({"index.md", "log.md"})
-NON_ROUTABLE_PAGE_PREFIXES = ("references/", "agent_session_log/")
+NON_ROUTABLE_PAGE_PREFIXES = ("inbox/", "references/", "agent_session_log/")
 ALLOWED_STATUSES = {"draft", "active", "stale", "superseded", "archived"}
 COMMON_SECTIONS = ["Summary", "Key Points", "Source Evidence", "Related Pages", "Open Questions"]
 TYPE_SECTIONS = {
