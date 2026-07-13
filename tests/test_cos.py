@@ -23,6 +23,7 @@ from pkm_brain.cos_actions import (
 )
 from pkm_brain.cos_audit import AUDITOR_MAX_BATCH_CHARS, run_sampled_audit
 from pkm_brain.cos_policy import (
+    NEAR_DUPLICATE_PAGE_MERGE_SIGNAL,
     PolicyDecision,
     classify_action_risk,
     evaluate_policy,
@@ -454,6 +455,41 @@ def test_policy_promotion_matches_low_medium_and_large_topology(tmp_path: Path) 
             "page_merge",
             {"risk_tier": "high", "affected_fact_count": 5, "large_topology": True},
         )
+        confirmed_duplicate = evaluate_policy(
+            conn,
+            "page_merge",
+            {
+                "candidate_signal": NEAR_DUPLICATE_PAGE_MERGE_SIGNAL,
+                "duplicate_page_merge_signal": True,
+                "gardener_confirmed": True,
+                "contract_compatible": True,
+                "cross_entity_merge": False,
+                "cross_type_merge": False,
+                "type_mismatch": False,
+                "reversible": True,
+                "truth_mutation": False,
+                "confidence": 0.84,
+                "risk_tier": "high",
+                "affected_fact_count": 53,
+                "large_topology": True,
+            },
+        )
+        unconfirmed_duplicate = evaluate_policy(
+            conn,
+            "page_merge",
+            {
+                "candidate_signal": NEAR_DUPLICATE_PAGE_MERGE_SIGNAL,
+                "duplicate_page_merge_signal": True,
+                "gardener_confirmed": False,
+                "contract_compatible": True,
+                "reversible": True,
+                "truth_mutation": False,
+                "confidence": 0.84,
+                "risk_tier": "high",
+                "affected_fact_count": 53,
+                "large_topology": True,
+            },
+        )
         entity_large = evaluate_policy(
             conn,
             "entity_merge",
@@ -481,6 +517,10 @@ def test_policy_promotion_matches_low_medium_and_large_topology(tmp_path: Path) 
     assert entity_high_certainty.autonomy_level == "L1"
     assert entity_high_certainty.critic_required is False
     assert large.autonomy_level == "L3"
+    assert confirmed_duplicate.autonomy_level == "L2"
+    assert confirmed_duplicate.critic_required is True
+    assert confirmed_duplicate.audit_sample_rate == 1.0
+    assert unconfirmed_duplicate.autonomy_level == "L3"
     assert entity_large.autonomy_level == "L3"
 
 

@@ -58,6 +58,7 @@ from .cos_policy import (
     promote_policy_for_autonomy,
 )
 from .llm import cos_provider_status, provider_status
+from .llm_usage import llm_usage_summary
 from .maintenance import managed_storage_inventory, prune_runtime_artifacts
 from .memory_proposals import (
     propose_failure_memories_from_sources,
@@ -1054,6 +1055,22 @@ def wiki_promote_curation(
 @llm_app.command("doctor")
 def llm_doctor(provider: Optional[str] = typer.Option(None)) -> None:
     console.print_json(json.dumps(provider_status(provider)))
+
+
+@llm_app.command("usage")
+def llm_usage(
+    cycle_id: Optional[str] = typer.Option(
+        None, "--cycle-id", help="Show one automation or CoS cycle."
+    ),
+    limit: int = typer.Option(
+        20, "--limit", min=1, max=500, help="Maximum recent cycles to return."
+    ),
+    home: Optional[Path] = typer.Option(None, help="Brain home directory."),
+) -> None:
+    paths = BrainPaths.from_value(home)
+    console.print_json(
+        json.dumps(llm_usage_summary(paths, cycle_id=cycle_id, limit=limit))
+    )
 
 
 @cos_app.command("providers")

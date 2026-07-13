@@ -541,6 +541,8 @@ def test_nightly_maintenance_runs_self_healing_tasks(tmp_path: Path) -> None:
     assert result.summary["cos_gardener"]["status"] == "policy"
     assert result.summary["cos_gardener"]["mode"] == "policy"
     assert result.summary["cos_audit"]["mode"] == "stub"
+    assert result.summary["llm_usage"]["cycle_count"] == 0
+    assert result.summary["llm_usage"]["log_path"].endswith("llm-usage.log")
     assert result.summary["telemetry_retention"]["status"] == "ok"
     assert "fts" in result.summary["index_maintenance"]
     assert result.summary["provenance_check"]["errors"] == []

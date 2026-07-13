@@ -30,6 +30,7 @@ from .llm import (
     OPENAI_DEFAULT_MODEL,
     get_provider,
 )
+from .llm_usage import llm_usage_summary
 from .memory_proposals import (
     propose_failure_memories_from_sources,
     propose_memories_from_lineage,
@@ -323,7 +324,9 @@ def run_nightly_maintenance(
             )
             summary["cos_extraction_shadow"] = summary["cos_extraction"]
 
-            summary["cos_gardener"] = run_cos_gardener(paths, cos_role)
+            summary["cos_gardener"] = run_cos_gardener(
+                paths, cos_role, run_id=run_id
+            )
             summary["cos_gardener_shadow"] = summary["cos_gardener"]
 
             summary["cos_synthesis"] = run_cos_synthesis(
@@ -337,7 +340,7 @@ def run_nightly_maintenance(
             )
             summary["index_maintenance"] = run_index_maintenance(paths)
             summary["cos_timeout_sweep"] = run_cos_timeout_sweep(paths)
-            summary["cos_audit"] = run_cos_audit(paths, cos_role)
+            summary["cos_audit"] = run_cos_audit(paths, cos_role, run_id=run_id)
             summary["queue_summary"] = review_queue_summary(paths)
             summary["provenance_check"] = provenance_check(paths)
             summary["wiki_lint"] = lint_wiki(paths)
@@ -369,6 +372,9 @@ def run_nightly_maintenance(
         except Exception as exc:
             status = "failed"
             error = str(exc)
+        summary["llm_usage"] = llm_usage_summary(
+            paths, cycle_id=run_id, limit=1
+        )
         finished_at = now_iso()
         record_automation_finish(paths, run_id, status, finished_at, summary, error)
         return NightlyMaintenanceResult(
@@ -444,10 +450,15 @@ def run_cos_extraction(
     }
 
 
-def run_cos_gardener(paths: BrainPaths, role_status: dict[str, Any]) -> dict[str, Any]:
+def run_cos_gardener(
+    paths: BrainPaths,
+    role_status: dict[str, Any],
+    *,
+    run_id: str | None = None,
+) -> dict[str, Any]:
     if not role_status.get("can_run_mutation_capable_stages"):
         return cos_stage_skipped("cos_gardener", role_status, mode="policy")
-    result = generate_gardener_candidates(paths, shadow=False)
+    result = generate_gardener_candidates(paths, shadow=False, run_id=run_id)
     return {
         **result,
         "stage": "cos_gardener",
@@ -488,15 +499,17 @@ def run_cos_once(paths: BrainPaths, *, llm_wiki: bool = True) -> dict[str, Any]:
     service.init_workspace()
     run_id = new_id("cosrun")
     role_status = cos_role_status(paths)
-    return {
+    result = {
         "run_id": run_id,
         "cos_role": role_status,
         "cos_extraction": run_cos_extraction(paths, role_status, run_id=run_id),
-        "cos_gardener": run_cos_gardener(paths, role_status),
+        "cos_gardener": run_cos_gardener(paths, role_status, run_id=run_id),
         "cos_synthesis": run_cos_synthesis(paths, role_status, enabled=llm_wiki),
         "cos_timeout_sweep": run_cos_timeout_sweep(paths),
-        "cos_audit": run_cos_audit(paths, role_status),
+        "cos_audit": run_cos_audit(paths, role_status, run_id=run_id),
     }
+    result["llm_usage"] = llm_usage_summary(paths, cycle_id=run_id, limit=1)
+    return result
 
 
 def run_cos_timeout_sweep(
@@ -595,10 +608,15 @@ def residue_action_type(question: dict[str, Any]) -> str | None:
     return None
 
 
-def run_cos_audit(paths: BrainPaths, role_status: dict[str, Any]) -> dict[str, Any]:
+def run_cos_audit(
+    paths: BrainPaths,
+    role_status: dict[str, Any],
+    *,
+    run_id: str | None = None,
+) -> dict[str, Any]:
     if not role_status.get("can_run_mutation_capable_stages"):
         return cos_stage_skipped("cos_audit", role_status, mode="stub")
-    result = run_sampled_audit(paths)
+    result = run_sampled_audit(paths, run_id=run_id)
     return {
         **result,
         "stage": "cos_audit",

@@ -49,7 +49,7 @@ def test_eval_run_writes_rebuildable_report(tmp_path: Path) -> None:
     assert report_path.name.endswith(f"{result['id']}.json")
     report_json = json.loads(report_path.read_text(encoding="utf-8"))
     assert report_json["id"] == result["id"]
-    assert report_json["package_version"] == "0.1.3"
+    assert report_json["package_version"] == "0.1.4"
     assert report_json["generated_date"] == result["generated_at"][:10]
 
 

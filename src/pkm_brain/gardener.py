@@ -10,7 +10,7 @@ from typing import Any
 
 from .contracts import active_page_contracts, validate_fact_against_contract
 from .cos_actions import propose_action
-from .cos_policy import classify_action_risk
+from .cos_policy import NEAR_DUPLICATE_PAGE_MERGE_SIGNAL, classify_action_risk
 from .curation_settings import load_curation_settings, normalize_topology_review_threshold
 from .db import connection, loads
 from .entities import normalize_entity_name, normalize_entity_type
@@ -21,6 +21,7 @@ from .llm import (
     cos_role_provider_configured,
     get_cos_role_provider,
 )
+from .llm_usage import configure_provider_usage
 from .paths import BrainPaths
 from .wiki_facts import managed_fact_page_summaries
 
@@ -164,6 +165,7 @@ def generate_gardener_candidates(
     max_candidates: int = 25,
     llm_provider: LLMProvider | None = None,
     provider: str | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     curation = load_curation_settings(paths)
     merge_aggressiveness = float(curation["merge_aggressiveness"])
@@ -199,6 +201,7 @@ def generate_gardener_candidates(
         paths=paths,
         llm_provider=llm_provider,
         provider=provider,
+        usage_cycle_id=run_id,
     )
     judged_candidates = llm_result["candidates"]
     prioritized_candidates, arbitration = prioritize_topology_candidates(
@@ -219,7 +222,11 @@ def generate_gardener_candidates(
     actions: list[dict[str, Any]] = []
     if not shadow:
         for candidate in candidates:
-            actions.append(propose_gardener_action(paths, candidate, decide=True))
+            actions.append(
+                propose_gardener_action(
+                    paths, candidate, decide=True, run_id=run_id
+                )
+            )
     return {
         "status": "ok",
         "shadow": shadow,
@@ -615,7 +622,11 @@ def compact_entity_key(value: Any) -> str:
 
 
 def propose_gardener_action(
-    paths: BrainPaths, candidate: dict[str, Any], *, decide: bool = False
+    paths: BrainPaths,
+    candidate: dict[str, Any],
+    *,
+    decide: bool = False,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     spec = gardener_action_spec(candidate)
     return propose_action(
@@ -624,6 +635,7 @@ def propose_gardener_action(
         action_payload=spec["action_payload"],
         evidence=spec["evidence"],
         action_features=spec["action_features"],
+        run_id=run_id,
         target_fact_ids=spec["target_fact_ids"],
         target_page_paths=spec["target_page_paths"],
         target_contract_ids=spec["target_contract_ids"],
@@ -637,6 +649,16 @@ def propose_gardener_action(
 def gardener_action_spec(candidate: dict[str, Any]) -> dict[str, Any]:
     action_type = str(candidate["action_type"])
     contract = candidate.get("contract") if isinstance(candidate.get("contract"), dict) else None
+    contract_check = (
+        candidate.get("contract_check")
+        if isinstance(candidate.get("contract_check"), dict)
+        else {}
+    )
+    judgment = (
+        candidate.get("llm_judgment")
+        if isinstance(candidate.get("llm_judgment"), dict)
+        else {}
+    )
     target_fact_ids = (
         [str(fact_id) for fact_id in candidate.get("fact_ids") or [] if fact_id]
         or ([str(candidate["fact_id"])] if candidate.get("fact_id") else [])
@@ -647,19 +669,36 @@ def gardener_action_spec(candidate: dict[str, Any]) -> dict[str, Any]:
         "candidate_signal": candidate.get("reason"),
         "score": candidate.get("score"),
         "similarity": candidate.get("similarity"),
+        "evidence_overlap": candidate.get("evidence_overlap"),
+        "fact_token_overlap": candidate.get("fact_token_overlap"),
+        "shared_source_count": int(candidate.get("shared_source_count") or 0),
+        "shared_entity_count": len(candidate.get("shared_entity_keys") or []),
         "affected_fact_count": int(candidate.get("affected_fact_count") or len(target_fact_ids)),
         "affected_page_count": len(candidate.get("page_hints") or []),
         "merged_entity_count": candidate.get("merged_entity_count"),
         "large_topology": candidate.get("large_topology"),
-        "cross_entity_merge": candidate.get("cross_entity_merge"),
-        "cross_type_merge": candidate.get("cross_type_merge"),
-        "type_mismatch": candidate.get("type_mismatch"),
+        "cross_entity_merge": bool(candidate.get("cross_entity_merge")),
+        "cross_type_merge": bool(candidate.get("cross_type_merge")),
+        "type_mismatch": bool(candidate.get("type_mismatch")),
+        "contract_compatible": bool(contract_check.get("compatible")),
+        "duplicate_page_merge_signal": (
+            action_type == "page_merge"
+            and candidate.get("reason") == NEAR_DUPLICATE_PAGE_MERGE_SIGNAL
+        ),
+        "gardener_confirmed": (
+            judgment.get("decision") == "keep"
+            and str(candidate.get("risk_tier") or "").lower() in {"low", "medium"}
+            and not bool(candidate.get("needs_review"))
+            and candidate.get("gardener_review_status") != "llm_judgment_failed"
+            and not judgment.get("error_type")
+        ),
         "merge_signal": candidate.get("merge_signal"),
         "merge_aggressiveness": candidate.get("merge_aggressiveness"),
         "split_aggressiveness": candidate.get("split_aggressiveness"),
         "topology_review_threshold": candidate.get("topology_review_threshold"),
         "admission_thresholds": candidate.get("admission_thresholds"),
         "reversible": True,
+        "truth_mutation": False,
     }
     if action_type != "entity_merge":
         action_features["eval_gate"] = {"suite": "topology"}
@@ -762,6 +801,7 @@ def apply_gardener_judgment(
     paths: BrainPaths | None,
     llm_provider: LLMProvider | None,
     provider: str | None,
+    usage_cycle_id: str | None = None,
 ) -> dict[str, Any]:
     role_configured = (
         llm_provider is not None
@@ -788,6 +828,7 @@ def apply_gardener_judgment(
         provider=provider,
         timeout_seconds=timeout_seconds,
         worker_count=worker_count,
+        usage_cycle_id=usage_cycle_id,
     )
     results = run_gardener_judgment_jobs(
         prepared_jobs,
@@ -861,6 +902,7 @@ def prepare_gardener_judgment_jobs(
     provider: str | None,
     timeout_seconds: int,
     worker_count: int,
+    usage_cycle_id: str | None,
 ) -> list[dict[str, Any]]:
     grouped: dict[str, list[tuple[int, dict[str, Any]]]] = {}
     for index, candidate in enumerate(candidates):
@@ -882,6 +924,7 @@ def prepare_gardener_judgment_jobs(
                     provider=provider,
                     timeout_seconds=timeout_seconds,
                     reasoning_effort=effort,
+                    usage_cycle_id=usage_cycle_id,
                 )
                 jobs.append(
                     {
@@ -910,13 +953,25 @@ def gardener_candidate_provider(
     provider: str | None,
     timeout_seconds: int,
     reasoning_effort: str,
+    usage_cycle_id: str | None,
 ) -> LLMProvider:
-    if llm_provider is not None:
-        return llm_provider
     active_paths = paths or BrainPaths.from_value(None)
-    active_provider = get_cos_role_provider(active_paths, "gardener", provider=provider)
+    active_provider = get_cos_role_provider(
+        active_paths,
+        "gardener",
+        provider=provider,
+        llm_provider=llm_provider,
+    )
     if active_provider is None:
         raise LLMConfigurationError("No CoS LLM provider configured for role: gardener")
+    configure_provider_usage(
+        active_provider,
+        active_paths,
+        "gardener",
+        cycle_id=usage_cycle_id,
+        run_id=usage_cycle_id,
+        stage="cos_gardener",
+    )
     if hasattr(active_provider, "timeout"):
         setattr(active_provider, "timeout", timeout_seconds)
     if hasattr(active_provider, "reasoning_effort"):
@@ -1003,7 +1058,7 @@ def judge_gardener_candidate(
             gardener_judgment_prompt([candidate], pages, contracts, fact_statement_limit=3),
             schema=GARDENER_JUDGMENT_SCHEMA,
             llm_provider=provider,
-            max_attempts=1,
+            max_attempts=2,
         )
     except Exception as exc:  # noqa: BLE001 - one bad candidate should become review residue.
         return {
@@ -1030,6 +1085,12 @@ def gardener_candidate_reasoning_effort(candidate: dict[str, Any]) -> str:
     merge_signal = str(candidate.get("merge_signal") or "")
     if merge_signal in HIGH_CERTAINTY_ENTITY_MERGE_SIGNALS and str(candidate.get("risk_tier") or "").lower() == "low":
         return "low"
+    if (
+        candidate.get("action_type") == "page_merge"
+        and candidate.get("reason") == NEAR_DUPLICATE_PAGE_MERGE_SIGNAL
+        and bool((candidate.get("contract_check") or {}).get("compatible"))
+    ):
+        return "medium"
     if bool(candidate.get("large_topology")) or bool(candidate.get("cross_entity_merge")):
         return "xhigh"
     if bool(candidate.get("cross_type_merge")) or bool(candidate.get("type_mismatch")):
@@ -1390,7 +1451,7 @@ def merge_candidate(
         "shared_entity_keys": shared_entities[:5],
         "shared_source_count": len(shared_sources),
         "contract_check": contract_check,
-        "reason": "near-duplicate page hints with overlapping fact evidence",
+        "reason": NEAR_DUPLICATE_PAGE_MERGE_SIGNAL,
         "contracts_present": [
             left_hint in contracts,
             right_hint in contracts,

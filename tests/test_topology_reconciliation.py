@@ -77,8 +77,11 @@ def test_topology_reconciliation_rejects_stale_and_routes_survivors_to_policy(
         dry_run=False,
         critic_review={"max_workers": 2, "disagreement_mode": "reject"},
         gardener_llm_provider=provider,
+        run_id="topology_reconciliation_test",
     )
 
+    assert result["run_id"] == "topology_reconciliation_test"
+    assert result["llm_usage"]["cycle_count"] == 0
     assert result["failure_count"] == 0
     assert result["closed_group_counts"]["stale_page_split"] == 1
     assert result["remaining_open_by_type"] == {"page_merge": 1, "page_split": 1}
@@ -89,7 +92,7 @@ def test_topology_reconciliation_rejects_stale_and_routes_survivors_to_policy(
                 """
                 SELECT
                   json_extract(action_features, '$.candidate_key') AS candidate_key,
-                  status, policy_version, autonomy_level, action_features
+                  status, run_id, policy_version, autonomy_level, action_features
                 FROM cos_actions
                 WHERE id IN (?, ?, ?)
                 """,
@@ -107,6 +110,7 @@ def test_topology_reconciliation_rejects_stale_and_routes_survivors_to_policy(
     ):
         action = actions[key]
         assert action["status"] == "needs_human"
+        assert action["run_id"] == "topology_reconciliation_test"
         assert action["policy_version"] is not None
         assert action["autonomy_level"] == "L3"
         features = json.loads(action["action_features"])

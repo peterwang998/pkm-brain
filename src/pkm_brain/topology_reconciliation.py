@@ -17,9 +17,10 @@ from .gardener import (
     prioritize_topology_candidates,
 )
 from .llm import LLMProvider
+from .llm_usage import llm_usage_summary
 from .paths import BrainPaths
 from .policy_reconciliation import redecide_policy_actions
-from .util import now_iso
+from .util import new_id, now_iso
 from .wiki_facts import managed_fact_page_summaries
 
 
@@ -34,6 +35,7 @@ def reconcile_topology_proposals(
     critic_review: dict[str, Any] | None = None,
     gardener_llm_provider: LLMProvider | None = None,
     critic_llm_provider: LLMProvider | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     context = current_topology_context(paths)
     groups = load_open_topology_groups(paths)
@@ -53,6 +55,7 @@ def reconcile_topology_proposals(
     )
     if dry_run:
         return {"status": "dry_run", **base}
+    active_run_id = run_id or new_id("topology_reconciliation")
 
     closed_counts: Counter[str] = Counter()
     for group in stale:
@@ -78,6 +81,7 @@ def reconcile_topology_proposals(
         critic_review=critic_review,
         gardener_llm_provider=gardener_llm_provider,
         critic_llm_provider=critic_llm_provider,
+        run_id=active_run_id,
         phase="merge",
         apply_arbitration=True,
     )
@@ -128,6 +132,7 @@ def reconcile_topology_proposals(
         critic_review=critic_review,
         gardener_llm_provider=gardener_llm_provider,
         critic_llm_provider=critic_llm_provider,
+        run_id=active_run_id,
         phase="split",
         apply_arbitration=False,
     )
@@ -136,8 +141,9 @@ def reconcile_topology_proposals(
     remaining = load_open_topology_groups(paths)
     all_results = [*merge_phase["results"], *split_phase["results"]]
     all_failures = [*merge_phase["failures"], *split_phase["failures"]]
-    return {
+    result = {
         "status": "applied",
+        "run_id": active_run_id,
         **base,
         "closed_group_counts": dict(sorted(closed_counts.items())),
         "gardener_review": {
@@ -160,6 +166,10 @@ def reconcile_topology_proposals(
         "remaining_open_unique_count": len(remaining),
         "remaining_open_by_type": count_groups_by_type(remaining),
     }
+    result["llm_usage"] = llm_usage_summary(
+        paths, cycle_id=active_run_id, limit=1
+    )
+    return result
 
 
 def current_topology_context(paths: BrainPaths) -> dict[str, Any]:
@@ -237,6 +247,7 @@ def reconcile_candidate_phase(
     critic_review: dict[str, Any] | None,
     gardener_llm_provider: LLMProvider | None,
     critic_llm_provider: LLMProvider | None,
+    run_id: str,
     phase: str,
     apply_arbitration: bool,
 ) -> dict[str, Any]:
@@ -253,6 +264,7 @@ def reconcile_candidate_phase(
         paths=paths,
         llm_provider=gardener_llm_provider,
         provider=None,
+        usage_cycle_id=run_id,
     )
     kept = [
         preserve_deterministic_risk(candidate, baseline_risk[str(candidate["candidate_key"])])
@@ -311,6 +323,7 @@ def reconcile_candidate_phase(
             paths,
             groups_by_key[key],
             candidate,
+            run_id=run_id,
             phase=phase,
         )
         with connection(paths.sqlite_path) as conn:
@@ -343,6 +356,7 @@ def refresh_topology_group(
     group: dict[str, Any],
     candidate: dict[str, Any],
     *,
+    run_id: str,
     phase: str,
 ) -> dict[str, Any]:
     canonical = group["actions"][0]
@@ -359,13 +373,26 @@ def refresh_topology_group(
         "phase": phase,
         "candidate_key": group["candidate_key"],
         "duplicate_action_ids": [str(action["id"]) for action in sibling_actions],
+        "run_id": run_id,
         "reconciled_at": timestamp,
     }
     with connection(paths.sqlite_path) as conn:
         conn.execute(
             """
+            INSERT OR IGNORE INTO wiki_curation_runs(
+              id, source_packet_id, group_by, status, summary, created_at
+            ) VALUES (?, NULL, 'cos_action', 'running', ?, ?)
+            """,
+            (
+                run_id,
+                dumps({"created_by": "topology_reconciliation"}),
+                timestamp,
+            ),
+        )
+        conn.execute(
+            """
             UPDATE cos_actions
-            SET status = 'proposed', target_fact_ids = ?, target_page_paths = ?,
+            SET run_id = ?, status = 'proposed', target_fact_ids = ?, target_page_paths = ?,
                 target_contract_ids = ?, action_features = ?, proposed_by = ?,
                 confidence = ?, risk_tier = ?, evidence_json = ?,
                 policy_id = NULL, policy_version = NULL, policy_decision = NULL,
@@ -373,6 +400,7 @@ def refresh_topology_group(
             WHERE id = ?
             """,
             (
+                run_id,
                 dumps(spec["target_fact_ids"]),
                 dumps(spec["target_page_paths"]),
                 dumps(spec["target_contract_ids"]),

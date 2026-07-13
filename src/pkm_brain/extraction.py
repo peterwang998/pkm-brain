@@ -231,7 +231,13 @@ def extract_recent_documents(
             "timing": extraction_run_timing(run_started),
         }
     active_provider = get_cos_role_provider(
-        paths, "extractor", provider=provider, llm_provider=llm_provider
+        paths,
+        "extractor",
+        provider=provider,
+        llm_provider=llm_provider,
+        usage_cycle_id=run_id,
+        usage_run_id=run_id,
+        usage_stage="cos_extraction",
     )
     extractor_model = getattr(active_provider, "model", None)
     selection_started = time.perf_counter()

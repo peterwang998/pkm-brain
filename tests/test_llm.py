@@ -81,6 +81,7 @@ def test_codex_provider_falls_back_on_model_selection_error(monkeypatch: pytest.
             'model_reasoning_effort="medium"',
         ]
         assert command[5] == "exec"
+        assert "--json" in command
         assert "--ask-for-approval" not in command[4:]
         assert "--skip-git-repo-check" in command
         model = command[command.index("--model") + 1]

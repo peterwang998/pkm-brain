@@ -21,6 +21,9 @@ HIGH_CERTAINTY_ENTITY_MERGE_SIGNALS = {
     "same_normalized_name_or_alias",
     "same_compact_name_or_alias",
 }
+NEAR_DUPLICATE_PAGE_MERGE_SIGNAL = (
+    "near-duplicate page hints with overlapping fact evidence"
+)
 LOW_AUTONOMY_ACTION_TYPES = {
     "fact_merge",
     "fact_supersede",
@@ -585,6 +588,38 @@ def autonomy_policy_rows(
                             "truth_mutation": False,
                         }
                     },
+                    "L2",
+                    True,
+                    1.0,
+                    created_at,
+                )
+            ]
+            if normalized_strictness != "strict"
+            else []
+        ),
+        *(
+            [
+                policy_row(
+                    version,
+                    "confirmed_duplicate_page_merge_l2",
+                    3,
+                    ["page_merge"],
+                    confidence_bound_predicate(
+                        {
+                            "eq": {
+                                "candidate_signal": NEAR_DUPLICATE_PAGE_MERGE_SIGNAL,
+                                "duplicate_page_merge_signal": True,
+                                "gardener_confirmed": True,
+                                "contract_compatible": True,
+                                "cross_entity_merge": False,
+                                "cross_type_merge": False,
+                                "type_mismatch": False,
+                                "reversible": True,
+                                "truth_mutation": False,
+                            }
+                        },
+                        minimum_auto_confidence,
+                    ),
                     "L2",
                     True,
                     1.0,

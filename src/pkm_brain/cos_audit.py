@@ -61,6 +61,7 @@ def run_sampled_audit(
     auto_revert_bad: bool = False,
     llm_provider: LLMProvider | None = None,
     provider: str | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     with connection(paths.sqlite_path) as conn:
         actions = load_audit_sample(conn, limit)
@@ -88,7 +89,13 @@ def run_sampled_audit(
     audit_provider = llm_provider
     if actions:
         audit_provider = get_cos_role_provider(
-            paths, "auditor", provider=provider, llm_provider=llm_provider
+            paths,
+            "auditor",
+            provider=provider,
+            llm_provider=llm_provider,
+            usage_cycle_id=run_id,
+            usage_run_id=run_id,
+            usage_stage="cos_audit",
         )
         cards = build_auditor_cards(paths, actions)
         judgments: dict[str, dict[str, Any]] = {}

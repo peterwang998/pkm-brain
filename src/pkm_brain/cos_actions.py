@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import re
-from threading import Lock
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +22,7 @@ from .llm import (
     LLMProvider,
     complete_json,
     cos_role_provider_configured,
-    get_cos_role_provider,
+    get_cos_action_provider,
     load_cos_llm_config,
 )
 from .paths import BrainPaths
@@ -36,7 +35,6 @@ OPEN_ACTION_STATUSES = {"proposed", "needs_human"}
 CRITIC_DISAGREEMENT_MODES = {"needs_human", "reject"}
 MAX_CRITIC_REPAIR_EVIDENCE_UNITS = 5
 CRITIC_CONTEXT_RADIUS = 4
-_COS_ROLE_PROVIDER_LOCK = Lock()
 CRITIC_SCHEMA = {
     "type": "object",
     "required": ["decision", "rationale"],
@@ -511,11 +509,12 @@ def critic_review(
             "decision": "unavailable",
             "rationale": "No CoS LLM provider configured for critic role",
         }
-    if llm_provider is not None:
-        active_provider = llm_provider
-    else:
-        with _COS_ROLE_PROVIDER_LOCK:
-            active_provider = get_cos_role_provider(paths, "critic", provider=provider)
+    active_provider = get_cos_action_provider(
+        paths, "critic", action,
+        provider=provider,
+        llm_provider=llm_provider,
+        stage="evaluation",
+    )
     if active_provider is None:
         return {
             "critic_by": "critic:unconfigured",

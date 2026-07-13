@@ -199,7 +199,8 @@ def curation_settings_payload(
             "truth_contradiction",
             "missing_quote_or_fallback_route",
             "cross_type_topology",
-            "topology_above_review_threshold",
+            "unconfirmed_topology_above_review_threshold",
+            "failed_topology_judgment",
             "failed_eval_gate",
         ],
     }

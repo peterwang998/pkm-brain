@@ -2728,6 +2728,11 @@ def test_curation_settings_promote_future_only_policy_profiles(tmp_path: Path) -
     assert default_settings["split_aggressiveness"] == 0.5
     assert default_settings["topology_review_threshold"] == 8
     assert default_settings["topology_applies_to"] == "future_gardener_runs_only"
+    assert (
+        "unconfirmed_topology_above_review_threshold"
+        in default_settings["hard_review_boundaries"]
+    )
+    assert "failed_topology_judgment" in default_settings["hard_review_boundaries"]
     assert default_settings["updated_at"] is not None
     assert "." not in default_settings["updated_at"]
     assert default_settings["configured"] is False
@@ -2767,9 +2772,31 @@ def test_curation_settings_promote_future_only_policy_profiles(tmp_path: Path) -
             "fact_upsert",
             {"risk_tier": "high", "confidence": 1.0, "truth_contradiction": True},
         )
+        strict_duplicate_merge = evaluate_policy(
+            conn,
+            "page_merge",
+            {
+                "candidate_signal": (
+                    "near-duplicate page hints with overlapping fact evidence"
+                ),
+                "duplicate_page_merge_signal": True,
+                "gardener_confirmed": True,
+                "contract_compatible": True,
+                "cross_entity_merge": False,
+                "cross_type_merge": False,
+                "type_mismatch": False,
+                "reversible": True,
+                "truth_mutation": False,
+                "confidence": 0.99,
+                "risk_tier": "high",
+                "affected_fact_count": 40,
+                "large_topology": True,
+            },
+        )
     assert strict_medium.autonomy_level == "L3"
     assert strict_exact.autonomy_level == "L1"
     assert hard_boundary.autonomy_level == "L3"
+    assert strict_duplicate_merge.autonomy_level == "L3"
 
     with running_ui(paths) as (host, port, token):
         topology_status, topology = request_json(

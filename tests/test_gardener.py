@@ -10,7 +10,9 @@ from pkm_brain.gardener import (
     apply_gardener_judgment,
     entity_merge_candidate,
     generate_gardener_candidates,
+    gardener_action_spec,
     gardener_candidate_reasoning_effort,
+    judge_gardener_candidate,
     merge_candidate,
     page_split_candidate,
     prioritize_topology_candidates,
@@ -255,6 +257,107 @@ def test_gardener_merge_candidates_require_fact_overlap(tmp_path: Path) -> None:
     ]
     assert merges[0]["fact_token_overlap"] > 0.5
     assert merges[0]["shared_source_count"] == 1
+
+
+def test_confirmed_duplicate_page_merge_preserves_policy_evidence() -> None:
+    candidate = {
+        "action_type": "page_merge",
+        "candidate_key": "page_merge:career/role-preferences.md,career/role-search-preferences.md:",
+        "page_hints": [
+            "career/role-preferences.md",
+            "career/role-search-preferences.md",
+        ],
+        "reason": "near-duplicate page hints with overlapping fact evidence",
+        "score": 0.87,
+        "similarity": 0.86,
+        "evidence_overlap": 0.45,
+        "fact_token_overlap": 0.45,
+        "shared_source_count": 3,
+        "shared_entity_keys": ["career:role-preferences:summary"],
+        "contract_check": {"compatible": True},
+        "affected_fact_count": 40,
+        "large_topology": True,
+        "risk_tier": "low",
+        "llm_judgment": {
+            "candidate_key": "page_merge:career/role-preferences.md,career/role-search-preferences.md:",
+            "decision": "keep",
+            "rationale": "The pages carry the same scope and evidence.",
+            "risk_tier": "low",
+        },
+    }
+
+    features = gardener_action_spec(candidate)["action_features"]
+
+    assert features["duplicate_page_merge_signal"] is True
+    assert features["gardener_confirmed"] is True
+    assert features["contract_compatible"] is True
+    assert features["evidence_overlap"] == 0.45
+    assert features["shared_source_count"] == 3
+    assert features["shared_entity_count"] == 1
+    assert features["truth_mutation"] is False
+
+    candidate["risk_tier"] = "high"
+    assert gardener_action_spec(candidate)["action_features"]["gardener_confirmed"] is False
+
+
+def test_duplicate_page_merge_uses_medium_gardener_effort_even_when_large() -> None:
+    assert (
+        gardener_candidate_reasoning_effort(
+            {
+                "action_type": "page_merge",
+                "reason": "near-duplicate page hints with overlapping fact evidence",
+                "contract_check": {"compatible": True},
+                "large_topology": True,
+                "risk_tier": "medium",
+            }
+        )
+        == "medium"
+    )
+
+
+def test_gardener_repairs_malformed_judgment_once() -> None:
+    candidate_key = "page_merge:concepts/alpha.md,concepts/alpha-details.md:"
+
+    class RepairingProvider:
+        name = "fake"
+        model = "test"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def complete(self, prompt: str) -> str:
+            self.calls += 1
+            if self.calls == 1:
+                return json.dumps({})
+            return json.dumps(
+                {
+                    "judgments": [
+                        {
+                            "candidate_key": candidate_key,
+                            "decision": "keep",
+                            "rationale": "The pages are duplicate views of the same facts.",
+                        }
+                    ]
+                }
+            )
+
+    provider = RepairingProvider()
+    result = judge_gardener_candidate(
+        {
+            "action_type": "page_merge",
+            "candidate_key": candidate_key,
+            "page_hints": ["concepts/alpha.md", "concepts/alpha-details.md"],
+        },
+        [],
+        {},
+        provider,
+        None,
+        "medium",
+    )
+
+    assert provider.calls == 2
+    assert result["error"] is None
+    assert result["judgment"]["decision"] == "keep"
 
 
 def test_merge_aggressiveness_changes_candidate_admission() -> None:

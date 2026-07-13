@@ -5,15 +5,27 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from typing import TYPE_CHECKING, Any, Protocol
 
 import yaml
+
+from .llm_usage import (
+    anthropic_response_usage,
+    codex_jsonl_usage,
+    configure_provider_usage,
+    ollama_response_usage,
+    openai_response_usage,
+    record_provider_usage,
+)
+from .util import now_iso
 
 if TYPE_CHECKING:
     from .paths import BrainPaths
@@ -31,6 +43,7 @@ COS_PROPOSER_ROLES = ("extractor", "resolver", "gardener", "synthesizer")
 COS_REVIEWER_ROLES = ("critic", "auditor")
 COS_LLM_CONFIG_FILENAME = "cos_llm.yaml"
 VALID_PROVIDERS = {"openai", "anthropic", "ollama", "codex"}
+_COS_ROLE_PROVIDER_LOCK = Lock()
 
 
 class LLMConfigurationError(RuntimeError):
@@ -94,6 +107,11 @@ class OpenAIProvider:
 
     def complete(self, prompt: str) -> str:
         def run_once(model: str) -> str:
+            started_at = now_iso()
+            started_clock = time.perf_counter()
+            data: dict[str, Any] | None = None
+            status = "failed"
+            error_type: str | None = None
             payload = {
                 "model": model,
                 "messages": [
@@ -101,17 +119,34 @@ class OpenAIProvider:
                     {"role": "user", "content": prompt},
                 ],
             }
-            data = post_json(
-                f"{self.base_url.rstrip('/')}/chat/completions",
-                payload,
-                {"Authorization": f"Bearer {self.api_key}"},
-            )
             try:
+                data = post_json(
+                    f"{self.base_url.rstrip('/')}/chat/completions",
+                    payload,
+                    {"Authorization": f"Bearer {self.api_key}"},
+                )
                 content = str(data["choices"][0]["message"]["content"])
+                self.model = model
+                status = "success"
+                return content
             except (KeyError, IndexError, TypeError) as exc:
-                raise LLMProviderError(f"Unexpected OpenAI response shape: {data}") from exc
-            self.model = model
-            return content
+                error_type = type(exc).__name__
+                raise LLMProviderError(
+                    f"Unexpected OpenAI response shape: {data}"
+                ) from exc
+            except Exception as exc:
+                error_type = type(exc).__name__
+                raise
+            finally:
+                record_provider_usage(
+                    self,
+                    model=model,
+                    usage=openai_response_usage(data),
+                    status=status,
+                    started_at=started_at,
+                    duration_ms=int((time.perf_counter() - started_clock) * 1000),
+                    error_type=error_type,
+                )
 
         return complete_with_model_fallbacks("OpenAI", self.models, run_once)
 
@@ -134,26 +169,48 @@ class AnthropicProvider:
 
     def complete(self, prompt: str) -> str:
         def run_once(model: str) -> str:
+            started_at = now_iso()
+            started_clock = time.perf_counter()
+            data: dict[str, Any] | None = None
+            status = "failed"
+            error_type: str | None = None
             payload = {
                 "model": model,
                 "max_tokens": 4096,
                 "system": "Return only valid JSON. Do not wrap it in Markdown.",
                 "messages": [{"role": "user", "content": prompt}],
             }
-            data = post_json(
-                f"{self.base_url.rstrip('/')}/v1/messages",
-                payload,
-                {
-                    "x-api-key": self.api_key,
-                    "anthropic-version": "2023-06-01",
-                },
-            )
             try:
+                data = post_json(
+                    f"{self.base_url.rstrip('/')}/v1/messages",
+                    payload,
+                    {
+                        "x-api-key": self.api_key,
+                        "anthropic-version": "2023-06-01",
+                    },
+                )
                 content = "".join(part.get("text", "") for part in data["content"] if part.get("type") == "text")
+                self.model = model
+                status = "success"
+                return content
             except (KeyError, TypeError) as exc:
-                raise LLMProviderError(f"Unexpected Anthropic response shape: {data}") from exc
-            self.model = model
-            return content
+                error_type = type(exc).__name__
+                raise LLMProviderError(
+                    f"Unexpected Anthropic response shape: {data}"
+                ) from exc
+            except Exception as exc:
+                error_type = type(exc).__name__
+                raise
+            finally:
+                record_provider_usage(
+                    self,
+                    model=model,
+                    usage=anthropic_response_usage(data),
+                    status=status,
+                    started_at=started_at,
+                    duration_ms=int((time.perf_counter() - started_clock) * 1000),
+                    error_type=error_type,
+                )
 
         return complete_with_model_fallbacks("Anthropic", self.models, run_once)
 
@@ -171,6 +228,11 @@ class OllamaProvider:
 
     def complete(self, prompt: str) -> str:
         def run_once(model: str) -> str:
+            started_at = now_iso()
+            started_clock = time.perf_counter()
+            data: dict[str, Any] | None = None
+            status = "failed"
+            error_type: str | None = None
             payload = {
                 "model": model,
                 "stream": False,
@@ -179,13 +241,30 @@ class OllamaProvider:
                     {"role": "user", "content": prompt},
                 ],
             }
-            data = post_json(f"{self.base_url.rstrip('/')}/api/chat", payload, {})
             try:
+                data = post_json(f"{self.base_url.rstrip('/')}/api/chat", payload, {})
                 content = str(data["message"]["content"])
+                self.model = model
+                status = "success"
+                return content
             except (KeyError, TypeError) as exc:
-                raise LLMProviderError(f"Unexpected Ollama response shape: {data}") from exc
-            self.model = model
-            return content
+                error_type = type(exc).__name__
+                raise LLMProviderError(
+                    f"Unexpected Ollama response shape: {data}"
+                ) from exc
+            except Exception as exc:
+                error_type = type(exc).__name__
+                raise
+            finally:
+                record_provider_usage(
+                    self,
+                    model=model,
+                    usage=ollama_response_usage(data),
+                    status=status,
+                    started_at=started_at,
+                    duration_ms=int((time.perf_counter() - started_clock) * 1000),
+                    error_type=error_type,
+                )
 
         return complete_with_model_fallbacks("Ollama", self.models, run_once)
 
@@ -217,6 +296,12 @@ class CodexProvider:
         return complete_with_model_fallbacks("Codex", self.models, lambda model: self._complete_once(model, prompt))
 
     def _complete_once(self, model: str, prompt: str) -> str:
+        started_at = now_iso()
+        started_clock = time.perf_counter()
+        usage: dict[str, int] | None = None
+        metadata: dict[str, Any] = {}
+        status = "failed"
+        error_type: str | None = None
         with tempfile.TemporaryDirectory(prefix="pkm-brain-codex-") as temp_dir:
             output_path = Path(temp_dir) / "last-message.txt"
             command = [
@@ -225,6 +310,7 @@ class CodexProvider:
                 "never",
                 *codex_reasoning_effort_args(self.reasoning_effort),
                 "exec",
+                "--json",
                 "--sandbox",
                 "read-only",
                 "--cd",
@@ -246,20 +332,48 @@ class CodexProvider:
                     check=False,
                 )
             except subprocess.TimeoutExpired as exc:
+                error_type = type(exc).__name__
+                record_provider_usage(
+                    self,
+                    model=model,
+                    usage=None,
+                    status=status,
+                    started_at=started_at,
+                    duration_ms=int((time.perf_counter() - started_clock) * 1000),
+                    error_type=error_type,
+                )
                 raise LLMProviderError(f"Codex timed out after {self.timeout} seconds") from exc
-            if completed.returncode != 0:
-                stderr = completed.stderr.strip()
-                stdout = completed.stdout.strip()
-                detail = stderr or stdout or f"exit code {completed.returncode}"
-                raise LLMProviderError(f"Codex provider failed: {detail}")
-            if output_path.exists():
-                output = output_path.read_text(encoding="utf-8").strip()
-            else:
-                output = completed.stdout.strip()
-            if not output:
-                raise LLMProviderError("Codex provider returned an empty response")
-            self.model = model
-            return output
+            usage, metadata = codex_jsonl_usage(completed.stdout)
+            try:
+                if completed.returncode != 0:
+                    stderr = completed.stderr.strip()
+                    stdout = completed.stdout.strip()
+                    detail = stderr or stdout or f"exit code {completed.returncode}"
+                    raise LLMProviderError(f"Codex provider failed: {detail}")
+                if output_path.exists():
+                    output = output_path.read_text(encoding="utf-8").strip()
+                else:
+                    output = completed.stdout.strip()
+                if not output:
+                    raise LLMProviderError("Codex provider returned an empty response")
+                self.model = model
+                status = "success"
+                return output
+            except Exception as exc:
+                error_type = type(exc).__name__
+                raise
+            finally:
+                record_provider_usage(
+                    self,
+                    model=model,
+                    usage=usage,
+                    status=status,
+                    started_at=started_at,
+                    duration_ms=int((time.perf_counter() - started_clock) * 1000),
+                    error_type=error_type,
+                    session_id=metadata.get("session_id"),
+                    rate_limits=metadata.get("rate_limits"),
+                )
 
 
 def get_provider(provider: str | None = None, *, role: str | None = None) -> LLMProvider:
@@ -566,14 +680,54 @@ def get_cos_role_provider(
     *,
     provider: str | None = None,
     llm_provider: LLMProvider | None = None,
+    usage_cycle_id: str | None = None,
+    usage_run_id: str | None = None,
+    usage_stage: str | None = None,
 ) -> LLMProvider | None:
     if llm_provider is not None:
-        return llm_provider
-    selection = resolve_cos_role_selection(paths, role, provider=provider)
-    if selection.provider is None:
-        return None
-    with cos_role_provider_environment(selection):
-        return get_provider(selection.provider, role=role)
+        return configure_provider_usage(
+            llm_provider,
+            paths,
+            normalize_llm_role(role),
+            cycle_id=usage_cycle_id,
+            run_id=usage_run_id,
+            stage=usage_stage,
+        )
+    with _COS_ROLE_PROVIDER_LOCK:
+        selection = resolve_cos_role_selection(paths, role, provider=provider)
+        if selection.provider is None:
+            return None
+        with cos_role_provider_environment(selection):
+            active_provider = get_provider(selection.provider, role=role)
+    return configure_provider_usage(
+        active_provider,
+        paths,
+        selection.role,
+        cycle_id=usage_cycle_id,
+        run_id=usage_run_id,
+        stage=usage_stage,
+    )
+
+
+def get_cos_action_provider(
+    paths: "BrainPaths",
+    role: str,
+    action: dict[str, Any],
+    *,
+    provider: str | None = None,
+    llm_provider: LLMProvider | None = None,
+    stage: str | None = None,
+) -> LLMProvider | None:
+    run_id = str(action.get("run_id") or "").strip() or None
+    return get_cos_role_provider(
+        paths,
+        role,
+        provider=provider,
+        llm_provider=llm_provider,
+        usage_cycle_id=run_id,
+        usage_run_id=run_id,
+        usage_stage=stage,
+    )
 
 
 def cos_provider_status(paths: "BrainPaths") -> dict[str, Any]:
