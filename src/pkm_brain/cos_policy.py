@@ -685,6 +685,20 @@ def autonomy_policy_rows(
         ),
         policy_row(
             version,
+            "topology_low_l2_critic",
+            35,
+            sorted(TOPOLOGY_ACTION_TYPES),
+            confidence_bound_predicate(
+                {"eq": {"risk_tier": "low", "reversible": True}},
+                minimum_auto_confidence,
+            ),
+            "L2",
+            True,
+            1.0,
+            created_at,
+        ),
+        policy_row(
+            version,
             "low_l1_critic",
             30,
             sorted(low_action_types),

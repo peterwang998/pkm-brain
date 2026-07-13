@@ -380,6 +380,16 @@ def test_policy_promotion_matches_low_medium_and_large_topology(tmp_path: Path) 
             "page_merge",
             {"risk_tier": "medium", "affected_fact_count": 3},
         )
+        low_topology = evaluate_policy(
+            conn,
+            "page_merge",
+            {
+                "risk_tier": "low",
+                "confidence": 0.9,
+                "reversible": True,
+                "affected_fact_count": 3,
+            },
+        )
         clean_fact = evaluate_policy(
             conn,
             "fact_upsert",
@@ -430,6 +440,9 @@ def test_policy_promotion_matches_low_medium_and_large_topology(tmp_path: Path) 
     assert "matched policy" not in low.reason
     assert medium.autonomy_level == "L2"
     assert medium.audit_sample_rate == 1.0
+    assert low_topology.autonomy_level == "L2"
+    assert low_topology.critic_required is True
+    assert low_topology.audit_sample_rate == 1.0
     assert clean_fact.autonomy_level == "L2"
     assert clean_fact.critic_required is True
     assert entity_medium.autonomy_level == "L2"

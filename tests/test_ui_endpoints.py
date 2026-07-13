@@ -1988,6 +1988,80 @@ def test_v2_queue_topology_surfaces_entity_names(tmp_path: Path) -> None:
     assert item["approvable"] is True
 
 
+def test_v2_queue_excludes_entity_merge_after_target_drift(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    with connection(paths.sqlite_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO entities(id, name, entity_type, aliases, status, source_ids, created_at)
+            VALUES (?, ?, 'event', '[]', 'active', '[]', ?)
+            """,
+            [
+                (
+                    "entity_destination",
+                    "Interview process",
+                    "2026-07-12T10:00:00+00:00",
+                ),
+                ("entity_source", "PM interview process", "2026-07-12T10:00:00+00:00"),
+                ("entity_other", "Interview loop", "2026-07-12T10:00:00+00:00"),
+            ],
+        )
+    action = propose_action(
+        paths,
+        "entity_merge",
+        action_payload={
+            "canonical_entity_id": "entity_destination",
+            "merged_entity_ids": ["entity_source"],
+        },
+        action_features={"confidence": 0.9, "reversible": True},
+        proposed_by="test",
+        risk_tier="low",
+    )
+    with connection(paths.sqlite_path) as conn:
+        conn.execute(
+            "UPDATE cos_actions SET status = 'needs_human' WHERE id = ?",
+            (action["id"],),
+        )
+        conn.execute(
+            "UPDATE entities SET status = 'merged', merged_into = 'entity_other' WHERE id = 'entity_source'"
+        )
+        conn.execute(
+            """
+            INSERT INTO open_questions(
+              id, kind, fact_ids, question, options, status, context, action_id,
+              recommended_action, risk_tier, created_at
+            ) VALUES (?, 'policy_escalation', '[]', ?, '[]', 'needs_human', ?, ?, ?, 'low', ?)
+            """,
+            (
+                "question_stale_entity_merge",
+                "Entity merge requires review.",
+                dumps({"action_id": action["id"]}),
+                action["id"],
+                dumps(
+                    {
+                        "action_type": "entity_merge",
+                        "payload": {
+                            "canonical_entity_id": "entity_destination",
+                            "merged_entity_ids": ["entity_source"],
+                        },
+                    }
+                ),
+                "2026-07-12T10:01:00+00:00",
+            ),
+        )
+
+    with running_ui(paths) as (host, port, token):
+        status, queue = request_json(
+            host, port, token, "GET", "/api/queue?kind=topology&state=all"
+        )
+
+    assert status == 200
+    assert queue["total"] == 0
+    assert queue["items"] == []
+    assert queue["queue_summary"]["blocked_total"] == 0
+
+
 def test_v2_queue_decision_applies_and_undoes_linked_action(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
     BrainService(paths).init_workspace()

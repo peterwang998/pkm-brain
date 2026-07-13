@@ -1184,7 +1184,7 @@ def queue_counts(conn: Any) -> dict[str, Any]:
             action_type = str((action or {}).get("action_type") or "")
             group = queue_group_for_kind(kind, action_type)
             if group == "topology" and action is not None:
-                if not entity_merge_action_already_applied(conn, action):
+                if entity_merge_action_is_queue_relevant(conn, action):
                     topology_identities.add(topology_action_identity(action))
                 continue
             counts[group] = counts.get(group, 0) + 1
@@ -1744,7 +1744,7 @@ def queue_open_topology_actions(
     seen_candidate_keys: set[str] = set()
     for row in rows:
         action = row_to_action(row)
-        if entity_merge_action_already_applied(conn, action):
+        if not entity_merge_action_is_queue_relevant(conn, action):
             continue
         candidate_key = action_candidate_key(action)
         if candidate_key and candidate_key in seen_candidate_keys:
@@ -1755,9 +1755,9 @@ def queue_open_topology_actions(
     return actions
 
 
-def entity_merge_action_already_applied(conn: Any, action: dict[str, Any]) -> bool:
+def entity_merge_action_is_queue_relevant(conn: Any, action: dict[str, Any]) -> bool:
     if action.get("action_type") != "entity_merge":
-        return False
+        return True
     payload = action_payload(action)
     canonical_id = str(
         payload.get("canonical_entity_id")
@@ -1779,23 +1779,19 @@ def entity_merge_action_already_applied(conn: Any, action: dict[str, Any]) -> bo
         if str(value or "").strip() and str(value).strip() != canonical_id
     ]
     if not canonical_id or not source_ids or not ui_table_exists(conn, "entities"):
-        return False
-    placeholders = ",".join("?" for _ in [canonical_id, *source_ids])
+        return True
+    target_ids = [canonical_id, *source_ids]
+    placeholders = ",".join("?" for _ in target_ids)
     entities = {
         str(row["id"]): row
         for row in conn.execute(
-            f"SELECT id, status, merged_into FROM entities WHERE id IN ({placeholders})",
-            [canonical_id, *source_ids],
+            f"SELECT id, status FROM entities WHERE id IN ({placeholders})", target_ids
         )
     }
-    canonical = entities.get(canonical_id)
-    if canonical is None or str(canonical["status"] or "active") != "active":
-        return False
+    if len(entities) != len(target_ids):
+        return True
     return all(
-        source_id in entities
-        and str(entities[source_id]["status"] or "") == "merged"
-        and str(entities[source_id]["merged_into"] or "") == canonical_id
-        for source_id in source_ids
+        str(entities[target_id]["status"] or "") == "active" for target_id in target_ids
     )
 
 
@@ -2037,7 +2033,9 @@ def queue_question_descriptors(
                 action = actions_for_ids(conn, {str(question["action_id"])}).get(
                     str(question["action_id"])
                 )
-                if action is None or entity_merge_action_already_applied(conn, action):
+                if action is None or not entity_merge_action_is_queue_relevant(
+                    conn, action
+                ):
                     continue
                 descriptor["dedupe_key"] = (
                     f"topology:{topology_action_identity(action)}"
