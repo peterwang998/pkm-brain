@@ -48,6 +48,7 @@ CALENDAR_CONNECTOR_ID = "calendar"
 GMAIL_CONNECTOR_ID = "gmail"
 CALENDAR_STREAM = "primary"
 GMAIL_STREAM = "mailbox"
+GMAIL_MANUAL_RUN_MAX_THREADS = 200
 CALENDAR_INITIAL_PAST_DAYS = 14
 CALENDAR_INITIAL_FUTURE_DAYS = 90
 GMAIL_INITIAL_QUERY = "newer_than:7d {newer_than:2d is:unread} -in:spam -in:trash"
@@ -355,9 +356,8 @@ class ShadowTrialRunner:
                 ),
             ),
         )
-        maximum_threads = max(
-            1,
-            min(1_000, policy.budgets.gmail.api_requests_per_day - 25),
+        maximum_threads = _gmail_manual_run_thread_cap(
+            policy.budgets.gmail.api_requests_per_day
         )
         return GmailThreadReader(
             client,
@@ -766,10 +766,22 @@ class ShadowTrialRunner:
             if (thread.thread_id, thread.source_revision or _gmail_revision(thread))
             not in decided
         ]
+        cached_threads = [
+            thread
+            for thread in result.threads
+            if (thread.thread_id, thread.source_revision or _gmail_revision(thread))
+            in decided
+        ]
         cached_thread_count = len(result.threads) - len(pending_threads)
         active_items = _active_gmail_items_by_thread(
             self.paths.ops_sqlite_path,
             account_key=account_key,
+        )
+        retained_provider_observations = _retained_gmail_provider_observations(
+            self.paths.ops_sqlite_path,
+            account_key=account_key,
+            threads=cached_threads,
+            active_items=active_items,
         )
         if pending_threads:
             provider = _DurablyBudgetedDetectorProvider(
@@ -859,6 +871,7 @@ class ShadowTrialRunner:
                 )
                 observations.append(observation)
                 observation_bindings.append((thread, detection, candidate))
+        observations.extend(retained_provider_observations)
         revalidation_reasons: dict[str, str] = {
             thread_id: "gmail_thread_missing"
             for thread_id in result.missing_thread_ids
@@ -1180,7 +1193,8 @@ class ShadowTrialRunner:
             "gmail_suppressed": dispositions["suppressed"],
             "gmail_deferred": dispositions["deferred"],
             "gmail_errors": dispositions["error"],
-            "gmail_candidates": len(observations),
+            "gmail_candidates": len(observation_bindings),
+            "gmail_authority_restored": len(retained_provider_observations),
             "gmail_items": len({item.item_id for item in reconciliations}),
         }
         return coverage, usage, counts
@@ -1217,6 +1231,13 @@ def _enabled_sources(policy: OperationsPolicy) -> tuple[str, ...]:
             (GMAIL_CONNECTOR_ID, policy.sources.gmail.enabled),
         )
         if enabled
+    )
+
+
+def _gmail_manual_run_thread_cap(api_requests_per_day: int) -> int:
+    return max(
+        1,
+        min(GMAIL_MANUAL_RUN_MAX_THREADS, int(api_requests_per_day) - 25),
     )
 
 
@@ -1597,6 +1618,97 @@ def _decided_gmail_revisions(
     return {(str(row["source_key"]), str(row["source_revision"])) for row in rows}
 
 
+def _retained_gmail_provider_observations(
+    db_path: Path,
+    *,
+    account_key: str,
+    threads: Sequence[NormalizedGmailThread],
+    active_items: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> tuple[OperationalObservation, ...]:
+    """Replay immutable provider evidence hidden by synthetic revalidation.
+
+    A decided Gmail revision normally skips the detector. If reset recovery has
+    since made its item synthetic/ambiguous, seeing that same thread revision is
+    affirmative presence evidence. Reusing the retained observation restores
+    provider authority without spending another model call.
+    """
+
+    revisions = {
+        thread.thread_id: thread.source_revision or _gmail_revision(thread)
+        for thread in threads
+    }
+    rows: list[Any] = []
+    with operational_connection(db_path, write=False) as conn:
+        for thread_id, items in active_items.items():
+            revision = revisions.get(thread_id)
+            if not revision:
+                continue
+            for item in items:
+                current_revision = str(item.get("current_source_revision") or "")
+                if not current_revision.startswith("gmail-revalidation-"):
+                    continue
+                cited_revisions = {
+                    str(reference.get("source_revision") or "")
+                    for reference in item.get("evidence_refs") or ()
+                    if isinstance(reference, Mapping)
+                }
+                if revision not in cited_revisions:
+                    continue
+                row = conn.execute(
+                    """
+                    SELECT * FROM ops_observations
+                    WHERE source_type = 'gmail' AND account_key = ?
+                      AND stream_key = ? AND source_key = ?
+                      AND source_revision = ?
+                    """,
+                    (
+                        account_key,
+                        GMAIL_STREAM,
+                        f"{thread_id}:{item['detector_key']}",
+                        revision,
+                    ),
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError(
+                        "Gmail revalidation cites a missing provider observation"
+                    )
+                rows.append(row)
+    observations: list[OperationalObservation] = []
+    for row in rows:
+        payload = json.loads(str(row["payload"]))
+        metadata = dict(payload.get("metadata") or {})
+        metadata.pop("schema_version", None)
+        observations.append(
+            OperationalObservation(
+                source_type="gmail",
+                account_key=account_key,
+                stream_key=GMAIL_STREAM,
+                source_key=str(row["source_key"]),
+                source_revision=str(row["source_revision"]),
+                source_order=int(row["source_order"]),
+                source_updated_at=row["source_updated_at"],
+                observed_at=str(row["observed_at"]),
+                item_kind=str(payload["item_kind"]),
+                title=str(payload["title"]),
+                details=payload.get("details"),
+                owner=str(payload["owner"]),
+                counterparty_entity_id=payload.get("counterparty_entity_id"),
+                project_ref=payload.get("project_ref"),
+                starts_at=payload.get("starts_at"),
+                due_at=payload.get("due_at"),
+                ends_at=payload.get("ends_at"),
+                source_timezone=payload.get("source_timezone"),
+                expires_at=payload.get("expires_at"),
+                confidence=float(payload["confidence"]),
+                priority=int(payload["priority"]),
+                cancelled=bool(payload["cancelled"]),
+                evidence_refs=tuple(json.loads(str(row["evidence_refs"]))),
+                metadata=metadata,
+            )
+        )
+    return tuple(observations)
+
+
 def _active_gmail_items_by_thread(
     db_path: Path,
     *,
@@ -1630,6 +1742,7 @@ def _active_gmail_items_by_thread(
         output.setdefault(thread_id, []).append(
             {
                 "id": row["id"],
+                "source_key": row["source_key"],
                 "detector_key": detector_key,
                 "kind": row["item_kind"],
                 "state": row["state"],

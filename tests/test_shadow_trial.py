@@ -46,6 +46,12 @@ from pkm_brain.shadow_trial import ShadowTrialRunner
 NOW = datetime(2026, 7, 13, 15, 0, tzinfo=timezone.utc)
 
 
+def test_manual_gmail_run_caps_responsive_thread_work() -> None:
+    assert shadow_trial_module._gmail_manual_run_thread_cap(1_200) == 200
+    assert shadow_trial_module._gmail_manual_run_thread_cap(100) == 75
+    assert shadow_trial_module._gmail_manual_run_thread_cap(1) == 1
+
+
 class FakeCalendarReader:
     def __init__(self, result: CalendarFetchResult) -> None:
         self.result = result
@@ -511,6 +517,95 @@ def test_missing_gmail_thread_advances_cursor_but_keeps_item_visible_uncertain(
     assert third.coverage["gmail"]["deferred_count"] == 1
     assert cursor["cursor"] == "mailbox-history-3"
     assert cursor["last_success_at"] == NOW.isoformat()
+
+
+def test_gmail_same_provider_revision_restores_without_another_model_call(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    service = OperationalService(paths, writer_guard=lambda: None)
+    ShadowTrialRunner(
+        paths,
+        service,
+        gmail_reader=FakeGmailReader(gmail_result()),
+        llm_provider=FakeProvider(detector_response()),
+        now=lambda: NOW,
+    ).run_live(sources=("gmail",), policy=policy())
+    ShadowTrialRunner(
+        paths,
+        service,
+        gmail_reader=FakeGmailReader(
+            GmailFetchResult(
+                mode="incremental",
+                raw_threads=(),
+                threads=(),
+                changed_thread_ids=("thread-1",),
+                missing_thread_ids=("thread-1",),
+                next_history_id="mailbox-history-2",
+                reset_required=False,
+                coverage_complete=True,
+                pages_fetched=1,
+            )
+        ),
+        llm_provider=FakeProvider([]),
+        now=lambda: NOW + timedelta(hours=1),
+    ).run_live(sources=("gmail",), policy=policy())
+    provider = FakeProvider(detector_response())
+
+    result = ShadowTrialRunner(
+        paths,
+        service,
+        gmail_reader=FakeGmailReader(
+            replace(
+                gmail_result(),
+                mode="incremental",
+                next_history_id="mailbox-history-3",
+            )
+        ),
+        llm_provider=provider,
+        now=lambda: NOW + timedelta(hours=2),
+    ).run_live(sources=("gmail",), policy=policy())
+
+    assert provider.calls == 0
+    assert result.coverage["gmail"]["status"] == "complete"
+    with operational_connection(paths.ops_sqlite_path, write=False) as conn:
+        item = conn.execute(
+            """
+            SELECT i.id, i.current_observation_id, i.confidence, i.metadata,
+                   o.source_revision
+            FROM ops_items i
+            JOIN ops_observations o ON o.id = i.current_observation_id
+            WHERE i.source_type = 'gmail'
+            """
+        ).fetchone()
+        observations = conn.execute(
+            """
+            SELECT id, source_revision, source_order
+            FROM ops_observations
+            WHERE source_type = 'gmail'
+            ORDER BY source_order, source_revision
+            """
+        ).fetchall()
+        authority_event = conn.execute(
+            """
+            SELECT metadata FROM ops_item_events
+            WHERE item_id = ? ORDER BY created_at DESC, id DESC LIMIT 1
+            """,
+            (item["id"],),
+        ).fetchone()
+    assert item["source_revision"] == "gmail-history-thread-1"
+    assert item["confidence"] == 0.95
+    assert json.loads(item["metadata"])["reconciliation_status"] == "confirmed"
+    assert len(observations) == 2
+    provider_observation, revalidation_observation = observations
+    assert provider_observation["source_revision"] == "gmail-history-thread-1"
+    assert provider_observation["source_order"] == 1
+    assert str(revalidation_observation["source_revision"]).startswith(
+        "gmail-revalidation-"
+    )
+    assert revalidation_observation["source_order"] == 2
+    assert item["current_observation_id"] == provider_observation["id"]
+    assert json.loads(authority_event["metadata"])["authority_reapplied"] is True
 
 
 def test_calendar_reset_advances_sync_token_and_marks_unseen_event_ambiguous(
