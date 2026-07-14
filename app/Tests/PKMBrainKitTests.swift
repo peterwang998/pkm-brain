@@ -346,16 +346,40 @@ struct PKMBrainKitTests {
     func connectorsFixtureDecodes() throws {
         let connectors: ConnectorsResponse = try decodeFixture("connectors")
 
-        #expect(connectors.count == 2)
+        #expect(connectors.count == 3)
         #expect(connectors.connectors.first?.manifest.id == "codex")
         #expect(connectors.connectors.first?.state.settings["sessions_dir"]?.stringValue == "~/.codex/sessions")
         #expect(connectors.connectors.first?.health.consecutive_failures == 3)
         #expect(connectors.connectors.first?.health.last_error == "sessions directory unavailable")
+        let calendar = connectors.connectors.first(where: { $0.manifest.id == "calendar" })
+        #expect(calendar?.manifest.lifecycleStatus == "auth_only")
+        #expect(calendar?.manifest.canCapture == false)
+        #expect(calendar?.manifest.auth?.phase == "read_only")
+        #expect(calendar?.manifest.auth?.requested_scopes == [
+            "openid",
+            "email",
+            "profile",
+            "https://www.googleapis.com/auth/calendar.events.owned.readonly",
+        ])
+        #expect(calendar?.state.auth?.provider == "calendar")
+        #expect(calendar?.state.auth?.status == "connected")
+        #expect(calendar?.state.auth?.granted_scopes == calendar?.state.auth?.requested_scopes)
+        #expect(calendar?.state.auth?.redirect_uri.hasSuffix("/oauth/callback/calendar") == true)
         let gmail = connectors.connectors.first(where: { $0.manifest.id == "gmail" })
         #expect(gmail?.manifest.lifecycleStatus == "auth_only")
         #expect(gmail?.manifest.canCapture == false)
+        #expect(gmail?.manifest.auth?.phase == "read_only")
+        #expect(gmail?.manifest.auth?.requested_scopes == [
+            "openid",
+            "email",
+            "profile",
+            "https://www.googleapis.com/auth/gmail.readonly",
+        ])
+        #expect(gmail?.state.auth?.provider == "gmail")
         #expect(gmail?.state.auth?.status == "ready")
         #expect(gmail?.state.auth?.client_secret_configured == true)
+        #expect(gmail?.state.auth?.redirect_uri.hasSuffix("/oauth/callback/gmail") == true)
+        #expect(calendar?.state.auth?.redirect_uri != gmail?.state.auth?.redirect_uri)
     }
 
     @Test("wiki fixtures decode")

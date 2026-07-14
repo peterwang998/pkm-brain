@@ -148,7 +148,7 @@ struct TodayView: View {
                 Text("Your first shadow run is read-only and starts only when you choose it.")
                     .font(.headline)
                 Text(
-                    "It reads your owned primary Calendar and Gmail, never downloads attachments or changes either service, and keeps supporting evidence on this Mac for up to 30 days. Bounded text from changed emails is analyzed by your configured detector model and may leave this Mac if that model is hosted elsewhere; the default detector has no tools or access to other local files."
+                    "It reads your owned primary Calendar and Gmail and never downloads attachments or changes either service. It keeps a disposable raw API cache on this Mac for up to 7 days and normalized supporting evidence for up to 30 days. Bounded text from changed emails is analyzed by your configured detector model and may leave this Mac if that model is hosted elsewhere; the default detector has no tools or access to other local files."
                 )
                 .font(.callout)
                 .foregroundStyle(.secondary)

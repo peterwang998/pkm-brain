@@ -44,6 +44,59 @@
     },
     {
       "manifest": {
+        "id": "calendar",
+        "display_name": "Google Calendar",
+        "description": "Authorize a separate read-only Google Calendar grant for the manual Chief of Staff Shadow trial.",
+        "source_type": "google_calendar",
+        "default_enabled": false,
+        "default_cadence_s": 900,
+        "settings_schema": [],
+        "permissions_note": "Reads events from the owned primary calendar only; event mutation, RSVP, calendar discovery, and shared-calendar access are unavailable.",
+        "lifecycle": "auth_only",
+        "capture_available": false,
+        "auth": {
+          "kind": "oauth2",
+          "provider": "calendar",
+          "phase": "read_only",
+          "requested_scopes": ["openid", "email", "profile", "https://www.googleapis.com/auth/calendar.events.owned.readonly"],
+          "client_secret_required": false,
+          "redirect_uri": "http://127.0.0.1:53682/oauth/callback/calendar",
+          "setup_url": "https://console.cloud.google.com/apis/credentials"
+        },
+        "activation_note": "Use Today > Run Shadow to read the owned primary calendar into the local operational ledger. Connector capture and automatic scheduling remain unavailable."
+      },
+      "state": {
+        "enabled": false,
+        "cadence_s": 900,
+        "settings": {},
+        "auth": {
+          "kind": "oauth2",
+          "provider": "calendar",
+          "phase": "read_only",
+          "status": "connected",
+          "client_id": "calendar-desktop-client-id",
+          "client_secret_configured": false,
+          "connected_at": "2026-07-14T06:00:00+00:00",
+          "account_label": "person@example.com",
+          "granted_scopes": ["openid", "email", "profile", "https://www.googleapis.com/auth/calendar.events.owned.readonly"],
+          "requested_scopes": ["openid", "email", "profile", "https://www.googleapis.com/auth/calendar.events.owned.readonly"],
+          "redirect_uri": "http://127.0.0.1:53682/oauth/callback/calendar",
+          "setup_url": "https://console.cloud.google.com/apis/credentials",
+          "can_authorize": true,
+          "can_disconnect": true,
+          "last_error": null
+        }
+      },
+      "health": {
+        "status": "unknown",
+        "consecutive_failures": 0,
+        "last_run_at": null,
+        "last_error": null,
+        "last_result": null
+      }
+    },
+    {
+      "manifest": {
         "id": "gmail",
         "display_name": "Gmail",
         "description": "Authorize a separate read-only Google account grant for Gmail evidence.",
@@ -96,5 +149,5 @@
       }
     }
   ],
-  "count": 2
+  "count": 3
 }

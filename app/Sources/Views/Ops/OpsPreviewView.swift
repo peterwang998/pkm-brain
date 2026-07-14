@@ -323,7 +323,9 @@ struct OpsPreviewView: View {
     private func connectorMetadata(_ connector: ConnectorPayload) -> [String?] {
         if let auth = connector.state.auth {
             return [
-                "authentication only",
+                auth.phase == "read_only"
+                    ? "operational read-only access"
+                    : "authentication only",
                 auth.account_label,
                 auth.connected_at,
             ]
@@ -551,7 +553,12 @@ private struct ConnectorAuthSheet: View {
     ) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                LabeledContent("Access", value: "Identity only")
+                LabeledContent(
+                    "Access",
+                    value: manifest.phase == "read_only"
+                        ? "Operational read-only access"
+                        : "Identity only"
+                )
                 if let account = state.account_label, !account.isEmpty {
                     LabeledContent("Account", value: account)
                 }

@@ -61,12 +61,27 @@ final class PKMBrainUITests: XCTestCase {
         XCTAssertTrue(connectorsSegment.waitForExistence(timeout: 10), "Missing Connectors segment")
         connectorsSegment.click()
 
+        XCTAssertTrue(
+            app.staticTexts["Google Calendar"].waitForExistence(timeout: 10),
+            "Missing Google Calendar connector"
+        )
         XCTAssertTrue(app.staticTexts["Gmail"].waitForExistence(timeout: 10), "Missing Gmail connector")
         XCTAssertTrue(app.staticTexts["Slack"].exists, "Missing Slack connector")
         let connectorsAttachment = XCTAttachment(screenshot: app.screenshot())
         connectorsAttachment.name = "ops-connectors"
         connectorsAttachment.lifetime = .keepAlways
         add(connectorsAttachment)
+
+        let calendarSetup = app.buttons["connector-auth-calendar"]
+        XCTAssertTrue(calendarSetup.waitForExistence(timeout: 10), "Missing Calendar setup action")
+        calendarSetup.click()
+        XCTAssertTrue(
+            app.staticTexts["Connector Authentication"].waitForExistence(timeout: 10),
+            "Missing Calendar authentication sheet"
+        )
+        XCTAssertTrue(app.staticTexts["Operational read-only access"].exists)
+        XCTAssertTrue(app.staticTexts["http://127.0.0.1:53682/oauth/callback/calendar"].exists)
+        app.buttons["Done"].click()
 
         let setup = app.buttons["connector-auth-gmail"]
         XCTAssertTrue(setup.waitForExistence(timeout: 10), "Missing Gmail setup action")
@@ -75,7 +90,7 @@ final class PKMBrainUITests: XCTestCase {
             app.staticTexts["Connector Authentication"].waitForExistence(timeout: 10),
             "Missing Gmail authentication sheet"
         )
-        XCTAssertTrue(app.staticTexts["Identity only"].exists)
+        XCTAssertTrue(app.staticTexts["Operational read-only access"].exists)
         XCTAssertTrue(app.staticTexts["http://127.0.0.1:53682/oauth/callback/gmail"].exists)
 
         let authAttachment = XCTAttachment(screenshot: app.screenshot())
