@@ -444,6 +444,8 @@ def _walk_mime_parts(
     attachment_root = not attachment_ancestor and _is_attachment(payload)
     blocked_by_attachment = attachment_ancestor or attachment_root
     yield payload, blocked_by_attachment, attachment_root
+    if blocked_by_attachment:
+        return
     for part in payload.get("parts") or []:
         if isinstance(part, Mapping):
             yield from _walk_mime_parts(
