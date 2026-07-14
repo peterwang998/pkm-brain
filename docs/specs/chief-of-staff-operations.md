@@ -1,7 +1,7 @@
 # Chief Of Staff Operations
 
-**Status:** canonical feature spec; implementation is in progress and no operational behavior is released
-**Last verified:** 2026-07-13 against knowledge-foundation commit `3937316e090a`; requirements below govern the in-progress implementation
+**Status:** canonical feature spec; the isolated COS-2 kernel is in progress and no operational behavior is released
+**Last verified:** 2026-07-13 against architecture commit `a44b713` plus the current operational-kernel working tree
 **Owns:** operational items, reconciliation, briefings, operational evaluation, and guarded external execution
 
 ## Mission And Product Boundary
@@ -97,11 +97,13 @@ Allowed transitions are:
 
 ```text
 active    -> resolved | dismissed | cancelled | expired
-resolved  -> active    only from materially newer evidence or human restore
-expired   -> active    only from materially newer evidence or human restore
-dismissed -> active    only through explicit human restore or a new episode
-cancelled -> active    only when the provider restores/reschedules it
+resolved  -> active | cancelled    only from materially newer evidence or human restore
+expired   -> active | cancelled    only from materially newer evidence or human restore
+dismissed -> active | cancelled    only through explicit human restore or a new episode
+cancelled -> active                only when the provider restores/reschedules it
 ```
+
+The `cancelled` target from `resolved|expired|dismissed` is valid only when an explicit human restore removes the local override and the current direct provider observation is already cancelled.
 
 Passing a commitment deadline marks the active item overdue; it does not resolve it. Calendar events may transition to `resolved` after their authoritative end time. `expired` is reserved for signals with an explicit expiry rule.
 
@@ -117,6 +119,7 @@ Passing a commitment deadline marks the active item overdue; it does not resolve
 | `details` | optional bounded explanation; never a full source payload |
 | `owner` | `operator|other|shared|unknown` |
 | `account_key` | local non-secret connector-account identity |
+| `source_type`, `stream_key`, `source_key` | exact provider source-unit and object identity |
 | `counterparty_entity_id` | optional stable Brain entity reference; no cross-database foreign key |
 | `project_ref` | optional page/entity reference used for ranking |
 | `starts_at`, `ends_at` | optional source-native event interval in UTC |
@@ -128,6 +131,7 @@ Passing a commitment deadline marks the active item overdue; it does not resolve
 | `confidence` | calibrated `0.0..1.0` detection/reconciliation confidence |
 | `current_observation_id` | current immutable `ops_observations` row |
 | `reconciliation_method` | exact-provider, deterministic, semantic, or human method/version |
+| `human_confirmed_at`, `last_human_action_at` | sticky operator-override provenance |
 | `metadata` | validated owner/counterparty, evidence, reconciliation-status, source-version, snooze, and resolution detail |
 | `created_at`, `updated_at` | lifecycle timestamps |
 
@@ -135,12 +139,16 @@ Dates are optional. The system MUST NOT invent a due date because an email says 
 
 ### Event History
 
-`ops_observations` stores immutable normalized source revisions. Each row records source type, account key, source key and revision, observation time, proposed item kind, `upsert|cancelled` event kind, validated payload, content hash, bounded evidence references, and creation time. Replaying the same source revision is a no-op.
+`ops_observations` stores immutable normalized source revisions. Each row records source type, account key, stream key, source key and opaque revision, a non-negative connector-supplied provider-authority order, optional provider source-update time, observation time, proposed item kind, `upsert|cancelled` event kind, validated payload, content hash, bounded stable evidence references, and creation time. Present operational timestamps are canonical UTC; `source_timezone` preserves the rendering context. A sparse provider tombstone may omit `source_updated_at`; the connector MUST NOT invent a wall-clock provider time. Replaying the same source revision and canonical content is a no-op. A conflicting replay of the same revision is an error. Revision strings and content hashes MUST NOT be used as chronology.
+
+`source_order` is scoped to one source type/account/stream and must be replay-stable. It derives from an authoritative provider sequence or from the persisted ordinal of a provider change-set committed with the source cursor. It MUST NOT derive from poll wall-clock time, response page position, lexical revision/etag order, or content-hash order. Projection authority compares `(source_order, source_updated_at-or-minimum)`; a distinct observation that does not sort after the current one is retained with `stale_ignored` and cannot mutate current state.
+
+Observation metadata uses a closed `schema_version=1` scalar-key contract. V1 admits only `all_day`, `attendee_count`, `attendee_response`, `calendar_id`, `detector_version`, `event_type`, `ical_uid`, `location`, `message_class`, `organizer_self`, `original_start_time`, `provider_sequence`, `reconciliation_status`, `recurring_event_id`, `source_status`, `transparency`, and `visibility`. Arbitrary keys, nested source payloads, descriptions, snippets, HTML, or message/event bodies are rejected. Full provider payloads remain in the separately governed evidence/capture layer, not `ops.sqlite`.
 
 `ops_item_events` is an append-only technical history, not a second domain model. Each event records:
 
 - event ID and item ID;
-- `created|updated|rescheduled|cancelled|resolved|expired|feedback` event type;
+- `created|updated|rescheduled|cancelled|resolved|expired|stale_ignored|feedback` event type;
 - actor class `connector|deterministic|model|human`;
 - source reference and source version where applicable;
 - prior and resulting state;
@@ -148,7 +156,9 @@ Dates are optional. The system MUST NOT invent a due date because an email says 
 - bounded structured transition detail and its hash;
 - event timestamp.
 
-`ops_source_cursors` stores replay-safe connector/account/stream cursors, watermarks, metadata, and last-success time. A cursor advances only after every observation/item/event write for that source unit commits.
+`ops_source_cursors` stores replay-safe connector/account/stream cursors, watermarks, bounded metadata, last-success time, and a monotonically increasing local generation. A source batch is bound to exactly one source type/account/stream. Its cursor advances only in the same transaction as every observation/item/event write for that source unit. Compare-and-swap checks both the prior cursor and generation, including cursorless watermark streams.
+
+A first-seen provider tombstone creates a terminal item and a `created` event with `source_event=cancelled`; cancellation of an existing item emits `cancelled`. If a human `resolved|dismissed` override exists, direct provider cancellation still advances the immutable current observation and appends the cancellation event, but it does not replace the sticky human state. Explicit restore then projects the current source as `active|cancelled`. Human feedback events reference the immutable current observation/version they supersede without creating a synthetic provider observation.
 
 The current item update and its event append MUST commit in one `ops.sqlite` transaction. Events and observations are immutable. Corrections append feedback/transition events rather than rewriting history.
 
@@ -247,6 +257,15 @@ The first connector:
 - normalizes source-native created/updated/start/end/timezone/status/recurrence/attendee-response fields;
 - stores no private extended properties unless explicitly required and approved;
 - never creates, edits, deletes, accepts, or declines an event.
+
+Calendar authority mapping is explicit:
+
+- `stream_key` is the canonical calendar ID and source identity includes the account, calendar, event ID, and recurring-instance original start where applicable;
+- `source_revision` is the event etag when present; for an ID-only deletion tombstone it is a deterministic hash of the provider sync checkpoint plus the minimal tombstone identity, used only for idempotence;
+- `source_order` is the next persisted per-calendar sync generation, derived from successful [`nextSyncToken` progression](https://developers.google.com/workspace/calendar/api/guides/sync) and committed atomically with that token; it is never API page order or poll time;
+- `source_updated_at` is the Calendar event `updated` value when present, while the provider `sequence` value is retained as bounded metadata; sparse tombstones may leave both absent because [Google guarantees only minimal identity fields for some cancelled events](https://developers.google.com/workspace/calendar/api/v3/reference/events#resource).
+
+The connector stages all pages for a change-set before applying its one source-unit batch. A replay of the same staged checkpoint reproduces the same revision/order inputs. An expired sync token marks coverage incomplete and triggers the bounded full-resync policy; absence from that resync never fabricates a cancellation.
 
 The default initial window is 14 days in the past and 90 days in the future. Configuration may narrow it. Expanding it requires an explicit storage/privacy reason.
 
@@ -552,7 +571,7 @@ The operational Chief-of-Staff foundation is complete when:
 Primary planned verification surfaces:
 
 ```bash
-uv run pytest tests/test_ops_store.py tests/test_ops_reconciliation.py \
+uv run pytest tests/test_operational_db.py tests/test_operational_state.py \
   tests/test_calendar_connector.py tests/test_ops_briefing.py -q
 uv run brain eval run --suite operations --home <test-home>
 swift test --package-path app

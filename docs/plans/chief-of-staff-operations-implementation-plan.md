@@ -1,7 +1,7 @@
 # Chief-of-Staff Operations Implementation Plan
 
-**Status:** execution started; COS-0 complete, COS-1/COS-2 in progress
-**Last verified:** 2026-07-13 against knowledge-foundation commit `3937316`
+**Status:** execution started; COS-0 complete, COS-1/COS-2 in progress; the COS-2 isolated kernel slice is implemented
+**Last verified:** 2026-07-13 against architecture commit `a44b713` plus the current operational-kernel working tree
 **Owning spec:** [Chief-of-Staff Operations](../specs/chief-of-staff-operations.md)
 
 ## Outcome
@@ -69,6 +69,8 @@ Conceptual documentation changes immediately from "Chief-of-Staff curation" to "
 
 Every new operational table, job, API, and UI control has exactly one owning spec. No document describes `cos_actions` as the operational action ledger.
 
+Architecture and privacy contracts were completed by commit `a44b713`. The versioned private-eval fixture artifact remains before the COS-1 exit gate closes.
+
 ## COS-2 - Operational Kernel
 
 ### Persistence
@@ -81,7 +83,7 @@ Create an independently migrated `db/ops.sqlite` with:
 - `ops_item_events` for append-only transitions and feedback;
 - `ops_source_cursors` for replay-safe connector progress and source coverage.
 
-Common item fields remain columns: kind, state, title, owner/counterparty metadata, starts/due/ends/expires/next-review times, priority, confidence, current observation, reconciliation method, and timestamps. Provider/type-specific material stays in validated JSON until repeated usage proves a column is necessary.
+Common item fields remain columns: source-unit/object identity, kind, state, title, owner/counterparty metadata, starts/due/ends/expires/snooze times, priority, confidence, current observation, reconciliation method, human-action provenance, and timestamps. Provider/type-specific material stays in validated JSON until repeated usage proves a column is necessary.
 
 Initial item kinds are `event`, `commitment`, `waiting`, `follow_up`, `deadline`, and `attention`. The universal state enum is `active`, `resolved`, `dismissed`, `cancelled`, or `expired`. Kind-specific semantics are expressed through deterministic transition validation rather than separate tables.
 
@@ -100,9 +102,12 @@ normalized source revision
 Rules:
 
 - identical source revision/hash is a no-op;
-- a changed revision updates the same canonical item;
+- a changed revision with a newer connector-supplied provider-authority order updates the same canonical item;
+- older or equal-authority distinct revisions are retained as `stale_ignored` history and cannot replace the projection;
+- revision strings and content hashes never determine chronology;
 - changes to start/end/due time emit `rescheduled`;
-- provider cancellation emits `cancelled`;
+- provider cancellation of an existing item emits `cancelled`; a first-seen tombstone creates a terminal item with `created` plus `source_event=cancelled` metadata;
+- human `resolved|dismissed` state remains sticky while direct source cancellation is retained in the current observation/event; explicit restore reveals the source-derived `active|cancelled` state;
 - user dismissal is sticky until explicit user restore or a materially new episode;
 - absence from one poll never implies completion;
 - ambiguous identity creates a separate `active` item with provisional/ambiguous reconciliation metadata rather than a false merge;
@@ -115,9 +120,20 @@ Rules:
 - `operational_state.py`
 - `paths.py` for the operational DB path
 
+### Current implementation
+
+The first isolated kernel slice exists in the current tree:
+
+- independently migrated `ops.sqlite` tables and an explicit bootstrap path;
+- immutable bounded observations, canonical items, append-only hashed events, and replay-safe source cursors with generation compare-and-swap;
+- exact source-unit binding, strict UTC normalization for present timestamps, provider-authority reconciliation, stale/equal-authority protection, lifecycle feedback, and one atomic source-unit/cursor batch primitive;
+- owner-only database/WAL/SHM handling, bounded lock retry, and focused isolation/concurrency tests.
+
+It is intentionally not called by `brain init`, the daemon, connectors, CLI, API, or UI yet. Before COS-2 is complete, the service layer must add primary/single-role writer fencing and serialized mutation ownership, and coordinated backup/restore must cover `brain.sqlite` plus `ops.sqlite`. Until then, no production operational database or behavior is enabled.
+
 ### Verification
 
-- fresh and upgraded migration idempotence;
+- fresh-store and same-version re-initialization idempotence; add a populated upgrade fixture before the first post-v1 migration;
 - WAL, busy timeout, foreign keys, and short transaction behavior;
 - observation replay idempotence;
 - update/reschedule/cancel/dismiss/restore history;
@@ -146,6 +162,8 @@ Poll a bounded past/future window with deleted events included. Normalize the mi
 - timed/all-day values and source timezone;
 - organizer, attendee role, and RSVP;
 - status/cancellation and provider update time.
+
+Stage each complete Calendar change-set before reconciliation. Map the event etag to the opaque revision when present, the committed per-calendar sync generation to `source_order`, Calendar `updated` to optional `source_updated_at`, and Calendar `sequence` to bounded metadata. For an ID-only tombstone, derive an idempotence-only revision from the sync checkpoint plus minimal identity and leave provider update time absent. Commit observations and the next sync token/generation in one source-unit transaction; never use page position, lexical etag order, or poll time as authority.
 
 ### Deterministic identity
 

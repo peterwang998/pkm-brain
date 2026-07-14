@@ -71,6 +71,10 @@ class BrainPaths:
         return self.db_dir / "brain.sqlite"
 
     @property
+    def ops_sqlite_path(self) -> Path:
+        return self.db_dir / "ops.sqlite"
+
+    @property
     def lancedb_path(self) -> Path:
         return self.indexes / "lancedb"
 

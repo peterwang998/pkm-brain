@@ -200,7 +200,7 @@ Allowed network activity is limited to explicitly configured LLM, connector, and
 
 The core local Knowledge Curation pipeline, fact/entity ledger, action policy, managed pages, retrieval, MCP, native daemon/app, and Primary/Secondary sync are implemented. The current schema version is 21. Existing `cos_*` code and tables implement Knowledge Curation despite their historical names.
 
-The Operational Chief-of-Staff context is additive target work. Until its own schema, reconciliation evaluation, and read-only briefing gates ship, Today and the existing connector shell retain their current behavior; no operational database or external-action authority is implied by this spec alone.
+The Operational Chief-of-Staff context is additive work. An isolated, independently migrated `ops.sqlite` kernel now exists in the implementation tree, but it is not initialized or called by the daemon, connectors, CLI, API, or UI. Until service-level writer fencing, coordinated recovery, source integration, reconciliation evaluation, and read-only briefing gates ship, Today and the existing connector shell retain their current behavior and no external-action authority exists.
 
 The item lifecycle, source-specific detection, reconciliation, briefing, evaluation, and execution protocol are specified in [Chief-of-Staff Operations](chief-of-staff-operations.md). This foundation owns the boundary between that context and existing Knowledge Curation.
 

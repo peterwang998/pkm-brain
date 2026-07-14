@@ -18,6 +18,12 @@ capture.py / connectors.py / connector_auth.py
   -> service.py retrieval
   -> mcp_server.py / ui_server.py / cli.py
 
+approved operational sources
+  -> operational_state.py
+  -> operational_db.py + operational_migrations.py
+  -> db/ops.sqlite
+  -> future coverage-aware Today briefing
+
 daemon.py + automation.py schedule the same primitives.
 SwiftUI and browser assets call ui_server.py JSON endpoints.
 sync_* modules move source files, never live DB/index state.
@@ -36,6 +42,7 @@ sync_* modules move source files, never live DB/index state.
 | entity identity | `entities` and `fact_entities` | `entities.py` |
 | durable mutation | `cos_actions` plus inverse | `cos_actions.py` |
 | autonomy | versioned `cos_policy` and eval state | `cos_policy.py`, `evals.py` |
+| operational current state | `db/ops.sqlite` items, observations, events, and cursors | `operational_state.py`, `operational_db.py` |
 | review residue | `open_questions`, proposed memories, audit flags | `wiki_facts.py`, `memory.py`, `ui_server.py` |
 | page projection | contracts, facts, synthesis, snapshots, Markdown | `wiki_facts.py`, `contracts.py` |
 | retrieval packet | facts/pages/chunks/memories plus verdict/lineage | `service.py` |
@@ -49,9 +56,12 @@ sync_* modules move source files, never live DB/index state.
 - `paths.py`: all home-relative paths, node identity, lock/token/handshake paths.
 - `db.py`: base schema, connection helpers, FTS setup, row helpers.
 - `migrations.py`: ordered idempotent migrations 1-21.
+- `operational_db.py` and `operational_migrations.py`: the independently versioned `db/ops.sqlite` control plane and bounded lock handling.
 - `config.py` and `sync_config.py`: local/shared and role-specific config.
 
 Do not create ad hoc paths or SQLite connections in UI/Swift code.
+
+`brain.sqlite` remains authoritative for knowledge. `ops.sqlite` is authoritative only for current operational state; neither database uses cross-database foreign keys or multi-database write transactions.
 
 ### Capture And Ingest
 
@@ -97,7 +107,18 @@ Entity identity is not a page path. `fact_entities` is link authority; `facts.en
 - `review_admission.py`: schema-21 Queue admission budget, grandfathering, deferral, and promotion.
 - `policy_reconciliation.py` and `topology_reconciliation.py`: dry-run-first repair commands for legacy review residue.
 
-Semantic judgment may choose an operation. Only `cos_actions.py` applies durable state.
+Semantic judgment may choose a knowledge operation. Only `cos_actions.py` applies durable Knowledge Curation state.
+
+The `cos_*` surface is a legacy physical name for Knowledge Curation. It must not be extended into operational items or external actions.
+
+### Chief-Of-Staff Operational State
+
+- `operational_state.py`: immutable source observations, deterministic source-key reconciliation, operator feedback, current items, event history, and source cursors.
+- `operational_db.py`: short-lived operational connections, WAL/foreign-key setup, and bounded lock retry.
+- `operational_migrations.py`: independently versioned `ops_*` schema migrations.
+- `paths.py`: `BrainPaths.ops_sqlite_path` resolves the operational database inside the same Brain home.
+
+This is the first provider-read-only/local-write isolated kernel. Calendar ingestion, coverage reporting, Today briefing projection, Gmail detection, and guarded execution remain later phases owned by [Chief-of-Staff Operations](specs/chief-of-staff-operations.md).
 
 ### Retrieval And Memory
 
@@ -215,11 +236,20 @@ When adding a repair or reconciliation:
 3. keep ordinary future work behind `review_admission.py` rather than bypassing Queue limits;
 4. archive or consolidate mission-specific repair code when its migration is complete.
 
+When adding an operational source or transition:
+
+1. normalize an immutable observation with replay-stable provider authority;
+2. prefer deterministic provider identity before semantic matching;
+3. apply the item change and append its event in one `ops.sqlite` transaction;
+4. expose missing coverage and ambiguity instead of manufacturing an all-clear;
+5. keep source mutation behind the separate guarded-execution boundary.
+
 ## Specs
 
 - [Product Foundation](specs/product-foundation.md)
 - [Capture And Knowledge](specs/capture-and-knowledge.md)
 - [Retrieval And Memory](specs/retrieval-and-memory.md)
 - [Curation And Review](specs/curation-and-review.md)
+- [Chief-Of-Staff Operations](specs/chief-of-staff-operations.md)
 - [App And Operations](specs/app-and-operations.md)
 - [Sync And Topology](specs/sync-and-topology.md)
