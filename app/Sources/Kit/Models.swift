@@ -961,6 +961,19 @@ public struct TodayUrgentOverflow: Codable, Equatable, Sendable {
 public struct TodayCalendar: Codable, Equatable, Sendable {
     public let now: [TodayItem]
     public let next: [TodayItem]
+    public let hidden_series: [TodayCalendarSuppression]?
+
+    public var hiddenSeries: [TodayCalendarSuppression] {
+        hidden_series ?? []
+    }
+}
+
+public struct TodayCalendarSuppression: Codable, Equatable, Identifiable, Sendable {
+    public let id: String
+    public let label: String
+    public let hidden_count: Int
+    public let created_at: String
+    public let next_starts_at: String?
 }
 
 public struct TodayFeedbackCapabilities: Codable, Equatable, Sendable {
@@ -992,6 +1005,7 @@ public struct TodayItem: Codable, Equatable, Identifiable, Sendable {
     public let reason_codes: [String]
     public let evidence: [TodayEvidenceLink]
     public let feedback_actions: [String]
+    public let meeting_brief_ready: Bool?
 
     public var handledLabel: String {
         switch handled_verdict {
@@ -1011,6 +1025,10 @@ public struct TodayItem: Codable, Equatable, Identifiable, Sendable {
 
     public var supportsMeetingPreparation: Bool {
         kind == "event" && BrainAPIClient.canPrepareMeeting(itemID: id)
+    }
+
+    public var isMeetingBriefReady: Bool {
+        meeting_brief_ready == true
     }
 }
 
@@ -1053,15 +1071,35 @@ public struct TodayRetainedEvidence: Codable, Equatable, Sendable {
 
 public struct TodayMeetingPacket: Codable, Equatable, Sendable {
     public let schema_version: Int
+    public let content_version: String?
     public let item_id: String
     public let generated_at: String
     public let title: String
+    public let brief_context: TodayMeetingContext?
     public let event_claims: [TodayMeetingClaim]
     public let knowledge_claims: [TodayMeetingClaim]
+    public let brief_knowledge_claims: [TodayMeetingClaim]?
     public let wiki_context: [TodayMeetingWikiContext]
+    public let brief_wiki_context: [TodayMeetingWikiContext]?
     public let suggestions: [TodayMeetingSuggestion]
+    public let open_questions: [TodayMeetingOpenQuestion]?
+    public let brief_open_questions: [TodayMeetingOpenQuestion]?
+    public let source_links: [TodayMeetingSourceLink]?
     public let coverage: [String: JSONValue]
     public let retrieval_reasons: [String]
+}
+
+public struct TodayMeetingContext: Codable, Equatable, Sendable {
+    public let calendar_notes: String?
+    public let calendar_notes_status: String
+    public let starts_at: String?
+    public let ends_at: String?
+    public let location: String?
+    public let organizer_email: String?
+    public let attendee_count: Int?
+    public let attendee_response: String?
+    public let source_timezone: String?
+    public let all_day: Bool
 }
 
 public struct TodayMeetingClaim: Codable, Equatable, Identifiable, Sendable {
@@ -1090,6 +1128,26 @@ public struct TodayMeetingSuggestion: Codable, Equatable, Identifiable, Sendable
     public let is_factual_claim: Bool
 
     public var id: String { suggestion }
+}
+
+public struct TodayMeetingOpenQuestion: Codable, Equatable, Identifiable, Sendable {
+    public let question: String
+    public let source: String
+    public let reference: String?
+    public let fact_ids: [String]
+
+    public var id: String { reference ?? question }
+}
+
+public struct TodayMeetingSourceLink: Codable, Equatable, Identifiable, Sendable {
+    public let id: String
+    public let label: String
+    public let detail: String?
+    public let source_type: String
+    public let reference: String
+    public let brain_route: String?
+    public let provider_url: String?
+    public let wiki_path: String?
 }
 
 public struct TodayFeedbackResponse: Codable, Equatable, Sendable {

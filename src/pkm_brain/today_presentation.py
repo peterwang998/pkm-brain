@@ -17,7 +17,15 @@ HANDLED_VERDICTS = {
     "fulfilled",
     "unknown",
 }
-FEEDBACK_ACTIONS = {"confirm", "correct", "done", "snooze", "dismiss", "restore"}
+FEEDBACK_ACTIONS = {
+    "confirm",
+    "correct",
+    "done",
+    "snooze",
+    "dismiss",
+    "dismiss_series",
+    "restore",
+}
 ITEM_SECTIONS = {
     "focus",
     "urgent_overflow",
@@ -91,6 +99,7 @@ class TodayItem:
     reason_codes: tuple[str, ...] = ()
     evidence: tuple[TodayEvidenceLink, ...] = ()
     feedback_actions: tuple[str, ...] = ()
+    meeting_brief_ready: bool = False
 
     def __post_init__(self) -> None:
         if not self.id.strip() or not self.title.strip():
@@ -127,6 +136,7 @@ class TodayItem:
             "reason_codes": list(self.reason_codes),
             "evidence": [item.as_dict() for item in self.evidence],
             "feedback_actions": list(self.feedback_actions),
+            "meeting_brief_ready": self.meeting_brief_ready,
         }
 
 
@@ -204,6 +214,30 @@ class TodayFeedbackCapabilities:
 
 
 @dataclass(frozen=True)
+class TodayCalendarSuppression:
+    id: str
+    label: str
+    hidden_count: int
+    created_at: str
+    next_starts_at: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.id.strip() or not self.label.strip():
+            raise ValueError("calendar suppression requires id and label")
+        if self.hidden_count < 0:
+            raise ValueError("calendar suppression hidden_count cannot be negative")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "label": self.label,
+            "hidden_count": self.hidden_count,
+            "created_at": self.created_at,
+            "next_starts_at": self.next_starts_at,
+        }
+
+
+@dataclass(frozen=True)
 class TodayBriefing:
     status: str
     generated_at: str
@@ -218,6 +252,7 @@ class TodayBriefing:
     urgent_overflow: tuple[TodayItem, ...] = ()
     calendar_now: tuple[TodayItem, ...] = ()
     calendar_next: tuple[TodayItem, ...] = ()
+    hidden_calendar_series: tuple[TodayCalendarSuppression, ...] = ()
     due_overdue: tuple[TodayItem, ...] = ()
     waiting: tuple[TodayItem, ...] = ()
     attention: tuple[TodayItem, ...] = ()
@@ -278,6 +313,9 @@ class TodayBriefing:
             "calendar": {
                 "now": [item.as_dict() for item in self.calendar_now],
                 "next": [item.as_dict() for item in self.calendar_next],
+                "hidden_series": [
+                    item.as_dict() for item in self.hidden_calendar_series
+                ],
             },
             "due_overdue": [item.as_dict() for item in self.due_overdue],
             "waiting": [item.as_dict() for item in self.waiting],
@@ -387,6 +425,8 @@ class TodayPresentationService(Protocol):
 
     def report_missing(self, report: TodayMissingReport) -> TodayFeedbackResult: ...
 
+    def restore_calendar_series(self, rule_id: str) -> TodayFeedbackResult: ...
+
 
 class UnavailableTodayPresentationService:
     """Safe presentation stub used until an operational projection is attached."""
@@ -419,6 +459,14 @@ class UnavailableTodayPresentationService:
             message=self.reason,
         )
 
+    def restore_calendar_series(self, rule_id: str) -> TodayFeedbackResult:
+        return TodayFeedbackResult(
+            status="unavailable",
+            item_id=rule_id,
+            action="restore",
+            message=self.reason,
+        )
+
 
 def today_briefing_payload(service: TodayPresentationService) -> dict[str, Any]:
     return service.briefing().as_dict()
@@ -441,6 +489,16 @@ def today_missing_payload(
     payload: Mapping[str, Any],
 ) -> dict[str, Any]:
     return service.report_missing(TodayMissingReport.from_payload(payload)).as_dict()
+
+
+def today_calendar_series_restore_payload(
+    service: TodayPresentationService,
+    rule_id: str,
+) -> dict[str, Any]:
+    normalized = rule_id.strip()
+    if not normalized:
+        raise ValueError("calendar-series suppression id is required")
+    return service.restore_calendar_series(normalized).as_dict()
 
 
 def today_item(

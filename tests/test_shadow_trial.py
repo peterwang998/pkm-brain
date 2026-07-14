@@ -13,6 +13,8 @@ import pkm_brain.shadow_trial as shadow_trial_module
 from pkm_brain.gmail_operations import (
     DETECTOR_INPUT_TOKEN_OVERHEAD_RESERVE,
     DETECTOR_OUTPUT_TOKEN_RESERVE,
+    GmailOperationalCandidate,
+    GmailThreadDetection,
 )
 from pkm_brain.google_cache import GoogleEvidenceCache
 from pkm_brain.google_normalization import (
@@ -24,14 +26,19 @@ from pkm_brain.google_normalization import (
 from pkm_brain.google_sources import CalendarFetchResult, GmailFetchResult
 from pkm_brain.llm_usage import record_provider_usage
 from pkm_brain.operational_budget import DailyBudgetExceeded, daily_budget_usage
-from pkm_brain.operational_db import operational_connection
+from pkm_brain.operational_db import init_operational_db, operational_connection
 from pkm_brain.operational_service import OperationalService
 from pkm_brain.operational_shadow import (
     latest_handled_assessments,
     list_shadow_decisions,
     list_shadow_runs,
 )
-from pkm_brain.operational_state import get_source_cursor
+from pkm_brain.operational_state import (
+    ObservationConflictError,
+    OperationalObservation,
+    get_source_cursor,
+    reconcile_observation,
+)
 from pkm_brain.operations_http import operations_evidence_payload
 from pkm_brain.operations_policy import (
     CALENDAR_OWNED_READ_SCOPE,
@@ -761,7 +768,7 @@ def test_gmail_same_provider_revision_restores_without_another_model_call(
         ).fetchone()
         observations = conn.execute(
             """
-            SELECT id, source_revision, source_order
+            SELECT id, source_revision, source_order, evidence_refs
             FROM ops_observations
             WHERE source_type = 'gmail'
             ORDER BY source_order, source_revision
@@ -774,12 +781,17 @@ def test_gmail_same_provider_revision_restores_without_another_model_call(
             """,
             (item["id"],),
         ).fetchone()
-    assert item["source_revision"] == "gmail-history-thread-1"
+    assert str(item["source_revision"]).startswith("gmail-derived-v1-")
     assert item["confidence"] == 0.95
     assert json.loads(item["metadata"])["reconciliation_status"] == "confirmed"
     assert len(observations) == 2
     provider_observation, revalidation_observation = observations
-    assert provider_observation["source_revision"] == "gmail-history-thread-1"
+    assert str(provider_observation["source_revision"]).startswith(
+        "gmail-derived-v1-"
+    )
+    assert json.loads(provider_observation["evidence_refs"])[0][
+        "source_revision"
+    ] == "gmail-history-thread-1"
     assert provider_observation["source_order"] == 1
     assert str(revalidation_observation["source_revision"]).startswith(
         "gmail-revalidation-"
@@ -787,6 +799,189 @@ def test_gmail_same_provider_revision_restores_without_another_model_call(
     assert revalidation_observation["source_order"] == 2
     assert item["current_observation_id"] == provider_observation["id"]
     assert json.loads(authority_event["metadata"])["authority_reapplied"] is True
+
+
+def test_gmail_detector_reclassification_upgrades_legacy_raw_revision(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "ops.sqlite"
+    init_operational_db(db_path)
+    thread = gmail_result(
+        body="I'm a recruiter reaching out about a product leadership role."
+    ).threads[0]
+    old_candidate = GmailOperationalCandidate(
+        detector_key="attention-f98cb494e3979a46",
+        operation="needs_reconciliation",
+        kind="attention",
+        title="Review recruiter email",
+        owner="operator",
+        confidence=0.25,
+        priority=90,
+        evidence_message_ids=("message-1",),
+        handled_verdict="unknown",
+        handled_confidence=0.25,
+        reason="The prior detector could not safely classify this thread.",
+        reconciliation_status="ambiguous",
+    )
+    new_candidate = replace(
+        old_candidate,
+        operation="update",
+        owner="unknown",
+        confidence=0.8,
+        priority=40,
+        handled_verdict="needs_action",
+        handled_confidence=0.98,
+        reason="Human recruiting activity is relevant for review.",
+        reconciliation_status="confirmed",
+    )
+    old_detection = GmailThreadDetection(
+        thread_id=thread.thread_id,
+        disposition="surfaced",
+        reason_code="detector_error_uncertain",
+        candidates=(old_candidate,),
+        confidence=0.25,
+    )
+    new_detection = replace(
+        old_detection,
+        reason_code="recruiter_activity",
+        candidates=(new_candidate,),
+        confidence=0.8,
+    )
+    # This matches the installed legacy-v2 rows: the immutable observation
+    # identity was the raw provider revision and policy_version was not stored.
+    old_observation = OperationalObservation(
+        source_type="gmail",
+        account_key="gmail.personal",
+        stream_key=shadow_trial_module.GMAIL_STREAM,
+        source_key=f"{thread.thread_id}:{old_candidate.detector_key}",
+        source_revision="gmail-history-thread-1",
+        source_order=1,
+        source_updated_at=thread.updated_at,
+        observed_at=NOW.isoformat(),
+        item_kind=old_candidate.kind,
+        title=old_candidate.title,
+        details=old_candidate.reason,
+        owner=old_candidate.owner,
+        source_timezone="America/Los_Angeles",
+        confidence=old_candidate.confidence,
+        priority=old_candidate.priority,
+        evidence_refs=(
+            {
+                "account_key": "gmail.personal",
+                "thread_id": thread.thread_id,
+                "message_id": "message-1",
+                "source_ref": "gmail.personal:thread-1",
+                "source_revision": "gmail-history-thread-1",
+            },
+        ),
+        metadata={
+            "detector_version": "gmail-operations-v2",
+            "message_class": thread.message_class,
+            "reconciliation_status": old_candidate.reconciliation_status,
+        },
+    )
+    new_observation = shadow_trial_module._gmail_observation(
+        thread,
+        new_detection,
+        new_candidate,
+        account_key="gmail.personal",
+        source_order=2,
+        observed_at=(NOW + timedelta(minutes=1)).isoformat(),
+        source_ref="gmail.personal:thread-1",
+        source_timezone="America/Los_Angeles",
+        detector_version="gmail-operations-v5",
+        policy_version="operations-v1@1",
+    )
+    divergent_observation = shadow_trial_module._gmail_observation(
+        thread,
+        new_detection,
+        replace(new_candidate, priority=41),
+        account_key="gmail.personal",
+        source_order=3,
+        observed_at=(NOW + timedelta(minutes=2)).isoformat(),
+        source_ref="gmail.personal:thread-1",
+        source_timezone="America/Los_Angeles",
+        detector_version="gmail-operations-v5",
+        policy_version="operations-v1@1",
+    )
+    revised_policy_observation = shadow_trial_module._gmail_observation(
+        thread,
+        new_detection,
+        new_candidate,
+        account_key="gmail.personal",
+        source_order=3,
+        observed_at=(NOW + timedelta(minutes=2)).isoformat(),
+        source_ref="gmail.personal:thread-1",
+        source_timezone="America/Los_Angeles",
+        detector_version="gmail-operations-v5",
+        policy_version="operations-v1@2",
+    )
+
+    first = reconcile_observation(
+        db_path,
+        old_observation,
+        processed_at=NOW.isoformat(),
+        run_id="run-v2",
+    )
+    second = reconcile_observation(
+        db_path,
+        new_observation,
+        processed_at=(NOW + timedelta(minutes=1)).isoformat(),
+        run_id="run-v5",
+    )
+    replay = reconcile_observation(
+        db_path,
+        new_observation,
+        processed_at=(NOW + timedelta(minutes=2)).isoformat(),
+        run_id="run-v5-replay",
+    )
+    with pytest.raises(ObservationConflictError, match="conflicting content"):
+        reconcile_observation(
+            db_path,
+            divergent_observation,
+            processed_at=(NOW + timedelta(minutes=3)).isoformat(),
+            run_id="run-v5-divergent",
+        )
+
+    assert old_observation.source_revision == "gmail-history-thread-1"
+    assert new_observation.source_revision.startswith("gmail-derived-v1-")
+    assert old_observation.source_revision != new_observation.source_revision
+    assert revised_policy_observation.source_revision != new_observation.source_revision
+    assert first.item_id == second.item_id == replay.item_id
+    assert first.observation_created is True
+    assert second.observation_created is True
+    assert second.event_type == "updated"
+    assert replay.observation_created is False
+    assert replay.event_type == "noop"
+    with operational_connection(db_path, write=False) as conn:
+        observations = conn.execute(
+            """
+            SELECT source_revision, evidence_refs
+            FROM ops_observations
+            WHERE source_type = 'gmail'
+            ORDER BY source_order
+            """
+        ).fetchall()
+        item = conn.execute(
+            "SELECT confidence, priority, metadata FROM ops_items WHERE id = ?",
+            (second.item_id,),
+        ).fetchone()
+        event_count = conn.execute(
+            "SELECT COUNT(*) FROM ops_item_events WHERE item_id = ?",
+            (second.item_id,),
+        ).fetchone()[0]
+    assert len(observations) == 2
+    assert all(
+        json.loads(row["evidence_refs"])[0]["source_revision"]
+        == "gmail-history-thread-1"
+        for row in observations
+    )
+    assert item["confidence"] == 0.8
+    assert item["priority"] == 40
+    assert json.loads(item["metadata"])["detector_version"] == (
+        "gmail-operations-v5"
+    )
+    assert event_count == 2
 
 
 def test_calendar_reset_advances_sync_token_and_marks_unseen_event_ambiguous(

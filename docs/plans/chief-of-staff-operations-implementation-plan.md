@@ -1,7 +1,7 @@
 # Chief-of-Staff Operations Implementation Plan
 
-**Status:** manual Calendar/Gmail shadow implementation is locally release-verified and has completed its first owner-authorized live validation; human review and every promotion gate remain pending
-**Last verified:** 2026-07-14 with Ruff green, 746 Python tests, 27 Swift tests, and a signed local app bundle built, installed, and launched with a healthy daemon; the latest app-driven validation persisted Calendar-complete/Gmail-partial coverage with 77 Gmail detector reviews visibly deferred by the approved daily budget
+**Status:** manual Calendar/Gmail shadow implementation and the operator-feedback tranche are locally release-verified and installed; visual UI acceptance, owner review, and every empirical promotion gate remain pending
+**Last verified:** 2026-07-14 with Ruff and diff checks green, 772 Python tests, 28 Swift tests, and a signed local app bundle installed with healthy runtime fingerprint `ac389246`; the latest provider run completed Calendar but stopped Gmail before fetch at the approved `1200/1200` daily API cap, while an isolated production-code replay of the exact retained 200-thread page completed without an observation conflict or visible marketing leak
 **Owning spec:** [Chief-of-Staff Operations](../specs/chief-of-staff-operations.md)
 
 ## Outcome
@@ -29,6 +29,11 @@ The program keeps one product, one app, one coordinator daemon, and one Brain ho
 15. Cross-source episode links are explicit, evidence-backed, and reversible; an ambiguous link never destructively merges source history.
 16. A persisted briefing is a bounded preview at or below 240 KiB under the immutable 256 KiB storage ceiling and preserves true total/included/omitted counts for every section.
 17. Each operational item appears in one primary visible section; low-confidence, provisional, or ambiguous items cannot become action candidates or render verified `P0`/`P1` badges.
+18. There is no monolithic Chief-of-Staff model: deterministic reconciliation, selection, ranking, suppression, and cache validity remain authoritative; the shared Chief-of-Staff generative default is `gpt-5.6-luna` at `high` reasoning, and the only current generative role is the restricted, tool-less Gmail detector that inherits those defaults unless explicitly overridden.
+19. Meeting briefs are proactively prepared from retained local evidence for timed, non-transparent events inside a 72-hour window after each Calendar shadow run and every 15 minutes; all-day, transparent, and high-precision `Family time` personal blocks remain visible and on-demand, and source refresh remains manual.
+20. A meeting brief leads with human-readable context and preparation, keeps source-backed links in the body, and moves raw claims, evidence IDs, coverage, and retrieval diagnostics to a collapsed appendix.
+21. Recurring Calendar-series hiding is a reversible local projection preference with a visible hidden-series disclosure and Undo; it never writes to Calendar or deletes operational evidence.
+22. Marketing updates are hidden/audit-only, while routine individual recruiter activity is Attention unless exact evidence establishes a stronger commitment, deadline, or scheduled time.
 
 ## Program Sequence
 
@@ -37,16 +42,65 @@ The program keeps one product, one app, one coordinator daemon, and one Brain ho
 | COS-0 | verified knowledge-layer foundation | none | complete |
 | COS-1 | canonical boundary, local policy, adapter, privacy, eval, and rollout contracts | none | complete |
 | COS-2 | separate operational kernel and deterministic lifecycle | none | complete |
-| COS-3 | read-only Calendar evidence and reconciliation | none | live path validated complete; human review and promotion pending |
-| COS-4 | coverage-aware Today focus, feedback, evidence audit, and basic meeting preparation API | none | repaired live snapshot/result path validated; human review and promotion pending |
-| COS-5 | one-stage Gmail operational detection and source-local satisfaction | none | live budget/partial path validated; 77 detector reviews deferred in the latest pass; quality promotion pending |
+| COS-3 | read-only Calendar evidence and reconciliation | none | latest live provider path complete; human review and promotion pending |
+| COS-4 | coverage-aware Today focus, feedback, evidence audit, and proactive meeting preparation | none | release-verified and installed; visual UX review and empirical promotion pending |
+| COS-5 | one-stage Gmail operational detection and source-local satisfaction | none | detector v6 release-verified by isolated retained-page replay; complete provider/cursor run, human quality review, and promotion pending |
 | COS-6 | reversible cross-source episodes, satisfaction, and production briefing gates | none | gated |
 | COS-7 | local draft/action plans with guarded approval protocol | none | gated |
 | COS-8 | capability-by-capability external execution | explicit only | gated |
 
 Calendar and the operational kernel preceded Gmail implementation. The owner has separately approved Gmail read-only access for a private operational shadow trial, but that does not promote either source or enable Gmail retrieval/knowledge ingestion. Source-local detection and satisfaction must work before cross-source aggregation. Reconciliation must work before the briefing is considered trustworthy. Optional adapters follow the same contract and cannot bypass Calendar/Gmail gates. Drafting must work before execution.
 
-Local release verification completed on 2026-07-14: Ruff was green, all 746 Python tests and 27 Swift tests passed, and the signed local app bundle built, installed, launched, and served a healthy daemon. The first live attempt exposed an oversized snapshot and weak terminal-result visibility; the latest app-driven validation retained source progress, completed Calendar, reported Gmail partial with 77 reviews deferred at the approved daily detector budget, persisted the bounded snapshot, and presented the terminal result in Today. This establishes that the live read-only storage, partial-coverage, budget, and terminal-outcome paths work. It does not establish detector quality, daily briefing trust, or any promotion gate; owner review and continued labeled evaluation are next.
+Local release verification completed on 2026-07-14: Ruff and diff checks were green, all 772 Python tests and 28 Swift tests passed, and the signed local app bundle built, installed, launched, and served healthy runtime fingerprint `ac389246`. The installed restricted-Codex selection is `gpt-5.6-luna` at `high` reasoning. The `executive-brief-v2` packet was verified as prepared in advance by the completed scheduler, and recurring `Family Time` hide/Undo behavior passed a live check.
+
+The latest installed provider run completed Calendar but stopped Gmail before fetch because the approved durable daily API budget was already `1200/1200`; it does not validate a complete detector-v6 provider/cursor run. An isolated production-code replay then exercised the exact retained 200-thread page with zero model calls: 51 marketing threads suppressed, 7 tracked marketing threads kept hidden while pending reconciliation, 5 bulk threads suppressed, 3 recruiter threads filed as Attention, 134 model-dependent threads deferred, 10 plausible threads retained as Uncertain, and 3 derived observations applied. It produced no visible marketing leak and no `ObservationConflictError`. This establishes the repaired deterministic routing and immutable-observation release paths, not model judgment quality or daily briefing trust. The macOS XCTest UI suite was attempted, but no UI test executed because the runner timed out while enabling automation mode; this is an environment-blocked visual-acceptance gate, not a passing result or an app assertion failure. Visual UI acceptance, owner review, continued labeling, and every empirical promotion gate remain next.
+
+## 2026-07-14 Operator-Feedback Tranche
+
+This tranche improves the owner-facing loop without widening connector scopes or enabling provider writes.
+
+Implementation status:
+
+- [x] Document the split model architecture and keep deterministic selection authoritative.
+- [x] Set the shared Chief-of-Staff default to `gpt-5.6-luna` at `high` reasoning and make the restricted, tool-less Gmail detector inherit it unless an explicit Gmail-specific config/environment override is present; retain effective-model/config-source/prompt/version/usage audit fields.
+- [x] Turn the meeting packet into a human-readable executive brief with source-backed context, conservative event-to-background relevance gating, open questions, preparation prompts, and relevant links.
+- [x] Move raw event/fact claims, evidence IDs, coverage, freshness, and retrieval diagnostics into a collapsed end appendix.
+- [x] Add revision-bound prepared-packet persistence, a 72-hour timed/non-transparent eligibility window, after-Calendar-run precomposition, and a daemon-local 15-minute job.
+- [x] Show **Open brief** for a prepared current revision and retain **Prepare now** as the fallback.
+- [x] Add durable per-account recurring-series suppression, exclude matching occurrences from Today and preparation, show a compact hidden-series disclosure, and support Undo.
+- [x] Keep suppression entirely local; do not dismiss source items, delete evidence, or mutate Calendar.
+- [x] Suppress marketing campaigns before semantic detection, keep them in the collapsed audit only, and prevent legacy marketing items from leaking into Uncertain.
+- [x] Classify individual recruiter outreach as Attention by default while preserving stronger evidenced commitments, deadlines, and scheduled events.
+- [x] Re-run the full Python, Swift, Ruff, diff, signed-build/install, and daemon-health gates against the completed tranche.
+- [x] Verify the installed `gpt-5.6-luna`/`high` restricted-Codex selection, proactive `executive-brief-v2` scheduler result, and recurring-series hide/Undo path.
+- [x] Replay detector v6 through production code against the exact retained 200-thread page without bypassing the exhausted live API budget; confirm deterministic routing, derived revisions, and no marketing leak or observation conflict.
+- [ ] Complete visual UI acceptance of the installed tranche with the owner.
+- [ ] Review a fresh private Calendar/Gmail result with the owner; this is evaluation, not automatic promotion.
+- [ ] Complete the labeled empirical promotion gates; release verification does not waive them.
+
+Focused automated coverage is required for:
+
+- operational migration and clean upgrade creation of `ops_suppression_rules` and `ops_meeting_packets`;
+- recurring-series hide/list/filter/restore behavior, one-off rejection, restart durability, and zero provider mutation;
+- prepared-packet save/load bounds, exact-revision invalidation, 72-hour timed/non-transparent selection, hidden-series exclusion, expiry pruning, and scheduler failure isolation;
+- meeting brief decoding and the separation between primary human-readable sections and the source/diagnostic appendix;
+- source link preservation, unsupported-claim prevention, partial-coverage warnings, and fallback preparation;
+- marketing campaign suppression, marketing-boilerplate false urgency, legacy visible-item removal, recruiter Attention, and stronger recruiter obligation preservation;
+- deterministic focus/section invariants and bounded briefing serialization after filtering.
+
+Verification checklist:
+
+```bash
+uv run pytest tests/test_operational_suppressions.py \
+  tests/test_operational_briefing.py tests/test_gmail_operations.py \
+  tests/test_shadow_trial.py tests/test_daemon.py -q
+uv run ruff check src tests
+uv run pytest -q
+swift test --package-path app
+scripts/build-app.sh
+scripts/install-app.sh
+scripts/ui-acceptance.sh
+```
 
 ## COS-0 - Knowledge Foundation Baseline
 
@@ -97,6 +151,11 @@ Create an independently migrated `db/ops.sqlite` with:
 - `ops_item_events` for append-only transitions and feedback;
 - `ops_source_cursors` for replay-safe connector progress and source coverage.
 
+The operator-feedback migration also adds two bounded supporting tables without changing the one-item aggregate:
+
+- `ops_suppression_rules` stores reversible, account-bound Calendar recurring-series projection preferences;
+- `ops_meeting_packets` stores revision-bound derived meeting briefs capped at 256 KiB with explicit generation and expiry times.
+
 Common item fields remain columns: source-unit/object identity, kind, state, title, owner/counterparty metadata, starts/due/ends/expires/snooze times, priority, confidence, current observation, reconciliation method, human-action provenance, and timestamps. Provider/type-specific material stays in validated JSON until repeated usage proves a column is necessary.
 
 Initial item kinds are `event`, `commitment`, `waiting`, `follow_up`, `deadline`, and `attention`. The universal state enum is `active`, `resolved`, `dismissed`, `cancelled`, or `expired`. Kind-specific semantics are expressed through deterministic transition validation rather than separate tables.
@@ -143,7 +202,7 @@ Rules:
 The completed COS-2 foundation consists of:
 
 - independently migrated `ops.sqlite` tables and an explicit bootstrap path;
-- immutable bounded observations, canonical items, append-only hashed events, and replay-safe source cursors with generation compare-and-swap;
+- immutable bounded observations, canonical items, append-only hashed events, and replay-safe source cursors with generation compare-and-swap; Gmail derived interpretation revisions are split from raw provider revisions, and optional `policy_version` observation metadata preserves compatibility with legacy rows;
 - exact source-unit binding, strict UTC normalization for present timestamps, provider-authority reconciliation, stale/equal-authority protection, lifecycle feedback, and one atomic source-unit/cursor batch primitive;
 - owner-only database/WAL/SHM handling, bounded lock retry, and focused isolation/concurrency tests;
 - a daemon-owned operational service that revalidates role, home, node identity, restore quarantine, and the active daemon lease for every mutation, with in-process and cross-process serialization;
@@ -151,7 +210,7 @@ The completed COS-2 foundation consists of:
 - one owner-only, checksummed `database_pair` recovery generation created under a fixed SQLite write barrier, with exact schema/integrity validation and a durable completion marker;
 - isolated restore that binds copied database content to the recovery manifest, preserves knowledge review plus operational feedback/cursors, and remains quarantined until a future explicit topology activation workflow.
 
-The daemon now owns and wires one fenced `OperationalService` into the manual shadow controller and Today presentation service. `ops.sqlite` is initialized only through that daemon-owned path when the owner starts Shadow; ordinary knowledge initialization and connector capture do not mutate it. Calendar/Gmail adapter work, source-unit reconciliation, handled assessments, briefing snapshots, item feedback, and missing reports use that service. No operational scheduler job or external-action authority is enabled.
+The daemon now owns and wires one fenced `OperationalService` into the manual shadow controller and Today presentation service. `ops.sqlite` is initialized only through that daemon-owned path when the owner starts Shadow; ordinary knowledge initialization and connector capture do not mutate it. Calendar/Gmail adapter work, source-unit reconciliation, handled assessments, briefing snapshots, item feedback, suppression preferences, prepared packets, and missing reports use that service. One serial 15-minute operational job prepares revision-bound meeting briefs from retained local evidence on `single|primary` roles; it neither polls a provider nor grants external-action authority.
 
 ### Verification
 
@@ -159,6 +218,8 @@ The daemon now owns and wires one fenced `OperationalService` into the manual sh
 - WAL, busy timeout, foreign keys, and short transaction behavior;
 - observation replay idempotence;
 - update/reschedule/cancel/dismiss/restore history;
+- recurring-series suppression/list/restore durability and one-off-event rejection;
+- meeting-packet size, revision, expiry, idempotence, and eligibility-window behavior;
 - concurrent short-writer coverage;
 - a test proving no knowledge table changes;
 - owner-only DB/WAL/SHM permissions and explicit missing-store failure;
@@ -232,6 +293,8 @@ Today renders:
 
 Every item supports evidence inspection plus correct, done, snooze, dismiss, restore, and report-missing feedback where valid. Feedback appends an operational item event; it does not masquerade as a provider observation and never mutates a fact merely because the user changes an item.
 
+A recurring Calendar event additionally supports **Hide recurring series**. The rule is keyed by account and provider series ID, filters every retained/future occurrence from Today and meeting preparation, and appears in a compact hidden-series disclosure with **Undo**. This is a local presentation preference; it does not change item lifecycle or Calendar.
+
 ### Briefing requirements
 
 - deterministic ranking with injected clock/timezone and validated operations-policy version;
@@ -246,7 +309,9 @@ Every item supports evidence inspection plus correct, done, snooze, dismiss, res
 - no low-confidence, provisional, or ambiguous item in action candidacy and no verified `P0`/`P1` styling on uncertain cards;
 - persisted briefing runs only when needed for shown/not-shown evaluation and feedback attribution.
 
-Add a bounded preparation packet for an operator-selected or configured upcoming meeting. The initial packet may combine Calendar metadata, active operational items, local operations policy, and approved Brain retrieval/facts/pages. Each factual claim keeps evidence IDs, freshness, and source coverage; suggested talking points are visually non-factual. The packet is derived, follows briefing retention, stores no full source bodies, and cannot mutate an item or fact.
+Add a bounded human-readable executive brief for an operator-selected or eligible upcoming meeting. The initial packet may combine Calendar metadata, active operational items, local operations policy, and approved Brain retrieval/facts/pages. The primary view leads with purpose/context, relevant background, agenda/talking points, open questions/preparation, and relevant links. Each factual claim keeps evidence IDs, freshness, and source coverage in a collapsed end appendix; suggested talking points are visually non-factual. The packet is derived, stores no full source bodies, and cannot mutate an item or fact.
+
+Precompose revision-current packets for unsuppressed active timed events that are not transparent and do not match the high-precision normalized `Family time` title/prefix in the next 72 hours after a Calendar shadow run and from one 15-minute daemon-local job. Excluded events retain their Today card, series controls, and explicit on-demand preparation without entering the proactive queue. Persist at most 256 KiB per packet, expire after 30 days, and treat a changed Calendar revision or packet-content version as a cache miss. User-visible retrieved background must share a meaningful normalized term/entity with the event title or retained Calendar notes after generic meeting words and operator identity terms are removed; non-matching retrieval stays diagnostics-only. The job uses retained local evidence only; Google polling and the Gmail detector remain manual-run behavior. **Open brief** reads the current cache and **Prepare now** is the explicit fallback.
 
 ### Exit gate
 
@@ -254,7 +319,9 @@ A user can inspect and correct a Calendar-backed briefing for at least two weeks
 
 ### Current implementation
 
-Today now exposes **Run Shadow**, polls one background run through accepted/running/terminal state, refreshes the briefing after every terminal result, and keeps Calendar and Gmail coverage visible even when the final projection path fails. A prominent outcome card distinguishes complete, partial, and failed results. The briefing assigns each operational item to one primary section, bounds persisted cards to the 240 KiB target, and keeps true total/included/omitted counts. The ignored/suppressed audit is collapsed by default with its true total and bounded preview; uncertain items cannot enter the action set or display verified priority badges. Cards can open retained local evidence. Local confirm, note-required correction, done, snooze, dismiss, restore, and report-missing actions write only operational feedback. The repaired live validation persisted its partial snapshot after the original oversized-snapshot defect and retained completed Calendar plus partial Gmail coverage. The meeting-packet projection, API, and native **Prepare** interaction remain implemented; owner review and factual-claim promotion evaluation remain pending. There is no automatic run schedule.
+Today now exposes **Run Shadow**, polls one background provider-reading run through accepted/running/terminal state, refreshes the briefing after every terminal result, and keeps Calendar and Gmail coverage visible even when the final projection path fails. A prominent outcome card distinguishes complete, partial, and failed results. The briefing assigns each operational item to one primary section, bounds persisted cards to the 240 KiB target, and keeps true total/included/omitted counts. The ignored/suppressed audit is collapsed by default with its true total and bounded preview; marketing updates stay there rather than entering Uncertain. Uncertain items cannot enter the action set or display verified priority badges. Cards can open retained local evidence. Local confirm, note-required correction, done, snooze, dismiss, restore, recurring-series hide/undo, and report-missing actions write only operational state.
+
+The meeting packet now renders as an executive brief rather than raw retrieval output: readable context and preparation lead, validated Calendar/Brain/source links are available in the body, and coverage plus claim/evidence diagnostics are collapsed at the end. Revision-bound `executive-brief-v2` packets are precomposed after Calendar shadow work and by the local 15-minute scheduler for timed, non-transparent events in the next 72 hours; all-day and transparent events stay on-demand, prepared cards show **Open brief**, and **Prepare now** remains the fallback. Suppressed recurring series are excluded and summarized in a compact reversible disclosure. Provider source refresh is still manual. Release verification confirmed a packet prepared in advance, scheduler completion, and live `Family Time` hide/Undo behavior in the installed app. Automated, build/install, and daemon-health gates are complete; owner visual UX review and empirical promotion remain pending.
 
 ## COS-5 - Gmail Operational Detection
 
@@ -268,14 +335,14 @@ This phase requires explicit approval of Gmail read-only scope, local retention,
 
 Only lane 3 is enabled by the current manual trial. Retrieval indexing and durable knowledge ingestion remain disabled and are not implicit side effects of operational evidence access.
 
-One changed thread is processed once, or in a failure-isolated batch of small transactional threads. Provider marketing/bulk classification gates broad keyword admission before semantic detection, while a changed thread with an already tracked item remains eligible. Input contains new messages, bounded thread context, source-native timestamps, and compact plausibly related active items. Output is a structured operation:
+One changed thread is processed once, or in a failure-isolated batch of small transactional threads. Advertising, newsletter, promotion, and other marketing campaign classification gates broad keyword admission before semantic detection, while a changed thread with an already tracked item remains detector-eligible. Marketing updates are audit-only and cannot fall back into visible uncertainty. Individual recruiter outreach is carved out as Attention; bulk job alerts remain marketing, and exact commitments/deadlines/scheduled times preserve their stronger semantics. Input contains new messages, bounded thread context, source-native timestamps, and compact plausibly related active items. Output is a structured operation:
 
 - ignore;
 - create item;
 - update/reschedule/cancel/close item;
 - needs reconciliation.
 
-No fact critic, fact route resolver, entity gardener, or wiki routing is invoked. Structured validation is isolated per thread so one malformed result cannot discard valid siblings in the same batch; any affected thread becomes explicit uncertainty without promoting model output. Cost is measured rather than inferred; 100–150K tokens/day is a planning hypothesis, not a benchmark result.
+No fact critic, fact route resolver, entity gardener, or wiki routing is invoked. The restricted, tool-less detector inherits the shared Chief-of-Staff default of `gpt-5.6-luna` at `high` reasoning unless an explicit Gmail-specific config/environment override is present. Structured validation is isolated per thread so one malformed result cannot discard valid siblings in the same batch; any affected admitted non-marketing thread becomes explicit uncertainty without promoting model output. Cost is measured rather than inferred; 100–150K tokens/day is a planning hypothesis, not a benchmark result.
 
 Implement source-local action-satisfaction verification in the same phase. Stable configured operator email identities plus Gmail message/thread lineage determine authorship and response; display names do not. The derived verdict is `needs_action|responded_waiting|being_handled|fulfilled|unknown`, with supporting/contradicting evidence, source coverage, method/version, policy version, confidence, and `as_of`. Read/viewed state and an outgoing reply never prove fulfillment. A direct supplied/declined result may recommend an allowed lifecycle transition, but deterministic reconciliation applies it.
 
@@ -300,7 +367,9 @@ Severity-weighted recall, false-alarm rate, source-date accuracy, handled-verdic
 
 ### Current implementation
 
-The owner-approved private lane uses a separate exact `gmail.readonly` grant, a seven-day recent/unread initial query, a 200-thread manual-run cap, resumable mailbox/history pagination, deterministic MIME normalization, quoted-history stripping, and no attachment fetches. Marketing/bulk gating precedes broad keyword matching, tracked threads remain eligible, and malformed batch entries are isolated per thread. Only the restricted, tool-less Codex detector may receive bounded changed-thread content; it returns schema-validated suggestions and deterministic code validates evidence and lifecycle effects before applying operational state. Daily API/call/token reservations, provider-reported positive usage deltas, and missing-usage/overage stops fail visibly into partial coverage. Raw resumable payloads expire after 7 days and normalized revision evidence after 30 days. The latest app-driven validation checked the bounded Gmail page and reported 77 deferred detector reviews when the approved daily detector budget was exhausted; the snapshot persisted and coverage remained partial rather than claiming completion. This validates budget and coverage behavior, not detector quality. Human labeling and the held-out promotion gate remain pending.
+The owner-approved private lane uses a separate exact `gmail.readonly` grant, a seven-day recent/unread initial query, a 200-thread manual-run cap, resumable mailbox/history pagination, deterministic MIME normalization, quoted-history stripping, and no attachment fetches. Marketing-campaign gating precedes broad keyword matching, tracked threads remain detector-eligible, routine individual recruiter activity becomes normal-priority Attention unless stronger evidence exists, and malformed batch entries are isolated per thread. Marketing decisions and legacy marketing items remain in the collapsed audit rather than Uncertain. Only the restricted, tool-less Codex detector may receive bounded changed-thread content; the installed selection is the shared `gpt-5.6-luna`/`high` default through restricted Codex unless a Gmail-specific override is present. Detector `gmail-operations-v6` returns schema-validated suggestions and remains subordinate to deterministic evidence/lifecycle validation. Derived interpretation revisions are versioned independently from raw Gmail evidence by provider revision, detector version, and active policy version; `policy_version` remains optional observation metadata for legacy compatibility. Daily API/call/token reservations, provider-reported positive usage deltas, and missing-usage/overage stops fail visibly into partial coverage. Raw resumable payloads expire after 7 days and normalized revision evidence after 30 days.
+
+The latest provider run completed Calendar but stopped Gmail before fetch at the approved `1200/1200` API cap, so it does not validate complete Gmail provider pagination or cursor advancement. An isolated production-code replay against the exact retained 200-thread page then completed with zero model calls: 51 marketing threads and 5 bulk threads were suppressed, 7 tracked marketing threads remained hidden pending reconciliation, 3 recruiter threads entered Attention, 134 model-dependent threads were deferred, 10 plausible threads remained Uncertain, and 3 derived observations were applied. No marketing item leaked visibly and no immutable-observation conflict occurred. Automated release verification is complete; human labeling, model-quality review in a fresh budget window, full provider/cursor validation, and the held-out promotion gate remain pending.
 
 ## COS-6 - Cross-Source Reconciliation
 
@@ -397,7 +466,9 @@ Every shadow release records:
 - item precision/recall by kind and severity;
 - reconciliation, reversible episode-relation, and handled-verdict metrics;
 - focus precision@5, critical/high-priority overflow recall, awareness-padding count, and evidence-route validity;
-- meeting-preparation factual evidence coverage, unsupported-claim rate, and stale/wrong-person rate;
+- marketing-to-visible leakage, recruiter-attention classification, and suppressed-source miss rate;
+- recurring-series suppression/restore leakage and disclosure accuracy;
+- meeting-preparation factual evidence coverage, unsupported-claim rate, stale/wrong-person rate, precomposition timeliness, and revision invalidation;
 - corrections, dismissals, snoozes, and reported misses;
 - DB size, write latency, lock errors, backup/integrity result;
 - model/prompt/classifier versions.
@@ -426,8 +497,10 @@ Stop the phase and preserve the previous release when:
 - a reply, view marker, display name, or unconfirmed cross-source relation suppresses required action;
 - focus is padded with awareness or omits undisclosed critical/high-priority overflow;
 - an operational item is repeated across primary sections, or an uncertain/unverified item is promoted into action candidacy or verified `P0`/`P1` presentation;
+- a marketing update appears in a visible section, a bulk job alert is promoted as personal recruiter activity, or routine individual recruiter activity disappears instead of entering Attention;
+- a recurring-series rule changes provider state, hides a different account/series, lacks an Undo disclosure, or survives explicit restore in the Today projection;
 - a provider link fails its scheme/host/tenant/account validation or a forgotten evidence route remains active;
-- a meeting packet emits an unsupported factual claim or hides stale/partial coverage;
+- a meeting packet emits an unsupported factual claim, presents diagnostics as the primary brief, hides stale/partial coverage, uses a stale Calendar revision, or prepares a locally suppressed series;
 - duplicate, stale, false-merge, false-link, false-handled, premature-close, or high-severity-miss gates regress;
 - calls/tokens grow without a per-changed-source budget;
 - SQLite lock/integrity or coordinated-backup tests fail;
@@ -447,8 +520,9 @@ Use separate commits for:
 7. Calendar adapter plus safe route builder;
 8. Today focus/API/UI plus Calendar/Brain meeting preparation;
 9. Gmail retrieval/detection plus source-local satisfaction verification;
-10. reversible cross-source episode relations, satisfaction, and briefing gates;
-11. each optional Git, agent-session, code-host, collaboration, or work-tracker adapter as its own read-only commit;
-12. draft/execution capabilities, split again by capability and reversibility class.
+10. operator-feedback tranche: proactive revision-bound meeting briefs, recurring Calendar-series suppression/undo, marketing hiding, recruiter Attention, and model-default inheritance;
+11. reversible cross-source episode relations, satisfaction, and briefing gates;
+12. each optional Git, agent-session, code-host, collaboration, or work-tracker adapter as its own read-only commit;
+13. draft/execution capabilities, split again by capability and reversibility class.
 
 Contract commits do not smuggle in runtime behavior. Every implementation commit updates the owning phase status and includes focused tests, private fixture/eval results where applicable, plus the full no-regression gate appropriate to its blast radius. A phase commit is pushed only after its owning gate passes; a later adapter or model regression can disable that capability without rolling back the knowledge, Calendar, or retrieval foundations.

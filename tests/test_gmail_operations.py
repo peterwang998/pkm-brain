@@ -114,7 +114,7 @@ def test_preclassifier_suppresses_marketing_but_keeps_transactional_deadlines() 
         operator_emails=("operator@example.com",),
     )
     assert newsletter_result.should_detect is False
-    assert newsletter_result.reason_code == "marketing_no_action"
+    assert newsletter_result.reason_code == "marketing_update"
     assert renewal_result.should_detect is True
     assert renewal_result.high_consequence is True
 
@@ -139,8 +139,575 @@ def test_preclassifier_does_not_promote_marketing_boilerplate_to_high_consequenc
     )
 
     assert result.should_detect is False
-    assert result.reason_code == "marketing_no_action"
+    assert result.reason_code == "marketing_update"
     assert result.high_consequence is True
+
+
+def test_no_reply_publication_digest_is_hidden_as_marketing() -> None:
+    digest = thread(
+        "publication-digest",
+        "The World in Brief: global news update",
+        (
+            message(
+                "publication-digest-1",
+                "For subscribers. The World in Brief. Catch up quickly on the "
+                "global stories that matter. Today's top stories follow.",
+                sender="noreply@publisher.example",
+            ),
+        ),
+        message_class="transactional",
+    )
+
+    result = preclassify_gmail_thread(
+        digest,
+        operator_emails=("operator@example.com",),
+    )
+
+    assert result.should_detect is False
+    assert result.marketing_update is True
+    assert result.reason_code == "marketing_update"
+
+
+def test_list_header_event_promotion_is_hidden_but_registration_receipt_is_not() -> None:
+    promotion = thread(
+        "event-promotion",
+        "This conference is for humans and agents",
+        (
+            message(
+                "event-promotion-1",
+                "Join us this October. Register now to lock in your spot. "
+                "Unsubscribe or manage your preferences.",
+            ),
+        ),
+        message_class="marketing",
+    )
+    receipt = thread(
+        "event-registration",
+        "Conference registration confirmed",
+        (
+            message(
+                "event-registration-1",
+                "Your registration is confirmed for October 19.",
+                sender="noreply@events.example",
+            ),
+        ),
+        message_class="transactional",
+    )
+
+    promotion_result = preclassify_gmail_thread(
+        promotion,
+        operator_emails=("operator@example.com",),
+    )
+    receipt_result = preclassify_gmail_thread(
+        receipt,
+        operator_emails=("operator@example.com",),
+    )
+
+    assert promotion_result.should_detect is False
+    assert promotion_result.reason_code == "marketing_update"
+    assert receipt_result.should_detect is True
+    assert receipt_result.marketing_update is False
+    assert receipt_result.reason_code == "transactional_event"
+
+
+def test_product_onboarding_campaign_is_hidden_but_security_alert_is_not() -> None:
+    onboarding = thread(
+        "product-onboarding",
+        "Review your account settings",
+        (
+            message(
+                "product-onboarding-1",
+                "Here are a few tips to get you started. Get the most out of "
+                "your account with personalized tips, news and recommendations. "
+                "Unsubscribe or manage your email preferences.",
+                sender="no-reply@product.example",
+            ),
+        ),
+        message_class="marketing",
+    )
+    security_alert = thread(
+        "security-alert",
+        "New sign-in on your account",
+        (
+            message(
+                "security-alert-1",
+                "Security alert: a new sign-in was detected on your account. If this wasn't "
+                "you, secure your account now.",
+                sender="no-reply@product.example",
+            ),
+        ),
+        message_class="marketing",
+    )
+
+    onboarding_result = preclassify_gmail_thread(
+        onboarding,
+        operator_emails=("operator@example.com",),
+    )
+    alert_result = preclassify_gmail_thread(
+        security_alert,
+        operator_emails=("operator@example.com",),
+    )
+
+    assert onboarding_result.should_detect is False
+    assert onboarding_result.reason_code == "marketing_update"
+    assert alert_result.should_detect is True
+    assert alert_result.marketing_update is False
+    assert alert_result.reason_code == "high_consequence_signal"
+
+
+def test_human_classified_advertising_is_hidden_without_a_model_call() -> None:
+    advertising = thread(
+        "advertising",
+        "Urgent: your limited-time offer ends today",
+        (
+            message(
+                "advertising-1",
+                "Please act now to claim your discount. Unsubscribe or manage "
+                "your email preferences.",
+            ),
+        ),
+        message_class="human",
+    )
+    provider = FakeProvider([])
+
+    result = detect_gmail_threads(
+        [advertising],
+        operator_emails=("operator@example.com",),
+        timezone_name="America/Los_Angeles",
+        policy_version="operations-v1@1",
+        budget=GmailDetectorBudget(),
+        llm_provider=provider,
+    )
+
+    detection = result.detections[0]
+    assert provider.calls == 0
+    assert detection.disposition == "suppressed"
+    assert detection.reason_code == "marketing_update"
+    assert detection.candidates == ()
+
+
+def test_direct_human_request_about_marketing_content_remains_eligible() -> None:
+    request = thread(
+        "newsletter-review",
+        "Review the customer newsletter",
+        (
+            message(
+                "newsletter-review-1",
+                "Could you review the customer newsletter before I send it?",
+            ),
+        ),
+        message_class="human",
+    )
+
+    result = preclassify_gmail_thread(
+        request,
+        operator_emails=("operator@example.com",),
+    )
+
+    assert result.should_detect is True
+    assert result.marketing_update is False
+    assert result.direct_operator_thread is True
+
+
+def test_list_header_notifications_are_not_semantically_marketing() -> None:
+    ci_failure = thread(
+        "ci-failure",
+        "[example/project] Run failed: CI - main",
+        (message("ci-failure-1", "The CI workflow run failed on main."),),
+        message_class="marketing",
+    )
+    social_reply = thread(
+        "social-reply",
+        "Someone replied to your comment",
+        (message("social-reply-1", "A person replied to your comment."),),
+        message_class="marketing",
+    )
+
+    ci_result = preclassify_gmail_thread(
+        ci_failure,
+        operator_emails=("operator@example.com",),
+    )
+    reply_result = preclassify_gmail_thread(
+        social_reply,
+        operator_emails=("operator@example.com",),
+    )
+
+    assert ci_result.should_detect is True
+    assert ci_result.reason_code == "operational_notification"
+    assert ci_result.marketing_update is False
+    assert reply_result.should_detect is True
+    assert reply_result.reason_code == "operational_notification"
+    assert reply_result.marketing_update is False
+
+
+def test_transactional_event_remains_model_eligible_without_action_boilerplate() -> None:
+    shipment = thread(
+        "shipment",
+        "Your order shipped",
+        (message("shipment-1", "Your package is on its way."),),
+        message_class="transactional",
+    )
+
+    result = preclassify_gmail_thread(
+        shipment,
+        operator_emails=("operator@example.com",),
+    )
+
+    assert result.should_detect is True
+    assert result.reason_code == "transactional_event"
+    assert result.marketing_update is False
+
+
+def test_exhausted_budget_still_classifies_recruiter_and_marketing_deterministically() -> None:
+    fresh_ad = thread(
+        "fresh-ad",
+        "A limited-time offer",
+        (message("fresh-ad-1", "Save 20% with this exclusive deal."),),
+        message_class="marketing",
+    )
+    tracked_ad = thread(
+        "tracked-ad",
+        "A limited-time offer",
+        (message("tracked-ad-1", "Save 20% with this exclusive deal."),),
+        message_class="marketing",
+    )
+    recruiter = thread(
+        "budget-recruiter",
+        "Product leadership role",
+        (
+            message(
+                "budget-recruiter-1",
+                "I'm a recruiter reaching out about a product leadership role. "
+                "Would you be interested in learning more?",
+            ),
+        ),
+        message_class="marketing",
+    )
+    ci_failure = thread(
+        "budget-ci",
+        "[example/project] Run failed: CI - main",
+        (message("budget-ci-1", "The CI workflow run failed on main."),),
+        message_class="marketing",
+    )
+    provider = FakeProvider([])
+
+    result = detect_gmail_threads(
+        [fresh_ad, tracked_ad, recruiter, ci_failure],
+        operator_emails=("operator@example.com",),
+        timezone_name="America/Los_Angeles",
+        policy_version="operations-v1@1",
+        budget=GmailDetectorBudget(
+            max_calls=1,
+            max_input_tokens=1,
+            max_total_tokens=1,
+            max_batch_threads=4,
+            max_batch_chars=48_000,
+        ),
+        llm_provider=provider,
+        active_items_by_thread={
+            "tracked-ad": [
+                {
+                    "detector_key": "old-ad",
+                    "kind": "attention",
+                    "title": "Review promotion",
+                    "owner": "unknown",
+                    "priority": 90,
+                    "state": "active",
+                }
+            ]
+        },
+    )
+
+    detections = {value.thread_id: value for value in result.detections}
+    assert provider.calls == 0
+    assert result.coverage_complete is False
+    assert result.deferred_count == 2
+    assert detections["fresh-ad"].disposition == "suppressed"
+    assert detections["fresh-ad"].reason_code == "marketing_update"
+    assert detections["tracked-ad"].disposition == "deferred"
+    assert detections["tracked-ad"].reason_code == (
+        "marketing_update_pending_reconciliation"
+    )
+    recruiter_detection = detections["budget-recruiter"]
+    assert recruiter_detection.disposition == "surfaced"
+    assert recruiter_detection.reason_code == "recruiter_activity"
+    assert recruiter_detection.candidates[0].kind == "attention"
+    assert recruiter_detection.candidates[0].handled_verdict == "needs_action"
+    assert detections["budget-ci"].disposition == "deferred"
+    assert detections["budget-ci"].reason_code == "detector_budget_exhausted"
+
+
+def test_deterministic_recruiter_attention_updates_unconfirmed_active_item() -> None:
+    recruiter = thread(
+        "tracked-recruiter",
+        "Product leadership role",
+        (
+            message(
+                "tracked-recruiter-1",
+                "I'm a recruiter reaching out about a product leadership role.",
+            ),
+        ),
+        message_class="marketing",
+    )
+    provider = FakeProvider([])
+
+    result = detect_gmail_threads(
+        [recruiter],
+        operator_emails=("operator@example.com",),
+        timezone_name="America/Los_Angeles",
+        policy_version="operations-v1@1",
+        budget=GmailDetectorBudget(),
+        llm_provider=provider,
+        active_items_by_thread={
+            "tracked-recruiter": [
+                {
+                    "detector_key": "existing-recruiter",
+                    "kind": "follow_up",
+                    "title": "Review recruiter email",
+                    "owner": "operator",
+                    "priority": 90,
+                    "state": "active",
+                }
+            ]
+        },
+    )
+
+    candidate = result.detections[0].candidates[0]
+    assert provider.calls == 0
+    assert result.coverage_complete is True
+    assert candidate.detector_key == "existing-recruiter"
+    assert candidate.operation == "update"
+    assert candidate.kind == "attention"
+    assert candidate.priority == 40
+    assert candidate.evidence_message_ids == ("tracked-recruiter-1",)
+
+
+def test_job_digest_is_marketing_but_individual_recruiter_outreach_is_attention() -> None:
+    digest = thread(
+        "job-digest",
+        "Your weekly job alert",
+        (
+            message(
+                "job-digest-1",
+                "New jobs matching your profile. Browse all jobs or unsubscribe.",
+            ),
+        ),
+        message_class="marketing",
+    )
+    outreach_body = (
+        "I'm a recruiter reaching out about a product leadership role. "
+        "Would you be interested in learning more? Unsubscribe from platform notices."
+    )
+    outreach = thread(
+        "recruiter",
+        "Product leadership role",
+        (message("recruiter-1", outreach_body, sender="recruiter@example.com"),),
+        message_class="marketing",
+    )
+    provider = FakeProvider(
+        [
+            {
+                "threads": [
+                    {
+                        "thread_id": "recruiter",
+                        "decision": "ignore",
+                        "reason_code": "no_explicit_obligation",
+                        "confidence": 0.9,
+                        "candidates": [],
+                    }
+                ]
+            }
+        ]
+    )
+
+    result = detect_gmail_threads(
+        [digest, outreach],
+        operator_emails=("operator@example.com",),
+        timezone_name="America/Los_Angeles",
+        policy_version="operations-v1@1",
+        budget=GmailDetectorBudget(),
+        llm_provider=provider,
+    )
+
+    detections = {value.thread_id: value for value in result.detections}
+    assert provider.calls == 0
+    assert detections["job-digest"].disposition == "suppressed"
+    assert detections["job-digest"].reason_code == "marketing_update"
+    recruiter = detections["recruiter"]
+    assert recruiter.disposition == "surfaced"
+    assert recruiter.reason_code == "recruiter_activity"
+    assert recruiter.candidates[0].kind == "attention"
+    assert recruiter.candidates[0].priority == 40
+    assert recruiter.candidates[0].handled_verdict == "needs_action"
+    assert recruiter.candidates[0].evidence_message_ids == ("recruiter-1",)
+
+
+def test_personalized_recruiting_platform_message_is_deterministic_attention() -> None:
+    body = (
+        "I came across your profile and would love to connect about an "
+        "opportunity with Example Corp."
+    )
+    outreach = thread(
+        "platform-recruiter",
+        "New message about an opportunity",
+        (message("platform-recruiter-1", body),),
+        message_class="marketing",
+    )
+    provider = FakeProvider([])
+
+    result = detect_gmail_threads(
+        [outreach],
+        operator_emails=("operator@example.com",),
+        timezone_name="America/Los_Angeles",
+        policy_version="operations-v1@1",
+        budget=GmailDetectorBudget(),
+        llm_provider=provider,
+    )
+
+    assert provider.calls == 0
+    assert result.detections[0].reason_code == "recruiter_activity"
+    assert result.detections[0].candidates[0].kind == "attention"
+    assert result.detections[0].candidates[0].evidence_message_ids == (
+        "platform-recruiter-1",
+    )
+
+
+def test_executive_search_outreach_is_deterministic_recruiter_attention() -> None:
+    body = (
+        "I support a partner on high-profile product searches at Example Talent. "
+        "I'm working with Example Data on a Head of Product search and wanted "
+        "to reach out directly."
+    )
+    outreach = thread(
+        "executive-search",
+        "Head of Product search",
+        (message("executive-search-1", body),),
+        message_class="human",
+    )
+    provider = FakeProvider([])
+
+    preclassified = preclassify_gmail_thread(
+        outreach,
+        operator_emails=("operator@example.com",),
+    )
+    result = detect_gmail_threads(
+        [outreach],
+        operator_emails=("operator@example.com",),
+        timezone_name="America/Los_Angeles",
+        policy_version="operations-v1@1",
+        budget=GmailDetectorBudget(),
+        llm_provider=provider,
+    )
+
+    assert preclassified.recruiting_activity is True
+    assert preclassified.reason_code == "recruiter_activity"
+    assert provider.calls == 0
+    assert result.detections[0].reason_code == "recruiter_activity"
+    assert result.detections[0].candidates[0].kind == "attention"
+    assert result.detections[0].candidates[0].evidence_message_ids == (
+        "executive-search-1",
+    )
+
+
+def test_profile_review_and_fit_outreach_is_recruiter_attention() -> None:
+    body = (
+        "A colleague and I reviewed\nengineering profiles together, and we're "
+        "reaching out to you as we thought you could be a great fit for our "
+        "next Engineering Manager."
+    )
+    outreach = thread(
+        "profile-fit-outreach",
+        "Engineering Manager opportunity",
+        (message("profile-fit-outreach-1", body),),
+        message_class="human",
+    )
+    provider = FakeProvider([])
+
+    preclassified = preclassify_gmail_thread(
+        outreach,
+        operator_emails=("operator@example.com",),
+    )
+    result = detect_gmail_threads(
+        [outreach],
+        operator_emails=("operator@example.com",),
+        timezone_name="America/Los_Angeles",
+        policy_version="operations-v1@1",
+        budget=GmailDetectorBudget(),
+        llm_provider=provider,
+    )
+
+    assert preclassified.recruiting_activity is True
+    assert preclassified.reason_code == "recruiter_activity"
+    assert provider.calls == 0
+    assert result.detections[0].reason_code == "recruiter_activity"
+    assert result.detections[0].candidates[0].kind == "attention"
+    assert result.detections[0].candidates[0].evidence_message_ids == (
+        "profile-fit-outreach-1",
+    )
+
+
+def test_routine_recruiter_candidate_is_demoted_to_attention_but_deadline_is_not() -> None:
+    routine_body = "I'm a recruiter reaching out about a product leadership role."
+    deadline_body = (
+        "I'm a recruiter. Please submit the interview exercise by July 17, 2026."
+    )
+    routine = thread(
+        "routine-recruiter",
+        "Leadership role",
+        (message("routine-recruiter-1", routine_body),),
+    )
+    deadline = thread(
+        "recruiter-deadline",
+        "Interview exercise deadline",
+        (message("recruiter-deadline-1", deadline_body),),
+    )
+    provider = FakeProvider(
+        [
+            {
+                "threads": [
+                    _candidate_response(
+                        "routine-recruiter",
+                        _candidate(
+                            message_id="routine-recruiter-1",
+                            quote=routine_body,
+                            kind="follow_up",
+                            priority="high",
+                        ),
+                    )["threads"][0],
+                    _candidate_response(
+                        "recruiter-deadline",
+                        _candidate(
+                            message_id="recruiter-deadline-1",
+                            quote=deadline_body,
+                            kind="deadline",
+                            due_at="2026-07-17T17:00:00-07:00",
+                        ),
+                    )["threads"][0],
+                ]
+            }
+        ]
+    )
+
+    result = detect_gmail_threads(
+        [routine, deadline],
+        operator_emails=("operator@example.com",),
+        timezone_name="America/Los_Angeles",
+        policy_version="operations-v1@1",
+        budget=GmailDetectorBudget(),
+        llm_provider=provider,
+    )
+
+    detections = {value.thread_id: value for value in result.detections}
+    routine_candidate = detections["routine-recruiter"].candidates[0]
+    assert detections["routine-recruiter"].reason_code == "recruiter_activity"
+    assert routine_candidate.kind == "attention"
+    assert routine_candidate.owner == "unknown"
+    assert routine_candidate.priority == 40
+    assert routine_candidate.handled_verdict == "unknown"
+    deadline_candidate = detections["recruiter-deadline"].candidates[0]
+    assert deadline_candidate.kind == "deadline"
+    assert deadline_candidate.due_at is None
+    assert deadline_candidate.reconciliation_status == "provisional"
 
 
 def test_detector_batches_threads_and_returns_validated_operational_candidates() -> None:

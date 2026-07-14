@@ -1,7 +1,7 @@
 # Chief Of Staff Operations
 
-**Status:** canonical feature spec; the manual Calendar/Gmail shadow implementation is locally release-verified and has completed its first owner-authorized live validation, while human review and every promotion gate remain pending
-**Last verified:** 2026-07-14 with Ruff green, 746 Python tests, 27 Swift tests, and a signed local app bundle built, installed, and launched with a healthy daemon; the latest app-driven validation persisted a partial briefing with Calendar complete and Gmail transparently partial after 77 detector reviews were deferred by the approved daily budget
+**Status:** canonical feature spec; the manual Calendar/Gmail shadow implementation and operator-feedback tranche are locally release-verified and installed, while owner visual UX review and every empirical promotion gate remain pending
+**Last verified:** 2026-07-14 with Ruff and diff checks green, 772 Python tests, 28 Swift tests, and a signed local app bundle installed with healthy runtime fingerprint `ac389246`; the latest provider run completed Calendar but stopped Gmail before fetch at the approved `1200/1200` daily API cap, while an isolated production-code replay of the exact retained 200-thread page completed without an observation conflict or visible marketing leak
 **Owns:** operational items, reconciliation, briefings, operational evaluation, and guarded external execution
 
 ## Mission And Product Boundary
@@ -31,7 +31,7 @@ The initial release is read-only and shadow-only. No Calendar or Gmail mutation 
 
 ## Current Shadow Trial State
 
-The implemented evaluation slice runs only when the owner chooses **Today > Run Shadow**. It requires two separately authorized Google grants: the owned-primary Calendar grant and the Gmail read-only grant. Immediately before every run, the daemon binds each grant to the exact policy email, stable provider identity when available, and exact approved scope set. A missing, broader, changed-account, or mismatched grant fails closed.
+The provider-reading evaluation slice runs only when the owner chooses **Today > Run Shadow**. It requires two separately authorized Google grants: the owned-primary Calendar grant and the Gmail read-only grant. Immediately before every run, the daemon binds each grant to the exact policy email, stable provider identity when available, and exact approved scope set. A missing, broader, changed-account, or mismatched grant fails closed.
 
 The first accepted run creates the owner-only `config/local/operations.yaml` from the approved defaults only when no policy exists. An existing policy is authoritative and is never silently rewritten. The approved defaults are:
 
@@ -43,11 +43,13 @@ The first accepted run creates the owner-only `config/local/operations.yaml` fro
 
 One asynchronous run reads Calendar and Gmail independently, reconciles bounded evidence into `ops.sqlite`, saves a coverage-aware briefing snapshot, and exposes progress plus a prominent terminal outcome through Today. A second start while a run is active reuses the active run rather than starting overlapping source work. Partial pagination and bounded deferred work remain resumable through persisted source cursors; a later manual run continues from the last atomically committed checkpoint. A terminal projection or snapshot failure preserves already-completed source coverage, usage, counts, and cursor progress rather than replacing them with an undifferentiated failure.
 
-This slice is not scheduled. It does not write `inbox/`, `brain.sqlite`, documents, chunks, facts, entities, or wiki pages. Gmail retrieval indexing and durable-knowledge ingestion remain disabled. Feedback, missing-item reports, observations, current items, and briefing snapshots are local operational records only. The owner—not an agent or background job—authorizes both grants and starts the first live run.
+Calendar/Gmail capture remains manual and is not scheduled. Once the operational store exists, a daemon-local job may prepare derived briefs from already retained Calendar and Brain evidence; it does not poll Google or invoke the Gmail detector. The slice does not write `inbox/`, `brain.sqlite`, documents, chunks, facts, entities, or wiki pages. Gmail retrieval indexing and durable-knowledge ingestion remain disabled. Feedback, missing-item reports, observations, current items, suppression preferences, prepared packets, and briefing snapshots are local operational records only. The owner—not an agent or background job—authorizes both grants and starts the first live run.
 
 Implementation completion and one live validation do not equal promotion. Human review plus a larger private trial must still establish labeled recall, false-alarm, duplicate, stale, handled-state, evidence-route, coverage, and cost behavior before the briefing can be treated as trusted daily operational guidance.
 
-Local release verification is complete: Ruff is green, 746 Python tests and 27 Swift tests pass, and the signed local app bundle builds, installs, launches, and serves a healthy daemon. The first live attempt exposed an oversized briefing-snapshot failure and insufficient terminal-result visibility. The latest app-driven validation retained source progress, completed Calendar coverage, reported Gmail as partial with 77 detector reviews deferred by the approved daily budget, persisted a bounded briefing snapshot, and showed the terminal partial result in Today. This proves the repaired failure, storage, budget, coverage, and terminal-outcome paths against private live sources; it does not establish Gmail detector quality or promote either connector. Human labeling and every Calendar, Gmail, cross-source, meeting-preparation, and daily-briefing promotion gate remain pending.
+Local release verification is complete: Ruff and diff checks are green, 772 Python tests and 28 Swift tests pass, and the signed local app bundle builds, installs, launches, and serves healthy runtime fingerprint `ac389246`. The proactive `executive-brief-v2` packet was verified as prepared in advance by the completed scheduler, and live hide/Undo behavior was verified for the recurring `Family Time` series.
+
+The latest installed provider run completed Calendar, then correctly stopped Gmail before any fetch because the approved durable daily API budget was already `1200/1200`. It therefore does not prove a complete detector-v6 provider/cursor run. To exercise the repaired classification and immutable-observation path without bypassing that budget, an isolated production-code replay used the exact retained 200-thread page: zero model calls, 51 marketing threads suppressed, 7 already-tracked marketing threads kept hidden while pending reconciliation, 5 bulk threads suppressed, 3 recruiter threads filed as Attention, 134 model-dependent threads deferred, 10 plausible threads retained as Uncertain, and 3 derived observations applied. No marketing item leaked into a visible section and no `ObservationConflictError` occurred. These results validate deterministic routing, budget behavior, and versioned observation storage; they do not establish model judgment quality or promote either connector. Owner visual review, human labeling, and every empirical Calendar, Gmail, cross-source, meeting-preparation, and daily-briefing promotion gate remain pending.
 
 The owner-facing procedure is [Live Chief-of-Staff Shadow Trial](../runbooks/chief-of-staff-shadow-trial.md). Offline chronological scoring remains documented separately in [Retrospective Shadow Replay](../runbooks/chief-of-staff-shadow-replay.md).
 
@@ -141,6 +143,14 @@ Human decisions outrank later automated inference:
 - a human-resolved item may reactivate only from materially new evidence or an explicit human restore, with that reason recorded in the transition event;
 - every override records the source version and prior state it superseded.
 
+## Model Roles And Decision Authority
+
+There is no single model behind the Chief of Staff. Source normalization, Calendar identity and lifecycle, operational reconciliation, handled-state rules, visible-section assignment, ranking, focus selection, suppression, and cached-packet validity are deterministic. That code remains authoritative even when a model proposes a candidate.
+
+The default Chief-of-Staff generative configuration is `gpt-5.6-luna` at `high` reasoning. The installed selection has been verified as that model and effort through the restricted, tool-less Codex route. The current generative-model role is deliberately narrow: the Gmail operational detector inherits those shared Chief-of-Staff defaults; an explicit Gmail-specific configuration or environment override may replace the inherited model or effort. It receives one bounded changed thread or bounded batch and returns schema-validated suggestions. The model cannot browse, call tools, mutate providers, select the final briefing, or adjudicate lifecycle state. Its effective model, effort, configuration source, provider route, prompt, detector version, and usage remain versioned evaluation inputs; changing any of them requires replay and cost/quality review.
+
+Calendar cards, the Today projection, recurring-series suppression, and the current meeting-preparation packet do not use a generative model. Meeting preparation uses deterministic structure plus approved local Brain retrieval to organize source-backed material. A later bounded wording stage MAY improve prose only after deterministic selection has fixed the claims, links, ordering, and coverage. It MUST NOT add or remove operational items, factual claims, people, dates, owners, priority, handled state, or evidence.
+
 ## Operational Item Model
 
 V1 has one business-object table, `ops_items`. Item kinds are an enum on that table rather than independent schemas or state machines.
@@ -216,11 +226,11 @@ Dates are optional. The system MUST NOT invent a due date because an email says 
 
 ### Event History
 
-`ops_observations` stores immutable normalized source revisions. Each row records source type, account key, stream key, source key and opaque revision, a non-negative connector-supplied provider-authority order, optional provider source-update time, observation time, proposed item kind, `upsert|cancelled` event kind, validated payload, content hash, bounded stable evidence references, and creation time. Present operational timestamps are canonical UTC; `source_timezone` preserves the rendering context. A sparse provider tombstone may omit `source_updated_at`; the connector MUST NOT invent a wall-clock provider time. Replaying the same source revision and canonical content is a no-op. A conflicting replay of the same revision is an error. Revision strings and content hashes MUST NOT be used as chronology.
+`ops_observations` stores immutable normalized source revisions. Each row records source type, account key, stream key, source key and opaque revision, a non-negative connector-supplied provider-authority order, optional provider source-update time, observation time, proposed item kind, `upsert|cancelled` event kind, validated payload, content hash, bounded stable evidence references, and creation time. Present operational timestamps are canonical UTC; `source_timezone` preserves the rendering context. A sparse provider tombstone may omit `source_updated_at`; the connector MUST NOT invent a wall-clock provider time. Replaying the same source revision and canonical content is a no-op. A conflicting replay of the same revision is an error. Revision strings and content hashes MUST NOT be used as chronology. The implemented Gmail path separates the immutable derived interpretation revision from the raw provider revision: the derived revision is keyed by raw provider revision, detector version, and the active policy version, while the raw provider revision remains separately cited in evidence. `policy_version` is allowed but not required in observation metadata so legacy observations remain valid. Detector or policy upgrades therefore append a new interpretation without rewriting legacy history, while divergent output under the same declared interpretation identity still fails closed.
 
 `source_order` is scoped to one source type/account/stream and must be replay-stable. It derives from an authoritative provider sequence or from the persisted ordinal of a provider change-set committed with the source cursor. It MUST NOT derive from poll wall-clock time, response page position, lexical revision/etag order, or content-hash order. Projection authority compares `(source_order, source_updated_at-or-minimum)`; a distinct observation that does not sort after the current one is retained with `stale_ignored` and cannot mutate current state.
 
-Observation metadata uses a closed `schema_version=1` scalar-key contract. V1 admits only `all_day`, `attendee_count`, `attendee_response`, `calendar_id`, `detector_version`, `event_type`, `ical_uid`, `location`, `message_class`, `organizer_self`, `original_start_time`, `provider_sequence`, `reconciliation_status`, `recurring_event_id`, `source_status`, `transparency`, and `visibility`. Arbitrary keys, nested source payloads, descriptions, snippets, HTML, or message/event bodies are rejected. Full provider payloads remain in the separately governed evidence/capture layer, not `ops.sqlite`.
+Observation metadata uses a closed `schema_version=1` scalar-key contract. V1 admits only `all_day`, `attendee_count`, `attendee_response`, `calendar_id`, `detector_version`, `event_type`, `ical_uid`, `location`, `message_class`, `organizer_self`, `original_start_time`, `policy_version`, `provider_sequence`, `reconciliation_status`, `recurring_event_id`, `source_status`, `transparency`, and `visibility`. Arbitrary keys, nested source payloads, descriptions, snippets, HTML, or message/event bodies are rejected. Full provider payloads remain in the separately governed evidence/capture layer, not `ops.sqlite`.
 
 `ops_item_events` is an append-only technical history, not a second domain model. Each event records:
 
@@ -396,6 +406,8 @@ Calendar normalization and reconciliation MUST correctly handle:
 
 Today/upcoming event cards are deterministic. A model is not required to restate an event title or decide that an event exists.
 
+The operator may hide an entire recurring Calendar series from Today when it is a personal block, routine, or other non-meeting. This is a reversible local projection preference keyed by account plus the provider recurring-series ID. It hides current and later retained occurrences from Today and from proactive meeting preparation without dismissing the underlying items, deleting evidence, or writing to Google Calendar. Today MUST retain a compact **hidden recurring series** disclosure with the number of hidden occurrences and an **Undo** action. One-off events cannot create a series rule, and restoring a rule makes eligible occurrences visible again immediately.
+
 ## Gmail Lanes
 
 The owner has approved `gmail.readonly` plus the 7/30-day retention, no-attachment, quoted-history-stripping, and no-external-write controls for the private operational shadow trial. This approval does not authorize Gmail knowledge capture, retrieval indexing, durable-fact extraction, or any Gmail mutation. The benchmark credential is not authorization for either Brain lane; the live trial requires its own separately authorized and account-bound Brain grant.
@@ -408,7 +420,9 @@ Gmail has three independently permissioned lanes over a normalized thread snapsh
 | knowledge | likely durable human/evidence threads | run the existing fact curation pipeline |
 | operations | changed threads with possible current work, including transactional logistics | detect and reconcile operational items |
 
-The knowledge filter and operational filter are orthogonal. Bulk/transactional mail MUST NOT be excluded from operations merely because it is ineligible for durable facts. Marketing and repetitive notifications may be deterministically suppressed. Provider message-class/header gating for marketing or bulk mail runs before broad action or high-consequence keyword matching so incidental newsletter boilerplate cannot force semantic detection. That gate MUST NOT strand an already tracked thread: a thread with a current operational item remains detector-eligible when its source revision changes.
+The knowledge filter and operational filter are orthogonal. Bulk/transactional mail MUST NOT be excluded from operations merely because it is ineligible for durable facts. Advertising, newsletters, promotions, and other marketing updates are deterministically suppressed before broad action or high-consequence keyword matching, remain available only in the collapsed suppression audit, and MUST NOT spill into the uncertainty section because boilerplate contains urgency words. That gate MUST NOT strand an already tracked thread: a thread with a current operational item remains detector-eligible when its source revision changes. Transactional logistics, payments, renewals, travel, security, and other current obligations remain independently eligible.
+
+Individual recruiter outreach, interview scheduling, application follow-up, and similar human recruiting activity are operationally relevant. Routine recruiter activity is filed under `attention` at normal priority and does not consume a Focus slot merely because it is new. Exact evidence for a commitment, deadline, or scheduled time preserves that stronger item kind and normal ranking. Bulk job alerts and job digests remain marketing updates and stay hidden by default.
 
 The shared normalization contract remains:
 
@@ -444,6 +458,8 @@ Malformed output produces no model-authored item. In a multi-thread response, va
 
 Daily request/input/token budgets are explicit configuration. Each detector attempt durably pre-reserves a conservative, no-refund input and total ceiling before launch, and the only supported live provider is the restricted Codex route with its matching in-flight rollout cap. Provider-reported usage is recorded separately and any positive call/input/total delta is durably added after the attempt; missing usage or an observed overage stops later calls and makes coverage partial. Overflow is never silently dropped. Production enablement requires a chronological replay demonstrating that the approved budget covers normal and high-volume days.
 
+The installed detector is `gmail-operations-v6`. Its latest provider run was stopped before Gmail fetch at the already-consumed `1200/1200` daily API cap, so provider pagination, cursor completion, and model judgment quality are not claimed from that run. An isolated production-code replay against the exact retained 200-thread page exercised detector-v6 deterministic admission, routing, and derived-observation persistence with zero model calls: 51 marketing threads and 5 bulk threads were suppressed, 7 tracked marketing threads remained hidden pending reconciliation, 3 recruiter threads entered Attention, 134 model-dependent threads were deferred, 10 plausible threads remained Uncertain, and 3 derived observations were applied. The replay produced no visible marketing leak and no immutable-observation conflict. This is release-path evidence, not a held-out quality result.
+
 ## Later Read-Only Adapters
 
 After Calendar, Gmail, handled-state, and cross-source reconciliation gates pass, additional adapters may be enabled independently under the common source contract:
@@ -460,7 +476,7 @@ Each adapter requires its own scope/privacy decision, labeled fixtures, source-l
 
 ## Briefing Contract
 
-The briefing is a deterministic ranked projection as of a declared local time. The current shadow implementation generates it on demand only. A configurable morning schedule remains a later, separately activated capability and is not enabled by the manual trial.
+The briefing is a deterministic ranked projection as of a declared local time. Calendar/Gmail source refresh remains an explicit manual shadow action. Derived meeting briefs are prepared proactively from retained local evidence for eligible timed, non-transparent events in the next 72 hours: once after a Calendar shadow run and by the serial daemon scheduler every 15 minutes. All-day events, transparent events, and the high-precision normalized `Family time` personal-block title/prefix are excluded from proactive preparation, but remain visible in Today and available through explicit on-demand preparation. This local job performs no provider poll and no generative-model call. A configurable morning source-refresh schedule remains a later, separately activated capability and is not enabled by the manual trial.
 
 Sections are:
 
@@ -474,7 +490,7 @@ Sections are:
 8. `low_confidence`: active items whose confidence/reconciliation metadata is provisional or ambiguous, visually separated from trusted work;
 9. `system_coverage`: connector freshness, deferred volume, and failures.
 
-Every operational item is assigned to exactly one primary user-visible item section. Facet counts may record that an item also matched other section predicates, but the same card is not repeated across Focus, Attention, Due, and Uncertain. Suppressed-source decisions are audit records rather than operational items and keep their own bounded preview.
+Every operational item is assigned to exactly one primary user-visible item section. Facet counts may record that an item also matched other section predicates, but the same card is not repeated across Focus, Attention, Due, and Uncertain. Suppressed-source decisions are audit records rather than operational items and keep their own bounded, collapsed preview. Marketing updates remain in that audit and never appear as visible uncertain work.
 
 Focus selection is adaptive rather than quota-filling:
 
@@ -523,6 +539,8 @@ When a provider object is unavailable or the route cannot be validated, the loca
 
 For a configured or operator-selected upcoming event, the Chief of Staff MAY generate a bounded preparation packet as a derived view. The initial Calendar/Brain version may use event metadata, explicit local operations policy, current operational items, and approved Brain retrieval, facts, entities, and pages. A later COS-6 version may add fresh evidence from linked communication, work-tracker, and code-host adapters.
 
+A packet is a human-readable executive meeting brief, not a dump of retrieval internals. Its primary reading order is purpose and meeting context, relevant background, likely agenda/talking points, open questions/preparation, and relevant source links. Raw event claims, fact IDs, evidence IDs, source freshness, coverage, and retrieval diagnostics remain available in a collapsed **Sources & diagnostics** appendix at the end.
+
 A packet may contain:
 
 - objective, timing, attendees, location, and material schedule changes;
@@ -531,9 +549,12 @@ A packet may contain:
 - recent relevant correspondence and authoritative work-object changes;
 - sourced risks, unresolved questions, and decisions needed;
 - suggested talking points clearly labeled as suggestions rather than facts;
-- evidence links, freshness, policy version, and per-source coverage.
+- validated local/provider evidence links, including relevant Calendar, Brain, and linked email sources when present;
+- freshness, policy version, and per-source coverage.
 
-Packets are generated on demand or inside a bounded pre-meeting window, use the same source budgets and coverage semantics as the briefing, and are never canonical state. They MUST query approved retrieval evidence when needed rather than depending only on fact admission. A model may organize or compress supported material, but it may not invent attendees, commitments, decisions, customer/entity identity, or completion. Cached packets contain bounded derived text and IDs, expire under the briefing-retention policy, and do not duplicate full source bodies.
+Packets are precomposed for eligible, unsuppressed active Calendar events inside a 72-hour window after each Calendar shadow run and every 15 minutes while the primary/single daemon is running. Proactive eligibility requires a timed event that is not marked transparent and does not match the high-precision normalized `Family time` personal-block title/prefix; excluded events retain their Today card, recurring-series controls, and explicit **Prepare now** support without consuming proactive preparation work. Opening a ready brief reads the cache; **Prepare now** is also the fallback when no current packet exists. The cache is bound to the exact Calendar source revision and current packet-content version, so an event update or presentation-safety change makes the prior packet ineligible. Packets use the same source budgets and coverage semantics as the briefing, are capped at 256 KiB, expire after 30 days, and are never canonical state. They MUST query approved retrieval evidence when needed rather than depending only on fact admission and MUST NOT duplicate full source bodies. User-visible Brain background, open questions, and Wiki links require meaningful normalized term/entity overlap with the Calendar title or retained Calendar notes after generic meeting words and operator-identity-only matches are removed; rejected retrieval remains available only inside the collapsed diagnostics footer.
+
+The implemented packet composer is deterministic and uses no generative model. A future bounded wording model MAY organize or compress the already selected supported material, but it may not invent or omit evidence-bearing claims, attendees, commitments, decisions, customer/entity identity, dates, ownership, or completion. The deterministic source set, section order, links, coverage, and appendix remain authoritative.
 
 ## Today UI
 
@@ -546,7 +567,8 @@ Today becomes the V1 Chief-of-Staff surface without changing navigation:
 - daemon, scheduler, index, sync, and review health remain a compact system pulse;
 - item actions write only through the operational service and append an event;
 - source links open the owning Brain evidence view and may offer a separately labeled validated provider route when available;
-- selected upcoming events may expand into a derived meeting-preparation packet without creating another navigation destination;
+- eligible upcoming events show **Open brief** when a revision-current packet has already been prepared and **Prepare now** only as the fallback; the brief opens without creating another navigation destination;
+- recurring Calendar cards may hide their entire provider series from Today, and a compact collapsed disclosure lists every hidden series with occurrence count and **Undo** without mutating Calendar;
 - a refresh shows the new `as_of` time and rejects late responses from older generations;
 - sidebar/menu badges do not count low-confidence or ambiguous items as confirmed obligations, and uncertain cards do not render verified `P0`/`P1` badges;
 - notification text contains counts/status by default, not mail or calendar contents.
@@ -582,6 +604,7 @@ Detection:
 - false alarms per briefing;
 - suppressed-source miss rate;
 - classification by source class;
+- marketing-to-visible leakage and recruiter-attention classification accuracy;
 - owner/responsibility attribution accuracy under the active policy version.
 
 Reconciliation:
@@ -613,6 +636,7 @@ Briefing:
 - ranking usefulness from operator feedback;
 - daily item churn and repeated false alarms;
 - incomplete-coverage disclosure accuracy;
+- hidden recurring-series leakage, disclosure, and restore accuracy;
 - local/provider evidence-link validity and correct account/provider routing.
 
 Meeting preparation:
@@ -620,6 +644,8 @@ Meeting preparation:
 - factual-claim evidence coverage and unsupported-claim rate;
 - current commitment/decision/change recall;
 - stale or wrong-person context rate;
+- precomposition timeliness, revision-cache invalidation, and suppressed-series exclusion;
+- primary-brief readability plus source/diagnostic appendix placement;
 - per-source freshness/coverage disclosure accuracy;
 - operator correction and usefulness feedback.
 
@@ -658,7 +684,7 @@ Gmail live briefing promotion requires, on held-out chronological data:
 
 At least 30 chronological days, including representative high-volume days, are required before a Gmail shadow result may be promoted. A metric regression disables Gmail-derived briefing items without disabling retrieval indexing or Calendar.
 
-Cross-source episode aggregation and handled-state suppression remain disabled until held-out chronological replay also meets the false-link, missed-link, retraction, authoritative-source, and false-handled gates. Meeting-preparation automation remains opt-in until every factual claim is evidence-linked, unsupported claims are zero on the release fixture, and stale/partial source coverage is always disclosed.
+Cross-source episode aggregation and handled-state suppression remain disabled until held-out chronological replay also meets the false-link, missed-link, retraction, authoritative-source, and false-handled gates. Local meeting-preparation precomposition may run in shadow because it reads only retained evidence and creates only a revision-bound derived cache; promotion as trusted preparation remains pending until every factual claim is evidence-linked, unsupported claims are zero on the release fixture, and stale/partial source coverage is always disclosed.
 
 ## Guarded External Execution
 
@@ -780,8 +806,8 @@ The operational Chief-of-Staff foundation is complete when:
 6. Today generates a freshness-stamped, storage-bounded briefing with evidence, confidence, reasons, handled verdicts, connector coverage, and true section total/included/omitted counts;
 7. focus contains at most five confirmed action-bearing episodes, never pads with awareness, discloses all urgent overflow, assigns each item to one primary visible section, and keeps unverified items out of action candidacy and verified priority styling;
 8. local and provider-native evidence routes are account-correct, allowlisted, and invalidated when evidence is forgotten;
-9. meeting preparation is derived, evidence-linked, coverage-aware, and cannot mutate canonical state;
-10. local completion, dismissal, snooze, and correction survive restart/replay and prevent same-version resurrection;
+9. meeting preparation is proactively cached inside the bounded window, opens as a human-readable source-linked brief, keeps evidence/diagnostics in an end appendix, invalidates on source revision change, and cannot mutate canonical state;
+10. local completion, dismissal, snooze, correction, recurring-series hiding, and recurring-series restore survive restart/replay and prevent same-version resurrection or provider mutation;
 11. knowledge facts, curation Queue, and `cos_*` compatibility paths remain behaviorally unchanged;
 12. Calendar deterministic replay gates pass independently; private Gmail shadow access does not imply Calendar or Gmail promotion;
 13. Gmail retrieval, knowledge, and operational lanes have separate admission and cost reporting;
@@ -800,12 +826,13 @@ uv run pytest tests/test_operational_db.py tests/test_operational_state.py \
   tests/test_google_sources.py tests/test_google_cache.py \
   tests/test_gmail_operations.py tests/test_shadow_trial.py \
   tests/test_operational_briefing.py tests/test_operational_today.py \
-  tests/test_today_presentation.py -q
+  tests/test_operational_suppressions.py tests/test_today_presentation.py \
+  tests/test_daemon.py -q
 uv run python -m pkm_brain.operational_replay --help
 swift test --package-path app
 scripts/build-app.sh
 ```
 
-Latest local release verification completed on 2026-07-14 with Ruff green, 746 Python tests passing, 27 Swift tests passing, and the signed local app bundle installed and serving a healthy daemon. The latest app-driven validation produced complete Calendar coverage, partial Gmail coverage with 77 detector reviews visibly deferred by the approved daily budget, a successfully persisted bounded snapshot, and a prominent terminal partial-result card. This validates the live storage/coverage/budget/result path only; human review and all empirical promotion gates remain open.
+Latest local release verification completed on 2026-07-14 with Ruff and diff checks green, 772 Python tests passing, 28 Swift tests passing, and the signed local app bundle installed and serving healthy runtime fingerprint `ac389246`. The installed selection is `gpt-5.6-luna` at `high` reasoning through restricted Codex. `executive-brief-v2` proactive preparation, scheduler completion, and recurring `Family Time` hide/Undo behavior were verified. The latest provider run completed Calendar but stopped Gmail before fetch at the approved `1200/1200` API cap; the exact retained 200-thread page then passed an isolated production-code replay with detector v6, zero model calls, no visible marketing leak, and no observation conflict. The macOS XCTest UI runner timed out while enabling automation mode before any UI test executed, so visual UI acceptance remains open rather than being treated as a pass. Owner review and all empirical promotion gates also remain open; neither complete Gmail provider/cursor behavior nor model judgment quality is claimed.
 
 The implementation plan owns release sequencing. This spec owns the behavior and promotion gates.

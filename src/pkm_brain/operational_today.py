@@ -7,10 +7,12 @@ from typing import Any
 from .operational_briefing import operational_briefing_or_unavailable
 from .operational_service import OperationalService
 from .operational_shadow import list_shadow_runs
+from .operational_suppressions import list_calendar_series_suppressions
 from .operations_policy import load_operations_policy
 from .paths import BrainPaths
 from .today_presentation import (
     TodayBriefing,
+    TodayCalendarSuppression,
     TodayCoverage,
     TodayEvidenceLink,
     TodayFeedbackCapabilities,
@@ -30,6 +32,7 @@ TODAY_FEEDBACK_ACTIONS = (
     "done",
     "snooze",
     "dismiss",
+    "dismiss_series",
     "restore",
     "report_missing",
 )
@@ -69,6 +72,18 @@ class OperationalTodayPresentationService:
             ),
             fresh_after_seconds=FRESH_AFTER_SECONDS,
         )
+        try:
+            projection["hidden_calendar_series"] = (
+                list_calendar_series_suppressions(
+                    self.paths.ops_sqlite_path,
+                    active_only=True,
+                    as_of=str(projection.get("generated_at") or now_iso()),
+                )
+            )
+        except Exception:
+            # An unavailable operational store is already represented by the
+            # projection status; its optional preference summary must not mask it.
+            projection["hidden_calendar_series"] = []
         return today_briefing_from_operational(projection)
 
     def submit_feedback(
@@ -76,6 +91,15 @@ class OperationalTodayPresentationService:
         item_id: str,
         request: TodayFeedbackRequest,
     ) -> TodayFeedbackResult:
+        if request.action == "dismiss_series":
+            result = self.operational_service.suppress_calendar_series(item_id)
+            return TodayFeedbackResult(
+                status="accepted",
+                item_id=str(result["id"]),
+                action=request.action,
+                recorded_at=str(result["updated_at"]),
+                message=_feedback_message(request.action),
+            )
         decision = {
             "confirm": "confirm",
             "correct": "incorrect",
@@ -101,6 +125,16 @@ class OperationalTodayPresentationService:
             action=request.action,
             recorded_at=str(result["item"].get("updated_at") or now_iso()),
             message=_feedback_message(request.action),
+        )
+
+    def restore_calendar_series(self, rule_id: str) -> TodayFeedbackResult:
+        result = self.operational_service.restore_calendar_series(rule_id)
+        return TodayFeedbackResult(
+            status="accepted",
+            item_id=rule_id,
+            action="restore",
+            recorded_at=str(result["updated_at"]),
+            message="Recurring Calendar series restored to Today.",
         )
 
     def report_missing(self, report: TodayMissingReport) -> TodayFeedbackResult:
@@ -175,6 +209,20 @@ def today_briefing_from_operational(
     elif status == "partial":
         availability_reason = "At least one source is incomplete; no all-clear is implied."
     feedback_enabled = status != "unavailable"
+    hidden_calendar_series = tuple(
+        TodayCalendarSuppression(
+            id=str(value["id"]),
+            label=str(value["label"]),
+            hidden_count=max(0, int(value.get("hidden_count") or 0)),
+            created_at=str(value["created_at"]),
+            next_starts_at=_optional_string(value.get("next_starts_at")),
+        )
+        for value in projection.get("hidden_calendar_series") or ()
+        if isinstance(value, Mapping)
+        and value.get("id")
+        and value.get("label")
+        and value.get("created_at")
+    )
     return TodayBriefing(
         status=status,
         generated_at=generated_at,
@@ -202,6 +250,7 @@ def today_briefing_from_operational(
         ),
         calendar_now=tuple(calendar_now[:10]),
         calendar_next=tuple(calendar_next[:10]),
+        hidden_calendar_series=hidden_calendar_series,
         due_overdue=tuple(
             _today_item(card, "due_overdue")
             for card in _cards(sections, "overdue_and_due")
@@ -289,6 +338,7 @@ def _today_item(card: Mapping[str, Any], section: str) -> TodayItem:
         reason_codes=tuple(dict.fromkeys(reason_codes)),
         evidence=evidence,
         feedback_actions=actions,
+        meeting_brief_ready=bool(card.get("meeting_brief_ready")),
     )
 
 
@@ -432,6 +482,7 @@ def _today_feedback_actions(values: Sequence[Any]) -> tuple[str, ...]:
         "done": "done",
         "snooze": "snooze",
         "dismiss": "dismiss",
+        "dismiss_series": "dismiss_series",
         "restore": "restore",
     }
     return tuple(
@@ -504,5 +555,6 @@ def _feedback_message(action: str) -> str:
         "done": "Item marked done.",
         "snooze": "Item snoozed.",
         "dismiss": "Item dismissed.",
+        "dismiss_series": "Recurring Calendar series hidden from Today.",
         "restore": "Item restored.",
     }[action]

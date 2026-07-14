@@ -10,6 +10,7 @@ from .db import connection
 from .google_cache import GoogleEvidenceCache
 from .maintenance import managed_storage_inventory
 from .operational_briefing import build_meeting_packet
+from .operational_meeting_packets import load_current_meeting_packet
 from .operations_policy import load_operations_policy
 from .paths import BrainPaths
 from .service import BrainService
@@ -148,6 +149,9 @@ def operations_meeting_packet_payload(
     normalized = item_id.strip()
     if not normalized or len(normalized) > 256:
         raise OperationsHTTPBadRequest("a bounded operational item id is required")
+    prepared = load_current_meeting_packet(paths.ops_sqlite_path, normalized)
+    if prepared is not None:
+        return prepared
     return build_meeting_packet(paths, normalized)
 
 

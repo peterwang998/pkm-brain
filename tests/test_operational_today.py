@@ -105,6 +105,15 @@ def projection(*, status: str = "complete"):
                 }
             ],
         },
+        "hidden_calendar_series": [
+            {
+                "id": "rule-1",
+                "label": "Family time",
+                "hidden_count": 4,
+                "created_at": "2026-07-13T12:00:00+00:00",
+                "next_starts_at": "2026-07-14T01:00:00+00:00",
+            }
+        ],
     }
 
 
@@ -121,6 +130,8 @@ def test_operational_projection_maps_to_today_with_coverage_evidence_and_audit()
     assert briefing.focus[0].evidence[0].brain_route.startswith("/api/ops/evidence")
     assert len(briefing.calendar_now) == 1
     assert briefing.calendar_now[0].title == "Planning review"
+    assert briefing.hidden_calendar_series[0].label == "Family time"
+    assert briefing.hidden_calendar_series[0].hidden_count == 4
     assert len(briefing.ignored_suppressed) == 1
     assert briefing.ignored_suppressed_count == 1
     assert briefing.ignored_suppressed[0].reason_codes == (

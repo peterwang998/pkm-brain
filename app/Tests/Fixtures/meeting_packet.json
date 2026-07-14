@@ -1,8 +1,21 @@
 {
   "schema_version": 1,
+  "content_version": "executive-brief-v2",
   "item_id": "event/project review",
   "generated_at": "2026-07-14T14:05:00+00:00",
   "title": "Project review",
+  "brief_context": {
+    "calendar_notes": "Review launch readiness and decide whether to ship.",
+    "calendar_notes_status": "available",
+    "starts_at": "2026-07-14T17:00:00+00:00",
+    "ends_at": "2026-07-14T18:00:00+00:00",
+    "location": "Video call",
+    "organizer_email": "organizer@example.com",
+    "attendee_count": 4,
+    "attendee_response": "accepted",
+    "source_timezone": "America/Los_Angeles",
+    "all_day": false
+  },
   "event_claims": [
     {
       "claim": "Meeting: Project review",
@@ -28,7 +41,28 @@
       "confidence": 0.91
     }
   ],
+  "brief_knowledge_claims": [
+    {
+      "claim": "Pricing approval remains open.",
+      "claim_type": "brain_fact",
+      "evidence_refs": [
+        {
+          "source_ref": "document-17"
+        }
+      ],
+      "fact_id": "fact-17",
+      "confidence": 0.91
+    }
+  ],
   "wiki_context": [
+    {
+      "title": "Project review",
+      "path": "projects/project-review.md",
+      "summary": "Current project decisions and open questions.",
+      "source_ids": ["document-17", "document-22"]
+    }
+  ],
+  "brief_wiki_context": [
     {
       "title": "Project review",
       "path": "projects/project-review.md",
@@ -40,6 +74,44 @@
     {
       "suggestion": "Confirm the desired outcome before the meeting.",
       "is_factual_claim": false
+    }
+  ],
+  "open_questions": [
+    {
+      "question": "Has Legal approved the pricing language?",
+      "source": "brain",
+      "reference": "question-1",
+      "fact_ids": ["fact-17"]
+    }
+  ],
+  "brief_open_questions": [
+    {
+      "question": "Has Legal approved the pricing language?",
+      "source": "brain",
+      "reference": "question-1",
+      "fact_ids": ["fact-17"]
+    }
+  ],
+  "source_links": [
+    {
+      "id": "calendar:calendar:personal:primary:event-42",
+      "label": "Calendar event",
+      "detail": "Open the retained local Calendar details",
+      "source_type": "calendar",
+      "reference": "calendar:personal:primary:event-42",
+      "brain_route": "/api/ops/evidence?source_type=calendar&account_key=calendar%3Apersonal&source_ref=calendar%3Apersonal%3Aprimary%3Aevent-42",
+      "provider_url": null,
+      "wiki_path": null
+    },
+    {
+      "id": "wiki:projects/project-review.md",
+      "label": "Project review",
+      "detail": "Open the relevant Brain page",
+      "source_type": "wiki",
+      "reference": "projects/project-review.md",
+      "brain_route": null,
+      "provider_url": null,
+      "wiki_path": "projects/project-review.md"
     }
   ],
   "coverage": {

@@ -23,7 +23,7 @@ from pkm_brain.operational_migrations import (
 from pkm_brain.paths import BrainPaths
 
 
-EXPECTED_OPERATIONAL_MIGRATIONS = [1, 2, 3, 4, 5, 6, 7, 8]
+EXPECTED_OPERATIONAL_MIGRATIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9]
 EXPECTED_OPERATIONAL_TABLES = {
     "ops_schema_migrations",
     "ops_observations",
@@ -36,6 +36,8 @@ EXPECTED_OPERATIONAL_TABLES = {
     "ops_briefing_snapshots",
     "ops_missing_reports",
     "ops_budget_reservations",
+    "ops_suppression_rules",
+    "ops_meeting_packets",
 }
 
 

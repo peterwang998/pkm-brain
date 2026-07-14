@@ -61,6 +61,7 @@ _TEXT_FIELD_BYTES = {
     "created_at": 128,
     "latest_event_type": 128,
     "reconciliation_status": 128,
+    "recurring_event_id": 1_024,
     "handled_verdict": 128,
     "why_now": 1_000,
     "next_move": 1_000,
@@ -70,6 +71,7 @@ _TEXT_FIELD_BYTES = {
     "disposition": 128,
 }
 _SCALAR_FIELDS = {"priority", "confidence", "handled_confidence"}
+_BOOLEAN_FIELDS = {"meeting_brief_ready", "recruiter_activity"}
 # A local evidence route plus one stable provider reference is sufficient to reopen
 # the complete source-backed record without duplicating its full provenance payload
 # into every briefing section where the same item may appear.
@@ -226,6 +228,10 @@ def _compact_card(value: Any) -> dict[str, Any] | None:
         if isinstance(raw, float) and not math.isfinite(raw):
             continue
         output[field] = raw
+    for field in _BOOLEAN_FIELDS:
+        raw = value.get(field)
+        if isinstance(raw, bool):
+            output[field] = raw
 
     evidence = value.get("evidence_refs")
     if isinstance(evidence, Sequence) and not isinstance(

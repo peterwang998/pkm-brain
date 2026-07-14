@@ -13,6 +13,10 @@ from typing import Any
 
 from .operational_budget import reserve_daily_budget, reserve_daily_budgets
 from .operational_db import init_operational_db
+from .operational_meeting_packets import (
+    prune_expired_meeting_packets,
+    save_meeting_packet,
+)
 from .operational_state import (
     OperationalObservation,
     ReconciliationResult,
@@ -36,6 +40,10 @@ from .operational_shadow import (
     record_shadow_decision,
     save_briefing_snapshot,
     start_shadow_run,
+)
+from .operational_suppressions import (
+    restore_calendar_series,
+    suppress_calendar_series,
 )
 from .paths import BrainPaths, local_node_id
 from .sync_config import load_sync_config
@@ -413,6 +421,66 @@ class OperationalService:
                 idempotency_key=idempotency_key,
                 created_at=created_at,
                 run_id=run_id,
+            )
+
+    def suppress_calendar_series(
+        self,
+        item_id: str,
+        *,
+        reason: str = "Hidden by the operator as a recurring non-meeting.",
+        updated_at: str | None = None,
+        as_of: str | None = None,
+    ) -> dict[str, Any]:
+        with self.mutation_lease():
+            return suppress_calendar_series(
+                self.paths.ops_sqlite_path,
+                item_id,
+                reason=reason,
+                updated_at=updated_at,
+                as_of=as_of,
+            )
+
+    def restore_calendar_series(
+        self,
+        rule_id: str,
+        *,
+        updated_at: str | None = None,
+        as_of: str | None = None,
+    ) -> dict[str, Any]:
+        with self.mutation_lease():
+            return restore_calendar_series(
+                self.paths.ops_sqlite_path,
+                rule_id,
+                updated_at=updated_at,
+                as_of=as_of,
+            )
+
+    def save_meeting_packet(
+        self,
+        item_id: str,
+        packet: Mapping[str, Any],
+        *,
+        generated_at: str | None = None,
+        retention_days: int = 30,
+    ) -> dict[str, Any]:
+        with self.mutation_lease():
+            return save_meeting_packet(
+                self.paths.ops_sqlite_path,
+                item_id,
+                packet,
+                generated_at=generated_at,
+                retention_days=retention_days,
+            )
+
+    def prune_expired_meeting_packets(
+        self,
+        *,
+        as_of: str | None = None,
+    ) -> int:
+        with self.mutation_lease():
+            return prune_expired_meeting_packets(
+                self.paths.ops_sqlite_path,
+                as_of=as_of,
             )
 
     def save_source_cursor(

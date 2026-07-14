@@ -356,6 +356,24 @@ final class AppState: ObservableObject {
         }
     }
 
+    func restoreTodayCalendarSeries(_ suppressionID: String) async {
+        guard let client = daemon.apiClient else {
+            todayFeedbackMessage = "The Brain service is not available."
+            return
+        }
+        do {
+            let result = try await client.restoreTodayCalendarSeries(
+                suppressionID: suppressionID
+            )
+            todayFeedbackMessage = result.message
+            if result.status == "accepted" {
+                await refreshToday()
+            }
+        } catch {
+            todayFeedbackMessage = error.localizedDescription
+        }
+    }
+
     func reportMissingTodayItem(
         title: String,
         detail: String?,

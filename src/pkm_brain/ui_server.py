@@ -343,6 +343,12 @@ class BrainUIHandler(BaseHTTPRequestHandler):
                         self.server.daemon_today_service, self.read_json_body()
                     )
                 )
+            elif len(parts) == 5 and parts[:3] == [
+                "v1", "today", "calendar-series"
+            ] and parts[4] == "restore":
+                self.write_json(today_api.today_calendar_series_restore_payload(
+                    self.server.daemon_today_service, parts[3]
+                ))
             elif parts == ["v1", "today", "run"]:
                 controller = self.server.daemon_shadow_controller
                 if controller is None:

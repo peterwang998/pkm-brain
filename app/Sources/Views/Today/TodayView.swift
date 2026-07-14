@@ -7,6 +7,10 @@ struct TodayView: View {
     @State private var meetingPreparationRequest: TodayMeetingPreparationRequest?
     @State private var reportsMissingItem = false
     @State private var showsSuppressedAudit = false
+    @State private var showsHiddenCalendarSeries = false
+    @State private var pendingCalendarItemIDs: Set<String> = []
+    @State private var pendingCalendarSuppressionIDs: Set<String> = []
+    @State private var calendarActionMessage: String?
 
     var body: some View {
         ScrollView {
@@ -216,6 +220,7 @@ struct TodayView: View {
             items: briefing.visibleFocus,
             emptyText: "Nothing needs to be forced into focus right now.",
             feedback: briefing.feedback,
+            pendingFeedbackItemIDs: pendingCalendarItemIDs,
             onFeedback: beginFeedback,
             onPrepare: beginMeetingPreparation,
             onBrainRoute: appState.openTodayBrainRoute
@@ -257,6 +262,7 @@ struct TodayView: View {
             items: briefing.due_overdue,
             emptyText: "No due or overdue items surfaced.",
             feedback: briefing.feedback,
+            pendingFeedbackItemIDs: pendingCalendarItemIDs,
             onFeedback: beginFeedback,
             onPrepare: beginMeetingPreparation,
             onBrainRoute: appState.openTodayBrainRoute
@@ -267,6 +273,7 @@ struct TodayView: View {
             items: briefing.waiting,
             emptyText: "Nothing is currently waiting on another person.",
             feedback: briefing.feedback,
+            pendingFeedbackItemIDs: pendingCalendarItemIDs,
             onFeedback: beginFeedback,
             onPrepare: beginMeetingPreparation,
             onBrainRoute: appState.openTodayBrainRoute
@@ -277,6 +284,7 @@ struct TodayView: View {
             items: briefing.attention,
             emptyText: "No additional attention items.",
             feedback: briefing.feedback,
+            pendingFeedbackItemIDs: pendingCalendarItemIDs,
             onFeedback: beginFeedback,
             onPrepare: beginMeetingPreparation,
             onBrainRoute: appState.openTodayBrainRoute
@@ -287,6 +295,7 @@ struct TodayView: View {
             items: briefing.awareness,
             emptyText: "No awareness-only updates.",
             feedback: briefing.feedback,
+            pendingFeedbackItemIDs: pendingCalendarItemIDs,
             onFeedback: beginFeedback,
             onPrepare: beginMeetingPreparation,
             onBrainRoute: appState.openTodayBrainRoute
@@ -298,6 +307,7 @@ struct TodayView: View {
             items: briefing.uncertain,
             emptyText: "No uncertain items surfaced.",
             feedback: briefing.feedback,
+            pendingFeedbackItemIDs: pendingCalendarItemIDs,
             onFeedback: beginFeedback,
             onPrepare: beginMeetingPreparation,
             onBrainRoute: appState.openTodayBrainRoute
@@ -371,6 +381,64 @@ struct TodayView: View {
                     }
                 }
             }
+            if !briefing.calendar.hiddenSeries.isEmpty {
+                DisclosureGroup(isExpanded: $showsHiddenCalendarSeries) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(
+                            "These recurring blocks stay on Google Calendar but are hidden from Today."
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        ForEach(briefing.calendar.hiddenSeries) { suppression in
+                            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(suppression.label)
+                                        .font(.callout.weight(.medium))
+                                    Text(
+                                        "\(suppression.hidden_count) "
+                                            + (suppression.hidden_count == 1 ? "occurrence hidden" : "occurrences hidden")
+                                    )
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    if let nextStartsAt = suppression.next_starts_at {
+                                        Text("Next occurrence: \(displayDateTime(nextStartsAt))")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                Spacer()
+                                if pendingCalendarSuppressionIDs.contains(suppression.id) {
+                                    ProgressView("Restoring…")
+                                        .controlSize(.small)
+                                        .accessibilityLabel("Restoring \(suppression.label) to Today")
+                                } else {
+                                    Button("Undo") {
+                                        restoreCalendarSeries(suppression)
+                                    }
+                                    .buttonStyle(.link)
+                                    .accessibilityLabel("Undo hiding \(suppression.label)")
+                                    .help("Show this recurring series in Today again")
+                                }
+                            }
+                        }
+                    }
+                    .padding(.top, 6)
+                } label: {
+                    Label(
+                        "\(briefing.calendar.hiddenSeries.count) recurring "
+                            + (briefing.calendar.hiddenSeries.count == 1 ? "series hidden" : "series hidden"),
+                        systemImage: "eye.slash"
+                    )
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                }
+            }
+            if let calendarActionMessage {
+                Label(calendarActionMessage, systemImage: "info.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("Calendar update: \(calendarActionMessage)")
+            }
         }
     }
 
@@ -383,6 +451,7 @@ struct TodayView: View {
             item: item,
             feedback: briefing.feedback,
             audit: audit,
+            isFeedbackPending: pendingCalendarItemIDs.contains(item.id),
             onFeedback: beginFeedback,
             onPrepare: beginMeetingPreparation,
             onBrainRoute: appState.openTodayBrainRoute
@@ -396,7 +465,8 @@ struct TodayView: View {
         }
         meetingPreparationRequest = TodayMeetingPreparationRequest(
             itemID: item.id,
-            fallbackTitle: item.title
+            fallbackTitle: item.title,
+            preparedInAdvance: item.isMeetingBriefReady
         )
     }
 
@@ -405,8 +475,30 @@ struct TodayView: View {
             feedbackDraft = TodayFeedbackDraft(item: item, action: action)
             return
         }
+        if action == "dismiss_series" {
+            guard !pendingCalendarItemIDs.contains(item.id) else { return }
+            pendingCalendarItemIDs.insert(item.id)
+            calendarActionMessage = nil
+            Task {
+                await appState.submitTodayFeedback(itemID: item.id, action: action)
+                calendarActionMessage = appState.todayFeedbackMessage
+                pendingCalendarItemIDs.remove(item.id)
+            }
+            return
+        }
         Task {
             await appState.submitTodayFeedback(itemID: item.id, action: action)
+        }
+    }
+
+    private func restoreCalendarSeries(_ suppression: TodayCalendarSuppression) {
+        guard !pendingCalendarSuppressionIDs.contains(suppression.id) else { return }
+        pendingCalendarSuppressionIDs.insert(suppression.id)
+        calendarActionMessage = nil
+        Task {
+            await appState.restoreTodayCalendarSeries(suppression.id)
+            calendarActionMessage = appState.todayFeedbackMessage
+            pendingCalendarSuppressionIDs.remove(suppression.id)
         }
     }
 
@@ -693,6 +785,7 @@ private struct TodayItemSection: View {
     let emptyText: String
     let feedback: TodayFeedbackCapabilities
     var audit = false
+    var pendingFeedbackItemIDs: Set<String> = []
     let onFeedback: (TodayItem, String) -> Void
     let onPrepare: (TodayItem) -> Void
     let onBrainRoute: (String) -> Void
@@ -715,6 +808,7 @@ private struct TodayItemSection: View {
                         item: item,
                         feedback: feedback,
                         audit: audit,
+                        isFeedbackPending: pendingFeedbackItemIDs.contains(item.id),
                         onFeedback: onFeedback,
                         onPrepare: onPrepare,
                         onBrainRoute: onBrainRoute
@@ -729,6 +823,7 @@ private struct TodayItemCard: View {
     let item: TodayItem
     let feedback: TodayFeedbackCapabilities
     let audit: Bool
+    let isFeedbackPending: Bool
     let onFeedback: (TodayItem, String) -> Void
     let onPrepare: (TodayItem) -> Void
     let onBrainRoute: (String) -> Void
@@ -797,6 +892,7 @@ private struct TodayItemCard: View {
                                 Label(evidence.label, systemImage: "brain.head.profile")
                             }
                             .buttonStyle(.link)
+                            .accessibilityLabel("Open local evidence for \(item.title)")
                             .help("Open local evidence · \(evidence.reference)")
                         }
                         if let url = safeProviderURL(evidence.provider_url) {
@@ -804,6 +900,7 @@ private struct TodayItemCard: View {
                                 Label("Source", systemImage: "arrow.up.right.square")
                             }
                             .buttonStyle(.link)
+                            .accessibilityLabel("Open source for \(item.title)")
                             .help("Open provider source · \(evidence.reference)")
                         }
                     }
@@ -814,10 +911,22 @@ private struct TodayItemCard: View {
                 Button {
                     onPrepare(item)
                 } label: {
-                    Label("Prepare", systemImage: "sparkles.rectangle.stack")
+                    Label(
+                        item.isMeetingBriefReady ? "Open brief" : "Prepare now",
+                        systemImage: item.isMeetingBriefReady
+                            ? "doc.text.magnifyingglass"
+                            : "sparkles.rectangle.stack"
+                    )
                 }
                 .buttonStyle(.bordered)
-                .help("Build a read-only meeting brief from Calendar and local Brain context")
+                .accessibilityLabel(
+                    "\(item.isMeetingBriefReady ? "Open brief" : "Prepare now") for \(item.title)"
+                )
+                .help(
+                    item.isMeetingBriefReady
+                        ? "Open the meeting brief prepared in advance"
+                        : "Prepare a read-only meeting brief now"
+                )
             }
             if !item.feedback_actions.isEmpty {
                 Menu {
@@ -827,12 +936,18 @@ private struct TodayItemCard: View {
                         } label: {
                             Label(feedbackTitle(action), systemImage: feedbackSymbol(action))
                         }
-                        .disabled(!feedback.allows(action))
+                        .disabled(!feedback.allows(action) || isFeedbackPending)
+                        .accessibilityLabel("\(feedbackTitle(action)) for \(item.title)")
                     }
                 } label: {
-                    Label("Update", systemImage: "ellipsis.circle")
+                    if isFeedbackPending {
+                        Label("Updating…", systemImage: "arrow.triangle.2.circlepath")
+                    } else {
+                        Label("Update", systemImage: "ellipsis.circle")
+                    }
                 }
-                .disabled(!feedback.enabled)
+                .disabled(!feedback.enabled || isFeedbackPending)
+                .accessibilityLabel("Update \(item.title)")
                 .help(feedback.unavailable_reason ?? "Correct this operational item")
             }
         }
@@ -895,6 +1010,7 @@ private struct TodayItemCard: View {
         case "done": return "Mark done"
         case "snooze": return "Snooze"
         case "dismiss": return "Dismiss"
+        case "dismiss_series": return "Hide recurring series"
         case "restore": return "Restore"
         default: return action.capitalized
         }
@@ -907,6 +1023,7 @@ private struct TodayItemCard: View {
         case "done": return "checkmark"
         case "snooze": return "clock"
         case "dismiss": return "eye.slash"
+        case "dismiss_series": return "repeat.circle"
         case "restore": return "arrow.uturn.backward"
         default: return "circle"
         }
@@ -916,6 +1033,7 @@ private struct TodayItemCard: View {
 private struct TodayMeetingPreparationRequest: Identifiable {
     let itemID: String
     let fallbackTitle: String
+    let preparedInAdvance: Bool
 
     var id: String { itemID }
 }
@@ -928,6 +1046,8 @@ private struct TodayMeetingPreparationSheet: View {
     @State private var packet: TodayMeetingPacket?
     @State private var errorMessage: String?
     @State private var isLoading = true
+    @State private var sourcesExpanded = false
+    @State private var sourceEvidenceRequest: TodayEvidenceRequest?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -936,7 +1056,11 @@ private struct TodayMeetingPreparationSheet: View {
             ScrollView {
                 Group {
                     if isLoading {
-                        ProgressView("Preparing your meeting brief…")
+                        ProgressView(
+                            request.preparedInAdvance
+                                ? "Opening your prepared meeting brief…"
+                                : "Preparing your meeting brief…"
+                        )
                             .frame(maxWidth: .infinity, minHeight: 360)
                     } else if let packet {
                         meetingPacket(packet)
@@ -952,6 +1076,10 @@ private struct TodayMeetingPreparationSheet: View {
         .task(id: request.id) {
             await load()
         }
+        .sheet(item: $sourceEvidenceRequest) { request in
+            TodayEvidenceSheet(request: request)
+                .environmentObject(appState)
+        }
     }
 
     private var header: some View {
@@ -963,7 +1091,7 @@ private struct TodayMeetingPreparationSheet: View {
                 Text(packet?.title ?? request.fallbackTitle)
                     .font(.title2.weight(.semibold))
                     .lineLimit(2)
-                Text("Meeting preparation")
+                Text("Executive meeting brief")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -983,10 +1111,13 @@ private struct TodayMeetingPreparationSheet: View {
             .font(.caption)
             .foregroundStyle(.secondary)
 
-            coverage(packet)
-            eventClaims(packet.event_claims)
-            brainContext(packet)
-            suggestions(packet.suggestions)
+            coverageWarning(packet)
+            purposeAndContext(packet)
+            relevantBackground(packet)
+            suggestedAgenda(packet.suggestions)
+            openQuestionsAndPreparation(packet)
+            relevantLinks(packet)
+            sourcesAndDiagnostics(packet)
 
             Label(
                 "This is a derived, read-only brief. Preparing it did not change Calendar, Gmail, or Brain knowledge.",
@@ -996,6 +1127,236 @@ private struct TodayMeetingPreparationSheet: View {
             .foregroundStyle(.secondary)
         }
         .textSelection(.enabled)
+    }
+
+    @ViewBuilder
+    private func coverageWarning(_ packet: TodayMeetingPacket) -> some View {
+        let concerns = packet.coverage.values.filter {
+            coveragePresentation($0).hasConcern
+        }
+        if !concerns.isEmpty || packet.coverage.isEmpty {
+            Label(
+                "This brief has partial source coverage. Use the available context, then check Sources & diagnostics before relying on omissions.",
+                systemImage: "exclamationmark.triangle.fill"
+            )
+            .font(.callout)
+            .foregroundStyle(.orange)
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.orange.opacity(0.08))
+            .clipShape(RoundedRectangle(cornerRadius: 9))
+        }
+    }
+
+    private func purposeAndContext(_ packet: TodayMeetingPacket) -> some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 12) {
+                if let context = packet.brief_context {
+                    if context.starts_at != nil {
+                        Label {
+                            Text(scheduleText(context))
+                        } icon: {
+                            Image(systemName: context.all_day ? "sun.max" : "clock")
+                        }
+                    }
+                    if let location = context.location, !location.isEmpty {
+                        Label(location, systemImage: "mappin.and.ellipse")
+                    }
+                    if let organizer = context.organizer_email, !organizer.isEmpty {
+                        Label("Organized by \(organizer)", systemImage: "person.crop.circle")
+                    }
+                    if let attendeeCount = context.attendee_count, attendeeCount > 0 {
+                        Label(
+                            "\(attendeeCount) attendee\(attendeeCount == 1 ? "" : "s")",
+                            systemImage: "person.2"
+                        )
+                    }
+                    if let response = context.attendee_response, !response.isEmpty {
+                        Label(
+                            "Your response: \(friendlyStatus(response))",
+                            systemImage: "checkmark.circle"
+                        )
+                    }
+                    Divider()
+                    if let notes = context.calendar_notes, !notes.isEmpty {
+                        Text(notes)
+                            .font(.body)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        Text(calendarNotesPlaceholder(context.calendar_notes_status))
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    Text("No purpose or agenda was included in the prepared Calendar context. Schedule details remain available under Sources & diagnostics.")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.top, 4)
+        } label: {
+            Label("Purpose & context", systemImage: "scope")
+        }
+    }
+
+    private func relevantBackground(_ packet: TodayMeetingPacket) -> some View {
+        let claims = packet.brief_knowledge_claims ?? []
+        let pages = packet.brief_wiki_context ?? []
+        return GroupBox {
+            VStack(alignment: .leading, spacing: 14) {
+                if claims.isEmpty && pages.isEmpty {
+                    Text("No source-backed background was found in the local Brain within this brief's retrieval budget.")
+                        .foregroundStyle(.secondary)
+                }
+
+                ForEach(claims) { claim in
+                    Label {
+                        Text(claim.claim)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } icon: {
+                        Image(systemName: "circle.fill")
+                            .font(.system(size: 6))
+                    }
+                }
+
+                ForEach(pages) { context in
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack(alignment: .firstTextBaseline) {
+                            Text(context.title)
+                                .font(.headline)
+                            Spacer()
+                            if let path = context.path, !path.isEmpty {
+                                Button("Open in Wiki") {
+                                    dismiss()
+                                    appState.showWiki(path: path)
+                                }
+                                .buttonStyle(.link)
+                            }
+                        }
+                        if !context.summary.isEmpty {
+                            Text(context.summary)
+                                .font(.callout)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .padding(10)
+                    .background(Color.secondary.opacity(0.06))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+            }
+            .padding(.top, 4)
+        } label: {
+            Label("Relevant background", systemImage: "text.book.closed")
+        }
+    }
+
+    private func suggestedAgenda(_ suggestions: [TodayMeetingSuggestion]) -> some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Suggested structure based on the meeting topic and available context—not source-backed claims.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                if suggestions.isEmpty {
+                    Text("No agenda prompts were generated.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(suggestions.indices, id: \.self) { index in
+                        let suggestion = suggestions[index]
+                        HStack(alignment: .firstTextBaseline, spacing: 9) {
+                            Text("\(index + 1)")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                                .frame(width: 18, alignment: .trailing)
+                            Text(suggestion.suggestion)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        if suggestion.is_factual_claim {
+                            Label("Verify this possible claim before relying on it.", systemImage: "exclamationmark.triangle")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                        }
+                    }
+                }
+            }
+            .padding(.top, 4)
+        } label: {
+            Label("Likely agenda & talking points", systemImage: "list.number")
+        }
+    }
+
+    private func openQuestionsAndPreparation(_ packet: TodayMeetingPacket) -> some View {
+        let questions = packet.brief_open_questions ?? []
+        return GroupBox {
+            VStack(alignment: .leading, spacing: 10) {
+                if questions.isEmpty {
+                    Text("No topic-specific open questions were found in Brain.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(questions) { question in
+                        Label(question.question, systemImage: "questionmark.bubble")
+                    }
+                }
+                Divider()
+                Label(
+                    "Decide what outcome would make this meeting worthwhile.",
+                    systemImage: "checkmark.circle"
+                )
+                Label(
+                    "Bring any material needed to resolve the decisions above.",
+                    systemImage: "checkmark.circle"
+                )
+            }
+            .padding(.top, 4)
+        } label: {
+            Label("Open questions & preparation", systemImage: "questionmark.circle")
+        }
+    }
+
+    @ViewBuilder
+    private func relevantLinks(_ packet: TodayMeetingPacket) -> some View {
+        let links = packet.source_links ?? []
+        if !links.isEmpty {
+            GroupBox {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(links) { link in
+                        HStack(alignment: .firstTextBaseline, spacing: 10) {
+                            Image(systemName: sourceLinkSymbol(link.source_type))
+                                .foregroundStyle(.secondary)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(link.label)
+                                    .font(.headline)
+                                if let detail = link.detail, !detail.isEmpty {
+                                    Text(detail)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            Spacer()
+                            sourceLinkAction(link)
+                        }
+                    }
+                }
+                .padding(.top, 4)
+            } label: {
+                Label("Relevant links", systemImage: "link")
+            }
+        }
+    }
+
+    private func sourcesAndDiagnostics(_ packet: TodayMeetingPacket) -> some View {
+        DisclosureGroup(isExpanded: $sourcesExpanded) {
+            VStack(alignment: .leading, spacing: 16) {
+                coverage(packet)
+                eventClaims(packet.event_claims)
+                backgroundEvidence(packet)
+                sourceReferences(packet)
+            }
+            .padding(.top, 12)
+        } label: {
+            Label("Sources & diagnostics", systemImage: "doc.text.magnifyingglass")
+                .font(.headline)
+        }
+        .padding(12)
+        .background(Color.secondary.opacity(0.05))
+        .clipShape(RoundedRectangle(cornerRadius: 9))
     }
 
     private func coverage(_ packet: TodayMeetingPacket) -> some View {
@@ -1064,7 +1425,7 @@ private struct TodayMeetingPreparationSheet: View {
         }
     }
 
-    private func brainContext(_ packet: TodayMeetingPacket) -> some View {
+    private func backgroundEvidence(_ packet: TodayMeetingPacket) -> some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 16) {
                 if packet.knowledge_claims.isEmpty && packet.wiki_context.isEmpty {
@@ -1082,13 +1443,6 @@ private struct TodayMeetingPreparationSheet: View {
                             Label(context.title, systemImage: "doc.text")
                                 .font(.headline)
                             Spacer()
-                            if let path = context.path, !path.isEmpty {
-                                Button("Open in Wiki") {
-                                    dismiss()
-                                    appState.showWiki(path: path)
-                                }
-                                .buttonStyle(.link)
-                            }
                         }
                         if !context.summary.isEmpty {
                             Text(context.summary)
@@ -1111,36 +1465,140 @@ private struct TodayMeetingPreparationSheet: View {
             }
             .padding(.top, 4)
         } label: {
-            Label("Evidence-bound Brain context", systemImage: "brain.head.profile")
+            Label("Background evidence", systemImage: "brain.head.profile")
         }
     }
 
-    private func suggestions(_ suggestions: [TodayMeetingSuggestion]) -> some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 10) {
-                Text("These are prompts for your preparation. They are not source-backed facts.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                if suggestions.isEmpty {
-                    Text("No suggestions were generated.")
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(suggestions) { suggestion in
-                        VStack(alignment: .leading, spacing: 4) {
-                            Label(suggestion.suggestion, systemImage: "lightbulb")
-                            if suggestion.is_factual_claim {
-                                Label("Verify this possible claim before relying on it.", systemImage: "exclamationmark.triangle")
-                                    .font(.caption)
-                                    .foregroundStyle(.orange)
-                            }
+    @ViewBuilder
+    private func sourceReferences(_ packet: TodayMeetingPacket) -> some View {
+        let links = packet.source_links ?? []
+        let questions = packet.open_questions ?? []
+        if !links.isEmpty || questions.contains(where: { !$0.fact_ids.isEmpty }) {
+            GroupBox {
+                VStack(alignment: .leading, spacing: 9) {
+                    ForEach(links) { link in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(link.label)
+                                .font(.callout.weight(.medium))
+                            Text(link.reference)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    ForEach(questions.filter { !$0.fact_ids.isEmpty }) { question in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(question.question)
+                                .font(.callout.weight(.medium))
+                            Text("Related facts: \(question.fact_ids.joined(separator: ", "))")
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
                         }
                     }
                 }
+                .padding(.top, 4)
+            } label: {
+                Label("Source references", systemImage: "number")
             }
-            .padding(.top, 4)
-        } label: {
-            Label("Suggestions — not facts", systemImage: "lightbulb.max")
         }
+    }
+
+    @ViewBuilder
+    private func sourceLinkAction(_ link: TodayMeetingSourceLink) -> some View {
+        let localRoute = link.brain_route.flatMap { route in
+            BrainAPIClient.canLoadTodayEvidence(at: route) ? route : nil
+        }
+        let providerURL = safeMeetingSourceURL(link.provider_url)
+        let wikiPath = link.wiki_path.flatMap { path in
+            path.isEmpty ? nil : path
+        }
+
+        HStack(spacing: 10) {
+            if let providerURL {
+                Link(providerActionTitle(link), destination: providerURL)
+                    .buttonStyle(.link)
+                    .accessibilityLabel("\(providerActionTitle(link)): \(link.label)")
+                    .help("Open the original source")
+            }
+            if let route = localRoute {
+                Button(localActionTitle(link)) {
+                    sourceEvidenceRequest = TodayEvidenceRequest(route: route)
+                }
+                .buttonStyle(.link)
+                .accessibilityLabel("\(localActionTitle(link)): \(link.label)")
+                .help("View the retained local evidence")
+            }
+            if let path = wikiPath {
+                Button("Open in Wiki") {
+                    dismiss()
+                    appState.showWiki(path: path)
+                }
+                .buttonStyle(.link)
+                .accessibilityLabel("Open \(link.label) in Wiki")
+            }
+            if providerURL == nil && localRoute == nil && wikiPath == nil {
+                Text("Unavailable")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func providerActionTitle(_ link: TodayMeetingSourceLink) -> String {
+        switch link.source_type {
+        case "gmail": return "Open email"
+        case "calendar": return "Open in Calendar"
+        default: return "Open source"
+        }
+    }
+
+    private func localActionTitle(_ link: TodayMeetingSourceLink) -> String {
+        switch link.source_type {
+        case "gmail": return "View local copy"
+        case "calendar": return "View event details"
+        default: return "View local evidence"
+        }
+    }
+
+    private func scheduleText(_ context: TodayMeetingContext) -> String {
+        guard let startsAt = context.starts_at else {
+            return context.all_day ? "All day" : "Time not reported"
+        }
+        let start = displayDateTime(startsAt)
+        if context.all_day {
+            return "All day · \(start)"
+        }
+        guard let endsAt = context.ends_at else {
+            return start
+        }
+        return "\(start) · ends \(displayDateTime(endsAt))"
+    }
+
+    private func calendarNotesPlaceholder(_ status: String) -> String {
+        switch status {
+        case "not_provided":
+            return "No purpose or agenda was included in the Calendar description."
+        case "source_unavailable":
+            return "The retained Calendar description was unavailable, so this brief does not infer a purpose."
+        default:
+            return "No purpose or agenda was available."
+        }
+    }
+
+    private func sourceLinkSymbol(_ source: String) -> String {
+        switch source {
+        case "calendar": return "calendar"
+        case "gmail": return "envelope"
+        case "wiki": return "doc.text"
+        default: return "link"
+        }
+    }
+
+    private func safeMeetingSourceURL(_ value: String?) -> URL? {
+        guard let value, let url = URL(string: value),
+              url.scheme == "https" || url.scheme == "http" else {
+            return nil
+        }
+        return url
     }
 
     private func claimView(

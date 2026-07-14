@@ -23,6 +23,7 @@ from .automation import (
 )
 from .migrations import MIGRATIONS
 from .operational_service import OperationalService, OperationalWriteRefusedError
+from .operational_meeting_packets import run_scheduled_meeting_preparation
 from .operational_today import OperationalTodayPresentationService
 from .paths import BrainPaths
 from .shadow_controller import ShadowTrialController
@@ -37,6 +38,7 @@ DEFAULT_SCHEDULER_TICK_SECONDS = 30.0
 DEFAULT_CAPTURE_CADENCE_SECONDS = 600
 DEFAULT_NIGHTLY_CHECK_CADENCE_SECONDS = 3600
 DEFAULT_SYNC_CADENCE_SECONDS = 1800
+DEFAULT_MEETING_PREPARATION_CADENCE_SECONDS = 900
 
 
 def package_version() -> str:
@@ -329,7 +331,11 @@ class SerialJobScheduler:
         return parsed
 
 
-def build_role_jobs(paths: BrainPaths) -> list[SchedulerJob]:
+def build_role_jobs(
+    paths: BrainPaths,
+    *,
+    operational_service: OperationalService | None = None,
+) -> list[SchedulerJob]:
     try:
         sync_config = load_sync_config(paths)
         role = sync_config.role
@@ -362,6 +368,17 @@ def build_role_jobs(paths: BrainPaths) -> list[SchedulerJob]:
             ),
         )
     )
+    if role in {"single", "primary"} and operational_service is not None:
+        jobs.append(
+            SchedulerJob(
+                id="meeting_preparation",
+                cadence_s=DEFAULT_MEETING_PREPARATION_CADENCE_SECONDS,
+                handler=lambda: run_scheduled_meeting_preparation(
+                    paths,
+                    operational_service,
+                ),
+            )
+        )
     if role == "primary" and sync_config and sync_config.primary:
         for peer in sync_config.primary.peers:
             jobs.append(
@@ -415,9 +432,17 @@ class BrainDaemon:
         self._acquire_lock()
         try:
             BrainService(self.paths).init_workspace()
+            if self.paths.ops_sqlite_path.exists():
+                # Existing Chief-of-Staff homes must be migrated before Today or
+                # the proactive meeting-preparation job opens the strict store.
+                self.operational_service.initialize()
             self.scheduler = SerialJobScheduler(
                 self.paths,
                 tick_seconds=self.scheduler_tick_seconds,
+                jobs=build_role_jobs(
+                    self.paths,
+                    operational_service=self.operational_service,
+                ),
             )
             self.server = create_ui_server(
                 self.paths,

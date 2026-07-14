@@ -129,6 +129,16 @@ public final class BrainAPIClient: Sendable {
         )
     }
 
+    public func restoreTodayCalendarSeries(
+        suppressionID: String
+    ) async throws -> TodayFeedbackResponse {
+        let encoded = percentEncodePathComponent(suppressionID)
+        return try await post(
+            "/api/v1/today/calendar-series/\(encoded)/restore",
+            payload: EmptyPayload()
+        )
+    }
+
     public func reportMissingTodayItem(
         title: String,
         detail: String? = nil,

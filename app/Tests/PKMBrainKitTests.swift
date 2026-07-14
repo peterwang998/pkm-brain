@@ -91,6 +91,11 @@ struct PKMBrainKitTests {
         #expect(briefing.visibleFocus.first?.evidence.first?.brain_route?.contains("/wiki") == true)
         #expect(briefing.urgent_overflow.count == 2)
         #expect(briefing.calendar.next.first?.title == "Project review")
+        #expect(briefing.calendar.next.first?.isMeetingBriefReady == true)
+        #expect(briefing.calendar.next.first?.feedback_actions.contains("dismiss_series") == true)
+        #expect(briefing.calendar.hiddenSeries.first?.label == "Family time")
+        #expect(briefing.calendar.hiddenSeries.first?.hidden_count == 3)
+        #expect(briefing.calendar.hiddenSeries.first?.next_starts_at == "2026-07-15T01:00:00+00:00")
         #expect(briefing.uncertain.first?.reason_codes == ["authoritative_source_unavailable"])
         #expect(briefing.ignored_suppressed.first?.handled_verdict == "fulfilled")
         #expect(briefing.ignoredSuppressedTotal == 1)
@@ -265,16 +270,30 @@ struct PKMBrainKitTests {
         let packet: TodayMeetingPacket = try decodeFixture("meeting_packet")
 
         #expect(packet.schema_version == 1)
+        #expect(packet.content_version == "executive-brief-v2")
         #expect(packet.title == "Project review")
+        #expect(packet.brief_context?.calendar_notes == "Review launch readiness and decide whether to ship.")
+        #expect(packet.brief_context?.location == "Video call")
+        #expect(packet.brief_context?.organizer_email == "organizer@example.com")
+        #expect(packet.brief_context?.attendee_count == 4)
+        #expect(packet.brief_context?.all_day == false)
         #expect(packet.event_claims.first?.claim_type == "calendar_observation")
         #expect(packet.event_claims.first?.evidence_refs.count == 1)
         #expect(packet.knowledge_claims.first?.fact_id == "fact-17")
+        #expect(packet.brief_knowledge_claims?.first?.fact_id == "fact-17")
         #expect(packet.knowledge_claims.first?.confidence == 0.91)
         #expect(packet.knowledge_claims.first?.evidence_refs.count == 1)
         #expect(packet.wiki_context.first?.source_ids == ["document-17", "document-22"])
+        #expect(packet.brief_wiki_context?.first?.path == "projects/project-review.md")
         #expect(packet.coverage["brain_retrieval"]?.objectValue?["stale"]?.boolValue == true)
         #expect(packet.retrieval_reasons.count == 1)
         #expect(packet.suggestions.first?.is_factual_claim == false)
+        #expect(packet.open_questions?.first?.question == "Has Legal approved the pricing language?")
+        #expect(packet.brief_open_questions?.first?.question == "Has Legal approved the pricing language?")
+        #expect(packet.open_questions?.first?.fact_ids == ["fact-17"])
+        #expect(packet.source_links?.first?.source_type == "calendar")
+        #expect(packet.source_links?.first?.brain_route?.hasPrefix("/api/ops/evidence?") == true)
+        #expect(packet.source_links?.last?.wiki_path == "projects/project-review.md")
 
         let briefing: TodayBriefing = try decodeFixture("today")
         #expect(briefing.calendar.next.first?.supportsMeetingPreparation == true)
@@ -361,6 +380,52 @@ struct PKMBrainKitTests {
                 Issue.record("Unexpected error for unsafe item ID: \(error)")
             }
         }
+    }
+
+    @Test("Calendar-series restore posts one encoded suppression ID")
+    func calendarSeriesRestoreRequest() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CalendarSeriesURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer {
+            CalendarSeriesURLProtocol.handler = nil
+            session.invalidateAndCancel()
+        }
+        let suppressionID = "series/family time?#%"
+        CalendarSeriesURLProtocol.handler = { request in
+            #expect(request.httpMethod == "POST")
+            #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-token")
+            #expect(
+                request.url?.absoluteString.contains(
+                    "/api/v1/today/calendar-series/series%2Ffamily%20time%3F%23%25/restore"
+                ) == true
+            )
+            #expect(try requestBody(request) == Data("{}".utf8))
+            let response = try #require(
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Type": "application/json"]
+                )
+            )
+            let payload = Data(
+                #"{"schema_version":1,"status":"accepted","item_id":null,"action":"restore","recorded_at":"2026-07-14T14:00:00+00:00","message":"Recurring series restored to Today."}"#.utf8
+            )
+            return (response, payload)
+        }
+
+        let client = BrainAPIClient(
+            baseURL: URL(string: "http://127.0.0.1:54321")!,
+            token: "test-token",
+            session: session
+        )
+        let response = try await client.restoreTodayCalendarSeries(
+            suppressionID: suppressionID
+        )
+
+        #expect(response.status == "accepted")
+        #expect(response.action == "restore")
     }
 
     @Test("queue fixture decodes")
@@ -815,6 +880,35 @@ private final class RetainedEvidenceURLProtocol: URLProtocol, @unchecked Sendabl
 }
 
 private final class MeetingPacketURLProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        true
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        guard let handler = Self.handler else {
+            client?.urlProtocol(self, didFailWithError: APIClientError.invalidResponse)
+            return
+        }
+        do {
+            let (response, data) = try handler(request)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
+}
+
+private final class CalendarSeriesURLProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
 
     override class func canInit(with request: URLRequest) -> Bool {

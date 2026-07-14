@@ -12,6 +12,7 @@ import pytest
 from pkm_brain.paths import BrainPaths
 from pkm_brain.today_presentation import (
     TodayBriefing,
+    TodayCalendarSuppression,
     TodayCoverage,
     TodayEvidenceLink,
     TodayFeedbackCapabilities,
@@ -62,6 +63,7 @@ class RecordingTodayService:
     def __init__(self) -> None:
         self.feedback: list[tuple[str, TodayFeedbackRequest]] = []
         self.missing: list[TodayMissingReport] = []
+        self.restored_series: list[str] = []
 
     def briefing(self) -> TodayBriefing:
         evidence = TodayEvidenceLink(
@@ -133,6 +135,14 @@ class RecordingTodayService:
                     evidence=(evidence,),
                 ),
             ),
+            hidden_calendar_series=(
+                TodayCalendarSuppression(
+                    id="series-rule-1",
+                    label="Family time",
+                    hidden_count=4,
+                    created_at="2026-07-14T13:00:00+00:00",
+                ),
+            ),
             ignored_suppressed=(
                 TodayItem(
                     id="ignored-1",
@@ -180,6 +190,16 @@ class RecordingTodayService:
             message="Missing item reported.",
         )
 
+    def restore_calendar_series(self, rule_id: str) -> TodayFeedbackResult:
+        self.restored_series.append(rule_id)
+        return TodayFeedbackResult(
+            status="accepted",
+            item_id=rule_id,
+            action="restore",
+            recorded_at="2026-07-14T14:03:00+00:00",
+            message="Series restored.",
+        )
+
 
 def test_unavailable_briefing_is_complete_and_safe() -> None:
     payload = UnavailableTodayPresentationService().briefing().as_dict()
@@ -188,7 +208,7 @@ def test_unavailable_briefing_is_complete_and_safe() -> None:
     assert payload["status"] == "unavailable"
     assert payload["focus"] == []
     assert payload["urgent_overflow"] == {"count": 0, "items": []}
-    assert payload["calendar"] == {"now": [], "next": []}
+    assert payload["calendar"] == {"now": [], "next": [], "hidden_series": []}
     assert payload["ignored_suppressed"] == []
     assert payload["feedback"]["enabled"] is False
 
@@ -244,6 +264,13 @@ def test_v1_today_routes_expose_briefing_and_feedback(tmp_path: Path) -> None:
             "/api/v1/today/feedback/missing",
             {"title": "Renew the domain", "source_hint": "email"},
         )
+        restore_status, restore = request_json(
+            host,
+            port,
+            "POST",
+            "/api/v1/today/calendar-series/series-rule-1/restore",
+            {},
+        )
 
     assert status == 200
     assert briefing["schema_version"] == 1
@@ -258,6 +285,10 @@ def test_v1_today_routes_expose_briefing_and_feedback(tmp_path: Path) -> None:
     assert missing_status == 200
     assert missing["action"] == "report_missing"
     assert service.missing[0].title == "Renew the domain"
+    assert briefing["calendar"]["hidden_series"][0]["label"] == "Family time"
+    assert restore_status == 200
+    assert restore["action"] == "restore"
+    assert service.restored_series == ["series-rule-1"]
 
 
 def test_v1_today_default_stub_and_request_validation(tmp_path: Path) -> None:

@@ -32,6 +32,7 @@ from .llm_usage import ProviderUsageRecord, capture_provider_usage
 from .operational_briefing import build_operational_briefing
 from .operational_budget import DailyBudgetExceeded
 from .operational_db import operational_connection
+from .operational_meeting_packets import precompose_upcoming_meeting_packets
 from .operational_service import OperationalService
 from .operational_shadow import HandledAssessment, ShadowDecision
 from .operational_state import (
@@ -237,6 +238,21 @@ class ShadowTrialRunner:
                 "error": message,
             }
             errors.append(f"briefing retention: {message}")
+        if CALENDAR_CONNECTOR_ID in requested:
+            try:
+                usage["meeting_preparation"] = precompose_upcoming_meeting_packets(
+                    self.paths,
+                    self.operational_service,
+                    as_of=started.isoformat(),
+                )
+            except Exception as exc:
+                # Preparation is a derived local projection. A failure must not
+                # invalidate otherwise complete read-only source coverage.
+                usage["meeting_preparation"] = {
+                    "status": "partial",
+                    "prepared_count": 0,
+                    "error": f"{type(exc).__name__}: {exc}"[:1000],
+                }
         statuses = {
             str(value.get("status") or "unavailable")
             for value in coverage.values()
@@ -879,6 +895,8 @@ class ShadowTrialRunner:
                     observed_at=started.isoformat(),
                     source_ref=_gmail_source_ref(account_key, thread.thread_id),
                     source_timezone=policy.operator.timezone,
+                    detector_version=GMAIL_DETECTOR_VERSION,
+                    policy_version=policy.version_ref,
                 )
                 observations.append(observation)
                 observation_bindings.append((thread, detection, candidate))
@@ -1405,15 +1423,22 @@ def _gmail_observation(
     observed_at: str,
     source_ref: str,
     source_timezone: str,
+    detector_version: str,
+    policy_version: str,
 ) -> OperationalObservation:
-    revision = thread.source_revision or _gmail_revision(thread)
+    provider_revision = thread.source_revision or _gmail_revision(thread)
+    revision = _gmail_derived_observation_revision(
+        provider_revision=provider_revision,
+        detector_version=detector_version,
+        policy_version=policy_version,
+    )
     evidence_refs = tuple(
         {
             "account_key": account_key,
             "thread_id": thread.thread_id,
             "message_id": message_id,
             "source_ref": source_ref,
-            "source_revision": revision,
+            "source_revision": provider_revision,
         }
         for message_id in candidate.evidence_message_ids
     )
@@ -1442,11 +1467,28 @@ def _gmail_observation(
         cancelled=False,
         evidence_refs=evidence_refs,
         metadata={
-            "detector_version": GMAIL_DETECTOR_VERSION,
+            "detector_version": detector_version,
             "message_class": thread.message_class,
+            "policy_version": policy_version,
             "reconciliation_status": candidate.reconciliation_status,
         },
     )
+
+
+def _gmail_derived_observation_revision(
+    *,
+    provider_revision: str,
+    detector_version: str,
+    policy_version: str,
+) -> str:
+    """Version an immutable detector interpretation separately from Gmail evidence."""
+
+    payload = json.dumps(
+        [provider_revision, detector_version, policy_version],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return "gmail-derived-v1-" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _gmail_revalidation_observation(
@@ -1670,20 +1712,40 @@ def _retained_gmail_provider_observations(
                 }
                 if revision not in cited_revisions:
                     continue
-                row = conn.execute(
+                candidate_rows = conn.execute(
                     """
                     SELECT * FROM ops_observations
                     WHERE source_type = 'gmail' AND account_key = ?
                       AND stream_key = ? AND source_key = ?
-                      AND source_revision = ?
+                    ORDER BY source_order DESC, created_at DESC, id DESC
                     """,
                     (
                         account_key,
                         GMAIL_STREAM,
                         f"{thread_id}:{item['detector_key']}",
-                        revision,
                     ),
-                ).fetchone()
+                ).fetchall()
+                row = next(
+                    (
+                        candidate_row
+                        for candidate_row in candidate_rows
+                        if not str(candidate_row["source_revision"]).startswith(
+                            "gmail-revalidation-"
+                        )
+                        and (
+                            str(candidate_row["source_revision"]) == revision
+                            or revision
+                            in {
+                                str(reference.get("source_revision") or "")
+                                for reference in json.loads(
+                                    str(candidate_row["evidence_refs"])
+                                )
+                                if isinstance(reference, Mapping)
+                            }
+                        )
+                    ),
+                    None,
+                )
                 if row is None:
                     raise RuntimeError(
                         "Gmail revalidation cites a missing provider observation"

@@ -72,6 +72,7 @@ OBSERVATION_METADATA_KEYS_V1 = {
     "message_class",
     "organizer_self",
     "original_start_time",
+    "policy_version",
     "provider_sequence",
     "reconciliation_status",
     "revalidation_reason",
@@ -1442,7 +1443,16 @@ def _restores_provider_authority(
         for reference in current.get("evidence_refs") or ()
         if isinstance(reference, Mapping)
     }
-    return str(incoming["source_revision"]) in predecessor_revisions
+    incoming_authority_revisions = {
+        str(incoming.get("source_revision") or ""),
+        *(
+            str(reference.get("source_revision") or "")
+            for reference in incoming.get("evidence_refs") or ()
+            if isinstance(reference, Mapping)
+        ),
+    }
+    incoming_authority_revisions.discard("")
+    return bool(incoming_authority_revisions.intersection(predecessor_revisions))
 
 
 def _is_synthetic_revalidation(observation: Mapping[str, Any]) -> bool:

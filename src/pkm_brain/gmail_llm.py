@@ -14,6 +14,12 @@ from typing import Any, Mapping
 
 import yaml
 
+from .chief_of_staff_llm import (
+    COS_CODEX_MODEL_ENV,
+    COS_CODEX_REASONING_EFFORT_ENV,
+    DEFAULT_COS_CODEX_MODEL,
+    DEFAULT_COS_CODEX_REASONING_EFFORT,
+)
 from .llm import (
     LLMConfigurationError,
     LLMProvider,
@@ -36,8 +42,8 @@ GMAIL_CODEX_REASONING_EFFORT_ENV = "PKM_BRAIN_GMAIL_CODEX_REASONING_EFFORT"
 GMAIL_CODEX_TIMEOUT_ENV = "PKM_BRAIN_GMAIL_CODEX_TIMEOUT_SECONDS"
 GMAIL_CODEX_BINARY_ENV = "PKM_BRAIN_GMAIL_CODEX_BIN"
 
-DEFAULT_GMAIL_CODEX_MODEL = "gpt-5.6-luna"
-DEFAULT_GMAIL_CODEX_REASONING_EFFORT = "low"
+DEFAULT_GMAIL_CODEX_MODEL = DEFAULT_COS_CODEX_MODEL
+DEFAULT_GMAIL_CODEX_REASONING_EFFORT = DEFAULT_COS_CODEX_REASONING_EFFORT
 DEFAULT_GMAIL_CODEX_TIMEOUT_SECONDS = 300
 MINIMUM_PERMISSION_PROFILE_CODEX_VERSION = (0, 142, 0)
 
@@ -315,7 +321,7 @@ def resolve_gmail_llm_selection(paths: BrainPaths | None = None) -> GmailLLMSele
         provider_source = f"config:{GMAIL_LLM_CONFIG_FILENAME}.provider"
     else:
         # The default is the restricted ChatGPT-authenticated Codex path. It
-        # intentionally ignores PKM_BRAIN_LLM_PROVIDER and every CoS role.
+        # intentionally ignores the general PKM_BRAIN_LLM_PROVIDER.
         provider = "codex"
         provider_source = "gmail-default:restricted-codex"
     if provider not in _ALLOWED_PROVIDERS:
@@ -326,6 +332,7 @@ def resolve_gmail_llm_selection(paths: BrainPaths | None = None) -> GmailLLMSele
     model = _first_value(
         os.environ.get(GMAIL_CODEX_MODEL_ENV),
         config.get("codex_model"),
+        os.environ.get(COS_CODEX_MODEL_ENV),
         DEFAULT_GMAIL_CODEX_MODEL,
     )
     if not _MODEL_RE.fullmatch(model):
@@ -334,6 +341,7 @@ def resolve_gmail_llm_selection(paths: BrainPaths | None = None) -> GmailLLMSele
         _first_value(
             os.environ.get(GMAIL_CODEX_REASONING_EFFORT_ENV),
             config.get("codex_reasoning_effort"),
+            os.environ.get(COS_CODEX_REASONING_EFFORT_ENV),
             DEFAULT_GMAIL_CODEX_REASONING_EFFORT,
         )
     )

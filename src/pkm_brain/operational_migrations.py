@@ -748,6 +748,69 @@ def _migration_008_expand_source_cursor_metadata(conn: sqlite3.Connection) -> No
     )
 
 
+def _migration_009_create_user_suppressions_and_meeting_packets(
+    conn: sqlite3.Connection,
+) -> None:
+    """Persist reversible display preferences and prepared meeting packets."""
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ops_suppression_rules (
+          id TEXT PRIMARY KEY CHECK(length(id) BETWEEN 1 AND 256),
+          source_type TEXT NOT NULL CHECK(source_type = 'calendar'),
+          account_key TEXT NOT NULL CHECK(length(account_key) BETWEEN 1 AND 512),
+          rule_kind TEXT NOT NULL CHECK(rule_kind = 'recurring_series'),
+          match_key TEXT NOT NULL CHECK(length(match_key) BETWEEN 1 AND 1024),
+          label TEXT NOT NULL CHECK(length(label) BETWEEN 1 AND 500),
+          reason TEXT NOT NULL CHECK(length(reason) BETWEEN 1 AND 2000),
+          active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1)),
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          restored_at TEXT,
+          UNIQUE(source_type, account_key, rule_kind, match_key)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_ops_suppression_rules_active
+        ON ops_suppression_rules(source_type, account_key, rule_kind, active)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ops_meeting_packets (
+          id TEXT PRIMARY KEY CHECK(length(id) BETWEEN 1 AND 256),
+          item_id TEXT NOT NULL REFERENCES ops_items(id) ON DELETE RESTRICT,
+          source_revision TEXT NOT NULL CHECK(length(source_revision) BETWEEN 1 AND 1024),
+          generated_at TEXT NOT NULL,
+          packet TEXT NOT NULL
+            CHECK(
+              json_valid(packet)
+              AND json_type(packet) = 'object'
+              AND length(CAST(packet AS BLOB)) <= 262144
+            ),
+          packet_hash TEXT NOT NULL CHECK(length(packet_hash) = 64),
+          expires_at TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          UNIQUE(item_id, source_revision, packet_hash)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_ops_meeting_packets_item
+        ON ops_meeting_packets(item_id, generated_at DESC)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_ops_meeting_packets_expiry
+        ON ops_meeting_packets(expires_at)
+        """
+    )
+
+
 OPERATIONAL_MIGRATIONS: list[OperationalMigration] = [
     (1, "create_observations", _migration_001_create_observations),
     (2, "create_items", _migration_002_create_items),
@@ -768,6 +831,11 @@ OPERATIONAL_MIGRATIONS: list[OperationalMigration] = [
         8,
         "expand_source_cursor_metadata",
         _migration_008_expand_source_cursor_metadata,
+    ),
+    (
+        9,
+        "create_user_suppressions_and_meeting_packets",
+        _migration_009_create_user_suppressions_and_meeting_packets,
     ),
 ]
 OPERATIONAL_MIGRATION_VERSIONS = tuple(

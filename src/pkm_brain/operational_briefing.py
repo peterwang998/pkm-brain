@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -8,8 +9,13 @@ from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 from .gmail_operations import GMAIL_DETECTOR_VERSION
+from .google_cache import GoogleCacheSecurityError, GoogleEvidenceCache
 from .google_routes import gmail_thread_route
 from .operational_db import OperationalStoreUnavailableError, operational_connection
+from .operational_meeting_packets import (
+    MEETING_PACKET_CONTENT_VERSION,
+    meeting_packet_readiness,
+)
 from .operational_briefing_projection import (
     BRIEFING_SECTION_ORDER,
     bound_briefing_projection,
@@ -19,6 +25,12 @@ from .operational_shadow import (
     list_shadow_decisions,
     list_shadow_runs,
 )
+from .operational_suppressions import (
+    active_calendar_series_keys,
+    calendar_card_is_series_suppressed,
+    list_calendar_series_suppressions,
+)
+from .operations_policy import load_operations_policy
 from .paths import BrainPaths
 from .service import BrainService
 from .util import now_iso
@@ -76,6 +88,24 @@ def build_operational_briefing(
     )
     handled = latest_handled_assessments(db_path)
     items = _load_items(db_path)
+    prepared_meeting_ids = meeting_packet_readiness(db_path)
+    hidden_calendar_keys = active_calendar_series_keys(db_path)
+    hidden_calendar_series = list_calendar_series_suppressions(
+        db_path,
+        active_only=True,
+        as_of=generated_at,
+    )
+    latest_gmail_decisions = _latest_gmail_decisions_by_thread(db_path)
+    hidden_marketing_items = [
+        item
+        for item in items
+        if _gmail_item_is_hidden_marketing(item, latest_gmail_decisions)
+    ]
+    visible_items = [
+        item
+        for item in items
+        if not _gmail_item_is_hidden_marketing(item, latest_gmail_decisions)
+    ]
 
     cards = [
         _briefing_card(
@@ -84,10 +114,27 @@ def build_operational_briefing(
             coverage=coverage,
             now=now,
             provider_account=(provider_accounts or {}).get(str(item["source_type"])),
+            recruiter_activity=_gmail_item_is_recruiter_activity(
+                item,
+                latest_gmail_decisions,
+            ),
+            meeting_brief_ready=str(item["id"]) in prepared_meeting_ids,
         )
-        for item in items
+        for item in visible_items
     ]
-    active_cards = [card for card in cards if card["state"] not in TERMINAL_STATES]
+    active_cards_before_calendar_suppression = [
+        card for card in cards if card["state"] not in TERMINAL_STATES
+    ]
+    hidden_calendar_occurrences = [
+        card
+        for card in active_cards_before_calendar_suppression
+        if calendar_card_is_series_suppressed(card, hidden_calendar_keys)
+    ]
+    active_cards = [
+        card
+        for card in active_cards_before_calendar_suppression
+        if not calendar_card_is_series_suppressed(card, hidden_calendar_keys)
+    ]
     actionable = [
         card
         for card in active_cards
@@ -160,7 +207,8 @@ def build_operational_briefing(
             if float(card["confidence"]) < LOW_CONFIDENCE
             or card["reconciliation_status"] in {"ambiguous", "provisional"}
             or (
-                card["kind"] != "event" and card["handled_verdict"] == "unknown"
+                card["kind"] not in {"event", "attention"}
+                and card["handled_verdict"] == "unknown"
             )
         ],
         key=lambda card: _action_rank(card, now=now),
@@ -187,6 +235,10 @@ def build_operational_briefing(
     )[:100]
 
     suppressed = _suppressed_audit(db_path, latest_run)
+    suppressed = _merge_hidden_marketing_audit(
+        suppressed,
+        hidden_marketing_items,
+    )
     raw_sections = {
         "focus": focus,
         "urgent_overflow": overflow,
@@ -208,7 +260,10 @@ def build_operational_briefing(
     counts.update(
         {
             "active_items": len(active_cards),
-            "terminal_items": len(cards) - len(active_cards),
+            "terminal_items": sum(
+                card["state"] in TERMINAL_STATES for card in cards
+            ),
+            "hidden_calendar_occurrences": len(hidden_calendar_occurrences),
             "action_candidates": len(actionable),
             "section_facets": facet_counts,
         }
@@ -235,6 +290,7 @@ def build_operational_briefing(
         "coverage": coverage,
         "sections": sections,
         "counts": counts,
+        "hidden_calendar_series": hidden_calendar_series,
     }
 
 
@@ -263,6 +319,7 @@ def unavailable_operational_briefing(
         },
         "sections": {name: [] for name in BRIEFING_SECTION_ORDER},
         "counts": {name: 0 for name in BRIEFING_SECTION_ORDER},
+        "hidden_calendar_series": [],
     }
 
 
@@ -318,6 +375,20 @@ def build_meeting_packet(
     item = dict(row)
     item["metadata"] = json.loads(str(item["metadata"]))
     evidence_refs = json.loads(str(item["evidence_refs"]))
+    calendar_evidence = _meeting_calendar_evidence(
+        paths,
+        evidence_refs=evidence_refs,
+    )
+    operator_terms = _meeting_operator_terms(paths, calendar_evidence)
+    meeting_terms = _meeting_match_terms(
+        " ".join(
+            (
+                str(item.get("title") or ""),
+                str((calendar_evidence or {}).get("details") or ""),
+            )
+        ),
+        ignored_terms=operator_terms,
+    )
     event_claims = [
         {
             "claim": f"Meeting: {item['title']}",
@@ -387,6 +458,30 @@ def build_meeting_packet(
                 "confidence": fact.get("truth_confidence", fact.get("confidence")),
             }
         )
+    related_email_context = _meeting_related_email_context(
+        paths,
+        meeting_item=item,
+        additional_context=(
+            str(calendar_evidence.get("details") or "")
+            if calendar_evidence is not None
+            else ""
+        ),
+        ignored_terms=operator_terms,
+    )
+    for related in related_email_context:
+        detail = str(related.get("details") or "").strip()
+        claim = f"Related email: {related['title']}"
+        if detail:
+            claim += f" — {detail}"
+        knowledge_claims.append(
+            {
+                "claim": claim[:1000],
+                "claim_type": "gmail_operational_item",
+                "evidence_refs": list(related.get("evidence_refs") or [])[:16],
+                "fact_id": None,
+                "confidence": related.get("confidence"),
+            }
+        )
     wiki_context = [
         {
             "title": str(page.get("title") or "")[:500],
@@ -396,14 +491,70 @@ def build_meeting_packet(
         }
         for page in (retrieval.get("relevant_wiki_pages") or [])[:8]
     ]
+    open_questions = [
+        {
+            "question": question,
+            "source": "brain",
+            "reference": str(row.get("id") or "").strip() or None,
+            "fact_ids": [
+                str(fact_id)
+                for fact_id in (row.get("fact_ids") or [])[:16]
+                if str(fact_id).strip()
+            ],
+        }
+        for row in (retrieval.get("open_questions") or [])[:5]
+        if (question := str(row.get("question") or "").strip())
+    ]
+    brief_knowledge_claims = [
+        claim
+        for claim in knowledge_claims
+        if _meeting_candidate_is_relevant(
+            meeting_terms,
+            str(claim.get("claim") or ""),
+            ignored_terms=operator_terms,
+        )
+    ]
+    brief_wiki_context = [
+        page
+        for page in wiki_context
+        if _meeting_candidate_is_relevant(
+            meeting_terms,
+            f"{page.get('title') or ''} {page.get('summary') or ''}",
+            ignored_terms=operator_terms,
+        )
+    ]
+    brief_open_questions = [
+        question
+        for question in open_questions
+        if _meeting_candidate_is_relevant(
+            meeting_terms,
+            str(question.get("question") or ""),
+            ignored_terms=operator_terms,
+        )
+    ]
+    brief_context = _meeting_brief_context(
+        item,
+        calendar_evidence=calendar_evidence,
+    )
+    source_links = _meeting_source_links(
+        item,
+        evidence_refs=evidence_refs,
+        calendar_evidence=calendar_evidence,
+        wiki_context=brief_wiki_context,
+        related_email_context=related_email_context,
+    )
     return {
         "schema_version": 1,
+        "content_version": MEETING_PACKET_CONTENT_VERSION,
         "item_id": item_id,
         "generated_at": timestamp,
         "title": str(item["title"]),
+        "brief_context": brief_context,
         "event_claims": event_claims,
         "knowledge_claims": knowledge_claims,
+        "brief_knowledge_claims": brief_knowledge_claims,
         "wiki_context": wiki_context,
+        "brief_wiki_context": brief_wiki_context,
         "suggestions": [
             {
                 "suggestion": "Confirm the desired outcome and decisions needed before the meeting.",
@@ -413,13 +564,349 @@ def build_meeting_packet(
                 "suggestion": "Review open commitments and waiting items that involve this topic.",
                 "is_factual_claim": False,
             },
+            {
+                "suggestion": "End with explicit owners and next steps for any decisions made.",
+                "is_factual_claim": False,
+            },
         ],
+        "open_questions": open_questions,
+        "brief_open_questions": brief_open_questions,
+        "source_links": source_links,
         "coverage": {
             "calendar": "complete",
             "brain_retrieval": retrieval.get("retrieval_verdict", "unknown"),
         },
         "retrieval_reasons": retrieval.get("retrieval_reasons") or [],
     }
+
+
+def _meeting_calendar_evidence(
+    paths: BrainPaths,
+    *,
+    evidence_refs: Sequence[Mapping[str, Any]],
+) -> Mapping[str, Any] | None:
+    source_ref = _first_reference_value(evidence_refs, "source_ref")
+    if not source_ref:
+        return None
+    cache_root = paths.home / "cache" / "google-evidence"
+    if not cache_root.is_dir():
+        return None
+    try:
+        payload = GoogleEvidenceCache.for_paths(paths).read_normalized(
+            "calendar",
+            source_ref,
+            source_revision=_first_reference_value(
+                evidence_refs,
+                "source_revision",
+            ),
+        )
+    except (GoogleCacheSecurityError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, Mapping) else None
+
+
+def _meeting_brief_context(
+    item: Mapping[str, Any],
+    *,
+    calendar_evidence: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    metadata = item.get("metadata")
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    calendar_notes = (
+        str(calendar_evidence.get("details") or "").strip()[:4000]
+        if calendar_evidence is not None
+        else ""
+    )
+    return {
+        "calendar_notes": calendar_notes or None,
+        "calendar_notes_status": (
+            "available"
+            if calendar_notes
+            else "not_provided"
+            if calendar_evidence is not None
+            else "source_unavailable"
+        ),
+        "starts_at": item.get("starts_at"),
+        "ends_at": item.get("ends_at"),
+        "location": (
+            calendar_evidence.get("location")
+            if calendar_evidence is not None
+            else metadata.get("location")
+        ),
+        "organizer_email": (
+            calendar_evidence.get("organizer_email")
+            if calendar_evidence is not None
+            else None
+        ),
+        "attendee_count": (
+            calendar_evidence.get("attendee_count")
+            if calendar_evidence is not None
+            else metadata.get("attendee_count")
+        ),
+        "attendee_response": (
+            calendar_evidence.get("attendee_response")
+            if calendar_evidence is not None
+            else metadata.get("attendee_response")
+        ),
+        "source_timezone": item.get("source_timezone"),
+        "all_day": bool(metadata.get("all_day")),
+    }
+
+
+def _meeting_source_links(
+    item: Mapping[str, Any],
+    *,
+    evidence_refs: Sequence[Mapping[str, Any]],
+    calendar_evidence: Mapping[str, Any] | None,
+    wiki_context: Sequence[Mapping[str, Any]],
+    related_email_context: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    links: list[dict[str, Any]] = []
+    source_ref = _first_reference_value(evidence_refs, "source_ref")
+    if source_ref and calendar_evidence is not None:
+        links.append(
+            {
+                "id": f"calendar:{source_ref}",
+                "label": "Calendar event",
+                "detail": "Open the retained local Calendar details",
+                "source_type": "calendar",
+                "reference": source_ref,
+                "brain_route": local_evidence_route(
+                    source_type="calendar",
+                    account_key=str(item["account_key"]),
+                    source_ref=source_ref,
+                    source_revision=_first_reference_value(
+                        evidence_refs,
+                        "source_revision",
+                    ),
+                ),
+                "provider_url": None,
+                "wiki_path": None,
+            }
+        )
+    for page in wiki_context:
+        path = str(page.get("path") or "").strip()
+        if not path:
+            continue
+        title = str(page.get("title") or "").strip() or "Brain page"
+        links.append(
+            {
+                "id": f"wiki:{path}",
+                "label": title[:500],
+                "detail": "Open the relevant Brain page",
+                "source_type": "wiki",
+                "reference": path,
+                "brain_route": None,
+                "provider_url": None,
+                "wiki_path": path,
+            }
+        )
+    for related in related_email_context:
+        source_ref = str(related.get("source_ref") or "").strip()
+        account_key = str(related.get("account_key") or "").strip()
+        if not source_ref or not account_key:
+            continue
+        links.append(
+            {
+                "id": f"gmail:{source_ref}",
+                "label": f"Email: {str(related['title'])[:480]}",
+                "detail": "Open the related source-backed email thread",
+                "source_type": "gmail",
+                "reference": source_ref,
+                "brain_route": local_evidence_route(
+                    source_type="gmail",
+                    account_key=account_key,
+                    source_ref=source_ref,
+                    source_revision=related.get("source_revision"),
+                ),
+                "provider_url": related.get("provider_url"),
+                "wiki_path": None,
+            }
+        )
+    return links[:12]
+
+
+_MEETING_MATCH_STOPWORDS = {
+    "about",
+    "after",
+    "agenda",
+    "and",
+    "appointment",
+    "appointments",
+    "before",
+    "calendar",
+    "call",
+    "catchup",
+    "check",
+    "checking",
+    "checkin",
+    "daily",
+    "discussion",
+    "event",
+    "from",
+    "general",
+    "into",
+    "meeting",
+    "monthly",
+    "next",
+    "notes",
+    "our",
+    "project",
+    "review",
+    "scheduled",
+    "session",
+    "status",
+    "sync",
+    "team",
+    "the",
+    "this",
+    "today",
+    "tomorrow",
+    "with",
+    "update",
+    "weekly",
+}
+
+
+def _meeting_related_email_context(
+    paths: BrainPaths,
+    *,
+    meeting_item: Mapping[str, Any],
+    additional_context: str = "",
+    ignored_terms: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    meeting_terms = _meeting_match_terms(
+        f"{meeting_item.get('title') or ''} {additional_context}",
+        ignored_terms=ignored_terms,
+    )
+    meeting_project = str(meeting_item.get("project_ref") or "").strip().casefold()
+    meeting_counterparty = str(
+        meeting_item.get("counterparty_entity_id") or ""
+    ).strip().casefold()
+    if not meeting_terms and not meeting_project and not meeting_counterparty:
+        return []
+    items = _load_items(paths.ops_sqlite_path)
+    latest_decisions = _latest_gmail_decisions_by_thread(paths.ops_sqlite_path)
+    try:
+        provider_account = load_operations_policy(paths).operator.gmail.email
+    except Exception:
+        provider_account = None
+    candidates: list[tuple[int, dict[str, Any]]] = []
+    for item in items:
+        if (
+            str(item.get("source_type") or "") != "gmail"
+            or str(item.get("state") or "active") in TERMINAL_STATES
+            or _gmail_item_is_hidden_marketing(item, latest_decisions)
+        ):
+            continue
+        candidate_terms = _meeting_match_terms(
+            f"{item.get('title') or ''} {item.get('details') or ''}",
+            ignored_terms=ignored_terms,
+        )
+        overlap = meeting_terms.intersection(candidate_terms)
+        score = len(overlap) * 20
+        if meeting_project and meeting_project == str(item.get("project_ref") or "").strip().casefold():
+            score += 50
+        if meeting_counterparty and meeting_counterparty == str(
+            item.get("counterparty_entity_id") or ""
+        ).strip().casefold():
+            score += 40
+        if score <= 0:
+            continue
+        refs = list(item.get("evidence_refs") or [])
+        source_ref = _first_reference_value(refs, "source_ref")
+        if not source_ref:
+            continue
+        card = {
+            "source_type": "gmail",
+            "account_key": str(item.get("account_key") or ""),
+            "evidence_refs": refs,
+        }
+        candidates.append(
+            (
+                score,
+                {
+                    "item_id": str(item["id"]),
+                    "title": str(item.get("title") or "Related email")[:500],
+                    "details": str(item.get("details") or "")[:1000] or None,
+                    "confidence": float(item.get("confidence") or 0.0),
+                    "account_key": str(item.get("account_key") or ""),
+                    "source_ref": source_ref,
+                    "source_revision": _first_reference_value(
+                        refs,
+                        "source_revision",
+                    ),
+                    "evidence_refs": refs,
+                    "provider_url": provider_native_route(
+                        card,
+                        provider_account=provider_account,
+                    ),
+                },
+            )
+        )
+    candidates.sort(
+        key=lambda value: (
+            value[0],
+            float(value[1]["confidence"]),
+            str(value[1]["item_id"]),
+        ),
+        reverse=True,
+    )
+    return [value for _score, value in candidates[:5]]
+
+
+def _meeting_match_terms(
+    value: str,
+    *,
+    ignored_terms: set[str] | None = None,
+) -> set[str]:
+    ignored = ignored_terms or set()
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", value.casefold())
+        if len(token) >= 3
+        and token not in _MEETING_MATCH_STOPWORDS
+        and token not in ignored
+        and not token.isdigit()
+    }
+
+
+def _meeting_candidate_is_relevant(
+    meeting_terms: set[str],
+    candidate: str,
+    *,
+    ignored_terms: set[str] | None = None,
+) -> bool:
+    if not meeting_terms:
+        return False
+    candidate_terms = _meeting_match_terms(
+        candidate,
+        ignored_terms=ignored_terms,
+    )
+    return bool(meeting_terms.intersection(candidate_terms))
+
+
+def _meeting_operator_terms(
+    paths: BrainPaths,
+    calendar_evidence: Mapping[str, Any] | None,
+) -> set[str]:
+    emails: list[str] = []
+    try:
+        operator = load_operations_policy(paths).operator
+        emails.extend((operator.calendar.email, operator.gmail.email))
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+    if calendar_evidence and calendar_evidence.get("organizer_self") is True:
+        emails.append(str(calendar_evidence.get("organizer_email") or ""))
+    terms: set[str] = set()
+    for email in emails:
+        local_part = str(email).partition("@")[0]
+        terms.update(
+            token
+            for token in re.findall(r"[a-z0-9]+", local_part.casefold())
+            if len(token) >= 3 and not token.isdigit()
+        )
+    return terms
 
 
 def local_evidence_route(
@@ -491,6 +978,8 @@ def _briefing_card(
     coverage: Mapping[str, Any],
     now: datetime,
     provider_account: str | None,
+    recruiter_activity: bool = False,
+    meeting_brief_ready: bool = False,
 ) -> dict[str, Any]:
     metadata = item.get("metadata") if isinstance(item.get("metadata"), Mapping) else {}
     evidence_refs = list(item.get("evidence_refs") or [])
@@ -523,6 +1012,9 @@ def _briefing_card(
         "updated_at": item.get("updated_at"),
         "latest_event_type": str(item.get("latest_event_type") or "created"),
         "reconciliation_status": str(metadata.get("reconciliation_status") or "confirmed"),
+        "recurring_event_id": metadata.get("recurring_event_id"),
+        "meeting_brief_ready": meeting_brief_ready,
+        "recruiter_activity": recruiter_activity,
         "handled_verdict": handled_verdict,
         "handled_confidence": float((assessment or {}).get("confidence") or 0.0),
         "handled_coverage": (assessment or {}).get("coverage") or coverage,
@@ -628,6 +1120,116 @@ def _coverage_from_run(
     return coverage, "partial"
 
 
+def _latest_gmail_decisions_by_thread(
+    db_path: Path,
+) -> dict[tuple[str, str], Mapping[str, Any]]:
+    output: dict[tuple[str, str], Mapping[str, Any]] = {}
+    for decision in list_shadow_decisions(db_path, limit=5000):
+        if str(decision.get("source_type") or "") != "gmail":
+            continue
+        key = (
+            str(decision.get("account_key") or ""),
+            str(decision.get("source_key") or ""),
+        )
+        output.setdefault(key, decision)
+    return output
+
+
+def _gmail_item_is_hidden_marketing(
+    item: Mapping[str, Any],
+    latest_decisions: Mapping[tuple[str, str], Mapping[str, Any]],
+) -> bool:
+    if (
+        str(item.get("source_type") or "") != "gmail"
+        or str(item.get("state") or "active") in TERMINAL_STATES
+    ):
+        return False
+    evidence_refs = item.get("evidence_refs") or []
+    thread_id = _first_reference_value(evidence_refs, "thread_id") or str(
+        item.get("source_key") or ""
+    ).partition(":")[0]
+    decision = latest_decisions.get(
+        (str(item.get("account_key") or ""), thread_id)
+    )
+    decision_reason = str((decision or {}).get("reason_code") or "").casefold()
+    decision_disposition = str((decision or {}).get("disposition") or "")
+    if decision_disposition == "surfaced" and decision_reason == "recruiter_activity":
+        return False
+    return decision_disposition != "surfaced" and "marketing" in decision_reason
+
+
+def _gmail_item_is_recruiter_activity(
+    item: Mapping[str, Any],
+    latest_decisions: Mapping[tuple[str, str], Mapping[str, Any]],
+) -> bool:
+    if str(item.get("source_type") or "") != "gmail":
+        return False
+    evidence_refs = item.get("evidence_refs") or []
+    thread_id = _first_reference_value(evidence_refs, "thread_id") or str(
+        item.get("source_key") or ""
+    ).partition(":")[0]
+    decision = latest_decisions.get(
+        (str(item.get("account_key") or ""), thread_id)
+    )
+    return bool(
+        decision
+        and str(decision.get("disposition") or "") == "surfaced"
+        and str(decision.get("reason_code") or "") == "recruiter_activity"
+    )
+
+
+def _merge_hidden_marketing_audit(
+    suppressed: Sequence[Mapping[str, Any]],
+    hidden_items: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    output = [dict(value) for value in suppressed]
+    existing = {
+        (
+            str(value.get("account_key") or ""),
+            _first_reference_value(value.get("evidence_refs") or [], "thread_id")
+            or str(value.get("source_key") or "").partition(":")[0],
+        )
+        for value in output
+        if str(value.get("source_type") or "") == "gmail"
+    }
+    for item in hidden_items:
+        evidence_refs = list(item.get("evidence_refs") or [])
+        thread_id = _first_reference_value(evidence_refs, "thread_id") or str(
+            item.get("source_key") or ""
+        ).partition(":")[0]
+        key = (str(item.get("account_key") or ""), thread_id)
+        if key in existing:
+            continue
+        existing.add(key)
+        source_ref = _first_reference_value(evidence_refs, "source_ref") or (
+            f"gmail:{item.get('account_key')}:{thread_id}"
+        )
+        output.append(
+            {
+                "id": f"marketing-hidden:{item['id']}",
+                "source_type": "gmail",
+                "account_key": str(item.get("account_key") or ""),
+                "source_key": thread_id,
+                "title": str(item.get("title") or "Marketing update")[:500],
+                "disposition": "suppressed",
+                "reason_code": "marketing_update",
+                "confidence": max(float(item.get("confidence") or 0.0), 0.99),
+                "created_at": item.get("updated_at") or item.get("created_at"),
+                "evidence_refs": evidence_refs,
+                "local_evidence_route": local_evidence_route(
+                    source_type="gmail",
+                    account_key=str(item.get("account_key") or ""),
+                    source_ref=source_ref,
+                    source_revision=_first_reference_value(
+                        evidence_refs,
+                        "source_revision",
+                    ),
+                ),
+            }
+        )
+    return output[:200]
+
+
 def _suppressed_audit(
     db_path: Path,
     run: Mapping[str, Any] | None,
@@ -702,6 +1304,13 @@ def _is_action_candidate(card: Mapping[str, Any], *, now: datetime) -> bool:
     if (
         float(card["confidence"]) < LOW_CONFIDENCE
         or str(card["reconciliation_status"]) != "confirmed"
+    ):
+        return False
+    if (
+        bool(card.get("recruiter_activity"))
+        and str(card.get("kind") or "") == "attention"
+        and not card.get("due_at")
+        and not card.get("starts_at")
     ):
         return False
     snoozed_until = card.get("snoozed_until")
@@ -865,7 +1474,15 @@ def _feedback_actions(item: Mapping[str, Any]) -> list[str]:
     state = str(item["state"])
     if state in TERMINAL_STATES:
         return ["restore"]
-    return ["confirm", "done", "snooze", "dismiss", "incorrect"]
+    actions = ["confirm", "done", "snooze", "dismiss", "incorrect"]
+    metadata = item.get("metadata")
+    if (
+        str(item.get("source_type") or "") == "calendar"
+        and isinstance(metadata, Mapping)
+        and str(metadata.get("recurring_event_id") or "").strip()
+    ):
+        actions.append("dismiss_series")
+    return actions
 
 
 def _first_reference_value(refs: Any, key: str) -> str | None:

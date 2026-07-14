@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Protocol, Sequence
 from zoneinfo import ZoneInfo
@@ -18,7 +18,7 @@ from .llm import LLMProvider, complete_json, json_prompt
 from .operational_budget import DailyBudgetExceeded
 
 
-GMAIL_DETECTOR_VERSION = "gmail-operations-v3"
+GMAIL_DETECTOR_VERSION = "gmail-operations-v6"
 DETECTOR_OUTPUT_TOKEN_RESERVE = GMAIL_DETECTOR_OUTPUT_TOKEN_CEILING
 DETECTOR_INPUT_TOKEN_OVERHEAD_RESERVE = (
     GMAIL_DETECTOR_INPUT_OVERHEAD_TOKEN_CEILING
@@ -35,6 +35,7 @@ HANDLED_VERDICTS = {
     "unknown",
 }
 SUPPRESSION_REASONS = {
+    "marketing_update",
     "marketing_no_action",
     "bulk_no_action",
     "transactional_no_current_action",
@@ -67,8 +68,80 @@ _HIGH_CONSEQUENCE_SIGNAL = re.compile(
     r"delivery|appointment|interview|cancelled|canceled|delayed|changed)\b",
     re.IGNORECASE,
 )
-_MARKETING_SIGNAL = re.compile(
-    r"\b(?:unsubscribe|shop now|sale|discount|offer|newsletter|digest|promotion)\b",
+_PROMOTIONAL_SIGNAL = re.compile(
+    r"\b(?:shop now|promo(?:tion|tional)? code|limited[ -]?time offer|"
+    r"special offer|sale ends?|clearance|sponsored|advertisement|"
+    r"save \d{1,2}%|\d{1,2}% off|exclusive deal)\b",
+    re.IGNORECASE,
+)
+_NEWSLETTER_DIGEST_SIGNAL = re.compile(
+    r"\b(?:newsletter|daily digest|weekly digest|monthly digest|news digest)\b",
+    re.IGNORECASE,
+)
+_PUBLISHER_DIGEST_SIGNAL = re.compile(
+    r"\b(?:the world in brief|for subscribers|today(?:'|’|&rsquo;)s top stories)\b|"
+    r"\bcatch up quickly on .{0,80}\bstories\b",
+    re.IGNORECASE,
+)
+_EVENT_PROMOTION_SIGNAL = re.compile(
+    r"\b(?:register (?:now|today)|reserve your (?:seat|spot)|"
+    r"save your (?:seat|spot)|lock in your spot|"
+    r"tickets? (?:are )?(?:available|on sale))\b",
+    re.IGNORECASE,
+)
+_PRODUCT_ONBOARDING_MARKETING_SIGNAL = re.compile(
+    r"\b(?:here are (?:a few )?tips to get you started|"
+    r"get the most out of your|personalized tips, news and recommendations|"
+    r"help you set up your (?:account|browser|device)|"
+    r"choose .{0,40}, the (?:browser|app|service) by)\b",
+    re.IGNORECASE,
+)
+_OPT_OUT_SIGNAL = re.compile(
+    r"\b(?:unsubscribe|manage (?:your )?(?:email )?preferences)\b",
+    re.IGNORECASE,
+)
+_RECRUITING_SIGNAL = re.compile(
+    r"\b(?:i(?:'m| am) (?:a |an )?(?:technical |executive )?recruiter|"
+    r"i(?:'m| am) recruiting for|talent acquisition|recruiting (?:team|process)|"
+    r"hiring (?:manager|team)|your (?:background|experience|profile).{0,120}"
+    r"(?:role|position|opportunity)|reaching out.{0,120}(?:role|position|opportunity)|"
+    r"came across your (?:background|experience|profile).{0,160}"
+    r"(?:connect|chat|role|position|opportunity)|"
+    r"would (?:like|love) to (?:connect|chat|speak).{0,160}"
+    r"(?:role|position|opportunity)|(?:career|job) opportunity (?:at|with)|"
+    r"working with .{1,120} on .{1,120}\bsearch\b.{0,160}"
+    r"(?:reach(?:ing)? out|connect)|"
+    r"(?:head of|vice president|vp|director|chief|senior).{1,100}"
+    r"\bsearch\b.{0,160}(?:reach(?:ing)? out|connect)|"
+    r"reviewed\s+.{0,120}\bprofiles\b.{0,160}\breaching out\b.{0,160}"
+    r"(?:great|good|strong) fit|"
+    r"interview (?:availability|schedule|scheduling|process|feedback)|"
+    r"application (?:status|update|process)|(?:next steps|moving forward).{0,120}"
+    r"(?:application|interview)|following up.{0,120}"
+    r"(?:role|position|interview|application))\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_RECRUITING_BULK_SIGNAL = re.compile(
+    r"\b(?:job alert|jobs? (?:alert|digest)|recommended jobs?|"
+    r"jobs? matching your|new jobs? (?:for|in)|browse all jobs?)\b",
+    re.IGNORECASE,
+)
+_RECRUITING_STRONG_OPERATION_SIGNAL = re.compile(
+    r"\b(?:deadline|past due|overdue|due (?:today|tomorrow|by|on)|"
+    r"by (?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|"
+    r"saturday|sunday|january|february|march|april|may|june|july|august|"
+    r"september|october|november|december)|scheduled (?:for|on)|"
+    r"confirmed (?:for|on)|offer expires?|submit (?:the |your )?"
+    r"(?:exercise|assignment|application)|complete (?:the |your )?"
+    r"(?:exercise|assignment|application))\b",
+    re.IGNORECASE,
+)
+_OPERATIONAL_NOTIFICATION_SIGNAL = re.compile(
+    r"\b(?:(?:run|workflow|build|check|tests?|deployment|pipeline) "
+    r"(?:failed|failing|cancelled|canceled|requires attention)|"
+    r"(?:failed|failing) (?:run|workflow|build|check|tests?|deployment|pipeline)|"
+    r"pull request|review requested|assigned to you|mentioned you|"
+    r"replied to your|commented on|new comment|direct message)\b",
     re.IGNORECASE,
 )
 _DETECTOR_KEY = re.compile(r"[a-z0-9][a-z0-9_-]{0,79}")
@@ -132,6 +205,8 @@ class GmailPreclassification:
     reason_code: str
     high_consequence: bool
     direct_operator_thread: bool
+    marketing_update: bool
+    recruiting_activity: bool
     estimated_input_tokens: int
 
 
@@ -231,6 +306,8 @@ def preclassify_gmail_thread(
             reason_code="empty_thread",
             high_consequence=False,
             direct_operator_thread=False,
+            marketing_update=False,
+            recruiting_activity=False,
             estimated_input_tokens=estimated,
         )
     high_consequence = bool(_HIGH_CONSEQUENCE_SIGNAL.search(content))
@@ -248,30 +325,65 @@ def preclassify_gmail_thread(
         not message.outgoing and "?" in message.body
         for message in thread.messages
     )
-    # Marketing headers are a stronger signal than incidental action/high-consequence
-    # words in newsletter boilerplate. Existing operational items are still sent to
-    # the detector by detect_gmail_threads(), so this gate cannot strand an item that
-    # is already being tracked.
-    marketing = thread.message_class in {"bulk", "marketing"}
-    should_detect = not marketing and (
-        thread.message_class == "human"
+    recruiting_activity = _is_recruiting_activity(
+        thread,
+        content=content,
+        direct_operator_thread=direct_operator_thread,
+    )
+    operational_notification = bool(_OPERATIONAL_NOTIFICATION_SIGNAL.search(content))
+    # List-Unsubscribe/List-Id headers identify distribution infrastructure, not
+    # semantic marketing. CI failures, direct replies, billing notices, and recruiter
+    # outreach commonly carry those headers too. Suppress only content with narrow
+    # promotional/newsletter semantics; individual recruiting is carved out first.
+    marketing_update = not recruiting_activity and (
+        bool(_PROMOTIONAL_SIGNAL.search(content))
+        or bool(_RECRUITING_BULK_SIGNAL.search(content))
+        or (
+            thread.message_class != "human"
+            and bool(_PUBLISHER_DIGEST_SIGNAL.search(content))
+        )
+        or (
+            thread.message_class in {"bulk", "marketing"}
+            and bool(
+                _NEWSLETTER_DIGEST_SIGNAL.search(content)
+                or _EVENT_PROMOTION_SIGNAL.search(content)
+                or (
+                    _PRODUCT_ONBOARDING_MARKETING_SIGNAL.search(content)
+                    and _OPT_OUT_SIGNAL.search(content)
+                )
+            )
+        )
+    )
+    should_detect = not marketing_update and (
+        recruiting_activity
+        or thread.message_class == "human"
+        or thread.message_class == "transactional"
         or high_consequence
         or action_signal
         or commitment_signal
+        or operational_notification
         or (direct_operator_thread and has_question)
     )
     if should_detect:
         reason = (
-            "high_consequence_signal"
+            "recruiter_activity"
+            if recruiting_activity
+            else "high_consequence_signal"
             if high_consequence
+            else "operational_notification"
+            if operational_notification
             else "human_correspondence"
             if thread.message_class == "human"
+            else "transactional_event"
+            if thread.message_class == "transactional"
             else "operational_language"
         )
-    elif marketing or _MARKETING_SIGNAL.search(content):
-        reason = "marketing_no_action"
+    elif marketing_update:
+        reason = "marketing_update"
     elif thread.message_class == "transactional":
         reason = "transactional_no_current_action"
+    elif thread.message_class in {"bulk", "marketing"}:
+        reason = "bulk_no_action"
     else:
         reason = "human_no_current_action"
     return GmailPreclassification(
@@ -280,6 +392,8 @@ def preclassify_gmail_thread(
         reason_code=reason,
         high_consequence=high_consequence,
         direct_operator_thread=direct_operator_thread,
+        marketing_update=marketing_update,
+        recruiting_activity=recruiting_activity,
         estimated_input_tokens=estimated,
     )
 
@@ -307,9 +421,22 @@ def detect_gmail_threads(
     preclassification_by_id = {decision.thread_id: decision for decision in preclassified}
     detections: dict[str, GmailThreadDetection] = {}
     model_entries: list[tuple[NormalizedGmailThread, GmailPreclassification]] = []
+    deterministic_suppressed_count = 0
     for decision in preclassified:
-        if decision.should_detect or active_items_by_thread.get(decision.thread_id):
-            model_entries.append((by_id[decision.thread_id], decision))
+        thread = by_id[decision.thread_id]
+        active_items = active_items_by_thread.get(decision.thread_id, ())
+        if decision.recruiting_activity and not _recruiting_requires_model(
+            thread,
+            active_items=active_items,
+        ):
+            detections[decision.thread_id] = _recruiting_attention_detection(
+                thread,
+                operator_emails=operator_emails,
+                active_items=active_items,
+            )
+            continue
+        if decision.should_detect or active_items:
+            model_entries.append((thread, decision))
             continue
         detections[decision.thread_id] = GmailThreadDetection(
             thread_id=decision.thread_id,
@@ -317,6 +444,7 @@ def detect_gmail_threads(
             reason_code=decision.reason_code,
             confidence=0.99,
         )
+        deterministic_suppressed_count += 1
 
     model_entries.sort(
         key=lambda pair: (
@@ -424,6 +552,11 @@ def detect_gmail_threads(
             for result in parsed:
                 decision = preclassification_by_id[result.thread_id]
                 active_items = active_items_by_thread.get(result.thread_id, ())
+                if decision.recruiting_activity:
+                    result = _apply_recruiting_attention_policy(
+                        result,
+                        active_items=active_items,
+                    )
                 direct_obligation = _has_direct_incoming_obligation(
                     by_id[result.thread_id],
                     operator_emails=operator_emails,
@@ -548,7 +681,7 @@ def detect_gmail_threads(
         estimated_output_tokens=estimated_output_tokens,
         deferred_count=deferred_count,
         model_thread_count=len(model_entries) - deferred_count,
-        deterministic_suppressed_count=len(threads) - len(model_entries),
+        deterministic_suppressed_count=deterministic_suppressed_count,
         coverage_complete=coverage_complete,
         errors=tuple(errors),
     )
@@ -560,11 +693,15 @@ def _defer_remaining(
     *,
     reason_code: str,
 ) -> int:
-    for thread, _decision in entries:
+    for thread, decision in entries:
         detections[thread.thread_id] = GmailThreadDetection(
             thread_id=thread.thread_id,
             disposition="deferred",
-            reason_code=reason_code,
+            reason_code=(
+                "marketing_update_pending_reconciliation"
+                if decision.marketing_update
+                else reason_code
+            ),
         )
     return len(entries)
 
@@ -708,6 +845,132 @@ def _visible_uncertain_fallback(
         reason_code=reason_code,
         candidates=(candidate,),
         confidence=0.25,
+    )
+
+
+def _recruiting_requires_model(
+    thread: NormalizedGmailThread,
+    *,
+    active_items: Sequence[Mapping[str, Any]],
+) -> bool:
+    if any(
+        item.get("human_confirmed_at")
+        or str(item.get("kind") or item.get("item_kind") or "")
+        in {"commitment", "deadline"}
+        or item.get("due_at")
+        or item.get("starts_at")
+        for item in active_items
+    ):
+        return True
+    content = _thread_signal_text(thread)
+    if _RECRUITING_STRONG_OPERATION_SIGNAL.search(content):
+        return True
+    return any(
+        message.outgoing and _COMMITMENT_SIGNAL.search(message.body or "")
+        for message in thread.messages
+    )
+
+
+def _recruiting_attention_detection(
+    thread: NormalizedGmailThread,
+    *,
+    operator_emails: Sequence[str],
+    active_items: Sequence[Mapping[str, Any]],
+) -> GmailThreadDetection:
+    evidence = _recruiting_evidence_message(thread)
+    handled, handled_confidence = _deterministic_handled_state(
+        thread,
+        operator_emails=operator_emails,
+    )
+    bases: Sequence[Mapping[str, Any]] = active_items[:12] or ({},)
+    candidates: list[GmailOperationalCandidate] = []
+    for active_item in bases:
+        title = str(
+            active_item.get("title") or thread.subject or "Recruiting activity"
+        )[:500]
+        raw_detector_key = str(active_item.get("detector_key") or "").strip()
+        detector_key = (
+            raw_detector_key
+            if _DETECTOR_KEY.fullmatch(raw_detector_key)
+            else _fallback_detector_key("attention", title)
+        )
+        candidates.append(
+            GmailOperationalCandidate(
+                detector_key=detector_key,
+                operation="update" if active_item else "create",
+                kind="attention",
+                title=title,
+                owner="unknown",
+                confidence=0.8,
+                priority=40,
+                evidence_message_ids=(evidence.message_id,),
+                handled_verdict=handled,
+                handled_confidence=handled_confidence,
+                reason="Human recruiting activity is relevant for review.",
+                reconciliation_status="confirmed",
+            )
+        )
+    normalized = tuple(candidates)
+    return GmailThreadDetection(
+        thread_id=thread.thread_id,
+        disposition="surfaced",
+        reason_code="recruiter_activity",
+        candidates=normalized,
+        confidence=max(candidate.confidence for candidate in normalized),
+    )
+
+
+def _apply_recruiting_attention_policy(
+    detection: GmailThreadDetection,
+    *,
+    active_items: Sequence[Mapping[str, Any]],
+) -> GmailThreadDetection:
+    """Keep routine recruiting visible as Attention without manufacturing urgency.
+
+    Explicit commitments, deadlines, and scheduled times retain their stronger
+    operational semantics. Existing tracked items also retain their reconciliation
+    path instead of being silently rewritten from a new classifier hint.
+    """
+
+    if detection.disposition == "suppressed":
+        return detection
+    if detection.disposition != "surfaced" or not detection.candidates:
+        return detection
+
+    active_has_stronger_item = any(
+        str(item.get("kind") or item.get("item_kind") or "")
+        in {"commitment", "deadline"}
+        for item in active_items
+    )
+    candidates: list[GmailOperationalCandidate] = []
+    for candidate in detection.candidates:
+        stronger = bool(
+            active_has_stronger_item
+            or candidate.kind in {"commitment", "deadline"}
+            or candidate.due_at
+            or candidate.starts_at
+        )
+        if stronger:
+            candidates.append(candidate)
+            continue
+        candidates.append(
+            replace(
+                candidate,
+                kind="attention",
+                owner="unknown",
+                priority=min(candidate.priority, 40),
+                reason=_append_reason(
+                    candidate.reason,
+                    "Routine recruiting activity is filed under Attention.",
+                ),
+            )
+        )
+    normalized = tuple(candidates)
+    return replace(
+        detection,
+        reason_code="recruiter_activity",
+        candidates=normalized,
+        confidence=max(candidate.confidence for candidate in normalized),
     )
 
 
@@ -861,6 +1124,8 @@ def _detector_prompt(
                         operator_emails=operator_emails,
                     ),
                     "high_consequence": classification.high_consequence,
+                    "marketing_update": classification.marketing_update,
+                    "recruiting_activity": classification.recruiting_activity,
                     "preclassification_reason": classification.reason_code,
                     "active_item_count": len(active_items),
                 },
@@ -872,8 +1137,12 @@ def _detector_prompt(
         "thread exactly once. Find current commitments, waiting items, follow-ups, "
         "deadlines, or attention/decision items. Bulk and transactional mail can contain "
         "important logistics, payments, renewals, travel changes, deliveries, appointments, "
-        "or security deadlines; do not reject it merely because it is automated. Marketing "
-        "with no current action should be ignored.\n\n"
+        "or security deadlines; do not reject it merely because it is automated. Advertising, "
+        "newsletters, promotions, and other marketing updates must be ignored even when their "
+        "boilerplate contains action or urgency words. Individual recruiter outreach, interview "
+        "scheduling, and application follow-ups are relevant: use kind=attention and no more "
+        "than normal priority unless exact cited evidence establishes a commitment, deadline, "
+        "or scheduled time.\n\n"
         "Handled-state rules: read/unread never proves completion; an outgoing reply proves "
         "only response unless it directly supplies or explicitly declines the requested "
         "result; a promise to act remains needs_action; silence never means being handled; "
@@ -954,6 +1223,33 @@ def _thread_signal_text(thread: NormalizedGmailThread) -> str:
     return "\n".join(
         [thread.subject or "", *(message.body for message in thread.messages)]
     )
+
+
+def _is_recruiting_activity(
+    thread: NormalizedGmailThread,
+    *,
+    content: str,
+    direct_operator_thread: bool,
+) -> bool:
+    if not direct_operator_thread or _RECRUITING_BULK_SIGNAL.search(content):
+        return False
+    if not _RECRUITING_SIGNAL.search(content):
+        return False
+    return True
+
+
+def _recruiting_evidence_message(
+    thread: NormalizedGmailThread,
+) -> NormalizedGmailMessage:
+    matching = [
+        message
+        for message in thread.messages
+        if not message.outgoing and _RECRUITING_SIGNAL.search(message.body)
+    ]
+    if matching:
+        return matching[-1]
+    incoming = [message for message in thread.messages if not message.outgoing]
+    return incoming[-1] if incoming else thread.messages[-1]
 
 
 def _has_direct_incoming_obligation(

@@ -385,6 +385,31 @@ def test_global_provider_selection_cannot_route_gmail_to_direct_api(
     selection = resolve_gmail_llm_selection(paths)
     assert selection.provider == "codex"
     assert selection.provider_source == "gmail-default:restricted-codex"
+    assert selection.codex_model == "gpt-5.6-luna"
+    assert selection.codex_reasoning_effort == "high"
+
+
+def test_shared_cos_model_defaults_can_be_overridden_by_gmail_specific_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    monkeypatch.setenv("PKM_BRAIN_COS_CODEX_MODEL", "gpt-5.6-luna")
+    monkeypatch.setenv("PKM_BRAIN_COS_CODEX_REASONING_EFFORT", "high")
+
+    shared = resolve_gmail_llm_selection(paths)
+    assert shared.codex_model == "gpt-5.6-luna"
+    assert shared.codex_reasoning_effort == "high"
+
+    paths.config_local.mkdir(parents=True)
+    config_path = paths.config_local / GMAIL_LLM_CONFIG_FILENAME
+    config_path.write_text(
+        "provider: codex\ncodex_reasoning_effort: medium\n",
+        encoding="utf-8",
+    )
+    os.chmod(config_path, 0o600)
+    specific = resolve_gmail_llm_selection(paths)
+    assert specific.codex_reasoning_effort == "medium"
 
 
 @pytest.mark.parametrize("provider_name", ("openai", "anthropic", "ollama"))
@@ -486,5 +511,5 @@ def test_restricted_provider_records_usage_without_persisting_session(
     assert summary["totals"]["cached_input_tokens"] == 100
     assert summary["cycles"][0]["roles"][0]["role"] == "gmail_detector"
     assert summary["cycles"][0]["roles"][0]["models"] == [
-        "codex-gmail-restricted:gpt-5.6-luna:low"
+        "codex-gmail-restricted:gpt-5.6-luna:high"
     ]
