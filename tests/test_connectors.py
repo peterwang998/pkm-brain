@@ -17,8 +17,11 @@ import yaml
 from pkm_brain.capture import AgentLogCapture
 from pkm_brain.connector_auth import (
     MemoryCredentialStore,
+    OAUTH_PROVIDERS,
     OAuthCallbackBroker,
+    PendingOAuthFlow,
     begin_connector_authorization,
+    complete_authorization,
     configure_connector_auth,
     connector_auth_status,
     disconnect_connector_auth,
@@ -236,6 +239,82 @@ def test_oauth_identity_flow_rejects_missing_identity_token(tmp_path: Path) -> N
         assert store.load("gmail") == {}
     finally:
         broker.shutdown()
+
+
+def test_oauth_refresh_token_is_preserved_only_for_the_same_provider_subject(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    store = MemoryCredentialStore()
+    configure_connector_auth(
+        paths,
+        "gmail",
+        client_id="desktop-client-id",
+        client_secret="client-secret",
+        store=store,
+    )
+    expires_at = int((datetime.now(timezone.utc) + timedelta(hours=1)).timestamp())
+
+    def identity_token(subject: str, email: str) -> str:
+        return encoded_id_token(
+            {
+                "aud": "desktop-client-id",
+                "iss": "https://accounts.google.com",
+                "email": email,
+                "sub": subject,
+                "exp": expires_at,
+            }
+        )
+
+    original_token = identity_token("google-subject-1", "person@example.com")
+    store.save(
+        "gmail",
+        {
+            "client_secret": "client-secret",
+            "access_token": "old-access",
+            "refresh_token": "old-refresh",
+            "id_token": original_token,
+        },
+    )
+    flow = PendingOAuthFlow(
+        paths=paths,
+        provider=OAUTH_PROVIDERS["gmail"],
+        store=store,
+        state="oauth-state",
+        client_id="desktop-client-id",
+        client_secret="client-secret",
+        redirect_uri="http://127.0.0.1/oauth/callback/gmail",
+        created_at=datetime.now(timezone.utc),
+    )
+    complete_authorization(
+        flow,
+        {
+            "access_token": "same-account-access",
+            "id_token": identity_token("google-subject-1", "person@example.com"),
+        },
+    )
+    same_account_credentials = store.load("gmail")
+    assert same_account_credentials is not None
+    assert same_account_credentials["refresh_token"] == "old-refresh"
+
+    with pytest.raises(ValueError, match="identity could not be verified"):
+        complete_authorization(
+            flow,
+            {
+                "access_token": "different-account-access",
+                "id_token": identity_token(
+                    "google-subject-2",
+                    "other-person@example.com",
+                ),
+            },
+        )
+
+    assert store.load("gmail") == same_account_credentials
+    status = connector_auth_status(paths, "gmail", store=store)
+    assert status is not None
+    assert status["provider_subject"] == "google-subject-1"
+    assert status["account_label"] == "person@example.com"
 
 
 def test_connector_capture_keeps_codex_paths_and_capture_source_keys(tmp_path: Path) -> None:

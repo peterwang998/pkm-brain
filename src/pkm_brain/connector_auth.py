@@ -731,13 +731,27 @@ def complete_authorization(flow: PendingOAuthFlow, token_response: dict[str, Any
         raise ValueError("OAuth provider returned an invalid identity token")
     _validate_identity_claims(flow, claims)
     existing = flow.store.load(flow.provider.connector_id) or {}
+    existing_refresh_token = str(existing.get("refresh_token") or "").strip()
+    response_refresh_token = str(token_response.get("refresh_token") or "").strip()
+    if existing_refresh_token and not response_refresh_token:
+        existing_subject = _provider_subject_from_credentials(existing)
+        response_subject = _provider_subject(claims)
+        if (
+            existing_subject is None
+            or response_subject is None
+            or existing_subject != response_subject
+        ):
+            raise ValueError(
+                "OAuth provider did not return a refresh token and the existing "
+                "credential identity could not be verified"
+            )
     credentials = {"client_secret": flow.client_secret} if flow.client_secret else {}
     for key in ("access_token", "refresh_token", "id_token", "token_type", "scope"):
         value = token_response.get(key)
         if value:
             credentials[key] = value
-        elif key == "refresh_token" and existing.get(key):
-            credentials[key] = existing[key]
+        elif key == "refresh_token" and existing_refresh_token:
+            credentials[key] = existing_refresh_token
     if token_response.get("expires_in") is not None:
         try:
             expires_at = datetime.now(timezone.utc) + timedelta(seconds=int(token_response["expires_in"]))
