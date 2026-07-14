@@ -1,7 +1,7 @@
 # Product Foundation
 
 **Status:** canonical living feature spec; the manual read-only Chief-of-Staff trial is locally release-verified and testing-ready, while its first owner-authorized live run and promotion remain pending
-**Last verified:** 2026-07-14 with Ruff green, 736 Python tests, 26 Swift tests, and a signed local app bundle built; no live connector result is claimed
+**Last verified:** 2026-07-14 with Ruff green, 736 Python tests, 26 Swift tests, and a signed local app bundle built, installed, and launched with a healthy daemon; no live connector result is claimed
 **Owns:** product boundaries, authority hierarchy, persistence model, privacy rules, and cross-feature invariants
 
 ## Purpose
@@ -204,7 +204,7 @@ The core local Knowledge Curation pipeline, fact/entity ledger, action policy, m
 
 The Operational Chief-of-Staff context now has an isolated, independently migrated `ops.sqlite` kernel, a daemon-owned fail-closed mutation service, coordinated database-pair recovery, read-only Calendar/Gmail source integration, deterministic reconciliation, a coverage-aware Today briefing, local feedback, and offline replay evaluation. The daemon initializes and serves the operational store, but does not schedule the shadow pass: the owner must authorize two exact-scope Google grants and select **Today > Run Shadow** for every live pass. Operational writes remain local to `ops.sqlite`; Calendar/Gmail knowledge ingestion and all external-action authority remain disabled. Restores publish only into a new quarantined home and cannot become a writer until a future explicit topology activation workflow.
 
-The 2026-07-14 local release gate is complete: Ruff is green, 736 Python tests and 26 Swift tests pass, and the signed local app bundle builds. That makes the manual workflow testing-ready; observed signed-app UI acceptance remains a separate final gate. Neither establishes live connector success, private-source quality, daily briefing trust, or promotion. The first owner-authorized live trial and the owning spec's empirical gates remain pending.
+The 2026-07-14 local release gate is complete: Ruff is green, 736 Python tests and 26 Swift tests pass, and the signed local app bundle builds, installs, launches, and serves a healthy daemon. That makes the manual workflow testing-ready. Two isolated UI-acceptance attempts executed no app test bodies because macOS timed out enabling XCTest automation mode, so observed native UI acceptance remains a host-level final gate. None of these checks establishes live connector success, private-source quality, daily briefing trust, or promotion. The first owner-authorized live trial and the owning spec's empirical gates remain pending.
 
 The item lifecycle, source-specific detection, reconciliation, briefing, evaluation, and execution protocol are specified in [Chief-of-Staff Operations](chief-of-staff-operations.md). This foundation owns the boundary between that context and existing Knowledge Curation.
 

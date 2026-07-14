@@ -1,7 +1,7 @@
 # Chief-of-Staff Operations Implementation Plan
 
 **Status:** manual Calendar/Gmail shadow implementation is locally release-verified and testing-ready; the first owner-authorized live trial and every promotion gate remain pending
-**Last verified:** 2026-07-14 with Ruff green, 736 Python tests, 26 Swift tests, and a signed local app bundle built; no live connector result or promotion is claimed
+**Last verified:** 2026-07-14 with Ruff green, 736 Python tests, 26 Swift tests, and a signed local app bundle built, installed, and launched with a healthy daemon; no live connector result or promotion is claimed
 **Owning spec:** [Chief-of-Staff Operations](../specs/chief-of-staff-operations.md)
 
 ## Outcome
@@ -44,7 +44,7 @@ The program keeps one product, one app, one coordinator daemon, and one Brain ho
 
 Calendar and the operational kernel preceded Gmail implementation. The owner has separately approved Gmail read-only access for a private operational shadow trial, but that does not promote either source or enable Gmail retrieval/knowledge ingestion. Source-local detection and satisfaction must work before cross-source aggregation. Reconciliation must work before the briefing is considered trustworthy. Optional adapters follow the same contract and cannot bypass Calendar/Gmail gates. Drafting must work before execution.
 
-Local release verification completed on 2026-07-14: Ruff was green, all 736 Python tests and 26 Swift tests passed, and the signed local app bundle built successfully. These checks establish testing readiness only. The observed signed-app UI acceptance pass remains a separate final gate. Neither result proves Google authorization, live source coverage, detector quality on private mail, daily briefing trust, or any promotion gate; the first owner-authorized live trial remains the next source-evaluation step.
+Local release verification completed on 2026-07-14: Ruff was green, all 736 Python tests and 26 Swift tests passed, and the signed local app bundle built, installed, launched, and served a healthy daemon. These checks establish testing readiness only. Two isolated UI-acceptance attempts executed no app test bodies because macOS timed out enabling XCTest automation mode, so observed native UI acceptance remains a host-level final gate. Neither result proves Google authorization, live source coverage, detector quality on private mail, daily briefing trust, or any promotion gate; the first owner-authorized live trial remains the next source-evaluation step.
 
 ## COS-0 - Knowledge Foundation Baseline
 

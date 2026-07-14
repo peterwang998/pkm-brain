@@ -1,7 +1,7 @@
 # App And Operations
 
 **Status:** canonical living feature spec; native app is primary, and the manual Calendar/Gmail shadow UI is locally release-verified and testing-ready, with the first owner-authorized live trial and promotion pending
-**Last verified:** 2026-07-14 with Ruff green, 736 Python tests, 26 Swift tests, and a signed local app bundle built; no private live connector result is claimed
+**Last verified:** 2026-07-14 with Ruff green, 736 Python tests, 26 Swift tests, and a signed local app bundle built, installed, and launched with a healthy daemon; no private live connector result is claimed
 **Owns:** daemon, scheduler, connector operations, native/browser UI, settings, provisioning, packaging, migration, and operational retention
 
 ## Product Shape
@@ -319,7 +319,7 @@ Provisioning checks bundle, local cache, then network. It smoke-tests `brain --v
 
 `scripts/build-app.sh` builds the exact project-version wheel, replaces stale runtime resources, resolves pinned Swift packages through absolute app-local cache paths, generates/builds the Xcode project, ad-hoc signs nested binaries and the app, and writes `dist/PKM Brain.app`. `scripts/install-app.sh` stages and verifies the bundle in `/Applications`, keeps one previous app rollback, refreshes the login item, and optionally activates the installed build.
 
-The 2026-07-14 local release gate completed with Ruff green, 736 Python tests and 26 Swift tests passing, and a signed `dist/PKM Brain.app` bundle built. This establishes local testing readiness only. The observed signed-app UI acceptance pass remains a separate final gate, and neither the build nor that UI gate claims successful Calendar/Gmail authorization, live source coverage, or promotion.
+The 2026-07-14 local release gate completed with Ruff green, 736 Python tests and 26 Swift tests passing, and a signed `dist/PKM Brain.app` bundle built, installed, launched, and serving a healthy daemon. This establishes local testing readiness only. Two isolated UI-acceptance attempts executed no app test bodies because macOS timed out enabling XCTest automation mode; observed native UI acceptance therefore remains a host-level final gate. Neither the build nor that UI gate claims successful Calendar/Gmail authorization, live source coverage, or promotion.
 
 Runtime versions are immutable deployment artifacts. Successful activation starts process-aware retention: current, one rollback, and every runtime referenced by a live process remain; inactive older versions are removed. Process inventory failure is fail-closed, and process output is drained before waiting for exit so large inventories cannot deadlock the retention task.
 
@@ -393,4 +393,4 @@ scripts/m3-migration-acceptance.sh
 scripts/build-app.sh
 ```
 
-The latest local result is Ruff green, 736 Python tests passing, 26 Swift tests passing, and a signed app bundle built. Observed signed-app UI acceptance remains a separate final gate; the first owner-authorized live shadow trial is an independent, pending source-evaluation step.
+The latest local result is Ruff green, 736 Python tests passing, 26 Swift tests passing, and a signed app bundle installed and serving a healthy daemon. Native UI automation remains blocked before test execution by the host's XCTest automation-mode timeout; the first owner-authorized live shadow trial is an independent, pending source-evaluation step.

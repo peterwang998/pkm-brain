@@ -2,7 +2,7 @@
 
 Use this runbook for the first private Calendar/Gmail evaluation in the macOS app. The trial is manual and read-only. It creates local operational state and feedback, but it cannot change Google data or add Gmail to Brain's knowledge layer.
 
-**Readiness:** local release verification completed on 2026-07-14 with Ruff green, 736 Python tests, 26 Swift tests, and a signed local app bundle built. The workflow is testing-ready; observed signed-app UI acceptance is a separate final gate. The first owner-authorized live trial and all promotion decisions remain pending, and this runbook does not claim live connector success.
+**Readiness:** local release verification completed on 2026-07-14 with Ruff green, 736 Python tests, 26 Swift tests, and a signed local app bundle built, installed, and launched with a healthy daemon. The workflow is testing-ready. Two isolated UI-acceptance attempts executed no app test bodies because macOS timed out enabling XCTest automation mode, so observed native UI acceptance remains a separate host-level final gate. The first owner-authorized live trial and all promotion decisions remain pending, and this runbook does not claim live connector success.
 
 ## What This Trial Can Access
 
@@ -12,6 +12,8 @@ Authorize two separate Google grants in **Ops > Connectors**:
 2. **Gmail:** identity plus `gmail.readonly`; this grant is used only for bounded operational shadow detection.
 
 Use the intended primary account for each card. The same email may authorize both cards, but the grants remain separate. Brain checks the exact account and exact scope set again before every run; a missing, broader, or changed-account grant stops the run.
+
+If a Google card says **Not configured**, open **Set Up**, paste the Google OAuth client ID, and choose **Connect**. The same client ID may be entered on both cards, but Brain stores the resulting Calendar and Gmail grants separately in Keychain. The Google cards use PKCE and do not require a client secret; the sheet exposes the fixed loopback redirect URL and a **Provider Console** link if the OAuth client still needs configuration.
 
 The approved local policy is fixed at:
 
@@ -97,4 +99,4 @@ Stop testing, do not interpret the result as an all-clear, and preserve the disp
 - a provider/model budget is exceeded without a visible partial/deferred result;
 - credentials, refresh tokens, or full detector prompts appear in Brain config, logs, reports, or briefing records.
 
-Implementation and local release verification are complete for this manual trial. Observed signed-app UI acceptance remains a separate final gate. The first owner-authorized private live result, human review, and every promotion gate remain pending until the owner performs the authorization and starts the run.
+Implementation and local release verification are complete for this manual trial. Two isolated native UI-acceptance attempts were blocked before test execution by the host's XCTest automation-mode timeout, so that observed gate remains open. The first owner-authorized private live result, human review, and every promotion gate remain pending until the owner performs the authorization and starts the run.

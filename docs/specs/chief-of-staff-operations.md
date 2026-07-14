@@ -1,7 +1,7 @@
 # Chief Of Staff Operations
 
 **Status:** canonical feature spec; the manual Calendar/Gmail shadow implementation is locally release-verified and testing-ready, with the first owner-authorized live trial and promotion still pending
-**Last verified:** 2026-07-14 with Ruff green, 736 Python tests, 26 Swift tests, and a signed local app bundle built; no private live connector result or promotion is claimed
+**Last verified:** 2026-07-14 with Ruff green, 736 Python tests, 26 Swift tests, and a signed local app bundle built, installed, and launched with a healthy daemon; no private live connector result or promotion is claimed
 **Owns:** operational items, reconciliation, briefings, operational evaluation, and guarded external execution
 
 ## Mission And Product Boundary
@@ -47,7 +47,7 @@ This slice is not scheduled. It does not write `inbox/`, `brain.sqlite`, documen
 
 Implementation completion does not equal promotion. The first private trial must still establish labeled recall, false-alarm, duplicate, stale, handled-state, evidence-route, coverage, and cost behavior before the briefing can be treated as trusted daily operational guidance.
 
-Local release verification is complete: Ruff is green, 736 Python tests and 26 Swift tests pass, and the signed local app bundle builds. This establishes that the manual trial is testing-ready, not that either connector has succeeded against private live data. An observed signed-app UI acceptance pass remains a separate final gate. The first owner-authorized live result, its human labels, and every Calendar, Gmail, cross-source, meeting-preparation, and daily-briefing promotion gate remain pending.
+Local release verification is complete: Ruff is green, 736 Python tests and 26 Swift tests pass, and the signed local app bundle builds, installs, launches, and serves a healthy daemon. This establishes that the manual trial is testing-ready, not that either connector has succeeded against private live data. Two isolated UI-acceptance attempts executed no app test bodies because macOS timed out enabling XCTest automation mode, so observed native UI acceptance remains a host-level final gate. The first owner-authorized live result, its human labels, and every Calendar, Gmail, cross-source, meeting-preparation, and daily-briefing promotion gate remain pending.
 
 The owner-facing procedure is [Live Chief-of-Staff Shadow Trial](../runbooks/chief-of-staff-shadow-trial.md). Offline chronological scoring remains documented separately in [Retrospective Shadow Replay](../runbooks/chief-of-staff-shadow-replay.md).
 
@@ -804,6 +804,6 @@ swift test --package-path app
 scripts/build-app.sh
 ```
 
-Latest local release verification completed on 2026-07-14 with Ruff green, 736 Python tests passing, 26 Swift tests passing, and the signed local app bundle built. This is a build/test gate only; observed signed-app UI acceptance remains a separate final gate, and the owner-authorized live trial plus all empirical promotion gates remain open.
+Latest local release verification completed on 2026-07-14 with Ruff green, 736 Python tests passing, 26 Swift tests passing, and the signed local app bundle installed and serving a healthy daemon. This is a local test/launch gate only; native UI automation remains blocked before test execution by the host's XCTest automation-mode timeout, and the owner-authorized live trial plus all empirical promotion gates remain open.
 
 The implementation plan owns release sequencing. This spec owns the behavior and promotion gates.
