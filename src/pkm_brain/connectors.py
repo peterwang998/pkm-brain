@@ -401,7 +401,10 @@ def gmail_connector() -> Connector:
         ConnectorManifest(
             id="gmail",
             display_name="Gmail",
-            description="Authorize a separate read-only Google account grant for Gmail evidence.",
+            description=(
+                "Authorize a separate read-only Gmail grant for the manual "
+                "Chief of Staff Shadow trial."
+            ),
             source_type="gmail_message",
             default_enabled=False,
             default_cadence_s=900,
@@ -413,8 +416,9 @@ def gmail_connector() -> Connector:
             capture_available=False,
             auth=auth_manifest("gmail"),
             activation_note=(
-                "The read-only transport is not wired to capture or scheduling; production "
-                "ingestion remains unavailable until its privacy gate passes."
+                "Use Today > Run Shadow for one bounded operational pass. Connector "
+                "capture, automatic scheduling, and Gmail knowledge ingestion remain "
+                "unavailable."
             ),
         )
     )
@@ -425,7 +429,10 @@ def calendar_connector() -> Connector:
         ConnectorManifest(
             id="calendar",
             display_name="Google Calendar",
-            description="Authorize a separate read-only Google Calendar grant.",
+            description=(
+                "Authorize a separate read-only Google Calendar grant for the manual "
+                "Chief of Staff Shadow trial."
+            ),
             source_type="google_calendar",
             default_enabled=False,
             default_cadence_s=900,
@@ -437,8 +444,9 @@ def calendar_connector() -> Connector:
             capture_available=False,
             auth=auth_manifest("calendar"),
             activation_note=(
-                "The read-only transport is not wired to capture, scheduling, or the "
-                "operational ledger."
+                "Use Today > Run Shadow to read the owned primary calendar into the "
+                "local operational ledger. Connector capture and automatic scheduling "
+                "remain unavailable."
             ),
         )
     )
