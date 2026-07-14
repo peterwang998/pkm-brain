@@ -90,10 +90,11 @@ def test_restricted_codex_command_is_fail_closed_and_non_agentic(
     assert "mcp_servers={}" in overrides
     assert "plugins={}" in overrides
     assert 'shell_environment_policy.inherit="none"' in overrides
-    rollout_index = overrides.index("features.rollout_budget=true")
-    assert overrides[rollout_index : rollout_index + 4] == [
-        "features.rollout_budget=true",
+    rollout_index = overrides.index("features.rollout_budget.enabled=true")
+    assert overrides[rollout_index : rollout_index + 5] == [
+        "features.rollout_budget.enabled=true",
         "features.rollout_budget.limit_tokens=16384",
+        "features.rollout_budget.reminder_at_remaining_tokens=[1]",
         "features.rollout_budget.sampling_token_weight=1.0",
         "features.rollout_budget.prefill_token_weight=1.0",
     ]
