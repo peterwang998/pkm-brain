@@ -16,7 +16,12 @@ from pkm_brain.google_routes import (
     gmail_thread_route,
     local_google_evidence_route,
 )
-from pkm_brain.google_sources import GoogleCalendarReader, GmailThreadReader
+from pkm_brain.google_sources import (
+    GoogleCalendarReader,
+    GmailThreadReader,
+    calendar_event_is_inactive,
+    calendar_occurrence_key,
+)
 
 
 class FakeClient:
@@ -90,15 +95,17 @@ def gmail_thread(thread_id: str = "thread-1") -> dict[str, Any]:
     }
 
 
-def test_calendar_full_fetch_preserves_recurrence_and_cancelled_instances() -> None:
-    recurring = {
-        "id": "series-1",
+def test_calendar_full_fetch_expands_weekly_occurrences_and_cancelled_exceptions() -> None:
+    occurrence = {
+        "id": "series-1_20260714T160000Z",
         "etag": '"etag-1"',
         "status": "confirmed",
         "summary": "Weekly review",
         "start": {"dateTime": "2026-07-14T09:00:00-07:00", "timeZone": "America/Los_Angeles"},
         "end": {"dateTime": "2026-07-14T09:30:00-07:00"},
-        "recurrence": ["RRULE:FREQ=WEEKLY"],
+        "recurringEventId": "series-1",
+        "originalStartTime": {"dateTime": "2026-07-14T09:00:00-07:00"},
+        "iCalUID": "weekly-review@example.com",
         "extendedProperties": {"private": {"secret": "not cached"}},
     }
     cancelled = {
@@ -109,7 +116,7 @@ def test_calendar_full_fetch_preserves_recurrence_and_cancelled_instances() -> N
     }
     client = FakeClient(
         [
-            {"items": [recurring], "nextPageToken": "page-2"},
+            {"items": [occurrence], "nextPageToken": "page-2"},
             {"items": [cancelled], "nextSyncToken": "sync-2"},
         ]
     )
@@ -123,7 +130,10 @@ def test_calendar_full_fetch_preserves_recurrence_and_cancelled_instances() -> N
     assert result.mode == "full"
     assert result.coverage_complete is True
     assert result.next_sync_token == "sync-2"
-    assert result.events[0].recurrence == ("RRULE:FREQ=WEEKLY",)
+    assert result.events[0].recurrence == ()
+    assert result.events[0].recurring_event_id == "series-1"
+    assert result.events[0].original_start_time == "2026-07-14T09:00:00-07:00"
+    assert result.events[0].ical_uid == "weekly-review@example.com"
     assert result.events[0].source_revision == '"etag-1"'
     assert result.events[1].cancelled is True
     assert result.events[1].recurring_event_id == "series-1"
@@ -134,7 +144,7 @@ def test_calendar_full_fetch_preserves_recurrence_and_cancelled_instances() -> N
         {
             "maxResults": 10,
             "showDeleted": "true",
-            "singleEvents": "false",
+            "singleEvents": "true",
             "timeMin": "2026-06-29T00:00:00Z",
             "timeMax": "2026-10-12T00:00:00Z",
             "timeZone": "America/Los_Angeles",
@@ -142,6 +152,38 @@ def test_calendar_full_fetch_preserves_recurrence_and_cancelled_instances() -> N
         1,
     )
     assert client.calls[1][1]["pageToken"] == "page-2"
+
+
+def test_calendar_expanded_exception_keeps_original_identity_and_decline() -> None:
+    moved_declined = normalize_calendar_event(
+        {
+            "id": "series-1_20260721T160000Z",
+            "etag": '"exception-etag"',
+            "status": "confirmed",
+            "summary": "Weekly review — moved",
+            "start": {"dateTime": "2026-07-22T11:00:00-07:00"},
+            "end": {"dateTime": "2026-07-22T11:30:00-07:00"},
+            "recurringEventId": "series-1",
+            "originalStartTime": {"dateTime": "2026-07-21T09:00:00-07:00"},
+            "attendees": [
+                {
+                    "email": "operator@example.com",
+                    "self": True,
+                    "responseStatus": "declined",
+                }
+            ],
+        }
+    )
+
+    assert moved_declined.recurring_event_id == "series-1"
+    assert moved_declined.original_start_time == "2026-07-21T09:00:00-07:00"
+    assert moved_declined.starts_at == "2026-07-22T11:00:00-07:00"
+    assert moved_declined.attendee_response == "declined"
+    assert moved_declined.cancelled is False
+    assert calendar_occurrence_key(moved_declined) == (
+        "series-1:2026-07-21T09:00:00-07:00"
+    )
+    assert calendar_event_is_inactive(moved_declined) is True
 
 
 def test_calendar_410_returns_explicit_replacement_full_snapshot() -> None:

@@ -37,6 +37,8 @@ class CalendarFetchResult:
     coverage_complete: bool
     pages_fetched: int
     continuation_page_token: str | None = None
+    api_requests: int = 0
+    quota_units: int = 0
 
 
 @dataclass(frozen=True)
@@ -51,6 +53,34 @@ class GmailFetchResult:
     coverage_complete: bool
     pages_fetched: int
     continuation_page_token: str | None = None
+    baseline_history_id: str | None = None
+    api_requests: int = 0
+    quota_units: int = 0
+
+
+@dataclass
+class _FetchUsage:
+    api_requests: int = 0
+    quota_units: int = 0
+
+    def add(self, quota_units: int) -> None:
+        self.api_requests += 1
+        self.quota_units += quota_units
+
+
+def calendar_occurrence_key(event: NormalizedCalendarEvent) -> str:
+    """Return one stable key for an expanded occurrence and all its exceptions."""
+
+    original = event.original_start_time or event.original_start_date
+    if event.recurring_event_id and original:
+        return f"{event.recurring_event_id}:{original}"
+    return event.event_id
+
+
+def calendar_event_is_inactive(event: NormalizedCalendarEvent) -> bool:
+    """Cancelled events and meetings declined by the operator are not active work."""
+
+    return event.cancelled or event.attendee_response == "declined"
 
 
 class GoogleCalendarReader:
@@ -84,8 +114,11 @@ class GoogleCalendarReader:
         time_max: str,
         sync_token: str | None = None,
         timezone_name: str | None = None,
+        continuation_page_token: str | None = None,
     ) -> CalendarFetchResult:
         _bounded_window(time_min, time_max)
+        page_token = _validated_page_token(continuation_page_token)
+        usage = _FetchUsage()
         if sync_token:
             try:
                 return self._fetch_pages(
@@ -94,6 +127,8 @@ class GoogleCalendarReader:
                     time_min=None,
                     time_max=None,
                     timezone_name=timezone_name,
+                    continuation_page_token=page_token,
+                    usage=usage,
                 )
             except GoogleAPIError as exc:
                 if exc.status != 410:
@@ -104,6 +139,8 @@ class GoogleCalendarReader:
                     time_min=time_min,
                     time_max=time_max,
                     timezone_name=timezone_name,
+                    continuation_page_token=None,
+                    usage=usage,
                 )
                 return replace(replacement, reset_required=True)
         return self._fetch_pages(
@@ -112,6 +149,8 @@ class GoogleCalendarReader:
             time_min=time_min,
             time_max=time_max,
             timezone_name=timezone_name,
+            continuation_page_token=page_token,
+            usage=usage,
         )
 
     def _fetch_pages(
@@ -122,9 +161,11 @@ class GoogleCalendarReader:
         time_min: str | None,
         time_max: str | None,
         timezone_name: str | None,
+        continuation_page_token: str | None,
+        usage: _FetchUsage,
     ) -> CalendarFetchResult:
         raw_events: list[dict[str, Any]] = []
-        page_token: str | None = None
+        page_token = continuation_page_token
         next_sync_token: str | None = None
         pages = 0
         coverage_complete = True
@@ -136,7 +177,10 @@ class GoogleCalendarReader:
             params: dict[str, str | int] = {
                 "maxResults": min(self.page_size, remaining),
                 "showDeleted": "true",
-                "singleEvents": "false",
+                # Today needs concrete occurrences, not recurrence masters.  Google
+                # keeps each expanded occurrence anchored to recurringEventId plus
+                # originalStartTime, including moved and cancelled exceptions.
+                "singleEvents": "true",
             }
             if sync_token:
                 params["syncToken"] = sync_token
@@ -148,6 +192,7 @@ class GoogleCalendarReader:
                 params["timeZone"] = timezone_name
             if page_token:
                 params["pageToken"] = page_token
+            usage.add(1)
             payload = self.client.get_json(
                 f"calendars/{urllib.parse.quote(self.calendar_id, safe='')}/events",
                 params=params,
@@ -175,6 +220,8 @@ class GoogleCalendarReader:
             coverage_complete=coverage_complete,
             pages_fetched=pages,
             continuation_page_token=page_token if not coverage_complete else None,
+            api_requests=usage.api_requests,
+            quota_units=usage.quota_units,
         )
 
 
@@ -218,28 +265,67 @@ class GmailThreadReader:
         *,
         query: str,
         history_id: str | None = None,
+        continuation_page_token: str | None = None,
+        baseline_history_id: str | None = None,
     ) -> GmailFetchResult:
         normalized_query = query.strip()
         if not normalized_query or len(normalized_query) > 2_000:
             raise ValueError("Gmail full-sync query must be non-empty and at most 2000 characters")
-        if history_id:
+        page_token = _validated_page_token(continuation_page_token)
+        baseline = _validated_history_id(baseline_history_id, name="baseline_history_id")
+        starting_history_id = _validated_history_id(history_id, name="history_id")
+        usage = _FetchUsage()
+        if starting_history_id:
+            if baseline is not None:
+                raise ValueError("baseline_history_id is only valid for full-sync resume")
             try:
-                return self._fetch_incremental(history_id)
+                return self._fetch_incremental(
+                    starting_history_id,
+                    continuation_page_token=page_token,
+                    usage=usage,
+                )
             except GoogleAPIError as exc:
                 if exc.status != 404:
                     raise
-                replacement = self._fetch_full(normalized_query)
+                replacement = self._fetch_full(
+                    normalized_query,
+                    continuation_page_token=None,
+                    baseline_history_id=None,
+                    usage=usage,
+                )
                 return replace(replacement, reset_required=True)
-        return self._fetch_full(normalized_query)
+        if page_token is not None and baseline is None:
+            raise ValueError(
+                "baseline_history_id is required when resuming a full Gmail fetch"
+            )
+        if baseline is not None and page_token is None:
+            raise ValueError(
+                "baseline_history_id requires a full-fetch continuation_page_token"
+            )
+        return self._fetch_full(
+            normalized_query,
+            continuation_page_token=page_token,
+            baseline_history_id=baseline,
+            usage=usage,
+        )
 
-    def _fetch_full(self, query: str) -> GmailFetchResult:
-        profile = self.client.get_json("profile", quota_units=self.PROFILE_UNITS)
-        baseline_history_id = _optional_string(profile.get("historyId"))
-        if not baseline_history_id:
-            raise RuntimeError("Gmail profile did not provide historyId")
+    def _fetch_full(
+        self,
+        query: str,
+        *,
+        continuation_page_token: str | None,
+        baseline_history_id: str | None,
+        usage: _FetchUsage,
+    ) -> GmailFetchResult:
+        if baseline_history_id is None:
+            usage.add(self.PROFILE_UNITS)
+            profile = self.client.get_json("profile", quota_units=self.PROFILE_UNITS)
+            baseline_history_id = _optional_string(profile.get("historyId"))
+            if not baseline_history_id:
+                raise RuntimeError("Gmail profile did not provide historyId")
         thread_ids: list[str] = []
         seen: set[str] = set()
-        page_token: str | None = None
+        page_token = continuation_page_token
         pages = 0
         coverage_complete = True
         while True:
@@ -253,6 +339,7 @@ class GmailThreadReader:
             }
             if page_token:
                 params["pageToken"] = page_token
+            usage.add(self.THREADS_LIST_UNITS)
             payload = self.client.get_json(
                 "threads",
                 params=params,
@@ -284,12 +371,20 @@ class GmailThreadReader:
             coverage_complete=coverage_complete,
             pages=pages,
             continuation_page_token=page_token if not coverage_complete else None,
+            baseline_history_id=baseline_history_id,
+            usage=usage,
         )
 
-    def _fetch_incremental(self, history_id: str) -> GmailFetchResult:
+    def _fetch_incremental(
+        self,
+        history_id: str,
+        *,
+        continuation_page_token: str | None,
+        usage: _FetchUsage,
+    ) -> GmailFetchResult:
         changed_ids: list[str] = []
         seen: set[str] = set()
-        page_token: str | None = None
+        page_token = continuation_page_token
         pages = 0
         records_seen = 0
         next_history_id: str | None = None
@@ -305,6 +400,7 @@ class GmailThreadReader:
             }
             if page_token:
                 params["pageToken"] = page_token
+            usage.add(self.HISTORY_LIST_UNITS)
             payload = self.client.get_json(
                 "history",
                 params=params,
@@ -344,6 +440,8 @@ class GmailThreadReader:
             coverage_complete=coverage_complete,
             pages=pages,
             continuation_page_token=page_token if not coverage_complete else None,
+            baseline_history_id=None,
+            usage=usage,
         )
 
     def _fetch_thread_payloads(
@@ -356,12 +454,15 @@ class GmailThreadReader:
         coverage_complete: bool,
         pages: int,
         continuation_page_token: str | None,
+        baseline_history_id: str | None,
+        usage: _FetchUsage,
     ) -> GmailFetchResult:
         raw_threads: list[dict[str, Any]] = []
         missing: list[str] = []
         for thread_id in thread_ids:
             safe_id = urllib.parse.quote(thread_id, safe="")
             try:
+                usage.add(self.THREADS_GET_UNITS)
                 payload = self.client.get_json(
                     f"threads/{safe_id}",
                     params={"format": "full"},
@@ -393,6 +494,9 @@ class GmailThreadReader:
             coverage_complete=coverage_complete,
             pages_fetched=pages,
             continuation_page_token=continuation_page_token,
+            baseline_history_id=baseline_history_id,
+            api_requests=usage.api_requests,
+            quota_units=usage.quota_units,
         )
 
 
@@ -429,3 +533,25 @@ def _optional_string(value: Any) -> str | None:
         return None
     normalized = str(value).strip()
     return normalized or None
+
+
+def _validated_page_token(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError("continuation_page_token must not be blank")
+    if len(normalized) > 8_192:
+        raise ValueError("continuation_page_token is too long")
+    return normalized
+
+
+def _validated_history_id(value: str | None, *, name: str) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"{name} must not be blank")
+    if len(normalized) > 256:
+        raise ValueError(f"{name} is too long")
+    return normalized

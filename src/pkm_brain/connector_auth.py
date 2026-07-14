@@ -271,6 +271,7 @@ def default_auth_state() -> dict[str, Any]:
         "status": "not_configured",
         "connected_at": None,
         "account_label": None,
+        "provider_subject": None,
         "granted_scopes": [],
         "last_error": None,
         "updated_at": None,
@@ -335,6 +336,10 @@ def connector_auth_status(
         "client_secret_configured": has_secret,
         "connected_at": state.get("connected_at"),
         "account_label": state.get("account_label"),
+        "provider_subject": (
+            state.get("provider_subject")
+            or _provider_subject_from_credentials(credentials)
+        ),
         "granted_scopes": sorted(granted),
         "requested_scopes": list(provider.scopes),
         "redirect_uri": callback_uri(connector_id),
@@ -380,6 +385,9 @@ def configure_connector_auth(
             "status": "ready",
             "connected_at": None if client_changed else state.get("connected_at"),
             "account_label": None if client_changed else state.get("account_label"),
+            "provider_subject": (
+                None if client_changed else state.get("provider_subject")
+            ),
             "granted_scopes": [] if client_changed else state.get("granted_scopes", []),
             "last_error": None,
             "updated_at": now_iso(),
@@ -418,6 +426,7 @@ def disconnect_connector_auth(
             "status": "ready" if state.get("client_id") else "not_configured",
             "connected_at": None,
             "account_label": None,
+            "provider_subject": None,
             "granted_scopes": [],
             "last_error": None,
             "updated_at": now_iso(),
@@ -744,6 +753,7 @@ def complete_authorization(flow: PendingOAuthFlow, token_response: dict[str, Any
             "status": "connected",
             "connected_at": now_iso(),
             "account_label": _account_label(claims),
+            "provider_subject": _provider_subject(claims),
             "granted_scopes": granted,
             "last_error": None,
             "updated_at": now_iso(),
@@ -830,6 +840,16 @@ def _account_label(claims: dict[str, Any]) -> str | None:
         if value:
             return value
     return None
+
+
+def _provider_subject(claims: dict[str, Any]) -> str | None:
+    value = str(claims.get("sub") or "").strip()
+    return value[:255] or None
+
+
+def _provider_subject_from_credentials(credentials: dict[str, Any]) -> str | None:
+    id_token = str(credentials.get("id_token") or "")
+    return _provider_subject(decode_id_token_claims(id_token)) if id_token else None
 
 
 def _query_value(query: dict[str, list[str]], key: str) -> str:

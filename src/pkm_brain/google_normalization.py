@@ -403,9 +403,10 @@ def _gmail_body(payload: Mapping[str, Any]) -> tuple[str, str | None, int]:
     plain: list[str] = []
     html_parts: list[str] = []
     attachment_count = 0
-    for part in _walk_mime_parts(payload):
-        if _is_attachment(part):
+    for part, blocked_by_attachment, attachment_root in _walk_mime_parts(payload):
+        if attachment_root:
             attachment_count += 1
+        if blocked_by_attachment:
             continue
         mime_type = str(part.get("mimeType") or "").casefold()
         if mime_type not in {"text/plain", "text/html"}:
@@ -427,16 +428,34 @@ def _gmail_body(payload: Mapping[str, Any]) -> tuple[str, str | None, int]:
     return "", None, attachment_count
 
 
-def _walk_mime_parts(payload: Mapping[str, Any]) -> Iterable[Mapping[str, Any]]:
-    parts = [part for part in payload.get("parts") or [] if isinstance(part, Mapping)]
-    if not parts:
-        yield payload
-        return
-    for part in parts:
-        yield from _walk_mime_parts(part)
+def _walk_mime_parts(
+    payload: Mapping[str, Any],
+    *,
+    attachment_ancestor: bool = False,
+) -> Iterable[tuple[Mapping[str, Any], bool, bool]]:
+    """Walk every MIME node while carrying the attachment security boundary.
+
+    Gmail can expand an attached RFC-822 message (or another multipart attachment)
+    into ordinary-looking text descendants. Those descendants are attachment bytes,
+    not correspondence in the containing thread. Count the outer attachment once and
+    never expose any node below it to body decoding.
+    """
+
+    attachment_root = not attachment_ancestor and _is_attachment(payload)
+    blocked_by_attachment = attachment_ancestor or attachment_root
+    yield payload, blocked_by_attachment, attachment_root
+    for part in payload.get("parts") or []:
+        if isinstance(part, Mapping):
+            yield from _walk_mime_parts(
+                part,
+                attachment_ancestor=blocked_by_attachment,
+            )
 
 
 def _is_attachment(part: Mapping[str, Any]) -> bool:
+    mime_type = str(part.get("mimeType") or "").split(";", 1)[0].strip().casefold()
+    if mime_type == "message/rfc822":
+        return True
     if str(part.get("filename") or "").strip():
         return True
     body = part.get("body") if isinstance(part.get("body"), Mapping) else {}
@@ -505,13 +524,13 @@ def _cap_thread_bodies(
     if cap < 0:
         raise ValueError("thread body cap cannot be negative")
     remaining = cap
-    output: list[NormalizedGmailMessage] = []
-    for message in messages:
+    newest_first: list[NormalizedGmailMessage] = []
+    for message in reversed(messages):
         if len(message.body) <= remaining:
-            output.append(message)
+            newest_first.append(message)
             remaining -= len(message.body)
             continue
-        output.append(
+        newest_first.append(
             replace(
                 message,
                 body=message.body[:remaining].rstrip() if remaining else "",
@@ -519,7 +538,7 @@ def _cap_thread_bodies(
             )
         )
         remaining = 0
-    return output
+    return list(reversed(newest_first))
 
 
 def _gmail_message_class(
@@ -547,14 +566,22 @@ def _gmail_message_class(
     return "human"
 
 
-def _strip_attachment_data(part: dict[str, Any]) -> None:
-    if _is_attachment(part) or not str(part.get("mimeType") or "").casefold().startswith("text/"):
+def _strip_attachment_data(
+    part: dict[str, Any],
+    *,
+    attachment_ancestor: bool = False,
+) -> None:
+    blocked_by_attachment = attachment_ancestor or _is_attachment(part)
+    if blocked_by_attachment or not str(part.get("mimeType") or "").casefold().startswith("text/"):
         body = part.get("body")
         if isinstance(body, dict):
             body.pop("data", None)
     for child in part.get("parts") or []:
         if isinstance(child, dict):
-            _strip_attachment_data(child)
+            _strip_attachment_data(
+                child,
+                attachment_ancestor=blocked_by_attachment,
+            )
 
 
 def _looks_like_header_quote(lines: list[str]) -> bool:

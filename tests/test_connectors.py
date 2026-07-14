@@ -128,6 +128,7 @@ def test_google_oauth_identity_flow_uses_pkce_and_keeps_secrets_out_of_config(
                     "aud": flow.client_id,
                     "iss": "https://accounts.google.com",
                     "email": "person@example.com",
+                    "sub": "google-subject-person-1",
                     "exp": int((datetime.now(timezone.utc) + timedelta(hours=1)).timestamp()),
                 }
             ),
@@ -164,6 +165,7 @@ def test_google_oauth_identity_flow_uses_pkce_and_keeps_secrets_out_of_config(
         assert status is not None
         assert status["status"] == "connected"
         assert status["account_label"] == "person@example.com"
+        assert status["provider_subject"] == "google-subject-person-1"
         assert status["client_secret_configured"] is True
 
         config_text = (paths.config_local / "connector-auth.yaml").read_text(encoding="utf-8")
