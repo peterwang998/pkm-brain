@@ -1,7 +1,7 @@
 # PKM Brain Architecture Code Guide
 
 **Status:** current code-navigation guide
-**Last verified:** 2026-07-14 against the locally release-verified manual Calendar/Gmail shadow implementation
+**Last verified:** 2026-07-14 against the release-verified and installed Gmail operational mirror/provider-sync tranche; fresh mailbox bootstrap/incremental validation remains pending
 
 This guide answers where behavior lives. Feature requirements and open work belong in [the specs index](README.md), not here.
 
@@ -20,14 +20,15 @@ capture.py / connectors.py / connector_auth.py
 
 approved operational sources
   -> google_api.py + google_sources.py + google_normalization.py
-  -> shadow_trial.py + gmail_operations.py
+  -> gmail_sync.py -> cache/gmail-mirror/gmail-mirror.sqlite
+  -> shadow_trial.py + gmail_operations.py (local queue analysis)
   -> operational_state.py + operational_shadow.py
   -> operational_db.py + operational_migrations.py + operational_budget.py
   -> db/ops.sqlite
   -> operational_briefing.py + operational_today.py
   -> Today briefing, evidence audit, and local feedback
 
-daemon.py + automation.py schedule the same primitives.
+daemon.py + automation.py schedule lane-isolated primitives.
 SwiftUI and browser assets call ui_server.py JSON endpoints.
 sync_* modules move source files, never live DB/index state.
 ```
@@ -45,6 +46,7 @@ sync_* modules move source files, never live DB/index state.
 | entity identity | `entities` and `fact_entities` | `entities.py` |
 | durable mutation | `cos_actions` plus inverse | `cos_actions.py` |
 | autonomy | versioned `cos_policy` and eval state | `cos_policy.py`, `evals.py` |
+| Gmail operational mirror | rebuildable immutable revisions/current pointers, tombstones, triage queue, and provider checkpoint | `gmail_mirror.py`, `gmail_sync.py` |
 | operational current state | `db/ops.sqlite` items, observations, events, and cursors | `operational_state.py`, `operational_db.py` |
 | review residue | `open_questions`, proposed memories, audit flags | `wiki_facts.py`, `memory.py`, `ui_server.py` |
 | page projection | contracts, facts, synthesis, snapshots, Markdown | `wiki_facts.py`, `contracts.py` |
@@ -60,11 +62,12 @@ sync_* modules move source files, never live DB/index state.
 - `db.py`: base schema, connection helpers, FTS setup, row helpers.
 - `migrations.py`: ordered idempotent migrations 1-21.
 - `operational_db.py` and `operational_migrations.py`: the independently versioned `db/ops.sqlite` control plane and bounded lock handling.
+- `gmail_mirror.py`: the independent owner-only, rebuildable Gmail operational evidence store, atomic local-analysis queue, and content-free poison-thread quarantine at `cache/gmail-mirror/gmail-mirror.sqlite`.
 - `config.py` and `sync_config.py`: local/shared and role-specific config.
 
 Do not create ad hoc paths or SQLite connections in UI/Swift code.
 
-`brain.sqlite` remains authoritative for knowledge. `ops.sqlite` is authoritative only for current operational state; neither database uses cross-database foreign keys or multi-database write transactions.
+`brain.sqlite` remains authoritative for knowledge. `ops.sqlite` is authoritative only for current operational state. The Gmail mirror is rebuildable operational evidence, not either authority; none of the three uses cross-database foreign keys or multi-database write transactions.
 
 ### Capture And Ingest
 
@@ -77,7 +80,7 @@ Do not create ad hoc paths or SQLite connections in UI/Swift code.
 
 Connector output stops at `inbox/`. `BrainService.ingest` is the single entry to raw/document/chunk/index state.
 
-The manually invoked Calendar/Gmail shadow path is not capture output. It uses the separately bound read-only credentials through the operational modules below and never writes `inbox/`, documents, chunks, facts, or wiki pages.
+The manual Calendar/Shadow evaluation path and scheduled Gmail mirror are not capture output. They use separately bound read-only credentials through the operational modules below and never write `inbox/`, documents, chunks, facts, or wiki pages.
 
 ### Embeddings And Indexes
 
@@ -122,16 +125,18 @@ The `cos_*` surface is a legacy physical name for Knowledge Curation. It must no
 - `operational_db.py`: short-lived operational connections, WAL/foreign-key setup, and bounded lock retry.
 - `operational_migrations.py`: independently versioned `ops_*` schema migrations.
 - `operations_policy.py` and `shadow_setup.py`: strict owner-only policy, approved 7/30-day privacy controls, and exact account/scope binding.
-- `google_api.py`, `google_sources.py`, `google_normalization.py`, and `google_routes.py`: bounded read-only Google transport, resumable Calendar/Gmail change reads, deterministic normalization, and safe provider routes.
+- `google_api.py`, `google_sources.py`, `google_normalization.py`, and `google_routes.py`: bounded read-only Google transport, resumable Calendar/Gmail change reads, deterministic normalization, and safe provider routes. Gmail full bootstrap uses `newer_than:7d -in:spam -in:trash`; later reads use Gmail history.
 - `google_cache.py`: owner-only disposable raw and revision-addressed normalized evidence with separate retention lanes.
-- `gmail_llm.py` and `gmail_operations.py`: restricted Gmail detector provider boundary, bounded structured detection, deterministic evidence/lifecycle validation, and source-local handled assessment.
+- `gmail_mirror.py`: private mode-`0700` mirror directory, owner-only SQLite/WAL/SHM, immutable sanitized revisions, current pointers, provider-confirmed tombstones, durable triage leases, and atomic mailbox checkpoints; no attachment bytes or knowledge ingestion.
+- `gmail_sync.py`: policy/grant-gated Gmail API bootstrap/history synchronization and crash-atomic mirror acceptance, with bounded expired-history resync that preserves prior state and never deletes by absence.
+- `gmail_llm.py` and `gmail_operations.py`: restricted Gmail detector boundary, local-queue-only bounded structured detection with no Gmail calls, deterministic evidence/lifecycle validation, and source-local handled assessment.
 - `operational_budget.py`: durable local-day API/call/token reservations.
 - `operational_shadow.py`: shadow runs, decisions, handled assessments, and missing reports.
-- `shadow_trial.py` and `shadow_controller.py`: one background manual Calendar/Gmail pass, atomic resume/cursor behavior, coverage, retention, and polling state.
+- `shadow_trial.py` and `shadow_controller.py`: manual Calendar refresh plus local Gmail analysis/reconciliation, coverage, retention, and polling state; Gmail provider checkpoints are owned separately by `gmail_sync.py`.
 - `operational_briefing.py`, `operational_today.py`, and `today_presentation.py`: deterministic briefing projection, ignored/suppressed audit, evidence navigation, and local feedback contracts.
-- `paths.py`: `BrainPaths.ops_sqlite_path` resolves the operational database inside the same Brain home.
+- `paths.py`: `BrainPaths.ops_sqlite_path` and `BrainPaths.gmail_mirror_sqlite_path` resolve the operational database and private rebuildable mirror inside the same Brain home.
 
-The provider-read-only/local-write manual shadow slice is implemented and locally release-verified. The first owner-started private evaluation, cross-source episode linking, scheduling, production trust, and guarded execution remain gated by [Chief-of-Staff Operations](specs/chief-of-staff-operations.md).
+The provider-read-only/local-write slice now separates scheduled Gmail transport from manual analysis/evaluation. `gmail_mirror_sync` runs only on `single|primary`, at startup and about every 600 seconds on the dedicated `provider_sync` scheduler lane, after exact policy/content-approval/account/scope gates pass. It safely restarts rejected saved page tokens, preflights the bounded worst-case request envelope, and quarantines a malformed/oversized/conflicting thread without blocking valid peer revisions or checkpoint progress. A complete normal checkpoint may be followed by one second generation that retries at most ten due quarantine thread IDs with durable exponential backoff and parser-version bypass; retry-only failure leaves mailbox freshness intact and analysis partial. Mailbox checkpoint freshness, scheduled-job health, and analysis/quarantine backlog are independent. Fresh live mirror validation, cross-source episode linking, production trust, and guarded execution remain gated by [Chief-of-Staff Operations](specs/chief-of-staff-operations.md).
 
 ### Retrieval And Memory
 
@@ -144,7 +149,7 @@ Retrieval exposure is telemetry. It can order review work but cannot alter truth
 ### Automation And Operations
 
 - `automation.py`: capture/nightly stage orchestration and summaries.
-- `daemon.py`: loopback API process, serial scheduler registry, token/lock/handshake, parent monitor.
+- `daemon.py`: loopback API process, lane-aware scheduler registry (including isolated `provider_sync`), token/lock/handshake, parent monitor.
 - `maintenance.py`: bounded storage inventory and dry-run-first backup cleanup; user-created brain backups are never auto-pruned.
 - `launch_agents.py` and scheduler adapters: legacy/development automation.
 - `ui_server.py`: auth HTTP handler, JSON endpoints, Queue projection/dispatch, browser static serving.

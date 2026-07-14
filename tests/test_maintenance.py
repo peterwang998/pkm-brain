@@ -106,4 +106,6 @@ def test_storage_inventory_classifies_managed_and_manual_roots(tmp_path: Path) -
 
     assert roots["app_runtimes"]["item_count"] == 1
     assert roots["app_runtimes"]["policy"] == "process_aware_retention"
+    assert details["gmail_mirror"]["path"] == str(paths.gmail_mirror_sqlite_path)
+    assert details["gmail_mirror"]["policy"] == "private_rebuildable_mirror"
     assert details["user_backups"]["policy"] == "manual_review"

@@ -73,7 +73,9 @@ def test_connector_registry_exposes_builtin_manifests(tmp_path: Path) -> None:
     assert manifests["files"]["default_enabled"] is True
     assert manifests["gmail"]["lifecycle"] == "auth_only"
     assert manifests["gmail"]["capture_available"] is False
+    assert manifests["gmail"]["default_cadence_s"] == 600
     assert "Today > Run Shadow" in manifests["gmail"]["activation_note"]
+    assert "local operational mirror" in manifests["gmail"]["activation_note"]
     assert "knowledge ingestion remain" in manifests["gmail"]["activation_note"]
     assert manifests["gmail"]["auth"]["phase"] == "read_only"
     assert manifests["gmail"]["auth"]["requested_scopes"] == [

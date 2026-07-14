@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping, Sequence
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .connector_auth import connector_auth_status
 from .db import connection
+from .gmail_mirror import GmailMirrorStore
 from .google_cache import GoogleEvidenceCache
 from .maintenance import managed_storage_inventory
 from .operational_briefing import build_meeting_packet
@@ -54,7 +56,14 @@ def operations_storage_payload(paths: BrainPaths) -> dict[str, Any]:
     return managed_storage_inventory(paths, app_support=app_support)
 
 
-def shadow_setup_payload(paths: BrainPaths) -> dict[str, Any]:
+def shadow_setup_payload(
+    paths: BrainPaths,
+    *,
+    scheduler_state: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    mirror = _gmail_mirror_status(paths)
+    scheduled_sync = gmail_mirror_sync_schedule_status(scheduler_state)
+    mirror["scheduled_sync"] = scheduled_sync
     return {
         "schema_version": 1,
         "policy": shadow_policy_status(paths),
@@ -63,7 +72,8 @@ def shadow_setup_payload(paths: BrainPaths) -> dict[str, Any]:
             for connector_id in ("calendar", "gmail")
         },
         "mode": "shadow_read_only",
-        "automatic_schedule_enabled": False,
+        "automatic_schedule_enabled": bool(scheduled_sync.get("enabled")),
+        "gmail_mirror": mirror,
         "approved_defaults": {
             "calendar": "owned primary calendar only",
             "gmail": "read-only thread content",
@@ -72,6 +82,7 @@ def shadow_setup_payload(paths: BrainPaths) -> dict[str, Any]:
             "fetch_attachments": False,
             "strip_quoted_history": True,
             "external_writes": False,
+            "gmail_sync_cadence_seconds": 600,
         },
     }
 
@@ -122,13 +133,27 @@ def operations_evidence_payload(
         raise OperationsHTTPNotFound(
             "evidence reference does not match its account and source"
         )
-    if not (paths.home / "cache" / "google-evidence").is_dir():
-        raise OperationsHTTPNotFound("retained local evidence is unavailable")
-    evidence = GoogleEvidenceCache.for_paths(paths).read_normalized(
-        source_type,
-        source_ref,
-        source_revision=source_revision,
-    )
+    evidence = None
+    evidence_origin = "retained_cache"
+    resolved_revision = source_revision
+    if source_type == "gmail" and paths.gmail_mirror_sqlite_path.is_file():
+        thread_id = source_ref.removeprefix(prefix)
+        store = GmailMirrorStore(paths.gmail_mirror_sqlite_path)
+        revision = (
+            store.get_revision(account_key, thread_id, source_revision)
+            if source_revision is not None
+            else store.get_current_revision(account_key, thread_id)
+        )
+        if revision is not None and not revision.tombstoned and revision.thread is not None:
+            evidence = revision.thread.as_dict()
+            evidence_origin = "gmail_mirror"
+            resolved_revision = revision.source_revision
+    if evidence is None and (paths.home / "cache" / "google-evidence").is_dir():
+        evidence = GoogleEvidenceCache.for_paths(paths).read_normalized(
+            source_type,
+            source_ref,
+            source_revision=source_revision,
+        )
     if evidence is None:
         raise OperationsHTTPNotFound("retained local evidence is unavailable")
     return {
@@ -136,8 +161,9 @@ def operations_evidence_payload(
         "source_type": source_type,
         "account_key": account_key,
         "source_ref": source_ref,
-        "source_revision": source_revision,
+        "source_revision": resolved_revision,
         "retention_days": policy.privacy.normalized_evidence_days,
+        "evidence_origin": evidence_origin,
         "evidence": evidence,
     }
 
@@ -158,3 +184,134 @@ def operations_meeting_packet_payload(
 def _first(query: Mapping[str, Sequence[str]], key: str) -> str:
     values = query.get(key) or ()
     return str(values[0]).strip() if values else ""
+
+
+def _gmail_mirror_status(paths: BrainPaths) -> dict[str, Any]:
+    try:
+        policy = load_operations_policy(paths)
+    except Exception as exc:
+        return {
+            "source_enabled": None,
+            "mailbox_status": "unavailable",
+            "triage_status": "unknown",
+            "triage_pending_count": None,
+            "sync_cadence_seconds": 600,
+            "message": f"Gmail mirror policy is unavailable: {exc}",
+        }
+    if not policy.sources.gmail.enabled:
+        return {
+            "source_enabled": False,
+            "mailbox_status": "disabled",
+            "triage_status": "disabled",
+            "triage_pending_count": 0,
+            "sync_cadence_seconds": 600,
+        }
+    mirror_path = paths.gmail_mirror_sqlite_path
+    if not mirror_path.exists() and not mirror_path.is_symlink():
+        return {
+            "source_enabled": True,
+            "mailbox_status": "not_initialized",
+            "triage_status": "idle",
+            "triage_pending_count": 0,
+            "sync_cadence_seconds": 600,
+        }
+    try:
+        store = GmailMirrorStore(mirror_path)
+        checkpoint = store.get_checkpoint(policy.sources.gmail.account_key)
+        counts = store.triage_counts(policy.sources.gmail.account_key)
+    except Exception as exc:
+        return {
+            "source_enabled": True,
+            "mailbox_status": "unavailable",
+            "triage_status": "unknown",
+            "triage_pending_count": None,
+            "sync_cadence_seconds": 600,
+            "message": str(exc),
+        }
+    if checkpoint is None:
+        mailbox_status = "not_initialized"
+        last_success_at = None
+    elif checkpoint.coverage_complete:
+        mailbox_status = "synchronized"
+        last_success_at = checkpoint.last_success_at
+    elif checkpoint.reset_required:
+        mailbox_status = "resyncing"
+        last_success_at = checkpoint.last_success_at
+    else:
+        mailbox_status = "partial"
+        last_success_at = checkpoint.last_success_at
+    backlog = int(counts["backlog_count"])
+    return {
+        "source_enabled": True,
+        "mailbox_status": mailbox_status,
+        "mailbox_last_success_at": last_success_at,
+        "triage_status": "backlogged" if backlog else "current",
+        "triage_pending_count": backlog,
+        "triage_counts": counts,
+        "sync_cadence_seconds": 600,
+    }
+
+
+def gmail_mirror_sync_schedule_status(
+    scheduler_state: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    unavailable = {
+        "available": False,
+        "job_id": "gmail_mirror_sync",
+        "enabled": None,
+        "paused": None,
+        "paused_until": None,
+        "last_run_at": None,
+        "last_status": None,
+        "last_error": None,
+        "next_due_at": None,
+        "running": None,
+    }
+    if not isinstance(scheduler_state, Mapping):
+        return unavailable
+    jobs = scheduler_state.get("jobs")
+    if not isinstance(jobs, Sequence) or isinstance(jobs, (str, bytes)):
+        return unavailable
+    job = next(
+        (
+            value
+            for value in jobs
+            if isinstance(value, Mapping)
+            and str(value.get("id") or "") == "gmail_mirror_sync"
+        ),
+        None,
+    )
+    if job is None:
+        return unavailable
+    paused_until = _optional_string(scheduler_state.get("paused_until"))
+    return {
+        "available": True,
+        "job_id": "gmail_mirror_sync",
+        "enabled": bool(job.get("enabled")),
+        "paused": _pause_is_active(paused_until),
+        "paused_until": paused_until,
+        "last_run_at": _optional_string(job.get("last_run_at")),
+        "last_status": _optional_string(job.get("last_status")),
+        "last_error": _optional_string(job.get("last_error")),
+        "next_due_at": _optional_string(job.get("next_due_at")),
+        "running": bool(job.get("running")),
+    }
+
+
+def _pause_is_active(paused_until: str | None) -> bool:
+    if paused_until is None:
+        return False
+    try:
+        parsed = datetime.fromisoformat(paused_until)
+    except ValueError:
+        return True
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc) > datetime.now(timezone.utc)
+
+
+def _optional_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None

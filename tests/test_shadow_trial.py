@@ -16,6 +16,8 @@ from pkm_brain.gmail_operations import (
     GmailOperationalCandidate,
     GmailThreadDetection,
 )
+from pkm_brain.gmail_mirror import GmailMirrorStore
+from pkm_brain.gmail_sync import GmailMirrorSynchronizer, GmailMirrorSyncOutcome
 from pkm_brain.google_cache import GoogleEvidenceCache
 from pkm_brain.google_normalization import (
     NormalizedCalendarEvent,
@@ -55,12 +57,6 @@ from pkm_brain.shadow_trial import ShadowTrialRunner
 NOW = datetime(2026, 7, 13, 15, 0, tzinfo=timezone.utc)
 
 
-def test_manual_gmail_run_caps_responsive_thread_work() -> None:
-    assert shadow_trial_module._gmail_manual_run_thread_cap(1_200) == 200
-    assert shadow_trial_module._gmail_manual_run_thread_cap(100) == 75
-    assert shadow_trial_module._gmail_manual_run_thread_cap(1) == 1
-
-
 class FakeCalendarReader:
     def __init__(self, result: CalendarFetchResult) -> None:
         self.result = result
@@ -79,6 +75,24 @@ class FakeGmailReader:
     def fetch(self, **kwargs):
         self.calls.append(kwargs)
         return self.result
+
+
+def sync_gmail_mirror(
+    paths: BrainPaths,
+    service: OperationalService,
+    result: GmailFetchResult,
+    *,
+    active_policy: OperationsPolicy | None = None,
+    now: datetime = NOW,
+) -> tuple[FakeGmailReader, GmailMirrorSyncOutcome]:
+    reader = FakeGmailReader(result)
+    outcome = GmailMirrorSynchronizer(
+        paths,
+        service,
+        reader=reader,
+        now=lambda: now,
+    ).sync(policy=active_policy or policy(), run_id="test-mirror-sync")
+    return reader, outcome
 
 
 class FakeProvider:
@@ -368,9 +382,7 @@ def test_live_shadow_run_writes_only_ops_and_private_evidence_and_builds_today(
     )
     assert len(result.briefing["sections"]["now_and_next"]) == 1
     assert provider.calls == 1
-    assert gmail.calls[0]["query"] == (
-        "newer_than:7d {newer_than:2d is:unread} -in:spam -in:trash"
-    )
+    assert gmail.calls[0]["query"] == "newer_than:7d -in:spam -in:trash"
     assert not paths.sqlite_path.exists()
     with operational_connection(paths.ops_sqlite_path, write=False) as conn:
         assert conn.execute("SELECT COUNT(*) FROM ops_items").fetchone()[0] == 2
@@ -426,7 +438,7 @@ def test_live_shadow_run_writes_only_ops_and_private_evidence_and_builds_today(
     )["thread_id"] == "thread-1"
 
 
-def test_detector_budget_deferral_keeps_provider_cursor_and_all_clear_blocked(
+def test_detector_budget_deferral_keeps_mirror_checkpoint_and_all_clear_blocked(
     tmp_path: Path,
 ) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
@@ -458,7 +470,10 @@ def test_detector_budget_deferral_keeps_provider_cursor_and_all_clear_blocked(
     assert result.briefing["status"] == "partial"
     assert result.briefing["all_clear"] is False
     assert result.coverage["gmail"]["deferred_count"] == 1
-    assert result.coverage["gmail"]["cursor_advanced"] is False
+    assert result.coverage["gmail"]["cursor_advanced"] is True
+    assert result.coverage["gmail"]["mailbox_status"] == "partial"
+    assert result.coverage["gmail"]["triage_status"] == "partial"
+    assert result.coverage["gmail"]["triage_pending_count"] == 1
     assert provider.calls == 0
     cursor = get_source_cursor(
         paths.ops_sqlite_path,
@@ -468,8 +483,117 @@ def test_detector_budget_deferral_keeps_provider_cursor_and_all_clear_blocked(
     )
     assert cursor["cursor"] is None
     assert cursor["generation"] == 1
-    assert cursor["metadata"]["continuation_page_token"] is None
-    assert cursor["metadata"]["baseline_history_id"] is None
+    assert cursor["metadata"]["continuation_page_token"] == "provider-page-2"
+    assert cursor["metadata"]["baseline_history_id"] == "provider-baseline"
+    mirror = GmailMirrorStore(paths.gmail_mirror_sqlite_path)
+    checkpoint = mirror.get_checkpoint("gmail.personal")
+    assert checkpoint is not None
+    assert checkpoint.generation == 1
+    assert checkpoint.continuation_page_token == "provider-page-2"
+    assert len(
+        mirror.list_pending_triage(
+            "gmail.personal",
+            as_of="9999-12-31T23:59:59+00:00",
+        )
+    ) == 1
+
+
+def test_active_mirror_triage_lease_blocks_false_all_clear_without_refetch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    service = OperationalService(paths, writer_guard=lambda: None)
+    original_persist = service.persist_shadow_source_unit
+
+    def interrupt_after_detection(*_args, **_kwargs):
+        raise RuntimeError("simulated ops commit interruption")
+
+    monkeypatch.setattr(
+        service,
+        "persist_shadow_source_unit",
+        interrupt_after_detection,
+    )
+    first = ShadowTrialRunner(
+        paths,
+        service,
+        gmail_reader=FakeGmailReader(gmail_result()),
+        llm_provider=FakeProvider(detector_response()),
+        now=lambda: NOW,
+    ).run_live(sources=("gmail",), policy=policy())
+
+    assert first.coverage["gmail"]["status"] == "unavailable"
+    mirror = GmailMirrorStore(paths.gmail_mirror_sqlite_path)
+    assert mirror.triage_counts("gmail.personal")["processing"] == 1
+
+    monkeypatch.setattr(
+        service,
+        "persist_shadow_source_unit",
+        original_persist,
+    )
+    unused_reader = FakeGmailReader(gmail_result())
+    unused_provider = FakeProvider(detector_response())
+    second = ShadowTrialRunner(
+        paths,
+        service,
+        gmail_reader=unused_reader,
+        llm_provider=unused_provider,
+        now=lambda: NOW + timedelta(minutes=1),
+    ).run_live(sources=("gmail",), policy=policy())
+
+    assert unused_reader.calls == []
+    assert unused_provider.calls == 0
+    assert second.coverage["gmail"]["status"] == "partial"
+    assert second.coverage["gmail"]["triage_status"] == "partial"
+    assert second.coverage["gmail"]["triage_pending_count"] == 1
+    assert second.briefing["all_clear"] is False
+
+
+def test_expired_triage_lease_reuses_durable_decision_without_model_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    service = OperationalService(paths, writer_guard=lambda: None)
+    provider = FakeProvider(detector_response())
+    runner = ShadowTrialRunner(
+        paths,
+        service,
+        gmail_reader=FakeGmailReader(gmail_result()),
+        llm_provider=provider,
+        now=lambda: NOW,
+    )
+
+    def interrupt_queue_ack(*_args, **_kwargs):
+        raise RuntimeError("simulated queue acknowledgement interruption")
+
+    monkeypatch.setattr(
+        runner.gmail_mirror,
+        "finish_triage",
+        interrupt_queue_ack,
+    )
+    first = runner.run_live(sources=("gmail",), policy=policy())
+
+    assert first.coverage["gmail"]["status"] == "unavailable"
+    assert provider.calls == 1
+    mirror = GmailMirrorStore(paths.gmail_mirror_sqlite_path)
+    assert mirror.triage_counts("gmail.personal")["processing"] == 1
+
+    unused_reader = FakeGmailReader(gmail_result())
+    unused_provider = FakeProvider(detector_response())
+    second = ShadowTrialRunner(
+        paths,
+        service,
+        gmail_reader=unused_reader,
+        llm_provider=unused_provider,
+        now=lambda: NOW + timedelta(minutes=16),
+    ).run_live(sources=("gmail",), policy=policy())
+
+    assert unused_reader.calls == []
+    assert unused_provider.calls == 0
+    assert second.coverage["gmail"]["status"] == "complete"
+    assert second.coverage["gmail"]["cached_decision_count"] == 1
+    assert second.coverage["gmail"]["triage_pending_count"] == 0
 
 
 def test_observed_provider_usage_above_reserve_is_appended_without_refunds(
@@ -645,16 +769,28 @@ def test_missing_gmail_thread_advances_cursor_but_keeps_item_visible_uncertain(
         coverage_complete=True,
         pages_fetched=1,
     )
+    sync_reader, sync_outcome = sync_gmail_mirror(
+        paths,
+        service,
+        missing,
+        now=NOW + timedelta(hours=1),
+    )
+    unused_reader = FakeGmailReader(missing)
     second = ShadowTrialRunner(
         paths,
         service,
-        gmail_reader=FakeGmailReader(missing),
+        gmail_reader=unused_reader,
         llm_provider=FakeProvider([]),
         now=lambda: NOW + timedelta(hours=1),
     ).run_live(sources=("gmail",), policy=policy())
 
+    assert len(sync_reader.calls) == 1
+    assert sync_outcome.checkpoint.history_id == "mailbox-history-2"
+    assert unused_reader.calls == []
     assert second.coverage["gmail"]["status"] == "partial"
     assert second.coverage["gmail"]["cursor_advanced"] is True
+    assert second.coverage["gmail"]["mailbox_status"] == "complete"
+    assert second.coverage["gmail"]["triage_status"] == "partial"
     cursor = get_source_cursor(
         paths.ops_sqlite_path,
         "gmail",
@@ -662,7 +798,9 @@ def test_missing_gmail_thread_advances_cursor_but_keeps_item_visible_uncertain(
         "mailbox",
     )
     assert cursor["cursor"] == "mailbox-history-2"
-    assert cursor["last_success_at"] == NOW.isoformat()
+    assert cursor["last_success_at"] == (
+        NOW + timedelta(hours=1)
+    ).isoformat()
     with operational_connection(paths.ops_sqlite_path, write=False) as conn:
         item = conn.execute(
             "SELECT id, state, confidence FROM ops_items WHERE source_type = 'gmail'"
@@ -680,17 +818,23 @@ def test_missing_gmail_thread_advances_cursor_but_keeps_item_visible_uncertain(
         "gmail_thread_missing"
     ]
 
+    no_change = replace(
+        missing,
+        changed_thread_ids=(),
+        missing_thread_ids=(),
+        next_history_id="mailbox-history-3",
+    )
+    sync_gmail_mirror(
+        paths,
+        service,
+        no_change,
+        now=NOW + timedelta(hours=2),
+    )
+    third_reader = FakeGmailReader(no_change)
     third = ShadowTrialRunner(
         paths,
         service,
-        gmail_reader=FakeGmailReader(
-            replace(
-                missing,
-                changed_thread_ids=(),
-                missing_thread_ids=(),
-                next_history_id="mailbox-history-3",
-            )
-        ),
+        gmail_reader=third_reader,
         llm_provider=FakeProvider([]),
         now=lambda: NOW + timedelta(hours=2),
     ).run_live(sources=("gmail",), policy=policy())
@@ -703,8 +847,11 @@ def test_missing_gmail_thread_advances_cursor_but_keeps_item_visible_uncertain(
 
     assert third.coverage["gmail"]["status"] == "partial"
     assert third.coverage["gmail"]["deferred_count"] == 1
+    assert third_reader.calls == []
     assert cursor["cursor"] == "mailbox-history-3"
-    assert cursor["last_success_at"] == NOW.isoformat()
+    assert cursor["last_success_at"] == (
+        NOW + timedelta(hours=2)
+    ).isoformat()
 
 
 def test_gmail_same_provider_revision_restores_without_another_model_call(
@@ -719,42 +866,54 @@ def test_gmail_same_provider_revision_restores_without_another_model_call(
         llm_provider=FakeProvider(detector_response()),
         now=lambda: NOW,
     ).run_live(sources=("gmail",), policy=policy())
+    missing = GmailFetchResult(
+        mode="incremental",
+        raw_threads=(),
+        threads=(),
+        changed_thread_ids=("thread-1",),
+        missing_thread_ids=("thread-1",),
+        next_history_id="mailbox-history-2",
+        reset_required=False,
+        coverage_complete=True,
+        pages_fetched=1,
+    )
+    sync_gmail_mirror(
+        paths,
+        service,
+        missing,
+        now=NOW + timedelta(hours=1),
+    )
     ShadowTrialRunner(
         paths,
         service,
-        gmail_reader=FakeGmailReader(
-            GmailFetchResult(
-                mode="incremental",
-                raw_threads=(),
-                threads=(),
-                changed_thread_ids=("thread-1",),
-                missing_thread_ids=("thread-1",),
-                next_history_id="mailbox-history-2",
-                reset_required=False,
-                coverage_complete=True,
-                pages_fetched=1,
-            )
-        ),
+        gmail_reader=FakeGmailReader(missing),
         llm_provider=FakeProvider([]),
         now=lambda: NOW + timedelta(hours=1),
     ).run_live(sources=("gmail",), policy=policy())
+    restored = replace(
+        gmail_result(),
+        mode="incremental",
+        next_history_id="mailbox-history-3",
+    )
+    sync_gmail_mirror(
+        paths,
+        service,
+        restored,
+        now=NOW + timedelta(hours=2),
+    )
     provider = FakeProvider(detector_response())
+    unused_reader = FakeGmailReader(restored)
 
     result = ShadowTrialRunner(
         paths,
         service,
-        gmail_reader=FakeGmailReader(
-            replace(
-                gmail_result(),
-                mode="incremental",
-                next_history_id="mailbox-history-3",
-            )
-        ),
+        gmail_reader=unused_reader,
         llm_provider=provider,
         now=lambda: NOW + timedelta(hours=2),
     ).run_live(sources=("gmail",), policy=policy())
 
     assert provider.calls == 0
+    assert unused_reader.calls == []
     assert result.coverage["gmail"]["status"] == "complete"
     with operational_connection(paths.ops_sqlite_path, write=False) as conn:
         item = conn.execute(
@@ -1225,65 +1384,77 @@ def test_calendar_revalidation_card_opens_retained_revision_evidence(
     assert evidence["evidence"]["event_id"] == "event-1"
 
 
-def test_resumed_gmail_page_is_retried_when_detector_cannot_finish(
+def test_mirror_accepts_next_gmail_page_when_detector_cannot_finish(
     tmp_path: Path,
 ) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
     service = OperationalService(paths, writer_guard=lambda: None)
-    service.initialize()
-    service.save_source_cursor(
-        "gmail",
-        "gmail.personal",
-        "mailbox",
-        source_type="gmail",
-        cursor="history-9",
-        metadata={
-            "coverage_status": "partial",
-            "continuation_page_token": "provider-page-2",
-            "continuation_mode": "incremental",
-            "continuation_history_id": "history-11",
-            "pending_thread_ids": json.dumps(["pending-old"]),
-        },
-        updated_at=NOW.isoformat(),
-    )
-    gmail = FakeGmailReader(
-        replace(
-            gmail_result(body="Can you review? " + "x" * 5000),
-            next_history_id=None,
-            coverage_complete=False,
-            continuation_page_token="provider-page-3",
-            baseline_history_id=None,
-            pending_thread_ids=("pending-next",),
-            continuation_history_id="history-12",
-        )
-    )
-    runner = ShadowTrialRunner(
+    ShadowTrialRunner(
         paths,
         service,
-        gmail_reader=gmail,
+        gmail_reader=FakeGmailReader(gmail_result()),
         llm_provider=FakeProvider(detector_response()),
         now=lambda: NOW,
-    )
+    ).run_live(sources=("gmail",), policy=policy())
 
-    result = runner.run_live(
+    base = gmail_result(body="Can you review? " + "x" * 5000)
+    revised_thread = replace(
+        base.threads[0],
+        history_id="gmail-history-thread-2",
+        source_revision="gmail-history-thread-2",
+    )
+    revised_raw = {**base.raw_threads[0], "historyId": "gmail-history-thread-2"}
+    next_page = replace(
+        base,
+        mode="incremental",
+        raw_threads=(revised_raw,),
+        threads=(revised_thread,),
+        next_history_id=None,
+        coverage_complete=False,
+        continuation_page_token="provider-page-3",
+        baseline_history_id=None,
+        pending_thread_ids=("pending-next",),
+        continuation_history_id="history-12",
+    )
+    sync_reader, sync_outcome = sync_gmail_mirror(
+        paths,
+        service,
+        next_page,
+        now=NOW + timedelta(minutes=1),
+    )
+    unused_reader = FakeGmailReader(next_page)
+
+    result = ShadowTrialRunner(
+        paths,
+        service,
+        gmail_reader=unused_reader,
+        llm_provider=FakeProvider(detector_response()),
+        now=lambda: NOW + timedelta(minutes=1),
+    ).run_live(
         sources=("gmail",),
         policy=policy(detector_input_tokens=1),
     )
 
-    assert result.coverage["gmail"]["cursor_advanced"] is False
-    assert gmail.calls[0]["continuation_page_token"] == "provider-page-2"
-    assert gmail.calls[0]["pending_thread_ids"] == ("pending-old",)
-    assert gmail.calls[0]["continuation_history_id"] == "history-11"
+    assert sync_reader.calls[0]["history_id"] == "mailbox-history-1"
+    assert sync_outcome.checkpoint.continuation_page_token == "provider-page-3"
+    assert sync_outcome.checkpoint.pending_thread_ids == ("pending-next",)
+    assert sync_outcome.checkpoint.continuation_history_id == "history-12"
+    assert result.coverage["gmail"]["cursor_advanced"] is True
+    assert result.coverage["gmail"]["mailbox_status"] == "partial"
+    assert result.coverage["gmail"]["triage_status"] == "partial"
+    assert result.coverage["gmail"]["triage_pending_count"] == 1
+    assert unused_reader.calls == []
     cursor = get_source_cursor(
         paths.ops_sqlite_path,
         "gmail",
         "gmail.personal",
         "mailbox",
     )
-    assert cursor["metadata"]["continuation_page_token"] == "provider-page-2"
+    assert cursor["cursor"] == "mailbox-history-1"
+    assert cursor["metadata"]["continuation_page_token"] == "provider-page-3"
     assert cursor["metadata"]["baseline_history_id"] is None
-    assert json.loads(cursor["metadata"]["pending_thread_ids"]) == ["pending-old"]
-    assert cursor["metadata"]["continuation_history_id"] == "history-11"
+    assert json.loads(cursor["metadata"]["pending_thread_ids"]) == ["pending-next"]
+    assert cursor["metadata"]["continuation_history_id"] == "history-12"
 
 
 def test_calendar_410_full_rebuild_resumes_without_the_expired_sync_token(
@@ -1379,11 +1550,17 @@ def test_gmail_404_full_rebuild_resumes_without_expired_history_or_false_absence
         continuation_page_token="gmail-reset-page-2",
         baseline_history_id="gmail-reset-baseline",
     )
-    reset_reader = FakeGmailReader(reset_page)
+    reset_reader, reset_outcome = sync_gmail_mirror(
+        paths,
+        service,
+        reset_page,
+        now=NOW + timedelta(hours=1),
+    )
+    unused_reset_reader = FakeGmailReader(reset_page)
     ShadowTrialRunner(
         paths,
         service,
-        gmail_reader=reset_reader,
+        gmail_reader=unused_reset_reader,
         llm_provider=FakeProvider(detector_response()),
         now=lambda: NOW + timedelta(hours=1),
     ).run_live(sources=("gmail",), policy=policy())
@@ -1394,6 +1571,8 @@ def test_gmail_404_full_rebuild_resumes_without_expired_history_or_false_absence
         "mailbox",
     )
     assert reset_reader.calls[0]["history_id"] == "mailbox-history-1"
+    assert reset_outcome.checkpoint.continuation_page_token == "gmail-reset-page-2"
+    assert unused_reset_reader.calls == []
     assert partial_cursor["cursor"] is None
     assert partial_cursor["metadata"]["continuation_mode"] == "full"
     assert partial_cursor["metadata"]["reset_rebuild"] is True
@@ -1406,12 +1585,18 @@ def test_gmail_404_full_rebuild_resumes_without_expired_history_or_false_absence
         next_history_id="gmail-reset-baseline",
         baseline_history_id="gmail-reset-baseline",
     )
-    resume_reader = FakeGmailReader(final_page)
+    resume_reader, resume_outcome = sync_gmail_mirror(
+        paths,
+        service,
+        final_page,
+        now=NOW + timedelta(hours=2),
+    )
+    unused_resume_reader = FakeGmailReader(final_page)
 
     result = ShadowTrialRunner(
         paths,
         service,
-        gmail_reader=resume_reader,
+        gmail_reader=unused_resume_reader,
         llm_provider=FakeProvider(detector_response()),
         now=lambda: NOW + timedelta(hours=2),
     ).run_live(sources=("gmail",), policy=policy())
@@ -1419,6 +1604,8 @@ def test_gmail_404_full_rebuild_resumes_without_expired_history_or_false_absence
     assert resume_reader.calls[0]["history_id"] is None
     assert resume_reader.calls[0]["continuation_page_token"] == "gmail-reset-page-2"
     assert resume_reader.calls[0]["baseline_history_id"] == "gmail-reset-baseline"
+    assert resume_outcome.checkpoint.history_id == "gmail-reset-baseline"
+    assert unused_resume_reader.calls == []
     assert result.coverage["gmail"]["status"] == "complete"
     completed_cursor = get_source_cursor(
         paths.ops_sqlite_path,
@@ -1537,15 +1724,18 @@ def test_missing_gmail_thread_keeps_existing_item_visible_and_advances_checkpoin
         missing_thread_ids=("thread-1",),
         next_history_id="mailbox-history-2",
     )
+    sync_gmail_mirror(paths, service, missing, now=NOW + timedelta(minutes=1))
+    unused_reader = FakeGmailReader(missing)
 
     second = ShadowTrialRunner(
         paths,
         service,
-        gmail_reader=FakeGmailReader(missing),
+        gmail_reader=unused_reader,
         llm_provider=FakeProvider(detector_response()),
-        now=lambda: NOW,
+        now=lambda: NOW + timedelta(minutes=1),
     ).run_live(sources=("gmail",), policy=policy())
 
+    assert unused_reader.calls == []
     assert second.run["status"] == "partial"
     assert second.coverage["gmail"]["missing_thread_count"] == 1
     assert second.coverage["gmail"]["cursor_advanced"] is True
@@ -1588,7 +1778,7 @@ def test_gmail_decision_cache_is_policy_and_detector_context_aware(
     assert provider.calls == 2
 
 
-def test_provider_error_fallback_is_cached_and_next_run_advances_cursor(
+def test_provider_error_defers_local_triage_without_refetching_gmail(
     tmp_path: Path,
 ) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
@@ -1622,7 +1812,7 @@ def test_provider_error_fallback_is_cached_and_next_run_advances_cursor(
     first = ShadowTrialRunner(
         paths,
         service,
-        gmail_reader=FakeGmailReader(gmail_result(body="FYI on the project update.")),
+        gmail_reader=FakeGmailReader(gmail_result()),
         llm_provider=provider,
         now=lambda: NOW,
     ).run_live(sources=("gmail",), policy=policy())
@@ -1632,7 +1822,10 @@ def test_provider_error_fallback_is_cached_and_next_run_advances_cursor(
         run_id=str(first.run["id"]),
     )
     assert first.coverage["gmail"]["status"] == "partial"
-    assert first.coverage["gmail"]["cursor_advanced"] is False
+    assert first.coverage["gmail"]["cursor_advanced"] is True
+    assert first.coverage["gmail"]["mailbox_status"] == "complete"
+    assert first.coverage["gmail"]["triage_status"] == "partial"
+    assert first.coverage["gmail"]["triage_pending_count"] == 1
     assert provider.calls == 1
     assert first.usage["gmail"]["actual_input_tokens"] == 80
     assert first.usage["gmail"]["actual_total_tokens"] == 85
@@ -1640,18 +1833,25 @@ def test_provider_error_fallback_is_cached_and_next_run_advances_cursor(
     assert first.usage["gmail"]["reported_provider_calls"] == 1
     assert first.usage["gmail"]["unreported_provider_calls"] == 0
     assert first_decisions[0]["disposition"] == "surfaced"
-    assert first_decisions[0]["reason_code"] == "detector_error_uncertain"
+    assert first_decisions[0]["reason_code"] == "direct_obligation_detector_error"
 
+    succeeding_provider = FakeProvider(detector_response())
+    unused_reader = FakeGmailReader(gmail_result())
     second = ShadowTrialRunner(
         paths,
         service,
-        gmail_reader=FakeGmailReader(gmail_result(body="FYI on the project update.")),
-        llm_provider=provider,
-        now=lambda: NOW,
+        gmail_reader=unused_reader,
+        llm_provider=succeeding_provider,
+        now=lambda: NOW + timedelta(minutes=11),
     ).run_live(sources=("gmail",), policy=policy())
 
     assert provider.calls == 1
-    assert second.coverage["gmail"]["cursor_advanced"] is True
+    assert succeeding_provider.calls == 1
+    assert unused_reader.calls == []
+    assert second.coverage["gmail"]["cursor_advanced"] is False
+    assert second.coverage["gmail"]["mailbox_status"] == "complete"
+    assert second.coverage["gmail"]["triage_status"] == "complete"
+    assert second.coverage["gmail"]["triage_pending_count"] == 0
     cursor = get_source_cursor(
         paths.ops_sqlite_path,
         "gmail",

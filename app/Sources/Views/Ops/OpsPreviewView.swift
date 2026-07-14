@@ -109,7 +109,7 @@ struct OpsPreviewView: View {
             if let jobs = (scheduler ?? appState.daemon.scheduler)?.jobs {
                 Table(jobs) {
                     TableColumn("Job") { job in
-                        Text(job.id)
+                        Text(job.displayName)
                     }
                     TableColumn("Status") { job in
                         Text(job.displayStatus)
@@ -131,7 +131,7 @@ struct OpsPreviewView: View {
                             Image(systemName: "play.fill")
                         }
                         .buttonStyle(.borderless)
-                        .help("Run \(job.id) now")
+                        .help("Run \(job.displayName) now")
                         .disabled(activeOperation != nil || !job.enabled)
                     }
                     .width(36)

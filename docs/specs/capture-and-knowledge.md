@@ -1,7 +1,7 @@
 # Capture And Knowledge
 
 **Status:** canonical living feature spec
-**Last verified:** 2026-07-13 against knowledge-foundation commit `3937316` and the current working tree
+**Last verified:** 2026-07-14 against the Gmail operational-mirror/provider-sync implementation; knowledge ingestion remains unchanged
 **Owns:** evidence connectors, ingest, source normalization, durable-knowledge extraction, facts, entities, routing, gardener topology, and wiki projection
 
 ## Feature Boundary
@@ -20,7 +20,7 @@ Operational awareness is a separate consumer of approved evidence. Calendar and 
 
 ## Capture Contract
 
-Current capture adapters wrap Codex, Claude, OpenCode, Hyprnote, and filesystem input. Gmail, Calendar, and Slack are registered as `auth_only` capture connectors: they expose account authorization but have no inbox discovery, capture scheduling, or knowledge-ingestion behavior. A separately approved manual Calendar/Gmail operational shadow pass consumes bounded evidence through [Chief-of-Staff Operations](chief-of-staff-operations.md); that path does not make either connector capture-capable. A capture-capable connector:
+Current capture adapters wrap Codex, Claude, OpenCode, Hyprnote, and filesystem input. Gmail, Calendar, and Slack are registered as `auth_only` capture connectors: they expose account authorization but have no inbox discovery, capture scheduling, or knowledge-ingestion behavior. Separately approved Calendar evaluation and scheduled Gmail operational-mirror paths consume bounded evidence through [Chief-of-Staff Operations](chief-of-staff-operations.md); those paths do not make either connector capture-capable. A capture-capable connector:
 
 - writes normalized Markdown or text under its `inbox/<connector_id>/` namespace;
 - advances `capture_sources` state only after a successful unit;
@@ -260,9 +260,9 @@ Calendar is operationally useful without LLM extraction. Its source evidence rem
 
 ## Future Gmail And Email Adapter
 
-Status: the manual read-only operational shadow adapter is implemented; capture, retrieval indexing, and durable-knowledge ingestion remain paused.
+Status: the read-only Gmail operational mirror and local analysis queue are implemented; capture, retrieval indexing, and durable-knowledge ingestion remain paused.
 
-The Gmail account card can hold the separately approved `gmail.readonly` grant for the manual operational shadow trial. It stores secrets and tokens in macOS Keychain, but the capture registry remains `auth_only`: it cannot discover mail into `inbox/`, schedule capture, index mail for retrieval, or run durable-fact ingestion. Any future knowledge adapter must receive a separate product decision and revise this capture plan. Its safety constraints remain:
+The Gmail account card can hold the separately approved `gmail.readonly` grant for the operational mirror and Shadow evaluation. It stores secrets and tokens in macOS Keychain, but the capture registry remains `auth_only`: its capture subsystem cannot discover mail into `inbox/`, schedule knowledge capture, index mail for retrieval, or run durable-fact ingestion. A separate provider-sync job may update only the rebuildable operational mirror. Any future knowledge adapter must receive a separate product decision and revise this capture plan. Its safety constraints remain:
 
 - no mail sender, label mutation, deletion, attachment retrieval, or full-corpus knowledge capture in the operational shadow phase;
 - local Maildir/mbox remains an eligible evidence input alongside a future Gmail API adapter;

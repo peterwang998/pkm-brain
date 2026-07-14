@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import urllib.parse
 from collections.abc import Mapping
@@ -19,6 +20,7 @@ from .operational_state import MAX_PENDING_THREAD_IDS_BYTES
 
 
 MAX_PENDING_THREAD_IDS = 10_000
+GMAIL_THREAD_PARSER_VERSION = "gmail-thread-v1"
 
 
 class GoogleJSONClient(Protocol):
@@ -46,6 +48,17 @@ class CalendarFetchResult:
 
 
 @dataclass(frozen=True)
+class GmailThreadFailure:
+    """One provider thread isolated from an otherwise valid mailbox unit."""
+
+    thread_id: str
+    source_revision: str | None
+    stage: str
+    error: str
+    payload_sha256: str
+
+
+@dataclass(frozen=True)
 class GmailFetchResult:
     mode: str
     raw_threads: tuple[dict[str, Any], ...]
@@ -62,6 +75,11 @@ class GmailFetchResult:
     continuation_history_id: str | None = None
     api_requests: int = 0
     quota_units: int = 0
+    quarantined_threads: tuple[GmailThreadFailure, ...] = ()
+
+
+class _InvalidContinuationToken(RuntimeError):
+    """A saved provider page token can be discarded and replayed safely."""
 
 
 @dataclass
@@ -304,13 +322,26 @@ class GmailThreadReader:
                     "baseline_history_id is only valid for full-sync resume"
                 )
             try:
-                return self._fetch_incremental(
-                    starting_history_id,
-                    continuation_page_token=page_token,
-                    pending_thread_ids=pending,
-                    continuation_history_id=history_checkpoint,
-                    usage=usage,
-                )
+                try:
+                    return self._fetch_incremental(
+                        starting_history_id,
+                        continuation_page_token=page_token,
+                        pending_thread_ids=pending,
+                        continuation_history_id=history_checkpoint,
+                        usage=usage,
+                    )
+                except _InvalidContinuationToken:
+                    # A history page token is opaque and may expire independently
+                    # from its retained startHistoryId. Replaying from that durable
+                    # history cursor is idempotent in the mirror and avoids a full
+                    # mailbox reset.
+                    return self._fetch_incremental(
+                        starting_history_id,
+                        continuation_page_token=None,
+                        pending_thread_ids=(),
+                        continuation_history_id=None,
+                        usage=usage,
+                    )
             except GoogleAPIError as exc:
                 if exc.status != 404:
                     raise
@@ -335,12 +366,24 @@ class GmailThreadReader:
             raise ValueError(
                 "baseline_history_id requires a full-fetch continuation_page_token"
             )
-        return self._fetch_full(
-            normalized_query,
-            continuation_page_token=page_token,
-            baseline_history_id=baseline,
-            usage=usage,
-        )
+        try:
+            return self._fetch_full(
+                normalized_query,
+                continuation_page_token=page_token,
+                baseline_history_id=baseline,
+                usage=usage,
+            )
+        except _InvalidContinuationToken:
+            # The old baseline cannot safely be paired with a newly restarted
+            # threads.list traversal. Take a new profile baseline while retaining
+            # all revisions already committed to the local mirror.
+            replacement = self._fetch_full(
+                normalized_query,
+                continuation_page_token=None,
+                baseline_history_id=None,
+                usage=usage,
+            )
+            return replace(replacement, reset_required=True)
 
     def _fetch_full(
         self,
@@ -374,11 +417,18 @@ class GmailThreadReader:
             if page_token:
                 params["pageToken"] = page_token
             usage.add(self.THREADS_LIST_UNITS)
-            payload = self.client.get_json(
-                "threads",
-                params=params,
-                quota_units=self.THREADS_LIST_UNITS,
-            )
+            try:
+                payload = self.client.get_json(
+                    "threads",
+                    params=params,
+                    quota_units=self.THREADS_LIST_UNITS,
+                )
+            except GoogleAPIError as exc:
+                if page_token and exc.status == 400:
+                    raise _InvalidContinuationToken(
+                        "saved Gmail threads page token is invalid"
+                    ) from exc
+                raise
             pages += 1
             page_threads = [
                 item
@@ -476,11 +526,18 @@ class GmailThreadReader:
             if page_token:
                 params["pageToken"] = page_token
             usage.add(self.HISTORY_LIST_UNITS)
-            payload = self.client.get_json(
-                "history",
-                params=params,
-                quota_units=self.HISTORY_LIST_UNITS,
-            )
+            try:
+                payload = self.client.get_json(
+                    "history",
+                    params=params,
+                    quota_units=self.HISTORY_LIST_UNITS,
+                )
+            except GoogleAPIError as exc:
+                if page_token and exc.status == 400:
+                    raise _InvalidContinuationToken(
+                        "saved Gmail history page token is invalid"
+                    ) from exc
+                raise
             pages += 1
             records = [
                 item
@@ -549,7 +606,9 @@ class GmailThreadReader:
         usage: _FetchUsage,
     ) -> GmailFetchResult:
         raw_threads: list[dict[str, Any]] = []
+        normalized_threads: list[NormalizedGmailThread] = []
         missing: list[str] = []
+        quarantined: list[GmailThreadFailure] = []
         for thread_id in thread_ids:
             safe_id = urllib.parse.quote(thread_id, safe="")
             try:
@@ -564,20 +623,41 @@ class GmailThreadReader:
                     missing.append(thread_id)
                     continue
                 raise
-            raw_threads.append(sanitize_gmail_thread_payload(payload))
-        normalized = tuple(
-            normalize_gmail_thread(
-                payload,
-                message_body_cap=self.message_body_cap,
-                thread_body_cap=self.thread_body_cap,
-                operator_emails=self.operator_emails,
-            )
-            for payload in raw_threads
-        )
+            try:
+                sanitized = sanitize_gmail_thread_payload(payload)
+            except (TypeError, ValueError, OverflowError, UnicodeError) as exc:
+                quarantined.append(
+                    _gmail_thread_failure(
+                        thread_id,
+                        payload,
+                        stage="sanitize",
+                        error=exc,
+                    )
+                )
+                continue
+            try:
+                normalized = normalize_gmail_thread(
+                    sanitized,
+                    message_body_cap=self.message_body_cap,
+                    thread_body_cap=self.thread_body_cap,
+                    operator_emails=self.operator_emails,
+                )
+            except (TypeError, ValueError, OverflowError, UnicodeError) as exc:
+                quarantined.append(
+                    _gmail_thread_failure(
+                        thread_id,
+                        sanitized,
+                        stage="normalize",
+                        error=exc,
+                    )
+                )
+                continue
+            raw_threads.append(sanitized)
+            normalized_threads.append(normalized)
         return GmailFetchResult(
             mode=mode,
             raw_threads=tuple(raw_threads),
-            threads=normalized,
+            threads=tuple(normalized_threads),
             changed_thread_ids=tuple(thread_ids),
             missing_thread_ids=tuple(missing),
             next_history_id=next_history_id if coverage_complete else None,
@@ -590,6 +670,7 @@ class GmailThreadReader:
             continuation_history_id=continuation_history_id,
             api_requests=usage.api_requests,
             quota_units=usage.quota_units,
+            quarantined_threads=tuple(quarantined),
         )
 
 
@@ -612,6 +693,37 @@ def _history_thread_ids(record: Mapping[str, Any]) -> list[str]:
             if thread_id:
                 output.append(thread_id)
     return output
+
+
+def _gmail_thread_failure(
+    thread_id: str,
+    payload: Mapping[str, Any],
+    *,
+    stage: str,
+    error: Exception,
+) -> GmailThreadFailure:
+    source_revision = _optional_string(payload.get("historyId"))
+    try:
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError, OverflowError):
+        encoded = json.dumps(
+            [thread_id, source_revision, "not-json-serializable"],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    detail = f"{type(error).__name__}: {error}".replace("\x00", " ")[:1_000]
+    return GmailThreadFailure(
+        thread_id=thread_id,
+        source_revision=source_revision,
+        stage=stage,
+        error=detail,
+        payload_sha256=hashlib.sha256(encoded).hexdigest(),
+    )
 
 
 def _bounded_window(time_min: str, time_max: str) -> None:

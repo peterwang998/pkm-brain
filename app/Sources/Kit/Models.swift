@@ -44,6 +44,17 @@ public struct SchedulerJobState: Codable, Equatable, Identifiable, Sendable {
     public let running: Bool
     public let queued: Bool?
 
+    public var displayName: String {
+        switch id {
+        case "capture_tick": "Capture updates"
+        case "nightly": "Nightly maintenance"
+        case "meeting_preparation": "Prepare meeting briefs"
+        case "gmail_mirror_sync": "Check Gmail for updates"
+        default:
+            id.replacingOccurrences(of: "_", with: " ")
+        }
+    }
+
     public var displayStatus: String {
         if running {
             return "running"

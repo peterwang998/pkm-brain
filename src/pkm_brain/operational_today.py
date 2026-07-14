@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
+from .gmail_mirror import GmailMirrorStore
+from .operations_http import gmail_mirror_sync_schedule_status
 from .operational_briefing import operational_briefing_or_unavailable
 from .operational_service import OperationalService
 from .operational_shadow import list_shadow_runs
@@ -41,9 +43,16 @@ TODAY_FEEDBACK_ACTIONS = (
 class OperationalTodayPresentationService:
     """Read the operational projection and route feedback through the daemon."""
 
-    def __init__(self, paths: BrainPaths, operational_service: OperationalService) -> None:
+    def __init__(
+        self,
+        paths: BrainPaths,
+        operational_service: OperationalService,
+        *,
+        scheduler_state_reader: Callable[[], Mapping[str, Any] | None] | None = None,
+    ) -> None:
         self.paths = paths
         self.operational_service = operational_service
+        self.scheduler_state_reader = scheduler_state_reader
 
     def briefing(self) -> TodayBriefing:
         try:
@@ -71,6 +80,21 @@ class OperationalTodayPresentationService:
                 if enabled
             ),
             fresh_after_seconds=FRESH_AFTER_SECONDS,
+        )
+        try:
+            scheduler_state = (
+                self.scheduler_state_reader()
+                if self.scheduler_state_reader is not None
+                else None
+            )
+        except Exception:
+            scheduler_state = None
+        _overlay_gmail_mirror_coverage(
+            projection,
+            paths=self.paths,
+            account_key=policy.sources.gmail.account_key,
+            enabled=policy.sources.gmail.enabled,
+            scheduled_sync=gmail_mirror_sync_schedule_status(scheduler_state),
         )
         try:
             projection["hidden_calendar_series"] = (
@@ -377,7 +401,25 @@ def _today_coverage(source: str, value: Mapping[str, Any]) -> TodayCoverage:
     state = str(value.get("status") or "unavailable")
     if state not in {"complete", "partial", "unavailable"}:
         state = "unavailable"
-    detail = value.get("error")
+    detail = value.get("error") or value.get("sync_error")
+    if not detail and source == "gmail" and value.get("mailbox_status"):
+        mailbox = str(value.get("mailbox_status") or "unavailable").replace("_", " ")
+        backlog = max(0, int(value.get("triage_pending_count") or 0))
+        triage_status = str(value.get("triage_status") or "unknown")
+        if mailbox == "synchronized":
+            detail = "Mailbox synchronized"
+        elif mailbox == "resyncing":
+            detail = "Mailbox is safely resynchronizing"
+        else:
+            detail = f"Mailbox {mailbox}"
+        if backlog:
+            detail += f" · {backlog} awaiting analysis"
+        elif triage_status == "unknown":
+            detail += " · analysis status unknown"
+        elif mailbox == "not initialized":
+            detail += " · awaiting first sync"
+        else:
+            detail += " · analysis current"
     if not detail and value.get("reason"):
         detail = _coverage_reason_detail(str(value["reason"]), source=source)
     if not detail and source == "gmail" and value.get("thread_count") is not None:
@@ -400,6 +442,212 @@ def _today_coverage(source: str, value: Mapping[str, Any]) -> TodayCoverage:
     )
 
 
+def _overlay_gmail_mirror_coverage(
+    projection: dict[str, Any],
+    *,
+    paths: BrainPaths,
+    account_key: str,
+    enabled: bool = True,
+    scheduled_sync: Mapping[str, Any] | None = None,
+) -> None:
+    """Keep provider freshness distinct from the local detector backlog."""
+
+    if not enabled:
+        return
+    mirror_path = paths.gmail_mirror_sqlite_path
+    if not mirror_path.exists() and not mirror_path.is_symlink():
+        _set_gmail_mirror_failure(
+            projection,
+            mailbox_status="not_initialized",
+            triage_status="idle",
+            triage_pending_count=0,
+            reason="gmail_mirror_not_initialized",
+        )
+        _overlay_gmail_sync_schedule(
+            projection,
+            scheduled_sync,
+            mirror_last_success_at=None,
+        )
+        return
+    try:
+        store = GmailMirrorStore(mirror_path)
+        checkpoint = store.get_checkpoint(account_key)
+        counts = store.triage_counts(account_key)
+    except Exception as exc:
+        _set_gmail_mirror_failure(
+            projection,
+            mailbox_status="unavailable",
+            triage_status="unknown",
+            triage_pending_count=None,
+            reason="gmail_mirror_unavailable",
+            error=f"Gmail mirror unavailable: {exc}",
+        )
+        _overlay_gmail_sync_schedule(
+            projection,
+            scheduled_sync,
+            mirror_last_success_at=None,
+        )
+        return
+    if checkpoint is None:
+        _set_gmail_mirror_failure(
+            projection,
+            mailbox_status="not_initialized",
+            triage_status="idle",
+            triage_pending_count=0,
+            reason="gmail_mirror_not_initialized",
+        )
+        _overlay_gmail_sync_schedule(
+            projection,
+            scheduled_sync,
+            mirror_last_success_at=None,
+        )
+        return
+    entry = _gmail_coverage_entry(projection)
+    backlog = int(counts["backlog_count"])
+    mailbox_status = (
+        "synchronized"
+        if checkpoint.coverage_complete
+        else "resyncing"
+        if checkpoint.reset_required
+        else "partial"
+    )
+    entry.update(
+        {
+            "mailbox_status": mailbox_status,
+            "mailbox_last_success_at": checkpoint.last_success_at,
+            "triage_status": "backlogged" if backlog else "current",
+            "triage_pending_count": backlog,
+            "triage_counts": counts,
+            "fresh_at": checkpoint.last_success_at,
+        }
+    )
+    if not checkpoint.coverage_complete:
+        entry.update({"status": "partial", "reason": "mailbox_resyncing"})
+    elif backlog:
+        entry.update({"status": "partial", "reason": "triage_backlog"})
+    if str(entry.get("status") or "unavailable") != "complete":
+        projection["all_clear"] = False
+        if projection.get("status") == "complete":
+            projection["status"] = "partial"
+    _overlay_gmail_sync_schedule(
+        projection,
+        scheduled_sync,
+        mirror_last_success_at=checkpoint.last_success_at,
+    )
+
+
+def _overlay_gmail_sync_schedule(
+    projection: dict[str, Any],
+    scheduled_sync: Mapping[str, Any] | None,
+    *,
+    mirror_last_success_at: str | None,
+) -> None:
+    if scheduled_sync is None:
+        return
+    entry = _gmail_coverage_entry(projection)
+    entry["scheduled_sync"] = dict(scheduled_sync)
+    available = bool(scheduled_sync.get("available"))
+    enabled = bool(scheduled_sync.get("enabled"))
+    paused = bool(scheduled_sync.get("paused"))
+    last_status = str(scheduled_sync.get("last_status") or "").casefold()
+    last_error = str(scheduled_sync.get("last_error") or "").strip()
+    scheduler_last_run = _timestamp(scheduled_sync.get("last_run_at"))
+    mirror_last_success = _timestamp(mirror_last_success_at)
+    failure_superseded = (
+        last_status in {"failed", "skipped"}
+        and scheduler_last_run is not None
+        and mirror_last_success is not None
+        and mirror_last_success > scheduler_last_run
+    )
+    target_status: str | None = None
+    reason: str | None = None
+    detail: str | None = None
+    if not available:
+        target_status = "unavailable"
+        reason = "gmail_sync_unavailable"
+        detail = "Automatic Gmail sync status is unavailable."
+    elif not enabled:
+        target_status = "unavailable"
+        reason = "gmail_sync_disabled"
+        detail = "Automatic Gmail sync is turned off."
+    elif paused:
+        target_status = "partial"
+        reason = "gmail_sync_paused"
+        paused_until = str(scheduled_sync.get("paused_until") or "").strip()
+        detail = (
+            f"Automatic Gmail sync is paused until {paused_until}."
+            if paused_until
+            else "Automatic Gmail sync is paused."
+        )
+    elif last_status in {"failed", "skipped", "unavailable"} and not failure_superseded:
+        target_status = "partial" if last_status != "unavailable" else "unavailable"
+        reason = f"gmail_sync_{last_status}"
+        if last_status == "failed":
+            detail = "Automatic Gmail sync failed"
+        elif last_status == "skipped":
+            detail = "Automatic Gmail sync did not run"
+        else:
+            detail = "Automatic Gmail sync is unavailable"
+        detail += f": {last_error}" if last_error else "."
+    else:
+        entry.pop("sync_error", None)
+        if str(entry.get("reason") or "").startswith("gmail_sync_"):
+            entry.pop("reason", None)
+        return
+
+    existing_status = str(entry.get("status") or "unavailable")
+    if existing_status == "complete" or target_status == "unavailable":
+        entry["status"] = target_status
+    if not entry.get("reason") or existing_status == "complete":
+        entry["reason"] = reason
+    entry["sync_error"] = detail
+    projection["all_clear"] = False
+    if projection.get("status") == "complete":
+        projection["status"] = "partial"
+
+
+def _set_gmail_mirror_failure(
+    projection: dict[str, Any],
+    *,
+    mailbox_status: str,
+    triage_status: str,
+    triage_pending_count: int | None,
+    reason: str,
+    error: str | None = None,
+) -> None:
+    entry = _gmail_coverage_entry(projection)
+    entry.pop("fresh_at", None)
+    entry.update(
+        {
+            "status": "unavailable",
+            "reason": reason,
+            "mailbox_status": mailbox_status,
+            "mailbox_last_success_at": None,
+            "triage_status": triage_status,
+            "triage_pending_count": triage_pending_count,
+        }
+    )
+    if error:
+        entry["error"] = error
+    else:
+        entry.pop("error", None)
+    projection["all_clear"] = False
+    if projection.get("status") == "complete":
+        projection["status"] = "partial"
+
+
+def _gmail_coverage_entry(projection: dict[str, Any]) -> dict[str, Any]:
+    coverage = projection.get("coverage")
+    if not isinstance(coverage, dict):
+        coverage = {}
+        projection["coverage"] = coverage
+    entry = coverage.get("gmail")
+    if not isinstance(entry, dict):
+        entry = {}
+        coverage["gmail"] = entry
+    return entry
+
+
 def _coverage_reason_detail(reason: str, *, source: str) -> str:
     labels = {
         "missing_coverage": "This run is still gathering source coverage.",
@@ -409,6 +657,8 @@ def _coverage_reason_detail(reason: str, *, source: str) -> str:
         "detector_version_mismatch": "Gmail needs a fresh detector review.",
         "stale": "The latest successful read is stale.",
         "detector_budget_exhausted": "The daily detector budget was reached; remaining reviews are deferred.",
+        "gmail_mirror_not_initialized": "Gmail is awaiting its first local mailbox sync.",
+        "gmail_mirror_unavailable": "The local Gmail mailbox mirror is unavailable.",
     }
     if reason in labels:
         return labels[reason]

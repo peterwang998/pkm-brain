@@ -387,6 +387,100 @@ def test_gmail_history_404_returns_explicit_bounded_full_reset() -> None:
     assert "pageToken" not in client.calls[2][1]
 
 
+def test_gmail_invalid_incremental_page_token_replays_retained_history() -> None:
+    client = FakeClient(
+        [
+            GoogleAPIError(400, "Invalid pageToken", reason="invalidArgument"),
+            {
+                "history": [
+                    {
+                        "id": "10",
+                        "messagesAdded": [
+                            {"message": {"id": "m1", "threadId": "t1"}}
+                        ],
+                    }
+                ],
+                "historyId": "11",
+            },
+            gmail_thread("t1"),
+        ]
+    )
+
+    result = GmailThreadReader(client).fetch(
+        query="newer_than:7d -in:spam -in:trash",
+        history_id="9",
+        continuation_page_token="expired-page",
+        continuation_history_id="10",
+    )
+
+    assert result.mode == "incremental"
+    assert result.coverage_complete is True
+    assert result.next_history_id == "11"
+    assert client.calls[0][1]["startHistoryId"] == "9"
+    assert client.calls[0][1]["pageToken"] == "expired-page"
+    assert client.calls[1][1]["startHistoryId"] == "9"
+    assert "pageToken" not in client.calls[1][1]
+    assert result.api_requests == 3
+
+
+def test_gmail_invalid_full_page_token_takes_new_baseline() -> None:
+    client = FakeClient(
+        [
+            GoogleAPIError(400, "Invalid pageToken", reason="invalidArgument"),
+            {"historyId": "new-baseline"},
+            {"threads": [{"id": "thread-1"}]},
+            gmail_thread(),
+        ]
+    )
+
+    result = GmailThreadReader(client).fetch(
+        query="newer_than:7d -in:spam -in:trash",
+        continuation_page_token="expired-page",
+        baseline_history_id="old-baseline",
+    )
+
+    assert result.mode == "full"
+    assert result.reset_required is True
+    assert result.coverage_complete is True
+    assert result.next_history_id == "new-baseline"
+    assert client.calls[0][0] == "threads"
+    assert client.calls[0][1]["pageToken"] == "expired-page"
+    assert client.calls[1][0] == "profile"
+    assert client.calls[2][0] == "threads"
+    assert "pageToken" not in client.calls[2][1]
+    assert result.api_requests == 4
+
+
+def test_gmail_malformed_thread_is_quarantined_without_losing_valid_peer() -> None:
+    malformed = {
+        "id": "thread-bad",
+        "historyId": "322",
+        "messages": [{"id": "message-bad", "payload": {}}],
+    }
+    client = FakeClient(
+        [
+            {"historyId": "300"},
+            {"threads": [{"id": "thread-1"}, {"id": "thread-bad"}]},
+            gmail_thread(),
+            malformed,
+        ]
+    )
+
+    result = GmailThreadReader(client).fetch(query="newer_than:7d")
+
+    assert [thread.thread_id for thread in result.threads] == ["thread-1"]
+    assert [raw["id"] for raw in result.raw_threads] == ["thread-1"]
+    assert result.changed_thread_ids == ("thread-1", "thread-bad")
+    assert len(result.quarantined_threads) == 1
+    failure = result.quarantined_threads[0]
+    assert failure.thread_id == "thread-bad"
+    assert failure.source_revision == "322"
+    assert failure.stage == "normalize"
+    assert len(failure.payload_sha256) == 64
+    assert result.coverage_complete is True
+    assert result.next_history_id == "300"
+
+
 def test_gmail_partial_full_fetch_never_advances_history_cursor() -> None:
     client = FakeClient(
         [

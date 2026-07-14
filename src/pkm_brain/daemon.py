@@ -21,9 +21,10 @@ from .automation import (
     run_nightly_maintenance,
     run_secondary_tick,
 )
+from .gmail_sync import run_scheduled_gmail_mirror_sync
 from .migrations import MIGRATIONS
-from .operational_service import OperationalService, OperationalWriteRefusedError
 from .operational_meeting_packets import run_scheduled_meeting_preparation
+from .operational_service import OperationalService, OperationalWriteRefusedError
 from .operational_today import OperationalTodayPresentationService
 from .paths import BrainPaths
 from .shadow_controller import ShadowTrialController
@@ -39,6 +40,7 @@ DEFAULT_CAPTURE_CADENCE_SECONDS = 600
 DEFAULT_NIGHTLY_CHECK_CADENCE_SECONDS = 3600
 DEFAULT_SYNC_CADENCE_SECONDS = 1800
 DEFAULT_MEETING_PREPARATION_CADENCE_SECONDS = 900
+DEFAULT_GMAIL_MIRROR_SYNC_CADENCE_SECONDS = 600
 
 
 def package_version() -> str:
@@ -109,6 +111,8 @@ class SchedulerJob:
     last_error: str | None = None
     next_due_at: str | None = None
     running: bool = False
+    lane: str = "serial"
+    run_on_start: bool = False
 
 
 @dataclass
@@ -130,19 +134,27 @@ class SerialJobScheduler:
         self.tick_seconds = tick_seconds
         self._now = now or (lambda: datetime.now(timezone.utc).replace(microsecond=0))
         self._lock = threading.RLock()
-        self._queue: queue.Queue[str | None] = queue.Queue()
         self._queued: set[str] = set()
         self._force_run: set[str] = set()
         self._stop = threading.Event()
-        self._worker_thread: threading.Thread | None = None
+        self._worker_threads: dict[str, threading.Thread] = {}
         self._ticker_thread: threading.Thread | None = None
         self._config = self._load_config()
         self.jobs: dict[str, SchedulerJob] = {
-            job.id: self._apply_config(job) for job in (jobs if jobs is not None else build_role_jobs(paths))
+            job.id: self._apply_config(job)
+            for job in (jobs if jobs is not None else build_role_jobs(paths))
+        }
+        self._queues: dict[str, queue.Queue[str | None]] = {
+            lane: queue.Queue() for lane in {job.lane for job in self.jobs.values()}
         }
         for job in self.jobs.values():
             if job.next_due_at is None:
-                job.next_due_at = self._iso(self._now() + timedelta(seconds=job.cadence_s))
+                due_at = (
+                    self._now()
+                    if job.run_on_start
+                    else self._now() + timedelta(seconds=job.cadence_s)
+                )
+                job.next_due_at = self._iso(due_at)
 
     def _load_config(self) -> SchedulerConfig:
         path = scheduler_config_path(self.paths)
@@ -178,29 +190,43 @@ class SerialJobScheduler:
 
     def start(self) -> None:
         with self._lock:
-            if self._worker_thread and self._worker_thread.is_alive():
+            if self._ticker_thread and self._ticker_thread.is_alive():
                 return
             self._stop.clear()
-            self._worker_thread = threading.Thread(target=self._worker_loop, name="brain-daemon-worker", daemon=True)
-            self._ticker_thread = threading.Thread(target=self._ticker_loop, name="brain-daemon-scheduler", daemon=True)
-            self._worker_thread.start()
+            self._worker_threads = {
+                lane: threading.Thread(
+                    target=self._worker_loop,
+                    args=(lane,),
+                    name=f"brain-daemon-worker-{lane}",
+                    daemon=True,
+                )
+                for lane in self._queues
+            }
+            self._ticker_thread = threading.Thread(
+                target=self._ticker_loop, name="brain-daemon-scheduler", daemon=True
+            )
+            for worker in self._worker_threads.values():
+                worker.start()
             self._ticker_thread.start()
+            self.enqueue_due_jobs()
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
-        self._queue.put(None)
+        for lane_queue in self._queues.values():
+            lane_queue.put(None)
         if self._ticker_thread:
             self._ticker_thread.join(timeout=timeout)
-        if self._worker_thread:
-            self._worker_thread.join(timeout=timeout)
+        for worker in self._worker_threads.values():
+            worker.join(timeout=timeout)
 
     def _ticker_loop(self) -> None:
         while not self._stop.wait(self.tick_seconds):
             self.enqueue_due_jobs()
 
-    def _worker_loop(self) -> None:
+    def _worker_loop(self, lane: str) -> None:
+        lane_queue = self._queues[lane]
         while not self._stop.is_set():
-            job_id = self._queue.get()
+            job_id = lane_queue.get()
             if job_id is None:
                 return
             with self._lock:
@@ -208,7 +234,12 @@ class SerialJobScheduler:
                 force = job_id in self._force_run
                 self._force_run.discard(job_id)
                 job = self.jobs.get(job_id)
-                if job is None or not job.enabled or (self._is_paused() and not force):
+                if (
+                    job is None
+                    or job.lane != lane
+                    or not job.enabled
+                    or (self._is_paused() and not force)
+                ):
                     continue
                 job.running = True
             started = self._now()
@@ -286,6 +317,8 @@ class SerialJobScheduler:
                         "id": job.id,
                         "enabled": job.enabled,
                         "cadence_s": job.cadence_s,
+                        "lane": job.lane,
+                        "run_on_start": job.run_on_start,
                         "last_run_at": job.last_run_at,
                         "last_status": job.last_status,
                         "last_result": job.last_result,
@@ -303,10 +336,13 @@ class SerialJobScheduler:
             if force:
                 self._force_run.add(job_id)
             return
+        job = self.jobs.get(job_id)
+        if job is None:
+            raise ValueError(f"unknown scheduler job: {job_id}")
         self._queued.add(job_id)
         if force:
             self._force_run.add(job_id)
-        self._queue.put(job_id)
+        self._queues[job.lane].put(job_id)
 
     def _is_paused(self) -> bool:
         paused_until = self._config.paused_until
@@ -369,6 +405,18 @@ def build_role_jobs(
         )
     )
     if role in {"single", "primary"} and operational_service is not None:
+        jobs.append(
+            SchedulerJob(
+                id="gmail_mirror_sync",
+                cadence_s=DEFAULT_GMAIL_MIRROR_SYNC_CADENCE_SECONDS,
+                handler=lambda: run_scheduled_gmail_mirror_sync(
+                    paths,
+                    operational_service,
+                ),
+                lane="provider_sync",
+                run_on_start=True,
+            )
+        )
         jobs.append(
             SchedulerJob(
                 id="meeting_preparation",
@@ -459,6 +507,11 @@ class BrainDaemon:
             self.server.daemon_today_service = OperationalTodayPresentationService(
                 self.paths,
                 self.operational_service,
+                scheduler_state_reader=(
+                    lambda: self.scheduler.as_dict()
+                    if self.scheduler is not None
+                    else None
+                ),
             )
             self.server.daemon_shadow_controller = ShadowTrialController(
                 self.paths,

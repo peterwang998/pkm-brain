@@ -402,12 +402,12 @@ def gmail_connector() -> Connector:
             id="gmail",
             display_name="Gmail",
             description=(
-                "Authorize a separate read-only Gmail grant for the manual "
-                "Chief of Staff Shadow trial."
+                "Authorize a separate read-only Gmail grant for the local "
+                "Chief of Staff mail mirror."
             ),
             source_type="gmail_message",
             default_enabled=False,
-            default_cadence_s=900,
+            default_cadence_s=600,
             permissions_note=(
                 "Read-only Gmail access; sending, mutation, deletion, labels, and attachment "
                 "download are unavailable."
@@ -416,9 +416,10 @@ def gmail_connector() -> Connector:
             capture_available=False,
             auth=auth_manifest("gmail"),
             activation_note=(
-                "Use Today > Run Shadow for one bounded operational pass. Connector "
-                "capture, automatic scheduling, and Gmail knowledge ingestion remain "
-                "unavailable."
+                "After the owner enables Gmail in the local operations policy, Brain "
+                "keeps a private local operational mirror current about every 10 minutes. "
+                "Today > Run Shadow analyzes queued local revisions. Gmail knowledge "
+                "ingestion remains unavailable."
             ),
         )
     )

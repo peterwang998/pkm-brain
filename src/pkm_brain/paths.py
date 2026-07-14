@@ -75,6 +75,12 @@ class BrainPaths:
         return self.db_dir / "ops.sqlite"
 
     @property
+    def gmail_mirror_sqlite_path(self) -> Path:
+        """Local, rebuildable Gmail mirror kept outside authoritative control DBs."""
+
+        return self.home / "cache" / "gmail-mirror" / "gmail-mirror.sqlite"
+
+    @property
     def operational_writer_lock_file(self) -> Path:
         return self.config_local / "operational-writer.lock"
 

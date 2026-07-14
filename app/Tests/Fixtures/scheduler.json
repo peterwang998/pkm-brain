@@ -12,6 +12,24 @@
       "running": false
     },
     {
+      "cadence_s": 600,
+      "enabled": true,
+      "id": "gmail_mirror_sync",
+      "lane": "provider_sync",
+      "last_error": null,
+      "last_result": {
+        "mailbox_status": "complete",
+        "queued": 3,
+        "status": "complete"
+      },
+      "last_run_at": "2026-07-08T08:00:00+00:00",
+      "last_status": "complete",
+      "next_due_at": "2026-07-08T08:10:00+00:00",
+      "queued": false,
+      "run_on_start": true,
+      "running": false
+    },
+    {
       "cadence_s": 3600,
       "enabled": true,
       "id": "nightly",

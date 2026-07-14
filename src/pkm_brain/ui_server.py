@@ -214,7 +214,8 @@ class BrainUIHandler(BaseHTTPRequestHandler):
                     raise BadRequestError("Shadow runner is not available")
                 self.write_json(controller.status())
             elif path == "/api/v1/today/setup":
-                self.write_json(shadow_setup_payload(self.server.paths))
+                scheduler = self.server.daemon_scheduler
+                self.write_json(shadow_setup_payload(self.server.paths, scheduler_state=scheduler.as_dict() if scheduler is not None else None))
             elif path == "/api/queue":
                 self.write_json(ui_queue(self.server.paths, query))
             elif path == "/api/search":

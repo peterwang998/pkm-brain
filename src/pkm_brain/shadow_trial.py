@@ -18,6 +18,12 @@ from .gmail_operations import (
     detect_gmail_threads,
 )
 from .gmail_llm import get_gmail_provider, gmail_detector_token_ceiling
+from .gmail_mirror import (
+    GmailMirrorCheckpoint,
+    GmailMirrorGenerationConflict,
+    GmailMirrorStore,
+)
+from .gmail_sync import GmailMirrorSynchronizer
 from .google_api import GoogleAPIClient, GoogleQuotaBudget, GoogleTokenManager
 from .google_cache import GoogleEvidenceCache
 from .google_normalization import NormalizedCalendarEvent, NormalizedGmailThread
@@ -53,7 +59,6 @@ GMAIL_STREAM = "mailbox"
 GMAIL_MANUAL_RUN_MAX_THREADS = 200
 CALENDAR_INITIAL_PAST_DAYS = 14
 CALENDAR_INITIAL_FUTURE_DAYS = 90
-GMAIL_INITIAL_QUERY = "newer_than:7d {newer_than:2d is:unread} -in:spam -in:trash"
 CALENDAR_ADAPTER_VERSION = "google-calendar-operations-v1"
 BRIEFING_FRESHNESS_SECONDS = 6 * 60 * 60
 
@@ -96,6 +101,7 @@ class ShadowTrialRunner:
         self._gmail_reader = gmail_reader
         self._llm_provider = llm_provider
         self.cache = cache or GoogleEvidenceCache.for_paths(paths)
+        self.gmail_mirror = GmailMirrorStore(paths.gmail_mirror_sqlite_path)
         self._now = now or (lambda: datetime.now(timezone.utc))
 
     def run_live(
@@ -350,45 +356,6 @@ class ShadowTrialRunner:
             client,
             calendar_id="primary",
             max_pages=min(20, policy.budgets.calendar.requests_per_day),
-        )
-
-    def _gmail_reader_for(
-        self,
-        policy: OperationsPolicy,
-        *,
-        run_id: str,
-        started: datetime,
-    ) -> GmailThreadReader:
-        if self._gmail_reader is not None:
-            return self._gmail_reader
-        tokens = GoogleTokenManager(
-            self.paths,
-            GMAIL_CONNECTOR_ID,
-            expected_email=policy.operator.gmail.email,
-            expected_subject=policy.operator.gmail.provider_subject,
-            require_exact_scopes=True,
-        )
-        client = GoogleAPIClient(
-            GMAIL_CONNECTOR_ID,
-            tokens,
-            quota=GoogleQuotaBudget(
-                requests_per_second=2.0,
-                on_acquire=self._api_budget_reserver(
-                    source_type=GMAIL_CONNECTOR_ID,
-                    limit=policy.budgets.gmail.api_requests_per_day,
-                    policy=policy,
-                    run_id=run_id,
-                    started=started,
-                ),
-            ),
-        )
-        maximum_threads = _gmail_manual_run_thread_cap(
-            policy.budgets.gmail.api_requests_per_day
-        )
-        return GmailThreadReader(
-            client,
-            max_threads=maximum_threads,
-            operator_emails=(policy.operator.gmail.email,),
         )
 
     def _api_budget_reserver(
@@ -716,89 +683,97 @@ class ShadowTrialRunner:
         started: datetime,
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, int]]:
         account_key = policy.sources.gmail.account_key
+        self.gmail_mirror.initialize()
+        sync_outcome = None
+        checkpoint = self.gmail_mirror.get_checkpoint(account_key, GMAIL_STREAM)
+        if checkpoint is None:
+            # The manual trial is allowed to bootstrap an empty mirror so the
+            # first-run UX remains useful. Once a checkpoint exists, provider
+            # polling belongs exclusively to the independent mirror scheduler.
+            sync_outcome = GmailMirrorSynchronizer(
+                self.paths,
+                self.operational_service,
+                store=self.gmail_mirror,
+                reader=self._gmail_reader,
+                now=self._now,
+            ).sync(policy=policy, run_id=run_id)
+            checkpoint = sync_outcome.checkpoint
+        assert checkpoint is not None
+
+        claimed = self.gmail_mirror.claim_pending_triage(
+            account_key,
+            limit=GMAIL_MANUAL_RUN_MAX_THREADS,
+            claimed_at=started.isoformat(),
+            detector_version=GMAIL_DETECTOR_VERSION,
+            policy_version=policy.version_ref,
+        )
+        thread_items = tuple(item for item in claimed if not item.tombstoned)
+        tombstone_items = tuple(item for item in claimed if item.tombstoned)
+        threads = tuple(
+            item.thread for item in thread_items if item.thread is not None
+        )
+        if len(threads) != len(thread_items):
+            raise RuntimeError("Gmail mirror triage item is missing normalized content")
+
+        # Keep the legacy evidence cache warm while local evidence routes move
+        # to the durable mirror. This is a local copy operation, not a provider
+        # read, and it preserves existing briefing evidence links during rollout.
+        for item in thread_items:
+            assert item.thread is not None
+            source_ref = _gmail_source_ref(account_key, item.thread_id)
+            revision = self.gmail_mirror.get_revision(
+                account_key,
+                item.thread_id,
+                item.source_revision,
+            )
+            if revision is not None and revision.raw_payload is not None:
+                self.cache.write_raw(
+                    GMAIL_CONNECTOR_ID,
+                    source_ref,
+                    revision.raw_payload,
+                    cached_at=started,
+                )
+            self.cache.write_normalized(
+                GMAIL_CONNECTOR_ID,
+                source_ref,
+                item.thread.as_dict(),
+                cached_at=started,
+                source_revision=item.source_revision,
+            )
+
         current = get_source_cursor(
             self.paths.ops_sqlite_path,
             GMAIL_CONNECTOR_ID,
             account_key,
             GMAIL_STREAM,
         )
-        cursor_metadata = dict((current or {}).get("metadata") or {})
-        continuation_page_token = _optional_cursor_text(
-            cursor_metadata.get("continuation_page_token")
-        )
-        baseline_history_id = _optional_cursor_text(
-            cursor_metadata.get("baseline_history_id")
-        )
-        continuation_mode = _continuation_mode(cursor_metadata)
-        resume_full_rebuild = continuation_mode == "full"
-        prior_reset_rebuild = bool(cursor_metadata.get("reset_rebuild"))
-        prior_reset_started_generation = _optional_cursor_generation(
-            cursor_metadata.get("reset_started_generation")
-        )
-        prior_reset_seen_item_ids, prior_reset_seen_overflow = _reset_seen_item_ids(
-            cursor_metadata
-        )
-        pending_thread_ids = _pending_thread_ids(cursor_metadata)
-        continuation_history_id = _optional_cursor_text(
-            cursor_metadata.get("continuation_history_id")
-        )
-        if resume_full_rebuild and (pending_thread_ids or continuation_history_id):
-            raise ValueError("full Gmail continuation contains incremental pending state")
-        if (
-            prior_reset_rebuild
-            and resume_full_rebuild
-            and prior_reset_started_generation is None
-        ):
-            raise ValueError("Gmail reset continuation is missing its start generation")
-        result = self._gmail_reader_for(
-            policy,
-            run_id=run_id,
-            started=started,
-        ).fetch(
-            query=GMAIL_INITIAL_QUERY,
-            history_id=(
-                None
-                if resume_full_rebuild
-                else str(current["cursor"])
-                if current and current.get("cursor")
-                else None
-            ),
-            continuation_page_token=continuation_page_token,
-            baseline_history_id=baseline_history_id,
-            pending_thread_ids=() if resume_full_rebuild else pending_thread_ids,
-            continuation_history_id=(
-                None if resume_full_rebuild else continuation_history_id
-            ),
-        )
-        for raw, thread in zip(result.raw_threads, result.threads):
-            source_ref = _gmail_source_ref(account_key, thread.thread_id)
-            self.cache.write_raw(GMAIL_CONNECTOR_ID, source_ref, raw, cached_at=started)
-            self.cache.write_normalized(
-                GMAIL_CONNECTOR_ID,
-                source_ref,
-                thread.as_dict(),
-                cached_at=started,
-                source_revision=thread.source_revision or _gmail_revision(thread),
-            )
         decided = _decided_gmail_revisions(
             self.paths.ops_sqlite_path,
             account_key=account_key,
             detector_version=GMAIL_DETECTOR_VERSION,
             policy_version=policy.version_ref,
         )
-        pending_threads = [
-            thread
-            for thread in result.threads
-            if (thread.thread_id, thread.source_revision or _gmail_revision(thread))
-            not in decided
-        ]
-        cached_threads = [
-            thread
-            for thread in result.threads
-            if (thread.thread_id, thread.source_revision or _gmail_revision(thread))
-            in decided
-        ]
-        cached_thread_count = len(result.threads) - len(pending_threads)
+        cached_items = tuple(
+            item
+            for item in thread_items
+            if item.last_error in {None, "triage lease expired"}
+            and (item.thread_id, item.source_revision) in decided
+        )
+        cached_keys = {
+            (item.thread_id, item.source_revision) for item in cached_items
+        }
+        pending_items = tuple(
+            item
+            for item in thread_items
+            if (item.thread_id, item.source_revision) not in cached_keys
+        )
+        pending_threads = tuple(
+            item.thread for item in pending_items if item.thread is not None
+        )
+        cached_threads = tuple(
+            item.thread for item in cached_items if item.thread is not None
+        )
+        cached_thread_count = len(cached_items)
         active_items = _active_gmail_items_by_thread(
             self.paths.ops_sqlite_path,
             account_key=account_key,
@@ -859,30 +834,12 @@ class ShadowTrialRunner:
                 coverage_complete=True,
             )
         detector_complete = detector.coverage_complete
-        next_generation = int((current or {}).get("generation") or 0) + 1
-        if not detector_complete:
-            reset_scan_active = prior_reset_rebuild
-            reset_started_generation = prior_reset_started_generation
-            reset_seen_item_ids = prior_reset_seen_item_ids
-            reset_seen_overflow = prior_reset_seen_overflow
-        elif result.reset_required:
-            reset_scan_active = True
-            reset_started_generation = next_generation
-            reset_seen_item_ids: set[str] = set()
-            reset_seen_overflow = False
-        elif prior_reset_rebuild and resume_full_rebuild and result.mode == "full":
-            reset_scan_active = True
-            reset_started_generation = prior_reset_started_generation
-            reset_seen_item_ids = prior_reset_seen_item_ids
-            reset_seen_overflow = prior_reset_seen_overflow
-        else:
-            reset_scan_active = False
-            reset_started_generation = None
-            reset_seen_item_ids = set()
-            reset_seen_overflow = False
         observations: list[OperationalObservation] = []
-        observation_bindings: list[tuple[NormalizedGmailThread, GmailThreadDetection, Any]] = []
+        observation_bindings: list[
+            tuple[NormalizedGmailThread, GmailThreadDetection, Any]
+        ] = []
         thread_by_id = {thread.thread_id: thread for thread in pending_threads}
+        triage_by_thread = {item.thread_id: item for item in pending_items}
         for detection in detector.detections:
             thread = thread_by_id[detection.thread_id]
             for candidate in detection.candidates:
@@ -891,7 +848,7 @@ class ShadowTrialRunner:
                     detection,
                     candidate,
                     account_key=account_key,
-                    source_order=next_generation,
+                    source_order=triage_by_thread[thread.thread_id].mirror_sequence,
                     observed_at=started.isoformat(),
                     source_ref=_gmail_source_ref(account_key, thread.thread_id),
                     source_timezone=policy.operator.timezone,
@@ -902,61 +859,23 @@ class ShadowTrialRunner:
                 observation_bindings.append((thread, detection, candidate))
         observations.extend(retained_provider_observations)
         revalidation_reasons: dict[str, str] = {
-            thread_id: "gmail_thread_missing"
-            for thread_id in result.missing_thread_ids
+            item.thread_id: "gmail_thread_missing" for item in tombstone_items
         }
-        if reset_scan_active and detector_complete:
-            fetched_thread_ids = {thread.thread_id for thread in result.threads}
-            seen_on_page = {
-                operational_item_id(observation) for observation in observations
-            }
-            seen_on_page.update(
-                str(item["id"])
-                for thread_id in fetched_thread_ids
-                for item in active_items.get(thread_id, ())
-            )
-            reset_seen_item_ids, overflowed = _merge_reset_seen_item_ids(
-                reset_seen_item_ids,
-                seen_on_page,
-            )
-            reset_seen_overflow = reset_seen_overflow or overflowed
-        if (
-            reset_scan_active
-            and result.coverage_complete
-            and detector_complete
-            and not reset_seen_overflow
-        ):
-            for thread_id, thread_items in active_items.items():
-                if thread_id not in fetched_thread_ids:
-                    if all(
-                        str(item["id"]) in reset_seen_item_ids
-                        for item in thread_items
-                    ):
-                        continue
-                    revalidation_reasons.setdefault(
-                        thread_id,
-                        "gmail_history_reset_revalidation",
-                    )
-        revalidation_bindings: list[tuple[str, Mapping[str, Any], OperationalObservation]] = []
-        revalidation_checkpoint = (
-            result.next_history_id
-            or str((current or {}).get("cursor") or "full-reset")
-        )
+        revalidation_bindings: list[
+            tuple[str, Mapping[str, Any], OperationalObservation]
+        ] = []
+        tombstone_by_thread = {item.thread_id: item for item in tombstone_items}
         for thread_id, reason_code in sorted(revalidation_reasons.items()):
+            tombstone = tombstone_by_thread[thread_id]
             for active_item in active_items.get(thread_id, ()):
-                if (
-                    reason_code == "gmail_history_reset_revalidation"
-                    and str(active_item["id"]) in reset_seen_item_ids
-                ):
-                    continue
                 observation = _gmail_revalidation_observation(
                     active_item,
                     account_key=account_key,
                     thread_id=thread_id,
-                    source_order=next_generation,
+                    source_order=tombstone.mirror_sequence,
                     observed_at=started.isoformat(),
                     source_timezone=policy.operator.timezone,
-                    checkpoint=revalidation_checkpoint,
+                    checkpoint=tombstone.source_revision,
                     reason_code=reason_code,
                 )
                 observations.append(observation)
@@ -976,88 +895,84 @@ class ShadowTrialRunner:
             str(active_item["id"])
             for _thread_id, active_item, _observation in revalidation_bindings
         }
-        durable_reset_seen_overflow = (
-            reset_seen_overflow
-            if reset_scan_active and detector_complete
-            else prior_reset_seen_overflow
+
+        detection_by_thread = {
+            detection.thread_id: detection for detection in detector.detections
+        }
+        items_to_defer: dict[tuple[str, str], str] = {}
+        for item in pending_items:
+            detection = detection_by_thread.get(item.thread_id)
+            if detection is None:
+                items_to_defer[(item.thread_id, item.source_revision)] = (
+                    "detector produced no result for the mirrored thread"
+                )
+            elif detection.disposition in {"deferred", "error"} or detection.error:
+                items_to_defer[(item.thread_id, item.source_revision)] = str(
+                    detection.error or detection.reason_code
+                )[:4000]
+        claimed_backlog = _gmail_triage_backlog(
+            self.gmail_mirror,
+            account_key=account_key,
         )
-        cursor_safe = result.coverage_complete and detector_complete
-        source_complete = (
-            cursor_safe
-            and not revalidation_reasons
+        triage_pending_count = max(0, claimed_backlog - len(claimed)) + len(
+            items_to_defer
+        )
+        triage_status = (
+            "complete"
+            if triage_pending_count == 0
+            and detector_complete
             and not unresolved_revalidation_ids
-            and not durable_reset_seen_overflow
+            else "partial"
+        )
+        source_complete = (
+            checkpoint.coverage_complete
+            and triage_status == "complete"
+            and not unresolved_revalidation_ids
         )
         deferred_count = (
-            detector.deferred_count
+            triage_pending_count
             + len(unresolved_revalidation_ids)
             + int(bool(revalidation_reasons) and not unresolved_revalidation_ids)
-            + int(durable_reset_seen_overflow)
-            + int(not result.coverage_complete and detector.deferred_count == 0)
+            + int(not checkpoint.coverage_complete and triage_pending_count == 0)
         )
-        provider_cursor_advanced = bool(cursor_safe and result.next_history_id)
-        if detector_complete:
-            retained_continuation = result.continuation_page_token
-            retained_baseline = (
-                result.baseline_history_id if not cursor_safe else None
-            )
-            retained_pending_thread_ids = result.pending_thread_ids
-            retained_history_id = result.continuation_history_id
-            retained_continuation_mode = result.mode if not cursor_safe else None
-        else:
-            # Detection is part of accepting a provider page. Retry exactly the
-            # input provider unit and keep its mode/cursor pairing intact.
-            retained_continuation = continuation_page_token
-            retained_baseline = baseline_history_id
-            retained_pending_thread_ids = pending_thread_ids
-            retained_history_id = continuation_history_id
-            retained_continuation_mode = continuation_mode
-        reset_scan_in_progress = reset_scan_active and not cursor_safe
+        provider_cursor_advanced = _gmail_checkpoint_differs_from_projection(
+            current,
+            checkpoint,
+        )
         cursor_update = SourceCursorUpdate(
             connector_id=GMAIL_CONNECTOR_ID,
             source_type="gmail",
             account_key=account_key,
             stream_key=GMAIL_STREAM,
-            cursor=(
-                result.next_history_id
-                if provider_cursor_advanced
-                else str(current["cursor"])
-                if not detector_complete and current and current.get("cursor")
-                else None
-                if reset_scan_active or result.mode == "full"
-                else str(current["cursor"])
-                if current and current.get("cursor")
-                else None
-            ),
+            cursor=checkpoint.history_id,
             metadata={
                 "coverage_status": "complete" if source_complete else "partial",
                 "deferred_count": deferred_count,
-                "full_sync": result.mode == "full",
-                "item_count": len(result.threads),
-                "page_count": result.pages_fetched,
-                "continuation_page_token": retained_continuation,
-                "baseline_history_id": retained_baseline,
+                "full_sync": checkpoint.mode == "full",
+                "item_count": len(claimed),
+                "page_count": (
+                    sync_outcome.fetch.pages_fetched if sync_outcome is not None else 0
+                ),
+                "continuation_page_token": checkpoint.continuation_page_token,
+                "baseline_history_id": checkpoint.baseline_history_id,
                 "pending_thread_ids": (
-                    _encode_pending_thread_ids(retained_pending_thread_ids)
-                    if retained_pending_thread_ids
+                    _encode_pending_thread_ids(checkpoint.pending_thread_ids)
+                    if checkpoint.pending_thread_ids
                     else None
                 ),
-                "continuation_history_id": retained_history_id,
-                "continuation_mode": retained_continuation_mode,
-                "reset_rebuild": reset_scan_in_progress,
-                "reset_started_generation": (
-                    reset_started_generation
-                    if reset_scan_in_progress
-                    else None
+                "continuation_history_id": checkpoint.continuation_history_id,
+                "continuation_mode": (
+                    checkpoint.mode if not checkpoint.coverage_complete else None
                 ),
-                "reset_seen_item_ids": (
-                    _encode_reset_seen_item_ids(reset_seen_item_ids)
-                    if reset_scan_in_progress
-                    else None
+                "reset_rebuild": bool(
+                    checkpoint.reset_required and not checkpoint.coverage_complete
                 ),
-                "reset_seen_overflow": durable_reset_seen_overflow,
+                "reset_started_generation": None,
+                "reset_seen_item_ids": None,
+                "reset_seen_overflow": False,
             },
-            last_success_at=(started.isoformat() if source_complete else None),
+            # Mailbox freshness is owned by the mirror, never by Luna triage.
+            last_success_at=checkpoint.last_success_at,
             expected_cursor=(
                 str(current["cursor"]) if current and current.get("cursor") else None
             ),
@@ -1089,7 +1004,9 @@ class ShadowTrialRunner:
                     coverage={
                         "gmail": {
                             "status": (
-                                "complete" if result.coverage_complete else "partial"
+                                "complete"
+                                if checkpoint.coverage_complete
+                                else "partial"
                             )
                         }
                     },
@@ -1149,6 +1066,7 @@ class ShadowTrialRunner:
                 )
             )
         for thread_id, reason_code in sorted(revalidation_reasons.items()):
+            tombstone = tombstone_by_thread[thread_id]
             matching = [
                 observation
                 for candidate_thread_id, _active_item, observation in revalidation_bindings
@@ -1162,7 +1080,9 @@ class ShadowTrialRunner:
                     stream_key=GMAIL_STREAM,
                     source_key=thread_id,
                     source_revision=(
-                        matching[0].source_revision if matching else revalidation_checkpoint
+                        matching[0].source_revision
+                        if matching
+                        else tombstone.source_revision
                     ),
                     disposition="error",
                     reason_code=reason_code,
@@ -1177,7 +1097,7 @@ class ShadowTrialRunner:
                             "account_key": account_key,
                             "thread_id": thread_id,
                             "source_ref": source_ref,
-                            "source_revision": revalidation_checkpoint,
+                            "source_revision": tombstone.source_revision,
                         },
                     ),
                     confidence=0.0,
@@ -1193,24 +1113,92 @@ class ShadowTrialRunner:
             run_id=run_id,
         )
         reconciliations = list(atomic_result.source_unit.reconciliations)
+
+        # Only acknowledge a queue revision after its operational decision (or
+        # tombstone revalidation) has committed. Provider/model failures remain
+        # durable deferred work; they never rewind the mailbox checkpoint.
+        retry_at = (started + timedelta(minutes=10)).isoformat()
+        for item in claimed:
+            key = (item.thread_id, item.source_revision)
+            try:
+                if key in items_to_defer:
+                    self.gmail_mirror.finish_triage(
+                        account_key,
+                        item.thread_id,
+                        item.source_revision,
+                        expected_generation=item.generation,
+                        state="deferred",
+                        updated_at=started.isoformat(),
+                        available_at=retry_at,
+                        error=items_to_defer[key],
+                    )
+                else:
+                    self.gmail_mirror.finish_triage(
+                        account_key,
+                        item.thread_id,
+                        item.source_revision,
+                        expected_generation=item.generation,
+                        state="completed",
+                        updated_at=started.isoformat(),
+                        detector_version=GMAIL_DETECTOR_VERSION,
+                        policy_version=policy.version_ref,
+                    )
+            except GmailMirrorGenerationConflict:
+                # A concurrent sync superseded this immutable revision. Its new
+                # current revision already owns another queue row.
+                continue
+
+        triage_pending_count = _gmail_triage_backlog(
+            self.gmail_mirror,
+            account_key=account_key,
+        )
+        triage_status = (
+            "complete"
+            if triage_pending_count == 0
+            and detector_complete
+            and not unresolved_revalidation_ids
+            else "partial"
+        )
+        source_complete = (
+            checkpoint.coverage_complete
+            and triage_status == "complete"
+            and not unresolved_revalidation_ids
+        )
         status = "complete" if source_complete else "partial"
+        mailbox_status = _gmail_mailbox_status(checkpoint)
         coverage = {
             "status": status,
-            "fresh_at": started.isoformat(),
-            "mode": result.mode,
-            "reset_required": result.reset_required,
-            "thread_count": len(result.threads),
-            "changed_thread_count": len(result.changed_thread_ids),
+            "fresh_at": checkpoint.last_success_at or checkpoint.updated_at,
+            "mailbox_status": mailbox_status,
+            "mailbox_last_success_at": checkpoint.last_success_at,
+            "triage_status": triage_status,
+            "triage_pending_count": triage_pending_count,
+            "mode": checkpoint.mode,
+            "reset_required": checkpoint.reset_required,
+            "thread_count": len(thread_items),
+            "changed_thread_count": (
+                len(sync_outcome.fetch.changed_thread_ids)
+                if sync_outcome is not None
+                else 0
+            ),
             "cached_decision_count": cached_thread_count,
-            "missing_thread_count": len(result.missing_thread_ids),
-            "pages": result.pages_fetched,
+            "missing_thread_count": len(tombstone_items),
+            "pages": (
+                sync_outcome.fetch.pages_fetched if sync_outcome is not None else 0
+            ),
             "deferred_count": deferred_count,
             "cursor_advanced": provider_cursor_advanced,
-            "reset_tracking_overflow": durable_reset_seen_overflow,
+            "reset_tracking_overflow": False,
         }
         usage = {
-            "api_pages": result.pages_fetched,
-            "api_thread_gets": len(result.changed_thread_ids),
+            "api_pages": (
+                sync_outcome.fetch.pages_fetched if sync_outcome is not None else 0
+            ),
+            "api_thread_gets": (
+                len(sync_outcome.fetch.changed_thread_ids)
+                if sync_outcome is not None
+                else 0
+            ),
             **detector.as_dict()["usage"],
             **(
                 budgeted_provider.usage_stats()
@@ -1220,7 +1208,7 @@ class ShadowTrialRunner:
         }
         dispositions = Counter(item.disposition for item in detector.detections)
         counts = {
-            "gmail_threads": len(result.threads),
+            "gmail_threads": len(thread_items),
             "gmail_pending_threads": len(pending_threads),
             "gmail_cached_decisions": cached_thread_count,
             "gmail_surfaced": dispositions["surfaced"],
@@ -1230,8 +1218,56 @@ class ShadowTrialRunner:
             "gmail_candidates": len(observation_bindings),
             "gmail_authority_restored": len(retained_provider_observations),
             "gmail_items": len({item.item_id for item in reconciliations}),
+            "gmail_triage_pending": triage_pending_count,
         }
         return coverage, usage, counts
+
+
+def _gmail_triage_backlog(
+    store: GmailMirrorStore,
+    *,
+    account_key: str,
+) -> int:
+    """Count all current triage backlog without truncating or hiding leases."""
+
+    return int(store.triage_counts(account_key)["backlog_count"])
+
+
+def _gmail_checkpoint_differs_from_projection(
+    current: Mapping[str, Any] | None,
+    checkpoint: GmailMirrorCheckpoint,
+) -> bool:
+    if current is None:
+        return True
+    metadata = dict(current.get("metadata") or {})
+    projected_pending = (
+        _encode_pending_thread_ids(checkpoint.pending_thread_ids)
+        if checkpoint.pending_thread_ids
+        else None
+    )
+    return any(
+        (
+            _optional_cursor_text(current.get("cursor")) != checkpoint.history_id,
+            _optional_cursor_text(metadata.get("continuation_page_token"))
+            != checkpoint.continuation_page_token,
+            _optional_cursor_text(metadata.get("baseline_history_id"))
+            != checkpoint.baseline_history_id,
+            _optional_cursor_text(metadata.get("pending_thread_ids"))
+            != projected_pending,
+            _optional_cursor_text(metadata.get("continuation_history_id"))
+            != checkpoint.continuation_history_id,
+            _continuation_mode(metadata)
+            != (checkpoint.mode if not checkpoint.coverage_complete else None),
+        )
+    )
+
+
+def _gmail_mailbox_status(checkpoint: GmailMirrorCheckpoint) -> str:
+    if checkpoint.coverage_complete:
+        return "complete"
+    if checkpoint.reset_required:
+        return "resyncing"
+    return "partial"
 
 
 def _requested_sources(
@@ -1265,13 +1301,6 @@ def _enabled_sources(policy: OperationsPolicy) -> tuple[str, ...]:
             (GMAIL_CONNECTOR_ID, policy.sources.gmail.enabled),
         )
         if enabled
-    )
-
-
-def _gmail_manual_run_thread_cap(api_requests_per_day: int) -> int:
-    return max(
-        1,
-        min(GMAIL_MANUAL_RUN_MAX_THREADS, int(api_requests_per_day) - 25),
     )
 
 

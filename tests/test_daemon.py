@@ -17,6 +17,7 @@ from pkm_brain.daemon import (
     BrainDaemon,
     SchedulerJob,
     SerialJobScheduler,
+    build_role_jobs,
     daemon_handshake_path,
     daemon_lock_path,
     parent_process_missing,
@@ -26,7 +27,7 @@ from pkm_brain.automation import run_nightly_maintenance
 from pkm_brain.connectors import load_connector_config, save_connector_config
 from pkm_brain.db import connection
 from pkm_brain.paths import BrainPaths
-from pkm_brain.operational_service import OperationalWriteRefusedError
+from pkm_brain.operational_service import OperationalService, OperationalWriteRefusedError
 from pkm_brain.sync_config import PeerConfig, PrimaryConfig, SyncConfig, write_sync_config
 from pkm_brain.sync_setup import init_secondary
 
@@ -302,6 +303,104 @@ def test_scheduler_due_math_and_serial_executor(tmp_path: Path) -> None:
     assert max_active == 1
 
 
+def test_scheduler_runs_distinct_lanes_concurrently_on_start(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    provider_started = threading.Event()
+    maintenance_started = threading.Event()
+    release = threading.Event()
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    def handler(started: threading.Event) -> dict[str, str]:
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        started.set()
+        assert release.wait(timeout=3)
+        with lock:
+            active -= 1
+        return {"status": "success"}
+
+    scheduler = SerialJobScheduler(
+        paths,
+        tick_seconds=60,
+        jobs=[
+            SchedulerJob(
+                "maintenance",
+                3600,
+                lambda: handler(maintenance_started),
+                run_on_start=True,
+            ),
+            SchedulerJob(
+                "provider",
+                600,
+                lambda: handler(provider_started),
+                lane="provider_sync",
+                run_on_start=True,
+            ),
+        ],
+    )
+    scheduler.start()
+    try:
+        assert maintenance_started.wait(timeout=1)
+        assert provider_started.wait(timeout=1)
+        assert max_active == 2
+    finally:
+        release.set()
+        scheduler.stop()
+
+    jobs = {job["id"]: job for job in scheduler.as_dict()["jobs"]}
+    assert jobs["maintenance"]["lane"] == "serial"
+    assert jobs["provider"]["lane"] == "provider_sync"
+
+
+def test_scheduler_does_not_overlap_repeated_run_for_same_job(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    first_started = threading.Event()
+    release_first = threading.Event()
+    active = 0
+    max_active = 0
+    invocation_count = 0
+    lock = threading.Lock()
+
+    def handler() -> dict[str, str]:
+        nonlocal active, max_active, invocation_count
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+            invocation_count += 1
+            invocation = invocation_count
+        if invocation == 1:
+            first_started.set()
+            assert release_first.wait(timeout=3)
+        with lock:
+            active -= 1
+        return {"status": "success"}
+
+    scheduler = SerialJobScheduler(
+        paths,
+        tick_seconds=60,
+        jobs=[SchedulerJob("job", 60, handler)],
+    )
+    scheduler.run_now("job")
+    scheduler.start()
+    try:
+        assert first_started.wait(timeout=1)
+        scheduler.run_now("job")
+        release_first.set()
+        deadline = time.time() + 3
+        while invocation_count < 2 and time.time() < deadline:
+            time.sleep(0.01)
+    finally:
+        release_first.set()
+        scheduler.stop()
+
+    assert invocation_count == 2
+    assert max_active == 1
+
+
 def test_scheduler_pause_persists(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
     scheduler = SerialJobScheduler(paths, jobs=[SchedulerJob("job", 60, lambda: {"status": "success"})])
@@ -415,6 +514,38 @@ def test_scheduler_registry_is_role_aware(tmp_path: Path) -> None:
     assert {"sync:secondary-a", "sync:secondary-b"}.issubset(primary_ids)
     assert primary_jobs["sync:secondary-a"]["cadence_s"] == 900
     assert primary_jobs["sync:secondary-b"]["cadence_s"] == 1800
+
+
+def test_gmail_mirror_sync_job_is_primary_lane_startup_work(tmp_path: Path) -> None:
+    for role in ("single", "primary"):
+        paths = BrainPaths.from_value(tmp_path / role)
+        if role == "primary":
+            write_sync_config(
+                paths,
+                SyncConfig(
+                    node_id="primary-node",
+                    role="primary",
+                    brain_home=paths.home,
+                    primary=PrimaryConfig(peers=[]),
+                ),
+            )
+        service = OperationalService(paths, writer_guard=lambda: None)
+        jobs = {
+            job.id: job for job in build_role_jobs(paths, operational_service=service)
+        }
+
+        gmail = jobs["gmail_mirror_sync"]
+        assert gmail.cadence_s == 600
+        assert gmail.lane == "provider_sync"
+        assert gmail.run_on_start is True
+
+    secondary = BrainPaths.from_value(tmp_path / "secondary-with-ops")
+    init_secondary(secondary, "secondary-node", "primary-node")
+    service = OperationalService(secondary, writer_guard=lambda: None)
+    secondary_ids = {
+        job.id for job in build_role_jobs(secondary, operational_service=service)
+    }
+    assert "gmail_mirror_sync" not in secondary_ids
 
 
 def test_daemon_nightly_summary_matches_automation_shape(tmp_path: Path) -> None:

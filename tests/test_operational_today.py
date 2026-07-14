@@ -1,8 +1,16 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 
-from pkm_brain.operational_today import today_briefing_from_operational
+import pytest
+
+from pkm_brain.gmail_mirror import GmailMirrorCheckpointUpdate, GmailMirrorStore
+from pkm_brain.operational_today import (
+    _overlay_gmail_mirror_coverage,
+    today_briefing_from_operational,
+)
+from pkm_brain.paths import BrainPaths
 
 
 NOW = datetime(2026, 7, 13, 16, 0, tzinfo=timezone.utc)
@@ -191,6 +199,247 @@ def test_coverage_reason_codes_are_presented_as_plain_language() -> None:
     assert "_" not in briefing.coverage[1].detail
 
 
+def test_gmail_coverage_distinguishes_synced_mailbox_from_analysis_backlog() -> None:
+    value = projection(status="partial")
+    value["coverage"]["gmail"].update(
+        {
+            "status": "partial",
+            "mailbox_status": "synchronized",
+            "mailbox_last_success_at": "2026-07-13T15:58:00+00:00",
+            "triage_status": "backlogged",
+            "triage_pending_count": 7,
+            "reason": "triage_backlog",
+        }
+    )
+
+    briefing = today_briefing_from_operational(value, now=NOW)
+
+    assert briefing.coverage[1].state == "partial"
+    assert briefing.coverage[1].detail == "Mailbox synchronized · 7 awaiting analysis"
+    assert briefing.coverage[1].last_success_at == "2026-07-13T15:58:00+00:00"
+
+
+def test_enabled_missing_gmail_mirror_blocks_stale_all_clear(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    value = projection()
+    value["all_clear"] = True
+
+    _overlay_gmail_mirror_coverage(
+        value,
+        paths=paths,
+        account_key="gmail.primary",
+        enabled=True,
+    )
+
+    assert value["all_clear"] is False
+    assert value["status"] == "partial"
+    assert value["coverage"]["gmail"]["status"] == "unavailable"
+    assert value["coverage"]["gmail"]["mailbox_status"] == "not_initialized"
+    assert "fresh_at" not in value["coverage"]["gmail"]
+    briefing = today_briefing_from_operational(value, now=NOW)
+    assert briefing.status == "partial"
+    assert briefing.coverage[1].detail == (
+        "Mailbox not initialized · awaiting first sync"
+    )
+
+
+def test_disabled_gmail_source_does_not_require_a_mirror(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    value = projection()
+    value["all_clear"] = True
+
+    _overlay_gmail_mirror_coverage(
+        value,
+        paths=paths,
+        account_key="gmail.primary",
+        enabled=False,
+    )
+
+    assert value["all_clear"] is True
+    assert value["status"] == "complete"
+
+
+def test_enabled_uninitialized_gmail_mirror_blocks_stale_all_clear(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    GmailMirrorStore(paths.gmail_mirror_sqlite_path).initialize()
+    value = projection()
+    value["all_clear"] = True
+
+    _overlay_gmail_mirror_coverage(
+        value,
+        paths=paths,
+        account_key="gmail.primary",
+        enabled=True,
+    )
+
+    assert value["all_clear"] is False
+    assert value["status"] == "partial"
+    assert value["coverage"]["gmail"]["mailbox_status"] == "not_initialized"
+
+
+def test_enabled_corrupt_gmail_mirror_blocks_stale_all_clear(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    mirror_path = paths.gmail_mirror_sqlite_path
+    mirror_path.parent.mkdir(parents=True, mode=0o700)
+    mirror_path.write_bytes(b"not a sqlite database")
+    mirror_path.chmod(0o600)
+    value = projection()
+    value["all_clear"] = True
+
+    _overlay_gmail_mirror_coverage(
+        value,
+        paths=paths,
+        account_key="gmail.primary",
+        enabled=True,
+    )
+
+    assert value["all_clear"] is False
+    assert value["status"] == "partial"
+    assert value["coverage"]["gmail"]["mailbox_status"] == "unavailable"
+    assert value["coverage"]["gmail"]["error"].startswith(
+        "Gmail mirror unavailable:"
+    )
+
+
+def test_enabled_insecure_gmail_mirror_blocks_stale_all_clear(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    GmailMirrorStore(paths.gmail_mirror_sqlite_path).initialize()
+    paths.gmail_mirror_sqlite_path.chmod(0o644)
+    value = projection()
+    value["all_clear"] = True
+
+    _overlay_gmail_mirror_coverage(
+        value,
+        paths=paths,
+        account_key="gmail.primary",
+        enabled=True,
+    )
+
+    assert value["all_clear"] is False
+    assert value["status"] == "partial"
+    assert value["coverage"]["gmail"]["mailbox_status"] == "unavailable"
+    assert "owner-only" in value["coverage"]["gmail"]["error"]
+
+
+@pytest.mark.parametrize(
+    ("scheduled_sync", "expected_state", "expected_detail"),
+    (
+        (
+            {"available": False},
+            "unavailable",
+            "Automatic Gmail sync status is unavailable.",
+        ),
+        (
+            {"available": True, "enabled": False, "paused": False},
+            "unavailable",
+            "Automatic Gmail sync is turned off.",
+        ),
+        (
+            {
+                "available": True,
+                "enabled": True,
+                "paused": True,
+                "paused_until": "2026-07-14T18:00:00+00:00",
+            },
+            "partial",
+            "Automatic Gmail sync is paused until 2026-07-14T18:00:00+00:00.",
+        ),
+        (
+            {
+                "available": True,
+                "enabled": True,
+                "paused": False,
+                "last_status": "failed",
+                "last_error": "daily Gmail request budget exhausted",
+            },
+            "partial",
+            "Automatic Gmail sync failed: daily Gmail request budget exhausted",
+        ),
+    ),
+)
+def test_current_gmail_sync_problem_blocks_today_all_clear(
+    tmp_path: Path,
+    scheduled_sync: dict[str, object],
+    expected_state: str,
+    expected_detail: str,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    _complete_gmail_mirror(paths)
+    value = projection()
+    value["all_clear"] = True
+
+    _overlay_gmail_mirror_coverage(
+        value,
+        paths=paths,
+        account_key="gmail.primary",
+        enabled=True,
+        scheduled_sync=scheduled_sync,
+    )
+
+    assert value["all_clear"] is False
+    assert value["status"] == "partial"
+    assert value["coverage"]["gmail"]["status"] == expected_state
+    briefing = today_briefing_from_operational(value, now=NOW)
+    assert briefing.coverage[1].detail == expected_detail
+
+
+def test_later_success_supersedes_an_old_gmail_sync_error(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    _complete_gmail_mirror(paths)
+    value = projection()
+    value["all_clear"] = True
+
+    _overlay_gmail_mirror_coverage(
+        value,
+        paths=paths,
+        account_key="gmail.primary",
+        enabled=True,
+        scheduled_sync={
+            "available": True,
+            "enabled": True,
+            "paused": False,
+            "last_status": "success",
+            "last_error": "an error retained from an older run",
+        },
+    )
+
+    assert value["all_clear"] is True
+    assert value["status"] == "complete"
+    assert value["coverage"]["gmail"]["status"] == "complete"
+    assert "sync_error" not in value["coverage"]["gmail"]
+
+
+def test_newer_manual_mirror_success_supersedes_scheduler_failure(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    _complete_gmail_mirror(paths)
+    value = projection()
+    value["all_clear"] = True
+
+    _overlay_gmail_mirror_coverage(
+        value,
+        paths=paths,
+        account_key="gmail.primary",
+        enabled=True,
+        scheduled_sync={
+            "available": True,
+            "enabled": True,
+            "paused": False,
+            "last_run_at": "2026-07-13T15:00:00+00:00",
+            "last_status": "failed",
+            "last_error": "failure before the manual Shadow run",
+        },
+    )
+
+    assert value["all_clear"] is True
+    assert value["status"] == "complete"
+    assert value["coverage"]["gmail"]["status"] == "complete"
+    assert "sync_error" not in value["coverage"]["gmail"]
+
+
 def test_today_preserves_total_urgent_count_when_snapshot_is_a_preview() -> None:
     value = projection()
     value["sections"]["urgent_overflow"] = [
@@ -207,3 +456,25 @@ def test_today_preserves_total_urgent_count_when_snapshot_is_a_preview() -> None
 
     assert briefing.urgent_overflow_count == 17
     assert len(briefing.urgent_overflow) == 1
+
+
+def _complete_gmail_mirror(paths: BrainPaths) -> None:
+    store = GmailMirrorStore(paths.gmail_mirror_sqlite_path)
+    store.initialize()
+    store.apply_sync_unit(
+        GmailMirrorCheckpointUpdate(
+            account_key="gmail.primary",
+            history_id="history-1",
+            mode="full",
+            coverage_complete=True,
+            reset_required=False,
+            continuation_page_token=None,
+            baseline_history_id=None,
+            pending_thread_ids=(),
+            continuation_history_id=None,
+            expected_generation=None,
+            last_success_at="2026-07-13T15:58:00+00:00",
+            updated_at="2026-07-13T15:58:00+00:00",
+        ),
+        (),
+    )

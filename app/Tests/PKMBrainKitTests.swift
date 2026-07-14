@@ -72,7 +72,11 @@ struct PKMBrainKitTests {
 
         #expect(scheduler.jobs.map(\.id).contains("capture_tick"))
         #expect(scheduler.jobs.first?.cadence_s == 600)
+        let gmail = try #require(scheduler.jobs.first { $0.id == "gmail_mirror_sync" })
+        #expect(gmail.displayName == "Check Gmail for updates")
+        #expect(gmail.displayStatus == "complete")
         let nightly = try #require(scheduler.jobs.first { $0.id == "nightly" })
+        #expect(nightly.displayName == "Nightly maintenance")
         #expect(nightly.displayStatus == "skipped")
         #expect(nightly.statusDetail == "last successful nightly run is less than 20 hours old")
     }

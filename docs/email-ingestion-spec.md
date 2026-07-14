@@ -1,8 +1,8 @@
 # Email Ingestion
 
-**Status:** compatibility pointer; identity-only auth exists, content capture remains planned and paused
-**Last verified:** 2026-07-13 against foundation commit `3937316`
+**Status:** compatibility pointer; Gmail operational mirroring is implemented, while retrieval indexing and durable-knowledge ingestion remain disabled
+**Last verified:** 2026-07-14 against the release-verified and installed read-only Gmail operational mirror/provider-sync tranche; fresh mailbox bootstrap/incremental validation remains pending
 
-Identity-only Gmail authorization and the isolated 90-day benchmark are implemented. The three-lane retrieval, durable-knowledge, and operational contract lives under [Future Gmail And Email Adapter](specs/capture-and-knowledge.md#future-gmail-and-email-adapter) and [Chief-of-Staff Operations](specs/chief-of-staff-operations.md#gmail-lanes).
+The owner-authorized operational lane uses exact-scope `gmail.readonly` API access to maintain a bounded, rebuildable local mirror at `~/brain/cache/gmail-mirror/gmail-mirror.sqlite`: exact seven-day bootstrap, history-based incremental sync about every 600 seconds, immutable sanitized revisions/current pointers, provider-confirmed tombstones, a durable triage queue, content-free poison-thread quarantine, recoverable saved page tokens, and one atomic provider checkpoint. After normal checkpoint acceptance, at most ten due quarantined threads may be retried in a second generation with durable exponential backoff and parser-version reprocessing; retry-only failure cannot make an accepted mailbox checkpoint stale. Attachment metadata may be retained, but attachment bodies/bytes are not fetched or stored. Luna drains the local queue with no Gmail calls, and mailbox freshness plus scheduled-sync health remain independent from analysis/quarantine backlog.
 
-A revised implementation proposal is scheduled in [the operational implementation plan](plans/chief-of-staff-operations-implementation-plan.md).
+This mirror is operational evidence only. It does not create inbox artifacts, documents, chunks, facts, entities, retrieval indexes, or wiki pages. The separate retrieval, durable-knowledge, and operational contracts live under [Future Gmail And Email Adapter](specs/capture-and-knowledge.md#future-gmail-and-email-adapter), [Chief-of-Staff Operations](specs/chief-of-staff-operations.md#gmail-lanes), and [the operational implementation plan](plans/chief-of-staff-operations-implementation-plan.md).
