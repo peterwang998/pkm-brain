@@ -1001,6 +1001,33 @@ public struct TodayEvidenceLink: Codable, Equatable, Identifiable, Sendable {
     public var id: String { "\(source_type):\(reference):\(label)" }
 }
 
+public struct TodayRetainedEvidence: Codable, Equatable, Sendable {
+    public let schema_version: Int
+    public let source_type: String
+    public let account_key: String
+    public let source_ref: String
+    public let source_revision: String?
+    public let retention_days: Int
+    public let evidence: JSONValue
+
+    public var sourceLabel: String {
+        switch source_type {
+        case "calendar": return "Google Calendar"
+        case "gmail": return "Gmail"
+        default: return "Local source"
+        }
+    }
+
+    public var displayTitle: String {
+        guard let object = evidence.objectValue else {
+            return "Retained evidence"
+        }
+        return object["subject"]?.stringValue
+            ?? object["title"]?.stringValue
+            ?? "Retained evidence"
+    }
+}
+
 public struct TodayFeedbackResponse: Codable, Equatable, Sendable {
     public let schema_version: Int
     public let status: String

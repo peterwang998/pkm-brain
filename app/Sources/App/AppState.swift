@@ -38,6 +38,7 @@ final class AppState: ObservableObject {
     @Published private(set) var isRunningTodayShadow = false
     @Published var todayShadowRunMessage: String?
     @Published var todayShadowRunError: String?
+    @Published var todayEvidenceRequest: TodayEvidenceRequest?
     @Published private(set) var queueSummary: QueueSummary?
     @Published var lastError: String?
     @Published var notificationsEnabled = true
@@ -177,6 +178,7 @@ final class AppState: ObservableObject {
             todayFeedbackMessage = nil
             todayShadowRunMessage = nil
             todayShadowRunError = nil
+            todayEvidenceRequest = nil
             await refreshMigrationPlan()
             await refreshDigest()
             await refreshToday()
@@ -366,6 +368,10 @@ final class AppState: ObservableObject {
     }
 
     func openTodayBrainRoute(_ route: String) {
+        if BrainAPIClient.canLoadTodayEvidence(at: route) {
+            todayEvidenceRequest = TodayEvidenceRequest(route: route)
+            return
+        }
         if route.hasPrefix("wiki:") {
             showWiki(path: String(route.dropFirst("wiki:".count)))
             return
@@ -608,4 +614,10 @@ final class AppState: ObservableObject {
         )
         UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
     }
+}
+
+struct TodayEvidenceRequest: Identifiable, Equatable {
+    let route: String
+
+    var id: String { route }
 }

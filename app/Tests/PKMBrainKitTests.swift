@@ -125,6 +125,78 @@ struct PKMBrainKitTests {
         #expect(result.succeeded)
     }
 
+    @Test("Today retained evidence only loads the local evidence route")
+    func todayRetainedEvidenceRequest() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [RetainedEvidenceURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer {
+            RetainedEvidenceURLProtocol.handler = nil
+            session.invalidateAndCancel()
+        }
+        RetainedEvidenceURLProtocol.handler = { request in
+            #expect(request.url?.path == "/api/ops/evidence")
+            #expect(request.url?.query?.contains("source_type=gmail") == true)
+            #expect(request.url?.query?.contains("account_key=gmail.personal") == true)
+            #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-token")
+            #expect(request.httpMethod == "GET")
+            let response = try #require(
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Type": "application/json"]
+                )
+            )
+            let payload = Data(
+                #"{"schema_version":1,"source_type":"gmail","account_key":"gmail.personal","source_ref":"gmail.personal:thread-1","source_revision":"history-42","retention_days":30,"evidence":{"thread_id":"thread-1","subject":"Send the board deck","messages":[{"body":"Can you send it today?"}]}}"#.utf8
+            )
+            return (response, payload)
+        }
+
+        let client = BrainAPIClient(
+            baseURL: URL(string: "http://127.0.0.1:54321")!,
+            token: "test-token",
+            session: session
+        )
+        let route = "/api/ops/evidence?source_type=gmail&account_key=gmail.personal&source_ref=gmail.personal%3Athread-1&source_revision=history-42"
+        let evidence = try await client.todayRetainedEvidence(at: route)
+
+        #expect(evidence.sourceLabel == "Gmail")
+        #expect(evidence.displayTitle == "Send the board deck")
+        #expect(evidence.source_revision == "history-42")
+        #expect(evidence.evidence.objectValue?["messages"]?.arrayValue?.count == 1)
+        #expect(BrainAPIClient.canLoadTodayEvidence(at: route))
+    }
+
+    @Test("Today retained evidence rejects remote, malformed, and expanded routes")
+    func todayRetainedEvidenceRejectsUnsafeRoutes() async {
+        let client = BrainAPIClient(
+            baseURL: URL(string: "http://127.0.0.1:54321")!,
+            token: "test-token"
+        )
+        let unsafeRoutes = [
+            "https://example.com/api/ops/evidence?source_type=gmail&account_key=a&source_ref=b",
+            "/api/ops/evidence?source_type=gmail&account_key=a&source_ref=b&redirect=https://example.com",
+            "/api/ops/evidence?source_type=gmail&account_key=a&source_ref=b#fragment",
+            "/api/ops/evidence?source_type=gmail&account_key=a&source_ref=b&source_ref=c",
+            "/api/ops/evidence?source_type=drive&account_key=a&source_ref=b",
+            "/api/ops/storage?source_type=gmail&account_key=a&source_ref=b",
+        ]
+
+        for route in unsafeRoutes {
+            #expect(!BrainAPIClient.canLoadTodayEvidence(at: route))
+            do {
+                let _: TodayRetainedEvidence = try await client.todayRetainedEvidence(at: route)
+                Issue.record("Unsafe evidence route was accepted: \(route)")
+            } catch let error as APIClientError {
+                #expect(error == .unsafeTodayEvidenceRoute)
+            } catch {
+                Issue.record("Unexpected error for unsafe route: \(error)")
+            }
+        }
+    }
+
     @Test("queue fixture decodes")
     func queueFixtureDecodes() throws {
         let queue: QueuePage = try decodeFixture("queue")
@@ -495,6 +567,35 @@ struct PKMBrainKitTests {
 }
 
 private final class ShadowRunURLProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        true
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        guard let handler = Self.handler else {
+            client?.urlProtocol(self, didFailWithError: APIClientError.invalidResponse)
+            return
+        }
+        do {
+            let (response, data) = try handler(request)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
+}
+
+private final class RetainedEvidenceURLProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
 
     override class func canInit(with request: URLRequest) -> Bool {

@@ -106,6 +106,10 @@ struct TodayView: View {
                 }
             }
         }
+        .sheet(item: $appState.todayEvidenceRequest) { request in
+            TodayEvidenceSheet(request: request)
+                .environmentObject(appState)
+        }
     }
 
     private var header: some View {

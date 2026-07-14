@@ -2,12 +2,15 @@ import Foundation
 
 public enum APIClientError: Error, Equatable, LocalizedError {
     case invalidResponse
+    case unsafeTodayEvidenceRoute
     case httpStatus(Int, String)
 
     public var errorDescription: String? {
         switch self {
         case .invalidResponse:
             return "The PKM Brain service returned an invalid response."
+        case .unsafeTodayEvidenceRoute:
+            return "This local evidence link is not valid."
         case let .httpStatus(status, body):
             return Self.responseMessage(body) ?? "PKM Brain request failed (HTTP \(status))."
         }
@@ -77,6 +80,17 @@ public final class BrainAPIClient: Sendable {
 
     public func todayShadowRunStatus() async throws -> TodayShadowRunStatus {
         try await get("/api/v1/today/run")
+    }
+
+    public func todayRetainedEvidence(at route: String) async throws -> TodayRetainedEvidence {
+        guard let safeRoute = Self.validatedTodayEvidenceRoute(route) else {
+            throw APIClientError.unsafeTodayEvidenceRoute
+        }
+        return try await get(safeRoute)
+    }
+
+    public static func canLoadTodayEvidence(at route: String) -> Bool {
+        validatedTodayEvidenceRoute(route) != nil
     }
 
     public func submitTodayFeedback(
@@ -390,6 +404,56 @@ public final class BrainAPIClient: Sendable {
         var allowed = CharacterSet.urlQueryAllowed
         allowed.remove(charactersIn: "&=")
         return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+    }
+
+    private static func validatedTodayEvidenceRoute(_ route: String) -> String? {
+        guard !route.isEmpty,
+              route.utf8.count <= 12_000,
+              let components = URLComponents(string: route),
+              components.scheme == nil,
+              components.host == nil,
+              components.user == nil,
+              components.password == nil,
+              components.port == nil,
+              components.fragment == nil,
+              components.percentEncodedPath == "/api/ops/evidence"
+        else {
+            return nil
+        }
+
+        let queryItems = components.queryItems ?? []
+        let allowedNames = Set(["source_type", "account_key", "source_ref", "source_revision"])
+        guard !queryItems.isEmpty,
+              queryItems.allSatisfy({ allowedNames.contains($0.name) })
+        else {
+            return nil
+        }
+
+        func singleValue(_ name: String, maximumLength: Int) -> String? {
+            let values = queryItems.filter { $0.name == name }
+            guard values.count == 1,
+                  let value = values[0].value?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !value.isEmpty,
+                  value.count <= maximumLength
+            else {
+                return nil
+            }
+            return value
+        }
+
+        guard let sourceType = singleValue("source_type", maximumLength: 32),
+              ["calendar", "gmail"].contains(sourceType),
+              singleValue("account_key", maximumLength: 1_000) != nil,
+              singleValue("source_ref", maximumLength: 4_000) != nil
+        else {
+            return nil
+        }
+        let revisionItems = queryItems.filter { $0.name == "source_revision" }
+        if !revisionItems.isEmpty,
+           singleValue("source_revision", maximumLength: 1_000) == nil {
+            return nil
+        }
+        return components.string
     }
 }
 
