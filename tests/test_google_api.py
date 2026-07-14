@@ -236,6 +236,58 @@ def test_quota_budget_waits_for_rate_and_minute_capacity() -> None:
     assert now[0] == 60.0
 
 
+def test_quota_budget_reserves_each_http_attempt_before_transport() -> None:
+    reservations: list[int] = []
+    attempts: list[str] = []
+    replies = [
+        response(429, {"error": {"message": "retry"}}),
+        response(200, {"ok": True}),
+    ]
+    client = GoogleAPIClient(
+        "gmail",
+        Tokens(),
+        requester=lambda request, _timeout: (
+            attempts.append(request.full_url) or replies.pop(0)
+        ),
+        quota=GoogleQuotaBudget(
+            requests_per_second=1_000,
+            on_acquire=reservations.append,
+        ),
+        sleeper=lambda _seconds: None,
+        jitter=lambda: 0,
+    )
+
+    assert client.get_json("threads/abc", quota_units=40) == {"ok": True}
+    assert reservations == [40, 40]
+    assert len(attempts) == 2
+
+
+def test_quota_budget_reservation_failure_prevents_http_attempt() -> None:
+    attempts = 0
+
+    def reserve(_units: int) -> None:
+        raise RuntimeError("daily request budget exhausted")
+
+    def requester(_request, _timeout):
+        nonlocal attempts
+        attempts += 1
+        return response(200, {"ok": True})
+
+    client = GoogleAPIClient(
+        "calendar",
+        Tokens(),
+        requester=requester,
+        quota=GoogleQuotaBudget(
+            requests_per_second=1_000,
+            on_acquire=reserve,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="daily request budget exhausted"):
+        client.get_json("calendars/primary/events")
+    assert attempts == 0
+
+
 def test_unexpired_token_is_reused_without_network(tmp_path: Path) -> None:
     paths, store = configured_google_grant(tmp_path, "gmail")
     store.save(

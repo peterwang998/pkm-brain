@@ -102,6 +102,7 @@ class GoogleQuotaBudget:
         requests_per_second: float = 2.0,
         monotonic: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
+        on_acquire: Callable[[int], None] | None = None,
     ) -> None:
         if units_per_minute <= 0:
             raise ValueError("units_per_minute must be positive")
@@ -111,6 +112,7 @@ class GoogleQuotaBudget:
         self.request_interval = 1.0 / requests_per_second
         self._monotonic = monotonic
         self._sleep = sleeper
+        self._on_acquire = on_acquire
         self._events: deque[tuple[float, int]] = deque()
         self._next_request_at = 0.0
         self._lock = threading.Lock()
@@ -134,6 +136,12 @@ class GoogleQuotaBudget:
                 rate_wait = max(0.0, self._next_request_at - now)
                 wait_for = max(quota_wait, rate_wait)
                 if wait_for <= 0:
+                    # Reserve durable daily capacity immediately before the HTTP
+                    # attempt. GoogleAPIClient calls acquire for every retry, so
+                    # a caller-provided reservation observes attempts rather than
+                    # merely successful logical requests.
+                    if self._on_acquire is not None:
+                        self._on_acquire(units)
                     timestamp = self._monotonic()
                     self._events.append((timestamp, units))
                     self._next_request_at = timestamp + self.request_interval
