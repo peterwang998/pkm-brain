@@ -84,10 +84,12 @@ def test_cache_retention_is_seven_days_raw_and_thirty_days_normalized(
     assert result.retained_files == 2
     assert result.removed_bytes > 0
     assert result.errors == ()
-    assert cache.read_raw("gmail", "old-raw") is None
-    assert cache.read_raw("gmail", "fresh-raw") == {"id": "fresh"}
-    assert cache.read_normalized("gmail", "middle-normalized") == {"id": "middle"}
-    assert cache.read_normalized("calendar", "old-normalized") is None
+    assert cache.read_raw("gmail", "old-raw", now=NOW) is None
+    assert cache.read_raw("gmail", "fresh-raw", now=NOW) == {"id": "fresh"}
+    assert cache.read_normalized(
+        "gmail", "middle-normalized", now=NOW
+    ) == {"id": "middle"}
+    assert cache.read_normalized("calendar", "old-normalized", now=NOW) is None
 
 
 def test_cache_rejects_symlinks_and_non_owner_permissions(tmp_path: Path) -> None:
@@ -130,3 +132,59 @@ def test_cache_requires_timezone_aware_retention_timestamps(tmp_path: Path) -> N
 
     with pytest.raises(ValueError, match="timezone"):
         cache.write_raw("gmail", "thread", {}, cached_at=datetime(2026, 7, 13))
+
+
+def test_normalized_revisions_are_immutable_and_exactly_addressable(
+    tmp_path: Path,
+) -> None:
+    cache = GoogleEvidenceCache(tmp_path / "google-cache")
+    cache.write_normalized(
+        "gmail",
+        "account:thread-1",
+        {"subject": "First"},
+        source_revision="revision-1",
+        cached_at=NOW,
+    )
+    cache.write_normalized(
+        "gmail",
+        "account:thread-1",
+        {"subject": "Second"},
+        source_revision="revision-2",
+        cached_at=NOW,
+    )
+
+    assert cache.read_normalized("gmail", "account:thread-1") == {
+        "subject": "Second"
+    }
+    assert cache.read_normalized(
+        "gmail",
+        "account:thread-1",
+        source_revision="revision-1",
+    ) == {"subject": "First"}
+    with pytest.raises(RuntimeError, match="conflicting content"):
+        cache.write_normalized(
+            "gmail",
+            "account:thread-1",
+            {"subject": "Tampered"},
+            source_revision="revision-1",
+            cached_at=NOW,
+        )
+
+
+def test_cache_reads_refuse_expired_content_before_pruning(tmp_path: Path) -> None:
+    cache = GoogleEvidenceCache(tmp_path / "google-cache")
+    cache.write_raw(
+        "gmail",
+        "expired",
+        {"id": "secret"},
+        cached_at=NOW - timedelta(days=8),
+    )
+    cache.write_normalized(
+        "gmail",
+        "expired",
+        {"id": "evidence"},
+        cached_at=NOW - timedelta(days=31),
+    )
+
+    assert cache.read_raw("gmail", "expired", now=NOW) is None
+    assert cache.read_normalized("gmail", "expired", now=NOW) is None

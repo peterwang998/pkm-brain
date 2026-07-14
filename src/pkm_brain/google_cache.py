@@ -18,6 +18,7 @@ NORMALIZED_RETENTION_DAYS = 30
 PRIVATE_DIRECTORY_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
 _CONNECTOR_ID = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_REVISION_POINTER_KEY = "__pkm_brain_normalized_revision__"
 
 
 class GoogleCacheSecurityError(RuntimeError):
@@ -87,20 +88,57 @@ class GoogleEvidenceCache:
         payload: Any,
         *,
         cached_at: datetime | None = None,
+        source_revision: str | None = None,
     ) -> Path:
-        return self._write(
+        if source_revision is None:
+            return self._write(
+                "normalized",
+                connector_id,
+                object_key,
+                payload,
+                cached_at=cached_at,
+            )
+        revision_key = _revision_object_key(object_key, source_revision)
+        revision_path = self._write(
+            "normalized",
+            connector_id,
+            revision_key,
+            payload,
+            cached_at=cached_at,
+            immutable_payload=True,
+        )
+        self._write(
             "normalized",
             connector_id,
             object_key,
-            payload,
+            {_REVISION_POINTER_KEY: revision_key},
             cached_at=cached_at,
         )
+        return revision_path
 
-    def read_raw(self, connector_id: str, object_key: str) -> Any | None:
-        return self._read("raw", connector_id, object_key)
+    def read_raw(
+        self,
+        connector_id: str,
+        object_key: str,
+        *,
+        now: datetime | None = None,
+    ) -> Any | None:
+        return self._read("raw", connector_id, object_key, now=now)
 
-    def read_normalized(self, connector_id: str, object_key: str) -> Any | None:
-        return self._read("normalized", connector_id, object_key)
+    def read_normalized(
+        self,
+        connector_id: str,
+        object_key: str,
+        *,
+        source_revision: str | None = None,
+        now: datetime | None = None,
+    ) -> Any | None:
+        effective_key = (
+            _revision_object_key(object_key, source_revision)
+            if source_revision is not None
+            else object_key
+        )
+        return self._read("normalized", connector_id, effective_key, now=now)
 
     def prune(self, *, now: datetime | None = None) -> CacheRetentionResult:
         current = _aware_utc(now or datetime.now(timezone.utc))
@@ -154,6 +192,7 @@ class GoogleEvidenceCache:
         payload: Any,
         *,
         cached_at: datetime | None,
+        immutable_payload: bool = False,
     ) -> Path:
         connector = _validated_connector_id(connector_id)
         normalized_key = object_key.strip()
@@ -165,6 +204,24 @@ class GoogleEvidenceCache:
         _ensure_private_directory(connector_dir)
         digest = hashlib.sha256(normalized_key.encode("utf-8")).hexdigest()
         path = connector_dir / f"{digest}.json"
+        if immutable_payload and (path.exists() or path.is_symlink()):
+            _assert_private_file(path)
+            existing = _read_json_file(path)
+            if (
+                existing.get("schema_version") != 1
+                or existing.get("lane") != lane
+                or existing.get("connector_id") != connector
+                or existing.get("object_key") != normalized_key
+            ):
+                raise RuntimeError(
+                    "Google cache revision envelope identity does not match its path"
+                )
+            if _canonical_payload(existing.get("payload")) != _canonical_payload(
+                payload
+            ):
+                raise RuntimeError(
+                    "immutable Google evidence revision has conflicting content"
+                )
         envelope = {
             "schema_version": 1,
             "lane": lane,
@@ -178,7 +235,14 @@ class GoogleEvidenceCache:
         _atomic_private_json(path, envelope)
         return path
 
-    def _read(self, lane: str, connector_id: str, object_key: str) -> Any | None:
+    def _read(
+        self,
+        lane: str,
+        connector_id: str,
+        object_key: str,
+        *,
+        now: datetime | None = None,
+    ) -> Any | None:
         connector = _validated_connector_id(connector_id)
         normalized_key = object_key.strip()
         if not normalized_key:
@@ -199,7 +263,21 @@ class GoogleEvidenceCache:
             or envelope.get("object_key") != normalized_key
         ):
             raise RuntimeError("Google cache envelope identity does not match its path")
-        return envelope.get("payload")
+        cached_at = _parse_cached_at(envelope)
+        retention = self.raw_retention if lane == "raw" else self.normalized_retention
+        if _aware_utc(now or datetime.now(timezone.utc)) - cached_at > retention:
+            return None
+        payload = envelope.get("payload")
+        if (
+            lane == "normalized"
+            and isinstance(payload, dict)
+            and set(payload) == {_REVISION_POINTER_KEY}
+        ):
+            target = payload.get(_REVISION_POINTER_KEY)
+            if not isinstance(target, str) or not target:
+                raise RuntimeError("Google cache revision pointer is invalid")
+            return self._read(lane, connector, target, now=now)
+        return payload
 
 
 def _ensure_private_directory(path: Path) -> None:
@@ -274,6 +352,15 @@ def _read_json_file(path: Path) -> dict[str, Any]:
     return payload
 
 
+def _canonical_payload(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
 def _parse_cached_at(envelope: dict[str, Any]) -> datetime:
     value = str(envelope.get("cached_at") or "")
     try:
@@ -294,3 +381,18 @@ def _validated_connector_id(value: str) -> str:
     if not _CONNECTOR_ID.fullmatch(normalized):
         raise ValueError("invalid Google cache connector id")
     return normalized
+
+
+def _revision_object_key(object_key: str, source_revision: str) -> str:
+    normalized_key = object_key.strip()
+    normalized_revision = source_revision.strip()
+    if not normalized_key or len(normalized_key) > 4_000:
+        raise ValueError("Google cache object key must be 1-4000 characters")
+    if not normalized_revision or len(normalized_revision) > 1_024:
+        raise ValueError("Google cache source revision must be 1-1024 characters")
+    return json.dumps(
+        {"object_key": normalized_key, "source_revision": normalized_revision},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )

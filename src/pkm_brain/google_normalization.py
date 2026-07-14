@@ -68,6 +68,7 @@ class NormalizedCalendarEvent:
     attendee_count: int
     attendee_response: str | None
     cancelled: bool
+    ical_uid: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -189,6 +190,7 @@ def normalize_calendar_event(value: Mapping[str, Any]) -> NormalizedCalendarEven
             else None
         ),
         cancelled=status == "cancelled",
+        ical_uid=_bounded(value.get("iCalUID"), 1_000),
     )
 
 
@@ -264,11 +266,10 @@ def normalize_gmail_message(
         body = body[:message_body_cap].rstrip()
     from_addresses = _email_addresses(headers.get("from"))
     labels = tuple(str(item) for item in value.get("labelIds") or [] if item)
-    normalized_operator_emails = {
-        str(address).strip().casefold() for address in operator_emails if str(address).strip()
-    }
-    operator_authored = bool(normalized_operator_emails.intersection(from_addresses))
-    outgoing = "SENT" in labels or operator_authored
+    # Gmail's provider-owned SENT label is the authority for direction. A From
+    # header is sender-controlled input and can impersonate the operator.
+    outgoing = "SENT" in labels
+    operator_authored = outgoing
     internal_date = _bounded(value.get("internalDate"), 100)
     return NormalizedGmailMessage(
         message_id=message_id,
