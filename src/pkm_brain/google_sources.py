@@ -23,8 +23,7 @@ class GoogleJSONClient(Protocol):
         *,
         params: Mapping[str, str | int] | None = None,
         quota_units: int = 1,
-    ) -> dict[str, Any]:
-        ...
+    ) -> dict[str, Any]: ...
 
 
 @dataclass(frozen=True)
@@ -96,7 +95,9 @@ class GoogleCalendarReader:
         max_events: int = 5_000,
     ) -> None:
         if calendar_id != "primary":
-            raise ValueError("the initial Calendar transport is restricted to calendarId=primary")
+            raise ValueError(
+                "the initial Calendar transport is restricted to calendarId=primary"
+            )
         if not 1 <= page_size <= 2_500:
             raise ValueError("Calendar page_size must be between 1 and 2500")
         if max_pages <= 0 or max_events <= 0:
@@ -199,7 +200,9 @@ class GoogleCalendarReader:
                 quota_units=1,
             )
             pages += 1
-            items = [item for item in payload.get("items") or [] if isinstance(item, Mapping)]
+            items = [
+                item for item in payload.get("items") or [] if isinstance(item, Mapping)
+            ]
             if len(items) > remaining:
                 items = items[:remaining]
                 coverage_complete = False
@@ -270,14 +273,20 @@ class GmailThreadReader:
     ) -> GmailFetchResult:
         normalized_query = query.strip()
         if not normalized_query or len(normalized_query) > 2_000:
-            raise ValueError("Gmail full-sync query must be non-empty and at most 2000 characters")
+            raise ValueError(
+                "Gmail full-sync query must be non-empty and at most 2000 characters"
+            )
         page_token = _validated_page_token(continuation_page_token)
-        baseline = _validated_history_id(baseline_history_id, name="baseline_history_id")
+        baseline = _validated_history_id(
+            baseline_history_id, name="baseline_history_id"
+        )
         starting_history_id = _validated_history_id(history_id, name="history_id")
         usage = _FetchUsage()
         if starting_history_id:
             if baseline is not None:
-                raise ValueError("baseline_history_id is only valid for full-sync resume")
+                raise ValueError(
+                    "baseline_history_id is only valid for full-sync resume"
+                )
             try:
                 return self._fetch_incremental(
                     starting_history_id,
@@ -421,7 +430,9 @@ class GmailThreadReader:
                     if thread_id not in seen:
                         seen.add(thread_id)
                         changed_ids.append(thread_id)
-            next_history_id = _optional_string(payload.get("historyId")) or next_history_id
+            next_history_id = (
+                _optional_string(payload.get("historyId")) or next_history_id
+            )
             page_token = _optional_string(payload.get("nextPageToken"))
             if not coverage_complete or not page_token:
                 break

@@ -95,13 +95,18 @@ def gmail_thread(thread_id: str = "thread-1") -> dict[str, Any]:
     }
 
 
-def test_calendar_full_fetch_expands_weekly_occurrences_and_cancelled_exceptions() -> None:
+def test_calendar_full_fetch_expands_weekly_occurrences_and_cancelled_exceptions() -> (
+    None
+):
     occurrence = {
         "id": "series-1_20260714T160000Z",
         "etag": '"etag-1"',
         "status": "confirmed",
         "summary": "Weekly review",
-        "start": {"dateTime": "2026-07-14T09:00:00-07:00", "timeZone": "America/Los_Angeles"},
+        "start": {
+            "dateTime": "2026-07-14T09:00:00-07:00",
+            "timeZone": "America/Los_Angeles",
+        },
         "end": {"dateTime": "2026-07-14T09:30:00-07:00"},
         "recurringEventId": "series-1",
         "originalStartTime": {"dateTime": "2026-07-14T09:00:00-07:00"},
@@ -139,6 +144,8 @@ def test_calendar_full_fetch_expands_weekly_occurrences_and_cancelled_exceptions
     assert result.events[1].recurring_event_id == "series-1"
     assert result.events[1].original_start_time == "2026-07-21T09:00:00-07:00"
     assert "extendedProperties" not in result.raw_events[0]
+    assert result.api_requests == 2
+    assert result.quota_units == 2
     assert client.calls[0] == (
         "calendars/primary/events",
         {
@@ -198,23 +205,26 @@ def test_calendar_410_returns_explicit_replacement_full_snapshot() -> None:
         time_min="2026-06-29T00:00:00Z",
         time_max="2026-10-12T00:00:00Z",
         sync_token="expired",
+        continuation_page_token="expired-page",
     )
 
     assert result.mode == "full"
     assert result.reset_required is True
     assert result.next_sync_token == "new"
+    assert result.api_requests == 2
+    assert result.quota_units == 2
     assert client.calls[0][1]["syncToken"] == "expired"
+    assert client.calls[0][1]["pageToken"] == "expired-page"
     assert "timeMin" not in client.calls[0][1]
     assert client.calls[1][1]["timeMin"] == "2026-06-29T00:00:00Z"
+    assert "pageToken" not in client.calls[1][1]
 
 
 def test_calendar_reader_refuses_non_primary_calendar_and_partial_cursor() -> None:
     with pytest.raises(ValueError, match="calendarId=primary"):
         GoogleCalendarReader(FakeClient([]), calendar_id="shared@example.com")
 
-    client = FakeClient(
-        [{"items": [{"id": "one"}], "nextPageToken": "more"}]
-    )
+    client = FakeClient([{"items": [{"id": "one"}], "nextPageToken": "more"}])
     result = GoogleCalendarReader(client, max_pages=1).fetch(
         time_min="2026-07-01T00:00:00Z",
         time_max="2026-08-01T00:00:00Z",
@@ -222,6 +232,42 @@ def test_calendar_reader_refuses_non_primary_calendar_and_partial_cursor() -> No
     assert result.coverage_complete is False
     assert result.next_sync_token is None
     assert result.continuation_page_token == "more"
+    assert result.api_requests == 1
+    assert result.quota_units == 1
+
+    resume_client = FakeClient(
+        [{"items": [{"id": "two"}], "nextSyncToken": "sync-after-resume"}]
+    )
+    resumed = GoogleCalendarReader(resume_client, max_pages=1).fetch(
+        time_min="2026-07-01T00:00:00Z",
+        time_max="2026-08-01T00:00:00Z",
+        continuation_page_token=result.continuation_page_token,
+    )
+
+    assert resumed.coverage_complete is True
+    assert resumed.next_sync_token == "sync-after-resume"
+    assert resume_client.calls[0][1]["pageToken"] == "more"
+    assert resume_client.calls[0][1]["singleEvents"] == "true"
+    assert resumed.api_requests == 1
+    assert resumed.quota_units == 1
+
+
+def test_calendar_incremental_fetch_resumes_page_sequence_with_expansion() -> None:
+    client = FakeClient([{"items": [{"id": "changed"}], "nextSyncToken": "sync-3"}])
+
+    result = GoogleCalendarReader(client).fetch(
+        time_min="2026-07-01T00:00:00Z",
+        time_max="2026-08-01T00:00:00Z",
+        sync_token="sync-2",
+        continuation_page_token="incremental-page-2",
+    )
+
+    assert result.mode == "incremental"
+    assert result.next_sync_token == "sync-3"
+    assert client.calls[0][1]["syncToken"] == "sync-2"
+    assert client.calls[0][1]["pageToken"] == "incremental-page-2"
+    assert client.calls[0][1]["singleEvents"] == "true"
+    assert "timeMin" not in client.calls[0][1]
 
 
 def test_gmail_full_fetch_normalizes_plain_text_and_removes_attachment_bytes() -> None:
@@ -254,6 +300,9 @@ def test_gmail_full_fetch_normalizes_plain_text_and_removes_attachment_bytes() -
     attachment = result.raw_threads[0]["messages"][0]["payload"]["parts"][2]
     assert "data" not in attachment["body"]
     assert [call[2] for call in client.calls] == [1, 10, 40]
+    assert result.baseline_history_id == "300"
+    assert result.api_requests == 3
+    assert result.quota_units == 51
 
 
 def test_gmail_incremental_history_collects_changes_and_missing_tombstone() -> None:
@@ -264,7 +313,9 @@ def test_gmail_incremental_history_collects_changes_and_missing_tombstone() -> N
                     {
                         "id": "10",
                         "messagesAdded": [{"message": {"id": "m1", "threadId": "t1"}}],
-                        "messagesDeleted": [{"message": {"id": "m2", "threadId": "t2"}}],
+                        "messagesDeleted": [
+                            {"message": {"id": "m2", "threadId": "t2"}}
+                        ],
                     }
                 ],
                 "historyId": "11",
@@ -286,6 +337,8 @@ def test_gmail_incremental_history_collects_changes_and_missing_tombstone() -> N
     assert result.coverage_complete is True
     assert client.calls[0][0] == "history"
     assert client.calls[0][2] == 2
+    assert result.api_requests == 3
+    assert result.quota_units == 82
 
 
 def test_gmail_history_404_returns_explicit_bounded_full_reset() -> None:
@@ -301,6 +354,7 @@ def test_gmail_history_404_returns_explicit_bounded_full_reset() -> None:
     result = GmailThreadReader(client).fetch(
         query="newer_than:7d -in:spam -in:trash",
         history_id="old",
+        continuation_page_token="expired-history-page",
     )
 
     assert result.mode == "full"
@@ -308,6 +362,10 @@ def test_gmail_history_404_returns_explicit_bounded_full_reset() -> None:
     assert result.next_history_id == "500"
     assert client.calls[0][0] == "history"
     assert client.calls[1][0] == "profile"
+    assert result.api_requests == 4
+    assert result.quota_units == 53
+    assert client.calls[0][1]["pageToken"] == "expired-history-page"
+    assert "pageToken" not in client.calls[2][1]
 
 
 def test_gmail_partial_full_fetch_never_advances_history_cursor() -> None:
@@ -324,6 +382,93 @@ def test_gmail_partial_full_fetch_never_advances_history_cursor() -> None:
     assert result.coverage_complete is False
     assert result.next_history_id is None
     assert result.continuation_page_token == "more"
+    assert result.baseline_history_id == "500"
+    assert result.api_requests == 3
+    assert result.quota_units == 51
+
+    resume_client = FakeClient(
+        [
+            {"threads": [{"id": "thread-2"}]},
+            gmail_thread("thread-2"),
+        ]
+    )
+    resumed = GmailThreadReader(resume_client, max_pages=1).fetch(
+        query="newer_than:30d",
+        continuation_page_token=result.continuation_page_token,
+        baseline_history_id=result.baseline_history_id,
+    )
+
+    assert resumed.coverage_complete is True
+    assert resumed.next_history_id == "500"
+    assert resumed.baseline_history_id == "500"
+    assert resume_client.calls[0][0] == "threads"
+    assert resume_client.calls[0][1]["pageToken"] == "more"
+    assert all(call[0] != "profile" for call in resume_client.calls)
+    assert resumed.api_requests == 2
+    assert resumed.quota_units == 50
+
+
+def test_gmail_incremental_history_resumes_from_page_token() -> None:
+    first_client = FakeClient(
+        [
+            {
+                "history": [
+                    {
+                        "id": "10",
+                        "messagesAdded": [{"message": {"id": "m1", "threadId": "t1"}}],
+                    }
+                ],
+                "historyId": "11",
+                "nextPageToken": "history-page-2",
+            },
+            gmail_thread("t1"),
+        ]
+    )
+    partial = GmailThreadReader(first_client, max_pages=1).fetch(
+        query="newer_than:30d",
+        history_id="9",
+    )
+
+    assert partial.coverage_complete is False
+    assert partial.next_history_id is None
+    assert partial.continuation_page_token == "history-page-2"
+    assert partial.api_requests == 2
+    assert partial.quota_units == 42
+
+    resume_client = FakeClient(
+        [
+            {
+                "history": [
+                    {
+                        "id": "11",
+                        "messagesAdded": [{"message": {"id": "m2", "threadId": "t2"}}],
+                    }
+                ],
+                "historyId": "12",
+            },
+            gmail_thread("t2"),
+        ]
+    )
+    resumed = GmailThreadReader(resume_client, max_pages=1).fetch(
+        query="newer_than:30d",
+        history_id="9",
+        continuation_page_token=partial.continuation_page_token,
+    )
+
+    assert resumed.coverage_complete is True
+    assert resumed.next_history_id == "12"
+    assert resume_client.calls[0][1]["startHistoryId"] == "9"
+    assert resume_client.calls[0][1]["pageToken"] == "history-page-2"
+    assert resumed.api_requests == 2
+    assert resumed.quota_units == 42
+
+
+def test_gmail_full_resume_requires_its_original_baseline() -> None:
+    with pytest.raises(ValueError, match="baseline_history_id is required"):
+        GmailThreadReader(FakeClient([])).fetch(
+            query="newer_than:30d",
+            continuation_page_token="page-2",
+        )
 
 
 def test_html_fallback_private_calendar_and_route_builders() -> None:
