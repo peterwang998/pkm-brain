@@ -33,16 +33,54 @@ The initial release is read-only and shadow-only. No Calendar or Gmail mutation 
 
 V1 proves one closed loop:
 
-1. capture read-only Calendar evidence;
-2. reconcile it into current operational state;
-3. generate an evidence-backed Today briefing;
-4. accept local corrections and completion/dismissal feedback;
-5. measure duplicate, stale, missed, and false-alarm rates;
-6. add read-only Gmail operational detection only after the Calendar loop passes.
+1. load an explicit local operations policy for identity, responsibility, ranking, and source selection;
+2. capture read-only Calendar evidence through a typed incremental source adapter;
+3. reconcile it into current operational state;
+4. generate an evidence-backed Today briefing with an adaptive focus set;
+5. accept local corrections and completion/dismissal feedback;
+6. measure duplicate, stale, missed, false-alarm, focus-selection, and evidence-link rates;
+7. add read-only Gmail operational detection and source-local action-satisfaction checks only after the Calendar loop passes;
+8. add reversible cross-source episode linkage and cross-source satisfaction checks only after both source-local paths are trustworthy.
 
 V1 keeps the existing seven-destination navigation. Today becomes the briefing surface. Queue remains the Knowledge Curation review workflow, and Ops remains the daemon/system-administration destination.
 
 Goals are operator-authored intent, not extracted observations. V1 MAY read an explicitly configured human-authored Markdown page, defaulting to `wiki/goals.md`, as ranking context. It MUST NOT create a goal table or infer goals from mail.
+
+## Local Operations Policy
+
+The Chief of Staff uses an explicit, versioned, local policy rather than inferring the operator's identity, responsibilities, or priorities from traffic volume. The default private configuration path is `config/local/operations.yaml`. It is not checked into source control, contains no credentials, and is validated before any configured value affects selection or ranking.
+
+The policy may declare:
+
+- stable operator identities per connector, including email addresses, provider user IDs, Git identities, and approved aliases;
+- owned, shared, and adjacent responsibility areas;
+- configured accounts, calendars, projects, repositories, people, and organizations;
+- local timezone, working hours, briefing schedule, and pre-meeting preparation window;
+- deterministic priority and exception rules, including legal, financial, security, safety, travel, and direct-commitment exceptions;
+- pointers to operator-authored goal pages and other approved ranking context;
+- connector-specific allowlists and provider-native host/tenant mappings used to construct safe source links.
+
+Stable provider IDs take precedence over display names. A display name alone MUST NOT prove operator identity, authorship, assignment, or reply status.
+
+Responsibility is a ranking signal, not a destructive admission filter. Out-of-area material is normally demoted, but a direct obligation or a configured high-consequence exception remains eligible. Unknown responsibility remains explicit; the system does not silently assign ownership or discard the item. Every persisted briefing or handled-state assessment records the policy version that influenced it so results are replayable after policy changes.
+
+## Source Adapter Contract
+
+Every operational source implements the same failure-isolated, incremental adapter boundary. An adapter emits bounded typed source-unit batches; it does not write current item projections directly and does not depend on an unbounded model context or a transient copied-source corpus.
+
+Each adapter contract declares:
+
+- connector and adapter version, account/tenant identity, source type, stream key, object key, revision, replay-stable authority order, and provider update time;
+- initial window, incremental cursor, pagination, tombstone, bounded resync, retry, and rate-limit behavior;
+- approved scope, allowlisted sources, redaction, retention, and deletion behavior;
+- stable evidence references plus a local evidence route and, when available, a validated provider-native route;
+- which native signals can establish authorship, assignment, response, delegation, fulfillment, cancellation, or current authoritative state;
+- per-run budgets, deferred-work accounting, freshness, and `complete|partial|unavailable` coverage;
+- deterministic normalization and fixture replay behavior before any optional detector is invoked.
+
+Adapters run independently so one large or unavailable source cannot consume another source's context or erase its result. Parallel polling is allowed, but each source-unit batch and cursor commit remains atomic under the operational writer.
+
+A notification or copied summary is a lead, not the authority for an upstream object. When an email or collaboration message points to a ticket, pull request, build, reservation, invoice, or other canonical object, the current state from that authoritative provider outranks the notification text. If the authoritative adapter is absent, unauthorized, stale, or failed, the Chief of Staff may surface the lead but MUST report verification as unknown and MUST NOT infer completion or an all-clear.
 
 ## Authority And Lifecycle
 
@@ -239,6 +277,42 @@ Reconciliation rules:
 - human dismissal prevents same-version resurrection;
 - reconciling duplicates retains a canonical survivor, resolves duplicates with explicit canonical-item metadata, and never deletes history.
 
+### Action Satisfaction And Handled State
+
+Lifecycle state answers whether an operational item remains active. Handled state answers whether the operator still owes the next move. They are related but MUST NOT be conflated.
+
+For obligations and attention items, the briefing derives one handled verdict:
+
+| Verdict | Meaning |
+|---|---|
+| `needs_action` | evidence indicates that the operator still owns the next move |
+| `responded_waiting` | the operator responded, but fulfillment now depends on another event or party |
+| `being_handled` | another identified party has accepted or is demonstrably progressing the next move |
+| `fulfilled` | direct evidence satisfies or declines the requested result |
+| `unknown` | evidence or source coverage is insufficient to decide safely |
+
+A handled verdict is a versioned derived assessment, not a sixth item state and not a provider observation. Each assessment records item/episode ID, verdict, supporting and contradicting evidence references, sources checked, per-source coverage, method/version, policy version, confidence, and `as_of`. It may be cached as bounded validated projection metadata, but it is recomputed when relevant source evidence, relations, policy, or coverage changes.
+
+Verification rules:
+
+- read/unread, seen, opened, or viewed state is only a weak attention signal and never proves fulfillment;
+- an outgoing reply proves at most that a response occurred; a promise to act leaves the commitment active;
+- a response resolves a waiting item only when it directly supplies, performs, or explicitly declines the awaited result;
+- delegation may yield `being_handled`, but it does not resolve the operator's accountability unless policy and direct evidence establish that transfer;
+- progress by another party may yield `responded_waiting|being_handled`; silence never does;
+- any source failure or unverified authoritative object that could change the verdict forces `unknown` rather than a verified all-clear;
+- a handled assessment may recommend an allowed transition, but only deterministic reconciliation or explicit human feedback mutates item lifecycle state.
+
+Gmail first implements these checks inside one thread using stable operator email identities and message lineage. Cross-source handled verification is a COS-6 capability and cannot be claimed from semantic similarity alone.
+
+### Cross-Source Episode Relations
+
+COS-6 may group evidence and items from different sources into one operational episode without destructively merging their source identities or histories. Relations are explicit, evidence-backed, reversible assertions such as `same_episode`, `duplicate_of`, `responds_to`, `fulfills`, `delegates`, or `supersedes`.
+
+Each relation binds exact endpoint IDs, relation type, supporting evidence, method/version, policy version, confidence, creator, and status. Automated relations begin proposed unless deterministic provider/business identifiers prove the link. Confirmation, rejection, and retraction append auditable transitions; they never delete either endpoint. A human-rejected relation cannot be recreated from the same evidence/version, and retracting a relation causes affected handled-state and briefing projections to be recomputed.
+
+The initial COS-6 schema MAY add `ops_episode_relations` plus append-only relation events after a dedicated migration review. It does not create a second task ontology. False merge is more severe than a temporary duplicate: ambiguous candidates remain separate, and one focus card may aggregate an episode only when the active relation meets the approved confidence/confirmation gate.
+
 ## Calendar-First Connector
 
 Calendar is the first production source because its schedule, identity, updates, and cancellation state are structured and require no LLM for the core briefing.
@@ -331,18 +405,46 @@ Malformed output produces no items and remains retryable on a later connector ru
 
 Daily request/input/token budgets are explicit configuration. Overflow is deferred with visible coverage status; it is never silently dropped. Production enablement requires a chronological replay demonstrating that the approved budget covers normal and high-volume days.
 
+## Later Read-Only Adapters
+
+After Calendar, Gmail, handled-state, and cross-source reconciliation gates pass, additional adapters may be enabled independently under the common source contract:
+
+- local Git worktrees for branch divergence, uncommitted state, recent commits, and locally observable integration risk;
+- approved code-host accounts for review requests, pull-request state, CI/build results, and merges;
+- local agent-session history for unfinished tasks, recorded outcomes, explicit blockers, and recurring friction;
+- collaboration systems for direct asks, mentions, thread progression, and stable-user-ID response evidence;
+- work trackers for assignments, questions directed to the operator, status, due dates, and authoritative ticket history.
+
+Local Git and agent-session summaries are evidence only for what they directly record. An agent-generated summary may suggest a lead, but it does not prove that an external task, review, or commitment is complete. Code-host build/review state and work-tracker ticket state outrank notifications about those objects. Collaboration response checks use stable provider user IDs rather than display names.
+
+Each adapter requires its own scope/privacy decision, labeled fixtures, source-local identity and replay tests, budget, coverage reporting, and rollback-free read-only disable path. No adapter is bundled into another adapter's authorization, and a later adapter does not delay or weaken the Calendar/Gmail release gates.
+
 ## Briefing Contract
 
 The briefing is a deterministic ranked projection as of a declared local time. It is generated on demand and by a configurable morning schedule.
 
 Sections are:
 
-1. `now_and_next`: current and upcoming Calendar events;
-2. `overdue_and_due`: active commitments/follow-ups/deadlines ordered by urgency;
-3. `waiting`: active `kind=waiting` items;
-4. `attention`: changed, uncertain, high-priority, or decision-bearing items;
-5. `low_confidence`: active items whose confidence/reconciliation metadata is provisional or ambiguous, visually separated from trusted work;
-6. `system_coverage`: connector freshness, deferred volume, and failures.
+1. `focus`: up to five distinct operational episodes that most need the operator's next move;
+2. `urgent_overflow`: any additional critical/high-priority `needs_action` episodes that did not fit in focus;
+3. `now_and_next`: current and upcoming Calendar events;
+4. `overdue_and_due`: active commitments/follow-ups/deadlines ordered by urgency;
+5. `waiting`: active `kind=waiting` items;
+6. `attention`: changed, uncertain, high-priority, or decision-bearing items;
+7. `awareness`: relevant informational items that do not currently need the operator's action;
+8. `low_confidence`: active items whose confidence/reconciliation metadata is provisional or ambiguous, visually separated from trusted work;
+9. `system_coverage`: connector freshness, deferred volume, and failures.
+
+Focus selection is adaptive rather than quota-filling:
+
+1. rank a bounded candidate set of active action-bearing items or confirmed episodes;
+2. derive handled state using all authorized, fresh sources that could satisfy the action;
+3. reject terminal, snoozed, duplicate-episode, and verified `fulfilled|being_handled` candidates from focus while retaining them in their appropriate full section when useful;
+4. include at most five `needs_action` candidates, or fewer when fewer qualify;
+5. disclose every additional critical/high-priority `needs_action` candidate in `urgent_overflow` rather than hiding it;
+6. never pad focus with awareness material merely to reach five.
+
+`unknown` handled state is never silently suppressed. It appears in focus or the uncertainty section according to consequence, confidence, and coverage. Zero focus items is a valid result only when coverage and satisfaction checks support it.
 
 Ranking is deterministic over:
 
@@ -360,21 +462,47 @@ Every briefing item exposes:
 
 - current state and freshness;
 - why it appears now;
+- who owns the next move and what evidence would satisfy it;
+- handled verdict plus checked-source coverage where applicable;
 - due/start/expiry with source timezone where relevant;
 - confidence and reconciliation status;
-- evidence/source navigation;
+- bounded local evidence navigation and validated provider-native navigation where authorized;
 - local `confirm`, `done`, `dismiss`, `snooze`, and correction actions that apply to its kind/state.
 
 Briefing generation MUST NOT fail closed on one source. It returns `complete|partial|unavailable` plus per-connector coverage. Stale data may remain visible only with its last-updated time and an explicit stale label.
+
+### Evidence Navigation
+
+Every factual card, handled assessment, and meeting-preparation claim references stable local evidence IDs. Provider-native links are optional conveniences, not evidence themselves. They are constructed from adapter-owned stable IDs and allowlisted scheme/host/tenant templates; arbitrary URLs from message or event text are never rendered as trusted source links. Links contain no credentials, refresh tokens, copied source bodies, or unredacted query text, and the UI identifies the account/provider before opening them.
+
+When a provider object is unavailable or the route cannot be validated, the local evidence route remains available where retention permits and the provider link is omitted. Source deletion or redaction invalidates the corresponding route and visibly downgrades dependent assessments rather than leaving a misleading deep link.
+
+## Derived Meeting Preparation
+
+For a configured or operator-selected upcoming event, the Chief of Staff MAY generate a bounded preparation packet as a derived view. The initial Calendar/Brain version may use event metadata, explicit local operations policy, current operational items, and approved Brain retrieval, facts, entities, and pages. A later COS-6 version may add fresh evidence from linked communication, work-tracker, and code-host adapters.
+
+A packet may contain:
+
+- objective, timing, attendees, location, and material schedule changes;
+- commitments, waiting items, and next moves in both directions;
+- prior decisions and durable facts, distinguished from current source observations;
+- recent relevant correspondence and authoritative work-object changes;
+- sourced risks, unresolved questions, and decisions needed;
+- suggested talking points clearly labeled as suggestions rather than facts;
+- evidence links, freshness, policy version, and per-source coverage.
+
+Packets are generated on demand or inside a bounded pre-meeting window, use the same source budgets and coverage semantics as the briefing, and are never canonical state. They MUST query approved retrieval evidence when needed rather than depending only on fact admission. A model may organize or compress supported material, but it may not invent attendees, commitments, decisions, customer/entity identity, or completion. Cached packets contain bounded derived text and IDs, expire under the briefing-retention policy, and do not duplicate full source bodies.
 
 ## Today UI
 
 Today becomes the V1 Chief-of-Staff surface without changing navigation:
 
 - the briefing leads the page;
+- focus shows zero to five cards, with urgent overflow and awareness visibly separate;
 - daemon, scheduler, index, sync, and review health remain a compact system pulse;
 - item actions write only through the operational service and append an event;
-- source links open the owning Brain evidence view when available;
+- source links open the owning Brain evidence view and may offer a separately labeled validated provider route when available;
+- selected upcoming events may expand into a derived meeting-preparation packet without creating another navigation destination;
 - a refresh shows the new `as_of` time and rejects late responses from older generations;
 - sidebar/menu badges do not count low-confidence or ambiguous items as confirmed obligations;
 - notification text contains counts/status by default, not mail or calendar contents.
@@ -391,6 +519,10 @@ The local labeled corpus remains private and outside git. It includes:
 - chronological Gmail threads across human, bulk, transactional, and marketing classes;
 - low/median/high-volume days;
 - threads/events with updates, cancellation, moved deadlines, completion, and no operational content;
+- source-local and cross-source examples of replied-but-not-fulfilled, fulfilled, delegated, being-handled, and unanswered work;
+- positive, negative, ambiguous, confirmed, rejected, and retracted episode relations;
+- owned, shared, adjacent, out-of-area, and configured high-consequence exception examples;
+- meeting-preparation examples with both relevant and tempting-but-unsupported context;
 - held-out dates not used to tune prompts or rules.
 
 ### Required Metrics
@@ -401,25 +533,47 @@ Detection:
 - critical/high-priority recall;
 - false alarms per briefing;
 - suppressed-source miss rate;
-- classification by source class.
+- classification by source class;
+- owner/responsibility attribution accuracy under the active policy version.
 
 Reconciliation:
 
 - duplicate-active-item rate;
 - false-merge and false-split rate;
+- false-link, missed-link, and relation-retraction rate by episode relation type;
 - stale-active-item rate;
 - reschedule/cancellation/closure accuracy;
 - resolved-item resurrection rate;
 - time from source update to canonical item update;
 - human correction and dismissal rate.
 
+Handled-state verification:
+
+- verdict precision/recall by `needs_action|responded_waiting|being_handled|fulfilled|unknown`;
+- false-handled rate, especially fulfilled/being-handled verdicts that suppress required action;
+- replied-but-not-fulfilled confusion rate;
+- authoritative-source verification and cross-source satisfaction accuracy;
+- time from satisfying evidence to handled-verdict update;
+- incomplete-coverage cases incorrectly reported as handled or all-clear.
+
 Briefing:
 
 - high-priority recall in the appropriate section;
+- focus precision@5 and recall of unresolved critical/high-priority episodes across focus plus urgent overflow;
+- focus padding count and urgent-overflow disclosure accuracy;
 - stale or terminal items shown as active;
 - ranking usefulness from operator feedback;
 - daily item churn and repeated false alarms;
-- incomplete-coverage disclosure accuracy.
+- incomplete-coverage disclosure accuracy;
+- local/provider evidence-link validity and correct account/provider routing.
+
+Meeting preparation:
+
+- factual-claim evidence coverage and unsupported-claim rate;
+- current commitment/decision/change recall;
+- stale or wrong-person context rate;
+- per-source freshness/coverage disclosure accuracy;
+- operator correction and usefulness feedback.
 
 Cost and reliability:
 
@@ -443,6 +597,11 @@ Gmail live briefing promotion requires, on held-out chronological data:
 - critical/high-priority recall at least `0.95`;
 - overall item precision at least `0.80`;
 - false-merge rate at most `0.01`;
+- high-consequence false-handled rate of zero and overall false-handled rate at most `0.01`;
+- `100%` of unresolved critical/high-priority episodes represented in focus or urgent overflow on the labeled release set;
+- zero awareness-padding items in focus;
+- zero incomplete-coverage cases presented as verified handled or all-clear;
+- `100%` validity for rendered local/provider evidence routes in the release fixture;
 - duplicate-active-item rate at most `0.05`;
 - stale-active-item rate at most `0.05`;
 - resolved-item resurrection rate at most `0.01`;
@@ -450,6 +609,8 @@ Gmail live briefing promotion requires, on held-out chronological data:
 - owner-approved daily token/call budget with no silent overflow.
 
 At least 30 chronological days, including representative high-volume days, are required before a Gmail shadow result may be promoted. A metric regression disables Gmail-derived briefing items without disabling retrieval indexing or Calendar.
+
+Cross-source episode aggregation and handled-state suppression remain disabled until held-out chronological replay also meets the false-link, missed-link, retraction, authoritative-source, and false-handled gates. Meeting-preparation automation remains opt-in until every factual claim is evidence-linked, unsupported claims are zero on the release fixture, and stale/partial source coverage is always disclosed.
 
 ## Guarded External Execution
 
@@ -511,6 +672,7 @@ The existing user-facing Ops destination continues to mean system/runtime operat
 ## Privacy And Security
 
 - Connector credentials and refresh tokens remain in macOS Keychain.
+- `config/local/operations.yaml` is private, non-secret, schema-validated, and excluded from source control; it never stores provider tokens.
 - Each connector requests the narrowest approved read scope; write scopes are absent before guarded-execution activation.
 - Account IDs stored in SQLite are local non-secret identifiers.
 - Full provider API caches are not part of the production contract.
@@ -519,6 +681,8 @@ The existing user-facing Ops destination continues to mean system/runtime operat
 - Provider use is explicit per operational detector role; unconfigured roles skip visibly.
 - Raw model prompts/responses are not retained by default. Debug retention is opt-in, private, bounded, and reported in storage inventory.
 - Briefing caches contain item IDs/ranking metadata rather than copied source bodies and expire after 30 days by default.
+- Provider-native routes are constructed only from allowlisted adapter templates and stable IDs; arbitrary source URLs are not trusted navigation.
+- Meeting-preparation caches follow briefing retention and never persist complete message, event, ticket, transcript, or document bodies.
 - Source forgetting/redaction must invalidate or redact linked operational evidence and may leave a tombstoned item event explaining the loss of evidence.
 - No private briefing content appears in notifications by default.
 - No analytics leave the machine.
@@ -527,6 +691,8 @@ The existing user-facing Ops destination continues to mean system/runtime operat
 
 - A connector failure marks its coverage stale/failed and does not abort other sources.
 - Provider timeout or malformed detector output produces no transition and cannot resolve existing work.
+- An unavailable authoritative provider leaves action satisfaction `unknown`; a notification cannot substitute for current object state.
+- Failure or staleness in any authorized source that could satisfy an action prevents a verified cross-source all-clear.
 - Deferred budget overflow is counted and aged; it is not reported as complete coverage.
 - Out-of-order source updates cannot overwrite a newer provider version.
 - Missing evidence renders an explicit unavailable state; it does not fabricate a quote or date.
@@ -540,7 +706,11 @@ The existing user-facing Ops destination continues to mean system/runtime operat
 
 - A second Chief-of-Staff app, daemon, auth store, or scheduler.
 - Treating every email, calendar event, or extracted fact as an operational item.
+- Inferring operator identity, responsibility, or completion from display names, traffic volume, read state, or a reply alone.
 - Running the fact extractor, critic, resolver, or gardener over all mail for operational detection.
+- Mandatory full-source rescans or one unbounded multi-source model context for each briefing.
+- Padding an adaptive focus set with informational material or hiding urgent overflow behind a five-item cap.
+- Treating a notification, copied summary, or agent-session summary as authority for an upstream object.
 - A general task/project-management replacement.
 - Inferred or model-authored goals in V1.
 - A separate state table and workflow for every item kind.
@@ -556,17 +726,23 @@ The operational Chief-of-Staff foundation is complete when:
 1. one app/daemon initializes and serves both knowledge and operational stores without cross-database write transactions;
 2. Calendar read-only capture and replay produce idempotent event items across recurrence, moves, cancellations, all-day dates, and timezone changes;
 3. `ops_items` and append-only events preserve every automated and human transition;
-4. Today generates a freshness-stamped briefing with evidence, confidence, reasons, and connector coverage;
-5. local completion, dismissal, snooze, and correction survive restart/replay and prevent same-version resurrection;
-6. knowledge facts, curation Queue, and `cos_*` compatibility paths remain behaviorally unchanged;
-7. Calendar promotion gates pass before Gmail content access is enabled;
-8. Gmail retrieval, knowledge, and operational lanes have separate admission and cost reporting;
-9. Gmail shadow evaluation includes labeled suppressed mail and passes detection, duplicate, staleness, reconciliation, and budget gates;
-10. an operational provider failure cannot complete or cancel an existing item;
-11. operational DB lock/failure cannot corrupt or block the knowledge DB;
-12. backup/restore preserves both current item state and human feedback history;
-13. no external mutation scope or action is enabled by the read-only/shadow implementation;
-14. any later write capability declares a reversibility class and passes payload-bound approval, drift, verification, audit, and recovery acceptance.
+4. a validated local operations policy controls stable identity, responsibility ranking, configured sources, and exception handling with replayable version provenance;
+5. every enabled adapter satisfies the source identity, cursor, budget, authoritative-signal, evidence-route, and coverage contract;
+6. Today generates a freshness-stamped briefing with evidence, confidence, reasons, handled verdicts, and connector coverage;
+7. focus contains at most five action-bearing episodes, never pads with awareness, and discloses all urgent overflow;
+8. local and provider-native evidence routes are account-correct, allowlisted, and invalidated when evidence is forgotten;
+9. meeting preparation is derived, evidence-linked, coverage-aware, and cannot mutate canonical state;
+10. local completion, dismissal, snooze, and correction survive restart/replay and prevent same-version resurrection;
+11. knowledge facts, curation Queue, and `cos_*` compatibility paths remain behaviorally unchanged;
+12. Calendar promotion gates pass before Gmail content access is enabled;
+13. Gmail retrieval, knowledge, and operational lanes have separate admission and cost reporting;
+14. Gmail shadow evaluation includes labeled suppressed mail and passes detection, handled-state, duplicate, staleness, reconciliation, focus, evidence-link, and budget gates;
+15. cross-source episode relations are explicit and reversible, and no reply, notification, or incomplete coverage incorrectly suppresses a required action;
+16. an operational provider failure cannot complete or cancel an existing item;
+17. operational DB lock/failure cannot corrupt or block the knowledge DB;
+18. backup/restore preserves both current item state and human feedback history;
+19. no external mutation scope or action is enabled by the read-only/shadow implementation;
+20. any later write capability declares a reversibility class and passes payload-bound approval, drift, verification, audit, and recovery acceptance.
 
 Primary planned verification surfaces:
 

@@ -22,22 +22,27 @@ The program keeps one product, one app, one coordinator daemon, and one Brain ho
 8. The Gmail operational detector is one-stage and high-recall. It does not call the fact critic or per-candidate route resolver.
 9. The current `cos_*` symbols remain frozen legacy names for Knowledge Curation until one atomic rename tranche. Operational code never uses them.
 10. No external provider write is authorized before draft-only evaluation and a payload-bound approval boundary exist.
+11. A schema-validated private `config/local/operations.yaml` supplies stable identities, responsibility/ranking policy, configured sources, goals pointers, and exception rules; responsibility demotes rather than destructively filters.
+12. Every source uses one typed incremental adapter contract with explicit authority, evidence-link, scope, budget, and coverage semantics.
+13. Handled state is a versioned derived assessment distinct from item lifecycle; reply/read state alone cannot resolve or suppress work.
+14. Today shows an adaptive focus set of at most five action-bearing episodes, discloses urgent overflow, and never pads with awareness.
+15. Cross-source episode links are explicit, evidence-backed, and reversible; an ambiguous link never destructively merges source history.
 
 ## Program Sequence
 
 | Phase | Outcome | External writes | State |
 |---|---|---:|---|
 | COS-0 | verified knowledge-layer foundation | none | complete |
-| COS-1 | canonical boundary, privacy, eval, and rollout contracts | none | in progress |
+| COS-1 | canonical boundary, local policy, adapter, privacy, eval, and rollout contracts | none | in progress |
 | COS-2 | separate operational kernel and deterministic lifecycle | none | in progress |
 | COS-3 | read-only Calendar evidence and reconciliation | none | planned |
-| COS-4 | coverage-aware Today shadow briefing and feedback | none | planned |
-| COS-5 | Gmail retrieval plus one-stage operational detection | none | gated |
-| COS-6 | cross-source reconciliation and production briefing gates | none | gated |
+| COS-4 | coverage-aware Today focus, feedback, and basic meeting preparation | none | planned |
+| COS-5 | Gmail retrieval, one-stage operational detection, and source-local satisfaction | none | gated |
+| COS-6 | reversible cross-source episodes, satisfaction, and production briefing gates | none | gated |
 | COS-7 | local draft/action plans with guarded approval protocol | none | gated |
 | COS-8 | capability-by-capability external execution | explicit only | gated |
 
-Calendar and the operational kernel precede Gmail content access. Detection must work before notifications. Reconciliation must work before the briefing is considered trustworthy. Drafting must work before execution.
+Calendar and the operational kernel precede Gmail content access. Source-local detection and satisfaction must work before cross-source aggregation. Reconciliation must work before the briefing is considered trustworthy. Optional adapters follow the same contract and cannot bypass Calendar/Gmail gates. Drafting must work before execution.
 
 ## COS-0 - Knowledge Foundation Baseline
 
@@ -58,8 +63,13 @@ The historical `audit-remediation-2026-07-12` branch is not merged because its s
 - canonical operational spec and this plan;
 - updated product, capture, curation, app, retrieval, sync, README, and compatibility pointers;
 - explicit Calendar and Gmail privacy/scope/retention contracts;
+- explicit local operations-policy schema covering stable identities, responsibility areas, configured sources, ranking/exception rules, timezone, and goals pointers;
+- common source-adapter contract covering provider authority, replay, evidence routes, budgets, and coverage;
+- handled-state, authoritative-source precedence, adaptive-focus, cross-source-relation, and derived-meeting-preparation contracts;
 - a versioned operational eval fixture format;
 - an all-or-nothing Knowledge Curation rename decision.
+
+The private eval fixture format includes lifecycle truth separately from handled-state truth, source coverage, policy version, authoritative-object state, positive/negative episode links, focus/overflow expectations, and evidence-route expectations. Meeting-preparation fixtures label every supported and unsupported factual claim.
 
 ### Naming decision
 
@@ -67,9 +77,9 @@ Conceptual documentation changes immediately from "Chief-of-Staff curation" to "
 
 ### Exit gate
 
-Every new operational table, job, API, and UI control has exactly one owning spec. No document describes `cos_actions` as the operational action ledger.
+Every new operational table, job, adapter, API, and UI control has exactly one owning spec. No document describes `cos_actions` as the operational action ledger. The local operations policy and every enabled adapter validate against a versioned schema, and evaluation can distinguish item-state, handled-state, episode-link, focus-selection, and evidence-link errors.
 
-Architecture and privacy contracts were completed by commit `a44b713`. The versioned private-eval fixture artifact remains before the COS-1 exit gate closes.
+The initial architecture and privacy contracts were completed by commit `a44b713`; the operator-policy, adapter, handled-state, focus, meeting-preparation, and episode-relation amendment is the next isolated contract commit. The versioned private-eval fixture artifact remains before the COS-1 exit gate closes.
 
 ## COS-2 - Operational Kernel
 
@@ -86,6 +96,8 @@ Create an independently migrated `db/ops.sqlite` with:
 Common item fields remain columns: source-unit/object identity, kind, state, title, owner/counterparty metadata, starts/due/ends/expires/snooze times, priority, confidence, current observation, reconciliation method, human-action provenance, and timestamps. Provider/type-specific material stays in validated JSON until repeated usage proves a column is necessary.
 
 Initial item kinds are `event`, `commitment`, `waiting`, `follow_up`, `deadline`, and `attention`. The universal state enum is `active`, `resolved`, `dismissed`, `cancelled`, or `expired`. Kind-specific semantics are expressed through deterministic transition validation rather than separate tables.
+
+Handled verdicts are derived assessments and do not extend this state enum. Cross-source episode relations are deferred to a reviewed COS-6 migration; COS-2 does not pre-commit a relation schema or weaken the one-item aggregate.
 
 ### Reconciliation
 
@@ -129,7 +141,7 @@ The first isolated kernel slice exists in the current tree:
 - exact source-unit binding, strict UTC normalization for present timestamps, provider-authority reconciliation, stale/equal-authority protection, lifecycle feedback, and one atomic source-unit/cursor batch primitive;
 - owner-only database/WAL/SHM handling, bounded lock retry, and focused isolation/concurrency tests.
 
-It is intentionally not called by `brain init`, the daemon, connectors, CLI, API, or UI yet. Before COS-2 is complete, the service layer must add primary/single-role writer fencing and serialized mutation ownership, and coordinated backup/restore must cover `brain.sqlite` plus `ops.sqlite`. Until then, no production operational database or behavior is enabled.
+It is intentionally not called by `brain init`, the daemon, connectors, CLI, API, or UI yet. The local operations policy, adapter workers, handled assessment, focus projection, and relation layer also remain unwired. Before COS-2 is complete, the service layer must add primary/single-role writer fencing and serialized mutation ownership, and coordinated backup/restore must cover `brain.sqlite` plus `ops.sqlite`. Until then, no production operational database or behavior is enabled.
 
 ### Verification
 
@@ -138,7 +150,7 @@ It is intentionally not called by `brain init`, the daemon, connectors, CLI, API
 - observation replay idempotence;
 - update/reschedule/cancel/dismiss/restore history;
 - concurrent short-writer coverage;
-- a test proving no knowledge table changes.
+- a test proving no knowledge table changes;
 - owner-only DB/WAL/SHM permissions and explicit missing-store failure;
 - primary/single-role writer fencing at the service boundary;
 - a coordinated backup/integrity fixture covering both SQLite databases.
@@ -152,6 +164,10 @@ A deterministic fixture replay can create, update, reschedule, cancel, resolve, 
 ### Connector contract
 
 Add a separate Google Calendar account grant with identity plus `https://www.googleapis.com/auth/calendar.events.owned.readonly`. The initial application policy reads only the owned primary calendar; additional owned calendars require an explicit ID allowlist, and shared calendars require a separate decision about the broader read scope. Do not widen the Gmail credential. Credentials remain in Keychain; local config contains only non-secret account/status/cursor metadata.
+
+Implement the versioned `config/local/operations.yaml` loader before enabling the connector. The Calendar slice consumes only validated operator identity, timezone, briefing/preparation window, primary/allowlisted calendar IDs, policy version, and provider host/account routing. Missing or invalid required policy makes the adapter unavailable; it never falls back to inferred identity or an unrestricted calendar scan.
+
+Calendar is also the reference implementation of the common adapter interface: typed source-unit batch, atomic cursor progression, bounded initial/resync windows, explicit coverage, retry/rate-limit budget, evidence references, and an allowlisted provider-route builder. The projection service receives normalized observations, never raw provider objects.
 
 Poll a bounded past/future window with deleted events included. Normalize the minimum necessary fields:
 
@@ -181,7 +197,7 @@ Stage each complete Calendar change-set before reconciliation. Map the event eta
 
 ### Exit gate
 
-An opted-in Calendar shadow run produces no LLM calls and no external mutation, while recurrence exceptions, moves, cancellations, timezones, and replay pass labeled fixtures.
+An opted-in Calendar shadow run produces no LLM calls and no external mutation, while recurrence exceptions, moves, cancellations, timezones, policy validation/versioning, local/provider evidence routing, coverage, and replay pass labeled fixtures. Invalid policy or an unvalidated provider route fails visibly without widening access.
 
 ## COS-4 - Today Shadow Briefing
 
@@ -190,24 +206,32 @@ Extend `/api/digest` with an optional briefing projection and add a narrow feedb
 Today renders:
 
 1. source coverage/freshness;
-2. now and today;
-3. upcoming and changed;
-4. needs correction or uncertain;
-5. the existing system pulse below the briefing.
+2. an adaptive focus set of zero to five action-bearing episodes;
+3. urgent overflow, never hidden behind the focus cap;
+4. now and today;
+5. upcoming and changed;
+6. needs correction or uncertain;
+7. separate awareness material;
+8. the existing system pulse below the briefing.
 
 Every item supports evidence inspection plus correct, done, snooze, dismiss, restore, and report-missing feedback where valid. Feedback appends an operational item event; it does not masquerade as a provider observation and never mutates a fact merely because the user changes an item.
 
 ### Briefing requirements
 
-- deterministic ranking with injected clock/timezone;
+- deterministic ranking with injected clock/timezone and validated operations-policy version;
 - no cancelled/resolved/dismissed item in active sections;
 - no duplicate mirrored event in the top projection;
+- no awareness padding in focus and no suppressed critical/high-priority overflow;
+- `unknown` handled state when relevant evidence or source coverage cannot support suppression;
+- every card has a stable local evidence route and only validated account-correct provider routes;
 - explicit `Calendar only`, `Gmail unavailable`, `stale`, and `incomplete` coverage labels;
 - persisted briefing runs only when needed for shown/not-shown evaluation and feedback attribution.
 
+Add a bounded preparation packet for an operator-selected or configured upcoming meeting. The initial packet may combine Calendar metadata, active operational items, local operations policy, and approved Brain retrieval/facts/pages. Each factual claim keeps evidence IDs, freshness, and source coverage; suggested talking points are visually non-factual. The packet is derived, follows briefing retention, stores no full source bodies, and cannot mutate an item or fact.
+
 ### Exit gate
 
-A user can inspect and correct a Calendar-backed briefing for at least two weeks of shadow replay without duplicate or stale cards exceeding the configured gates.
+A user can inspect and correct a Calendar-backed briefing for at least two weeks of shadow replay without duplicate or stale cards exceeding the configured gates. Focus never pads, urgent overflow disclosure and evidence-route validity are `100%` in fixtures, and meeting packets contain zero unsupported factual claims while partial coverage is always visible.
 
 ## COS-5 - Gmail Retrieval And Operational Detection
 
@@ -228,6 +252,10 @@ One changed thread is processed once, or in a failure-isolated batch of small tr
 
 No fact critic, fact route resolver, entity gardener, or wiki routing is invoked. A malformed response is retried only as bounded schema repair. Cost is measured rather than inferred; 100–150K tokens/day is a planning hypothesis, not a benchmark result.
 
+Implement source-local action-satisfaction verification in the same phase. Stable configured operator email identities plus Gmail message/thread lineage determine authorship and response; display names do not. The derived verdict is `needs_action|responded_waiting|being_handled|fulfilled|unknown`, with supporting/contradicting evidence, source coverage, method/version, policy version, confidence, and `as_of`. Read/viewed state and an outgoing reply never prove fulfillment. A direct supplied/declined result may recommend an allowed lifecycle transition, but deterministic reconciliation applies it.
+
+Messages that notify about a ticket, review, build, reservation, invoice, or other upstream object are leads. Without a fresh authorized adapter for that canonical object, their authoritative-state check remains `unknown`; email text cannot close the item. Provider-native Gmail routes are built from allowlisted account/thread/message IDs, not arbitrary message links.
+
 ### Label program
 
 Shadow predictions are not labels. Build a chronological, versioned set containing:
@@ -237,11 +265,13 @@ Shadow predictions are not labels. Build a chronological, versioned set containi
 - full-day audits;
 - missed-item reports;
 - immutable holdout days;
-- operational importance, type, state, evidence, due/owner, and sensitivity labels.
+- operational importance, type, state, evidence, due/owner, responsibility area, and sensitivity labels;
+- source-local replied-but-not-fulfilled, fulfilled, delegated, unanswered, and ambiguous handled-state labels;
+- focus, urgent-overflow, authoritative-object-needed, and evidence-route expectations under a declared policy version.
 
 ### Exit gate
 
-Severity-weighted recall, false-alarm rate, source-date accuracy, schema-repair rate, and token/call budgets meet their approved thresholds on held-out replay.
+Severity-weighted recall, false-alarm rate, source-date accuracy, handled-verdict accuracy, replied-but-not-fulfilled confusion, focus/overflow selection, evidence-route validity, schema-repair rate, and token/call budgets meet their approved thresholds on held-out replay. High-consequence false handled is zero, overall false handled is at most `0.01`, no incomplete authoritative-source coverage is presented as handled, and no focus slot is padded with awareness.
 
 ## COS-6 - Cross-Source Reconciliation
 
@@ -257,21 +287,46 @@ Deterministic candidate keys precede semantic candidates:
 
 Ambiguous matches remain separate or require confirmation. False merge is treated as more severe than a temporary duplicate.
 
+### Episode relations and handled state
+
+Add a dedicated reviewed migration for reversible episode relations only after fixture shape and lifecycle are approved. A relation records exact endpoints, `same_episode|duplicate_of|responds_to|fulfills|delegates|supersedes` type, supporting evidence, method/version, policy version, confidence, creator, and proposed/confirmed/rejected/retracted status. Relation changes append audit events and never delete or rewrite endpoint observations/items. A human rejection blocks recreation from the same evidence/version; retraction recomputes handled and briefing projections.
+
+Cross-source handled assessment evaluates the complete authorized source set that could satisfy an obligation. An email response may be satisfied in collaboration, a work tracker, or a code-host object only when an evidence-backed relation and fresh authoritative state prove it. Missing/stale authoritative coverage yields `unknown`, not suppression. One focus card may aggregate a confirmed episode while preserving every source-local item and link.
+
+Enrich meeting preparation with confirmed episode relations, fresh communication evidence, and authoritative work-object changes. Full source bodies remain in their governed evidence stores; packets retain bounded derived text and evidence IDs.
+
+### Optional adapter tranches
+
+After the Calendar/Gmail COS-6 gate passes, add read-only adapters independently rather than as one multi-source release:
+
+1. local Git worktree state;
+2. local agent-session outcomes, unfinished tasks, and explicit blockers;
+3. approved code-host review/CI/merge state;
+4. approved collaboration direct-ask and stable-user-ID thread progression;
+5. approved work-tracker assignment, question, due-date, and canonical status history.
+
+Each tranche implements the common adapter interface, adds private labeled replay fixtures, declares scope/retention/budget/authority rules, and can be disabled without disabling another source. Local Git and agent summaries cannot establish external completion. Code-host and work-tracker state outrank their notification copies. Each remote adapter requires a separate authorization decision and implementation commit.
+
 ### Required metrics
 
 - duplicate-active and stale-active rate;
 - false-merge and false-split rate;
+- false-link, missed-link, relation rejection/retraction, and wrong-relation-type rate;
 - update/reschedule/cancel/closure recall;
 - premature-close rate;
+- handled-verdict precision/recall and false-handled rate by source combination;
+- replied-but-not-fulfilled and authoritative-source-verification accuracy;
 - resolved-item resurrection;
 - wrong person/project/episode linkage;
 - high-severity miss rate and detection latency;
 - replay idempotence;
-- briefing precision@K and stale/duplicate share.
+- focus precision@5, urgent-overflow recall, padding count, and stale/duplicate share;
+- local/provider evidence-route validity;
+- meeting-packet evidence coverage, unsupported-claim rate, and stale/wrong-person rate.
 
 ### Exit gate
 
-The production briefing remains disabled until chronological replay meets the reconciliation gates, not merely detection precision.
+The production cross-source briefing remains disabled until chronological replay meets relation, authoritative-source, handled-state, focus/overflow, evidence-link, and meeting-preparation gates, not merely detection precision. High-consequence false handled, hidden critical/high-priority overflow, invalid evidence routes, and unsupported meeting-packet facts are zero in the release fixture; overall false handled and false link are each at most `0.01`.
 
 ## COS-7 - Draft-Only Actions
 
@@ -308,15 +363,17 @@ Enable one capability at a time. Each capability needs live sandbox fixtures, fa
 
 Every shadow release records:
 
-- source coverage and replay window;
+- source/authoritative-object coverage, replay window, adapter versions, and operations-policy version;
 - calls, total/uncached tokens, latency, and invalid-output rate;
 - item precision/recall by kind and severity;
-- reconciliation and briefing metrics;
+- reconciliation, reversible episode-relation, and handled-verdict metrics;
+- focus precision@5, critical/high-priority overflow recall, awareness-padding count, and evidence-route validity;
+- meeting-preparation factual evidence coverage, unsupported-claim rate, and stale/wrong-person rate;
 - corrections, dismissals, snoozes, and reported misses;
 - DB size, write latency, lock errors, backup/integrity result;
 - model/prompt/classifier versions.
 
-No release can average away a wrong-person link, false closure of a user-confirmed commitment, missed high-consequence cancellation, or unapproved external write.
+No release can average away a wrong-person link, false closure of a user-confirmed commitment, false handled assessment that suppresses high-consequence work, hidden urgent overflow, unsupported factual meeting-preparation claim, missed high-consequence cancellation, or unapproved external write.
 
 ## Backup, Sync, And Recovery
 
@@ -335,7 +392,12 @@ Stop the phase and preserve the previous release when:
 - a knowledge action is used to represent a current item or external side effect;
 - Calendar recurrence/timezone/cancellation replay is not deterministic;
 - source coverage is incomplete but Today presents an all-clear;
-- duplicate, stale, false-merge, premature-close, or high-severity-miss gates regress;
+- an unavailable authoritative object is treated as handled from notification text;
+- a reply, view marker, display name, or unconfirmed cross-source relation suppresses required action;
+- focus is padded with awareness or omits undisclosed critical/high-priority overflow;
+- a provider link fails its scheme/host/tenant/account validation or a forgotten evidence route remains active;
+- a meeting packet emits an unsupported factual claim or hides stale/partial coverage;
+- duplicate, stale, false-merge, false-link, false-handled, premature-close, or high-severity-miss gates regress;
 - calls/tokens grow without a per-changed-source budget;
 - SQLite lock/integrity or coordinated-backup tests fail;
 - an external plan lacks exact approval binding or a reversibility class;
@@ -345,13 +407,16 @@ Stop the phase and preserve the previous release when:
 
 Use separate commits for:
 
-1. knowledge foundation;
-2. operational specs/plan;
-3. operational DB/kernel;
-4. Calendar source;
-5. Today/API/UI;
-6. Gmail retrieval/detection;
-7. cross-source reconciliation;
-8. draft/execution capabilities.
+1. knowledge foundation (`3937316`);
+2. initial operational specs/plan (`a44b713`);
+3. operational DB/kernel (`03be261`);
+4. local-policy, adapter, handled-state, focus, evidence-link, meeting-preparation, and episode-relation contract amendment;
+5. COS-2 writer fencing plus coordinated backup/restore;
+6. Calendar adapter plus operations-policy schema/loader and safe route builder;
+7. Today focus/API/UI plus Calendar/Brain meeting preparation;
+8. Gmail retrieval/detection plus source-local satisfaction verification;
+9. reversible cross-source episode relations, satisfaction, and briefing gates;
+10. each optional Git, agent-session, code-host, collaboration, or work-tracker adapter as its own read-only commit;
+11. draft/execution capabilities, split again by capability and reversibility class.
 
-Every implementation commit updates the owning phase status and includes focused tests plus the full no-regression gate appropriate to its blast radius.
+Contract commits do not smuggle in runtime behavior. Every implementation commit updates the owning phase status and includes focused tests, private fixture/eval results where applicable, plus the full no-regression gate appropriate to its blast radius. A phase commit is pushed only after its owning gate passes; a later adapter or model regression can disable that capability without rolling back the knowledge, Calendar, or retrieval foundations.
