@@ -1,0 +1,328 @@
+from __future__ import annotations
+
+import base64
+from collections.abc import Mapping
+from typing import Any
+
+import pytest
+
+from pkm_brain.google_api import GoogleAPIError
+from pkm_brain.google_normalization import (
+    normalize_calendar_event,
+    normalize_gmail_message,
+)
+from pkm_brain.google_routes import (
+    calendar_event_route,
+    gmail_thread_route,
+    local_google_evidence_route,
+)
+from pkm_brain.google_sources import GoogleCalendarReader, GmailThreadReader
+
+
+class FakeClient:
+    def __init__(self, replies: list[dict[str, Any] | Exception]) -> None:
+        self.replies = list(replies)
+        self.calls: list[tuple[str, dict[str, Any], int]] = []
+
+    def get_json(
+        self,
+        relative_path: str,
+        *,
+        params: Mapping[str, str | int] | None = None,
+        quota_units: int = 1,
+    ) -> dict[str, Any]:
+        self.calls.append((relative_path, dict(params or {}), quota_units))
+        if not self.replies:
+            raise AssertionError(f"unexpected request: {relative_path}")
+        reply = self.replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+
+def encoded(value: str) -> str:
+    return base64.urlsafe_b64encode(value.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def gmail_thread(thread_id: str = "thread-1") -> dict[str, Any]:
+    return {
+        "id": thread_id,
+        "historyId": "321",
+        "messages": [
+            {
+                "id": "message-1",
+                "threadId": thread_id,
+                "internalDate": "1783969200000",
+                "labelIds": ["SENT"],
+                "payload": {
+                    "mimeType": "multipart/mixed",
+                    "headers": [
+                        {"name": "From", "value": "Peter <peter@example.com>"},
+                        {"name": "To", "value": "Teammate <team@example.com>"},
+                        {"name": "Subject", "value": "Deck due Friday"},
+                        {"name": "Message-ID", "value": "<message-1@example.com>"},
+                    ],
+                    "parts": [
+                        {
+                            "mimeType": "text/html",
+                            "body": {"data": encoded("<p>HTML fallback</p>")},
+                        },
+                        {
+                            "mimeType": "text/plain",
+                            "body": {
+                                "data": encoded(
+                                    "Please send the deck.\n\nOn Sun, Jul 12, 2026 wrote:\nOld text"
+                                )
+                            },
+                        },
+                        {
+                            "mimeType": "application/pdf",
+                            "filename": "deck.pdf",
+                            "body": {
+                                "attachmentId": "attachment-1",
+                                "data": encoded("private attachment bytes"),
+                            },
+                        },
+                    ],
+                },
+            }
+        ],
+    }
+
+
+def test_calendar_full_fetch_preserves_recurrence_and_cancelled_instances() -> None:
+    recurring = {
+        "id": "series-1",
+        "etag": '"etag-1"',
+        "status": "confirmed",
+        "summary": "Weekly review",
+        "start": {"dateTime": "2026-07-14T09:00:00-07:00", "timeZone": "America/Los_Angeles"},
+        "end": {"dateTime": "2026-07-14T09:30:00-07:00"},
+        "recurrence": ["RRULE:FREQ=WEEKLY"],
+        "extendedProperties": {"private": {"secret": "not cached"}},
+    }
+    cancelled = {
+        "id": "exception-1",
+        "status": "cancelled",
+        "recurringEventId": "series-1",
+        "originalStartTime": {"dateTime": "2026-07-21T09:00:00-07:00"},
+    }
+    client = FakeClient(
+        [
+            {"items": [recurring], "nextPageToken": "page-2"},
+            {"items": [cancelled], "nextSyncToken": "sync-2"},
+        ]
+    )
+
+    result = GoogleCalendarReader(client, page_size=10).fetch(
+        time_min="2026-06-29T00:00:00Z",
+        time_max="2026-10-12T00:00:00Z",
+        timezone_name="America/Los_Angeles",
+    )
+
+    assert result.mode == "full"
+    assert result.coverage_complete is True
+    assert result.next_sync_token == "sync-2"
+    assert result.events[0].recurrence == ("RRULE:FREQ=WEEKLY",)
+    assert result.events[0].source_revision == '"etag-1"'
+    assert result.events[1].cancelled is True
+    assert result.events[1].recurring_event_id == "series-1"
+    assert result.events[1].original_start_time == "2026-07-21T09:00:00-07:00"
+    assert "extendedProperties" not in result.raw_events[0]
+    assert client.calls[0] == (
+        "calendars/primary/events",
+        {
+            "maxResults": 10,
+            "showDeleted": "true",
+            "singleEvents": "false",
+            "timeMin": "2026-06-29T00:00:00Z",
+            "timeMax": "2026-10-12T00:00:00Z",
+            "timeZone": "America/Los_Angeles",
+        },
+        1,
+    )
+    assert client.calls[1][1]["pageToken"] == "page-2"
+
+
+def test_calendar_410_returns_explicit_replacement_full_snapshot() -> None:
+    client = FakeClient(
+        [
+            GoogleAPIError(410, "full sync required"),
+            {"items": [{"id": "fresh", "status": "confirmed"}], "nextSyncToken": "new"},
+        ]
+    )
+
+    result = GoogleCalendarReader(client).fetch(
+        time_min="2026-06-29T00:00:00Z",
+        time_max="2026-10-12T00:00:00Z",
+        sync_token="expired",
+    )
+
+    assert result.mode == "full"
+    assert result.reset_required is True
+    assert result.next_sync_token == "new"
+    assert client.calls[0][1]["syncToken"] == "expired"
+    assert "timeMin" not in client.calls[0][1]
+    assert client.calls[1][1]["timeMin"] == "2026-06-29T00:00:00Z"
+
+
+def test_calendar_reader_refuses_non_primary_calendar_and_partial_cursor() -> None:
+    with pytest.raises(ValueError, match="calendarId=primary"):
+        GoogleCalendarReader(FakeClient([]), calendar_id="shared@example.com")
+
+    client = FakeClient(
+        [{"items": [{"id": "one"}], "nextPageToken": "more"}]
+    )
+    result = GoogleCalendarReader(client, max_pages=1).fetch(
+        time_min="2026-07-01T00:00:00Z",
+        time_max="2026-08-01T00:00:00Z",
+    )
+    assert result.coverage_complete is False
+    assert result.next_sync_token is None
+    assert result.continuation_page_token == "more"
+
+
+def test_gmail_full_fetch_normalizes_plain_text_and_removes_attachment_bytes() -> None:
+    client = FakeClient(
+        [
+            {"historyId": "300"},
+            {"threads": [{"id": "thread-1"}]},
+            gmail_thread(),
+        ]
+    )
+
+    result = GmailThreadReader(
+        client,
+        operator_emails=("peter@example.com",),
+    ).fetch(query="newer_than:30d -in:spam -in:trash")
+
+    assert result.mode == "full"
+    assert result.next_history_id == "300"
+    assert result.coverage_complete is True
+    thread = result.threads[0]
+    assert thread.source_revision == "321"
+    assert thread.message_class == "human"
+    message = thread.messages[0]
+    assert message.body == "Please send the deck."
+    assert message.body_kind == "text/plain"
+    assert message.timestamp == "2026-07-13T19:00:00+00:00"
+    assert message.outgoing is True
+    assert message.operator_authored is True
+    assert message.attachment_count == 1
+    attachment = result.raw_threads[0]["messages"][0]["payload"]["parts"][2]
+    assert "data" not in attachment["body"]
+    assert [call[2] for call in client.calls] == [1, 10, 40]
+
+
+def test_gmail_incremental_history_collects_changes_and_missing_tombstone() -> None:
+    client = FakeClient(
+        [
+            {
+                "history": [
+                    {
+                        "id": "10",
+                        "messagesAdded": [{"message": {"id": "m1", "threadId": "t1"}}],
+                        "messagesDeleted": [{"message": {"id": "m2", "threadId": "t2"}}],
+                    }
+                ],
+                "historyId": "11",
+            },
+            gmail_thread("t1"),
+            GoogleAPIError(404, "thread disappeared"),
+        ]
+    )
+
+    result = GmailThreadReader(client).fetch(
+        query="newer_than:30d -in:spam -in:trash",
+        history_id="9",
+    )
+
+    assert result.mode == "incremental"
+    assert result.changed_thread_ids == ("t1", "t2")
+    assert result.missing_thread_ids == ("t2",)
+    assert result.next_history_id == "11"
+    assert result.coverage_complete is True
+    assert client.calls[0][0] == "history"
+    assert client.calls[0][2] == 2
+
+
+def test_gmail_history_404_returns_explicit_bounded_full_reset() -> None:
+    client = FakeClient(
+        [
+            GoogleAPIError(404, "history expired"),
+            {"historyId": "500"},
+            {"threads": [{"id": "thread-1"}]},
+            gmail_thread(),
+        ]
+    )
+
+    result = GmailThreadReader(client).fetch(
+        query="newer_than:7d -in:spam -in:trash",
+        history_id="old",
+    )
+
+    assert result.mode == "full"
+    assert result.reset_required is True
+    assert result.next_history_id == "500"
+    assert client.calls[0][0] == "history"
+    assert client.calls[1][0] == "profile"
+
+
+def test_gmail_partial_full_fetch_never_advances_history_cursor() -> None:
+    client = FakeClient(
+        [
+            {"historyId": "500"},
+            {"threads": [{"id": "thread-1"}], "nextPageToken": "more"},
+            gmail_thread(),
+        ]
+    )
+
+    result = GmailThreadReader(client, max_pages=1).fetch(query="newer_than:30d")
+
+    assert result.coverage_complete is False
+    assert result.next_history_id is None
+    assert result.continuation_page_token == "more"
+
+
+def test_html_fallback_private_calendar_and_route_builders() -> None:
+    html_message = {
+        "id": "message-html",
+        "threadId": "thread-html",
+        "internalDate": "1783969200000",
+        "payload": {
+            "mimeType": "text/html",
+            "headers": [{"name": "From", "value": "sender@example.com"}],
+            "body": {
+                "data": encoded(
+                    "<p>Current answer</p><blockquote>Old quoted answer</blockquote>"
+                )
+            },
+        },
+    }
+    message = normalize_gmail_message(html_message)
+    event = normalize_calendar_event(
+        {
+            "id": "private-1",
+            "visibility": "private",
+            "summary": "Secret title",
+            "description": "Secret details",
+            "location": "Secret room",
+        }
+    )
+
+    assert message.body == "Current answer"
+    assert message.body_kind == "text/html"
+    assert event.title == "Private event"
+    assert event.details is None
+    assert event.location is None
+    assert gmail_thread_route("peter@example.com", "abc/123") == (
+        "https://mail.google.com/mail/u/peter@example.com/#all/abc%2F123"
+    )
+    assert calendar_event_route("peter@example.com", "event id") == (
+        "https://calendar.google.com/calendar/u/peter@example.com/r/eventedit/event%20id"
+    )
+    assert local_google_evidence_route("gmail", "account/1", "thread#1") == (
+        "/evidence/google/gmail/account%2F1/thread%231"
+    )
+    with pytest.raises(ValueError):
+        gmail_thread_route("https://attacker.example", "thread")

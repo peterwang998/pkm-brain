@@ -401,15 +401,45 @@ def gmail_connector() -> Connector:
         ConnectorManifest(
             id="gmail",
             display_name="Gmail",
-            description="Authorize a Google account for a future email evidence connector.",
+            description="Authorize a separate read-only Google account grant for Gmail evidence.",
             source_type="gmail_message",
             default_enabled=False,
             default_cadence_s=900,
-            permissions_note="Identity access only; no Gmail messages or metadata are requested.",
+            permissions_note=(
+                "Read-only Gmail access; sending, mutation, deletion, labels, and attachment "
+                "download are unavailable."
+            ),
             lifecycle="auth_only",
             capture_available=False,
             auth=auth_manifest("gmail"),
-            activation_note="Capture remains unavailable until email preprocessing and privacy policy are approved.",
+            activation_note=(
+                "The read-only transport is not wired to capture or scheduling; production "
+                "ingestion remains unavailable until its privacy gate passes."
+            ),
+        )
+    )
+
+
+def calendar_connector() -> Connector:
+    return AuthOnlyConnector(
+        ConnectorManifest(
+            id="calendar",
+            display_name="Google Calendar",
+            description="Authorize a separate read-only Google Calendar grant.",
+            source_type="google_calendar",
+            default_enabled=False,
+            default_cadence_s=900,
+            permissions_note=(
+                "Reads events from the owned primary calendar only; event mutation, RSVP, "
+                "calendar discovery, and shared-calendar access are unavailable."
+            ),
+            lifecycle="auth_only",
+            capture_available=False,
+            auth=auth_manifest("calendar"),
+            activation_note=(
+                "The read-only transport is not wired to capture, scheduling, or the "
+                "operational ledger."
+            ),
         )
     )
 
@@ -438,6 +468,7 @@ BUILTIN_CONNECTORS: dict[str, Callable[[], Connector]] = {
     "opencode": opencode_connector,
     "hyprnote": hyprnote_connector,
     "files": FilesConnector,
+    "calendar": calendar_connector,
     "gmail": gmail_connector,
     "slack": slack_connector,
 }

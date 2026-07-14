@@ -41,6 +41,7 @@ class OAuthProvider:
     setup_url: str
     scopes: tuple[str, ...]
     client_secret_required: bool
+    phase: str = "identity_only"
     uses_pkce: bool = False
     uses_nonce: bool = False
     issuer: str | None = None
@@ -49,7 +50,7 @@ class OAuthProvider:
         return {
             "kind": "oauth2",
             "provider": self.connector_id,
-            "phase": "identity_only",
+            "phase": self.phase,
             "requested_scopes": list(self.scopes),
             "client_secret_required": self.client_secret_required,
             "redirect_uri": callback_uri(self.connector_id),
@@ -64,8 +65,31 @@ OAUTH_PROVIDERS: dict[str, OAuthProvider] = {
         authorization_endpoint="https://accounts.google.com/o/oauth2/v2/auth",
         token_endpoint="https://oauth2.googleapis.com/token",
         setup_url="https://console.cloud.google.com/apis/credentials",
-        scopes=("openid", "email", "profile"),
+        scopes=(
+            "openid",
+            "email",
+            "profile",
+            "https://www.googleapis.com/auth/gmail.readonly",
+        ),
         client_secret_required=False,
+        phase="read_only",
+        uses_pkce=True,
+        issuer="https://accounts.google.com",
+    ),
+    "calendar": OAuthProvider(
+        connector_id="calendar",
+        display_name="Google Calendar",
+        authorization_endpoint="https://accounts.google.com/o/oauth2/v2/auth",
+        token_endpoint="https://oauth2.googleapis.com/token",
+        setup_url="https://console.cloud.google.com/apis/credentials",
+        scopes=(
+            "openid",
+            "email",
+            "profile",
+            "https://www.googleapis.com/auth/calendar.events.owned.readonly",
+        ),
+        client_secret_required=False,
+        phase="read_only",
         uses_pkce=True,
         issuer="https://accounts.google.com",
     ),
@@ -305,7 +329,7 @@ def connector_auth_status(
     return {
         "kind": "oauth2",
         "provider": connector_id,
-        "phase": "identity_only",
+        "phase": provider.phase,
         "status": status,
         "client_id": client_id or None,
         "client_secret_configured": has_secret,

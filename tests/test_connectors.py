@@ -54,16 +54,37 @@ def test_connector_registry_exposes_builtin_manifests(tmp_path: Path) -> None:
     result = list_connectors(paths)
     manifests = {item["manifest"]["id"]: item["manifest"] for item in result["connectors"]}
 
-    assert {"codex", "claude", "opencode", "hyprnote", "files", "gmail", "slack"}.issubset(
-        manifests
-    )
+    assert {
+        "codex",
+        "claude",
+        "opencode",
+        "hyprnote",
+        "files",
+        "calendar",
+        "gmail",
+        "slack",
+    }.issubset(manifests)
     assert manifests["codex"]["source_type"] == "agent_session_log"
     assert manifests["hyprnote"]["source_type"] == "hyprnote_meeting"
     assert manifests["hyprnote"]["default_enabled"] is False
     assert manifests["files"]["default_enabled"] is True
     assert manifests["gmail"]["lifecycle"] == "auth_only"
     assert manifests["gmail"]["capture_available"] is False
-    assert manifests["gmail"]["auth"]["requested_scopes"] == ["openid", "email", "profile"]
+    assert manifests["gmail"]["auth"]["phase"] == "read_only"
+    assert manifests["gmail"]["auth"]["requested_scopes"] == [
+        "openid",
+        "email",
+        "profile",
+        "https://www.googleapis.com/auth/gmail.readonly",
+    ]
+    assert manifests["calendar"]["lifecycle"] == "auth_only"
+    assert manifests["calendar"]["capture_available"] is False
+    assert manifests["calendar"]["auth"]["requested_scopes"] == [
+        "openid",
+        "email",
+        "profile",
+        "https://www.googleapis.com/auth/calendar.events.owned.readonly",
+    ]
     assert manifests["slack"]["auth"]["client_secret_required"] is True
 
 
@@ -97,7 +118,10 @@ def test_google_oauth_identity_flow_uses_pkce_and_keeps_secrets_out_of_config(
         token_exchanger=lambda flow, code: {
             "access_token": "access-secret",
             "refresh_token": "refresh-secret",
-            "scope": "openid email profile",
+            "scope": (
+                "openid email profile "
+                "https://www.googleapis.com/auth/gmail.readonly"
+            ),
             "expires_in": 3600,
             "id_token": encoded_id_token(
                 {
@@ -122,7 +146,9 @@ def test_google_oauth_identity_flow_uses_pkce_and_keeps_secrets_out_of_config(
         query = parse_qs(parsed.query)
 
         assert parsed.netloc == "accounts.google.com"
-        assert query["scope"] == ["openid email profile"]
+        assert query["scope"] == [
+            "openid email profile https://www.googleapis.com/auth/gmail.readonly"
+        ]
         assert query["code_challenge_method"] == ["S256"]
         assert query["redirect_uri"] == [started["redirect_uri"]]
 
@@ -174,7 +200,10 @@ def test_oauth_identity_flow_rejects_missing_identity_token(tmp_path: Path) -> N
         port=0,
         token_exchanger=lambda _flow, _code: {
             "access_token": "access-secret",
-            "scope": "openid email profile",
+            "scope": (
+                "openid email profile "
+                "https://www.googleapis.com/auth/gmail.readonly"
+            ),
         },
     )
     configure_connector_auth(
