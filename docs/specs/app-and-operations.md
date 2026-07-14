@@ -1,12 +1,14 @@
 # App And Operations
 
 **Status:** canonical living feature spec; native app is primary and browser UI is an off-by-default fallback
-**Last verified:** 2026-07-13 against installed release `0.1.5` and the current working tree
+**Last verified:** 2026-07-13 against knowledge-foundation commit `3937316` and the current working tree
 **Owns:** daemon, scheduler, connector operations, native/browser UI, settings, provisioning, packaging, migration, and operational retention
 
 ## Product Shape
 
 `PKM Brain.app` is a menu-bar-resident macOS application supervising one Python daemon for one Brain home.
+
+The proactive Chief of Staff is folded into this product rather than shipped as a second app. The app and daemon share evidence, identity, connector administration, scheduling, and policy surfaces, while Knowledge Curation and Chief-of-Staff Operations keep separate state models and write paths.
 
 - Closing the main window keeps the app, daemon, and jobs running.
 - Quitting the app stops the supervised daemon and jobs.
@@ -27,8 +29,10 @@ PKM Brain.app
 
   DaemonSupervisor
     -> app-managed Python runtime
-      -> brain daemon
+        -> brain daemon
         -> serial scheduler + optional browser server
+        -> knowledge services (`brain.sqlite`)
+        -> operational services (`ops.sqlite`)
 ```
 
 The daemon writes a per-home handshake containing port, PID, token path, runtime version, and home identity. It holds a single-instance lock and exits when its supervising parent disappears.
@@ -45,6 +49,8 @@ The daemon:
 - keeps jobs role-gated.
 
 Current job classes include capture tick, nightly maintenance, secondary tick, and one `sync:<peer>` job per configured child on a primary. The registry derives cadence and due state from config. Pausing does not erase due state; run-now behavior is explicit.
+
+Operational detection/reconciliation is a separate job family. Calendar shadow polling is the first planned job and is disabled by default. Only a `single` or active `primary` role may write canonical operational state. An operational failure records incomplete source coverage and leaves the last valid item projection intact; it does not block capture, knowledge curation, or daemon health.
 
 The app daemon replaces normal LaunchAgent automation. Legacy LaunchAgent commands remain only for rollback/development and must identify themselves as deprecated when an app-managed daemon exists.
 
@@ -65,6 +71,8 @@ Each connector exposes:
 One connector failure does not abort other connectors or the scheduler tick. Connectors only write inbox artifacts and capture state. An `auth_only` connector cannot be enabled, scheduled, or manually run.
 
 Gmail and Slack currently stop at identity-only OAuth/OpenID authorization. Client secrets and tokens are stored in macOS Keychain under a Brain-home-scoped account; only non-secret client/status metadata is stored under `config/local/connector-auth.yaml`. Authorization uses state validation, Google PKCE, Slack nonce validation, and a fixed loopback callback at `127.0.0.1:53682`. API responses never return secrets or tokens.
+
+The first operational connector is a separate read-only Calendar grant. Connector administration may share the manifest/auth/health UI, but Calendar reconciliation writes only through the operational service. It does not route event state through the knowledge action ledger.
 
 Native connector cards expose lifecycle and source-specific status. OAuth setup provides provider-console navigation, redirect URL copy, client credential save, browser authorization with polling, and local disconnect. Full native forms for path/cadence settings remain incomplete.
 
@@ -96,7 +104,15 @@ Global status, sidebar badges, menu bar, Today, and destination pages must not m
 
 ## Today
 
-Today shows:
+Today is the only information-architecture change in the first operational release. Its target ordering is:
+
+- coverage and freshness, including which approved sources were or were not checked;
+- now/today/upcoming Calendar items;
+- commitments, waiting-on, deadlines, changes, and uncertainty once their source lanes exist;
+- evidence, why-surfaced context, confidence, and one-click correct/done/snooze/dismiss/report-missing feedback;
+- existing Brain/system pulse below the personal briefing.
+
+The current implementation shows:
 
 - daemon/scheduler health;
 - latest nightly and eval/audit status;
@@ -107,9 +123,11 @@ Today shows:
 
 Pulse items link into the owning destination. Errors remain specific and actionable. The current implementation is functional, but its Queue counts inherit the global-state reconciliation requirement above.
 
+An absent or failed source may never render as an empty all-clear. The briefing must say Calendar-only, Gmail-unavailable, stale, or incomplete as appropriate. Briefing prose and ranking are derived; `ops_items` and their source-backed transition history remain canonical.
+
 ## Queue
 
-Queue is the primary human workflow. Its data/action contract lives in [Curation And Review](curation-and-review.md).
+Queue is the primary Knowledge Curation review workflow. Its data/action contract lives in [Curation And Review](curation-and-review.md). Operational corrections and future execution approvals remain separate even when both appear in the same app; V1 adds no Work or Approvals destination.
 
 Native requirements:
 
@@ -194,6 +212,8 @@ Current native Ask implements those primary sections, exposes retrieval debug/su
 
 ## Ops
 
+This destination means system/runtime administration, not Chief-of-Staff operational state.
+
 Target Ops consolidates:
 
 - scheduler run-now/pause/resume and next-due state;
@@ -209,7 +229,7 @@ Target Ops consolidates:
 
 Current native Ops has segmented Scheduler, Runs, Connectors, and Storage views. It supports job run-now, pause/resume, automation/ingestion history, connector enable/disable/run, auth-only Gmail/Slack account setup, active/deferred review counts, and managed/runtime/backup storage inventory through `GET /api/ops/storage`. Action-ledger revert, policy/audit/contracts, index doctor, sync, and logs still require native sections.
 
-Provider usage accounting is available operationally before the native Logs section: request events append to `<brain-home>/logs/llm-usage.log`, nightly/CoS summaries include cycle usage, and `brain llm usage` reports timestamped per-cycle and per-role totals. The report distinguishes extractor, evaluator (internal critic), auditor, and any additional instrumented role, including cached versus uncached input and requests whose provider did not report tokens.
+Provider usage accounting is available operationally before the native Logs section: request events append to `<brain-home>/logs/llm-usage.log`, nightly/Knowledge Curation summaries include cycle usage, and `brain llm usage` reports timestamped per-cycle and per-role totals. The report distinguishes extractor, evaluator (internal critic), auditor, and any additional instrumented role, including cached versus uncached input and requests whose provider did not report tokens.
 
 In-app explanatory copy should not substitute for controls or status. The final Ops view should expose the action directly and keep raw JSON/log detail behind disclosure.
 
@@ -261,7 +281,8 @@ Key UI endpoints:
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /api/digest` | Today/global pulse and deltas |
+| `GET /api/digest` | implemented Today/global pulse; optional freshness-aware briefing is planned for COS-4 |
+| `POST /api/briefing/items/<id>/feedback` | planned COS-4 endpoint to correct, resolve, snooze, dismiss, or report an operational item |
 | `GET /api/queue?kind=&sort=&limit=&cursor=` | deduplicated complete review cards |
 | `POST /api/queue/<id>/decision` | dispatch to owning primitive |
 | `POST /api/queue/undo` | guarded revert/reopen |
@@ -309,6 +330,7 @@ Rollback restores launchd operation without rewriting Brain data.
 - loopback only unless an explicit debug override is used;
 - per-boot token, owner-only file;
 - no Swift database access;
+- no client opens either `brain.sqlite` or `ops.sqlite`; operational reads and feedback use the authenticated loopback API;
 - notifications exclude content;
 - logs retain existing redaction;
 - no analytics;
@@ -337,6 +359,9 @@ Required coverage for completion:
 
 - app start/quit leaves exactly one supervised daemon process while running and none after quit;
 - Today, menu bar, sidebar, and Queue agree on active review count;
+- Today never presents partial operational coverage as a complete all-clear;
+- every operational briefing item exposes evidence/freshness and records feedback through the operational event log;
+- Queue remains knowledge review and never silently mixes in commitments or Calendar state;
 - no approvable Queue card lacks required evidence;
 - all seven destinations have implemented controls or are honestly marked incomplete in the UI/spec;
 - a native Wiki citation reaches its source and supports Confirm/Flag;

@@ -141,7 +141,7 @@ Primary:
 Child:
 
 - `secondary_tick` exists and advances capture/outbox state;
-- mutation-capable CoS stages report role-gated skip;
+- mutation-capable Knowledge Curation (`brain cos`) stages report role-gated skip;
 - no child-initiated primary sync job exists.
 
 For two configured children, run the three-home acceptance harness and verify both origin namespaces/mirrors independently.

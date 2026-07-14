@@ -1,8 +1,8 @@
 # Project Improvement Implementation Plan
 
-**Status:** execution in progress; R1-R4 complete, R5/R6 partially complete in release `0.1.5`
-**Last verified:** 2026-07-13 against installed release `0.1.5` and the current working tree
-**Inputs:** [Project Audit](../audits/project-audit-2026-07-10.md) and the six [canonical feature specs](../README.md)
+**Status:** knowledge-foundation program stable; operational Chief-of-Staff program started from commit `3937316`
+**Last verified:** 2026-07-13 against foundation commit `3937316` and the current working tree
+**Inputs:** [Project Audit](../audits/project-audit-2026-07-10.md), the [canonical feature specs](../README.md), and the [Chief-of-Staff Operations Implementation Plan](chief-of-staff-operations-implementation-plan.md)
 
 ## Objective
 
@@ -13,9 +13,11 @@ Execute the improvement roadmap in releases that:
 - add frontend acceptance before expanding the native UI;
 - finish the native product before broad internal refactoring;
 - preserve reversible, eval-gated, local-first behavior;
-- defer topology expansion, email, and retrieval research until their prerequisites are real.
+- preserve the working knowledge layer as the evidence foundation;
+- add proactive Chief-of-Staff operations through a separate Calendar-first bounded context;
+- defer Gmail content, external actions, and retrieval research until their prerequisites are real.
 
-This plan selects implementation order and interfaces. It does not authorize live data deletion, policy promotion, fact rebuilds, topology role changes, or email ingestion.
+This plan selects implementation order and interfaces. It does not authorize live data deletion, policy promotion, fact rebuilds, topology role changes, Gmail content access, or external provider mutation.
 
 ## Execution Snapshot
 
@@ -36,6 +38,12 @@ Implemented in `0.1.5`:
 - explicit active/passive/auth-only connector lifecycle;
 - identity-only Gmail and Slack authorization shells with macOS Keychain storage and native setup surfaces;
 - hard capture boundary: Gmail and Slack cannot be enabled, scheduled, run, or granted message scopes before their preprocessing specs are approved.
+
+Knowledge foundation checkpoint `3937316`:
+
+- reconciled the Gmail benchmark to 1,653,671 total tokens including route resolution and corrected future source-date frontmatter;
+- passed 510 Python tests, 17 Swift tests, Ruff, and the full macOS UI acceptance path;
+- established the clean boundary for the separate operational program.
 
 Verified rollout results, 2026-07-11:
 
@@ -59,6 +67,7 @@ The source improvement plan is directionally correct, with four execution change
 2. **Review admission moves ahead of broad native polish.** W2a reduced the Queue once; a daily budget/deferred pool must stop it from growing back.
 3. **Critic independence blocks automatic aging, not basic deferral.** The system may defer/rank work while the Luna/Luna critic tradeoff is evaluated, but it may not age deferred semantic work into autonomy first.
 4. **Module splitting follows behavior stabilization.** Queue, retention, telemetry, and native contracts need characterization before code is moved.
+5. **Chief-of-Staff operations start with Calendar and deterministic state.** A separate `ops.sqlite`, reconciliation, and coverage-aware Today briefing precede Gmail content or any LLM operational detector.
 
 ## Priority Model
 
@@ -100,7 +109,7 @@ Relative sizes:
 | 17 | Email evidence connector | P3 | XL | only after the owner approves a revised privacy/volume spec |
 | 18 | Retrieval quality experiments | P3 | L each | one isolated eval-gated experiment at a time with attribution and rollback |
 
-Ranks 1-8 are the immediate product program. Ranks 9-12 complete the native product. Ranks 13-16 strengthen the platform. Ranks 17-18 remain explicitly gated.
+Ranks 1-8 are the original immediate knowledge-product program. Ranks 9-12 complete its native surface. Ranks 13-16 strengthen the platform. The next product expansion is governed by the separate [Chief-of-Staff Operations Implementation Plan](chief-of-staff-operations-implementation-plan.md); the old rank-17 email package is superseded by that plan's three-lane Gmail phases.
 
 ## Release Map
 
@@ -116,6 +125,7 @@ Ranks 1-8 are the immediate product program. Ranks 9-12 complete the native prod
 | R7 | privacy and compatibility cleanup | PRIVACY-1, LEGACY-1/2 | GROWTH-1, ARCH-1 |
 | R8 | recoverable/mobile topology | TOPO-1 through TOPO-5 | R7 data contracts |
 | R9 | new inputs and retrieval research | EMAIL-1, RETRIEVAL-1..N | explicit approval/eval gates |
+| COS-0..8 | proactive Chief-of-Staff operations | operational kernel, Calendar, Today, Gmail, reconciliation, guarded execution | foundation `3937316` and phase-specific gates |
 
 R2's UI and storage lanes may run in parallel in separate branches. The default single-agent sequence is TEST-1, GROWTH-1, then GROWTH-2.
 
@@ -186,7 +196,7 @@ Implementation checkpoint, 2026-07-13:
 - implemented: Hyprnote capture restores true multi-channel chronology with stable speaker labels, explicitly groups legacy synthetic-clock tracks, suppresses metadata-only placeholders, and carries speaker identity through evidence units;
 - implemented: fact critic review distinguishes unsupported statements from incomplete evidence packets, performs one bounded citation union plus fresh review, falls back from malformed entity disambiguation, and isolates parallel action failures;
 - implemented: compatible gardener-confirmed near-duplicate page merges use a size-independent L2 critic/full-audit rule outside Review First, while failed/high-risk judgments and all hard boundaries remain L3;
-- implemented: provider-level token accounting records timestamped extractor/evaluator/auditor and gardener usage, cached input, reasoning output, retries/fallbacks, and unreported requests; nightly, CoS, CLI, and topology-maintenance summaries share run IDs;
+- implemented: provider-level token accounting records timestamped extractor/evaluator/auditor and gardener usage, cached input, reasoning output, retries/fallbacks, and unreported requests; nightly, Knowledge Curation (`brain cos`), CLI, and topology-maintenance summaries share run IDs;
 - verified: the incremental approved W2a pass resolved 19 later candidates with zero failures and annotated 51 survivors, leaving the live deduplicated Queue at 230 actionable and 0 blocked;
 - verified: the pairwise-v2 apply released all 82 active fact-conflict cards, including 6 resolver-confirmed coexistence cases, and found no missing candidate payloads; the audit-demoted L3 policy retained the released candidates as Policy reviews rather than allowing a policy bypass;
 - verified: restored More Autonomy policy v12 reclassified all 167 active Policy questions as L2; normal critic/ledger reconciliation applied 104 facts plus one synthesis, rejected 62 candidates, left zero Policy questions, and passed SQLite integrity with an exact +104 fact delta;
@@ -762,17 +772,15 @@ Only after topology identity/fencing:
 
 ## R9 - New Inputs And Retrieval Research
 
-### EMAIL-1 - Evidence-Only Email
+### EMAIL-1 - Superseded By Three-Lane Gmail Plan
 
-Identity-only Gmail authorization is complete. Capture remains blocked until the owner revises/approves the email preprocessing and privacy spec. Then:
+Identity-only Gmail authorization is complete. This older evidence-only package is replaced by COS-5 and COS-6 in the [Chief-of-Staff Operations Implementation Plan](chief-of-staff-operations-implementation-plan.md).
 
-1. approve Gmail API read-only versus Maildir/mbox inputs, scopes, redaction, retention, and deletion semantics;
-2. capture one snapshot-replaced document per thread with Gmail internal source dates;
-3. exclude attachment payloads and quoted reply duplication by default;
-4. label and test human/bulk/transactional classification plus retrieval negative controls;
-5. enforce separate index and extraction budgets with deferred overflow;
-6. admit likely human/evidence threads only, link known entities by default, and cap residue;
-7. reduce critic requests per clean candidate before a production rollout.
+The replacement separates:
+
+1. retrieval indexing of approved normalized thread snapshots;
+2. conservative durable-fact admission through the existing Knowledge Curation pipeline;
+3. high-recall one-stage operational detection over changed mail without the fact critic/resolver loop.
 
 The current OAuth grant is identity-only. No Gmail message scope, sending, or full-corpus extraction is authorized in this phase.
 
@@ -840,6 +848,9 @@ Stop the release and keep the previous state when:
 - a data operation touches unknown/user-managed paths;
 - popularity or pinned lineage changes unexpectedly;
 - SQLite lock/integrity checks fail;
+- an operational write touches `brain.sqlite` or a Knowledge Curation action represents current work;
+- source coverage is incomplete but Today renders an operational all-clear;
+- reconciliation duplicate/stale/false-merge/high-severity-miss gates regress;
 - eval gates or negative controls regress;
 - a UI mutation bypasses existing service/action primitives;
 - a topology writer lacks current epoch;
@@ -859,4 +870,4 @@ The immediate program (ranks 1-8) is complete when:
 
 The native-product program (ranks 9-12) is complete when all seven destinations meet [App And Operations](../specs/app-and-operations.md) acceptance without relying on browser parity.
 
-Later platform/product programs are separately approved; they are not implied by completing the immediate program.
+The proactive product program is complete only under the separate operational plan's COS-0..8 acceptance. It is not implied by completing the original knowledge-foundation ranks.

@@ -1,7 +1,7 @@
 # PKM Brain Documentation
 
 **Status:** authoritative docs index
-**Last verified:** 2026-07-11 against public release `0.1.1` code snapshot `b3ba211`
+**Last verified:** 2026-07-13 against knowledge-foundation commit `3937316e090a` plus the current operational working tree
 
 Current requirements are organized by product feature, not implementation stream. Start with Product Foundation, then read the owning feature spec for the behavior being changed.
 
@@ -12,8 +12,9 @@ Current requirements are organized by product feature, not implementation stream
 | Product boundaries, persistence, privacy, invariants | [Product Foundation](specs/product-foundation.md) |
 | Capture, ingest, extraction, facts, entities, routing, Wiki | [Capture And Knowledge](specs/capture-and-knowledge.md) |
 | Search, context packets, embeddings, memory, telemetry, evals | [Retrieval And Memory](specs/retrieval-and-memory.md) |
-| CoS actions/policy, relations, Queue, autonomy, review volume | [Curation And Review](specs/curation-and-review.md) |
-| Daemon, scheduler, native/browser UI, Settings, packaging | [App And Operations](specs/app-and-operations.md) |
+| Knowledge Curation actions/policy, relations, Queue, autonomy, review volume | [Curation And Review](specs/curation-and-review.md) |
+| Operational items, reconciliation, briefings, guarded external execution | [Chief Of Staff Operations](specs/chief-of-staff-operations.md) |
+| Daemon, scheduler, native/browser UI, system Ops, Settings, packaging | [App And Operations](specs/app-and-operations.md) |
 | Primary/Secondary sync, role mobility, profiles | [Sync And Topology](specs/sync-and-topology.md) |
 
 ## Engineering And Operations
@@ -22,6 +23,7 @@ Current requirements are organized by product feature, not implementation stream
 - [Sync Acceptance Runbook](runbooks/sync-acceptance.md): real-machine validation.
 - [Project Audit - 2026-07-10](audits/project-audit-2026-07-10.md): current risks and evidence.
 - [Project Implementation Plan](plans/project-implementation-plan.md): canonical roadmap, prioritized releases, work packages, dependencies, and acceptance hits.
+- [Chief-of-Staff Operations Implementation Plan](plans/chief-of-staff-operations-implementation-plan.md): Calendar-first operational rollout, reconciliation gates, and guarded-execution sequence.
 - [Project Improvement Plan](plans/project-improvement-plan.md): compatibility pointer retained for old links.
 
 ## History
@@ -37,10 +39,12 @@ Consolidation map:
 | V0.1 broad product spec | Product Foundation plus Capture/Retrieval |
 | extraction payload, entity layer, email | Capture And Knowledge |
 | retrieval contract, embeddings | Retrieval And Memory |
-| Chief-of-Staff, fact review volume, regeneration | Curation And Review |
+| Autonomous-wiki Chief-of-Staff, fact review volume, regeneration | Curation And Review (the Knowledge Curation foundation) |
 | browser UI v2, macOS app | App And Operations |
 | sync spec/plan, topology/role mobility | Sync And Topology |
 | July 7 audit | July 10 audit and improvement plan |
+
+The operational Chief-of-Staff mission is now owned by [Chief Of Staff Operations](specs/chief-of-staff-operations.md). Historical `cos_*` names refer to the implemented Knowledge Curation system until an all-or-nothing compatibility migration renames them; they are not the operational item or external-execution model.
 
 ## Ownership Rule
 

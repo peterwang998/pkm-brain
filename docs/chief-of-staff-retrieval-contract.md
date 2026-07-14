@@ -1,8 +1,10 @@
-# Chief-of-Staff Retrieval Contract
+# Knowledge-Curation Retrieval Contract
 
-**Status:** compatibility pointer; consolidated 2026-07-10
-**Last verified:** 2026-07-10 against commit `e43e9c1e1287` plus the current working tree
+**Status:** historical compatibility pointer; consolidated 2026-07-13
+**Last verified:** 2026-07-13 against knowledge-foundation commit `3937316` plus the current working tree
 
-The verdict, ranking, packet, embedding, memory, popularity, and eval contracts now live in [Retrieval And Memory](specs/retrieval-and-memory.md).
+This document's former “Chief-of-Staff” name referred to retrieval work for the autonomous wiki, now called **Knowledge Curation**. The verdict, ranking, packet, embedding, memory, popularity, and knowledge-eval contracts live in [Retrieval And Memory](specs/retrieval-and-memory.md).
+
+Freshness-aware operational retrieval and Today briefing selection belong to [Chief-of-Staff Operations](specs/chief-of-staff-operations.md). They do not reuse knowledge popularity or fact-confidence signals as operational state.
 
 Historical tuning context is summarized in [Implementation Stream History](archive/implementation-stream-history.md).

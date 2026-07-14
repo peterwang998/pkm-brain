@@ -4,13 +4,14 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB)](pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-PKM Brain is a local-first personal knowledge system and MCP memory server for coding agents. It ingests messy private sources, turns durable claims into a source-backed fact ledger, renders managed wiki pages from those facts, and returns bounded context to agents.
+PKM Brain is a local-first personal knowledge system and proactive personal Chief of Staff. Its working knowledge layer ingests messy private sources, turns durable claims into a source-backed fact ledger, renders managed wiki pages, and returns bounded context to agents. The operational layer is being built on that evidence foundation to maintain current commitments, Calendar state, attention, and briefings without conflating them with durable facts.
 
 Core rule:
 
 ```text
 Raw sources are evidence.
 Facts are the canonical knowledge ledger.
+Operational items are the canonical current-work ledger.
 Managed wiki pages are rebuildable projections.
 Memories are reviewed typed claims.
 Indexes and eval reports are derived artifacts.
@@ -63,10 +64,15 @@ capture / inbox
   -> documents + chunks + raw artifacts
   -> FTS / vector indexes
   -> LLM extraction into candidate facts
-  -> CoS actions + policy + critic/audit gates
+  -> knowledge-curation actions + policy + critic/audit gates
   -> facts + entities + open-question residue
   -> managed wiki pages
   -> search / retrieve_context / MCP
+
+approved Calendar/Gmail evidence
+  -> operational observations + deterministic reconciliation
+  -> current items + append-only transitions
+  -> freshness-aware Today briefing
 ```
 
 Key layers:
@@ -75,17 +81,22 @@ Key layers:
 - SQLite FTS5 provides BM25 lexical search; LanceDB stores chunk vectors.
 - `facts` stores atomic source-backed claims with quotes, spans, routes, status, and confidence fields.
 - `entities` and `fact_entities` link facts to named people, companies, products, projects, and other named referents.
-- `cos_actions` is the reversible mutation ledger for fact, page, entity, and topology changes.
-- `cos_policy` decides autonomy level; clean low/medium-risk actions can apply, while conflicts and ambiguous topology become residue.
+- `cos_actions` is the legacy-named reversible Knowledge Curation ledger for fact, page, entity, and topology changes.
+- `cos_policy` decides knowledge-mutation autonomy; clean low/medium-risk actions can apply, while conflicts and ambiguous topology become residue.
 - `open_questions` is the human review queue for conflicts, unrouted facts, anomalies, policy escalations, and other residue.
 - Managed wiki pages are rendered from active facts. Optional synthesis is derived prose and never becomes evidence.
+- `ops.sqlite` is the separate operational store for source-backed observations, current items, transition history, and briefing feedback.
 - `brain eval run` gates extraction, topology, conflict, routing, and retrieval behavior.
 
 The detailed code-derived guide is [docs/architecture-code-guide.md](docs/architecture-code-guide.md). The docs index is [docs/README.md](docs/README.md).
 
 ## Chief Of Staff
 
-The Chief-of-Staff layer is the autonomous curation system. It extracts facts from eligible source windows, validates quotes/spans, routes facts to canonical pages, resolves safe duplicates, flags conflicts, applies reversible actions, samples audits, and lets the gardener propose topology cleanup.
+Chief of Staff is the product mission, not another app. It uses Brain's evidence and compiled knowledge to proactively surface what needs attention, maintain temporal operational state, and eventually prepare or execute tightly guarded external actions.
+
+The existing autonomous subsystem is Knowledge Curation: it extracts facts from eligible source windows, validates quotes/spans, routes facts to canonical pages, resolves safe duplicates, flags conflicts, applies reversible actions, samples audits, and lets the gardener propose topology cleanup. Its current `cos_*` names remain compatibility identifiers until an atomic rename; they must not be used for operational items or external side effects.
+
+The initial operational rollout is read-only: a Calendar-first shadow ledger and a coverage-aware Today briefing, followed by a separately evaluated Gmail operational detector. See [Chief-of-Staff Operations](docs/specs/chief-of-staff-operations.md).
 
 Useful commands:
 
@@ -163,7 +174,7 @@ uv run brain daemon --home ~/brain
 uv run brain doctor --home ~/brain
 ```
 
-Nightly maintenance captures/ingests sources, runs CoS extraction/gardener/synthesis/audit stages according to provider configuration, compacts telemetry, optimizes indexes, checks provenance, lints wiki pages, and audits memories. Secondary sync nodes skip mutation-capable CoS stages by default.
+Nightly maintenance captures/ingests sources, runs Knowledge Curation extraction/gardener/synthesis/audit stages according to provider configuration, compacts telemetry, optimizes indexes, checks provenance, lints wiki pages, and audits memories. Secondary sync nodes skip mutation-capable curation stages by default. Operational polling/reconciliation is a separate primary-only job family.
 
 Legacy `brain launch-agent` commands remain for migration rollback and
 development compatibility; they are not the normal app-managed path.

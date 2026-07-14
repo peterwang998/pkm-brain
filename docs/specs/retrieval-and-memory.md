@@ -1,12 +1,14 @@
 # Retrieval And Memory
 
 **Status:** canonical living feature spec
-**Last verified:** 2026-07-11 against public release `0.1.1` code snapshot `b3ba211`
-**Owns:** search, context packets, ranking/calibration, embeddings, retrieval telemetry, evals, and reviewed memories
+**Last verified:** 2026-07-13 against the current knowledge retrieval implementation; operational retrieval below is the additive target contract
+**Owns:** knowledge search, operational retrieval, context packets, ranking/calibration, embeddings, retrieval telemetry, evals, and reviewed memories
 
 ## Retrieval Contract
 
-Every context retrieval returns an explicit verdict:
+Knowledge and operational retrieval are separate typed paths over related evidence. They may appear together in a user-facing briefing, but their ranks, trust, lifecycle, and telemetry are never flattened into one undifferentiated result list.
+
+Every knowledge context retrieval returns an explicit verdict:
 
 - `found`: strong evidence matches the task;
 - `partial`: useful but incomplete or weakly scoped evidence exists;
@@ -23,6 +25,8 @@ The packet keeps evidence layers distinct:
 
 Negative results must remain honest: a `no_strong_match` packet may expose diagnostics, but it must not present unrelated facts as an answer.
 
+The existing `search_knowledge` and `retrieve_context` behavior remains the Knowledge Curation contract. Operational sections are introduced through an explicit operational query/briefing surface; they do not silently change existing MCP packet semantics.
+
 ## Search Stack
 
 The current hybrid path combines:
@@ -36,6 +40,41 @@ The current hybrid path combines:
 Source-aware penalties keep agent-session traces from dominating ordinary knowledge queries. Agent-intent queries may relax those penalties.
 
 Facts, pages, memories, and chunks retain separate caps and trust treatment. A high lexical score in one noisy layer is not sufficient by itself to claim `found`.
+
+## Operational Retrieval
+
+Operational retrieval reads canonical item state and event history from `ops.sqlite`, then resolves cited source or knowledge IDs through the service layer. It does not copy source bodies into the operational database, attach the two SQLite files in UI code, or treat semantic similarity as proof that an item is still active.
+
+An operational result carries enough state to evaluate current relevance:
+
+- stable item ID and type;
+- current state and most recent transition;
+- `starts_at`, `due_at`, `expires_at`, and operator timezone where applicable;
+- `last_observed_at`, last reconciled source change, and staleness classification;
+- confidence and whether a proposed cross-thread link remains ambiguous;
+- stable evidence references and any related fact, entity, project, or goal references;
+- why the item was included, suppressed, updated, or considered stale.
+
+Operational selection is freshness-first:
+
+1. Filter by legal active states and the requested time horizon.
+2. Apply `resolved|cancelled|expired` lifecycle transitions plus recurrence and reschedule changes before ranking.
+3. Prefer explicit due/start time, recent source change, waiting duration, severity, and operator feedback over text similarity.
+4. Use semantic relevance only after current-state and freshness gates.
+5. Suppress terminal items and reconciled duplicates from active briefing sections; route stale active items to an explicit needs-reconciliation section rather than present them as fresh.
+
+A briefing must never present an old active detection as current merely because it ranks well lexically. Low-confidence ambiguity remains labeled and may be shown as a possible attention item; it is not silently adjudicated by the Knowledge Curation critic or resolver.
+
+The two evidence flows can inform one another only through explicit references:
+
+- Operational Chief-of-Staff detection may cite raw documents/chunks and may read facts/pages as background.
+- Facts and pages never become an operational commitment, deadline, or completion signal by themselves.
+- Operational observations and feedback never become durable facts without re-entering the Knowledge Curation proposal and ledger path.
+- Operational exposure, urgency, dismissal, or completion never changes fact confidence, knowledge popularity, or source authority.
+
+V1 briefing retrieval is read-only and primary-local. A secondary may not reconcile or mutate operational items; absent an approved read-only operational replica, it reports operational context unavailable rather than serving a locally divergent ledger.
+
+The owning item, reconciliation, and Today presentation contract is [Chief-of-Staff Operations](chief-of-staff-operations.md). This spec owns how those items are selected and exposed without weakening knowledge retrieval semantics.
 
 ## Embedding Provider
 
@@ -106,6 +145,8 @@ The native UI displays the count and last exposure time where available.
 
 Popularity counts production retrieval use, not evaluation activity. Retrieval evals and sync acceptance probes call retrieval with telemetry disabled, and automated tests run against isolated temporary homes unless a test explicitly exercises telemetry. New eval or acceptance flows must preserve that boundary.
 
+Operational retrieval records its own briefing/item exposure and correction signals in `ops.sqlite`. Those events support operational trust metrics such as duplicate-active rate, stale-active rate, false closure, briefing churn, and missed-item feedback. They do not contribute to knowledge popularity or retrieval-event lineage in `brain.sqlite` unless a separate knowledge retrieval actually occurred.
+
 Legacy retrieval evals were not labeled separately and can be identified only by the exact golden queries they executed under caller `retrieve_context`. `brain eval purge-retrieval-telemetry` is dry-run by default. Apply mode deletes only lineage attached to those exact legacy events and relabels the retained retrieval rows as `eval:retrieval_legacy`, preserving audit history while removing their popularity contribution. Real retrievals with other queries and their lineage remain untouched; rerunning the cleanup is idempotent.
 
 ## Telemetry And Retention
@@ -140,7 +181,7 @@ MCP cannot approve memories or mutate wiki knowledge. It may propose memory, ret
 
 ## Agent Interface
 
-The stable MCP surface is intentionally small:
+The current stable Knowledge Curation MCP surface is intentionally small:
 
 - `search_knowledge(query, limit)`
 - `retrieve_context(task, project)`
@@ -151,6 +192,8 @@ The stable MCP surface is intentionally small:
 - `write_agent_session(summary, files_touched, commands_run, outcome, unresolved_issues)`
 
 Normal app-managed registration points to the `brain-mcp` shim. Direct `brain mcp` remains a development path.
+
+An operational interface must use explicitly typed commands or packet sections and must remain read-only until its writer, reconciliation, and primary-role gates pass. External action planning and execution are not implicit powers of `retrieve_context`; they use the separate guarded-execution boundary defined in [Product Foundation](product-foundation.md).
 
 ## Evals
 
@@ -165,6 +208,16 @@ Retrieval gates include:
 - session-trace noise rate;
 - 100% negative-control pass for provider/index promotion.
 
+Before an Operational Chief-of-Staff briefing can become the default Today surface, chronological replay and reviewed suppressed-source samples must measure:
+
+- high-severity item precision and recall;
+- update/reschedule/cancellation linkage accuracy;
+- duplicate-active, stale-active, premature-closure, and resolved-item-resurrection rates;
+- briefing churn and operator correction rate;
+- evidence-reference completeness and time-to-reconcile.
+
+Detection-only precision is not sufficient. Shadow predictions become a labeled set only when surfaced and suppressed samples receive human or deterministic outcome labels.
+
 Fixture loading accepts packaged built-ins plus local `evals/golden_queries.yaml` cases. Local cases are not dead configuration.
 
 ## Current Gaps
@@ -176,7 +229,8 @@ The following are experiments, not implied current behavior:
 - neighbor/context expansion;
 - cross-encoder reranking;
 - semantic entity/gardener candidate generation;
-- email retrieval fixtures and source weights.
+- email retrieval fixtures and source weights;
+- `ops.sqlite` item retrieval, freshness ranking, briefing packets, and operational feedback telemetry.
 
 Each must be evaluated independently and kept only if it improves the suite without weakening negative controls, source grounding, latency, or storage bounds.
 
@@ -191,6 +245,10 @@ Each must be evaluated independently and kept only if it improves the suite with
 - Eval and acceptance retrievals create no production retrieval or exposure-lineage rows.
 - Proposed and active memories remain visibly separate.
 - Telemetry compaction preserves required lineage and aggregate popularity.
+- Operational queries exclude `resolved|dismissed|cancelled|expired` items and reconciled duplicates from active briefing sections and never present stale active items as current without a staleness warning.
+- Every surfaced operational item exposes current-state timing and stable evidence references.
+- Operational exposure and feedback do not change knowledge popularity, confidence, or authority.
+- A secondary without an approved operational replica reports operational context unavailable and performs no operational write.
 
 Verification:
 

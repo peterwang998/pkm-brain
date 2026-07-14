@@ -1,12 +1,12 @@
 # Curation And Review
 
 **Status:** canonical living feature spec
-**Last verified:** 2026-07-13 against release `0.1.4` code snapshot `f89c70d`
-**Owns:** Chief-of-Staff roles, action/policy/audit flow, fact relations, review Queue, autonomy settings, and review-volume controls
+**Last verified:** 2026-07-13 against knowledge-foundation commit `3937316` and the current working tree
+**Owns:** knowledge-curation model roles, action/policy/audit flow, fact relations, review Queue, autonomy settings, and review-volume controls
 
 ## Operating Model
 
-The Chief-of-Staff layer curates evidence into facts and managed pages while keeping durable mutations reversible:
+The Knowledge Curation layer compiles evidence into facts and managed pages while keeping durable mutations reversible:
 
 ```text
 extract -> resolve -> garden -> synthesize
@@ -18,6 +18,10 @@ extract -> resolve -> garden -> synthesize
 ```
 
 Ingest is not model-backed. Curation runs on changed sources in the nightly daemon job or an explicit `brain cos run`.
+
+This working layer is the knowledge foundation for the product's proactive Chief-of-Staff mission; it is not itself the operational Chief of Staff. It does not own current commitments, deadlines, waiting-on state, Calendar events, briefings, or plans that mutate an external provider. Those lifecycles belong to [Chief-of-Staff Operations](chief-of-staff-operations.md).
+
+The physical symbols `cos_actions`, `cos_policy`, `cos_audit`, `brain cos`, and `config/local/cos_llm.yaml` are legacy implementation names for Knowledge Curation. They remain canonical in code until one complete compatibility-aware rename tranche changes modules, tables, migrations, CLI/API/config fields, tests, and documentation together. New operational code must not reuse or extend those symbols.
 
 ## Core Primitives
 
@@ -348,6 +352,8 @@ Autonomy promotion also requires the relevant extraction, routing, topology, con
 ## Acceptance
 
 - All durable mutations use `cos_actions` and have an inverse.
+- `cos_actions` contains only knowledge mutations; operational item transitions and external side effects never enter this ledger.
+- A commitment, deadline, Calendar event, or waiting-on item can remain operational without becoming a durable fact.
 - Re-proposing a candidate key produces one active review item.
 - A stale merge retry cannot throw or reappear as work.
 - Every visible filter count equals retrievable cards.

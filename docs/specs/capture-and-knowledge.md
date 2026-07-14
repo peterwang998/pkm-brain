@@ -1,8 +1,8 @@
 # Capture And Knowledge
 
 **Status:** canonical living feature spec
-**Last verified:** 2026-07-13 against installed release `0.1.5` and the current working tree
-**Owns:** connectors, ingest, source normalization, extraction, facts, entities, routing, gardener topology, and wiki projection
+**Last verified:** 2026-07-13 against knowledge-foundation commit `3937316` and the current working tree
+**Owns:** evidence connectors, ingest, source normalization, durable-knowledge extraction, facts, entities, routing, gardener topology, and wiki projection
 
 ## Feature Boundary
 
@@ -15,6 +15,8 @@ connector/manual input -> inbox -> raw/document/chunks
 ```
 
 Capture adapters and model roles never bypass ingest or write knowledge tables directly.
+
+Operational awareness is a separate consumer of approved evidence. Calendar and Gmail can also feed operational observations, reconciliation, and a briefing without turning those observations into facts. The lifecycle and persistence contract for that path lives in [Chief-of-Staff Operations](chief-of-staff-operations.md).
 
 ## Capture Contract
 
@@ -71,6 +73,8 @@ An explicit document-ID filter is available for bounded repair/reprocessing runs
 `agent_session_log` is skipped by default. Ordinary notes, meetings, transcripts, web clips, and unknown non-noisy sources are eligible unless local policy says otherwise.
 
 The source policy lives in `config/local/cos_llm.yaml`. The verified local extractor deployment on 2026-07-10 is Codex `gpt-5.6-luna` at low effort with four workers. Provider configuration remains user-overridable.
+
+This selector answers whether a source should enter the durable fact pipeline. It is not an operational-relevance classifier. A thread can be ineligible for facts and still contain an important reservation, renewal, delivery, deadline, cancellation, or payment signal.
 
 ## Extractor Payload
 
@@ -149,6 +153,8 @@ Non-durable classes are dropped without retry:
 - `pleasantry`
 - `boilerplate`
 - `non_claim`
+
+"Dropped" here means excluded from the durable fact ledger. The raw evidence remains searchable, and an independently approved operational detector may represent time-bound logistics in `ops.sqlite`.
 
 Durable classes include decisions, commitments, preferences, roles/responsibilities, project state, factual updates, and open questions.
 
@@ -242,6 +248,16 @@ The verified local gardener model is `gpt-5.6-luna`. Page/entity candidate volum
 - Typed relation edges are intentionally absent; natural-language facts plus entity links remain the knowledge graph.
 - Native Wiki rendering/provenance interaction is incomplete; see [App And Operations](app-and-operations.md).
 
+## Future Calendar Evidence Adapter
+
+Status: planned as the first read-only operational connector.
+
+The initial provider is Google Calendar with a separate narrowly scoped account grant. Event snapshots enter the evidence boundary with stable account, calendar, event, recurrence, and revision identity. The adapter requests no mutation scope and does not infer a task merely because an event exists.
+
+Normalization must preserve timed versus all-day semantics, source timezone, organizer/attendee role, RSVP, recurrence master and exception identity, cancellation/deletion, visibility, and update revision while minimizing retained private payload. Replaying an unchanged revision is a no-op. A changed, moved, or cancelled event creates a new immutable operational observation and reconciles the same canonical item instead of creating a duplicate.
+
+Calendar is operationally useful without LLM extraction. Its source evidence remains eligible for normal retrieval only under an approved capture/privacy policy; the current item lifecycle and briefing behavior belong to [Chief-of-Staff Operations](chief-of-staff-operations.md).
+
 ## Future Gmail And Email Adapter
 
 Status: authentication shell implemented; capture planned and paused.
@@ -254,14 +270,17 @@ An identity-only Gmail OAuth shell requests `openid`, `email`, and `profile`, st
 - deterministic bulk-versus-human classification;
 - redaction before writing `inbox/` or `raw/`;
 - attachment metadata only, never binary copies;
-- searchable by default but extraction opt-in by reply/star/allowlist signal;
-- ephemeral logistics dropped at extraction;
+- retrieval indexing, durable-fact extraction, and operational detection are separately permissioned and budgeted lanes;
+- durable-fact extraction is opt-in by human/evidence policy rather than mailbox-wide;
+- ephemeral logistics stay out of facts but may become source-backed operational items;
 - email mentions may link to known entities but may not create entities by default;
 - strict per-run extraction and residue caps.
 
 An isolated 2026-07-13 experiment used a separate existing Google Workspace credential, not the Brain connector grant, to normalize and index 90 days of Gmail in a private test Brain. It measured 6,650 threads, 21,458 chunks, and 319.5 MB of allocated Brain growth. Deterministic bulk/transactional filtering admitted 318 threads (4.8%) to fact eligibility. A production-policy three-day sample averaged 551,224 total tokens and 172,976 uncached input tokens per selected day; scaling observed per-document cost to the 90-day mean eligible volume projects about 448,792 total tokens/day, while an all-mail full-fact-pipeline counterfactual is about 9.43 million tokens/day. The measurement and limitations are recorded in [Gmail Indexing Benchmark](../audits/gmail-indexing-benchmark-2026-07-13.md).
 
-These results narrow the future contract but do not authorize capture. A production adapter must classify before extraction, default attachment payloads out, remove quoted-history duplication, use replaceable thread snapshots, carry explicit daily document/token budgets, and leave bulk/transactional mail retrieval-only unless a narrower policy admits it.
+These results narrow the future contract but do not authorize capture. The 9.43-million-token counterfactual applies the complete extractor/resolver/critic fact pipeline to every thread; it is not the cost of a single-stage operational scan. A production adapter must classify before durable extraction, default attachment payloads out, remove quoted-history duplication, use replaceable thread snapshots, and carry explicit daily document/token budgets.
+
+The operational lane is orthogonal to the 4.8% fact gate. It may inspect changed bulk, transactional, and human mail with one low-cost structured pass per changed thread or failure-isolated batch. It must not inherit the fact critic or candidate resolver loop. Exact thread/message lineage drives reconciliation first; ambiguous cross-thread matches remain provisional. Marketing/noise can still be suppressed, so the operational set is not literally the complement of the fact set.
 
 ## Future Slack Adapter
 

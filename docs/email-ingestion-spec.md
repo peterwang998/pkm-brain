@@ -1,8 +1,8 @@
 # Email Ingestion
 
-**Status:** compatibility pointer; feature remains planned and paused
-**Last verified:** 2026-07-10 against commit `e43e9c1e1287` plus the current working tree
+**Status:** compatibility pointer; identity-only auth exists, content capture remains planned and paused
+**Last verified:** 2026-07-13 against foundation commit `3937316`
 
-Only telemetry/retention prerequisites are implemented. The retained safety constraints and explicit non-implementation status live under [Future Email Adapter](specs/capture-and-knowledge.md#future-email-adapter).
+Identity-only Gmail authorization and the isolated 90-day benchmark are implemented. The three-lane retrieval, durable-knowledge, and operational contract lives under [Future Gmail And Email Adapter](specs/capture-and-knowledge.md#future-gmail-and-email-adapter) and [Chief-of-Staff Operations](specs/chief-of-staff-operations.md#gmail-lanes).
 
-A revised implementation proposal is scheduled in [the improvement plan](plans/project-improvement-plan.md).
+A revised implementation proposal is scheduled in [the operational implementation plan](plans/chief-of-staff-operations-implementation-plan.md).
