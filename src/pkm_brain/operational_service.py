@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .operational_budget import reserve_daily_budget, reserve_daily_budgets
 from .operational_db import init_operational_db
 from .operational_state import (
     OperationalObservation,
@@ -21,6 +22,20 @@ from .operational_state import (
     reconcile_source_unit,
     record_item_feedback,
     save_source_cursor,
+)
+from .operational_shadow import (
+    HandledAssessment,
+    ShadowDecision,
+    ShadowSourceUnitResult,
+    finish_shadow_run,
+    interrupt_running_shadow_runs,
+    persist_shadow_source_unit,
+    prune_expired_briefing_snapshots,
+    record_handled_assessment,
+    record_missing_report,
+    record_shadow_decision,
+    save_briefing_snapshot,
+    start_shadow_run,
 )
 from .paths import BrainPaths, local_node_id
 from .sync_config import load_sync_config
@@ -299,6 +314,52 @@ class OperationalService:
         with self.mutation_lease():
             init_operational_db(self.paths.ops_sqlite_path)
 
+    def reserve_daily_budget(
+        self,
+        *,
+        source_type: str,
+        metric: str,
+        amount: int,
+        limit: int | None,
+        local_day: str,
+        policy_version: str,
+        run_id: str | None,
+        created_at: str | None = None,
+    ) -> dict[str, Any]:
+        with self.mutation_lease():
+            return reserve_daily_budget(
+                self.paths.ops_sqlite_path,
+                source_type=source_type,
+                metric=metric,
+                amount=amount,
+                limit=limit,
+                local_day=local_day,
+                policy_version=policy_version,
+                run_id=run_id,
+                created_at=created_at,
+            )
+
+    def reserve_daily_budgets(
+        self,
+        *,
+        source_type: str,
+        reservations: Mapping[str, tuple[int, int | None]],
+        local_day: str,
+        policy_version: str,
+        run_id: str | None,
+        created_at: str | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        with self.mutation_lease():
+            return reserve_daily_budgets(
+                self.paths.ops_sqlite_path,
+                source_type=source_type,
+                reservations=reservations,
+                local_day=local_day,
+                policy_version=policy_version,
+                run_id=run_id,
+                created_at=created_at,
+            )
+
     def reconcile_observation(
         self,
         observation: OperationalObservation,
@@ -385,4 +446,177 @@ class OperationalService:
                 expected_generation=expected_generation,
                 enforce_expected_cursor=enforce_expected_cursor,
                 updated_at=updated_at,
+            )
+
+    def start_shadow_run(
+        self,
+        *,
+        mode: str,
+        requested_sources: Sequence[str],
+        policy_version: str,
+        detector_version: str | None = None,
+        started_at: str | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        with self.mutation_lease():
+            return start_shadow_run(
+                self.paths.ops_sqlite_path,
+                mode=mode,
+                requested_sources=requested_sources,
+                policy_version=policy_version,
+                detector_version=detector_version,
+                started_at=started_at,
+                run_id=run_id,
+            )
+
+    def finish_shadow_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        coverage: Mapping[str, Any],
+        usage: Mapping[str, Any] | None = None,
+        counts: Mapping[str, Any] | None = None,
+        error: str | None = None,
+        hard_stop_reason: str | None = None,
+        finished_at: str | None = None,
+    ) -> dict[str, Any]:
+        with self.mutation_lease():
+            return finish_shadow_run(
+                self.paths.ops_sqlite_path,
+                run_id,
+                status=status,
+                coverage=coverage,
+                usage=usage,
+                counts=counts,
+                error=error,
+                hard_stop_reason=hard_stop_reason,
+                finished_at=finished_at,
+            )
+
+    def interrupt_running_shadow_runs(
+        self,
+        *,
+        interrupted_at: str | None = None,
+    ) -> list[dict[str, Any]]:
+        with self.mutation_lease():
+            return interrupt_running_shadow_runs(
+                self.paths.ops_sqlite_path,
+                interrupted_at=interrupted_at,
+            )
+
+    def record_shadow_decision(
+        self,
+        run_id: str,
+        decision: ShadowDecision,
+        *,
+        created_at: str | None = None,
+    ) -> dict[str, Any]:
+        with self.mutation_lease():
+            return record_shadow_decision(
+                self.paths.ops_sqlite_path,
+                run_id,
+                decision,
+                created_at=created_at,
+            )
+
+    def record_handled_assessment(
+        self,
+        assessment: HandledAssessment,
+        *,
+        run_id: str | None = None,
+        created_at: str | None = None,
+    ) -> dict[str, Any]:
+        with self.mutation_lease():
+            return record_handled_assessment(
+                self.paths.ops_sqlite_path,
+                assessment,
+                run_id=run_id,
+                created_at=created_at,
+            )
+
+    def persist_shadow_source_unit(
+        self,
+        observations: Sequence[OperationalObservation],
+        *,
+        cursor_update: SourceCursorUpdate | None,
+        decisions: Sequence[ShadowDecision] = (),
+        handled_assessments: Sequence[HandledAssessment] = (),
+        processed_at: str | None = None,
+        run_id: str,
+    ) -> ShadowSourceUnitResult:
+        """Commit one provider unit under the daemon's exclusive writer lease."""
+
+        with self.mutation_lease():
+            return persist_shadow_source_unit(
+                self.paths.ops_sqlite_path,
+                observations,
+                cursor_update=cursor_update,
+                decisions=decisions,
+                handled_assessments=handled_assessments,
+                processed_at=processed_at,
+                run_id=run_id,
+            )
+
+    def save_briefing_snapshot(
+        self,
+        *,
+        as_of: str,
+        timezone_name: str,
+        policy_version: str,
+        status: str,
+        sections: Mapping[str, Any],
+        coverage: Mapping[str, Any],
+        counts: Mapping[str, Any] | None = None,
+        run_id: str | None = None,
+        generated_at: str | None = None,
+        retention_days: int = 30,
+    ) -> dict[str, Any]:
+        with self.mutation_lease():
+            return save_briefing_snapshot(
+                self.paths.ops_sqlite_path,
+                as_of=as_of,
+                timezone_name=timezone_name,
+                policy_version=policy_version,
+                status=status,
+                sections=sections,
+                coverage=coverage,
+                counts=counts,
+                run_id=run_id,
+                generated_at=generated_at,
+                retention_days=retention_days,
+            )
+
+    def prune_expired_briefing_snapshots(
+        self,
+        *,
+        as_of: str | None = None,
+    ) -> dict[str, int]:
+        with self.mutation_lease():
+            return prune_expired_briefing_snapshots(
+                self.paths.ops_sqlite_path,
+                as_of=as_of,
+            )
+
+    def record_missing_report(
+        self,
+        *,
+        summary: str,
+        run_id: str | None = None,
+        source_type: str | None = None,
+        source_ref: str | None = None,
+        expected_kind: str | None = None,
+        idempotency_key: str | None = None,
+        created_at: str | None = None,
+    ) -> dict[str, Any]:
+        with self.mutation_lease():
+            return record_missing_report(
+                self.paths.ops_sqlite_path,
+                summary=summary,
+                run_id=run_id,
+                source_type=source_type,
+                source_ref=source_ref,
+                expected_kind=expected_kind,
+                idempotency_key=idempotency_key,
+                created_at=created_at,
             )

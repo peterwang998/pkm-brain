@@ -219,3 +219,67 @@ def test_missing_operational_store_is_an_explicit_unavailable_briefing(
     assert briefing["status"] == "unavailable"
     assert briefing["all_clear"] is False
     assert briefing["coverage"]["calendar"]["status"] == "unavailable"
+
+
+def test_briefing_requires_every_enabled_source_and_ignores_stale_handled_state(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "ops.sqlite"
+    init_operational_db(db_path)
+    run = start_shadow_run(
+        db_path,
+        mode="fixture",
+        requested_sources=["gmail"],
+        policy_version="operations-v1",
+        detector_version=GMAIL_DETECTOR_VERSION,
+        started_at=NOW,
+    )
+    item_id = add_item(
+        db_path,
+        source_key="stale-work",
+        kind="commitment",
+        title="Complete stale work",
+        priority=70,
+    )
+    record_handled_assessment(
+        db_path,
+        HandledAssessment(
+            item_id=item_id,
+            verdict="fulfilled",
+            sources_checked=("gmail",),
+            coverage={"gmail": {"status": "complete"}},
+            policy_version="operations-v1",
+            confidence=0.99,
+            as_of=NOW,
+        ),
+        run_id=run["id"],
+    )
+    finish_shadow_run(
+        db_path,
+        run["id"],
+        status="complete",
+        coverage={"gmail": {"status": "complete", "fresh_at": NOW}},
+        finished_at=NOW,
+    )
+
+    missing_source = build_operational_briefing(
+        db_path,
+        timezone_name="America/Los_Angeles",
+        policy_version="operations-v1",
+        as_of=NOW,
+    )
+    stale = build_operational_briefing(
+        db_path,
+        timezone_name="America/Los_Angeles",
+        policy_version="operations-v1",
+        as_of="2026-07-13T23:00:01+00:00",
+        required_sources=("gmail",),
+    )
+
+    assert missing_source["status"] == "partial"
+    assert missing_source["all_clear"] is False
+    assert missing_source["coverage"]["calendar"]["status"] == "unavailable"
+    assert stale["status"] == "partial"
+    assert stale["coverage"]["gmail"]["reason"] == "stale"
+    assert stale["sections"]["focus"][0]["item_id"] == item_id
+    assert stale["sections"]["focus"][0]["handled_verdict"] == "unknown"

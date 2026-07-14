@@ -49,7 +49,15 @@ from .app_migration import (
     retire_launch_agents,
 )
 from .mcp_tools import MCP_TOOL_NAMES, call_mcp_tool
-from .maintenance import managed_storage_inventory
+from .operations_http import (
+    OperationsHTTPBadRequest,
+    OperationsHTTPNotFound,
+    operations_evidence_payload,
+    operations_meeting_packet_payload,
+    operations_runs_payload,
+    operations_storage_payload,
+    shadow_setup_payload,
+)
 from .paths import BrainPaths
 from .routing_coherence import (
     coherence_bonus,
@@ -65,6 +73,7 @@ from .service import BrainService, row_to_memory
 from .setup_wizard import build_setup_plan
 from .source_dates import derive_fact_source_date, document_source_date_metadata
 from . import today_presentation as today_api
+from .shadow_controller import ShadowTrialController, shadow_run_start_payload
 from .util import new_id, now_iso
 from .wiki import (
     ALLOWED_PAGE_TYPES,
@@ -110,6 +119,7 @@ class BrainUIServer(ThreadingHTTPServer):
     daemon_scheduler: Any | None
     daemon_operational_service: Any | None
     daemon_today_service: today_api.TodayPresentationService
+    daemon_shadow_controller: ShadowTrialController | None
     daemon_shutdown_enabled: bool
 
 
@@ -198,6 +208,13 @@ class BrainUIHandler(BaseHTTPRequestHandler):
                 self.write_json(ui_digest(self.server.paths, query))
             elif path == "/api/v1/today":
                 self.write_json(today_api.today_briefing_payload(self.server.daemon_today_service))
+            elif path == "/api/v1/today/run":
+                controller = self.server.daemon_shadow_controller
+                if controller is None:
+                    raise BadRequestError("Shadow runner is not available")
+                self.write_json(controller.status())
+            elif path == "/api/v1/today/setup":
+                self.write_json(shadow_setup_payload(self.server.paths))
             elif path == "/api/queue":
                 self.write_json(ui_queue(self.server.paths, query))
             elif path == "/api/search":
@@ -228,14 +245,27 @@ class BrainUIHandler(BaseHTTPRequestHandler):
             elif path == "/api/settings/curation":
                 self.write_json(ui_curation_settings(self.server.paths))
             elif path == "/api/ops/runs":
-                self.write_json(ui_ops_runs(self.server.paths))
+                self.write_json(operations_runs_payload(self.server.paths))
             elif path == "/api/ops/storage":
-                self.write_json(ui_ops_storage(self.server.paths))
+                self.write_json(operations_storage_payload(self.server.paths))
+            elif path == "/api/ops/evidence":
+                self.write_json(operations_evidence_payload(self.server.paths, query))
+            elif path.startswith("/api/ops/items/") and path.endswith("/meeting-packet"):
+                item_id = path.removeprefix("/api/ops/items/").removesuffix(
+                    "/meeting-packet"
+                ).strip("/")
+                self.write_json(
+                    operations_meeting_packet_payload(self.server.paths, item_id)
+                )
             else:
                 self.write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
         except BadRequestError as exc:
             self.write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+        except OperationsHTTPBadRequest as exc:
+            self.write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
         except NotFoundError as exc:
+            self.write_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+        except OperationsHTTPNotFound as exc:
             self.write_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
         except ValueError as exc:
             self.write_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
@@ -312,6 +342,13 @@ class BrainUIHandler(BaseHTTPRequestHandler):
                     today_api.today_missing_payload(
                         self.server.daemon_today_service, self.read_json_body()
                     )
+                )
+            elif parts == ["v1", "today", "run"]:
+                controller = self.server.daemon_shadow_controller
+                if controller is None:
+                    raise BadRequestError("Shadow runner is not available")
+                self.write_json(
+                    shadow_run_start_payload(controller, self.read_json_body())
                 )
             elif len(parts) == 3 and parts[0] == "queue" and parts[2] == "decision":
                 payload = self.read_json_body()
@@ -529,6 +566,7 @@ def create_ui_server(
     server.daemon_scheduler = None
     server.daemon_operational_service = None
     server.daemon_today_service = today_api.UnavailableTodayPresentationService()
+    server.daemon_shadow_controller = None
     server.daemon_shutdown_enabled = False
     return server
 
@@ -5423,49 +5461,6 @@ def entity_merge_features(paths: BrainPaths, entity_ids: list[str]) -> dict[str,
 def ui_revert_action(paths: BrainPaths, action_id: str) -> dict[str, Any]:
     service(paths).init_workspace()
     return {"action": revert_action(paths, action_id)}
-
-
-def ui_ops_runs(paths: BrainPaths) -> dict[str, Any]:
-    service(paths).init_workspace()
-    with connection(paths.sqlite_path) as conn:
-        automation = (
-            [
-                row_to_plain_dict(row)
-                for row in conn.execute(
-                    """
-                    SELECT *
-                    FROM automation_runs
-                    ORDER BY started_at DESC
-                    LIMIT 100
-                    """
-                )
-            ]
-            if ui_table_exists(conn, "automation_runs")
-            else []
-        )
-        ingestion = (
-            [
-                row_to_plain_dict(row)
-                for row in conn.execute(
-                    """
-                    SELECT *
-                    FROM ingestion_runs
-                    ORDER BY started_at DESC
-                    LIMIT 100
-                    """
-                )
-            ]
-            if ui_table_exists(conn, "ingestion_runs")
-            else []
-        )
-    return {"automation_runs": automation, "ingestion_runs": ingestion}
-
-
-def ui_ops_storage(paths: BrainPaths) -> dict[str, Any]:
-    service(paths).init_workspace()
-    configured = str(os.environ.get("PKM_BRAIN_APP_SUPPORT") or "").strip()
-    app_support = Path(configured).expanduser() if configured else None
-    return managed_storage_inventory(paths, app_support=app_support)
 
 
 def ui_wiki_fact_dashboard(paths: BrainPaths) -> dict[str, Any]:

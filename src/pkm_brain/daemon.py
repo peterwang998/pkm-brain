@@ -23,7 +23,9 @@ from .automation import (
 )
 from .migrations import MIGRATIONS
 from .operational_service import OperationalService, OperationalWriteRefusedError
+from .operational_today import OperationalTodayPresentationService
 from .paths import BrainPaths
+from .shadow_controller import ShadowTrialController
 from .service import BrainService
 from .sync_config import load_sync_config
 from .sync_transfer import sync_run
@@ -429,6 +431,14 @@ class BrainDaemon:
             self.server.daemon_started_at = self.started_at
             self.server.daemon_scheduler = self.scheduler
             self.server.daemon_operational_service = self.operational_service
+            self.server.daemon_today_service = OperationalTodayPresentationService(
+                self.paths,
+                self.operational_service,
+            )
+            self.server.daemon_shadow_controller = ShadowTrialController(
+                self.paths,
+                self.operational_service,
+            )
             self.server.daemon_shutdown_enabled = True
             host, actual_port = self.server.server_address
             payload = {
