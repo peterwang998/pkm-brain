@@ -91,14 +91,15 @@ def test_single_oversized_thread_is_deferred_without_crossing_batch_char_bound()
             max_input_tokens=100_000,
             max_total_tokens=100_000,
             max_batch_threads=2,
-            max_batch_chars=1_500,
+            max_batch_chars=5_000,
         ),
         llm_provider=provider,
     )
 
     assert len(provider.prompts) == 1
+    assert all(len(prompt) <= 5_000 for prompt in provider.prompts)
     assert result.coverage_complete is False
     assert result.deferred_count == 1
     assert result.detections[0].disposition == "deferred"
-    assert result.detections[0].reason_code == "detector_thread_oversized"
+    assert result.detections[0].reason_code == "detector_prompt_oversized"
     assert result.detections[1].disposition == "suppressed"

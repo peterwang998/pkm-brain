@@ -8,10 +8,12 @@ from datetime import datetime, timezone
 from typing import Any, Mapping, Protocol, Sequence
 
 from .google_normalization import NormalizedGmailMessage, NormalizedGmailThread
-from .llm import LLMProvider, complete_json
+from .llm import LLMProvider, complete_json, json_prompt
 
 
 GMAIL_DETECTOR_VERSION = "gmail-operations-v1"
+DETECTOR_OUTPUT_TOKEN_RESERVE = 4_096
+DETECTOR_RESPONSE_SCHEMA = {"type": "object", "required": ["threads"]}
 ITEM_KINDS = {"commitment", "waiting", "follow_up", "deadline", "attention"}
 ITEM_OWNERS = {"operator", "other", "shared", "unknown"}
 OPERATIONS = {"create", "update", "resolve", "cancel", "none", "needs_reconciliation"}
@@ -297,70 +299,74 @@ def detect_gmail_threads(
     errors: list[str] = []
     index = 0
     while index < len(model_entries):
+        if requests >= budget.max_calls:
+            deferred_count += _defer_remaining(
+                detections,
+                model_entries[index:],
+                reason_code="detector_budget_exhausted",
+            )
+            break
         batch: list[NormalizedGmailThread] = []
-        batch_chars = 0
+        batch_prompt = ""
         batch_input_tokens = 0
         while index < len(model_entries) and len(batch) < budget.max_batch_threads:
             thread, _preclassification = model_entries[index]
-            payload = _thread_model_payload(
-                thread,
-                active_items=active_items_by_thread.get(thread.thread_id, ()),
+            candidate_batch = [*batch, thread]
+            candidate_prompt = _detector_prompt(
+                candidate_batch,
+                operator_emails=operator_emails,
+                timezone_name=timezone_name,
+                policy_version=policy_version,
+                active_items_by_thread=active_items_by_thread,
             )
-            encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-            estimated = _estimate_tokens(payload)
-            if len(encoded) > budget.max_batch_chars:
+            provider_prompt = json_prompt(
+                candidate_prompt,
+                schema=DETECTOR_RESPONSE_SCHEMA,
+            )
+            if len(provider_prompt) > budget.max_batch_chars:
+                if batch:
+                    break
                 detections[thread.thread_id] = GmailThreadDetection(
                     thread_id=thread.thread_id,
                     disposition="deferred",
-                    reason_code="detector_thread_oversized",
+                    reason_code="detector_prompt_oversized",
                 )
                 deferred_count += 1
                 index += 1
                 continue
-            if batch and batch_chars + len(encoded) > budget.max_batch_chars:
-                break
+            candidate_input_tokens = _estimate_tokens(provider_prompt)
             if (
-                requests >= budget.max_calls
-                or estimated_input_tokens + batch_input_tokens + estimated
+                estimated_input_tokens + candidate_input_tokens
                 > budget.max_input_tokens
                 or estimated_input_tokens
                 + estimated_output_tokens
-                + batch_input_tokens
-                + estimated
-                + 800
+                + candidate_input_tokens
+                + DETECTOR_OUTPUT_TOKEN_RESERVE
                 > budget.max_total_tokens
             ):
-                for remaining, _decision in model_entries[index:]:
-                    detections[remaining.thread_id] = GmailThreadDetection(
-                        thread_id=remaining.thread_id,
-                        disposition="deferred",
-                        reason_code="detector_budget_exhausted",
-                    )
-                    deferred_count += 1
+                if batch:
+                    break
+                deferred_count += _defer_remaining(
+                    detections,
+                    model_entries[index:],
+                    reason_code="detector_budget_exhausted",
+                )
                 index = len(model_entries)
-                batch = []
                 break
-            batch.append(thread)
-            batch_chars += len(encoded)
-            batch_input_tokens += estimated
+            batch = candidate_batch
+            batch_prompt = candidate_prompt
+            batch_input_tokens = candidate_input_tokens
             index += 1
         if not batch:
             continue
-        prompt = _detector_prompt(
-            batch,
-            operator_emails=operator_emails,
-            timezone_name=timezone_name,
-            policy_version=policy_version,
-            active_items_by_thread=active_items_by_thread,
-        )
         requests += 1
         estimated_input_tokens += batch_input_tokens
         try:
             response = complete_json(
-                prompt,
-                schema={"type": "object", "required": ["threads"]},
+                batch_prompt,
+                schema=DETECTOR_RESPONSE_SCHEMA,
                 llm_provider=llm_provider,
-                max_attempts=2,
+                max_attempts=1,
             )
             parsed = _parse_batch_response(response, batch)
             for result in parsed:
@@ -419,6 +425,21 @@ def detect_gmail_threads(
         coverage_complete=coverage_complete,
         errors=tuple(errors),
     )
+
+
+def _defer_remaining(
+    detections: dict[str, GmailThreadDetection],
+    entries: Sequence[tuple[NormalizedGmailThread, GmailPreclassification]],
+    *,
+    reason_code: str,
+) -> int:
+    for thread, _decision in entries:
+        detections[thread.thread_id] = GmailThreadDetection(
+            thread_id=thread.thread_id,
+            disposition="deferred",
+            reason_code=reason_code,
+        )
+    return len(entries)
 
 
 def _parse_batch_response(
