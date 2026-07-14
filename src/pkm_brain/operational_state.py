@@ -7,6 +7,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -55,6 +56,8 @@ MAX_EVIDENCE_REFS = 64
 MAX_OBSERVATION_PAYLOAD_BYTES = 32768
 MAX_EVIDENCE_REFS_BYTES = 16384
 MAX_METADATA_BYTES = 16384
+MAX_CURSOR_METADATA_BYTES = 512 * 1024
+MAX_PENDING_THREAD_IDS_BYTES = 500 * 1024
 FORBIDDEN_REFERENCE_KEYS = {"body", "content", "html", "payload", "raw", "text"}
 OBSERVATION_METADATA_SCHEMA_VERSION = 1
 OBSERVATION_METADATA_KEYS_V1 = {
@@ -71,6 +74,7 @@ OBSERVATION_METADATA_KEYS_V1 = {
     "original_start_time",
     "provider_sequence",
     "reconciliation_status",
+    "revalidation_reason",
     "recurring_event_id",
     "source_status",
     "transparency",
@@ -104,13 +108,22 @@ EVIDENCE_IDENTITY_KEYS = {
 }
 EVIDENCE_INTEGER_KEYS = {"end_offset", "start_offset"}
 CURSOR_METADATA_KEYS = {
+    "baseline_history_id",
+    "continuation_mode",
+    "continuation_history_id",
     "coverage_status",
+    "continuation_page_token",
     "deferred_count",
     "full_sync",
     "item_count",
     "page_count",
     "pages",
+    "pending_thread_ids",
     "retry_count",
+    "reset_rebuild",
+    "reset_seen_item_ids",
+    "reset_seen_overflow",
+    "reset_started_generation",
     "window_end",
     "window_start",
 }
@@ -317,7 +330,7 @@ class SourceCursorUpdate:
             raise ValueError("expected_generation must be a non-negative integer")
         cursor_metadata = dict(self.metadata)
         _validate_cursor_metadata(cursor_metadata)
-        _bounded_json(cursor_metadata, "cursor metadata", MAX_METADATA_BYTES)
+        _bounded_json(cursor_metadata, "cursor metadata", MAX_CURSOR_METADATA_BYTES)
         if self.last_success_at is not None:
             _parse_source_timestamp(self.last_success_at, "last_success_at")
         if self.updated_at is not None:
@@ -363,6 +376,29 @@ def reconcile_source_unit(
     processed_at: str | None = None,
     run_id: str | None = None,
 ) -> SourceUnitResult:
+    timestamp, effective_run_id = _prepare_source_unit(
+        observations,
+        cursor_update=cursor_update,
+        processed_at=processed_at,
+        run_id=run_id,
+    )
+    with operational_connection(db_path, write=True) as conn:
+        return _reconcile_source_unit_in_connection(
+            conn,
+            observations,
+            cursor_update=cursor_update,
+            processed_at=timestamp,
+            run_id=effective_run_id,
+        )
+
+
+def _prepare_source_unit(
+    observations: Sequence[OperationalObservation],
+    *,
+    cursor_update: SourceCursorUpdate | None,
+    processed_at: str | None,
+    run_id: str | None,
+) -> tuple[str, str]:
     if not observations and cursor_update is None:
         raise ValueError("a source unit requires observations or a cursor update")
     for observation in observations:
@@ -391,27 +427,48 @@ def reconcile_source_unit(
     timestamp = _canonical_timestamp(processed_at or now_iso(), "processed_at")
     effective_run_id = run_id or new_id("opsrun")
     _validate_identifier(effective_run_id, "run_id", 256)
+    return timestamp, effective_run_id
+
+
+def _reconcile_source_unit_in_connection(
+    conn: sqlite3.Connection,
+    observations: Sequence[OperationalObservation],
+    *,
+    cursor_update: SourceCursorUpdate | None,
+    processed_at: str,
+    run_id: str,
+    before_cursor: Callable[[tuple[ReconciliationResult, ...]], None] | None = None,
+) -> SourceUnitResult:
+    """Persist one validated unit; optional audit work runs before cursor mutation.
+
+    The caller must own the surrounding SQLite write transaction.  Keeping the
+    cursor write last lets higher-level source-unit projections participate in
+    the same all-or-nothing boundary without teaching reconciliation about them.
+    """
+
     reconciliations: list[ReconciliationResult] = []
     cursor: dict[str, Any] | None = None
-    with operational_connection(db_path, write=True) as conn:
-        for observation in observations:
-            reconciliations.append(
-                _reconcile_in_connection(
-                    conn,
-                    observation,
-                    processed_at=timestamp,
-                    run_id=effective_run_id,
-                )
-            )
-        if cursor_update is not None:
-            cursor = _save_source_cursor_in_connection(
+    for observation in observations:
+        reconciliations.append(
+            _reconcile_in_connection(
                 conn,
-                cursor_update,
-                updated_at=cursor_update.updated_at or timestamp,
+                observation,
+                processed_at=processed_at,
+                run_id=run_id,
             )
+        )
+    frozen_reconciliations = tuple(reconciliations)
+    if before_cursor is not None:
+        before_cursor(frozen_reconciliations)
+    if cursor_update is not None:
+        cursor = _save_source_cursor_in_connection(
+            conn,
+            cursor_update,
+            updated_at=cursor_update.updated_at or processed_at,
+        )
     return SourceUnitResult(
-        run_id=effective_run_id,
-        reconciliations=tuple(reconciliations),
+        run_id=run_id,
+        reconciliations=frozen_reconciliations,
         cursor=cursor,
     )
 
@@ -728,6 +785,12 @@ def canonical_source_key(observation: OperationalObservation) -> str:
     return f"source_{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:32]}"
 
 
+def operational_item_id(observation: OperationalObservation) -> str:
+    """Return the stable item id reconciliation assigns to an observation."""
+
+    return f"item_{canonical_source_key(observation).removeprefix('source_')}"
+
+
 def row_to_observation(row: sqlite3.Row) -> dict[str, Any]:
     output = dict(row)
     output["payload"] = json.loads(str(output["payload"]))
@@ -771,20 +834,9 @@ def _reconcile_in_connection(
         "SELECT * FROM ops_items WHERE canonical_key = ?",
         (canonical_key,),
     ).fetchone()
-    if not observation_created:
-        if item is None:
-            raise RuntimeError(
-                "an existing observation is missing its reconciled operational item"
-            )
-        return ReconciliationResult(
-            observation_id=observation_id,
-            item_id=str(item["id"]),
-            event_id=None,
-            event_type="noop",
-            state=str(item["state"]),
-            observation_created=False,
-            item_created=False,
-            item_changed=False,
+    if not observation_created and item is None:
+        raise RuntimeError(
+            "an existing observation is missing its reconciled operational item"
         )
     if item is None:
         return _create_item(
@@ -797,6 +849,21 @@ def _reconcile_in_connection(
         )
     incoming = _load_observation(conn, observation_id)
     current = _load_observation(conn, item["current_observation_id"])
+    if not observation_created:
+        if observation_id == str(current["id"]):
+            return _noop_reconciliation(item, observation_id)
+        if _restores_provider_authority(incoming, current):
+            return _update_item(
+                conn,
+                item,
+                observation,
+                observation_id=observation_id,
+                timestamp=processed_at,
+                run_id=run_id,
+                observation_created=False,
+                authority_reapplied=True,
+            )
+        return _noop_reconciliation(item, observation_id)
     incoming_order = _observation_order_key(incoming)
     current_order = _observation_order_key(current)
     if incoming_order <= current_order:
@@ -943,7 +1010,7 @@ def _create_item(
     timestamp: str,
     run_id: str,
 ) -> ReconciliationResult:
-    item_id = f"item_{canonical_key.removeprefix('source_')}"
+    item_id = operational_item_id(observation)
     state = "cancelled" if observation.cancelled else "active"
     payload = observation.payload()
     conn.execute(
@@ -1034,6 +1101,8 @@ def _update_item(
     observation_id: str,
     timestamp: str,
     run_id: str,
+    observation_created: bool = True,
+    authority_reapplied: bool = False,
 ) -> ReconciliationResult:
     before = row_to_item(row)
     previous_observation = _load_observation(conn, row["current_observation_id"])
@@ -1109,10 +1178,20 @@ def _update_item(
             ],
             "source_cancelled_before": source_cancelled_before,
             "source_cancelled_now": source_cancelled_now,
+            "authority_reapplied": authority_reapplied,
         },
         run_id=run_id,
         reconciliation_version=RECONCILIATION_VERSION,
-        idempotency_key=f"observation:{observation_id}",
+        idempotency_key=(
+            "authority:"
+            + hashlib.sha256(
+                _json([observation_id, previous_observation["id"], run_id]).encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+            if authority_reapplied
+            else f"observation:{observation_id}"
+        ),
         created_at=timestamp,
     )
     return ReconciliationResult(
@@ -1121,7 +1200,7 @@ def _update_item(
         event_id=event_id,
         event_type=event_type,
         state=state,
-        observation_created=True,
+        observation_created=observation_created,
         item_created=False,
         item_changed=True,
     )
@@ -1165,7 +1244,7 @@ def _save_source_cursor_in_connection(
     metadata_json = _bounded_json(
         dict(update.metadata),
         "cursor metadata",
-        MAX_METADATA_BYTES,
+        MAX_CURSOR_METADATA_BYTES,
     )
     conn.execute(
         """
@@ -1332,6 +1411,48 @@ def _observation_order_key(observation: Mapping[str, Any]) -> tuple[int, float]:
     )
 
 
+def _noop_reconciliation(
+    item: Mapping[str, Any],
+    observation_id: str,
+) -> ReconciliationResult:
+    return ReconciliationResult(
+        observation_id=observation_id,
+        item_id=str(item["id"]),
+        event_id=None,
+        event_type="noop",
+        state=str(item["state"]),
+        observation_created=False,
+        item_created=False,
+        item_changed=False,
+    )
+
+
+def _restores_provider_authority(
+    incoming: Mapping[str, Any],
+    current: Mapping[str, Any],
+) -> bool:
+    """Let a retained provider revision replace a synthetic uncertainty marker."""
+
+    if not _is_synthetic_revalidation(current):
+        return False
+    if _is_synthetic_revalidation(incoming):
+        return False
+    predecessor_revisions = {
+        str(reference.get("source_revision") or "")
+        for reference in current.get("evidence_refs") or ()
+        if isinstance(reference, Mapping)
+    }
+    return str(incoming["source_revision"]) in predecessor_revisions
+
+
+def _is_synthetic_revalidation(observation: Mapping[str, Any]) -> bool:
+    metadata = dict(observation.get("payload", {}).get("metadata") or {})
+    if metadata.get("revalidation_reason"):
+        return True
+    revision = str(observation.get("source_revision") or "")
+    return revision.startswith(("calendar-revalidation-", "gmail-revalidation-"))
+
+
 def _require_state(state: str, allowed: set[str], decision: str) -> None:
     if state not in allowed:
         raise ValueError(f"feedback {decision} is not valid from state {state}")
@@ -1446,7 +1567,14 @@ def _validate_cursor_metadata(metadata: Mapping[str, Any]) -> None:
     for key, value in metadata.items():
         if value is None or isinstance(value, (bool, int)):
             continue
-        if not isinstance(value, str) or len(value) > 256:
+        maximum = (
+            MAX_PENDING_THREAD_IDS_BYTES
+            if key == "pending_thread_ids"
+            else 8_192
+            if key in {"continuation_page_token", "reset_seen_item_ids"}
+            else 256
+        )
+        if not isinstance(value, str) or len(value) > maximum:
             raise ValueError(f"cursor metadata {key} must be a bounded scalar")
 
 

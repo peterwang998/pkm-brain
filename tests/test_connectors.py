@@ -126,6 +126,8 @@ def test_google_oauth_identity_flow_uses_pkce_and_keeps_secrets_out_of_config(
             "refresh_token": "refresh-secret",
             "scope": (
                 "openid email profile "
+                "https://www.googleapis.com/auth/userinfo.email "
+                "https://www.googleapis.com/auth/userinfo.profile "
                 "https://www.googleapis.com/auth/gmail.readonly"
             ),
             "expires_in": 3600,
@@ -173,6 +175,12 @@ def test_google_oauth_identity_flow_uses_pkce_and_keeps_secrets_out_of_config(
         assert status["account_label"] == "person@example.com"
         assert status["provider_subject"] == "google-subject-person-1"
         assert status["client_secret_configured"] is True
+        assert status["granted_scopes"] == [
+            "email",
+            "https://www.googleapis.com/auth/gmail.readonly",
+            "openid",
+            "profile",
+        ]
 
         config_text = (paths.config_local / "connector-auth.yaml").read_text(encoding="utf-8")
         assert "client-secret" not in config_text

@@ -125,6 +125,155 @@ def test_token_manager_refuses_identity_only_or_stale_scope_state(tmp_path: Path
         manager.access_token()
 
 
+def test_token_manager_can_require_exact_scopes_and_account_binding(
+    tmp_path: Path,
+) -> None:
+    paths, store = configured_google_grant(tmp_path, "gmail")
+    store.save(
+        "gmail",
+        {
+            "access_token": "secret",
+            "refresh_token": "refresh",
+            "expires_at": "2026-07-13T14:00:00+00:00",
+        },
+    )
+    config = load_auth_config(paths)
+    state = config["connectors"]["gmail"]
+    state["account_label"] = "owner@example.com"
+    state["provider_subject"] = "google-subject-1"
+    state["granted_scopes"] = [
+        "openid",
+        "https://www.googleapis.com/auth/userinfo.email",
+        "https://www.googleapis.com/auth/userinfo.profile",
+        "https://www.googleapis.com/auth/gmail.readonly",
+    ]
+    save_auth_config(paths, config)
+
+    manager = GoogleTokenManager(
+        paths,
+        "gmail",
+        store=store,
+        clock=lambda: datetime(2026, 7, 13, 12, tzinfo=timezone.utc),
+        expected_email="owner@example.com",
+        expected_subject="google-subject-1",
+        require_exact_scopes=True,
+    )
+    assert manager.access_token() == "secret"
+
+    config = load_auth_config(paths)
+    config["connectors"]["gmail"]["granted_scopes"].append(
+        "https://www.googleapis.com/auth/gmail.modify"
+    )
+    save_auth_config(paths, config)
+    with pytest.raises(RuntimeError, match="requires reauthorization"):
+        manager.access_token()
+
+
+def test_exact_token_refresh_accepts_google_identity_scope_aliases(
+    tmp_path: Path,
+) -> None:
+    paths, store = configured_google_grant(tmp_path, "gmail")
+    store.save(
+        "gmail",
+        {
+            "access_token": "expired",
+            "refresh_token": "refresh-secret",
+            "expires_at": "2026-07-13T08:00:00+00:00",
+        },
+    )
+    manager = GoogleTokenManager(
+        paths,
+        "gmail",
+        store=store,
+        requester=lambda _request, _timeout: response(
+            200,
+            {
+                "access_token": "new-secret",
+                "expires_in": 3600,
+                "scope": (
+                    "openid "
+                    "https://www.googleapis.com/auth/userinfo.email "
+                    "https://www.googleapis.com/auth/userinfo.profile "
+                    "https://www.googleapis.com/auth/gmail.readonly"
+                ),
+            },
+        ),
+        clock=lambda: datetime(2026, 7, 13, 12, tzinfo=timezone.utc),
+        require_exact_scopes=True,
+    )
+
+    assert manager.access_token() == "new-secret"
+    config = load_auth_config(paths)
+    assert config["connectors"]["gmail"]["granted_scopes"] == [
+        "email",
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "openid",
+        "profile",
+    ]
+
+
+def test_exact_token_refresh_still_rejects_broader_service_scope(
+    tmp_path: Path,
+) -> None:
+    paths, store = configured_google_grant(tmp_path, "gmail")
+    original = {
+        "access_token": "expired",
+        "refresh_token": "refresh-secret",
+        "expires_at": "2026-07-13T08:00:00+00:00",
+    }
+    store.save("gmail", original)
+    manager = GoogleTokenManager(
+        paths,
+        "gmail",
+        store=store,
+        requester=lambda _request, _timeout: response(
+            200,
+            {
+                "access_token": "overbroad-secret",
+                "expires_in": 3600,
+                "scope": (
+                    "openid "
+                    "https://www.googleapis.com/auth/userinfo.email "
+                    "https://www.googleapis.com/auth/userinfo.profile "
+                    "https://www.googleapis.com/auth/gmail.readonly "
+                    "https://www.googleapis.com/auth/gmail.modify"
+                ),
+            },
+        ),
+        clock=lambda: datetime(2026, 7, 13, 12, tzinfo=timezone.utc),
+        require_exact_scopes=True,
+    )
+
+    with pytest.raises(RuntimeError, match="returned unapproved scopes"):
+        manager.access_token()
+    assert store.load("gmail") == original
+
+
+def test_token_manager_refuses_policy_account_mismatch(tmp_path: Path) -> None:
+    paths, store = configured_google_grant(tmp_path, "calendar")
+    store.save(
+        "calendar",
+        {
+            "access_token": "secret",
+            "expires_at": "2026-07-13T14:00:00+00:00",
+        },
+    )
+    config = load_auth_config(paths)
+    config["connectors"]["calendar"]["account_label"] = "other@example.com"
+    save_auth_config(paths, config)
+
+    manager = GoogleTokenManager(
+        paths,
+        "calendar",
+        store=store,
+        clock=lambda: datetime(2026, 7, 13, 12, tzinfo=timezone.utc),
+        expected_email="owner@example.com",
+        require_exact_scopes=True,
+    )
+    with pytest.raises(RuntimeError, match="different account"):
+        manager.access_token()
+
+
 def test_get_client_retries_quota_error_and_uses_get_only() -> None:
     tokens = Tokens()
     requests = []

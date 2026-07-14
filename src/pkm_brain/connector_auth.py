@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Iterable, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
@@ -30,6 +30,30 @@ AUTH_CALLBACK_HOST = "127.0.0.1"
 AUTH_CALLBACK_PORT = 53682
 AUTH_FLOW_TTL = timedelta(minutes=10)
 KEYCHAIN_SERVICE = "com.pkm-brain.connector-auth"
+
+_GOOGLE_CONNECTOR_IDS = frozenset({"gmail", "calendar"})
+_GOOGLE_IDENTITY_SCOPE_ALIASES = {
+    "https://www.googleapis.com/auth/userinfo.email": "email",
+    "https://www.googleapis.com/auth/userinfo.profile": "profile",
+}
+
+
+def canonical_oauth_scopes(
+    connector_id: str,
+    values: Iterable[Any],
+) -> set[str]:
+    """Normalize provider aliases without collapsing service scopes."""
+    aliases = (
+        _GOOGLE_IDENTITY_SCOPE_ALIASES
+        if connector_id in _GOOGLE_CONNECTOR_IDS
+        else {}
+    )
+    scopes: set[str] = set()
+    for item in values:
+        value = str(item).strip()
+        if value:
+            scopes.add(aliases.get(value, value))
+    return scopes
 
 
 @dataclass(frozen=True)
@@ -308,8 +332,11 @@ def connector_auth_status(
         credentials.get(key)
         for key in ("access_token", "refresh_token", "id_token")
     )
-    requested = set(provider.scopes)
-    granted = {str(item) for item in state.get("granted_scopes") or [] if item}
+    requested = canonical_oauth_scopes(connector_id, provider.scopes)
+    granted = canonical_oauth_scopes(
+        connector_id,
+        state.get("granted_scopes") or [],
+    )
     if not client_id:
         status = "not_configured"
     elif credential_error:
@@ -759,7 +786,11 @@ def complete_authorization(flow: PendingOAuthFlow, token_response: dict[str, Any
         except (TypeError, ValueError):
             pass
     flow.store.save(flow.provider.connector_id, credentials)
-    granted = _granted_scopes(token_response, flow.provider.scopes)
+    granted = _granted_scopes(
+        flow.provider.connector_id,
+        token_response,
+        flow.provider.scopes,
+    )
     config = load_auth_config(flow.paths)
     state = config["connectors"].setdefault(flow.provider.connector_id, default_auth_state())
     state.update(
@@ -838,14 +869,19 @@ def _validate_identity_claims(flow: PendingOAuthFlow, claims: dict[str, Any]) ->
             raise ValueError("OAuth identity token is expired")
 
 
-def _granted_scopes(response: dict[str, Any], fallback: tuple[str, ...]) -> list[str]:
+def _granted_scopes(
+    connector_id: str,
+    response: dict[str, Any],
+    fallback: tuple[str, ...],
+) -> list[str]:
     raw = response.get("scope")
     if isinstance(raw, str):
         values = raw.replace(",", " ").split()
-        return sorted(set(values))
-    if isinstance(raw, list):
-        return sorted({str(item) for item in raw if item})
-    return list(fallback)
+    elif isinstance(raw, list):
+        values = raw
+    else:
+        values = fallback
+    return sorted(canonical_oauth_scopes(connector_id, values))
 
 
 def _account_label(claims: dict[str, Any]) -> str | None:

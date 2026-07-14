@@ -16,16 +16,26 @@ from pkm_brain.operational_db import (
     init_operational_db,
     operational_connection,
 )
+from pkm_brain.operational_migrations import (
+    OPERATIONAL_MIGRATIONS,
+    run_operational_migrations,
+)
 from pkm_brain.paths import BrainPaths
 
 
-EXPECTED_OPERATIONAL_MIGRATIONS = [1, 2, 3, 4]
+EXPECTED_OPERATIONAL_MIGRATIONS = [1, 2, 3, 4, 5, 6, 7, 8]
 EXPECTED_OPERATIONAL_TABLES = {
     "ops_schema_migrations",
     "ops_observations",
     "ops_items",
     "ops_item_events",
     "ops_source_cursors",
+    "ops_shadow_runs",
+    "ops_shadow_decisions",
+    "ops_handled_assessments",
+    "ops_briefing_snapshots",
+    "ops_missing_reports",
+    "ops_budget_reservations",
 }
 
 
@@ -63,6 +73,64 @@ def test_operational_migrations_are_independent_and_idempotent(tmp_path: Path) -
     assert "facts" not in tables
     assert "cos_actions" not in tables
     assert not paths.sqlite_path.exists()
+
+
+def test_cursor_metadata_expansion_preserves_v7_rows_and_other_bounds(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "ops-v7.sqlite"
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        run_operational_migrations(conn, migrations=OPERATIONAL_MIGRATIONS[:7])
+        conn.execute(
+            """
+            INSERT INTO ops_source_cursors(
+              connector_id, source_type, account_key, stream_key,
+              cursor, metadata, generation, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "gmail",
+                "gmail",
+                "gmail.personal",
+                "mailbox",
+                "history-7",
+                '{"coverage_status":"partial"}',
+                3,
+                "2026-07-13T15:00:00+00:00",
+            ),
+        )
+        run_operational_migrations(conn)
+
+        row = conn.execute(
+            "SELECT cursor, metadata, generation FROM ops_source_cursors"
+        ).fetchone()
+        cursor_sql = str(
+            conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'ops_source_cursors'"
+            ).fetchone()[0]
+        )
+        item_sql = str(
+            conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'ops_items'"
+            ).fetchone()[0]
+        )
+        observation_sql = str(
+            conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'ops_observations'"
+            ).fetchone()[0]
+        )
+    finally:
+        conn.close()
+
+    assert tuple(row) == ("history-7", '{"coverage_status":"partial"}', 3)
+    assert "<= 524288" in cursor_sql
+    assert "<= 16384" in item_sql
+    assert "<= 32768" in observation_sql
 
 
 def test_operational_connection_uses_wal_busy_timeout_and_foreign_keys(

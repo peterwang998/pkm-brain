@@ -12,6 +12,7 @@ import pytest
 from pkm_brain.db import init_db
 from pkm_brain.operational_db import init_operational_db, operational_connection
 from pkm_brain.operational_state import (
+    MAX_PENDING_THREAD_IDS_BYTES,
     CursorConflictError,
     FeedbackConflictError,
     ObservationConflictError,
@@ -736,6 +737,53 @@ def test_source_cursor_round_trip_updates_one_stream(tmp_path: Path) -> None:
     assert [first["generation"], second["generation"]] == [1, 2]
     assert second["metadata"] == {"pages": 2}
     assert get_source_cursor(db_path, "calendar", "account-1", "primary") == second
+
+
+def test_source_cursor_accepts_bounded_durable_gmail_backlog(tmp_path: Path) -> None:
+    db_path = operational_db(tmp_path)
+    pending_ids = [f"thread-{index:038d}" for index in range(10_000)]
+    encoded_pending = json.dumps(
+        pending_ids,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    assert 16_384 < len(encoded_pending.encode("utf-8")) < (
+        MAX_PENDING_THREAD_IDS_BYTES
+    )
+    update = SourceCursorUpdate(
+        connector_id="gmail",
+        source_type="gmail",
+        account_key="gmail.personal",
+        stream_key="mailbox",
+        cursor="history-1",
+        metadata={"pending_thread_ids": encoded_pending},
+    ).validated()
+
+    saved = save_source_cursor(
+        db_path,
+        update.connector_id,
+        update.account_key,
+        update.stream_key,
+        source_type=update.source_type,
+        cursor=update.cursor,
+        metadata=update.metadata,
+    )
+
+    assert saved["metadata"]["pending_thread_ids"] == encoded_pending
+
+
+def test_source_cursor_rejects_pending_backlog_over_its_byte_bound() -> None:
+    with pytest.raises(ValueError, match="pending_thread_ids"):
+        SourceCursorUpdate(
+            connector_id="gmail",
+            source_type="gmail",
+            account_key="gmail.personal",
+            stream_key="mailbox",
+            cursor=None,
+            metadata={
+                "pending_thread_ids": "x" * (MAX_PENDING_THREAD_IDS_BYTES + 1)
+            },
+        ).validated()
 
 
 def test_cursor_generation_cas_protects_streams_with_no_cursor_value(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import urllib.parse
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -14,6 +15,10 @@ from .google_normalization import (
     sanitize_calendar_event_payload,
     sanitize_gmail_thread_payload,
 )
+from .operational_state import MAX_PENDING_THREAD_IDS_BYTES
+
+
+MAX_PENDING_THREAD_IDS = 10_000
 
 
 class GoogleJSONClient(Protocol):
@@ -53,6 +58,8 @@ class GmailFetchResult:
     pages_fetched: int
     continuation_page_token: str | None = None
     baseline_history_id: str | None = None
+    pending_thread_ids: tuple[str, ...] = ()
+    continuation_history_id: str | None = None
     api_requests: int = 0
     quota_units: int = 0
 
@@ -270,6 +277,8 @@ class GmailThreadReader:
         history_id: str | None = None,
         continuation_page_token: str | None = None,
         baseline_history_id: str | None = None,
+        pending_thread_ids: tuple[str, ...] = (),
+        continuation_history_id: str | None = None,
     ) -> GmailFetchResult:
         normalized_query = query.strip()
         if not normalized_query or len(normalized_query) > 2_000:
@@ -281,6 +290,11 @@ class GmailThreadReader:
             baseline_history_id, name="baseline_history_id"
         )
         starting_history_id = _validated_history_id(history_id, name="history_id")
+        pending = _validated_pending_thread_ids(pending_thread_ids)
+        history_checkpoint = _validated_history_id(
+            continuation_history_id,
+            name="continuation_history_id",
+        )
         usage = _FetchUsage()
         if starting_history_id:
             if baseline is not None:
@@ -291,6 +305,8 @@ class GmailThreadReader:
                 return self._fetch_incremental(
                     starting_history_id,
                     continuation_page_token=page_token,
+                    pending_thread_ids=pending,
+                    continuation_history_id=history_checkpoint,
                     usage=usage,
                 )
             except GoogleAPIError as exc:
@@ -303,6 +319,12 @@ class GmailThreadReader:
                     usage=usage,
                 )
                 return replace(replacement, reset_required=True)
+        if pending:
+            raise ValueError("pending_thread_ids require an incremental history cursor")
+        if history_checkpoint is not None:
+            raise ValueError(
+                "continuation_history_id requires an incremental history cursor"
+            )
         if page_token is not None and baseline is None:
             raise ValueError(
                 "baseline_history_id is required when resuming a full Gmail fetch"
@@ -381,6 +403,8 @@ class GmailThreadReader:
             pages=pages,
             continuation_page_token=page_token if not coverage_complete else None,
             baseline_history_id=baseline_history_id,
+            pending_thread_ids=(),
+            continuation_history_id=None,
             usage=usage,
         )
 
@@ -389,23 +413,59 @@ class GmailThreadReader:
         history_id: str,
         *,
         continuation_page_token: str | None,
+        pending_thread_ids: tuple[str, ...],
+        continuation_history_id: str | None,
         usage: _FetchUsage,
     ) -> GmailFetchResult:
+        if pending_thread_ids:
+            selected = list(pending_thread_ids[: self.max_threads])
+            remaining_pending = pending_thread_ids[self.max_threads :]
+            coverage_complete = (
+                not remaining_pending and continuation_page_token is None
+            )
+            if coverage_complete and continuation_history_id is None:
+                raise ValueError(
+                    "pending history completion requires continuation_history_id"
+                )
+            return self._fetch_thread_payloads(
+                mode="incremental",
+                thread_ids=selected,
+                next_history_id=(
+                    continuation_history_id if coverage_complete else None
+                ),
+                reset_required=False,
+                coverage_complete=coverage_complete,
+                pages=0,
+                continuation_page_token=(
+                    continuation_page_token if not coverage_complete else None
+                ),
+                baseline_history_id=None,
+                pending_thread_ids=remaining_pending,
+                continuation_history_id=(
+                    continuation_history_id if not coverage_complete else None
+                ),
+                usage=usage,
+            )
         changed_ids: list[str] = []
         seen: set[str] = set()
         page_token = continuation_page_token
         pages = 0
         records_seen = 0
-        next_history_id: str | None = None
+        next_history_id: str | None = continuation_history_id
         coverage_complete = True
         while True:
             remaining = self.max_history_records - records_seen
-            if remaining <= 0 or pages >= self.max_pages:
+            remaining_threads = self.max_threads - len(changed_ids)
+            if remaining <= 0 or remaining_threads <= 0 or pages >= self.max_pages:
                 coverage_complete = False
                 break
             params: dict[str, str | int] = {
                 "startHistoryId": history_id,
-                "maxResults": min(self.history_page_size, remaining),
+                "maxResults": min(
+                    self.history_page_size,
+                    remaining,
+                    remaining_threads,
+                ),
             }
             if page_token:
                 params["pageToken"] = page_token
@@ -434,24 +494,35 @@ class GmailThreadReader:
                 _optional_string(payload.get("historyId")) or next_history_id
             )
             page_token = _optional_string(payload.get("nextPageToken"))
-            if not coverage_complete or not page_token:
+            if (
+                not coverage_complete
+                or not page_token
+                or len(changed_ids) >= self.max_threads
+            ):
                 break
         if page_token:
             coverage_complete = False
-        if len(changed_ids) > self.max_threads:
-            changed_ids = changed_ids[: self.max_threads]
+        selected_ids = changed_ids[: self.max_threads]
+        pending_ids = _validated_pending_thread_ids(
+            tuple(changed_ids[self.max_threads :])
+        )
+        if pending_ids:
             coverage_complete = False
         if coverage_complete and not next_history_id:
             raise RuntimeError("Gmail completed history sync without historyId")
         return self._fetch_thread_payloads(
             mode="incremental",
-            thread_ids=changed_ids,
+            thread_ids=selected_ids,
             next_history_id=next_history_id if coverage_complete else None,
             reset_required=False,
             coverage_complete=coverage_complete,
             pages=pages,
             continuation_page_token=page_token if not coverage_complete else None,
             baseline_history_id=None,
+            pending_thread_ids=pending_ids,
+            continuation_history_id=(
+                next_history_id if not coverage_complete else None
+            ),
             usage=usage,
         )
 
@@ -466,6 +537,8 @@ class GmailThreadReader:
         pages: int,
         continuation_page_token: str | None,
         baseline_history_id: str | None,
+        pending_thread_ids: tuple[str, ...],
+        continuation_history_id: str | None,
         usage: _FetchUsage,
     ) -> GmailFetchResult:
         raw_threads: list[dict[str, Any]] = []
@@ -506,6 +579,8 @@ class GmailThreadReader:
             pages_fetched=pages,
             continuation_page_token=continuation_page_token,
             baseline_history_id=baseline_history_id,
+            pending_thread_ids=pending_thread_ids,
+            continuation_history_id=continuation_history_id,
             api_requests=usage.api_requests,
             quota_units=usage.quota_units,
         )
@@ -566,3 +641,25 @@ def _validated_history_id(value: str | None, *, name: str) -> str | None:
     if len(normalized) > 256:
         raise ValueError(f"{name} is too long")
     return normalized
+
+
+def _validated_pending_thread_ids(values: tuple[str, ...]) -> tuple[str, ...]:
+    if not isinstance(values, tuple):
+        raise ValueError("pending_thread_ids must be a tuple")
+    if len(values) > MAX_PENDING_THREAD_IDS:
+        raise ValueError("pending_thread_ids exceeds the durable continuation bound")
+    output: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, str):
+            raise ValueError("pending_thread_ids must contain strings")
+        normalized = value.strip()
+        if not normalized or len(normalized) > 256:
+            raise ValueError("pending_thread_ids contains an invalid thread id")
+        if normalized not in seen:
+            output.append(normalized)
+            seen.add(normalized)
+    encoded = json.dumps(output, ensure_ascii=False, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > MAX_PENDING_THREAD_IDS_BYTES:
+        raise ValueError("pending_thread_ids exceeds the durable continuation bound")
+    return tuple(output)

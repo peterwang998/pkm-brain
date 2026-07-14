@@ -17,7 +17,9 @@ from typing import Any, Protocol
 from .connector_auth import (
     CredentialStore,
     OAUTH_PROVIDERS,
+    canonical_oauth_scopes,
     credential_store_for,
+    decode_id_token_claims,
     load_auth_config,
     save_auth_config,
 )
@@ -165,6 +167,9 @@ class GoogleTokenManager:
         requester: HTTPRequester = perform_http_request,
         timeout_seconds: float = 30.0,
         clock: Callable[[], datetime] | None = None,
+        expected_email: str | None = None,
+        expected_subject: str | None = None,
+        require_exact_scopes: bool = False,
     ) -> None:
         provider = OAUTH_PROVIDERS.get(connector_id)
         if connector_id not in GOOGLE_API_ROOTS or provider is None:
@@ -178,6 +183,9 @@ class GoogleTokenManager:
         self.requester = requester
         self.timeout_seconds = timeout_seconds
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.expected_email = (expected_email or "").strip().casefold() or None
+        self.expected_subject = (expected_subject or "").strip() or None
+        self.require_exact_scopes = require_exact_scopes
         self._lock = threading.Lock()
 
     def access_token(self, *, force_refresh: bool = False) -> str:
@@ -189,13 +197,25 @@ class GoogleTokenManager:
                 raise RuntimeError(
                     f"{self.connector_id} OAuth client is not configured"
                 )
-            granted = {str(value) for value in state.get("granted_scopes") or []}
-            required = set(self.provider.scopes)
-            if not required.issubset(granted):
+            granted = canonical_oauth_scopes(
+                self.connector_id,
+                state.get("granted_scopes") or [],
+            )
+            required = canonical_oauth_scopes(
+                self.connector_id,
+                self.provider.scopes,
+            )
+            scopes_match = (
+                granted == required
+                if self.require_exact_scopes
+                else required.issubset(granted)
+            )
+            if not scopes_match:
                 raise RuntimeError(
                     f"{self.connector_id} read-only grant requires reauthorization"
                 )
             credentials = self.store.load(self.connector_id) or {}
+            self._validate_account_binding(state, credentials)
             access_token = str(credentials.get("access_token") or "").strip()
             if (
                 not force_refresh
@@ -270,10 +290,21 @@ class GoogleTokenManager:
             updated["token_type"] = str(payload["token_type"])
         if payload.get("scope"):
             updated["scope"] = str(payload["scope"])
-            refreshed_scopes = set(str(payload["scope"]).replace(",", " ").split())
-            if not set(self.provider.scopes).issubset(refreshed_scopes):
+            refreshed_scopes = canonical_oauth_scopes(
+                self.connector_id,
+                str(payload["scope"]).replace(",", " ").split(),
+            )
+            required_scopes = canonical_oauth_scopes(
+                self.connector_id,
+                self.provider.scopes,
+            )
+            if not required_scopes.issubset(refreshed_scopes):
                 raise RuntimeError(
                     f"{self.connector_id} token refresh dropped required read-only scopes"
+                )
+            if self.require_exact_scopes and refreshed_scopes != required_scopes:
+                raise RuntimeError(
+                    f"{self.connector_id} token refresh returned unapproved scopes"
                 )
             state["granted_scopes"] = sorted(refreshed_scopes)
         try:
@@ -292,6 +323,28 @@ class GoogleTokenManager:
         )
         save_auth_config(self.paths, config)
         return token
+
+    def _validate_account_binding(
+        self,
+        state: Mapping[str, Any],
+        credentials: Mapping[str, Any],
+    ) -> None:
+        if self.expected_email is None and self.expected_subject is None:
+            return
+        claims = decode_id_token_claims(str(credentials.get("id_token") or ""))
+        actual_email = str(claims.get("email") or state.get("account_label") or "")
+        actual_email = actual_email.strip().casefold()
+        actual_subject = str(
+            claims.get("sub") or state.get("provider_subject") or ""
+        ).strip()
+        if self.expected_email is not None and actual_email != self.expected_email:
+            raise RuntimeError(
+                f"{self.connector_id} OAuth grant is bound to a different account"
+            )
+        if self.expected_subject is not None and actual_subject != self.expected_subject:
+            raise RuntimeError(
+                f"{self.connector_id} OAuth grant subject does not match policy"
+            )
 
 
 class GoogleAPIClient:

@@ -17,8 +17,10 @@ from pkm_brain.google_routes import (
     local_google_evidence_route,
 )
 from pkm_brain.google_sources import (
+    MAX_PENDING_THREAD_IDS,
     GoogleCalendarReader,
     GmailThreadReader,
+    _validated_pending_thread_ids,
     calendar_event_is_inactive,
     calendar_occurrence_key,
 )
@@ -461,6 +463,154 @@ def test_gmail_incremental_history_resumes_from_page_token() -> None:
     assert resume_client.calls[0][1]["pageToken"] == "history-page-2"
     assert resumed.api_requests == 2
     assert resumed.quota_units == 42
+
+
+def test_gmail_incremental_thread_cap_stops_at_page_boundary_and_resumes() -> None:
+    first_client = FakeClient(
+        [
+            {
+                "history": [
+                    {"id": "10", "messagesAdded": [{"message": {"threadId": "t1"}}]},
+                    {"id": "11", "messagesAdded": [{"message": {"threadId": "t2"}}]},
+                ],
+                "historyId": "11",
+                "nextPageToken": "cap-page-2",
+            },
+            gmail_thread("t1"),
+            gmail_thread("t2"),
+        ]
+    )
+    partial = GmailThreadReader(
+        first_client,
+        max_threads=2,
+        max_pages=10,
+    ).fetch(query="newer_than:30d", history_id="9")
+
+    assert partial.coverage_complete is False
+    assert partial.changed_thread_ids == ("t1", "t2")
+    assert partial.continuation_page_token == "cap-page-2"
+    assert first_client.calls[0][1]["maxResults"] == 2
+
+    resume_client = FakeClient(
+        [
+            {
+                "history": [
+                    {"id": "12", "messagesAdded": [{"message": {"threadId": "t3"}}]}
+                ],
+                "historyId": "12",
+            },
+            gmail_thread("t3"),
+        ]
+    )
+    resumed = GmailThreadReader(resume_client, max_threads=2).fetch(
+        query="newer_than:30d",
+        history_id="9",
+        continuation_page_token=partial.continuation_page_token,
+    )
+
+    assert resumed.coverage_complete is True
+    assert resumed.changed_thread_ids == ("t3",)
+    assert resumed.next_history_id == "12"
+    assert resume_client.calls[0][1]["pageToken"] == "cap-page-2"
+
+
+def test_gmail_history_overflow_is_drained_before_advancing_page_token() -> None:
+    first_client = FakeClient(
+        [
+            {
+                "history": [
+                    {
+                        "id": "10",
+                        "messagesAdded": [
+                            {"message": {"id": "m1", "threadId": "t1"}},
+                            {"message": {"id": "m2", "threadId": "t2"}},
+                            {"message": {"id": "m3", "threadId": "t3"}},
+                        ],
+                    }
+                ],
+                "historyId": "11",
+                "nextPageToken": "history-page-2",
+            },
+            gmail_thread("t1"),
+            gmail_thread("t2"),
+        ]
+    )
+    first = GmailThreadReader(first_client, max_threads=2).fetch(
+        query="newer_than:30d",
+        history_id="9",
+    )
+
+    assert first.coverage_complete is False
+    assert first.changed_thread_ids == ("t1", "t2")
+    assert first.pending_thread_ids == ("t3",)
+    assert first.continuation_page_token == "history-page-2"
+    assert first.continuation_history_id == "11"
+
+    drain_client = FakeClient([gmail_thread("t3")])
+    drained = GmailThreadReader(drain_client, max_threads=2).fetch(
+        query="newer_than:30d",
+        history_id="9",
+        continuation_page_token=first.continuation_page_token,
+        pending_thread_ids=first.pending_thread_ids,
+        continuation_history_id=first.continuation_history_id,
+    )
+
+    assert drained.coverage_complete is False
+    assert drained.changed_thread_ids == ("t3",)
+    assert drained.pending_thread_ids == ()
+    assert drained.continuation_page_token == "history-page-2"
+    assert drained.continuation_history_id == "11"
+    assert all(call[0] != "history" for call in drain_client.calls)
+
+    final_client = FakeClient(
+        [
+            {
+                "history": [
+                    {
+                        "id": "11",
+                        "messagesAdded": [
+                            {"message": {"id": "m4", "threadId": "t4"}}
+                        ],
+                    }
+                ],
+                "historyId": "12",
+            },
+            gmail_thread("t4"),
+        ]
+    )
+    final = GmailThreadReader(final_client, max_threads=2).fetch(
+        query="newer_than:30d",
+        history_id="9",
+        continuation_page_token=drained.continuation_page_token,
+        continuation_history_id=drained.continuation_history_id,
+    )
+
+    assert final.coverage_complete is True
+    assert final.changed_thread_ids == ("t4",)
+    assert final.next_history_id == "12"
+    assert final_client.calls[0][1]["pageToken"] == "history-page-2"
+
+
+def test_gmail_pending_backlog_accepts_its_durable_count_and_byte_envelope() -> None:
+    pending = tuple(
+        f"thread-{index:038d}" for index in range(MAX_PENDING_THREAD_IDS)
+    )
+
+    assert _validated_pending_thread_ids(pending) == pending
+
+
+def test_gmail_pending_backlog_rejects_count_or_encoded_payload_overflow() -> None:
+    with pytest.raises(ValueError, match="durable continuation bound"):
+        _validated_pending_thread_ids(
+            tuple(f"thread-{index}" for index in range(MAX_PENDING_THREAD_IDS + 1))
+        )
+    with pytest.raises(ValueError, match="durable continuation bound"):
+        _validated_pending_thread_ids(
+            tuple(
+                f"{index:05d}-{'x' * 50}"
+                for index in range(MAX_PENDING_THREAD_IDS)
+            )
+        )
 
 
 def test_gmail_full_resume_requires_its_original_baseline() -> None:
