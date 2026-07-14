@@ -182,8 +182,9 @@ class GoogleCalendarReader:
             if remaining <= 0 or pages >= self.max_pages:
                 coverage_complete = False
                 break
+            requested_max = min(self.page_size, remaining)
             params: dict[str, str | int] = {
-                "maxResults": min(self.page_size, remaining),
+                "maxResults": requested_max,
                 "showDeleted": "true",
                 # Today needs concrete occurrences, not recurrence masters.  Google
                 # keeps each expanded occurrence anchored to recurringEventId plus
@@ -210,9 +211,10 @@ class GoogleCalendarReader:
             items = [
                 item for item in payload.get("items") or [] if isinstance(item, Mapping)
             ]
-            if len(items) > remaining:
-                items = items[:remaining]
-                coverage_complete = False
+            if len(items) > requested_max:
+                raise RuntimeError(
+                    "Calendar events.list exceeded its requested page bound"
+                )
             raw_events.extend(sanitize_calendar_event_payload(item) for item in items)
             page_token = _optional_string(payload.get("nextPageToken"))
             if not page_token:
@@ -364,8 +366,9 @@ class GmailThreadReader:
             if remaining <= 0 or pages >= self.max_pages:
                 coverage_complete = False
                 break
+            requested_max = min(self.page_size, remaining)
             params: dict[str, str | int] = {
-                "maxResults": min(self.page_size, remaining),
+                "maxResults": requested_max,
                 "q": query,
             }
             if page_token:
@@ -377,20 +380,22 @@ class GmailThreadReader:
                 quota_units=self.THREADS_LIST_UNITS,
             )
             pages += 1
-            overflowed_page = False
-            for item in payload.get("threads") or []:
-                if not isinstance(item, Mapping):
-                    continue
+            page_threads = [
+                item
+                for item in payload.get("threads") or []
+                if isinstance(item, Mapping)
+            ]
+            if len(page_threads) > requested_max:
+                raise RuntimeError(
+                    "Gmail threads.list exceeded its requested page bound"
+                )
+            for item in page_threads:
                 thread_id = _optional_string(item.get("id"))
                 if thread_id and thread_id not in seen:
-                    if len(thread_ids) >= self.max_threads:
-                        overflowed_page = True
-                        coverage_complete = False
-                        break
                     seen.add(thread_id)
                     thread_ids.append(thread_id)
             page_token = _optional_string(payload.get("nextPageToken"))
-            if overflowed_page or not page_token:
+            if not page_token:
                 break
         if page_token:
             coverage_complete = False
@@ -459,13 +464,14 @@ class GmailThreadReader:
             if remaining <= 0 or remaining_threads <= 0 or pages >= self.max_pages:
                 coverage_complete = False
                 break
+            requested_max = min(
+                self.history_page_size,
+                remaining,
+                remaining_threads,
+            )
             params: dict[str, str | int] = {
                 "startHistoryId": history_id,
-                "maxResults": min(
-                    self.history_page_size,
-                    remaining,
-                    remaining_threads,
-                ),
+                "maxResults": requested_max,
             }
             if page_token:
                 params["pageToken"] = page_token
@@ -481,9 +487,10 @@ class GmailThreadReader:
                 for item in payload.get("history") or []
                 if isinstance(item, Mapping)
             ]
-            if len(records) > remaining:
-                records = records[:remaining]
-                coverage_complete = False
+            if len(records) > requested_max:
+                raise RuntimeError(
+                    "Gmail history.list exceeded its requested page bound"
+                )
             records_seen += len(records)
             for record in records:
                 for thread_id in _history_thread_ids(record):

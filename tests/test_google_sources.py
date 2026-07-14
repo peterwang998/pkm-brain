@@ -254,6 +254,23 @@ def test_calendar_reader_refuses_non_primary_calendar_and_partial_cursor() -> No
     assert resumed.quota_units == 1
 
 
+def test_calendar_fails_closed_when_provider_exceeds_requested_page_bound() -> None:
+    client = FakeClient(
+        [
+            {
+                "items": [{"id": "one"}, {"id": "two"}, {"id": "three"}],
+                "nextPageToken": "unsafe-resume",
+            }
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="exceeded its requested page bound"):
+        GoogleCalendarReader(client, max_events=2).fetch(
+            time_min="2026-07-01T00:00:00Z",
+            time_max="2026-08-01T00:00:00Z",
+        )
+
+
 def test_calendar_incremental_fetch_resumes_page_sequence_with_expansion() -> None:
     client = FakeClient([{"items": [{"id": "changed"}], "nextSyncToken": "sync-3"}])
 
@@ -408,6 +425,21 @@ def test_gmail_partial_full_fetch_never_advances_history_cursor() -> None:
     assert all(call[0] != "profile" for call in resume_client.calls)
     assert resumed.api_requests == 2
     assert resumed.quota_units == 50
+
+
+def test_gmail_full_fetch_fails_closed_on_overfull_provider_page() -> None:
+    client = FakeClient(
+        [
+            {"historyId": "500"},
+            {
+                "threads": [{"id": "t1"}, {"id": "t2"}, {"id": "t3"}],
+                "nextPageToken": "unsafe-resume",
+            },
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="exceeded its requested page bound"):
+        GmailThreadReader(client, max_threads=2).fetch(query="newer_than:30d")
 
 
 def test_gmail_incremental_history_resumes_from_page_token() -> None:
@@ -589,6 +621,60 @@ def test_gmail_history_overflow_is_drained_before_advancing_page_token() -> None
     assert final.changed_thread_ids == ("t4",)
     assert final.next_history_id == "12"
     assert final_client.calls[0][1]["pageToken"] == "history-page-2"
+
+
+def test_google_readers_fail_closed_when_provider_exceeds_requested_page_bound() -> None:
+    calendar = GoogleCalendarReader(
+        FakeClient(
+            [
+                {
+                    "items": [
+                        {"id": "event-1", "status": "cancelled"},
+                        {"id": "event-2", "status": "cancelled"},
+                    ],
+                    "nextSyncToken": "sync-2",
+                }
+            ]
+        ),
+        page_size=1,
+        max_events=1,
+    )
+    with pytest.raises(RuntimeError, match="events.list exceeded"):
+        calendar.fetch(
+            time_min="2026-07-01T00:00:00Z",
+            time_max="2026-08-01T00:00:00Z",
+        )
+
+    full_gmail = GmailThreadReader(
+        FakeClient(
+            [
+                {"historyId": "20"},
+                {"threads": [{"id": "t1"}, {"id": "t2"}]},
+            ]
+        ),
+        page_size=1,
+        max_threads=1,
+    )
+    with pytest.raises(RuntimeError, match="threads.list exceeded"):
+        full_gmail.fetch(query="newer_than:30d")
+
+    incremental_gmail = GmailThreadReader(
+        FakeClient(
+            [
+                {
+                    "history": [
+                        {"id": "10", "messages": []},
+                        {"id": "11", "messages": []},
+                    ],
+                    "historyId": "12",
+                }
+            ]
+        ),
+        history_page_size=1,
+        max_history_records=1,
+    )
+    with pytest.raises(RuntimeError, match="history.list exceeded"):
+        incremental_gmail.fetch(query="newer_than:30d", history_id="9")
 
 
 def test_gmail_pending_backlog_accepts_its_durable_count_and_byte_envelope() -> None:
