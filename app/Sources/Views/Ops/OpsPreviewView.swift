@@ -555,9 +555,7 @@ private struct ConnectorAuthSheet: View {
             VStack(alignment: .leading, spacing: 18) {
                 LabeledContent(
                     "Access",
-                    value: manifest.phase == "read_only"
-                        ? "Operational read-only access"
-                        : "Identity only"
+                    value: manifest.accessSummary(for: connector.id)
                 )
                 if let account = state.account_label, !account.isEmpty {
                     LabeledContent("Account", value: account)

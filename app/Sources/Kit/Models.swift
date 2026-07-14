@@ -747,6 +747,20 @@ public struct ConnectorAuthManifest: Codable, Equatable, Sendable {
     public let client_secret_required: Bool
     public let redirect_uri: String
     public let setup_url: String
+
+    public func accessSummary(for connectorID: String) -> String {
+        guard phase == "read_only" else {
+            return "Identity only"
+        }
+        switch connectorID {
+        case "gmail":
+            return "Read Gmail messages and threads only"
+        case "calendar":
+            return "Read events on your owned primary calendar only"
+        default:
+            return "Operational read-only access"
+        }
+    }
 }
 
 public struct ConnectorSettingField: Codable, Equatable, Identifiable, Sendable {

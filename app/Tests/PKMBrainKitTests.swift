@@ -5,6 +5,44 @@ import Testing
 
 @Suite("PKMBrainKit decoding")
 struct PKMBrainKitTests {
+    @Test("Connector authorization explains each read-only boundary")
+    func connectorAuthorizationAccessSummary() {
+        let gmail = ConnectorAuthManifest(
+            kind: "oauth2",
+            provider: "gmail",
+            phase: "read_only",
+            requested_scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+            client_secret_required: false,
+            redirect_uri: "http://127.0.0.1/oauth/callback/gmail",
+            setup_url: "https://console.cloud.google.com/apis/credentials"
+        )
+        let calendar = ConnectorAuthManifest(
+            kind: "oauth2",
+            provider: "calendar",
+            phase: "read_only",
+            requested_scopes: ["https://www.googleapis.com/auth/calendar.events.owned.readonly"],
+            client_secret_required: false,
+            redirect_uri: "http://127.0.0.1/oauth/callback/calendar",
+            setup_url: "https://console.cloud.google.com/apis/credentials"
+        )
+        let identity = ConnectorAuthManifest(
+            kind: "oauth2",
+            provider: "slack",
+            phase: "identity_only",
+            requested_scopes: ["openid"],
+            client_secret_required: true,
+            redirect_uri: "http://127.0.0.1/oauth/callback/slack",
+            setup_url: "https://api.slack.com/apps"
+        )
+
+        #expect(gmail.accessSummary(for: "gmail") == "Read Gmail messages and threads only")
+        #expect(
+            calendar.accessSummary(for: "calendar")
+                == "Read events on your owned primary calendar only"
+        )
+        #expect(identity.accessSummary(for: "slack") == "Identity only")
+    }
+
     @Test("health fixture decodes")
     func healthFixtureDecodes() throws {
         let health: DaemonHealth = try decodeFixture("health")
