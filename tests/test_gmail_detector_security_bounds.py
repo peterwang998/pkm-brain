@@ -102,4 +102,5 @@ def test_single_oversized_thread_is_deferred_without_crossing_batch_char_bound()
     assert result.deferred_count == 1
     assert result.detections[0].disposition == "deferred"
     assert result.detections[0].reason_code == "detector_prompt_oversized"
-    assert result.detections[1].disposition == "suppressed"
+    assert result.detections[1].disposition == "surfaced"
+    assert result.detections[1].reason_code == "direct_obligation_model_uncertain"

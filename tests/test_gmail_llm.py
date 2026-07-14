@@ -11,6 +11,7 @@ from pkm_brain.gmail_llm import (
     GMAIL_LLM_CONFIG_FILENAME,
     RestrictedCodexGmailProvider,
     get_gmail_provider,
+    resolve_codex_binary,
     restricted_codex_command,
     restricted_codex_process_environment,
     resolve_gmail_llm_selection,
@@ -153,7 +154,16 @@ def test_adversarial_email_is_stdin_only_and_environment_is_scrubbed(
     submitted = str(captured["input"])
     assert hostile in submitted
     assert "untrusted data" in submitted
-    assert captured["schema"] == gmail_llm._GENERIC_OBJECT_SCHEMA
+    assert captured["schema"] == gmail_llm._GMAIL_DETECTOR_OUTPUT_SCHEMA
+    candidate_schema = captured["schema"]["properties"]["threads"]["items"][
+        "properties"
+    ]["candidates"]["items"]
+    assert "evidence" in candidate_schema["required"]
+    assert candidate_schema["properties"]["operation"]["enum"] == [
+        "create",
+        "update",
+        "needs_reconciliation",
+    ]
     environment = captured["env"]
     assert isinstance(environment, dict)
     assert set(environment) <= {
@@ -293,6 +303,34 @@ def test_process_environment_is_allowlist_not_denylist() -> None:
         "PATH": "/usr/bin:/bin",
         "USER": "test",
     }
+
+
+def test_codex_binary_resolves_home_local_bin_for_finder_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    binary = tmp_path / ".local" / "bin" / "codex"
+    binary.parent.mkdir(parents=True)
+    binary.touch(mode=0o700)
+    monkeypatch.setattr(gmail_llm.shutil, "which", lambda *_args, **_kwargs: None)
+
+    resolved = resolve_codex_binary(
+        environ={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"}
+    )
+
+    assert resolved == str(binary.resolve())
+
+
+def test_codex_binary_rejects_missing_or_non_executable_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    binary = tmp_path / "codex"
+    binary.touch(mode=0o600)
+    monkeypatch.setattr(gmail_llm.shutil, "which", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(LLMConfigurationError, match="executable was not found"):
+        resolve_codex_binary(str(binary), environ={"HOME": str(tmp_path)})
 
 
 def test_global_provider_selection_cannot_route_gmail_to_direct_api(

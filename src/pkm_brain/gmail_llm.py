@@ -57,10 +57,96 @@ _CONFIG_KEYS = frozenset(
 _MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _VERSION_RE = re.compile(r"(?:codex(?:-cli)?\s+)?(\d+)\.(\d+)\.(\d+)")
 
-_GENERIC_OBJECT_SCHEMA: dict[str, Any] = {
+_NULLABLE_STRING = {"type": ["string", "null"]}
+_EVIDENCE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "message_id": {"type": "string", "minLength": 1},
+        "quote": {"type": "string", "minLength": 1, "maxLength": 500},
+    },
+    "required": ["message_id", "quote"],
+}
+_CANDIDATE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "detector_key": {"type": "string"},
+        "operation": {"enum": ["create", "update", "needs_reconciliation"]},
+        "kind": {
+            "enum": ["commitment", "waiting", "follow_up", "deadline", "attention"]
+        },
+        "title": {"type": "string"},
+        "owner": {"enum": ["operator", "other", "shared", "unknown"]},
+        "priority": {"type": ["string", "integer"]},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "due_at": _NULLABLE_STRING,
+        "starts_at": _NULLABLE_STRING,
+        "ends_at": _NULLABLE_STRING,
+        "expires_at": _NULLABLE_STRING,
+        "counterparty": _NULLABLE_STRING,
+        "evidence_message_ids": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 12,
+            "items": {"type": "string"},
+        },
+        "evidence": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 12,
+            "items": _EVIDENCE_SCHEMA,
+        },
+        # Handled-state fields stay in the transport contract for direct-provider
+        # compatibility. gmail_operations derives the authoritative value itself.
+        "handled_verdict": {
+            "enum": ["needs_action", "responded_waiting", "unknown"]
+        },
+        "handled_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "reason": _NULLABLE_STRING,
+        "reconciliation_status": {
+            "enum": ["confirmed", "provisional", "ambiguous"]
+        },
+    },
+    "required": [
+        "detector_key",
+        "operation",
+        "kind",
+        "title",
+        "owner",
+        "priority",
+        "confidence",
+        "due_at",
+        "starts_at",
+        "ends_at",
+        "expires_at",
+        "counterparty",
+        "evidence_message_ids",
+        "evidence",
+        "handled_verdict",
+        "handled_confidence",
+        "reason",
+        "reconciliation_status",
+    ],
+}
+_THREAD_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "thread_id": {"type": "string"},
+        "decision": {"enum": ["ignore", "candidates"]},
+        "reason_code": {"type": "string"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "candidates": {"type": "array", "maxItems": 12, "items": _CANDIDATE_SCHEMA},
+    },
+    "required": ["thread_id", "decision", "reason_code", "confidence", "candidates"],
+}
+_GMAIL_DETECTOR_OUTPUT_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
-    "additionalProperties": True,
+    "additionalProperties": False,
+    "properties": {"threads": {"type": "array", "items": _THREAD_SCHEMA}},
+    "required": ["threads"],
 }
 
 # Every switch is supplied after --ignore-user-config, at the highest CLI
@@ -81,7 +167,6 @@ _RESTRICTED_CONFIG_OVERRIDES = (
     'file_opener="none"',
     'web_search="disabled"',
     "tools.web_search=false",
-    "tools.view_image=false",
     "apps._default.enabled=false",
     "mcp_servers={}",
     "plugins={}",
@@ -308,15 +393,7 @@ class RestrictedCodexGmailProvider:
             minimum=30,
             maximum=900,
         )
-        candidate = binary or shutil.which("codex")
-        if not candidate:
-            raise LLMConfigurationError(
-                "codex executable was not found; install/login to Codex CLI first"
-            )
-        resolved = (
-            shutil.which(candidate) if not Path(candidate).is_absolute() else candidate
-        )
-        self.binary = str(resolved or candidate)
+        self.binary = resolve_codex_binary(binary)
         verify_restricted_codex_capabilities(self.binary)
         verify_codex_login(self.binary)
 
@@ -334,7 +411,7 @@ class RestrictedCodexGmailProvider:
                 cwd.mkdir(mode=0o700)
                 schema_path = root / "response.schema.json"
                 schema_path.write_text(
-                    json.dumps(_GENERIC_OBJECT_SCHEMA, sort_keys=True),
+                    json.dumps(_GMAIL_DETECTOR_OUTPUT_SCHEMA, sort_keys=True),
                     encoding="utf-8",
                 )
                 output_path = root / "last-message.json"
@@ -442,6 +519,40 @@ def restricted_codex_command(
         )
     )
     return command
+
+
+def resolve_codex_binary(
+    configured: str | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> str:
+    """Resolve Codex safely even when a Finder app receives a minimal PATH."""
+
+    source = environ if environ is not None else os.environ
+    candidates: list[str] = []
+    if configured and configured.strip():
+        configured_value = configured.strip()
+        configured_path = Path(configured_value).expanduser()
+        if configured_path.is_absolute():
+            candidates.append(str(configured_path))
+        else:
+            found = shutil.which(configured_value, path=source.get("PATH"))
+            if found:
+                candidates.append(found)
+    else:
+        found = shutil.which("codex", path=source.get("PATH"))
+        if found:
+            candidates.append(found)
+        home = source.get("HOME")
+        if home:
+            candidates.append(str(Path(home) / ".local" / "bin" / "codex"))
+    for candidate in candidates:
+        path = Path(candidate)
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path.resolve())
+    raise LLMConfigurationError(
+        "codex executable was not found; install/login to Codex CLI first"
+    )
 
 
 def restricted_codex_process_environment(
