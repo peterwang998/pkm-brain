@@ -989,6 +989,10 @@ public struct TodayItem: Codable, Equatable, Identifiable, Sendable {
         if let starts_at { return "Starts \(starts_at)" }
         return ends_at.map { "Ends \($0)" }
     }
+
+    public var supportsMeetingPreparation: Bool {
+        kind == "event" && BrainAPIClient.canPrepareMeeting(itemID: id)
+    }
 }
 
 public struct TodayEvidenceLink: Codable, Equatable, Identifiable, Sendable {
@@ -1026,6 +1030,47 @@ public struct TodayRetainedEvidence: Codable, Equatable, Sendable {
             ?? object["title"]?.stringValue
             ?? "Retained evidence"
     }
+}
+
+public struct TodayMeetingPacket: Codable, Equatable, Sendable {
+    public let schema_version: Int
+    public let item_id: String
+    public let generated_at: String
+    public let title: String
+    public let event_claims: [TodayMeetingClaim]
+    public let knowledge_claims: [TodayMeetingClaim]
+    public let wiki_context: [TodayMeetingWikiContext]
+    public let suggestions: [TodayMeetingSuggestion]
+    public let coverage: [String: JSONValue]
+    public let retrieval_reasons: [String]
+}
+
+public struct TodayMeetingClaim: Codable, Equatable, Identifiable, Sendable {
+    public let claim: String
+    public let claim_type: String
+    public let evidence_refs: [JSONValue]
+    public let fact_id: String?
+    public let confidence: Double?
+
+    public var id: String {
+        "\(claim_type):\(fact_id ?? claim)"
+    }
+}
+
+public struct TodayMeetingWikiContext: Codable, Equatable, Identifiable, Sendable {
+    public let title: String
+    public let path: String?
+    public let summary: String
+    public let source_ids: [String]
+
+    public var id: String { path ?? title }
+}
+
+public struct TodayMeetingSuggestion: Codable, Equatable, Identifiable, Sendable {
+    public let suggestion: String
+    public let is_factual_claim: Bool
+
+    public var id: String { suggestion }
 }
 
 public struct TodayFeedbackResponse: Codable, Equatable, Sendable {

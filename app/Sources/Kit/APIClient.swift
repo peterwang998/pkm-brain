@@ -2,6 +2,7 @@ import Foundation
 
 public enum APIClientError: Error, Equatable, LocalizedError {
     case invalidResponse
+    case invalidMeetingItemID
     case unsafeTodayEvidenceRoute
     case httpStatus(Int, String)
 
@@ -9,6 +10,8 @@ public enum APIClientError: Error, Equatable, LocalizedError {
         switch self {
         case .invalidResponse:
             return "The PKM Brain service returned an invalid response."
+        case .invalidMeetingItemID:
+            return "This meeting preparation link is not valid."
         case .unsafeTodayEvidenceRoute:
             return "This local evidence link is not valid."
         case let .httpStatus(status, body):
@@ -91,6 +94,17 @@ public final class BrainAPIClient: Sendable {
 
     public static func canLoadTodayEvidence(at route: String) -> Bool {
         validatedTodayEvidenceRoute(route) != nil
+    }
+
+    public func todayMeetingPacket(itemID: String) async throws -> TodayMeetingPacket {
+        guard let path = Self.meetingPacketPath(for: itemID) else {
+            throw APIClientError.invalidMeetingItemID
+        }
+        return try await get(path)
+    }
+
+    public static func canPrepareMeeting(itemID: String) -> Bool {
+        meetingPacketPath(for: itemID) != nil
     }
 
     public func submitTodayFeedback(
@@ -454,6 +468,26 @@ public final class BrainAPIClient: Sendable {
             return nil
         }
         return components.string
+    }
+
+    static func meetingPacketPath(for itemID: String) -> String? {
+        let normalized = itemID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty,
+              normalized == itemID,
+              normalized.count <= 256,
+              normalized.utf8.count <= 1_024,
+              normalized != ".",
+              normalized != "..",
+              !normalized.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+              let encoded = normalized.addingPercentEncoding(
+                  withAllowedCharacters: CharacterSet(
+                      charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~"
+                  )
+              )
+        else {
+            return nil
+        }
+        return "/api/ops/items/\(encoded)/meeting-packet"
     }
 }
 

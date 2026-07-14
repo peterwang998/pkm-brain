@@ -197,6 +197,109 @@ struct PKMBrainKitTests {
         }
     }
 
+    @Test("Meeting preparation fixture decodes evidence, coverage, and non-factual suggestions")
+    func meetingPreparationFixtureDecodes() throws {
+        let packet: TodayMeetingPacket = try decodeFixture("meeting_packet")
+
+        #expect(packet.schema_version == 1)
+        #expect(packet.title == "Project review")
+        #expect(packet.event_claims.first?.claim_type == "calendar_observation")
+        #expect(packet.event_claims.first?.evidence_refs.count == 1)
+        #expect(packet.knowledge_claims.first?.fact_id == "fact-17")
+        #expect(packet.knowledge_claims.first?.confidence == 0.91)
+        #expect(packet.knowledge_claims.first?.evidence_refs.count == 1)
+        #expect(packet.wiki_context.first?.source_ids == ["document-17", "document-22"])
+        #expect(packet.coverage["brain_retrieval"]?.objectValue?["stale"]?.boolValue == true)
+        #expect(packet.retrieval_reasons.count == 1)
+        #expect(packet.suggestions.first?.is_factual_claim == false)
+
+        let briefing: TodayBriefing = try decodeFixture("today")
+        #expect(briefing.calendar.next.first?.supportsMeetingPreparation == true)
+        #expect(briefing.urgent_overflow.items.first?.supportsMeetingPreparation == false)
+    }
+
+    @Test("Meeting preparation GET percent-encodes one bounded item ID")
+    func meetingPreparationRequest() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [MeetingPacketURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer {
+            MeetingPacketURLProtocol.handler = nil
+            session.invalidateAndCancel()
+        }
+        let itemID = "event/project review?#%"
+        MeetingPacketURLProtocol.handler = { request in
+            #expect(request.httpMethod == "GET")
+            #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-token")
+            #expect(
+                request.url?.absoluteString.contains(
+                    "/api/ops/items/event%2Fproject%20review%3F%23%25/meeting-packet"
+                ) == true
+            )
+            let response = try #require(
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Type": "application/json"]
+                )
+            )
+            let payload = try JSONSerialization.data(withJSONObject: [
+                "schema_version": 1,
+                "item_id": itemID,
+                "generated_at": "2026-07-14T14:05:00+00:00",
+                "title": "Project review",
+                "event_claims": [],
+                "knowledge_claims": [],
+                "wiki_context": [],
+                "suggestions": [],
+                "coverage": ["calendar": "complete"],
+                "retrieval_reasons": [],
+            ])
+            return (response, payload)
+        }
+
+        let client = BrainAPIClient(
+            baseURL: URL(string: "http://127.0.0.1:54321")!,
+            token: "test-token",
+            session: session
+        )
+        let packet = try await client.todayMeetingPacket(itemID: itemID)
+
+        #expect(packet.item_id == itemID)
+        #expect(packet.title == "Project review")
+        #expect(BrainAPIClient.canPrepareMeeting(itemID: itemID))
+    }
+
+    @Test("Meeting preparation rejects empty, control-character, traversal, and oversized IDs")
+    func meetingPreparationRejectsUnsafeIDs() async {
+        let client = BrainAPIClient(
+            baseURL: URL(string: "http://127.0.0.1:54321")!,
+            token: "test-token"
+        )
+        let invalidIDs = [
+            "",
+            "   ",
+            ".",
+            "..",
+            " event-42 ",
+            "event\nid",
+            String(repeating: "x", count: 257),
+        ]
+
+        for itemID in invalidIDs {
+            #expect(!BrainAPIClient.canPrepareMeeting(itemID: itemID))
+            do {
+                let _: TodayMeetingPacket = try await client.todayMeetingPacket(itemID: itemID)
+                Issue.record("Unsafe meeting item ID was accepted: \(itemID)")
+            } catch let error as APIClientError {
+                #expect(error == .invalidMeetingItemID)
+            } catch {
+                Issue.record("Unexpected error for unsafe item ID: \(error)")
+            }
+        }
+    }
+
     @Test("queue fixture decodes")
     func queueFixtureDecodes() throws {
         let queue: QueuePage = try decodeFixture("queue")
@@ -596,6 +699,35 @@ private final class ShadowRunURLProtocol: URLProtocol, @unchecked Sendable {
 }
 
 private final class RetainedEvidenceURLProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        true
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        guard let handler = Self.handler else {
+            client?.urlProtocol(self, didFailWithError: APIClientError.invalidResponse)
+            return
+        }
+        do {
+            let (response, data) = try handler(request)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
+}
+
+private final class MeetingPacketURLProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
 
     override class func canInit(with request: URLRequest) -> Bool {

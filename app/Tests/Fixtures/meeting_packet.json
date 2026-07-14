@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "item_id": "event/project review",
+  "generated_at": "2026-07-14T14:05:00+00:00",
+  "title": "Project review",
+  "event_claims": [
+    {
+      "claim": "Meeting: Project review",
+      "claim_type": "calendar_observation",
+      "evidence_refs": [
+        {
+          "source_ref": "calendar:personal:primary:event-42",
+          "event_id": "event-42"
+        }
+      ]
+    }
+  ],
+  "knowledge_claims": [
+    {
+      "claim": "Pricing approval remains open.",
+      "claim_type": "brain_fact",
+      "evidence_refs": [
+        {
+          "source_ref": "document-17"
+        }
+      ],
+      "fact_id": "fact-17",
+      "confidence": 0.91
+    }
+  ],
+  "wiki_context": [
+    {
+      "title": "Project review",
+      "path": "projects/project-review.md",
+      "summary": "Current project decisions and open questions.",
+      "source_ids": ["document-17", "document-22"]
+    }
+  ],
+  "suggestions": [
+    {
+      "suggestion": "Confirm the desired outcome before the meeting.",
+      "is_factual_claim": false
+    }
+  ],
+  "coverage": {
+    "calendar": "complete",
+    "brain_retrieval": {
+      "status": "partial",
+      "stale": true,
+      "as_of": "2026-07-12T14:00:00+00:00",
+      "detail": "One relevant source was unavailable."
+    }
+  },
+  "retrieval_reasons": [
+    "One relevant source was unavailable."
+  ]
+}

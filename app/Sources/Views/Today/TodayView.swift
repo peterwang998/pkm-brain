@@ -4,12 +4,16 @@ import SwiftUI
 struct TodayView: View {
     @EnvironmentObject private var appState: AppState
     @State private var feedbackDraft: TodayFeedbackDraft?
+    @State private var meetingPreparationRequest: TodayMeetingPreparationRequest?
     @State private var reportsMissingItem = false
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 header
+                if appState.todayBriefing?.briefing_id == nil {
+                    shadowFirstRunDisclosure
+                }
                 if let briefing = appState.todayBriefing, briefing.isAvailable {
                     operationalBriefing(briefing)
                     Divider()
@@ -110,6 +114,10 @@ struct TodayView: View {
             TodayEvidenceSheet(request: request)
                 .environmentObject(appState)
         }
+        .sheet(item: $meetingPreparationRequest) { request in
+            TodayMeetingPreparationSheet(request: request)
+                .environmentObject(appState)
+        }
     }
 
     private var header: some View {
@@ -131,6 +139,38 @@ struct TodayView: View {
         }
     }
 
+    private var shadowFirstRunDisclosure: some View {
+        HStack(alignment: .center, spacing: 14) {
+            Image(systemName: "lock.shield")
+                .font(.title2)
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Your first shadow run is read-only and starts only when you choose it.")
+                    .font(.headline)
+                Text(
+                    "It reads your owned primary Calendar and Gmail, never downloads attachments or changes either service, and keeps supporting evidence on this Mac for up to 30 days. Bounded text from changed emails is analyzed by your configured detector model and may leave this Mac if that model is hosted elsewhere; the default detector has no tools or access to other local files."
+                )
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 12)
+            Button {
+                Task { await appState.runTodayShadow() }
+            } label: {
+                Label("Run Shadow", systemImage: "play.circle")
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(appState.isRunningTodayShadow)
+        }
+        .padding(14)
+        .background(Color.accentColor.opacity(0.07))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.accentColor.opacity(0.18), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
     @ViewBuilder
     private func operationalBriefing(_ briefing: TodayBriefing) -> some View {
         TodayCoverageView(briefing: briefing)
@@ -143,6 +183,7 @@ struct TodayView: View {
             emptyText: "Nothing needs to be forced into focus right now.",
             feedback: briefing.feedback,
             onFeedback: beginFeedback,
+            onPrepare: beginMeetingPreparation,
             onBrainRoute: appState.openTodayBrainRoute
         )
 
@@ -179,6 +220,7 @@ struct TodayView: View {
             emptyText: "No due or overdue items surfaced.",
             feedback: briefing.feedback,
             onFeedback: beginFeedback,
+            onPrepare: beginMeetingPreparation,
             onBrainRoute: appState.openTodayBrainRoute
         )
         TodayItemSection(
@@ -188,6 +230,7 @@ struct TodayView: View {
             emptyText: "Nothing is currently waiting on another person.",
             feedback: briefing.feedback,
             onFeedback: beginFeedback,
+            onPrepare: beginMeetingPreparation,
             onBrainRoute: appState.openTodayBrainRoute
         )
         TodayItemSection(
@@ -197,6 +240,7 @@ struct TodayView: View {
             emptyText: "No additional attention items.",
             feedback: briefing.feedback,
             onFeedback: beginFeedback,
+            onPrepare: beginMeetingPreparation,
             onBrainRoute: appState.openTodayBrainRoute
         )
         TodayItemSection(
@@ -206,6 +250,7 @@ struct TodayView: View {
             emptyText: "No awareness-only updates.",
             feedback: briefing.feedback,
             onFeedback: beginFeedback,
+            onPrepare: beginMeetingPreparation,
             onBrainRoute: appState.openTodayBrainRoute
         )
         TodayItemSection(
@@ -216,6 +261,7 @@ struct TodayView: View {
             emptyText: "No uncertain items surfaced.",
             feedback: briefing.feedback,
             onFeedback: beginFeedback,
+            onPrepare: beginMeetingPreparation,
             onBrainRoute: appState.openTodayBrainRoute
         )
         TodayItemSection(
@@ -227,6 +273,7 @@ struct TodayView: View {
             feedback: briefing.feedback,
             audit: true,
             onFeedback: beginFeedback,
+            onPrepare: beginMeetingPreparation,
             onBrainRoute: appState.openTodayBrainRoute
         )
     }
@@ -267,7 +314,19 @@ struct TodayView: View {
             feedback: briefing.feedback,
             audit: audit,
             onFeedback: beginFeedback,
+            onPrepare: beginMeetingPreparation,
             onBrainRoute: appState.openTodayBrainRoute
+        )
+    }
+
+    private func beginMeetingPreparation(_ item: TodayItem) {
+        guard item.supportsMeetingPreparation else {
+            appState.todayFeedbackMessage = "Meeting preparation is not available for this item."
+            return
+        }
+        meetingPreparationRequest = TodayMeetingPreparationRequest(
+            itemID: item.id,
+            fallbackTitle: item.title
         )
     }
 
@@ -513,6 +572,7 @@ private struct TodayItemSection: View {
     let feedback: TodayFeedbackCapabilities
     var audit = false
     let onFeedback: (TodayItem, String) -> Void
+    let onPrepare: (TodayItem) -> Void
     let onBrainRoute: (String) -> Void
 
     var body: some View {
@@ -534,6 +594,7 @@ private struct TodayItemSection: View {
                         feedback: feedback,
                         audit: audit,
                         onFeedback: onFeedback,
+                        onPrepare: onPrepare,
                         onBrainRoute: onBrainRoute
                     )
                 }
@@ -547,6 +608,7 @@ private struct TodayItemCard: View {
     let feedback: TodayFeedbackCapabilities
     let audit: Bool
     let onFeedback: (TodayItem, String) -> Void
+    let onPrepare: (TodayItem) -> Void
     let onBrainRoute: (String) -> Void
 
     var body: some View {
@@ -625,6 +687,15 @@ private struct TodayItemCard: View {
                     }
                 }
                 .font(.caption)
+            }
+            if item.supportsMeetingPreparation {
+                Button {
+                    onPrepare(item)
+                } label: {
+                    Label("Prepare", systemImage: "sparkles.rectangle.stack")
+                }
+                .buttonStyle(.bordered)
+                .help("Build a read-only meeting brief from Calendar and local Brain context")
             }
             if !item.feedback_actions.isEmpty {
                 Menu {
@@ -717,6 +788,398 @@ private struct TodayItemCard: View {
         case "restore": return "arrow.uturn.backward"
         default: return "circle"
         }
+    }
+}
+
+private struct TodayMeetingPreparationRequest: Identifiable {
+    let itemID: String
+    let fallbackTitle: String
+
+    var id: String { itemID }
+}
+
+private struct TodayMeetingPreparationSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var appState: AppState
+    let request: TodayMeetingPreparationRequest
+
+    @State private var packet: TodayMeetingPacket?
+    @State private var errorMessage: String?
+    @State private var isLoading = true
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            Divider()
+            ScrollView {
+                Group {
+                    if isLoading {
+                        ProgressView("Preparing your meeting brief…")
+                            .frame(maxWidth: .infinity, minHeight: 360)
+                    } else if let packet {
+                        meetingPacket(packet)
+                    } else {
+                        unavailable
+                    }
+                }
+                .padding(22)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .frame(minWidth: 720, idealWidth: 820, minHeight: 600, idealHeight: 760)
+        .task(id: request.id) {
+            await load()
+        }
+    }
+
+    private var header: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "sparkles.rectangle.stack")
+                .font(.title2)
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(packet?.title ?? request.fallbackTitle)
+                    .font(.title2.weight(.semibold))
+                    .lineLimit(2)
+                Text("Meeting preparation")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("Done") { dismiss() }
+                .keyboardShortcut(.cancelAction)
+        }
+        .padding(18)
+    }
+
+    private func meetingPacket(_ packet: TodayMeetingPacket) -> some View {
+        VStack(alignment: .leading, spacing: 20) {
+            Label(
+                "Prepared \(displayDateTime(packet.generated_at)) from Calendar and local Brain context.",
+                systemImage: "clock"
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+            coverage(packet)
+            eventClaims(packet.event_claims)
+            brainContext(packet)
+            suggestions(packet.suggestions)
+
+            Label(
+                "This is a derived, read-only brief. Preparing it did not change Calendar, Gmail, or Brain knowledge.",
+                systemImage: "lock.shield"
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+        .textSelection(.enabled)
+    }
+
+    private func coverage(_ packet: TodayMeetingPacket) -> some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 10) {
+                if packet.coverage.isEmpty {
+                    Label("Source coverage was not reported.", systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.orange)
+                } else {
+                    ForEach(packet.coverage.keys.sorted(), id: \.self) { source in
+                        let presentation = coveragePresentation(packet.coverage[source])
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack {
+                                Text(coverageLabel(source))
+                                    .font(.headline)
+                                Spacer()
+                                Label(
+                                    presentation.status,
+                                    systemImage: presentation.hasConcern
+                                        ? "exclamationmark.triangle.fill"
+                                        : "checkmark.circle.fill"
+                                )
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(presentation.hasConcern ? Color.orange : Color.green)
+                            }
+                            if let detail = presentation.detail {
+                                Text(detail)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+                if !packet.retrieval_reasons.isEmpty {
+                    Divider()
+                    Label("Retrieval notes", systemImage: "info.circle")
+                        .font(.headline)
+                    ForEach(packet.retrieval_reasons, id: \.self) { reason in
+                        Text("• \(reason)")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .padding(.top, 4)
+        } label: {
+            Label("Coverage & freshness", systemImage: "checklist")
+        }
+    }
+
+    private func eventClaims(_ claims: [TodayMeetingClaim]) -> some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 12) {
+                if claims.isEmpty {
+                    Text("No Calendar observations were available for this event.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(claims) { claim in
+                        claimView(claim, symbol: "calendar", sourceLabel: "Calendar observation")
+                    }
+                }
+            }
+            .padding(.top, 4)
+        } label: {
+            Label("Event details", systemImage: "calendar")
+        }
+    }
+
+    private func brainContext(_ packet: TodayMeetingPacket) -> some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 16) {
+                if packet.knowledge_claims.isEmpty && packet.wiki_context.isEmpty {
+                    Text("No relevant Brain facts or Wiki context were found within the retrieval budget.")
+                        .foregroundStyle(.secondary)
+                }
+
+                ForEach(packet.knowledge_claims) { claim in
+                    claimView(claim, symbol: "brain.head.profile", sourceLabel: "Brain fact")
+                }
+
+                ForEach(packet.wiki_context) { context in
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(alignment: .firstTextBaseline) {
+                            Label(context.title, systemImage: "doc.text")
+                                .font(.headline)
+                            Spacer()
+                            if let path = context.path, !path.isEmpty {
+                                Button("Open in Wiki") {
+                                    dismiss()
+                                    appState.showWiki(path: path)
+                                }
+                                .buttonStyle(.link)
+                            }
+                        }
+                        if !context.summary.isEmpty {
+                            Text(context.summary)
+                                .font(.callout)
+                        }
+                        if context.source_ids.isEmpty {
+                            Label("No supporting source IDs were returned.", systemImage: "exclamationmark.triangle")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                        } else {
+                            Text("Evidence: \(context.source_ids.joined(separator: ", "))")
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(10)
+                    .background(Color.secondary.opacity(0.06))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+            }
+            .padding(.top, 4)
+        } label: {
+            Label("Evidence-bound Brain context", systemImage: "brain.head.profile")
+        }
+    }
+
+    private func suggestions(_ suggestions: [TodayMeetingSuggestion]) -> some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("These are prompts for your preparation. They are not source-backed facts.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                if suggestions.isEmpty {
+                    Text("No suggestions were generated.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(suggestions) { suggestion in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Label(suggestion.suggestion, systemImage: "lightbulb")
+                            if suggestion.is_factual_claim {
+                                Label("Verify this possible claim before relying on it.", systemImage: "exclamationmark.triangle")
+                                    .font(.caption)
+                                    .foregroundStyle(.orange)
+                            }
+                        }
+                    }
+                }
+            }
+            .padding(.top, 4)
+        } label: {
+            Label("Suggestions — not facts", systemImage: "lightbulb.max")
+        }
+    }
+
+    private func claimView(
+        _ claim: TodayMeetingClaim,
+        symbol: String,
+        sourceLabel: String
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Label(claim.claim, systemImage: symbol)
+                .font(.callout)
+            HStack(spacing: 8) {
+                Text(sourceLabel)
+                    .font(.caption.weight(.medium))
+                if let confidence = claim.confidence {
+                    Text("\(Int((min(max(confidence, 0), 1) * 100).rounded()))% confidence")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if let factID = claim.fact_id, !factID.isEmpty {
+                    Text(factID)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if claim.evidence_refs.isEmpty {
+                Label("No supporting evidence reference was returned.", systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            } else {
+                ForEach(Array(claim.evidence_refs.enumerated()), id: \.offset) { _, reference in
+                    Text("Evidence: \(evidenceReference(reference))")
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(10)
+        .background(Color.secondary.opacity(0.06))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var unavailable: some View {
+        ContentUnavailableView {
+            Label("Meeting brief unavailable", systemImage: "exclamationmark.triangle")
+        } description: {
+            Text(errorMessage ?? "Brain could not prepare this meeting brief.")
+        } actions: {
+            Button("Try Again") {
+                Task { await load() }
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 360)
+    }
+
+    private func load() async {
+        isLoading = true
+        errorMessage = nil
+        packet = nil
+        defer { isLoading = false }
+        guard let client = await appState.waitForAPIClient() else {
+            errorMessage = "The Brain service is not available."
+            return
+        }
+        do {
+            let loaded = try await client.todayMeetingPacket(itemID: request.itemID)
+            guard loaded.schema_version == 1 else {
+                errorMessage = "This meeting brief uses an unsupported format."
+                return
+            }
+            guard loaded.item_id == request.itemID else {
+                errorMessage = "Brain returned a meeting brief for a different event."
+                return
+            }
+            packet = loaded
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func coverageLabel(_ source: String) -> String {
+        switch source {
+        case "calendar": return "Calendar"
+        case "brain_retrieval": return "Brain context"
+        case "gmail": return "Gmail"
+        default: return source.replacingOccurrences(of: "_", with: " ").capitalized
+        }
+    }
+
+    private func coveragePresentation(_ value: JSONValue?) -> (
+        status: String,
+        detail: String?,
+        hasConcern: Bool
+    ) {
+        guard let value else {
+            return ("Not reported", nil, true)
+        }
+        if let raw = value.stringValue {
+            let status = friendlyStatus(raw)
+            return (
+                status,
+                "A source freshness timestamp was not reported.",
+                !isCompleteCoverage(raw)
+            )
+        }
+        guard let object = value.objectValue else {
+            return ("Unknown", nil, true)
+        }
+        let rawStatus = object["status"]?.stringValue
+            ?? object["state"]?.stringValue
+            ?? object["verdict"]?.stringValue
+            ?? "unknown"
+        let stale = object["stale"]?.boolValue == true
+            || rawStatus.lowercased().contains("stale")
+        var details: [String] = []
+        if let detail = object["detail"]?.stringValue ?? object["reason"]?.stringValue,
+           !detail.isEmpty {
+            details.append(detail)
+        }
+        if let asOf = object["as_of"]?.stringValue ?? object["last_success_at"]?.stringValue {
+            details.append("As of \(displayDateTime(asOf))")
+        }
+        if let age = object["age_seconds"]?.intValue {
+            details.append("Age \(friendlyDuration(age))")
+        }
+        if stale {
+            details.append("Source context is stale")
+        }
+        return (
+            stale ? "Stale · \(friendlyStatus(rawStatus))" : friendlyStatus(rawStatus),
+            details.isEmpty ? nil : details.joined(separator: " · "),
+            stale || !isCompleteCoverage(rawStatus)
+        )
+    }
+
+    private func isCompleteCoverage(_ value: String) -> Bool {
+        ["complete", "found", "fresh", "available", "ok"].contains(value.lowercased())
+    }
+
+    private func friendlyStatus(_ value: String) -> String {
+        value.replacingOccurrences(of: "_", with: " ").capitalized
+    }
+
+    private func friendlyDuration(_ seconds: Int) -> String {
+        if seconds < 60 { return "\(seconds)s" }
+        if seconds < 3_600 { return "\(seconds / 60)m" }
+        if seconds < 86_400 { return "\(seconds / 3_600)h" }
+        return "\(seconds / 86_400)d"
+    }
+
+    private func evidenceReference(_ value: JSONValue) -> String {
+        if let text = value.stringValue, !text.isEmpty {
+            return text
+        }
+        if let object = value.objectValue {
+            for key in ["source_ref", "source_id", "event_id", "message_id", "calendar_id"] {
+                if let text = object[key]?.stringValue, !text.isEmpty {
+                    return text
+                }
+            }
+        }
+        return "Local evidence reference"
     }
 }
 
