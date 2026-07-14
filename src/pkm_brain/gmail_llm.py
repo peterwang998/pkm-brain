@@ -15,12 +15,9 @@ from typing import Any, Mapping
 import yaml
 
 from .llm import (
-    AnthropicProvider,
     LLMConfigurationError,
     LLMProvider,
     LLMProviderError,
-    OllamaProvider,
-    OpenAIProvider,
     normalized_reasoning_effort,
 )
 from .llm_usage import (
@@ -42,9 +39,17 @@ GMAIL_CODEX_BINARY_ENV = "PKM_BRAIN_GMAIL_CODEX_BIN"
 DEFAULT_GMAIL_CODEX_MODEL = "gpt-5.6-luna"
 DEFAULT_GMAIL_CODEX_REASONING_EFFORT = "low"
 DEFAULT_GMAIL_CODEX_TIMEOUT_SECONDS = 300
-MINIMUM_PERMISSION_PROFILE_CODEX_VERSION = (0, 138, 0)
+MINIMUM_PERMISSION_PROFILE_CODEX_VERSION = (0, 142, 0)
 
-_ALLOWED_PROVIDERS = frozenset({"codex", "openai", "anthropic", "ollama"})
+# Codex contributes model instructions and the structured-output schema outside
+# the detector prompt. Live CLI measurements on the supported boundary are
+# roughly 5,700 input tokens above the visible prompt, so reserve a full 8K
+# before every call. The combined ceiling is also enforced by Codex's
+# per-rollout token budget; neither value is reduced after a cheaper call.
+GMAIL_DETECTOR_INPUT_OVERHEAD_TOKEN_CEILING = 8_192
+GMAIL_DETECTOR_OUTPUT_TOKEN_CEILING = 4_096
+
+_ALLOWED_PROVIDERS = frozenset({"codex"})
 _CONFIG_KEYS = frozenset(
     {
         "provider",
@@ -220,6 +225,47 @@ class GmailLLMSelection:
     codex_binary: str | None
 
 
+@dataclass(frozen=True)
+class GmailDetectorTokenCeiling:
+    """Conservative tokens to reserve before one detector process starts."""
+
+    prompt_tokens: int
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+
+
+def gmail_detector_token_ceiling(
+    provider: LLMProvider,
+    prompt: str,
+) -> GmailDetectorTokenCeiling:
+    """Return a fail-closed per-call ceiling shared by planning and execution.
+
+    The byte length is a conservative upper bound for byte-pair tokenization of
+    the visible prompt, including non-ASCII email. Provider declarations may
+    raise, but never lower, the Gmail safety margins.
+    """
+
+    prompt_tokens = max(1, len(prompt.encode("utf-8")))
+    input_overhead = _provider_token_ceiling(
+        provider,
+        "gmail_input_overhead_token_ceiling",
+        GMAIL_DETECTOR_INPUT_OVERHEAD_TOKEN_CEILING,
+    )
+    output_tokens = _provider_token_ceiling(
+        provider,
+        "gmail_output_token_ceiling",
+        GMAIL_DETECTOR_OUTPUT_TOKEN_CEILING,
+    )
+    input_tokens = prompt_tokens + input_overhead
+    return GmailDetectorTokenCeiling(
+        prompt_tokens=prompt_tokens,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=input_tokens + output_tokens,
+    )
+
+
 def gmail_llm_config_path(paths: BrainPaths) -> Path:
     return paths.config_local / GMAIL_LLM_CONFIG_FILENAME
 
@@ -274,7 +320,7 @@ def resolve_gmail_llm_selection(paths: BrainPaths | None = None) -> GmailLLMSele
         provider_source = "gmail-default:restricted-codex"
     if provider not in _ALLOWED_PROVIDERS:
         raise LLMConfigurationError(
-            "Gmail LLM provider must be one of: anthropic, codex, ollama, openai"
+            "Gmail operational detection requires the restricted Codex provider"
         )
 
     model = _first_value(
@@ -322,29 +368,19 @@ def get_gmail_provider(
 ) -> LLMProvider:
     """Return the only provider authorized to receive normalized Gmail text.
 
-    OpenAI, Anthropic, and Ollama are reachable only from the Gmail-specific
-    provider environment variable or config file. A global provider selection
-    is deliberately ignored. `codex` always means the restricted implementation
-    below, never the general agentic `CodexProvider`.
+    Global and Gmail-specific direct API selections are rejected. `codex`
+    always means the restricted implementation below, never the general
+    agentic `CodexProvider`.
     """
 
     active_paths = paths or BrainPaths.from_value(None)
     selection = resolve_gmail_llm_selection(active_paths)
-    if selection.provider == "codex":
-        provider: Any = RestrictedCodexGmailProvider(
-            model=selection.codex_model,
-            reasoning_effort=selection.codex_reasoning_effort,
-            timeout=selection.codex_timeout_seconds,
-            binary=selection.codex_binary,
-        )
-    elif selection.provider == "openai":
-        provider = OpenAIProvider()
-    elif selection.provider == "anthropic":
-        provider = AnthropicProvider()
-    elif selection.provider == "ollama":
-        provider = OllamaProvider()
-    else:  # pragma: no cover - resolve_gmail_llm_selection is closed above.
-        raise LLMConfigurationError("unsupported Gmail LLM provider")
+    provider: Any = RestrictedCodexGmailProvider(
+        model=selection.codex_model,
+        reasoning_effort=selection.codex_reasoning_effort,
+        timeout=selection.codex_timeout_seconds,
+        binary=selection.codex_binary,
+    )
     if hasattr(provider, "models"):
         # The operational pass gets one model and no hidden fallback,
         # regardless of the fallback list used by the independent knowledge
@@ -371,6 +407,10 @@ class RestrictedCodexGmailProvider:
     """
 
     name = "codex-gmail-restricted"
+    gmail_input_overhead_token_ceiling = (
+        GMAIL_DETECTOR_INPUT_OVERHEAD_TOKEN_CEILING
+    )
+    gmail_output_token_ceiling = GMAIL_DETECTOR_OUTPUT_TOKEN_CEILING
 
     def __init__(
         self,
@@ -400,6 +440,7 @@ class RestrictedCodexGmailProvider:
     def complete(self, prompt: str) -> str:
         started_at = now_iso()
         started_clock = time.perf_counter()
+        token_ceiling = gmail_detector_token_ceiling(self, prompt)
         usage: dict[str, int] | None = None
         metadata: dict[str, Any] = {}
         status = "failed"
@@ -422,6 +463,7 @@ class RestrictedCodexGmailProvider:
                     cwd=cwd,
                     schema_path=schema_path,
                     output_path=output_path,
+                    rollout_token_ceiling=token_ceiling.total_tokens,
                 )
                 try:
                     completed = subprocess.run(
@@ -486,6 +528,7 @@ def restricted_codex_command(
     cwd: Path,
     schema_path: Path,
     output_path: Path,
+    rollout_token_ceiling: int,
 ) -> list[str]:
     if not _MODEL_RE.fullmatch(model):
         raise LLMConfigurationError("Gmail Codex model contains unsupported characters")
@@ -501,6 +544,20 @@ def restricted_codex_command(
     ]
     for override in _RESTRICTED_CONFIG_OVERRIDES:
         command.extend(("--config", override))
+    if isinstance(rollout_token_ceiling, bool) or rollout_token_ceiling <= 0:
+        raise LLMConfigurationError("Gmail Codex token ceiling must be positive")
+    command.extend(
+        (
+            "--config",
+            "features.rollout_budget=true",
+            "--config",
+            f"features.rollout_budget.limit_tokens={rollout_token_ceiling}",
+            "--config",
+            "features.rollout_budget.sampling_token_weight=1.0",
+            "--config",
+            "features.rollout_budget.prefill_token_weight=1.0",
+        )
+    )
     if reasoning_effort:
         command.extend(("--config", f'model_reasoning_effort="{reasoning_effort}"'))
     command.extend(
@@ -658,6 +715,17 @@ def _bounded_process_error(stderr: str, stdout: str) -> str:
     # Avoid propagating arbitrary model text into daemon errors or the UI.
     first_line = value.splitlines()[0] if value else "non-zero exit"
     return first_line[:500]
+
+
+def _provider_token_ceiling(provider: Any, attribute: str, minimum: int) -> int:
+    value = getattr(provider, attribute, minimum)
+    if isinstance(value, bool):
+        return minimum
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        return minimum
+    return max(minimum, normalized)
 
 
 def _first_value(*values: Any) -> str:

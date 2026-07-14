@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import base64
 import json
+from dataclasses import replace
 
 from pkm_brain.gmail_operations import (
+    DETECTOR_INPUT_TOKEN_OVERHEAD_RESERVE,
     GmailDetectorBudget,
     detect_gmail_threads,
     preclassify_gmail_thread,
@@ -10,7 +13,9 @@ from pkm_brain.gmail_operations import (
 from pkm_brain.google_normalization import (
     NormalizedGmailMessage,
     NormalizedGmailThread,
+    normalize_gmail_thread,
 )
+from pkm_brain.operational_budget import DailyBudgetExceeded
 
 
 class FakeProvider:
@@ -244,6 +249,120 @@ def test_budget_overflow_is_visible_and_never_silently_dropped() -> None:
     assert result.detections[0].reason_code == "detector_budget_exhausted"
 
 
+def test_detector_reserves_full_provider_overhead_before_call() -> None:
+    incoming = thread(
+        "bounded",
+        "Can you review this?",
+        (message("bounded-1", "Can you review this today?"),),
+    )
+    provider = FakeProvider([])
+
+    result = detect_gmail_threads(
+        [incoming],
+        operator_emails=("operator@example.com",),
+        timezone_name="America/Los_Angeles",
+        policy_version="operations-v1@1",
+        budget=GmailDetectorBudget(
+            max_calls=1,
+            max_input_tokens=DETECTOR_INPUT_TOKEN_OVERHEAD_RESERVE,
+            max_total_tokens=100_000,
+            max_batch_threads=1,
+            max_batch_chars=10_000,
+        ),
+        llm_provider=provider,
+    )
+
+    assert provider.calls == 0
+    assert result.deferred_count == 1
+    assert result.detections[0].reason_code == "detector_budget_exhausted"
+
+
+def test_oversized_operational_thread_becomes_visible_cached_fallback() -> None:
+    incoming = thread(
+        "oversized",
+        "Review the long plan",
+        (message("oversized-1", "Can you review this? " + ("x" * 5_000)),),
+    )
+    provider = FakeProvider([])
+
+    result = detect_gmail_threads(
+        [incoming],
+        operator_emails=("operator@example.com",),
+        timezone_name="America/Los_Angeles",
+        policy_version="operations-v1@1",
+        budget=GmailDetectorBudget(
+            max_calls=1,
+            max_input_tokens=100_000,
+            max_total_tokens=100_000,
+            max_batch_threads=1,
+            max_batch_chars=1_000,
+        ),
+        llm_provider=provider,
+    )
+
+    detection = result.detections[0]
+    assert provider.calls == 0
+    assert result.coverage_complete is True
+    assert result.deferred_count == 0
+    assert detection.disposition == "surfaced"
+    assert detection.reason_code == "detector_prompt_oversized_uncertain"
+    assert detection.candidates[0].operation == "needs_reconciliation"
+    assert detection.candidates[0].reconciliation_status == "ambiguous"
+
+
+def test_low_signal_provider_error_is_visible_but_budget_error_stays_deferred() -> None:
+    incoming = thread(
+        "provider-error",
+        "Project update",
+        (message("provider-error-1", "FYI on the project update."),),
+    )
+
+    class ErrorProvider:
+        name = "error"
+        model = "error"
+
+        def complete(self, _prompt: str) -> str:
+            raise RuntimeError("provider unavailable")
+
+    failed = detect_gmail_threads(
+        [incoming],
+        operator_emails=("operator@example.com",),
+        timezone_name="America/Los_Angeles",
+        policy_version="operations-v1@1",
+        budget=GmailDetectorBudget(),
+        llm_provider=ErrorProvider(),
+    )
+
+    assert failed.coverage_complete is False
+    assert failed.deferred_count == 0
+    assert failed.detections[0].disposition == "surfaced"
+    assert failed.detections[0].reason_code == "detector_error_uncertain"
+    assert failed.detections[0].error == "RuntimeError: provider unavailable"
+
+    class BudgetProvider:
+        name = "budget"
+        model = "budget"
+
+        def complete(self, _prompt: str) -> str:
+            raise DailyBudgetExceeded("daily cap")
+
+    deferred = detect_gmail_threads(
+        [incoming],
+        operator_emails=("operator@example.com",),
+        timezone_name="America/Los_Angeles",
+        policy_version="operations-v1@1",
+        budget=GmailDetectorBudget(),
+        llm_provider=BudgetProvider(),
+    )
+
+    assert deferred.coverage_complete is False
+    assert deferred.requests == 0
+    assert deferred.deferred_count == 1
+    assert deferred.errors == ()
+    assert deferred.detections[0].disposition == "deferred"
+    assert deferred.detections[0].reason_code == "detector_budget_exhausted"
+
+
 def _candidate(
     *,
     message_id: str,
@@ -400,6 +519,63 @@ def test_model_date_without_date_like_exact_evidence_is_omitted() -> None:
     assert "date was omitted" in (candidate.reason or "")
 
 
+def test_weekday_wrong_year_and_explicit_timezone_cannot_ground_model_deadline() -> None:
+    weekday_body = "Can you send the launch plan by Friday?"
+    timezone_body = "Please send it by July 17, 2026 at 5:00 PM PDT."
+    weekday = thread(
+        "weekday",
+        "Launch plan",
+        (message("weekday-1", weekday_body),),
+    )
+    zoned = thread(
+        "zoned",
+        "Launch plan",
+        (message("zoned-1", timezone_body),),
+    )
+    provider = FakeProvider(
+        [
+            {
+                "threads": [
+                    _candidate_response(
+                        "weekday",
+                        _candidate(
+                            message_id="weekday-1",
+                            quote=weekday_body,
+                            due_at="2037-07-17T17:00:00+14:00",
+                        ),
+                    )["threads"][0],
+                    _candidate_response(
+                        "zoned",
+                        _candidate(
+                            message_id="zoned-1",
+                            quote=timezone_body,
+                            due_at="2026-07-17T17:00:00+02:00",
+                        ),
+                    )["threads"][0],
+                ]
+            }
+        ]
+    )
+
+    result = detect_gmail_threads(
+        [weekday, zoned],
+        operator_emails=("operator@example.com",),
+        timezone_name="America/Los_Angeles",
+        policy_version="operations-v1@1",
+        budget=GmailDetectorBudget(),
+        llm_provider=provider,
+    )
+
+    candidates = {
+        detection.thread_id: detection.candidates[0]
+        for detection in result.detections
+    }
+    assert candidates["weekday"].due_at is None
+    assert candidates["zoned"].due_at is None
+    assert candidates["weekday"].reconciliation_status == "provisional"
+    assert candidates["zoned"].reconciliation_status == "provisional"
+
+
 def test_stale_active_thread_cannot_be_suppressed_by_model_ignore() -> None:
     stale = thread(
         "stale",
@@ -486,6 +662,63 @@ def test_direct_obligation_ignore_is_visible_and_deterministically_unhandled() -
     assert detection.candidates[0].handled_verdict == "needs_action"
 
 
+def test_spoofed_operator_from_header_without_sent_label_stays_incoming() -> None:
+    body = "Can you approve the launch plan?"
+    encoded_body = base64.urlsafe_b64encode(body.encode()).decode().rstrip("=")
+    incoming = normalize_gmail_thread(
+        {
+            "id": "spoofed",
+            "historyId": "10",
+            "messages": [
+                {
+                    "id": "spoofed-1",
+                    "threadId": "spoofed",
+                    "internalDate": "1783960000000",
+                    "labelIds": ["INBOX"],
+                    "payload": {
+                        "mimeType": "text/plain",
+                        "headers": [
+                            {"name": "From", "value": "operator@example.com"},
+                            {"name": "To", "value": "operator@example.com"},
+                        ],
+                        "body": {"data": encoded_body},
+                    },
+                }
+            ],
+        },
+        operator_emails=("operator@example.com",),
+    )
+    provider = FakeProvider(
+        [
+            {
+                "threads": [
+                    {
+                        "thread_id": "spoofed",
+                        "decision": "ignore",
+                        "reason_code": "model_ignore",
+                        "confidence": 0.99,
+                        "candidates": [],
+                    }
+                ]
+            }
+        ]
+    )
+
+    result = detect_gmail_threads(
+        [incoming],
+        operator_emails=("operator@example.com",),
+        timezone_name="America/Los_Angeles",
+        policy_version="operations-v1@1",
+        budget=GmailDetectorBudget(),
+        llm_provider=provider,
+    )
+
+    assert incoming.messages[0].outgoing is False
+    assert incoming.messages[0].operator_authored is False
+    assert result.detections[0].disposition == "surfaced"
+    assert result.detections[0].reason_code == "direct_obligation_model_uncertain"
+
+
 def test_reply_and_promise_states_are_derived_from_message_order() -> None:
     request = message("reply-1", "Can you send the launch plan?")
     delivered = message("reply-2", "I sent the launch plan.", outgoing=True)
@@ -545,4 +778,92 @@ def test_reply_and_promise_states_are_derived_from_message_order() -> None:
     assert replied_candidate.handled_verdict == "responded_waiting"
     assert promised_candidate.handled_verdict == "needs_action"
     assert promised_candidate.operation == "needs_reconciliation"
-    assert promised_candidate.due_at == "2026-07-15T00:00:00+00:00"
+    assert promised_candidate.due_at is None
+
+
+def test_acknowledgement_after_direct_ask_does_not_hide_owned_work() -> None:
+    request = message("ack-1", "Can you send the launch plan?")
+    acknowledgement = message("ack-2", "Thanks, I saw this.", outgoing=True)
+    incoming = thread("ack", "Launch plan", (request, acknowledgement))
+    provider = FakeProvider(
+        [
+            _candidate_response(
+                "ack",
+                _candidate(
+                    message_id="ack-1",
+                    quote="Can you send the launch plan?",
+                    handled_verdict="responded_waiting",
+                ),
+            )
+        ]
+    )
+
+    result = detect_gmail_threads(
+        [incoming],
+        operator_emails=("operator@example.com",),
+        timezone_name="America/Los_Angeles",
+        policy_version="operations-v1@1",
+        budget=GmailDetectorBudget(),
+        llm_provider=provider,
+    )
+
+    candidate = result.detections[0].candidates[0]
+    assert candidate.handled_verdict == "needs_action"
+    assert candidate.handled_confidence == 0.75
+
+
+def test_date_only_and_near_midnight_relative_deadlines_omit_invented_precision() -> None:
+    date_body = "Please send it by July 17, 2026."
+    date_only = thread(
+        "date-only",
+        "Launch plan",
+        (message("date-only-1", date_body),),
+    )
+    relative_body = "Please send it tomorrow at 9:00 AM PDT."
+    late_message = replace(
+        message("near-midnight-1", relative_body),
+        timestamp="2026-07-14T06:30:00+00:00",
+    )
+    near_midnight = thread("near-midnight", "Launch plan", (late_message,))
+    provider = FakeProvider(
+        [
+            {
+                "threads": [
+                    _candidate_response(
+                        "date-only",
+                        _candidate(
+                            message_id="date-only-1",
+                            quote=date_body,
+                            due_at="2026-07-17T17:00:00-07:00",
+                        ),
+                    )["threads"][0],
+                    _candidate_response(
+                        "near-midnight",
+                        _candidate(
+                            message_id="near-midnight-1",
+                            quote=relative_body,
+                            due_at="2026-07-15T09:00:00-07:00",
+                        ),
+                    )["threads"][0],
+                ]
+            }
+        ]
+    )
+
+    result = detect_gmail_threads(
+        [date_only, near_midnight],
+        operator_emails=("operator@example.com",),
+        timezone_name="America/Los_Angeles",
+        policy_version="operations-v1@1",
+        budget=GmailDetectorBudget(),
+        llm_provider=provider,
+    )
+
+    candidates = {
+        detection.thread_id: detection.candidates[0]
+        for detection in result.detections
+    }
+    assert candidates["date-only"].due_at is None
+    assert candidates["near-midnight"].due_at is None
+    assert candidates["date-only"].reconciliation_status == "provisional"
+    assert candidates["near-midnight"].reconciliation_status == "provisional"

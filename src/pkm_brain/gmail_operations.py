@@ -4,15 +4,25 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Protocol, Sequence
+from zoneinfo import ZoneInfo
 
+from .gmail_llm import (
+    GMAIL_DETECTOR_INPUT_OVERHEAD_TOKEN_CEILING,
+    GMAIL_DETECTOR_OUTPUT_TOKEN_CEILING,
+    gmail_detector_token_ceiling,
+)
 from .google_normalization import NormalizedGmailMessage, NormalizedGmailThread
 from .llm import LLMProvider, complete_json, json_prompt
+from .operational_budget import DailyBudgetExceeded
 
 
 GMAIL_DETECTOR_VERSION = "gmail-operations-v2"
-DETECTOR_OUTPUT_TOKEN_RESERVE = 4_096
+DETECTOR_OUTPUT_TOKEN_RESERVE = GMAIL_DETECTOR_OUTPUT_TOKEN_CEILING
+DETECTOR_INPUT_TOKEN_OVERHEAD_RESERVE = (
+    GMAIL_DETECTOR_INPUT_OVERHEAD_TOKEN_CEILING
+)
 DETECTOR_RESPONSE_SCHEMA = {"type": "object", "required": ["threads"]}
 ITEM_KINDS = {"commitment", "waiting", "follow_up", "deadline", "attention"}
 ITEM_OWNERS = {"operator", "other", "shared", "unknown"}
@@ -43,6 +53,14 @@ _COMMITMENT_SIGNAL = re.compile(
     r"\b(?:i(?:'ll| will| can| am going to)|let me|we(?:'ll| will| can))\b",
     re.IGNORECASE,
 )
+_DETERMINISTIC_RESPONSE_SIGNAL = re.compile(
+    r"\b(?:attached|here (?:is|are)|i (?:sent|submitted|completed|approved|signed|"
+    r"paid|confirmed|decline|declined)|we (?:sent|submitted|completed|approved|"
+    r"signed|paid|confirmed|decline|declined)|i (?:can't|cannot|won't|am unable)|"
+    r"we (?:can't|cannot|won't|are unable)|awaiting|waiting (?:for|on)|can you "
+    r"confirm)\b",
+    re.IGNORECASE,
+)
 _HIGH_CONSEQUENCE_SIGNAL = re.compile(
     r"\b(?:urgent|past due|overdue|expires?|renewal|deadline|security|fraud|"
     r"breach|legal|lawsuit|tax|payment|invoice|bill|flight|reservation|hotel|"
@@ -51,17 +69,6 @@ _HIGH_CONSEQUENCE_SIGNAL = re.compile(
 )
 _MARKETING_SIGNAL = re.compile(
     r"\b(?:unsubscribe|shop now|sale|discount|offer|newsletter|digest|promotion)\b",
-    re.IGNORECASE,
-)
-_DATE_EVIDENCE_SIGNAL = re.compile(
-    r"(?:\b20\d{2}[-/.]\d{1,2}(?:[-/.]\d{1,2})?\b|"
-    r"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
-    r"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|"
-    r"dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s+20\d{2})?\b|"
-    r"\b(?:mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|"
-    r"fri(?:day)?|sat(?:urday)?|sun(?:day)?|today|tomorrow|tonight|"
-    r"next\s+week|this\s+week|end\s+of\s+day|eod)\b|"
-    r"\b\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)\b)",
     re.IGNORECASE,
 )
 _DETECTOR_KEY = re.compile(r"[a-z0-9][a-z0-9_-]{0,79}")
@@ -317,6 +324,7 @@ def detect_gmail_threads(
     requests = 0
     estimated_input_tokens = 0
     estimated_output_tokens = 0
+    reserved_total_tokens = 0
     deferred_count = 0
     errors: list[str] = []
     index = 0
@@ -331,8 +339,9 @@ def detect_gmail_threads(
         batch: list[NormalizedGmailThread] = []
         batch_prompt = ""
         batch_input_tokens = 0
+        batch_total_tokens = 0
         while index < len(model_entries) and len(batch) < budget.max_batch_threads:
-            thread, _preclassification = model_entries[index]
+            thread, preclassification = model_entries[index]
             candidate_batch = [*batch, thread]
             candidate_prompt = _detector_prompt(
                 candidate_batch,
@@ -349,22 +358,30 @@ def detect_gmail_threads(
             if len(provider_prompt) > budget.max_batch_chars:
                 if batch:
                     break
-                detections[thread.thread_id] = GmailThreadDetection(
-                    thread_id=thread.thread_id,
-                    disposition="deferred",
-                    reason_code="detector_prompt_oversized",
+                active_items = active_items_by_thread.get(thread.thread_id, ())
+                direct_obligation = _has_direct_incoming_obligation(
+                    thread,
+                    operator_emails=operator_emails,
                 )
-                deferred_count += 1
+                detections[thread.thread_id] = _visible_uncertain_fallback(
+                    thread,
+                    reason_code="detector_prompt_oversized_uncertain",
+                    operator_emails=operator_emails,
+                    active_items=active_items,
+                    high_consequence=preclassification.high_consequence,
+                    direct_obligation=direct_obligation,
+                )
                 index += 1
                 continue
-            candidate_input_tokens = _estimate_tokens(provider_prompt)
+            token_ceiling = gmail_detector_token_ceiling(
+                llm_provider,
+                provider_prompt,
+            )
+            candidate_input_tokens = token_ceiling.input_tokens
             if (
                 estimated_input_tokens + candidate_input_tokens
                 > budget.max_input_tokens
-                or estimated_input_tokens
-                + estimated_output_tokens
-                + candidate_input_tokens
-                + DETECTOR_OUTPUT_TOKEN_RESERVE
+                or reserved_total_tokens + token_ceiling.total_tokens
                 > budget.max_total_tokens
             ):
                 if batch:
@@ -379,11 +396,13 @@ def detect_gmail_threads(
             batch = candidate_batch
             batch_prompt = candidate_prompt
             batch_input_tokens = candidate_input_tokens
+            batch_total_tokens = token_ceiling.total_tokens
             index += 1
         if not batch:
             continue
         requests += 1
         estimated_input_tokens += batch_input_tokens
+        reserved_total_tokens += batch_total_tokens
         try:
             response = complete_json(
                 batch_prompt,
@@ -395,6 +414,7 @@ def detect_gmail_threads(
                 response,
                 batch,
                 operator_emails=operator_emails,
+                timezone_name=timezone_name,
             )
             for result in parsed:
                 decision = preclassification_by_id[result.thread_id]
@@ -424,6 +444,22 @@ def detect_gmail_threads(
                 else:
                     detections[result.thread_id] = result
             estimated_output_tokens += _estimate_tokens(response)
+        except DailyBudgetExceeded:
+            requests -= 1
+            estimated_input_tokens -= batch_input_tokens
+            reserved_total_tokens -= batch_total_tokens
+            deferred_entries = [
+                (thread, preclassification_by_id[thread.thread_id])
+                for thread in batch
+            ]
+            deferred_entries.extend(model_entries[index:])
+            deferred_count += _defer_remaining(
+                detections,
+                deferred_entries,
+                reason_code="detector_budget_exhausted",
+            )
+            index = len(model_entries)
+            break
         except Exception as exc:
             message = f"{type(exc).__name__}: {exc}"[:1000]
             errors.append(message)
@@ -434,32 +470,26 @@ def detect_gmail_threads(
                     thread,
                     operator_emails=operator_emails,
                 )
-                if decision.high_consequence or direct_obligation or active_items:
-                    reason_code = (
-                        "high_consequence_detector_error"
-                        if decision.high_consequence
-                        else "direct_obligation_detector_error"
-                        if direct_obligation
-                        else "active_item_detector_error"
-                    )
-                    fallback = _visible_uncertain_fallback(
-                        thread,
-                        reason_code=reason_code,
-                        operator_emails=operator_emails,
-                        active_items=active_items,
-                        high_consequence=decision.high_consequence,
-                        direct_obligation=direct_obligation,
-                    )
-                    detections[thread.thread_id] = GmailThreadDetection(
-                        **{**fallback.__dict__, "error": message}
-                    )
-                else:
-                    detections[thread.thread_id] = GmailThreadDetection(
-                        thread_id=thread.thread_id,
-                        disposition="error",
-                        reason_code="detector_error",
-                        error=message,
-                    )
+                reason_code = (
+                    "high_consequence_detector_error"
+                    if decision.high_consequence
+                    else "direct_obligation_detector_error"
+                    if direct_obligation
+                    else "active_item_detector_error"
+                    if active_items
+                    else "detector_error_uncertain"
+                )
+                fallback = _visible_uncertain_fallback(
+                    thread,
+                    reason_code=reason_code,
+                    operator_emails=operator_emails,
+                    active_items=active_items,
+                    high_consequence=decision.high_consequence,
+                    direct_obligation=direct_obligation,
+                )
+                detections[thread.thread_id] = GmailThreadDetection(
+                    **{**fallback.__dict__, "error": message}
+                )
 
     ordered = tuple(
         detections.get(
@@ -509,6 +539,7 @@ def _parse_batch_response(
     batch: Sequence[NormalizedGmailThread],
     *,
     operator_emails: Sequence[str],
+    timezone_name: str,
 ) -> tuple[GmailThreadDetection, ...]:
     raw_results = response.get("threads")
     if not isinstance(raw_results, list):
@@ -545,6 +576,7 @@ def _parse_batch_response(
                 candidate,
                 allowed[thread_id],
                 operator_emails=operator_emails,
+                timezone_name=timezone_name,
             )
             for candidate in raw_candidates[:12]
         )
@@ -611,8 +643,8 @@ def _visible_uncertain_fallback(
         handled_verdict=handled,
         handled_confidence=handled_confidence,
         reason=(
-            "The detector could not safely dismiss a direct obligation, "
-            "high-consequence signal, or previously active item."
+            "The detector could not safely resolve this preclassified operational "
+            "thread; review the cited message."
         ),
         reconciliation_status="ambiguous",
     )
@@ -630,6 +662,7 @@ def _parse_candidate(
     thread: NormalizedGmailThread,
     *,
     operator_emails: Sequence[str],
+    timezone_name: str,
 ) -> GmailOperationalCandidate:
     if not isinstance(raw, Mapping):
         raise GmailDetectorError("candidate must be an object")
@@ -663,16 +696,54 @@ def _parse_candidate(
     ).strip()
     if reconciliation_status not in {"confirmed", "provisional", "ambiguous"}:
         raise GmailDetectorError("candidate has invalid reconciliation status")
-    due_at = _timestamp_or_none(raw.get("due_at"))
-    starts_at = _timestamp_or_none(raw.get("starts_at"))
-    ends_at = _timestamp_or_none(raw.get("ends_at"))
-    expires_at = _timestamp_or_none(raw.get("expires_at"))
+    raw_due_at = raw.get("due_at")
+    raw_starts_at = raw.get("starts_at")
+    raw_ends_at = raw.get("ends_at")
+    raw_expires_at = raw.get("expires_at")
+    due_at = _timestamp_or_none(raw_due_at)
+    starts_at = _timestamp_or_none(raw_starts_at)
+    ends_at = _timestamp_or_none(raw_ends_at)
+    expires_at = _timestamp_or_none(raw_expires_at)
     confidence = _confidence(raw.get("confidence"), default=0.5)
     reason = _bounded_optional(raw.get("reason"), 1000)
-    if any((due_at, starts_at, ends_at, expires_at)) and not any(
-        _DATE_EVIDENCE_SIGNAL.search(quote) for _message_id, quote in citations
-    ):
-        due_at = starts_at = ends_at = expires_at = None
+    grounding_text = _candidate_grounding_text(thread, citations)
+    if not _candidate_text_is_grounded(title, grounding_text):
+        title = (thread.subject or "Review email")[:500]
+        reconciliation_status = "ambiguous"
+        confidence = min(confidence, 0.49)
+        reason = _append_reason(reason, "Ungrounded model title was replaced.")
+    counterparty = _bounded_optional(raw.get("counterparty"), 500)
+    if counterparty and counterparty.casefold() not in grounding_text.casefold():
+        counterparty = None
+        reconciliation_status = "ambiguous"
+        confidence = min(confidence, 0.49)
+        reason = _append_reason(reason, "Ungrounded counterparty was omitted.")
+    timestamps = {
+        "due_at": (due_at, raw_due_at),
+        "starts_at": (starts_at, raw_starts_at),
+        "ends_at": (ends_at, raw_ends_at),
+        "expires_at": (expires_at, raw_expires_at),
+    }
+    ungrounded_dates = {
+        key
+        for key, (value, original) in timestamps.items()
+        if value is not None
+        and not _timestamp_is_grounded(
+            str(original),
+            citations=citations,
+            thread=thread,
+            timezone_name=timezone_name,
+        )
+    }
+    if ungrounded_dates:
+        if "due_at" in ungrounded_dates:
+            due_at = None
+        if "starts_at" in ungrounded_dates:
+            starts_at = None
+        if "ends_at" in ungrounded_dates:
+            ends_at = None
+        if "expires_at" in ungrounded_dates:
+            expires_at = None
         reconciliation_status = "provisional"
         confidence = min(confidence, 0.49)
         reason = _append_reason(reason, "Unverified model-supplied date was omitted.")
@@ -703,7 +774,7 @@ def _parse_candidate(
         starts_at=starts_at,
         ends_at=ends_at,
         expires_at=expires_at,
-        counterparty=_bounded_optional(raw.get("counterparty"), 500),
+        counterparty=counterparty,
         reason=reason,
         reconciliation_status=reconciliation_status,
     )
@@ -884,7 +955,15 @@ def _deterministic_handled_state(
             return "needs_action", 0.98
         if any(index > latest_request for index in outgoing_promises):
             return "needs_action", 0.92
-        return "responded_waiting", 0.9
+        if any(
+            _DETERMINISTIC_RESPONSE_SIGNAL.search(thread.messages[index].body)
+            for index in replies
+        ):
+            return "responded_waiting", 0.9
+        # An acknowledgement, partial update, or unrelated outgoing message
+        # proves neither completion nor that another party now owns the next
+        # move. Keep the original direct obligation actionable.
+        return "needs_action", 0.75
     if outgoing_promises:
         return "needs_action", 0.9
     return "unknown", 0.25
@@ -934,6 +1013,190 @@ def _verified_evidence_citations(
             seen.add(citation)
             citations.append(citation)
     return tuple(citations)
+
+
+def _candidate_grounding_text(
+    thread: NormalizedGmailThread,
+    citations: Sequence[tuple[str, str]],
+) -> str:
+    addresses = [
+        address
+        for message in thread.messages
+        for address in (
+            *message.from_addresses,
+            *message.to_addresses,
+            *message.cc_addresses,
+        )
+    ]
+    return "\n".join(
+        [
+            thread.subject or "",
+            *addresses,
+            *(quote for _message_id, quote in citations),
+        ]
+    )
+
+
+def _timestamp_is_grounded(
+    value: str,
+    *,
+    citations: Sequence[tuple[str, str]],
+    thread: NormalizedGmailThread,
+    timezone_name: str,
+) -> bool:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    local_zone = ZoneInfo(timezone_name)
+    month_names = (
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+    )
+    month = month_names[parsed.month - 1]
+    day_suffix = "(?:st|nd|rd|th)?"
+    full_date_patterns = (
+        rf"(?<!\d){parsed.year}[-/]{parsed.month:02d}[-/]{parsed.day:02d}(?!\d)",
+        rf"(?<!\d){parsed.year}[-/]{parsed.month}[-/]{parsed.day}(?!\d)",
+        rf"(?<!\d){parsed.month}/{parsed.day}/{parsed.year}(?!\d)",
+        rf"\b{month}\s+{parsed.day}{day_suffix},?\s+{parsed.year}\b",
+        rf"\b{month[:3]}\.?\s+{parsed.day}{day_suffix},?\s+{parsed.year}\b",
+    )
+    messages = {message.message_id: message for message in thread.messages}
+    for message_id, quote in citations:
+        normalized = quote.casefold()
+        if (
+            any(re.search(pattern, normalized) for pattern in full_date_patterns)
+            and _explicit_time_matches(parsed, normalized)
+            and _explicit_timezone_matches(parsed, normalized, require_explicit=True)
+        ):
+            return True
+        message = messages.get(message_id)
+        if message is None or not message.timestamp:
+            continue
+        try:
+            message_date = datetime.fromisoformat(
+                message.timestamp.replace("Z", "+00:00")
+            ).astimezone(local_zone).date()
+        except ValueError:
+            continue
+        precise_relative_time = _explicit_time_matches(
+            parsed, normalized
+        ) and _explicit_timezone_matches(
+            parsed,
+            normalized,
+            require_explicit=True,
+        )
+        if (
+            "today" in normalized
+            and parsed.astimezone(local_zone).date() == message_date
+            and precise_relative_time
+        ):
+            return True
+        if (
+            "tomorrow" in normalized
+            and parsed.astimezone(local_zone).date()
+            == message_date + timedelta(days=1)
+            and precise_relative_time
+        ):
+            return True
+    return False
+
+
+def _explicit_time_matches(value: datetime, quote: str) -> bool:
+    twelve_hour = re.search(r"\b(1[0-2]|0?[1-9])(?::([0-5]\d))?\s*([ap])\.?m\.?\b", quote)
+    if twelve_hour:
+        hour = int(twelve_hour.group(1)) % 12
+        if twelve_hour.group(3) == "p":
+            hour += 12
+        minute = int(twelve_hour.group(2) or 0)
+        return (value.hour, value.minute) == (hour, minute)
+    twenty_four_hour = re.search(
+        r"(?:t|\b)([01]?\d|2[0-3]):([0-5]\d)(?::[0-5]\d)?\b",
+        quote,
+    )
+    if not twenty_four_hour:
+        return False
+    return (value.hour, value.minute) == (
+        int(twenty_four_hour.group(1)),
+        int(twenty_four_hour.group(2)),
+    )
+
+
+def _explicit_timezone_matches(
+    value: datetime,
+    quote: str,
+    *,
+    require_explicit: bool,
+) -> bool:
+    expected = value.utcoffset()
+    if expected is None:
+        return False
+    offset_match = re.search(
+        r"(?:t|\s)\d{1,2}:\d{2}(?::\d{2})?\s*(z|[+-]\d{2}:?\d{2})\b",
+        quote,
+    )
+    if offset_match:
+        token = offset_match.group(1)
+        if token == "z":
+            cited_minutes = 0
+        else:
+            sign = -1 if token.startswith("-") else 1
+            digits = token[1:].replace(":", "")
+            cited_minutes = sign * (int(digits[:2]) * 60 + int(digits[2:]))
+        return int(expected.total_seconds() // 60) == cited_minutes
+    named_offsets = {
+        "utc": 0,
+        "gmt": 0,
+        "pst": -8 * 60,
+        "pdt": -7 * 60,
+        "mst": -7 * 60,
+        "mdt": -6 * 60,
+        "cst": -6 * 60,
+        "cdt": -5 * 60,
+        "est": -5 * 60,
+        "edt": -4 * 60,
+    }
+    cited = {
+        offset
+        for name, offset in named_offsets.items()
+        if re.search(rf"\b{name}\b", quote)
+    }
+    if not cited:
+        return not require_explicit
+    return cited == {int(expected.total_seconds() // 60)}
+
+
+def _candidate_text_is_grounded(value: str, grounding_text: str) -> bool:
+    stop_words = {
+        "about",
+        "action",
+        "attention",
+        "email",
+        "follow",
+        "from",
+        "need",
+        "please",
+        "review",
+        "send",
+        "that",
+        "this",
+        "with",
+    }
+    tokens = {
+        token.casefold()
+        for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9._@-]{2,}", value)
+        if token.casefold() not in stop_words
+    }
+    corpus = grounding_text.casefold()
+    return not tokens or any(token in corpus for token in tokens)
 
 
 def _bounded_responsibility_context(value: Mapping[str, Any] | None) -> Any:

@@ -308,7 +308,7 @@ Reconciliation rules:
 - a reply may resolve a `kind=waiting` item only when it directly supplies or declines the awaited result;
 - an outgoing message does not prove the recipient completed their work;
 - source disappearance does not imply cancellation or completion;
-- a model may recommend `create|update|resolve|cancel|none`, but deterministic code checks source lineage and allowed transitions;
+- the current Gmail detector may recommend only `create|update|needs_reconciliation`; deterministic code owns every lifecycle effect and downgrades unsupported or ambiguous operations;
 - no critic or candidate-by-candidate resolver loop runs in the operational path;
 - malformed/timeout output causes no transition and marks connector coverage incomplete;
 - human dismissal prevents same-version resurrection;
@@ -373,10 +373,10 @@ Calendar authority mapping is explicit:
 
 - `stream_key` is the canonical calendar ID and source identity includes the account, calendar, event ID, and recurring-instance original start where applicable;
 - `source_revision` is the event etag when present; for an ID-only deletion tombstone it is a deterministic hash of the provider sync checkpoint plus the minimal tombstone identity, used only for idempotence;
-- `source_order` is the next persisted per-calendar sync generation, derived from successful [`nextSyncToken` progression](https://developers.google.com/workspace/calendar/api/guides/sync) and committed atomically with that token; it is never API page order or poll time;
+- `source_order` is the next locally committed per-calendar source-unit/cursor generation; accepted partial continuation tranches advance that local generation, while the final provider [`nextSyncToken`](https://developers.google.com/workspace/calendar/api/guides/sync) is committed only with complete coverage. It is never API page order or poll time;
 - `source_updated_at` is the Calendar event `updated` value when present, while the provider `sequence` value is retained as bounded metadata; sparse tombstones may leave both absent because [Google guarantees only minimal identity fields for some cancelled events](https://developers.google.com/workspace/calendar/api/v3/reference/events#resource).
 
-The connector stages all pages for a change-set before applying its one source-unit batch. A replay of the same staged checkpoint reproduces the same revision/order inputs. An expired sync token marks coverage incomplete and triggers the bounded full-resync policy; absence from that resync never fabricates a cancellation.
+The connector commits each bounded continuation tranche as one atomic source unit: observations, decisions, assessments, and the matching continuation checkpoint advance together. A replay from the last committed checkpoint reproduces the same revision/order inputs. Coverage remains partial while continuation is pending. An expired sync token marks coverage incomplete and triggers the bounded full-resync policy; absence from that resync never fabricates a cancellation.
 
 The default initial window is 14 days in the past and 90 days in the future. Configuration may narrow it. Expanding it requires an explicit storage/privacy reason.
 
@@ -428,7 +428,7 @@ The operational detector receives only:
 - a bounded list of plausibly related active items;
 - the closed item kinds, owners, state hints, and transition vocabulary.
 
-It returns bounded structured candidates containing a detector-local key, kind, title, owner, optional dates, direct evidence references, confidence, and one recommended `create|update|resolve|cancel|none` operation.
+It returns bounded structured candidates containing a detector-local key, kind, title, owner, optional dates, direct evidence references, confidence, and one recommended `create|update|needs_reconciliation` operation. The model cannot directly resolve, cancel, complete, or suppress an existing item; deterministic reconciliation and explicit operator feedback own those effects.
 
 V1 permits at most one semantic detector pass per changed thread, or one request containing a bounded batch of short threads. It has:
 
@@ -440,7 +440,7 @@ V1 permits at most one semantic detector pass per changed thread, or one request
 
 Malformed output produces no items and remains retryable on a later connector run. Ambiguity becomes an active low-confidence item with provisional/ambiguous reconciliation metadata, or no item, not an adjudication request.
 
-Daily request/input/token budgets are explicit configuration. Overflow is deferred with visible coverage status; it is never silently dropped. Production enablement requires a chronological replay demonstrating that the approved budget covers normal and high-volume days.
+Daily request/input/token budgets are explicit configuration. Each detector attempt durably pre-reserves a conservative, no-refund input and total ceiling before launch. The restricted Codex route enforces that same total as a provider-side rollout cap. Provider-reported actual usage, when available, is recorded separately in LLM usage telemetry and does not reduce the reservation. Explicitly selected providers without an equivalent in-flight cap retain a circuit-breaker caveat: one already-running call may exceed its reservation, while later exhausted work is deferred with visible partial coverage. Overflow is never silently dropped. Production enablement requires a chronological replay demonstrating that the approved budget covers normal and high-volume days.
 
 ## Later Read-Only Adapters
 

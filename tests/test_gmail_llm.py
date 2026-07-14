@@ -16,7 +16,7 @@ from pkm_brain.gmail_llm import (
     restricted_codex_process_environment,
     resolve_gmail_llm_selection,
 )
-from pkm_brain.llm import LLMConfigurationError, LLMProviderError, OpenAIProvider
+from pkm_brain.llm import LLMConfigurationError, LLMProviderError
 from pkm_brain.llm_usage import configure_provider_usage, llm_usage_summary
 from pkm_brain.paths import BrainPaths
 
@@ -44,6 +44,7 @@ def test_restricted_codex_command_is_fail_closed_and_non_agentic(
         cwd=cwd,
         schema_path=schema,
         output_path=output,
+        rollout_token_ceiling=16_384,
     )
 
     assert command[:4] == ["/opt/codex", "--ask-for-approval", "never", "exec"]
@@ -89,6 +90,32 @@ def test_restricted_codex_command_is_fail_closed_and_non_agentic(
     assert "mcp_servers={}" in overrides
     assert "plugins={}" in overrides
     assert 'shell_environment_policy.inherit="none"' in overrides
+    rollout_index = overrides.index("features.rollout_budget=true")
+    assert overrides[rollout_index : rollout_index + 4] == [
+        "features.rollout_budget=true",
+        "features.rollout_budget.limit_tokens=16384",
+        "features.rollout_budget.sampling_token_weight=1.0",
+        "features.rollout_budget.prefill_token_weight=1.0",
+    ]
+
+
+def test_gmail_token_ceiling_is_byte_safe_and_cannot_be_lowered() -> None:
+    class Provider:
+        name = "test"
+        model = "test"
+        gmail_input_overhead_token_ceiling = 1
+        gmail_output_token_ceiling = 1
+
+    prompt = "ASCII and calendar \U0001f4c5"
+    ceiling = gmail_llm.gmail_detector_token_ceiling(Provider(), prompt)
+
+    assert ceiling.prompt_tokens == len(prompt.encode("utf-8"))
+    assert ceiling.input_tokens == (
+        ceiling.prompt_tokens
+        + gmail_llm.GMAIL_DETECTOR_INPUT_OVERHEAD_TOKEN_CEILING
+    )
+    assert ceiling.output_tokens == gmail_llm.GMAIL_DETECTOR_OUTPUT_TOKEN_CEILING
+    assert ceiling.total_tokens == ceiling.input_tokens + ceiling.output_tokens
 
 
 def test_adversarial_email_is_stdin_only_and_environment_is_scrubbed(
@@ -225,9 +252,9 @@ def test_restricted_codex_has_one_model_and_never_falls_back(
 @pytest.mark.parametrize(
     ("version", "help_text", "message"),
     [
-        ("codex-cli 0.137.9", ALL_EXEC_FLAGS, "0.138.0+"),
+        ("codex-cli 0.141.9", ALL_EXEC_FLAGS, "0.142.0+"),
         ("codex-cli 0.144.3", "--ephemeral --json", "lacks required"),
-        ("unparseable", ALL_EXEC_FLAGS, "0.138.0+"),
+        ("unparseable", ALL_EXEC_FLAGS, "0.142.0+"),
     ],
 )
 def test_restricted_codex_refuses_unsupported_isolation(
@@ -359,23 +386,20 @@ def test_global_provider_selection_cannot_route_gmail_to_direct_api(
     assert selection.provider_source == "gmail-default:restricted-codex"
 
 
-def test_direct_provider_requires_gmail_specific_selection_and_has_no_fallback(
+@pytest.mark.parametrize("provider_name", ("openai", "anthropic", "ollama"))
+def test_direct_provider_selection_fails_closed_for_gmail(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    provider_name: str,
 ) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
-    monkeypatch.setenv(gmail_llm.GMAIL_LLM_PROVIDER_ENV, "openai")
-    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-    monkeypatch.setenv("PKM_BRAIN_OPENAI_MODEL", "gmail-explicit-model")
-    monkeypatch.setenv(
-        "PKM_BRAIN_OPENAI_MODEL_FALLBACKS",
-        "must-not-run-1,must-not-run-2",
-    )
+    monkeypatch.setenv(gmail_llm.GMAIL_LLM_PROVIDER_ENV, provider_name)
 
-    provider = get_gmail_provider(paths)
-
-    assert isinstance(provider, OpenAIProvider)
-    assert provider.models == ["gmail-explicit-model"]
+    with pytest.raises(
+        LLMConfigurationError,
+        match="requires the restricted Codex provider",
+    ):
+        get_gmail_provider(paths)
 
 
 def test_gmail_specific_config_selects_provider_and_rejects_unknown_keys(
