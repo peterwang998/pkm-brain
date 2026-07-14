@@ -23,6 +23,7 @@ from .cos_audit import run_sampled_audit
 from .db import connection, dumps
 from .extraction import extract_recent_documents
 from .gardener import generate_gardener_candidates
+from .google_cache import GoogleEvidenceCache
 from .indexes import lancedb_stats, optimize_vectors, should_optimize_vectors
 from .llm import (
     CODEX_DEFAULT_MODEL,
@@ -295,6 +296,9 @@ def run_nightly_maintenance(
         status = "success"
         error: str | None = None
         try:
+            summary["google_evidence_retention"] = (
+                run_google_evidence_cache_retention(paths)
+            )
             cos_role = cos_role_status(paths)
             connector_ids = connector_ids_for_agent(
                 agent, include_hyprnote=include_hyprnote
@@ -361,6 +365,7 @@ def run_nightly_maintenance(
             errors = (
                 summary["capture"].get("errors", [])
                 + summary["ingest"].get("errors", [])
+                + summary["google_evidence_retention"].get("errors", [])
                 + summary["telemetry_retention"].get("errors", [])
                 + summary["index_maintenance"].get("errors", [])
                 + summary["provenance_check"].get("errors", [])
@@ -388,6 +393,40 @@ def run_nightly_maintenance(
             summary=summary,
             error=error,
         )
+
+
+def run_google_evidence_cache_retention(paths: BrainPaths) -> dict[str, Any]:
+    """Prune an existing private Google evidence cache without creating one."""
+
+    cache_root = paths.home / "cache" / "google-evidence"
+    if not cache_root.exists() and not cache_root.is_symlink():
+        return {
+            "status": "not_configured",
+            "configured": False,
+            "removed_files": 0,
+            "removed_bytes": 0,
+            "retained_files": 0,
+            "errors": [],
+            "note": "Google evidence cache is absent; nightly cleanup was a no-op",
+        }
+    try:
+        result = GoogleEvidenceCache.for_paths(paths).prune().as_dict()
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "configured": True,
+            "removed_files": 0,
+            "removed_bytes": 0,
+            "retained_files": 0,
+            "errors": [str(exc)],
+        }
+    errors = list(result.get("errors", []))
+    return {
+        "status": "failed" if errors else "ok",
+        "configured": True,
+        **result,
+        "errors": errors,
+    }
 
 
 def cos_role_status(paths: BrainPaths) -> dict[str, Any]:

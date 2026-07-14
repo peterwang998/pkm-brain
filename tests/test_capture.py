@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import json
 import plistlib
 import shlex
@@ -13,11 +14,13 @@ from pkm_brain.automation import (
     render_launch_agent,
     render_nightly_launch_agent,
     run_agent_log_ingest,
+    run_google_evidence_cache_retention,
     run_nightly_maintenance,
     validate_nightly_launch_agent_plist,
 )
 from pkm_brain.capture import AgentLogCapture, redact_text, render_hyprnote_transcript
 from pkm_brain.db import connection
+from pkm_brain.google_cache import GoogleEvidenceCache
 from pkm_brain.llm import (
     CODEX_DEFAULT_FALLBACK_MODELS,
     CODEX_DEFAULT_MODEL,
@@ -544,6 +547,8 @@ def test_nightly_maintenance_runs_self_healing_tasks(tmp_path: Path) -> None:
     assert result.summary["llm_usage"]["cycle_count"] == 0
     assert result.summary["llm_usage"]["log_path"].endswith("llm-usage.log")
     assert result.summary["telemetry_retention"]["status"] == "ok"
+    assert result.summary["google_evidence_retention"]["status"] == "not_configured"
+    assert result.summary["google_evidence_retention"]["errors"] == []
     assert "fts" in result.summary["index_maintenance"]
     assert result.summary["provenance_check"]["errors"] == []
     assert result.summary["wiki_lint"]["errors"] == []
@@ -555,6 +560,83 @@ def test_nightly_maintenance_runs_self_healing_tasks(tmp_path: Path) -> None:
         ).fetchone()
     assert row is not None
     assert row["status"] == "success"
+
+
+def test_google_evidence_retention_prunes_expired_raw_and_normalized_files(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    cache = GoogleEvidenceCache.for_paths(paths)
+    now = datetime.now(timezone.utc)
+    raw_path = cache.write_raw(
+        "gmail",
+        "thread:expired",
+        {"id": "expired"},
+        cached_at=now - timedelta(days=8),
+    )
+    normalized_path = cache.write_normalized(
+        "calendar",
+        "event:expired",
+        {"id": "expired"},
+        cached_at=now - timedelta(days=31),
+    )
+    retained_path = cache.write_raw(
+        "gmail",
+        "thread:current",
+        {"id": "current"},
+        cached_at=now - timedelta(days=1),
+    )
+
+    result = run_google_evidence_cache_retention(paths)
+
+    assert result["status"] == "ok"
+    assert result["configured"] is True
+    assert result["removed_files"] == 2
+    assert result["removed_bytes"] > 0
+    assert result["retained_files"] == 1
+    assert result["errors"] == []
+    assert not raw_path.exists()
+    assert not normalized_path.exists()
+    assert retained_path.exists()
+
+
+def test_google_evidence_retention_does_not_create_absent_cache(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    cache_root = paths.home / "cache" / "google-evidence"
+
+    result = run_google_evidence_cache_retention(paths)
+
+    assert result["status"] == "not_configured"
+    assert result["configured"] is False
+    assert result["errors"] == []
+    assert not cache_root.exists()
+
+
+def test_nightly_google_evidence_retention_errors_are_visible(
+    tmp_path: Path,
+) -> None:
+    svc = make_service(tmp_path)
+    cache = GoogleEvidenceCache.for_paths(svc.paths)
+    malformed_path = cache.write_raw("gmail", "thread:bad", {"id": "bad"})
+    malformed_path.write_text("not-json", encoding="utf-8")
+
+    result = run_nightly_maintenance(
+        svc.paths,
+        codex_state=tmp_path / "missing-codex.sqlite",
+        claude_projects=tmp_path / "missing-claude",
+        opencode_db=tmp_path / "missing-opencode.sqlite",
+        hyprnote_root=tmp_path / "missing-hyprnote",
+    )
+
+    retention = result.summary["google_evidence_retention"]
+    assert result.status == "failed"
+    assert retention["status"] == "failed"
+    assert retention["errors"]
+    assert "invalid JSON" in retention["errors"][0]
+    assert result.error is not None
+    assert "invalid JSON" in result.error
 
 
 def test_nightly_memory_audit_errors_are_warning_tier(tmp_path: Path) -> None:

@@ -75,6 +75,8 @@ The trial stores:
 | normalized evidence | `~/brain/cache/google-evidence/normalized/` | revision-addressed retained evidence, 30-day retention |
 | operational state | `~/brain/db/ops.sqlite` | items, transitions, cursors, briefings, and feedback |
 
+Nightly maintenance automatically removes expired raw and normalized Google evidence and records the counts in its `google_evidence_retention` summary. If the cache has never been used, maintenance reports a harmless `not_configured` no-op and does not create it. A cleanup error is a visible nightly failure; cleanup never starts Calendar or Gmail source work.
+
 To dispose of cached source payloads, first wait for Shadow to stop and quit PKM Brain, then move `~/brain/cache/google-evidence/` to Trash. This removes the disposable raw and normalized cache, not Keychain credentials or derived operational history; old evidence links will become unavailable. Disconnect each Google card in **Ops > Connectors** to revoke Brain's local credential use. Do not delete `ops.sqlite`, its WAL/SHM files, or the policy while the daemon is running. A full operational-state reset should use a coordinated backup/reset procedure rather than live file deletion.
 
 ## Stop Conditions
