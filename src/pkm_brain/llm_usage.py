@@ -4,6 +4,10 @@ import fcntl
 import json
 import threading
 from collections import deque
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -22,6 +26,59 @@ USAGE_CATEGORY_BY_ROLE = {
     "auditor": "auditor",
 }
 _USAGE_WRITE_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class ProviderUsageRecord:
+    model: str
+    usage: dict[str, int] | None
+    status: str
+    started_at: str
+    duration_ms: int
+    error_type: str | None = None
+    session_id: str | None = None
+    rate_limits: dict[str, Any] | None = None
+
+
+@dataclass
+class ProviderUsageCapture:
+    records: list[ProviderUsageRecord] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _ProviderUsageCaptureFrame:
+    provider: Any
+    capture: ProviderUsageCapture
+
+
+_PROVIDER_USAGE_CAPTURES: ContextVar[tuple[_ProviderUsageCaptureFrame, ...]] = (
+    ContextVar("pkm_provider_usage_captures", default=())
+)
+
+
+@contextmanager
+def capture_provider_usage(provider: Any) -> Iterator[ProviderUsageCapture]:
+    """Capture usage reported by ``provider`` in this execution context."""
+
+    capture = ProviderUsageCapture()
+    stack = _PROVIDER_USAGE_CAPTURES.get()
+    token = _PROVIDER_USAGE_CAPTURES.set(
+        (*stack, _ProviderUsageCaptureFrame(provider=provider, capture=capture))
+    )
+    try:
+        yield capture
+    finally:
+        _PROVIDER_USAGE_CAPTURES.reset(token)
+
+
+def _notify_provider_usage_capture(
+    provider: Any,
+    record: ProviderUsageRecord,
+) -> None:
+    for frame in reversed(_PROVIDER_USAGE_CAPTURES.get()):
+        if frame.provider is provider:
+            frame.capture.records.append(record)
+            return
 
 
 def configure_provider_usage(
@@ -64,17 +121,34 @@ def record_provider_usage(
     session_id: str | None = None,
     rate_limits: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
+    normalized = normalize_token_usage(usage)
+    try:
+        normalized_duration_ms = max(0, int(duration_ms))
+    except (TypeError, ValueError):
+        normalized_duration_ms = 0
+    _notify_provider_usage_capture(
+        provider,
+        ProviderUsageRecord(
+            model=model,
+            usage=normalized,
+            status=status,
+            started_at=started_at,
+            duration_ms=normalized_duration_ms,
+            error_type=error_type,
+            session_id=session_id,
+            rate_limits=rate_limits,
+        ),
+    )
     context = getattr(provider, "_pkm_usage_context", None)
     if not isinstance(context, dict) or not context.get("log_path"):
         return None
-    normalized = normalize_token_usage(usage)
     event = {
         "schema_version": LLM_USAGE_SCHEMA_VERSION,
         "event_type": "llm_usage",
         "request_id": new_id("llmusage"),
         "recorded_at": now_iso(),
         "started_at": started_at,
-        "duration_ms": max(0, int(duration_ms)),
+        "duration_ms": normalized_duration_ms,
         "cycle_id": str(context.get("cycle_id") or ""),
         "run_id": context.get("run_id"),
         "stage": str(context.get("stage") or ""),

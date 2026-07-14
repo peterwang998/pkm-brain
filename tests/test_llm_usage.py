@@ -1,16 +1,120 @@
 from __future__ import annotations
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from pkm_brain import llm
 from pkm_brain.llm import CodexProvider
 from pkm_brain.llm_usage import (
+    capture_provider_usage,
     codex_jsonl_usage,
     configure_provider_usage,
     llm_usage_summary,
+    record_provider_usage,
 )
 from pkm_brain.paths import BrainPaths
+
+
+def _record_test_usage(
+    provider: object,
+    *,
+    model: str,
+    usage: dict[str, int] | None,
+) -> None:
+    record_provider_usage(
+        provider,
+        model=model,
+        usage=usage,
+        status="success",
+        started_at="2026-07-14T08:00:00Z",
+        duration_ms=25,
+    )
+
+
+def test_provider_usage_capture_isolates_parallel_same_provider_calls() -> None:
+    provider = object()
+    barrier = threading.Barrier(2)
+
+    def capture_in_thread(model: str, total_tokens: int) -> tuple[str, int]:
+        with capture_provider_usage(provider) as captured:
+            barrier.wait(timeout=5)
+            _record_test_usage(
+                provider,
+                model=model,
+                usage={"input_tokens": total_tokens, "total_tokens": total_tokens},
+            )
+        record = captured.records[0]
+        assert record.usage is not None
+        return record.model, record.usage["total_tokens"]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(capture_in_thread, "model-a", 101),
+            executor.submit(capture_in_thread, "model-b", 202),
+        ]
+
+    assert {future.result() for future in futures} == {
+        ("model-a", 101),
+        ("model-b", 202),
+    }
+
+
+def test_provider_usage_capture_uses_nearest_matching_nested_capture() -> None:
+    provider = object()
+    other_provider = object()
+
+    with capture_provider_usage(provider) as outer:
+        _record_test_usage(provider, model="outer-before", usage={"input_tokens": 1})
+        with capture_provider_usage(other_provider) as other:
+            _record_test_usage(provider, model="outer-through-other", usage={"input_tokens": 2})
+            with capture_provider_usage(provider) as inner:
+                _record_test_usage(provider, model="inner", usage={"input_tokens": 3})
+                _record_test_usage(
+                    other_provider,
+                    model="other",
+                    usage={"input_tokens": 4},
+                )
+        _record_test_usage(provider, model="outer-after", usage={"input_tokens": 5})
+
+    _record_test_usage(provider, model="after-exit", usage={"input_tokens": 6})
+
+    assert [record.model for record in outer.records] == [
+        "outer-before",
+        "outer-through-other",
+        "outer-after",
+    ]
+    assert [record.model for record in inner.records] == ["inner"]
+    assert [record.model for record in other.records] == ["other"]
+
+
+def test_provider_usage_capture_represents_missing_usage() -> None:
+    provider = object()
+
+    with capture_provider_usage(provider) as captured:
+        result = record_provider_usage(
+            provider,
+            model="usage-unavailable",
+            usage=None,
+            status="error",
+            started_at="2026-07-14T08:00:00Z",
+            duration_ms=-10,
+            error_type="ProviderUsageUnavailable",
+            session_id="session-test",
+            rate_limits={"primary": {"used_percent": 12}},
+        )
+
+    assert result is None
+    assert len(captured.records) == 1
+    record = captured.records[0]
+    assert record.model == "usage-unavailable"
+    assert record.usage is None
+    assert record.status == "error"
+    assert record.duration_ms == 0
+    assert record.error_type == "ProviderUsageUnavailable"
+    assert record.session_id == "session-test"
+    assert record.rate_limits == {"primary": {"used_percent": 12}}
 
 
 def test_codex_jsonl_usage_reads_public_and_internal_event_shapes() -> None:
