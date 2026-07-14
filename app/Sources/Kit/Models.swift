@@ -1010,6 +1010,30 @@ public struct TodayFeedbackResponse: Codable, Equatable, Sendable {
     public let message: String
 }
 
+public struct TodayShadowRunStatus: Codable, Equatable, Sendable {
+    public let schema_version: Int
+    public let status: String
+    public let message: String
+    public let run_id: String?
+    public let started_at: String?
+    public let finished_at: String?
+    public let counts: [String: JSONValue]?
+    public let coverage: [String: JSONValue]?
+    public let usage: [String: JSONValue]?
+
+    public var succeeded: Bool {
+        ["complete", "partial"].contains(status.lowercased())
+    }
+
+    public var isInProgress: Bool {
+        ["accepted", "running"].contains(status.lowercased())
+    }
+
+    public var isTerminal: Bool {
+        ["complete", "partial", "failed"].contains(status.lowercased())
+    }
+}
+
 public enum DaemonStatus: Equatable, Sendable {
     case idle
     case provisioning(String)

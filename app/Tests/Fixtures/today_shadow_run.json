@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "status": "partial",
+  "message": "Shadow run finished with partial coverage.",
+  "run_id": "opsshadow_example",
+  "started_at": "2026-07-13T15:00:00+00:00",
+  "finished_at": "2026-07-13T15:00:12+00:00",
+  "coverage": {
+    "calendar": {
+      "status": "complete",
+      "fresh_at": "2026-07-13T15:00:04+00:00"
+    },
+    "gmail": {
+      "status": "partial",
+      "fresh_at": "2026-07-13T15:00:10+00:00",
+      "deferred_count": 2
+    }
+  },
+  "usage": {
+    "calendar": {"requests": 2},
+    "gmail": {"requests": 8}
+  },
+  "counts": {
+    "calendar_events": 4,
+    "gmail_threads": 7,
+    "surfaced": 3
+  }
+}

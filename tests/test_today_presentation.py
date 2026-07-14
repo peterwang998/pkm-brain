@@ -83,7 +83,7 @@ class RecordingTodayService:
             handled_verdict="needs_action",
             reason_codes=("direct_question",),
             evidence=(evidence,),
-            feedback_actions=("correct", "done", "snooze", "dismiss"),
+            feedback_actions=("confirm", "correct", "done", "snooze", "dismiss"),
         )
         return TodayBriefing(
             status="partial",
@@ -146,6 +146,7 @@ class RecordingTodayService:
             feedback=TodayFeedbackCapabilities(
                 enabled=True,
                 actions=(
+                    "confirm",
                     "correct",
                     "done",
                     "snooze",
@@ -214,6 +215,15 @@ def test_today_contract_enforces_focus_and_item_confidence() -> None:
         )
 
 
+def test_today_feedback_supports_confirmation_and_requires_correction_note() -> None:
+    confirmation = TodayFeedbackRequest.from_payload({"action": "confirm"})
+
+    assert confirmation.action == "confirm"
+    assert confirmation.note is None
+    with pytest.raises(ValueError, match="note is required"):
+        TodayFeedbackRequest.from_payload({"action": "correct"})
+
+
 def test_v1_today_routes_expose_briefing_and_feedback(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
     service = RecordingTodayService()
@@ -225,7 +235,7 @@ def test_v1_today_routes_expose_briefing_and_feedback(tmp_path: Path) -> None:
             port,
             "POST",
             "/api/v1/today/items/item-1/feedback",
-            {"action": "done", "note": "Handled in the meeting."},
+            {"action": "confirm"},
         )
         missing_status, missing = request_json(
             host,
@@ -244,7 +254,7 @@ def test_v1_today_routes_expose_briefing_and_feedback(tmp_path: Path) -> None:
     assert feedback_status == 200
     assert feedback["status"] == "accepted"
     assert service.feedback[0][0] == "item-1"
-    assert service.feedback[0][1].action == "done"
+    assert service.feedback[0][1].action == "confirm"
     assert missing_status == 200
     assert missing["action"] == "report_missing"
     assert service.missing[0].title == "Renew the domain"

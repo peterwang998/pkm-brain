@@ -17,7 +17,7 @@ HANDLED_VERDICTS = {
     "fulfilled",
     "unknown",
 }
-FEEDBACK_ACTIONS = {"correct", "done", "snooze", "dismiss", "restore"}
+FEEDBACK_ACTIONS = {"confirm", "correct", "done", "snooze", "dismiss", "restore"}
 ITEM_SECTIONS = {
     "focus",
     "urgent_overflow",
@@ -295,12 +295,15 @@ class TodayFeedbackRequest:
         action = str(payload.get("action") or "").strip()
         if action not in FEEDBACK_ACTIONS:
             raise ValueError(f"unsupported today feedback action: {action or '(missing)'}")
+        note = _optional_text(payload.get("note"))
+        if action == "correct" and not note:
+            raise ValueError("note is required for correct feedback")
         snoozed_until = _optional_text(payload.get("snoozed_until"))
         if action == "snooze" and not snoozed_until:
             raise ValueError("snoozed_until is required for snooze feedback")
         return cls(
             action=action,
-            note=_optional_text(payload.get("note")),
+            note=note,
             snoozed_until=snoozed_until,
             idempotency_key=_optional_text(payload.get("idempotency_key")),
         )

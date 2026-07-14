@@ -57,7 +57,7 @@
           "provider_url": "https://calendar.google.com/calendar/event?eid=safe"
         }
       ],
-      "feedback_actions": ["correct", "done", "snooze", "dismiss"]
+      "feedback_actions": ["confirm", "correct", "done", "snooze", "dismiss"]
     }
   ],
   "urgent_overflow": {
@@ -161,6 +161,7 @@
   "feedback": {
     "enabled": true,
     "actions": [
+      "confirm",
       "correct",
       "done",
       "snooze",

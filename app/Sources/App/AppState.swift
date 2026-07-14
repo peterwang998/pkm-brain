@@ -35,6 +35,9 @@ final class AppState: ObservableObject {
     @Published var todayBriefing: TodayBriefing?
     @Published var todayError: String?
     @Published var todayFeedbackMessage: String?
+    @Published private(set) var isRunningTodayShadow = false
+    @Published var todayShadowRunMessage: String?
+    @Published var todayShadowRunError: String?
     @Published private(set) var queueSummary: QueueSummary?
     @Published var lastError: String?
     @Published var notificationsEnabled = true
@@ -172,6 +175,8 @@ final class AppState: ObservableObject {
             todayBriefing = nil
             todayError = nil
             todayFeedbackMessage = nil
+            todayShadowRunMessage = nil
+            todayShadowRunError = nil
             await refreshMigrationPlan()
             await refreshDigest()
             await refreshToday()
@@ -269,6 +274,44 @@ final class AppState: ObservableObject {
             todayError = nil
         } catch {
             todayError = error.localizedDescription
+        }
+    }
+
+    func runTodayShadow() async {
+        guard !isRunningTodayShadow else {
+            return
+        }
+        guard let client = daemon.apiClient else {
+            todayShadowRunMessage = nil
+            todayShadowRunError = "The Brain service is not available."
+            return
+        }
+
+        isRunningTodayShadow = true
+        todayShadowRunMessage = "Running read-only Calendar and Gmail shadow scan…"
+        todayShadowRunError = nil
+        defer {
+            isRunningTodayShadow = false
+        }
+
+        do {
+            var result = try await client.runTodayShadow()
+            todayShadowRunMessage = result.message
+            while result.isInProgress {
+                try await Task.sleep(nanoseconds: 2_000_000_000)
+                result = try await client.todayShadowRunStatus()
+                todayShadowRunMessage = result.message
+            }
+            if result.succeeded {
+                todayShadowRunMessage = result.message
+                await refreshToday()
+            } else {
+                todayShadowRunMessage = nil
+                todayShadowRunError = result.message
+            }
+        } catch {
+            todayShadowRunMessage = nil
+            todayShadowRunError = error.localizedDescription
         }
     }
 
@@ -421,6 +464,8 @@ final class AppState: ObservableObject {
         todayBriefing = nil
         todayError = nil
         todayFeedbackMessage = nil
+        todayShadowRunMessage = nil
+        todayShadowRunError = nil
         if pid != nil, didStart {
             Task {
                 await refreshDigest()

@@ -62,6 +62,23 @@ public final class BrainAPIClient: Sendable {
         try await get("/api/v1/today")
     }
 
+    public func runTodayShadow(
+        timezoneName: String = TimeZone.current.identifier,
+        sources: [String] = ["calendar", "gmail"]
+    ) async throws -> TodayShadowRunStatus {
+        try await post(
+            "/api/v1/today/run",
+            payload: TodayShadowRunRequest(
+                timezone_name: timezoneName,
+                sources: sources
+            )
+        )
+    }
+
+    public func todayShadowRunStatus() async throws -> TodayShadowRunStatus {
+        try await get("/api/v1/today/run")
+    }
+
     public func submitTodayFeedback(
         itemID: String,
         action: String,
@@ -377,6 +394,11 @@ public final class BrainAPIClient: Sendable {
 }
 
 private struct EmptyPayload: Encodable {}
+
+private struct TodayShadowRunRequest: Encodable {
+    let timezone_name: String
+    let sources: [String]
+}
 
 private struct ConnectorAuthConfigRequest: Encodable {
     let client_id: String

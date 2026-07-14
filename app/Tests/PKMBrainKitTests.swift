@@ -49,12 +49,80 @@ struct PKMBrainKitTests {
         #expect(briefing.hasCoverageWarning)
         #expect(briefing.visibleFocus.count == 1)
         #expect(briefing.visibleFocus.first?.handledLabel == "Needs action")
+        #expect(briefing.visibleFocus.first?.feedback_actions.contains("confirm") == true)
         #expect(briefing.visibleFocus.first?.evidence.first?.brain_route?.contains("/wiki") == true)
         #expect(briefing.urgent_overflow.count == 2)
         #expect(briefing.calendar.next.first?.title == "Project review")
         #expect(briefing.uncertain.first?.reason_codes == ["authoritative_source_unavailable"])
         #expect(briefing.ignored_suppressed.first?.handled_verdict == "fulfilled")
         #expect(briefing.feedback.allows("report_missing"))
+        #expect(briefing.feedback.allows("confirm"))
+    }
+
+    @Test("Today shadow-run fixture decodes a partial usable result")
+    func todayShadowRunFixtureDecodes() throws {
+        let result: TodayShadowRunStatus = try decodeFixture("today_shadow_run")
+
+        #expect(result.run_id == "opsshadow_example")
+        #expect(result.status == "partial")
+        #expect(result.succeeded)
+        #expect(result.isTerminal)
+        #expect(!result.isInProgress)
+        #expect(result.counts?["surfaced"]?.intValue == 3)
+        #expect(result.message == "Shadow run finished with partial coverage.")
+    }
+
+    @Test("Today shadow-run client posts the manual source and timezone selection")
+    func todayShadowRunRequest() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ShadowRunURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer {
+            ShadowRunURLProtocol.handler = nil
+            session.invalidateAndCancel()
+        }
+        ShadowRunURLProtocol.handler = { request in
+            #expect(request.url?.path == "/api/v1/today/run")
+            #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-token")
+            if request.httpMethod == "POST" {
+                #expect(request.value(forHTTPHeaderField: "Content-Type") == "application/json")
+                let body = try requestBody(request)
+                let object = try #require(
+                    JSONSerialization.jsonObject(with: body) as? [String: Any]
+                )
+                #expect(object["timezone_name"] as? String == TimeZone.current.identifier)
+                #expect(object["sources"] as? [String] == ["calendar", "gmail"])
+                #expect(Set(object.keys) == Set(["timezone_name", "sources"]))
+            } else {
+                #expect(request.httpMethod == "GET")
+            }
+
+            let response = try #require(
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Type": "application/json"]
+                )
+            )
+            let status = request.httpMethod == "POST" ? "accepted" : "complete"
+            let payload = Data(
+                #"{"schema_version":1,"status":"\#(status)","message":"Shadow status: \#(status).","run_id":"opsshadow_request","coverage":{},"usage":{},"counts":{}}"#.utf8
+            )
+            return (response, payload)
+        }
+
+        let client = BrainAPIClient(
+            baseURL: URL(string: "http://127.0.0.1:54321")!,
+            token: "test-token",
+            session: session
+        )
+        let accepted = try await client.runTodayShadow()
+        let result = try await client.todayShadowRunStatus()
+
+        #expect(accepted.isInProgress)
+        #expect(result.run_id == "opsshadow_request")
+        #expect(result.succeeded)
     }
 
     @Test("queue fixture decodes")
@@ -423,5 +491,58 @@ struct PKMBrainKitTests {
             try await Task.sleep(nanoseconds: 200_000_000)
         }
         Issue.record("Timed out waiting for condition")
+    }
+}
+
+private final class ShadowRunURLProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        true
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        guard let handler = Self.handler else {
+            client?.urlProtocol(self, didFailWithError: APIClientError.invalidResponse)
+            return
+        }
+        do {
+            let (response, data) = try handler(request)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
+}
+
+private func requestBody(_ request: URLRequest) throws -> Data {
+    if let body = request.httpBody {
+        return body
+    }
+    let stream = try #require(request.httpBodyStream)
+    stream.open()
+    defer { stream.close() }
+
+    var body = Data()
+    var buffer = [UInt8](repeating: 0, count: 4096)
+    while true {
+        let count = buffer.withUnsafeMutableBufferPointer { pointer in
+            stream.read(pointer.baseAddress!, maxLength: pointer.count)
+        }
+        if count < 0 {
+            throw stream.streamError ?? APIClientError.invalidResponse
+        }
+        if count == 0 {
+            return body
+        }
+        body.append(contentsOf: buffer.prefix(count))
     }
 }

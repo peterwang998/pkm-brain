@@ -23,6 +23,21 @@ struct TodayView: View {
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
+                if let message = appState.todayShadowRunMessage {
+                    Label(
+                        message,
+                        systemImage: appState.isRunningTodayShadow
+                            ? "arrow.triangle.2.circlepath"
+                            : "checkmark.circle"
+                    )
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                }
+                if let error = appState.todayShadowRunError {
+                    Label(error, systemImage: "exclamationmark.triangle")
+                        .font(.callout)
+                        .foregroundStyle(.red)
+                }
                 if let error = appState.todayError ?? appState.lastError {
                     Text(error)
                         .font(.callout)
@@ -33,6 +48,24 @@ struct TodayView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .toolbar {
+            Button {
+                Task {
+                    await appState.runTodayShadow()
+                }
+            } label: {
+                if appState.isRunningTodayShadow {
+                    HStack(spacing: 6) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Running Shadow…")
+                    }
+                } else {
+                    Label("Run Shadow", systemImage: "play.circle")
+                }
+            }
+            .disabled(appState.isRunningTodayShadow)
+            .help("Run one read-only Calendar and Gmail operational pass")
+
             Button {
                 reportsMissingItem = true
             } label: {
@@ -660,7 +693,8 @@ private struct TodayItemCard: View {
 
     private func feedbackTitle(_ action: String) -> String {
         switch action {
-        case "correct": return "Correct"
+        case "confirm": return "Looks right"
+        case "correct": return "This is wrong"
         case "done": return "Mark done"
         case "snooze": return "Snooze"
         case "dismiss": return "Dismiss"
@@ -671,6 +705,7 @@ private struct TodayItemCard: View {
 
     private func feedbackSymbol(_ action: String) -> String {
         switch action {
+        case "confirm": return "checkmark.seal"
         case "correct": return "pencil"
         case "done": return "checkmark"
         case "snooze": return "clock"
