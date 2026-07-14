@@ -28,6 +28,7 @@ from .google_sources import (
     calendar_occurrence_key,
 )
 from .llm import LLMProvider
+from .llm_usage import ProviderUsageRecord, capture_provider_usage
 from .operational_briefing import build_operational_briefing
 from .operational_budget import DailyBudgetExceeded
 from .operational_db import operational_connection
@@ -783,8 +784,9 @@ class ShadowTrialRunner:
             threads=cached_threads,
             active_items=active_items,
         )
+        budgeted_provider: _DurablyBudgetedDetectorProvider | None = None
         if pending_threads:
-            provider = _DurablyBudgetedDetectorProvider(
+            budgeted_provider = _DurablyBudgetedDetectorProvider(
                 self._llm_provider
                 or get_gmail_provider(self.paths, run_id=run_id),
                 operational_service=self.operational_service,
@@ -798,7 +800,7 @@ class ShadowTrialRunner:
                 timezone_name=policy.operator.timezone,
                 policy_version=policy.version_ref,
                 budget=budget_from_operations_policy(policy),
-                llm_provider=provider,
+                llm_provider=budgeted_provider,
                 active_items_by_thread=active_items,
                 responsibility_context={
                     "owned": list(policy.responsibility.owned),
@@ -1183,6 +1185,11 @@ class ShadowTrialRunner:
             "api_pages": result.pages_fetched,
             "api_thread_gets": len(result.changed_thread_ids),
             **detector.as_dict()["usage"],
+            **(
+                budgeted_provider.usage_stats()
+                if budgeted_provider is not None
+                else _empty_provider_usage_stats()
+            ),
         }
         dispositions = Counter(item.disposition for item in detector.detections)
         counts = {
@@ -1922,10 +1929,21 @@ class _DurablyBudgetedDetectorProvider:
             "gmail_output_token_ceiling",
             None,
         )
+        self._latched_reason: str | None = None
+        self._pre_reserved_calls = 0
+        self._pre_reserved_input_tokens = 0
+        self._pre_reserved_total_tokens = 0
+        self._actual_input_tokens = 0
+        self._actual_total_tokens = 0
+        self._actual_usage_complete = True
+        self._reported_provider_calls = 0
+        self._unreported_provider_calls = 0
 
     def complete(self, prompt: str) -> str:
+        if self._latched_reason is not None:
+            raise DailyBudgetExceeded(self._latched_reason)
         token_ceiling = gmail_detector_token_ceiling(self._provider, prompt)
-        self._service.reserve_daily_budgets(
+        reservations = self._service.reserve_daily_budgets(
             source_type=GMAIL_CONNECTOR_ID,
             reservations={
                 "detector_calls": (
@@ -1946,4 +1964,151 @@ class _DurablyBudgetedDetectorProvider:
             run_id=self._run_id,
             created_at=self._started.isoformat(),
         )
-        return self._provider.complete(prompt)
+        self._pre_reserved_calls += 1
+        self._pre_reserved_input_tokens += token_ceiling.input_tokens
+        self._pre_reserved_total_tokens += token_ceiling.total_tokens
+
+        result: str | None = None
+        provider_error: BaseException | None = None
+        with capture_provider_usage(self._provider) as capture:
+            try:
+                result = self._provider.complete(prompt)
+            except BaseException as exc:
+                provider_error = exc
+
+        try:
+            self._reconcile_usage(
+                capture.records,
+                reserved_input_tokens=token_ceiling.input_tokens,
+                reserved_total_tokens=token_ceiling.total_tokens,
+                reservation_totals={
+                    metric: int(value["used"])
+                    for metric, value in reservations.items()
+                },
+            )
+        except DailyBudgetExceeded as exc:
+            if provider_error is not None:
+                raise exc from provider_error
+            raise
+        if provider_error is not None:
+            raise provider_error
+        if result is None:
+            raise RuntimeError("detector provider returned no result")
+        return result
+
+    def usage_stats(self) -> dict[str, Any]:
+        return {
+            "pre_reserved_calls": self._pre_reserved_calls,
+            "pre_reserved_input_tokens": self._pre_reserved_input_tokens,
+            "pre_reserved_total_tokens": self._pre_reserved_total_tokens,
+            "actual_input_tokens": self._actual_input_tokens,
+            "actual_total_tokens": self._actual_total_tokens,
+            "actual_usage_complete": self._actual_usage_complete,
+            "reported_provider_calls": self._reported_provider_calls,
+            "unreported_provider_calls": self._unreported_provider_calls,
+        }
+
+    def _reconcile_usage(
+        self,
+        records: Sequence[ProviderUsageRecord],
+        *,
+        reserved_input_tokens: int,
+        reserved_total_tokens: int,
+        reservation_totals: Mapping[str, int],
+    ) -> None:
+        reported = [record for record in records if record.usage is not None]
+        unreported_calls = sum(record.usage is None for record in records)
+        if not records:
+            # The wrapper invoked the provider once, but it did not emit even an
+            # attempt record. Treat that invocation as unreported and stop.
+            unreported_calls = 1
+        actual_calls = len(records) if records else 1
+        actual_input_tokens = sum(
+            int((record.usage or {}).get("input_tokens") or 0)
+            for record in reported
+        )
+        actual_total_tokens = sum(
+            int((record.usage or {}).get("total_tokens") or 0)
+            for record in reported
+        )
+        self._reported_provider_calls += len(reported)
+        self._unreported_provider_calls += unreported_calls
+        self._actual_input_tokens += actual_input_tokens
+        self._actual_total_tokens += actual_total_tokens
+        if unreported_calls:
+            self._actual_usage_complete = False
+
+        deltas = {
+            "detector_calls": max(0, actual_calls - 1),
+            "detector_input_tokens": max(
+                0,
+                actual_input_tokens - reserved_input_tokens,
+            ),
+            "detector_total_tokens": max(
+                0,
+                actual_total_tokens - reserved_total_tokens,
+            ),
+        }
+        positive_deltas = {
+            metric: (amount, None)
+            for metric, amount in deltas.items()
+            if amount > 0
+        }
+        used_totals = dict(reservation_totals)
+        if positive_deltas:
+            adjustments = self._service.reserve_daily_budgets(
+                source_type=GMAIL_CONNECTOR_ID,
+                reservations=positive_deltas,
+                local_day=self._local_day,
+                policy_version=self._policy.version_ref,
+                run_id=self._run_id,
+                created_at=self._started.isoformat(),
+            )
+            used_totals.update(
+                {
+                    metric: int(value["used"])
+                    for metric, value in adjustments.items()
+                }
+            )
+
+        limits = {
+            "detector_calls": self._policy.budgets.gmail.detector_calls_per_day,
+            "detector_input_tokens": (
+                self._policy.budgets.gmail.detector_input_tokens_per_day
+            ),
+            "detector_total_tokens": (
+                self._policy.budgets.gmail.detector_total_tokens_per_day
+            ),
+        }
+        overages = [
+            f"{metric} {used_totals[metric]}/{limit}"
+            for metric, limit in limits.items()
+            if int(used_totals.get(metric, 0)) > int(limit)
+        ]
+        if overages:
+            self._latch(
+                "observed detector usage exceeded the daily budget: "
+                + ", ".join(overages)
+            )
+        if unreported_calls:
+            self._latch(
+                "detector provider did not report complete token usage; "
+                "further calls are blocked"
+            )
+
+    def _latch(self, reason: str) -> None:
+        self._latched_reason = reason
+        raise DailyBudgetExceeded(reason)
+
+
+def _empty_provider_usage_stats() -> dict[str, Any]:
+    return {
+        "pre_reserved_calls": 0,
+        "pre_reserved_input_tokens": 0,
+        "pre_reserved_total_tokens": 0,
+        "actual_input_tokens": 0,
+        "actual_total_tokens": 0,
+        "actual_usage_complete": True,
+        "reported_provider_calls": 0,
+        "unreported_provider_calls": 0,
+    }

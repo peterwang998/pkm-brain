@@ -22,6 +22,8 @@ from pkm_brain.google_normalization import (
     normalize_calendar_event,
 )
 from pkm_brain.google_sources import CalendarFetchResult, GmailFetchResult
+from pkm_brain.llm_usage import record_provider_usage
+from pkm_brain.operational_budget import DailyBudgetExceeded, daily_budget_usage
 from pkm_brain.operational_db import operational_connection
 from pkm_brain.operational_service import OperationalService
 from pkm_brain.operational_shadow import (
@@ -76,12 +78,32 @@ class FakeProvider:
     name = "fake"
     model = "fake-ops"
 
-    def __init__(self, response: dict) -> None:
+    def __init__(
+        self,
+        response: dict,
+        *,
+        usage: dict[str, int] | None = None,
+    ) -> None:
         self.response = response
         self.calls = 0
+        self.usage = usage or {
+            "input_tokens": 100,
+            "cached_input_tokens": 0,
+            "output_tokens": 20,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 120,
+        }
 
     def complete(self, prompt: str) -> str:
         self.calls += 1
+        record_provider_usage(
+            self,
+            model=self.model,
+            usage=self.usage,
+            status="success",
+            started_at=NOW.isoformat(),
+            duration_ms=1,
+        )
         return json.dumps(self.response)
 
 
@@ -351,9 +373,10 @@ def test_live_shadow_run_writes_only_ops_and_private_evidence_and_builds_today(
             str(row["metric"]): int(row["amount"])
             for row in conn.execute(
                 """
-                SELECT metric, amount FROM ops_budget_reservations
+                SELECT metric, SUM(amount) AS amount FROM ops_budget_reservations
                 WHERE source_type = 'gmail'
                   AND metric IN ('detector_input_tokens', 'detector_total_tokens')
+                GROUP BY metric
                 """
             ).fetchall()
         }
@@ -363,6 +386,16 @@ def test_live_shadow_run_writes_only_ops_and_private_evidence_and_builds_today(
     assert detector_reservations["detector_total_tokens"] == (
         detector_reserved + DETECTOR_OUTPUT_TOKEN_RESERVE
     )
+    assert result.usage["gmail"]["pre_reserved_calls"] == 1
+    assert result.usage["gmail"]["pre_reserved_input_tokens"] == detector_reserved
+    assert result.usage["gmail"]["pre_reserved_total_tokens"] == (
+        detector_reserved + DETECTOR_OUTPUT_TOKEN_RESERVE
+    )
+    assert result.usage["gmail"]["actual_input_tokens"] == 100
+    assert result.usage["gmail"]["actual_total_tokens"] == 120
+    assert result.usage["gmail"]["actual_usage_complete"] is True
+    assert result.usage["gmail"]["reported_provider_calls"] == 1
+    assert result.usage["gmail"]["unreported_provider_calls"] == 0
     calendar_cursor = get_source_cursor(
         paths.ops_sqlite_path,
         "calendar",
@@ -430,6 +463,154 @@ def test_detector_budget_deferral_keeps_provider_cursor_and_all_clear_blocked(
     assert cursor["generation"] == 1
     assert cursor["metadata"]["continuation_page_token"] is None
     assert cursor["metadata"]["baseline_history_id"] is None
+
+
+def test_observed_provider_usage_above_reserve_is_appended_without_refunds(
+    tmp_path: Path,
+) -> None:
+    class MultiAttemptProvider:
+        name = "multi-attempt"
+        model = "multi-attempt"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def complete(self, _prompt: str) -> str:
+            self.calls += 1
+            for input_tokens, output_tokens in ((10_000, 1_000), (12_000, 1_000)):
+                record_provider_usage(
+                    self,
+                    model=self.model,
+                    usage={
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "total_tokens": input_tokens + output_tokens,
+                    },
+                    status="success",
+                    started_at=NOW.isoformat(),
+                    duration_ms=1,
+                )
+            return json.dumps(detector_response())
+
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    service = OperationalService(paths, writer_guard=lambda: None)
+    provider = MultiAttemptProvider()
+    result = ShadowTrialRunner(
+        paths,
+        service,
+        gmail_reader=FakeGmailReader(gmail_result()),
+        llm_provider=provider,
+        now=lambda: NOW,
+    ).run_live(sources=("gmail",), policy=policy())
+
+    gmail_usage = result.usage["gmail"]
+    assert result.run["status"] == "complete"
+    assert gmail_usage["pre_reserved_calls"] == 1
+    assert gmail_usage["actual_input_tokens"] == 22_000
+    assert gmail_usage["actual_total_tokens"] == 24_000
+    assert gmail_usage["reported_provider_calls"] == 2
+    assert gmail_usage["unreported_provider_calls"] == 0
+    assert gmail_usage["actual_usage_complete"] is True
+    durable = daily_budget_usage(
+        paths.ops_sqlite_path,
+        local_day="2026-07-13",
+    )["gmail"]
+    assert durable["detector_calls"] == 2
+    assert durable["detector_input_tokens"] == 22_000
+    assert durable["detector_total_tokens"] == 24_000
+
+
+def test_observed_provider_overage_is_persisted_latched_and_blocks_later_calls(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    service = OperationalService(paths, writer_guard=lambda: None)
+    service.initialize()
+    run = service.start_shadow_run(
+        mode="live",
+        requested_sources=("gmail",),
+        policy_version=policy().version_ref,
+        started_at=NOW.isoformat(),
+    )
+    provider = FakeProvider(
+        {},
+        usage={
+            "input_tokens": 200_000,
+            "output_tokens": 100,
+            "total_tokens": 200_100,
+        },
+    )
+    wrapped = shadow_trial_module._DurablyBudgetedDetectorProvider(
+        provider,
+        operational_service=service,
+        policy=policy(),
+        run_id=str(run["id"]),
+        started=NOW,
+    )
+
+    with pytest.raises(DailyBudgetExceeded, match="observed detector usage"):
+        wrapped.complete("small request")
+    with pytest.raises(DailyBudgetExceeded, match="observed detector usage"):
+        wrapped.complete("must not reach the provider")
+
+    assert provider.calls == 1
+    assert wrapped.usage_stats()["actual_input_tokens"] == 200_000
+    durable = daily_budget_usage(
+        paths.ops_sqlite_path,
+        local_day="2026-07-13",
+    )["gmail"]
+    assert durable["detector_calls"] == 1
+    assert durable["detector_input_tokens"] == 200_000
+    assert durable["detector_total_tokens"] == 200_100
+
+
+def test_missing_provider_usage_fails_closed_and_latches_wrapper(
+    tmp_path: Path,
+) -> None:
+    class UnreportedProvider:
+        name = "unreported"
+        model = "unreported"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def complete(self, _prompt: str) -> str:
+            self.calls += 1
+            return "{}"
+
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    service = OperationalService(paths, writer_guard=lambda: None)
+    service.initialize()
+    run = service.start_shadow_run(
+        mode="live",
+        requested_sources=("gmail",),
+        policy_version=policy().version_ref,
+        started_at=NOW.isoformat(),
+    )
+    provider = UnreportedProvider()
+    wrapped = shadow_trial_module._DurablyBudgetedDetectorProvider(
+        provider,
+        operational_service=service,
+        policy=policy(),
+        run_id=str(run["id"]),
+        started=NOW,
+    )
+
+    with pytest.raises(DailyBudgetExceeded, match="did not report complete"):
+        wrapped.complete("small request")
+    with pytest.raises(DailyBudgetExceeded, match="did not report complete"):
+        wrapped.complete("must not reach the provider")
+
+    assert provider.calls == 1
+    stats = wrapped.usage_stats()
+    assert stats["pre_reserved_calls"] == 1
+    assert stats["pre_reserved_input_tokens"] > 0
+    assert stats["pre_reserved_total_tokens"] > stats["pre_reserved_input_tokens"]
+    assert stats["actual_input_tokens"] == 0
+    assert stats["actual_total_tokens"] == 0
+    assert stats["actual_usage_complete"] is False
+    assert stats["reported_provider_calls"] == 0
+    assert stats["unreported_provider_calls"] == 1
 
 
 def test_missing_gmail_thread_advances_cursor_but_keeps_item_visible_uncertain(
@@ -1223,6 +1404,19 @@ def test_provider_error_fallback_is_cached_and_next_run_advances_cursor(
 
         def complete(self, _prompt: str) -> str:
             self.calls += 1
+            record_provider_usage(
+                self,
+                model=self.model,
+                usage={
+                    "input_tokens": 80,
+                    "output_tokens": 5,
+                    "total_tokens": 85,
+                },
+                status="error",
+                started_at=NOW.isoformat(),
+                duration_ms=1,
+                error_type="RuntimeError",
+            )
             raise RuntimeError("provider unavailable")
 
     provider = FailingProvider()
@@ -1241,6 +1435,11 @@ def test_provider_error_fallback_is_cached_and_next_run_advances_cursor(
     assert first.coverage["gmail"]["status"] == "partial"
     assert first.coverage["gmail"]["cursor_advanced"] is False
     assert provider.calls == 1
+    assert first.usage["gmail"]["actual_input_tokens"] == 80
+    assert first.usage["gmail"]["actual_total_tokens"] == 85
+    assert first.usage["gmail"]["actual_usage_complete"] is True
+    assert first.usage["gmail"]["reported_provider_calls"] == 1
+    assert first.usage["gmail"]["unreported_provider_calls"] == 0
     assert first_decisions[0]["disposition"] == "surfaced"
     assert first_decisions[0]["reason_code"] == "detector_error_uncertain"
 
