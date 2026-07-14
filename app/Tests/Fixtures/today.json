@@ -1,0 +1,173 @@
+{
+  "schema_version": 1,
+  "status": "partial",
+  "availability_reason": null,
+  "briefing_id": "briefing-2026-07-14",
+  "generated_at": "2026-07-14T14:00:00+00:00",
+  "as_of": "2026-07-14T13:59:00+00:00",
+  "timezone": "America/Los_Angeles",
+  "freshness": {
+    "state": "fresh",
+    "as_of": "2026-07-14T13:59:00+00:00",
+    "age_seconds": 60,
+    "stale_after_seconds": 900
+  },
+  "coverage": [
+    {
+      "source_id": "calendar",
+      "label": "Calendar",
+      "state": "complete",
+      "last_success_at": "2026-07-14T13:59:00+00:00",
+      "detail": null,
+      "deferred_count": 0
+    },
+    {
+      "source_id": "gmail",
+      "label": "Email",
+      "state": "partial",
+      "last_success_at": "2026-07-14T13:58:00+00:00",
+      "detail": "Two threads deferred by the source budget.",
+      "deferred_count": 2
+    }
+  ],
+  "focus": [
+    {
+      "id": "focus-1",
+      "section": "focus",
+      "title": "Prepare for the project review",
+      "summary": "Review the open pricing decision before the meeting.",
+      "kind": "event",
+      "state": "active",
+      "priority": "P1",
+      "starts_at": "2026-07-14T17:00:00+00:00",
+      "due_at": null,
+      "ends_at": "2026-07-14T17:30:00+00:00",
+      "owner": "operator",
+      "counterparty": "Project team",
+      "confidence": 0.94,
+      "handled_verdict": "needs_action",
+      "handled_reason": "A direct question remains unanswered.",
+      "reason_codes": ["direct_question", "owned_area"],
+      "evidence": [
+        {
+          "source_type": "google_calendar",
+          "label": "Project review",
+          "reference": "primary:event-42",
+          "brain_route": "/wiki?path=projects%2Fpkm-brain.md",
+          "provider_url": "https://calendar.google.com/calendar/event?eid=safe"
+        }
+      ],
+      "feedback_actions": ["correct", "done", "snooze", "dismiss"]
+    }
+  ],
+  "urgent_overflow": {
+    "count": 2,
+    "items": [
+      {
+        "id": "overflow-1",
+        "section": "urgent_overflow",
+        "title": "Confirm tomorrow's deadline",
+        "summary": null,
+        "kind": "deadline",
+        "state": "active",
+        "priority": "P1",
+        "starts_at": null,
+        "due_at": "2026-07-15T16:00:00+00:00",
+        "ends_at": null,
+        "owner": "operator",
+        "counterparty": null,
+        "confidence": 0.82,
+        "handled_verdict": "unknown",
+        "handled_reason": "Email coverage is partial.",
+        "reason_codes": ["urgent_overflow", "coverage_partial"],
+        "evidence": [],
+        "feedback_actions": ["correct", "done", "snooze", "dismiss"]
+      }
+    ]
+  },
+  "calendar": {
+    "now": [],
+    "next": [
+      {
+        "id": "event-42",
+        "section": "calendar_next",
+        "title": "Project review",
+        "summary": "30 minutes",
+        "kind": "event",
+        "state": "active",
+        "priority": null,
+        "starts_at": "2026-07-14T17:00:00+00:00",
+        "due_at": null,
+        "ends_at": "2026-07-14T17:30:00+00:00",
+        "owner": null,
+        "counterparty": "Project team",
+        "confidence": 1.0,
+        "handled_verdict": "unknown",
+        "handled_reason": null,
+        "reason_codes": [],
+        "evidence": [],
+        "feedback_actions": ["correct", "dismiss"]
+      }
+    ]
+  },
+  "due_overdue": [],
+  "waiting": [],
+  "attention": [],
+  "awareness": [],
+  "uncertain": [
+    {
+      "id": "uncertain-1",
+      "section": "uncertain",
+      "title": "Possible renewal notice",
+      "summary": "The canonical billing source was unavailable.",
+      "kind": "attention",
+      "state": "active",
+      "priority": null,
+      "starts_at": null,
+      "due_at": null,
+      "ends_at": null,
+      "owner": null,
+      "counterparty": null,
+      "confidence": 0.51,
+      "handled_verdict": "unknown",
+      "handled_reason": "Authoritative verification is unavailable.",
+      "reason_codes": ["authoritative_source_unavailable"],
+      "evidence": [],
+      "feedback_actions": ["correct", "dismiss"]
+    }
+  ],
+  "ignored_suppressed": [
+    {
+      "id": "ignored-1",
+      "section": "ignored_suppressed",
+      "title": "Follow-up already handled",
+      "summary": "A provider-native reply satisfies the request.",
+      "kind": "follow_up",
+      "state": "resolved",
+      "priority": null,
+      "starts_at": null,
+      "due_at": null,
+      "ends_at": null,
+      "owner": "operator",
+      "counterparty": null,
+      "confidence": 0.97,
+      "handled_verdict": "fulfilled",
+      "handled_reason": "A reply was found in the authoritative thread.",
+      "reason_codes": ["authoritative_reply_found"],
+      "evidence": [],
+      "feedback_actions": ["restore", "correct"]
+    }
+  ],
+  "feedback": {
+    "enabled": true,
+    "actions": [
+      "correct",
+      "done",
+      "snooze",
+      "dismiss",
+      "restore",
+      "report_missing"
+    ],
+    "unavailable_reason": null
+  }
+}

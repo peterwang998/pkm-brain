@@ -58,6 +58,50 @@ public final class BrainAPIClient: Sendable {
         return try await get(path)
     }
 
+    public func todayBriefing() async throws -> TodayBriefing {
+        try await get("/api/v1/today")
+    }
+
+    public func submitTodayFeedback(
+        itemID: String,
+        action: String,
+        note: String? = nil,
+        snoozedUntil: String? = nil
+    ) async throws -> TodayFeedbackResponse {
+        var payload: [String: JSONValue] = [
+            "action": .string(action),
+            "idempotency_key": .string(UUID().uuidString),
+        ]
+        if let note, !note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            payload["note"] = .string(note)
+        }
+        if let snoozedUntil {
+            payload["snoozed_until"] = .string(snoozedUntil)
+        }
+        return try await post(
+            "/api/v1/today/items/\(percentEncodePathComponent(itemID))/feedback",
+            payload: payload
+        )
+    }
+
+    public func reportMissingTodayItem(
+        title: String,
+        detail: String? = nil,
+        sourceHint: String? = nil
+    ) async throws -> TodayFeedbackResponse {
+        var payload: [String: JSONValue] = [
+            "title": .string(title),
+            "idempotency_key": .string(UUID().uuidString),
+        ]
+        if let detail, !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            payload["detail"] = .string(detail)
+        }
+        if let sourceHint, !sourceHint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            payload["source_hint"] = .string(sourceHint)
+        }
+        return try await post("/api/v1/today/feedback/missing", payload: payload)
+    }
+
     public func queue(
         kind: String = "all",
         state: String = "actionable",

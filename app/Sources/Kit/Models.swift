@@ -882,6 +882,134 @@ public struct MigrationStep: Codable, Equatable, Identifiable, Sendable {
     public let required: Bool
 }
 
+public struct TodayBriefing: Codable, Equatable, Sendable {
+    public let schema_version: Int
+    public let status: String
+    public let availability_reason: String?
+    public let briefing_id: String?
+    public let generated_at: String
+    public let as_of: String?
+    public let timezone: String?
+    public let freshness: TodayFreshness
+    public let coverage: [TodayCoverage]
+    public let focus: [TodayItem]
+    public let urgent_overflow: TodayUrgentOverflow
+    public let calendar: TodayCalendar
+    public let due_overdue: [TodayItem]
+    public let waiting: [TodayItem]
+    public let attention: [TodayItem]
+    public let awareness: [TodayItem]
+    public let uncertain: [TodayItem]
+    public let ignored_suppressed: [TodayItem]
+    public let feedback: TodayFeedbackCapabilities
+
+    public var isAvailable: Bool {
+        status == "available" || status == "partial"
+    }
+
+    public var visibleFocus: [TodayItem] {
+        Array(focus.prefix(5))
+    }
+
+    public var hasCoverageWarning: Bool {
+        status == "partial" || coverage.contains { $0.state != "complete" }
+    }
+}
+
+public struct TodayFreshness: Codable, Equatable, Sendable {
+    public let state: String
+    public let as_of: String?
+    public let age_seconds: Int?
+    public let stale_after_seconds: Int?
+}
+
+public struct TodayCoverage: Codable, Equatable, Identifiable, Sendable {
+    public let source_id: String
+    public let label: String
+    public let state: String
+    public let last_success_at: String?
+    public let detail: String?
+    public let deferred_count: Int
+
+    public var id: String { source_id }
+}
+
+public struct TodayUrgentOverflow: Codable, Equatable, Sendable {
+    public let count: Int
+    public let items: [TodayItem]
+}
+
+public struct TodayCalendar: Codable, Equatable, Sendable {
+    public let now: [TodayItem]
+    public let next: [TodayItem]
+}
+
+public struct TodayFeedbackCapabilities: Codable, Equatable, Sendable {
+    public let enabled: Bool
+    public let actions: [String]
+    public let unavailable_reason: String?
+
+    public func allows(_ action: String) -> Bool {
+        enabled && actions.contains(action)
+    }
+}
+
+public struct TodayItem: Codable, Equatable, Identifiable, Sendable {
+    public let id: String
+    public let section: String
+    public let title: String
+    public let summary: String?
+    public let kind: String
+    public let state: String
+    public let priority: String?
+    public let starts_at: String?
+    public let due_at: String?
+    public let ends_at: String?
+    public let owner: String?
+    public let counterparty: String?
+    public let confidence: Double?
+    public let handled_verdict: String
+    public let handled_reason: String?
+    public let reason_codes: [String]
+    public let evidence: [TodayEvidenceLink]
+    public let feedback_actions: [String]
+
+    public var handledLabel: String {
+        switch handled_verdict {
+        case "needs_action": return "Needs action"
+        case "responded_waiting": return "Responded · waiting"
+        case "being_handled": return "Being handled"
+        case "fulfilled": return "Fulfilled"
+        default: return "Handling unknown"
+        }
+    }
+
+    public var timingText: String? {
+        if let due_at { return "Due \(due_at)" }
+        if let starts_at { return "Starts \(starts_at)" }
+        return ends_at.map { "Ends \($0)" }
+    }
+}
+
+public struct TodayEvidenceLink: Codable, Equatable, Identifiable, Sendable {
+    public let source_type: String
+    public let label: String
+    public let reference: String
+    public let brain_route: String?
+    public let provider_url: String?
+
+    public var id: String { "\(source_type):\(reference):\(label)" }
+}
+
+public struct TodayFeedbackResponse: Codable, Equatable, Sendable {
+    public let schema_version: Int
+    public let status: String
+    public let item_id: String?
+    public let action: String
+    public let recorded_at: String?
+    public let message: String
+}
+
 public enum DaemonStatus: Equatable, Sendable {
     case idle
     case provisioning(String)

@@ -39,6 +39,24 @@ struct PKMBrainKitTests {
         #expect(nightly.statusDetail == "last successful nightly run is less than 20 hours old")
     }
 
+    @Test("Today briefing fixture decodes every presentation section")
+    func todayFixtureDecodes() throws {
+        let briefing: TodayBriefing = try decodeFixture("today")
+
+        #expect(briefing.schema_version == 1)
+        #expect(briefing.status == "partial")
+        #expect(briefing.isAvailable)
+        #expect(briefing.hasCoverageWarning)
+        #expect(briefing.visibleFocus.count == 1)
+        #expect(briefing.visibleFocus.first?.handledLabel == "Needs action")
+        #expect(briefing.visibleFocus.first?.evidence.first?.brain_route?.contains("/wiki") == true)
+        #expect(briefing.urgent_overflow.count == 2)
+        #expect(briefing.calendar.next.first?.title == "Project review")
+        #expect(briefing.uncertain.first?.reason_codes == ["authoritative_source_unavailable"])
+        #expect(briefing.ignored_suppressed.first?.handled_verdict == "fulfilled")
+        #expect(briefing.feedback.allows("report_missing"))
+    }
+
     @Test("queue fixture decodes")
     func queueFixtureDecodes() throws {
         let queue: QueuePage = try decodeFixture("queue")

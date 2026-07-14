@@ -32,6 +32,9 @@ final class AppState: ObservableObject {
 
     @Published var selectedDestination: Destination
     @Published var digest: Digest?
+    @Published var todayBriefing: TodayBriefing?
+    @Published var todayError: String?
+    @Published var todayFeedbackMessage: String?
     @Published private(set) var queueSummary: QueueSummary?
     @Published var lastError: String?
     @Published var notificationsEnabled = true
@@ -166,8 +169,12 @@ final class AppState: ObservableObject {
             UserDefaults.standard.set(target.path, forKey: homeDefaultsKey)
             queueSummary = nil
             digest = nil
+            todayBriefing = nil
+            todayError = nil
+            todayFeedbackMessage = nil
             await refreshMigrationPlan()
             await refreshDigest()
+            await refreshToday()
             lastError = nil
             return true
         }
@@ -178,6 +185,7 @@ final class AppState: ObservableObject {
         homePath = previous.path
         await refreshMigrationPlan()
         await refreshDigest()
+        await refreshToday()
         lastError = "Could not open \(target.path) (\(targetFailure)); restored \(previous.path)."
         return false
     }
@@ -210,6 +218,7 @@ final class AppState: ObservableObject {
         }
         await refreshMigrationPlan()
         await refreshDigest()
+        await refreshToday()
         notifyDaemonFailureIfNeeded()
         startMonitor()
     }
@@ -239,6 +248,106 @@ final class AppState: ObservableObject {
         } catch {
             lastError = error.localizedDescription
         }
+    }
+
+    func refreshToday() async {
+        guard let client = daemon.apiClient else {
+            return
+        }
+        do {
+            let briefing = try await client.todayBriefing()
+            guard briefing.schema_version == 1 else {
+                todayBriefing = nil
+                todayError = "This Today briefing uses an unsupported schema version."
+                return
+            }
+            todayBriefing = briefing
+            todayError = nil
+        } catch APIClientError.httpStatus(404, _) {
+            // Compatibility with an older daemon: retain the existing digest Today view.
+            todayBriefing = nil
+            todayError = nil
+        } catch {
+            todayError = error.localizedDescription
+        }
+    }
+
+    func submitTodayFeedback(
+        itemID: String,
+        action: String,
+        note: String? = nil,
+        snoozedUntil: String? = nil
+    ) async {
+        guard let client = daemon.apiClient else {
+            todayFeedbackMessage = "The Brain service is not available."
+            return
+        }
+        do {
+            let result = try await client.submitTodayFeedback(
+                itemID: itemID,
+                action: action,
+                note: note,
+                snoozedUntil: snoozedUntil
+            )
+            todayFeedbackMessage = result.message
+            if result.status == "accepted" {
+                await refreshToday()
+            }
+        } catch {
+            todayFeedbackMessage = error.localizedDescription
+        }
+    }
+
+    func reportMissingTodayItem(
+        title: String,
+        detail: String?,
+        sourceHint: String?
+    ) async {
+        guard let client = daemon.apiClient else {
+            todayFeedbackMessage = "The Brain service is not available."
+            return
+        }
+        do {
+            let result = try await client.reportMissingTodayItem(
+                title: title,
+                detail: detail,
+                sourceHint: sourceHint
+            )
+            todayFeedbackMessage = result.message
+            if result.status == "accepted" {
+                await refreshToday()
+            }
+        } catch {
+            todayFeedbackMessage = error.localizedDescription
+        }
+    }
+
+    func openTodayBrainRoute(_ route: String) {
+        if route.hasPrefix("wiki:") {
+            showWiki(path: String(route.dropFirst("wiki:".count)))
+            return
+        }
+        guard let components = URLComponents(string: route) else {
+            todayFeedbackMessage = "The evidence route is not available."
+            return
+        }
+        if components.path == "/wiki",
+           let path = components.queryItems?.first(where: { $0.name == "path" })?.value {
+            showWiki(path: path)
+            return
+        }
+        if components.path.hasPrefix("/entities/") {
+            let value = String(components.path.dropFirst("/entities/".count))
+            showEntity(id: value.removingPercentEncoding ?? value)
+            return
+        }
+        if components.path == "/queue" {
+            let state = components.queryItems?.first(where: { $0.name == "state" })?.value
+                ?? "actionable"
+            showQueue(state: state)
+            return
+        }
+        todayFeedbackMessage = "The evidence route is not available in this app build."
     }
 
     func runCaptureNow() async {
@@ -296,6 +405,7 @@ final class AppState: ObservableObject {
                     return
                 }
                 await self?.refreshDigest()
+                await self?.refreshToday()
                 self?.notifyDaemonFailureIfNeeded()
             }
         }
@@ -308,8 +418,14 @@ final class AppState: ObservableObject {
         queueSummaryDaemonPID = pid
         queueSummary = nil
         digest = nil
+        todayBriefing = nil
+        todayError = nil
+        todayFeedbackMessage = nil
         if pid != nil, didStart {
-            Task { await refreshDigest() }
+            Task {
+                await refreshDigest()
+                await refreshToday()
+            }
         }
     }
 
