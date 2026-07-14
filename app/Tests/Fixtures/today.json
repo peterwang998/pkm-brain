@@ -136,6 +136,7 @@
       "feedback_actions": ["correct", "dismiss"]
     }
   ],
+  "ignored_suppressed_count": 1,
   "ignored_suppressed": [
     {
       "id": "ignored-1",

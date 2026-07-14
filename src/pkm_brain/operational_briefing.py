@@ -10,6 +10,10 @@ from zoneinfo import ZoneInfo
 from .gmail_operations import GMAIL_DETECTOR_VERSION
 from .google_routes import gmail_thread_route
 from .operational_db import OperationalStoreUnavailableError, operational_connection
+from .operational_briefing_projection import (
+    BRIEFING_SECTION_ORDER,
+    bound_briefing_projection,
+)
 from .operational_shadow import (
     latest_handled_assessments,
     list_shadow_decisions,
@@ -20,24 +24,23 @@ from .service import BrainService
 from .util import now_iso
 
 
-BRIEFING_SECTION_ORDER = (
+ACTION_KINDS = {"commitment", "follow_up", "deadline", "attention"}
+TERMINAL_STATES = {"resolved", "dismissed", "cancelled", "expired"}
+HIGH_PRIORITY = 50
+LOW_CONFIDENCE = 0.65
+DEFAULT_FRESH_AFTER_SECONDS = 6 * 60 * 60
+PRIMARY_ITEM_SECTION_ORDER = (
     "focus",
     "urgent_overflow",
     "now_and_next",
     "upcoming",
     "overdue_and_due",
     "waiting",
+    "low_confidence",
     "attention",
     "awareness",
-    "low_confidence",
     "changed",
-    "suppressed",
 )
-ACTION_KINDS = {"commitment", "follow_up", "deadline", "attention"}
-TERMINAL_STATES = {"resolved", "dismissed", "cancelled", "expired"}
-HIGH_PRIORITY = 50
-LOW_CONFIDENCE = 0.65
-DEFAULT_FRESH_AFTER_SECONDS = 6 * 60 * 60
 
 
 def build_operational_briefing(
@@ -141,7 +144,10 @@ def build_operational_briefing(
             card
             for card in active_cards
             if card["kind"] == "attention"
-            or card["handled_verdict"] == "unknown"
+            or (
+                card["kind"] != "event"
+                and card["handled_verdict"] == "unknown"
+            )
             or str(card["item_id"]) in focus_ids
         ],
         key=lambda card: _action_rank(card, now=now),
@@ -181,7 +187,7 @@ def build_operational_briefing(
     )[:100]
 
     suppressed = _suppressed_audit(db_path, latest_run)
-    sections = {
+    raw_sections = {
         "focus": focus,
         "urgent_overflow": overflow,
         "now_and_next": now_and_next,
@@ -194,14 +200,20 @@ def build_operational_briefing(
         "changed": changed,
         "suppressed": suppressed,
     }
-    counts = {name: len(sections[name]) for name in BRIEFING_SECTION_ORDER}
+    facet_counts = {
+        name: len(raw_sections[name]) for name in BRIEFING_SECTION_ORDER
+    }
+    raw_sections = _primary_item_sections(raw_sections)
+    counts = {name: len(raw_sections[name]) for name in BRIEFING_SECTION_ORDER}
     counts.update(
         {
             "active_items": len(active_cards),
             "terminal_items": len(cards) - len(active_cards),
             "action_candidates": len(actionable),
+            "section_facets": facet_counts,
         }
     )
+    sections, counts = bound_briefing_projection(raw_sections, counts=counts)
     all_clear = status == "complete" and not focus and not overflow
     if status != "complete":
         headline = "Shadow coverage is incomplete"
@@ -687,6 +699,11 @@ def _current_assessment(
 def _is_action_candidate(card: Mapping[str, Any], *, now: datetime) -> bool:
     if card["kind"] not in ACTION_KINDS:
         return False
+    if (
+        float(card["confidence"]) < LOW_CONFIDENCE
+        or str(card["reconciliation_status"]) != "confirmed"
+    ):
+        return False
     snoozed_until = card.get("snoozed_until")
     if snoozed_until and _parse_timestamp(str(snoozed_until)) > now:
         return False
@@ -696,6 +713,31 @@ def _is_action_candidate(card: Mapping[str, Any], *, now: datetime) -> bool:
     if verdict != "unknown":
         return False
     return str(card["owner"]) == "operator" or int(card["priority"]) >= HIGH_PRIORITY
+
+
+def _primary_item_sections(
+    sections: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Assign every operational item to one user-visible briefing section.
+
+    Section membership is still available in section_facets counts, but repeating
+    the same card across Focus, Attention, and Uncertain makes the briefing look
+    noisier than the underlying ledger. Suppressed decisions are audit records, not
+    operational items, and therefore retain their independent preview.
+    """
+
+    output = {name: [] for name in BRIEFING_SECTION_ORDER}
+    seen: set[str] = set()
+    for section in PRIMARY_ITEM_SECTION_ORDER:
+        for value in sections.get(section, ()):
+            card = dict(value)
+            item_id = str(card.get("item_id") or card.get("id") or "")
+            if not item_id or item_id in seen:
+                continue
+            output[section].append(card)
+            seen.add(item_id)
+    output["suppressed"] = [dict(value) for value in sections.get("suppressed", ())]
+    return output
 
 
 def _action_rank(card: Mapping[str, Any], *, now: datetime) -> tuple[int, int, str]:

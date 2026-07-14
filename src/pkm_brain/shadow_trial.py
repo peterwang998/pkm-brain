@@ -118,30 +118,39 @@ class ShadowTrialRunner:
             ),
             started_at=started.isoformat(),
         )
+        coverage: dict[str, Any] = {}
+        usage: dict[str, Any] = {}
+        counts: Counter[str] = Counter()
+        errors: list[str] = []
         try:
             return self._run_started(
                 active_policy=active_policy,
                 requested=requested,
                 run=run,
                 started=started,
+                coverage=coverage,
+                usage=usage,
+                counts=counts,
+                errors=errors,
             )
         except BaseException as exc:
             terminal_status = "failed" if isinstance(exc, Exception) else "stopped"
             message = f"{type(exc).__name__}: {exc}"[:4000]
+            failure_coverage = dict(coverage)
+            failure_coverage["system"] = {
+                "status": "unavailable",
+                "fresh_at": None,
+                "reason": "shadow_run_interrupted",
+            }
+            failure_error = "\n".join(dict.fromkeys([*errors, message]))[:4000]
             try:
                 self.operational_service.finish_shadow_run(
                     str(run["id"]),
                     status=terminal_status,
-                    coverage={
-                        "system": {
-                            "status": "unavailable",
-                            "fresh_at": None,
-                            "reason": "shadow_run_interrupted",
-                        }
-                    },
-                    usage={},
-                    counts={},
-                    error=message,
+                    coverage=failure_coverage,
+                    usage=usage,
+                    counts=dict(counts),
+                    error=failure_error,
                     hard_stop_reason="shadow_run_interrupted",
                     finished_at=_utc(self._now()).replace(microsecond=0).isoformat(),
                 )
@@ -158,11 +167,11 @@ class ShadowTrialRunner:
         requested: Sequence[str],
         run: Mapping[str, Any],
         started: datetime,
+        coverage: dict[str, Any],
+        usage: dict[str, Any],
+        counts: Counter[str],
+        errors: list[str],
     ) -> ShadowTrialResult:
-        coverage: dict[str, Any] = {}
-        usage: dict[str, Any] = {}
-        counts: Counter[str] = Counter()
-        errors: list[str] = []
         for source in requested:
             try:
                 if source == CALENDAR_CONNECTOR_ID:

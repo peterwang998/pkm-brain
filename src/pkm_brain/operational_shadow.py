@@ -8,6 +8,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from .operational_briefing_projection import (
+    BRIEFING_SECTIONS_STORAGE_BYTES,
+    bound_briefing_projection,
+)
 from .operational_db import operational_connection
 from .operational_state import (
     OperationalObservation,
@@ -592,9 +596,15 @@ def save_briefing_snapshot(
     _bounded_text(timezone_name, "timezone", 128)
     _bounded_text(policy_version, "policy_version", 128)
     _bounded_optional_text(run_id, "run_id", 256)
-    _validate_metadata(sections, "briefing sections")
+    _reject_source_bodies(sections, "briefing sections")
     _validate_metadata(coverage, "briefing coverage")
-    _validate_metadata(counts or {}, "briefing counts")
+    _reject_source_bodies(counts or {}, "briefing counts")
+    projected_sections, projected_counts = bound_briefing_projection(
+        sections,
+        counts=counts,
+    )
+    _validate_metadata(projected_sections, "briefing sections")
+    _validate_metadata(projected_counts, "briefing counts")
     generated = _canonical_timestamp(generated_at or now_iso(), "generated_at")
     effective_as_of = _canonical_timestamp(as_of, "as_of")
     expires = (
@@ -607,9 +617,9 @@ def save_briefing_snapshot(
         "timezone": timezone_name,
         "policy_version": policy_version,
         "status": status,
-        "sections": dict(sections),
+        "sections": projected_sections,
         "coverage": dict(coverage),
-        "counts": dict(counts or {}),
+        "counts": projected_counts,
     }
     snapshot_hash = hashlib.sha256(_json(canonical).encode("utf-8")).hexdigest()
     with operational_connection(db_path, write=True) as conn:
@@ -640,9 +650,13 @@ def save_briefing_snapshot(
                 timezone_name,
                 policy_version,
                 status,
-                _bounded_json(sections, "briefing sections", 262_144),
+                _bounded_json(
+                    projected_sections,
+                    "briefing sections",
+                    BRIEFING_SECTIONS_STORAGE_BYTES,
+                ),
                 _bounded_json(coverage, "briefing coverage", 32_768),
-                _bounded_json(counts or {}, "briefing counts", 16_384),
+                _bounded_json(projected_counts, "briefing counts", 16_384),
                 snapshot_hash,
                 expires,
                 generated,

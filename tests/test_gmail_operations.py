@@ -119,6 +119,30 @@ def test_preclassifier_suppresses_marketing_but_keeps_transactional_deadlines() 
     assert renewal_result.high_consequence is True
 
 
+def test_preclassifier_does_not_promote_marketing_boilerplate_to_high_consequence() -> None:
+    promotion = thread(
+        "promotion",
+        "Weekly travel offers",
+        (
+            message(
+                "promotion-1",
+                "Save on flights and hotels. Payment options changed. "
+                "Unsubscribe from this newsletter anytime.",
+            ),
+        ),
+        message_class="marketing",
+    )
+
+    result = preclassify_gmail_thread(
+        promotion,
+        operator_emails=("operator@example.com",),
+    )
+
+    assert result.should_detect is False
+    assert result.reason_code == "marketing_no_action"
+    assert result.high_consequence is True
+
+
 def test_detector_batches_threads_and_returns_validated_operational_candidates() -> None:
     incoming = thread(
         "ask",
@@ -217,7 +241,7 @@ def test_high_consequence_model_ignore_becomes_visible_uncertain_attention() -> 
     assert detection.disposition == "surfaced"
     assert detection.reason_code == "high_consequence_model_uncertain"
     assert detection.candidates[0].kind == "attention"
-    assert detection.candidates[0].priority == 90
+    assert detection.candidates[0].priority == 40
     assert detection.candidates[0].handled_verdict == "needs_action"
 
 
@@ -408,6 +432,60 @@ def _candidate_response(
             }
         ]
     }
+
+
+def test_one_invalid_thread_does_not_discard_valid_batch_results() -> None:
+    valid_body = "Can you review the plan?"
+    invalid_body = "Can you review the budget?"
+    valid = thread(
+        "valid",
+        "Review the plan",
+        (message("valid-1", valid_body),),
+    )
+    invalid = thread(
+        "invalid",
+        "Urgent payment review",
+        (message("invalid-1", invalid_body),),
+        message_class="transactional",
+    )
+    provider = FakeProvider(
+        [
+            {
+                "threads": [
+                    _candidate_response(
+                        "valid",
+                        _candidate(message_id="valid-1", quote=valid_body),
+                    )["threads"][0],
+                    _candidate_response(
+                        "invalid",
+                        _candidate(
+                            message_id="invalid-1",
+                            quote="A fabricated quote that is not in the message.",
+                        ),
+                    )["threads"][0],
+                ]
+            }
+        ]
+    )
+
+    result = detect_gmail_threads(
+        [valid, invalid],
+        operator_emails=("operator@example.com",),
+        timezone_name="America/Los_Angeles",
+        policy_version="operations-v1@1",
+        budget=GmailDetectorBudget(),
+        llm_provider=provider,
+    )
+
+    detections = {item.thread_id: item for item in result.detections}
+    assert provider.calls == 1
+    assert result.coverage_complete is False
+    assert len(result.errors) == 1
+    assert detections["valid"].reason_code == "operational_candidate"
+    assert detections["valid"].candidates[0].confidence == 0.9
+    assert detections["invalid"].reason_code == "high_consequence_detector_error"
+    assert detections["invalid"].candidates[0].priority == 40
+    assert detections["invalid"].candidates[0].confidence == 0.25
 
 
 def test_adversarial_email_cannot_authorize_terminal_or_handled_state() -> None:

@@ -40,7 +40,7 @@ from pkm_brain.operations_policy import (
     operations_policy_path,
 )
 from pkm_brain.paths import BrainPaths
-from pkm_brain.shadow_controller import ShadowTrialController
+from pkm_brain.shadow_controller import ShadowTrialController, _completion_message
 from pkm_brain.shadow_setup import default_operations_policy_payload
 from pkm_brain.shadow_trial import ShadowTrialRunner
 
@@ -1354,8 +1354,12 @@ def test_missing_gmail_thread_keeps_existing_item_visible_and_advances_checkpoin
     assert second.run["status"] == "partial"
     assert second.coverage["gmail"]["missing_thread_count"] == 1
     assert second.coverage["gmail"]["cursor_advanced"] is True
-    assert item_id in {
+    assert item_id not in {
         card["item_id"] for card in second.briefing["sections"]["focus"]
+    }
+    assert item_id in {
+        card["item_id"]
+        for card in second.briefing["sections"]["low_confidence"]
     }
     assert latest_handled_assessments(paths.ops_sqlite_path)[item_id]["verdict"] == "unknown"
     assert any(
@@ -1491,6 +1495,39 @@ def test_post_start_failure_closes_the_owned_shadow_run(
     assert run["status"] == "failed"
     assert run["hard_stop_reason"] == "shadow_run_interrupted"
     assert "briefing synthesis failed" in run["error"]
+    assert run["coverage"]["calendar"]["status"] == "complete"
+    assert run["coverage"]["system"]["reason"] == "shadow_run_interrupted"
+    assert run["counts"]["calendar_items"] == 1
+
+
+def test_snapshot_failure_preserves_completed_source_progress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    service = OperationalService(paths, writer_guard=lambda: None)
+
+    def fail_snapshot(*_args, **_kwargs):
+        raise RuntimeError("briefing snapshot storage failed")
+
+    monkeypatch.setattr(service, "save_briefing_snapshot", fail_snapshot)
+    runner = ShadowTrialRunner(
+        paths,
+        service,
+        calendar_reader=FakeCalendarReader(calendar_result()),
+        now=lambda: NOW,
+    )
+
+    with pytest.raises(RuntimeError, match="briefing snapshot storage failed"):
+        runner.run_live(sources=("calendar",), policy=policy())
+
+    run = list_shadow_runs(paths.ops_sqlite_path, limit=1)[0]
+    assert run["status"] == "failed"
+    assert run["coverage"]["calendar"]["status"] == "complete"
+    assert run["coverage"]["calendar"]["fresh_at"] == NOW.isoformat()
+    assert run["coverage"]["system"]["status"] == "unavailable"
+    assert run["counts"]["calendar_items"] == 1
+    assert "briefing snapshot storage failed" in run["error"]
 
 
 def test_restarted_controller_presents_and_recovers_orphaned_run(
@@ -1517,3 +1554,22 @@ def test_restarted_controller_presents_and_recovers_orphaned_run(
     )
     assert recovered[0]["status"] == "stopped"
     assert recovered[0]["hard_stop_reason"] == "daemon_restart_interrupted_run"
+
+
+def test_shadow_completion_message_uses_natural_singular_and_plural() -> None:
+    singular = _completion_message(
+        {
+            "status": "partial",
+            "counts": {"calendar_items": 1, "gmail_items": 0},
+        }
+    )
+    plural = _completion_message(
+        {
+            "status": "complete",
+            "counts": {"calendar_items": 1, "gmail_items": 2},
+        }
+    )
+
+    assert "with 1 item;" in singular
+    assert "with 3 operational items." in plural
+    assert "item(s)" not in singular + plural

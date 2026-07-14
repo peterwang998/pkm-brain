@@ -122,6 +122,7 @@ def test_operational_projection_maps_to_today_with_coverage_evidence_and_audit()
     assert len(briefing.calendar_now) == 1
     assert briefing.calendar_now[0].title == "Planning review"
     assert len(briefing.ignored_suppressed) == 1
+    assert briefing.ignored_suppressed_count == 1
     assert briefing.ignored_suppressed[0].reason_codes == (
         "transactional_no_current_action",
     )
@@ -137,3 +138,61 @@ def test_partial_projection_never_becomes_an_all_clear() -> None:
     assert briefing.status == "partial"
     assert briefing.availability_reason
     assert briefing.coverage[1].state == "partial"
+
+
+def test_uncertain_items_do_not_display_verified_priority_badges() -> None:
+    value = projection(status="partial")
+    value["sections"]["focus"] = []
+    value["sections"]["low_confidence"] = [
+        card(
+            id="uncertain-1",
+            item_id="uncertain-1",
+            priority=95,
+            confidence=0.25,
+            reconciliation_status="ambiguous",
+            handled_verdict="unknown",
+        )
+    ]
+
+    briefing = today_briefing_from_operational(value, now=NOW)
+
+    assert len(briefing.uncertain) == 1
+    assert briefing.uncertain[0].priority is None
+    assert briefing.uncertain[0].confidence == 0.25
+
+
+def test_coverage_reason_codes_are_presented_as_plain_language() -> None:
+    value = projection(status="partial")
+    value["coverage"]["calendar"] = {
+        "status": "unavailable",
+        "reason": "missing_coverage",
+    }
+    value["coverage"]["gmail"] = {
+        "status": "partial",
+        "reason": "detector_version_mismatch",
+    }
+
+    briefing = today_briefing_from_operational(value, now=NOW)
+
+    assert briefing.coverage[0].detail == "This run is still gathering source coverage."
+    assert briefing.coverage[1].detail == "Gmail needs a fresh detector review."
+    assert "_" not in briefing.coverage[0].detail
+    assert "_" not in briefing.coverage[1].detail
+
+
+def test_today_preserves_total_urgent_count_when_snapshot_is_a_preview() -> None:
+    value = projection()
+    value["sections"]["urgent_overflow"] = [
+        card(id="urgent-1", item_id="urgent-1")
+    ]
+    value["counts"] = {
+        "urgent_overflow": 17,
+        "section_projection": {
+            "urgent_overflow": {"total": 17, "included": 1, "omitted": 16}
+        },
+    }
+
+    briefing = today_briefing_from_operational(value, now=NOW)
+
+    assert briefing.urgent_overflow_count == 17
+    assert len(briefing.urgent_overflow) == 1

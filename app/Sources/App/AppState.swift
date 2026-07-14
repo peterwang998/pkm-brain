@@ -38,6 +38,7 @@ final class AppState: ObservableObject {
     @Published private(set) var isRunningTodayShadow = false
     @Published var todayShadowRunMessage: String?
     @Published var todayShadowRunError: String?
+    @Published private(set) var todayShadowRunResult: TodayShadowRunStatus?
     @Published var todayEvidenceRequest: TodayEvidenceRequest?
     @Published private(set) var queueSummary: QueueSummary?
     @Published var lastError: String?
@@ -178,6 +179,7 @@ final class AppState: ObservableObject {
             todayFeedbackMessage = nil
             todayShadowRunMessage = nil
             todayShadowRunError = nil
+            todayShadowRunResult = nil
             todayEvidenceRequest = nil
             await refreshMigrationPlan()
             await refreshDigest()
@@ -292,21 +294,30 @@ final class AppState: ObservableObject {
         isRunningTodayShadow = true
         todayShadowRunMessage = "Running read-only Calendar and Gmail shadow scan…"
         todayShadowRunError = nil
+        todayShadowRunResult = nil
         defer {
             isRunningTodayShadow = false
         }
 
         do {
             var result = try await client.runTodayShadow()
+            todayShadowRunResult = result
             todayShadowRunMessage = result.message
             while result.isInProgress {
                 try await Task.sleep(nanoseconds: 2_000_000_000)
                 result = try await client.todayShadowRunStatus()
+                todayShadowRunResult = result
                 todayShadowRunMessage = result.message
+            }
+
+            // The operational ledger can contain useful retained state even if
+            // final briefing persistence failed. Always reload it once the run
+            // leaves progress rather than making refresh conditional on success.
+            if result.shouldRefreshBriefing {
+                await refreshToday()
             }
             if result.succeeded {
                 todayShadowRunMessage = result.message
-                await refreshToday()
             } else {
                 todayShadowRunMessage = nil
                 todayShadowRunError = result.message
@@ -314,6 +325,8 @@ final class AppState: ObservableObject {
         } catch {
             todayShadowRunMessage = nil
             todayShadowRunError = error.localizedDescription
+            // The request may have failed after the daemon retained partial state.
+            await refreshToday()
         }
     }
 
@@ -472,6 +485,7 @@ final class AppState: ObservableObject {
         todayFeedbackMessage = nil
         todayShadowRunMessage = nil
         todayShadowRunError = nil
+        todayShadowRunResult = nil
         if pid != nil, didStart {
             Task {
                 await refreshDigest()

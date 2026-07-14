@@ -201,11 +201,12 @@ def _completion_message(payload: Mapping[str, Any]) -> str:
     item_count = int(counts.get("calendar_items") or 0) + int(
         counts.get("gmail_items") or 0
     )
+    item_label = "item" if item_count == 1 else "items"
     if status == "complete":
-        return f"Shadow run complete with {item_count} operational item(s)."
+        return f"Shadow run complete with {item_count} operational {item_label}."
     if status == "partial":
         return (
-            f"Shadow run completed partially with {item_count} item(s); "
+            f"Shadow run completed partially with {item_count} {item_label}; "
             "coverage details remain visible."
         )
     return str(payload.get("message") or "Shadow run failed.")

@@ -914,6 +914,7 @@ public struct TodayBriefing: Codable, Equatable, Sendable {
     public let attention: [TodayItem]
     public let awareness: [TodayItem]
     public let uncertain: [TodayItem]
+    public let ignored_suppressed_count: Int?
     public let ignored_suppressed: [TodayItem]
     public let feedback: TodayFeedbackCapabilities
 
@@ -927,6 +928,10 @@ public struct TodayBriefing: Codable, Equatable, Sendable {
 
     public var hasCoverageWarning: Bool {
         status == "partial" || coverage.contains { $0.state != "complete" }
+    }
+
+    public var ignoredSuppressedTotal: Int {
+        max(ignored_suppressed_count ?? ignored_suppressed.count, ignored_suppressed.count)
     }
 }
 
@@ -1118,6 +1123,32 @@ public struct TodayShadowRunStatus: Codable, Equatable, Sendable {
     public var isTerminal: Bool {
         ["complete", "partial", "failed"].contains(status.lowercased())
     }
+
+    public var displayKind: TodayShadowRunDisplayKind {
+        switch status.lowercased() {
+        case "accepted", "running":
+            return .progress
+        case "complete":
+            return .complete
+        case "partial":
+            return .partial
+        default:
+            return .failed
+        }
+    }
+
+    /// A non-progress response may arrive after the runner has already retained
+    /// useful operational state, including when its final briefing projection fails.
+    public var shouldRefreshBriefing: Bool {
+        displayKind != .progress
+    }
+}
+
+public enum TodayShadowRunDisplayKind: Equatable, Sendable {
+    case progress
+    case complete
+    case partial
+    case failed
 }
 
 public enum DaemonStatus: Equatable, Sendable {

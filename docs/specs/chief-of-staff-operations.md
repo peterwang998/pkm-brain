@@ -1,7 +1,7 @@
 # Chief Of Staff Operations
 
-**Status:** canonical feature spec; the manual Calendar/Gmail shadow implementation is locally release-verified and testing-ready, with the first owner-authorized live trial and promotion still pending
-**Last verified:** 2026-07-14 with Ruff green, 736 Python tests, 26 Swift tests, and a signed local app bundle built, installed, and launched with a healthy daemon; no private live connector result or promotion is claimed
+**Status:** canonical feature spec; the manual Calendar/Gmail shadow implementation is locally release-verified and has completed its first owner-authorized live validation, while human review and every promotion gate remain pending
+**Last verified:** 2026-07-14 with Ruff green, 746 Python tests, 27 Swift tests, and a signed local app bundle built, installed, and launched with a healthy daemon; the latest app-driven validation persisted a partial briefing with Calendar complete and Gmail transparently partial after 77 detector reviews were deferred by the approved daily budget
 **Owns:** operational items, reconciliation, briefings, operational evaluation, and guarded external execution
 
 ## Mission And Product Boundary
@@ -41,13 +41,13 @@ The first accepted run creates the owner-only `config/local/operations.yaml` fro
 - no attachment fetching, quoted-history stripping enabled, and no external provider writes;
 - daily Calendar API, Gmail API, detector-call, detector-input-token, and detector-total-token budgets.
 
-One asynchronous run reads Calendar and Gmail independently, reconciles bounded evidence into `ops.sqlite`, saves a coverage-aware briefing snapshot, and exposes progress through Today. A second start while a run is active reuses the active run rather than starting overlapping source work. Partial pagination and bounded deferred work remain resumable through persisted source cursors; a later manual run continues from the last atomically committed checkpoint.
+One asynchronous run reads Calendar and Gmail independently, reconciles bounded evidence into `ops.sqlite`, saves a coverage-aware briefing snapshot, and exposes progress plus a prominent terminal outcome through Today. A second start while a run is active reuses the active run rather than starting overlapping source work. Partial pagination and bounded deferred work remain resumable through persisted source cursors; a later manual run continues from the last atomically committed checkpoint. A terminal projection or snapshot failure preserves already-completed source coverage, usage, counts, and cursor progress rather than replacing them with an undifferentiated failure.
 
 This slice is not scheduled. It does not write `inbox/`, `brain.sqlite`, documents, chunks, facts, entities, or wiki pages. Gmail retrieval indexing and durable-knowledge ingestion remain disabled. Feedback, missing-item reports, observations, current items, and briefing snapshots are local operational records only. The owner—not an agent or background job—authorizes both grants and starts the first live run.
 
-Implementation completion does not equal promotion. The first private trial must still establish labeled recall, false-alarm, duplicate, stale, handled-state, evidence-route, coverage, and cost behavior before the briefing can be treated as trusted daily operational guidance.
+Implementation completion and one live validation do not equal promotion. Human review plus a larger private trial must still establish labeled recall, false-alarm, duplicate, stale, handled-state, evidence-route, coverage, and cost behavior before the briefing can be treated as trusted daily operational guidance.
 
-Local release verification is complete: Ruff is green, 736 Python tests and 26 Swift tests pass, and the signed local app bundle builds, installs, launches, and serves a healthy daemon. This establishes that the manual trial is testing-ready, not that either connector has succeeded against private live data. Two isolated UI-acceptance attempts executed no app test bodies because macOS timed out enabling XCTest automation mode, so observed native UI acceptance remains a host-level final gate. The first owner-authorized live result, its human labels, and every Calendar, Gmail, cross-source, meeting-preparation, and daily-briefing promotion gate remain pending.
+Local release verification is complete: Ruff is green, 746 Python tests and 27 Swift tests pass, and the signed local app bundle builds, installs, launches, and serves a healthy daemon. The first live attempt exposed an oversized briefing-snapshot failure and insufficient terminal-result visibility. The latest app-driven validation retained source progress, completed Calendar coverage, reported Gmail as partial with 77 detector reviews deferred by the approved daily budget, persisted a bounded briefing snapshot, and showed the terminal partial result in Today. This proves the repaired failure, storage, budget, coverage, and terminal-outcome paths against private live sources; it does not establish Gmail detector quality or promote either connector. Human labeling and every Calendar, Gmail, cross-source, meeting-preparation, and daily-briefing promotion gate remain pending.
 
 The owner-facing procedure is [Live Chief-of-Staff Shadow Trial](../runbooks/chief-of-staff-shadow-trial.md). Offline chronological scoring remains documented separately in [Retrospective Shadow Replay](../runbooks/chief-of-staff-shadow-replay.md).
 
@@ -263,7 +263,7 @@ Storage requirements:
 - item/event writes retry bounded transient locks and fail visibly after the retry budget;
 - the daemon's mutation executor prevents overlapping operational writes.
 
-Briefing snapshots are derived. They MAY be cached in `ops.sqlite` with generation time, horizon, ordered item IDs, ranking reasons, completeness, and connector coverage, but MUST NOT duplicate source bodies. Cached briefing snapshots expire after 30 days by default.
+Briefing snapshots are derived. They MAY be cached in `ops.sqlite` with generation time, horizon, ordered item IDs, ranking reasons, completeness, and connector coverage, but MUST NOT duplicate source bodies. The serialized sections field has an immutable 256 KiB storage ceiling; generation MUST compact and fairly bound the user-visible projection to at most 240 KiB, leaving storage headroom. Bounding preserves each section's true `total`, preview `included`, and `omitted` counts, so truncation cannot become a false all-clear. Complete operational history remains in the canonical item, observation, event, and decision tables rather than being copied into the briefing. Cached briefing snapshots expire after 30 days by default.
 
 ### Backup And Recovery
 
@@ -408,7 +408,7 @@ Gmail has three independently permissioned lanes over a normalized thread snapsh
 | knowledge | likely durable human/evidence threads | run the existing fact curation pipeline |
 | operations | changed threads with possible current work, including transactional logistics | detect and reconcile operational items |
 
-The knowledge filter and operational filter are orthogonal. Bulk/transactional mail MUST NOT be excluded from operations merely because it is ineligible for durable facts. Marketing and repetitive notifications may be deterministically suppressed.
+The knowledge filter and operational filter are orthogonal. Bulk/transactional mail MUST NOT be excluded from operations merely because it is ineligible for durable facts. Marketing and repetitive notifications may be deterministically suppressed. Provider message-class/header gating for marketing or bulk mail runs before broad action or high-consequence keyword matching so incidental newsletter boilerplate cannot force semantic detection. That gate MUST NOT strand an already tracked thread: a thread with a current operational item remains detector-eligible when its source revision changes.
 
 The shared normalization contract remains:
 
@@ -440,7 +440,7 @@ V1 permits at most one semantic detector pass per changed thread, or one request
 - no truth-maintenance loop;
 - no automatic retry that multiplies calls for every ambiguity.
 
-Malformed output produces no model-authored item. Any thread admitted to semantic detection may instead receive a clearly labeled low-confidence attention fallback so detector failure is visible; direct and high-consequence obligations receive the stronger no-suppress treatment and ranking. The fallback decision is cached for that exact source revision to avoid repeated billing, and a newer revision is eligible for detection again. Deterministic ambiguity may otherwise produce a provisional item or no item, but never an adjudicated lifecycle effect.
+Malformed output produces no model-authored item. In a multi-thread response, validation is isolated per thread: one malformed or missing result cannot discard valid results for the other threads in that batch. Any failed admitted thread may instead receive a clearly labeled low-confidence attention fallback so detector failure is visible; direct and high-consequence obligations receive the stronger no-suppress treatment and internal ranking without being presented as verified work. The fallback decision is cached for that exact source revision to avoid repeated billing, and a newer revision is eligible for detection again. Deterministic ambiguity may otherwise produce a provisional item or no item, but never an adjudicated lifecycle effect.
 
 Daily request/input/token budgets are explicit configuration. Each detector attempt durably pre-reserves a conservative, no-refund input and total ceiling before launch, and the only supported live provider is the restricted Codex route with its matching in-flight rollout cap. Provider-reported usage is recorded separately and any positive call/input/total delta is durably added after the attempt; missing usage or an observed overage stops later calls and makes coverage partial. Overflow is never silently dropped. Production enablement requires a chronological replay demonstrating that the approved budget covers normal and high-volume days.
 
@@ -469,21 +469,23 @@ Sections are:
 3. `now_and_next`: current and upcoming Calendar events;
 4. `overdue_and_due`: active commitments/follow-ups/deadlines ordered by urgency;
 5. `waiting`: active `kind=waiting` items;
-6. `attention`: changed, uncertain, high-priority, or decision-bearing items;
+6. `attention`: confirmed decision-bearing or high-priority items that do not belong in a more specific action section;
 7. `awareness`: relevant informational items that do not currently need the operator's action;
 8. `low_confidence`: active items whose confidence/reconciliation metadata is provisional or ambiguous, visually separated from trusted work;
 9. `system_coverage`: connector freshness, deferred volume, and failures.
 
+Every operational item is assigned to exactly one primary user-visible item section. Facet counts may record that an item also matched other section predicates, but the same card is not repeated across Focus, Attention, Due, and Uncertain. Suppressed-source decisions are audit records rather than operational items and keep their own bounded preview.
+
 Focus selection is adaptive rather than quota-filling:
 
-1. rank a bounded candidate set of active action-bearing items or confirmed episodes;
+1. rank a bounded candidate set of active, confirmed action-bearing items or confirmed episodes; an item below `0.65` confidence or with `provisional|ambiguous` reconciliation status is not an action candidate;
 2. derive handled state using all authorized, fresh sources that could satisfy the action;
 3. reject terminal, snoozed, duplicate-episode, and verified `fulfilled|being_handled` candidates from focus while retaining them in their appropriate full section when useful;
 4. include at most five `needs_action` candidates, or fewer when fewer qualify;
 5. disclose every additional critical/high-priority `needs_action` candidate in `urgent_overflow` rather than hiding it;
 6. never pad focus with awareness material merely to reach five.
 
-`unknown` handled state is never silently suppressed. It appears in focus or the uncertainty section according to consequence, confidence, and coverage. Zero focus items is a valid result only when coverage and satisfaction checks support it.
+`unknown` handled state is never silently suppressed. A confirmed, sufficiently confident operator-owned or high-priority item may remain an action candidate when handled verification is unknown; an unverified, provisional, ambiguous, or low-confidence item appears only in the uncertainty section. Uncertain cards MUST NOT display verified-style `P0` or `P1` badges even when their internal urgency score is high. Zero focus items is a valid result only when coverage and satisfaction checks support it.
 
 Ranking is deterministic over:
 
@@ -509,7 +511,7 @@ Every briefing item exposes:
 - bounded local evidence navigation and validated provider-native navigation where authorized;
 - local `confirm`, `done`, `dismiss`, `snooze`, and correction actions that apply to its kind/state.
 
-Briefing generation MUST NOT fail closed on one source. It returns `complete|partial|unavailable` plus per-connector coverage. Stale data may remain visible only with its last-updated time and an explicit stale label.
+Briefing generation MUST NOT fail closed on one source. It returns `complete|partial|unavailable` plus per-connector coverage. Stale data may remain visible only with its last-updated time and an explicit stale label. The persisted preview MUST remain within the 240 KiB projection target under the 256 KiB storage ceiling and expose true total/included/omitted counts for every section.
 
 ### Evidence Navigation
 
@@ -538,15 +540,15 @@ Packets are generated on demand or inside a bounded pre-meeting window, use the 
 Today becomes the V1 Chief-of-Staff surface without changing navigation:
 
 - the briefing leads the page;
-- **Run Shadow** starts one manual read-only Calendar/Gmail pass and shows accepted, running, complete, partial, or failed status;
+- **Run Shadow** starts one manual read-only Calendar/Gmail pass and shows a prominent accepted, running, complete, partial, or failed outcome that remains visible after the terminal refresh;
 - focus shows zero to five cards, with urgent overflow and awareness visibly separate;
-- retained local evidence opens in an in-app evidence sheet, while the ignored/suppressed audit shows bounded reason codes and source references;
+- retained local evidence opens in an in-app evidence sheet, while the ignored/suppressed audit is collapsed by default and shows its true total plus bounded reason-code/source-reference preview and omitted count;
 - daemon, scheduler, index, sync, and review health remain a compact system pulse;
 - item actions write only through the operational service and append an event;
 - source links open the owning Brain evidence view and may offer a separately labeled validated provider route when available;
 - selected upcoming events may expand into a derived meeting-preparation packet without creating another navigation destination;
 - a refresh shows the new `as_of` time and rejects late responses from older generations;
-- sidebar/menu badges do not count low-confidence or ambiguous items as confirmed obligations;
+- sidebar/menu badges do not count low-confidence or ambiguous items as confirmed obligations, and uncertain cards do not render verified `P0`/`P1` badges;
 - notification text contains counts/status by default, not mail or calendar contents.
 
 No separate Work, Goals, Approvals, or Chief Of Staff destination ships before shadow-mode evidence shows that Today cannot support the workflow.
@@ -775,8 +777,8 @@ The operational Chief-of-Staff foundation is complete when:
 3. `ops_items` and append-only events preserve every automated and human transition;
 4. a validated local operations policy controls stable identity, responsibility ranking, configured sources, and exception handling with replayable version provenance;
 5. every enabled adapter satisfies the source identity, cursor, budget, authoritative-signal, evidence-route, and coverage contract;
-6. Today generates a freshness-stamped briefing with evidence, confidence, reasons, handled verdicts, and connector coverage;
-7. focus contains at most five action-bearing episodes, never pads with awareness, and discloses all urgent overflow;
+6. Today generates a freshness-stamped, storage-bounded briefing with evidence, confidence, reasons, handled verdicts, connector coverage, and true section total/included/omitted counts;
+7. focus contains at most five confirmed action-bearing episodes, never pads with awareness, discloses all urgent overflow, assigns each item to one primary visible section, and keeps unverified items out of action candidacy and verified priority styling;
 8. local and provider-native evidence routes are account-correct, allowlisted, and invalidated when evidence is forgotten;
 9. meeting preparation is derived, evidence-linked, coverage-aware, and cannot mutate canonical state;
 10. local completion, dismissal, snooze, and correction survive restart/replay and prevent same-version resurrection;
@@ -804,6 +806,6 @@ swift test --package-path app
 scripts/build-app.sh
 ```
 
-Latest local release verification completed on 2026-07-14 with Ruff green, 736 Python tests passing, 26 Swift tests passing, and the signed local app bundle installed and serving a healthy daemon. This is a local test/launch gate only; native UI automation remains blocked before test execution by the host's XCTest automation-mode timeout, and the owner-authorized live trial plus all empirical promotion gates remain open.
+Latest local release verification completed on 2026-07-14 with Ruff green, 746 Python tests passing, 27 Swift tests passing, and the signed local app bundle installed and serving a healthy daemon. The latest app-driven validation produced complete Calendar coverage, partial Gmail coverage with 77 detector reviews visibly deferred by the approved daily budget, a successfully persisted bounded snapshot, and a prominent terminal partial-result card. This validates the live storage/coverage/budget/result path only; human review and all empirical promotion gates remain open.
 
 The implementation plan owns release sequencing. This spec owns the behavior and promotion gates.

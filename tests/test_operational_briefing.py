@@ -169,6 +169,81 @@ def test_briefing_focus_is_adaptive_and_urgent_overflow_is_never_hidden(
     assert briefing["sections"]["focus"][0]["local_evidence_route"].startswith(
         "/api/ops/evidence?"
     )
+    visible_item_ids = [
+        card["item_id"]
+        for section in (
+            "focus",
+            "urgent_overflow",
+            "now_and_next",
+            "upcoming",
+            "overdue_and_due",
+            "waiting",
+            "low_confidence",
+            "attention",
+            "awareness",
+            "changed",
+        )
+        for card in briefing["sections"][section]
+    ]
+    assert len(visible_item_ids) == len(set(visible_item_ids))
+
+
+def test_ambiguous_low_confidence_item_stays_out_of_focus(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "ops.sqlite"
+    init_operational_db(db_path)
+    run = start_shadow_run(
+        db_path,
+        mode="fixture",
+        requested_sources=["gmail"],
+        policy_version="operations-v1",
+        detector_version=GMAIL_DETECTOR_VERSION,
+        started_at=NOW,
+    )
+    item_id = add_item(
+        db_path,
+        source_key="uncertain-security",
+        kind="attention",
+        title="Review an uncertain security notice",
+        priority=90,
+        confidence=0.25,
+    )
+    record_handled_assessment(
+        db_path,
+        HandledAssessment(
+            item_id=item_id,
+            verdict="needs_action",
+            sources_checked=("gmail",),
+            coverage={"gmail": {"status": "complete"}},
+            policy_version="operations-v1",
+            confidence=0.95,
+            as_of=NOW,
+        ),
+        run_id=run["id"],
+    )
+    finish_shadow_run(
+        db_path,
+        run["id"],
+        status="complete",
+        coverage={"gmail": {"status": "complete", "fresh_at": NOW}},
+        finished_at=NOW,
+    )
+
+    briefing = build_operational_briefing(
+        db_path,
+        timezone_name="America/Los_Angeles",
+        policy_version="operations-v1",
+        as_of=NOW,
+        required_sources=("gmail",),
+    )
+
+    assert briefing["sections"]["focus"] == []
+    assert briefing["sections"]["urgent_overflow"] == []
+    assert [
+        card["item_id"] for card in briefing["sections"]["low_confidence"]
+    ] == [item_id]
+    assert briefing["sections"]["attention"] == []
 
 
 def test_briefing_does_not_claim_all_clear_when_coverage_is_partial(

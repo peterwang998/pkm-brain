@@ -93,6 +93,7 @@ struct PKMBrainKitTests {
         #expect(briefing.calendar.next.first?.title == "Project review")
         #expect(briefing.uncertain.first?.reason_codes == ["authoritative_source_unavailable"])
         #expect(briefing.ignored_suppressed.first?.handled_verdict == "fulfilled")
+        #expect(briefing.ignoredSuppressedTotal == 1)
         #expect(briefing.feedback.allows("report_missing"))
         #expect(briefing.feedback.allows("confirm"))
     }
@@ -106,8 +107,32 @@ struct PKMBrainKitTests {
         #expect(result.succeeded)
         #expect(result.isTerminal)
         #expect(!result.isInProgress)
+        #expect(result.displayKind == .partial)
+        #expect(result.shouldRefreshBriefing)
         #expect(result.counts?["surfaced"]?.intValue == 3)
         #expect(result.message == "Shadow run finished with partial coverage.")
+    }
+
+    @Test("Today shadow-run display state refreshes retained results after every terminal outcome")
+    func todayShadowRunDisplayState() throws {
+        let expected: [(String, TodayShadowRunDisplayKind, Bool)] = [
+            ("accepted", .progress, false),
+            ("running", .progress, false),
+            ("complete", .complete, true),
+            ("partial", .partial, true),
+            ("failed", .failed, true),
+            ("cancelled", .failed, true),
+        ]
+
+        for (status, displayKind, shouldRefresh) in expected {
+            let data = Data(
+                #"{"schema_version":1,"status":"\#(status)","message":"Shadow status","run_id":"opsshadow_state","coverage":{},"usage":{},"counts":{}}"#.utf8
+            )
+            let result = try JSONDecoder().decode(TodayShadowRunStatus.self, from: data)
+
+            #expect(result.displayKind == displayKind)
+            #expect(result.shouldRefreshBriefing == shouldRefresh)
+        }
     }
 
     @Test("Today shadow-run client posts the manual source and timezone selection")

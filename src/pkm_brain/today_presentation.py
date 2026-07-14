@@ -223,6 +223,7 @@ class TodayBriefing:
     attention: tuple[TodayItem, ...] = ()
     awareness: tuple[TodayItem, ...] = ()
     uncertain: tuple[TodayItem, ...] = ()
+    ignored_suppressed_count: int | None = None
     ignored_suppressed: tuple[TodayItem, ...] = ()
     feedback: TodayFeedbackCapabilities = field(
         default_factory=TodayFeedbackCapabilities
@@ -235,6 +236,13 @@ class TodayBriefing:
             raise ValueError("today focus cannot contain more than five items")
         if self.urgent_overflow_count < len(self.urgent_overflow):
             raise ValueError("urgent overflow count cannot be smaller than its preview")
+        if (
+            self.ignored_suppressed_count is not None
+            and self.ignored_suppressed_count < len(self.ignored_suppressed)
+        ):
+            raise ValueError(
+                "ignored/suppressed count cannot be smaller than its preview"
+            )
 
     @classmethod
     def unavailable(cls, reason: str) -> TodayBriefing:
@@ -276,6 +284,10 @@ class TodayBriefing:
             "attention": [item.as_dict() for item in self.attention],
             "awareness": [item.as_dict() for item in self.awareness],
             "uncertain": [item.as_dict() for item in self.uncertain],
+            "ignored_suppressed_count": max(
+                self.ignored_suppressed_count or 0,
+                len(self.ignored_suppressed),
+            ),
             "ignored_suppressed": [
                 item.as_dict() for item in self.ignored_suppressed
             ],

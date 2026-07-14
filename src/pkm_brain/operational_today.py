@@ -139,6 +139,9 @@ def today_briefing_from_operational(
     sections = projection.get("sections")
     if not isinstance(sections, Mapping):
         sections = {}
+    counts = projection.get("counts")
+    if not isinstance(counts, Mapping):
+        counts = {}
 
     coverage = tuple(
         _today_coverage(source, value)
@@ -188,7 +191,11 @@ def today_briefing_from_operational(
         focus=tuple(
             _today_item(card, "focus") for card in _cards(sections, "focus")[:5]
         ),
-        urgent_overflow_count=len(_cards(sections, "urgent_overflow")),
+        urgent_overflow_count=_section_total(
+            counts,
+            "urgent_overflow",
+            fallback=len(_cards(sections, "urgent_overflow")),
+        ),
         urgent_overflow=tuple(
             _today_item(card, "urgent_overflow")
             for card in _cards(sections, "urgent_overflow")[:20]
@@ -213,6 +220,11 @@ def today_briefing_from_operational(
         uncertain=tuple(
             _today_item(card, "uncertain")
             for card in _cards(sections, "low_confidence")
+        ),
+        ignored_suppressed_count=_section_total(
+            counts,
+            "suppressed",
+            fallback=len(_cards(sections, "suppressed")),
         ),
         ignored_suppressed=tuple(
             _today_suppressed(card) for card in _cards(sections, "suppressed")
@@ -258,7 +270,14 @@ def _today_item(card: Mapping[str, Any], section: str) -> TodayItem:
         summary=_optional_string(card.get("next_move") or card.get("details")),
         kind=str(card.get("kind") or "attention"),
         state=str(card.get("state") or "active"),
-        priority=_priority_label(card.get("priority")),
+        # An urgency score is useful for ranking verified work, but displaying it
+        # as P0/P1 on an explicitly uncertain card overstates what the evidence
+        # supports. Confidence and reconciliation state remain visible instead.
+        priority=(
+            None
+            if section == "uncertain"
+            else _priority_label(card.get("priority"))
+        ),
         starts_at=_optional_string(card.get("starts_at")),
         due_at=_optional_string(card.get("due_at")),
         ends_at=_optional_string(card.get("ends_at")),
@@ -308,7 +327,17 @@ def _today_coverage(source: str, value: Mapping[str, Any]) -> TodayCoverage:
     state = str(value.get("status") or "unavailable")
     if state not in {"complete", "partial", "unavailable"}:
         state = "unavailable"
-    detail = value.get("error") or value.get("reason")
+    detail = value.get("error")
+    if not detail and value.get("reason"):
+        detail = _coverage_reason_detail(str(value["reason"]), source=source)
+    if not detail and source == "gmail" and value.get("thread_count") is not None:
+        thread_count = max(0, int(value.get("thread_count") or 0))
+        deferred = max(0, int(value.get("deferred_count") or 0))
+        detail = f"{thread_count} threads checked"
+        if deferred:
+            detail += f" · {deferred} detector reviews deferred"
+    if not detail and source == "calendar" and value.get("item_count") is not None:
+        detail = f"{max(0, int(value.get('item_count') or 0))} events checked"
     if not detail and value.get("mode"):
         detail = f"{value['mode']} read-only sync"
     return TodayCoverage(
@@ -319,6 +348,23 @@ def _today_coverage(source: str, value: Mapping[str, Any]) -> TodayCoverage:
         detail=_optional_string(detail),
         deferred_count=max(0, int(value.get("deferred_count") or 0)),
     )
+
+
+def _coverage_reason_detail(reason: str, *, source: str) -> str:
+    labels = {
+        "missing_coverage": "This run is still gathering source coverage.",
+        "never_run": "No shadow run has checked this source yet.",
+        "not_requested_in_latest_run": "This source was not included in the latest run.",
+        "policy_version_mismatch": "The latest result used an older operations policy.",
+        "detector_version_mismatch": "Gmail needs a fresh detector review.",
+        "stale": "The latest successful read is stale.",
+        "detector_budget_exhausted": "The daily detector budget was reached; remaining reviews are deferred.",
+    }
+    if reason in labels:
+        return labels[reason]
+    source_label = "Calendar" if source == "calendar" else "Gmail" if source == "gmail" else source.title()
+    readable = reason.replace("_", " ").strip().rstrip(".")
+    return f"{source_label}: {readable}." if readable else f"{source_label} coverage is unavailable."
 
 
 def _freshness(
@@ -351,6 +397,20 @@ def _cards(sections: Mapping[str, Any], key: str) -> list[Mapping[str, Any]]:
     if not isinstance(values, list):
         return []
     return [value for value in values if isinstance(value, Mapping)]
+
+
+def _section_total(counts: Mapping[str, Any], key: str, *, fallback: int) -> int:
+    projection = counts.get("section_projection")
+    if isinstance(projection, Mapping):
+        section = projection.get(key)
+        if isinstance(section, Mapping):
+            total = section.get("total")
+            if isinstance(total, int) and not isinstance(total, bool) and total >= 0:
+                return max(fallback, total)
+    total = counts.get(key)
+    if isinstance(total, int) and not isinstance(total, bool) and total >= 0:
+        return max(fallback, total)
+    return fallback
 
 
 def _unique_cards(cards: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:

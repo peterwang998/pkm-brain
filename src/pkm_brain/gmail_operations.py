@@ -18,7 +18,7 @@ from .llm import LLMProvider, complete_json, json_prompt
 from .operational_budget import DailyBudgetExceeded
 
 
-GMAIL_DETECTOR_VERSION = "gmail-operations-v2"
+GMAIL_DETECTOR_VERSION = "gmail-operations-v3"
 DETECTOR_OUTPUT_TOKEN_RESERVE = GMAIL_DETECTOR_OUTPUT_TOKEN_CEILING
 DETECTOR_INPUT_TOKEN_OVERHEAD_RESERVE = (
     GMAIL_DETECTOR_INPUT_OVERHEAD_TOKEN_CEILING
@@ -248,7 +248,12 @@ def preclassify_gmail_thread(
         not message.outgoing and "?" in message.body
         for message in thread.messages
     )
-    should_detect = (
+    # Marketing headers are a stronger signal than incidental action/high-consequence
+    # words in newsletter boilerplate. Existing operational items are still sent to
+    # the detector by detect_gmail_threads(), so this gate cannot strand an item that
+    # is already being tracked.
+    marketing = thread.message_class in {"bulk", "marketing"}
+    should_detect = not marketing and (
         thread.message_class == "human"
         or high_consequence
         or action_signal
@@ -263,7 +268,7 @@ def preclassify_gmail_thread(
             if thread.message_class == "human"
             else "operational_language"
         )
-    elif thread.message_class in {"bulk", "marketing"} or _MARKETING_SIGNAL.search(content):
+    elif marketing or _MARKETING_SIGNAL.search(content):
         reason = "marketing_no_action"
     elif thread.message_class == "transactional":
         reason = "transactional_no_current_action"
@@ -410,7 +415,7 @@ def detect_gmail_threads(
                 llm_provider=llm_provider,
                 max_attempts=1,
             )
-            parsed = _parse_batch_response(
+            parsed, parse_failures = _parse_batch_response(
                 response,
                 batch,
                 operator_emails=operator_emails,
@@ -443,6 +448,36 @@ def detect_gmail_threads(
                     )
                 else:
                     detections[result.thread_id] = result
+            for thread_id, parse_error in parse_failures.items():
+                thread = by_id[thread_id]
+                decision = preclassification_by_id[thread_id]
+                active_items = active_items_by_thread.get(thread_id, ())
+                direct_obligation = _has_direct_incoming_obligation(
+                    thread,
+                    operator_emails=operator_emails,
+                )
+                reason_code = (
+                    "high_consequence_detector_error"
+                    if decision.high_consequence
+                    else "direct_obligation_detector_error"
+                    if direct_obligation
+                    else "active_item_detector_error"
+                    if active_items
+                    else "detector_error_uncertain"
+                )
+                fallback = _visible_uncertain_fallback(
+                    thread,
+                    reason_code=reason_code,
+                    operator_emails=operator_emails,
+                    active_items=active_items,
+                    high_consequence=decision.high_consequence,
+                    direct_obligation=direct_obligation,
+                )
+                message = f"GmailDetectorError: {parse_error}"[:1000]
+                errors.append(message)
+                detections[thread_id] = GmailThreadDetection(
+                    **{**fallback.__dict__, "error": message}
+                )
             estimated_output_tokens += _estimate_tokens(response)
         except DailyBudgetExceeded:
             requests -= 1
@@ -540,61 +575,75 @@ def _parse_batch_response(
     *,
     operator_emails: Sequence[str],
     timezone_name: str,
-) -> tuple[GmailThreadDetection, ...]:
+) -> tuple[tuple[GmailThreadDetection, ...], dict[str, str]]:
     raw_results = response.get("threads")
     if not isinstance(raw_results, list):
         raise GmailDetectorError("detector response threads must be a list")
     allowed = {thread.thread_id: thread for thread in batch}
-    seen: set[str] = set()
-    output: list[GmailThreadDetection] = []
+    raw_by_id: dict[str, Mapping[str, Any]] = {}
+    failures: dict[str, str] = {}
     for raw in raw_results:
         if not isinstance(raw, Mapping):
-            raise GmailDetectorError("detector thread result must be an object")
+            continue
         thread_id = str(raw.get("thread_id") or "").strip()
-        if thread_id not in allowed or thread_id in seen:
-            raise GmailDetectorError("detector returned an unknown or duplicate thread")
-        seen.add(thread_id)
-        decision = str(raw.get("decision") or "").strip()
-        if decision == "ignore":
-            reason = str(raw.get("reason_code") or "model_ignore").strip()
+        if thread_id not in allowed:
+            continue
+        if thread_id in raw_by_id:
+            failures[thread_id] = "detector returned a duplicate thread result"
+            raw_by_id.pop(thread_id, None)
+            continue
+        raw_by_id[thread_id] = raw
+
+    output: list[GmailThreadDetection] = []
+    for thread in batch:
+        thread_id = thread.thread_id
+        if thread_id in failures:
+            continue
+        raw = raw_by_id.get(thread_id)
+        if raw is None:
+            failures[thread_id] = "detector omitted the thread result"
+            continue
+        try:
+            decision = str(raw.get("decision") or "").strip()
+            if decision == "ignore":
+                reason = str(raw.get("reason_code") or "model_ignore").strip()
+                output.append(
+                    GmailThreadDetection(
+                        thread_id=thread_id,
+                        disposition="suppressed",
+                        reason_code=reason[:128] or "model_ignore",
+                        confidence=_confidence(raw.get("confidence"), default=0.7),
+                    )
+                )
+                continue
+            if decision != "candidates":
+                raise GmailDetectorError(
+                    "detector decision must be ignore or candidates"
+                )
+            raw_candidates = raw.get("candidates")
+            if not isinstance(raw_candidates, list) or not raw_candidates:
+                raise GmailDetectorError("candidate decision requires candidates")
+            candidates = tuple(
+                _parse_candidate(
+                    candidate,
+                    thread,
+                    operator_emails=operator_emails,
+                    timezone_name=timezone_name,
+                )
+                for candidate in raw_candidates[:12]
+            )
             output.append(
                 GmailThreadDetection(
                     thread_id=thread_id,
-                    disposition="suppressed",
-                    reason_code=reason[:128] or "model_ignore",
-                    confidence=_confidence(raw.get("confidence"), default=0.7),
+                    disposition="surfaced",
+                    reason_code="operational_candidate",
+                    candidates=candidates,
+                    confidence=max(candidate.confidence for candidate in candidates),
                 )
             )
-            continue
-        if decision != "candidates":
-            raise GmailDetectorError("detector decision must be ignore or candidates")
-        raw_candidates = raw.get("candidates")
-        if not isinstance(raw_candidates, list) or not raw_candidates:
-            raise GmailDetectorError("candidate decision requires candidates")
-        candidates = tuple(
-            _parse_candidate(
-                candidate,
-                allowed[thread_id],
-                operator_emails=operator_emails,
-                timezone_name=timezone_name,
-            )
-            for candidate in raw_candidates[:12]
-        )
-        output.append(
-            GmailThreadDetection(
-                thread_id=thread_id,
-                disposition="surfaced",
-                reason_code="operational_candidate",
-                candidates=candidates,
-                confidence=max(candidate.confidence for candidate in candidates),
-            )
-        )
-    missing = set(allowed) - seen
-    if missing:
-        raise GmailDetectorError(
-            "detector omitted thread results: " + ", ".join(sorted(missing))
-        )
-    return tuple(output)
+        except (GmailDetectorError, TypeError, ValueError) as exc:
+            failures[thread_id] = str(exc)[:900]
+    return tuple(output), failures
 
 
 def _visible_uncertain_fallback(
@@ -626,7 +675,12 @@ def _visible_uncertain_fallback(
         thread,
         operator_emails=operator_emails,
     )
-    priority = 90 if high_consequence else 70 if direct_obligation else 55
+    if active_item:
+        priority = int(active_item.get("priority") or 40)
+    else:
+        # An unresolved detector result is evidence of uncertainty, not evidence
+        # of urgency. Keep it visible for review without displacing grounded work.
+        priority = 40 if high_consequence else 30 if direct_obligation else 15
     candidate = GmailOperationalCandidate(
         detector_key=detector_key,
         operation="needs_reconciliation",

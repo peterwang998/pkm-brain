@@ -1,8 +1,8 @@
 # Live Chief-of-Staff Shadow Trial
 
-Use this runbook for the first private Calendar/Gmail evaluation in the macOS app. The trial is manual and read-only. It creates local operational state and feedback, but it cannot change Google data or add Gmail to Brain's knowledge layer.
+Use this runbook for private Calendar/Gmail evaluation in the macOS app. The trial is manual and read-only. It creates local operational state and feedback, but it cannot change Google data or add Gmail to Brain's knowledge layer.
 
-**Readiness:** local release verification completed on 2026-07-14 with Ruff green, 736 Python tests, 26 Swift tests, and a signed local app bundle built, installed, and launched with a healthy daemon. The workflow is testing-ready. Two isolated UI-acceptance attempts executed no app test bodies because macOS timed out enabling XCTest automation mode, so observed native UI acceptance remains a separate host-level final gate. The first owner-authorized live trial and all promotion decisions remain pending, and this runbook does not claim live connector success.
+**Readiness:** local release verification completed on 2026-07-14 with Ruff green, 746 Python tests, 27 Swift tests, and a signed local app bundle built, installed, and launched with a healthy daemon. The first live attempt exposed an oversized briefing-snapshot failure and weak terminal-result visibility. The latest app-driven validation retained source progress, completed Calendar, reported Gmail partial with 77 detector reviews deferred by the approved daily budget, persisted a bounded snapshot, and presented the terminal result in Today. The workflow is ready for owner review, but this result does not promote either connector or establish Gmail detector quality.
 
 ## What This Trial Can Access
 
@@ -35,21 +35,24 @@ Gmail capture, retrieval indexing, document/chunk creation, fact extraction, and
 1. Open **Ops > Connectors** and connect Calendar and Gmail separately. Confirm that each card shows the intended account and a connected read-only state.
 2. Open **Today** and select **Run Shadow**. The first accepted run creates the private operations policy only if one does not already exist; an existing policy is never overwritten.
 3. Leave the app open while the button shows **Running Shadow…**. Today polls the daemon automatically, so do not start another run.
-4. Read the terminal result:
+4. Read the prominent terminal-result card at the top of Today:
    - **Complete:** both required sources finished with current coverage.
    - **Partial:** at least one source made progress, but pagination, a budget, retention cleanup, or another bounded failure left incomplete coverage.
    - **Failed:** neither source produced usable current coverage. The displayed error is the starting point for diagnosis.
-5. Treat a partial or stale result as incomplete even when the visible focus list is empty. It is not an all-clear.
+5. Treat a partial or stale result as incomplete even when the visible focus list is empty. It is not an all-clear. Today refreshes after every terminal outcome, so completed source coverage remains reviewable even if briefing projection or snapshot persistence reports a separate failure.
 
 The initial Calendar read is bounded to 14 days back and 90 days forward. Gmail stays inside the most recent seven days, selecting the last two days plus unread mail, and processes at most 200 threads per manual run. Remaining work is retained as visible partial coverage for the next run rather than importing historical mail or blocking the app for an unbounded pass.
+
+The saved briefing is also a bounded preview: serialized sections target at most 240 KiB under the 256 KiB storage ceiling. Today preserves the true total, included, and omitted counts when it cannot include every audit or section card. The complete item and decision history remains in operational storage; preview truncation is never an all-clear.
 
 ## Review What It Found
 
 Use Today as the evaluation surface:
 
 - **Coverage** shows whether Calendar and Gmail were complete, partial, stale, or unavailable.
-- **Focus**, **Urgent overflow**, **Now and next**, **Due**, **Waiting**, **Attention**, **Awareness**, and **Uncertain** show what the current projection admitted.
-- **Ignored & suppressed audit** shows bounded reasons for material withheld from focus. Review this section as carefully as the surfaced items; it is where over-filtering becomes visible.
+- **Focus**, **Urgent overflow**, **Now and next**, **Due**, **Waiting**, **Attention**, **Awareness**, and **Uncertain** show what the current projection admitted. Each operational item appears in one primary section rather than being repeated across several sections.
+- **Uncertain** is not an action queue. Low-confidence, provisional, or ambiguous items remain here and do not display verified `P0`/`P1` badges.
+- **Ignored & suppressed audit** is collapsed by default and shows the true total, a bounded reason/source preview, and how many entries were omitted from that preview. Review it as carefully as the surfaced items; it is where over-filtering becomes visible.
 - **Local evidence** opens the retained source revision in the app. A provider link, when shown, is a separately labeled convenience and is not the evidence authority.
 - **Prepare** on an upcoming Calendar item opens a bounded, read-only meeting packet using Calendar claims plus supported Brain facts/pages; suggestions are labeled and are never promoted to facts.
 
@@ -67,6 +70,8 @@ Compare the briefing with the actual Calendar and Gmail sources. Pay special att
 ## Rerun And Resume
 
 After a run reaches a terminal state, selecting **Run Shadow** again starts the next bounded pass. Persisted cursors resume unfinished pagination and request only the next changes where the provider supports it. Observations, items, handled assessments, and cursor progress commit together, so a failed page does not advance past unapplied evidence.
+
+Daily detector reservations are durable and no-refund. When Today reports reviews deferred by the approved daily budget, another same-day run may still leave those reviews deferred; that is expected and must remain visible as partial coverage. Do not delete reservations or raise the local policy budget merely to force completion. Resume after the next budget window, or make a separate explicit cost-policy decision before changing the limit.
 
 Rerunning should reconcile newer source revisions into existing items rather than duplicate them. Use repeated manual runs to evaluate duplicate, stale, resurrection, and deadline-change behavior. A schedule is intentionally absent during shadow evaluation.
 
@@ -99,4 +104,4 @@ Stop testing, do not interpret the result as an all-clear, and preserve the disp
 - a provider/model budget is exceeded without a visible partial/deferred result;
 - credentials, refresh tokens, or full detector prompts appear in Brain config, logs, reports, or briefing records.
 
-Implementation and local release verification are complete for this manual trial. Two isolated native UI-acceptance attempts were blocked before test execution by the host's XCTest automation-mode timeout, so that observed gate remains open. The first owner-authorized private live result, human review, and every promotion gate remain pending until the owner performs the authorization and starts the run.
+Implementation and local release verification are complete for this manual trial. The latest app-driven validation persisted a bounded partial briefing with Calendar complete and Gmail visibly partial because 77 detector reviews were deferred by the approved daily budget, then left the terminal partial-result card visible in Today. Human review, continued labeled runs, and every promotion gate remain pending; partial coverage must never be interpreted as an all-clear.

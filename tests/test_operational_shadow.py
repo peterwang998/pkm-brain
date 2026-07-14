@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
 
 from pkm_brain.operational_db import init_operational_db, operational_connection
+from pkm_brain.operational_briefing_projection import (
+    BRIEFING_SECTION_ORDER,
+    BRIEFING_SECTIONS_TARGET_BYTES,
+)
 from pkm_brain.operational_shadow import (
     HandledAssessment,
     ShadowDecision,
@@ -169,6 +174,95 @@ def test_shadow_run_decisions_assessments_and_briefing_are_bounded_and_replayabl
     )
     assert snapshot["idempotent"] is False
     assert latest_briefing_snapshot(db_path)["sections"]["focus"][0]["item_id"] == item_id
+
+
+def test_oversized_briefing_is_projected_with_explicit_omission_counts(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "ops.sqlite"
+    init_operational_db(db_path)
+    card_count = 180
+    sections = {
+        section: [
+            {
+                "id": f"{section}-{index}",
+                "item_id": f"{section}-{index}",
+                "kind": "attention",
+                "state": "active",
+                "title": f"{section} item {index} " + ("x" * 2_000),
+                "details": "detail " + ("y" * 4_000),
+                "priority": 80,
+                "confidence": 0.5,
+                "source_type": "gmail",
+                "account_key": "gmail:test@example.com",
+                "source_key": f"thread-{index}",
+                "handled_coverage": {
+                    "gmail": {"status": "complete", "duplicate": "z" * 2_000}
+                },
+                "evidence_refs": [
+                    {
+                        "thread_id": f"thread-{index}",
+                        "source_ref": f"gmail:test@example.com:thread-{index}",
+                    }
+                ],
+                "local_evidence_route": f"/api/ops/evidence?item={index}",
+                "feedback_actions": ["confirm", "done", "incorrect", "dismiss"],
+            }
+            for index in range(card_count)
+        ]
+        for section in BRIEFING_SECTION_ORDER
+    }
+
+    snapshot = save_briefing_snapshot(
+        db_path,
+        generated_at=NOW,
+        as_of=NOW,
+        timezone_name="America/Los_Angeles",
+        policy_version="operations-v1",
+        status="complete",
+        sections=sections,
+        coverage={
+            "calendar": {"status": "complete", "fresh_at": NOW},
+            "gmail": {"status": "complete", "fresh_at": NOW},
+        },
+    )
+
+    encoded = json.dumps(
+        snapshot["sections"],
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    assert len(encoded) <= BRIEFING_SECTIONS_TARGET_BYTES
+    assert len(snapshot["sections"]["focus"]) == 5
+    assert all(snapshot["sections"][section] for section in BRIEFING_SECTION_ORDER)
+    assert snapshot["counts"]["briefing_sections_truncated"] is True
+    assert snapshot["counts"]["briefing_sections_omitted"] > 0
+    for section in BRIEFING_SECTION_ORDER:
+        projection = snapshot["counts"]["section_projection"][section]
+        assert projection["total"] == card_count
+        assert projection["included"] == len(snapshot["sections"][section])
+        assert projection["omitted"] == card_count - projection["included"]
+    assert "handled_coverage" not in snapshot["sections"]["focus"][0]
+    assert latest_briefing_snapshot(db_path)["id"] == snapshot["id"]
+
+
+def test_briefing_projection_rejects_source_bodies_before_compaction(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "ops.sqlite"
+    init_operational_db(db_path)
+    with pytest.raises(ValueError, match="cannot contain source bodies"):
+        save_briefing_snapshot(
+            db_path,
+            generated_at=NOW,
+            as_of=NOW,
+            timezone_name="UTC",
+            policy_version="operations-v1",
+            status="complete",
+            sections={"focus": [{"item_id": "item-1", "body": "secret"}]},
+            coverage={"gmail": {"status": "complete"}},
+        )
 
 
 def test_shadow_tables_reject_source_bodies_and_append_only_rows(tmp_path: Path) -> None:

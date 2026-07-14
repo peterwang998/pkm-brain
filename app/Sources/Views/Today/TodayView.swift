@@ -6,11 +6,13 @@ struct TodayView: View {
     @State private var feedbackDraft: TodayFeedbackDraft?
     @State private var meetingPreparationRequest: TodayMeetingPreparationRequest?
     @State private var reportsMissingItem = false
+    @State private var showsSuppressedAudit = false
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 header
+                shadowRunStatus
                 if appState.todayBriefing?.briefing_id == nil {
                     shadowFirstRunDisclosure
                 }
@@ -26,21 +28,6 @@ struct TodayView: View {
                     Label(message, systemImage: "info.circle")
                         .font(.callout)
                         .foregroundStyle(.secondary)
-                }
-                if let message = appState.todayShadowRunMessage {
-                    Label(
-                        message,
-                        systemImage: appState.isRunningTodayShadow
-                            ? "arrow.triangle.2.circlepath"
-                            : "checkmark.circle"
-                    )
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                }
-                if let error = appState.todayShadowRunError {
-                    Label(error, systemImage: "exclamationmark.triangle")
-                        .font(.callout)
-                        .foregroundStyle(.red)
                 }
                 if let error = appState.todayError ?? appState.lastError {
                     Text(error)
@@ -125,7 +112,7 @@ struct TodayView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Today")
                     .font(.largeTitle.weight(.semibold))
-                Text(appState.daemon.status.label)
+                Text(daemonStatusLabel)
                     .foregroundStyle(.secondary)
             }
             Spacer()
@@ -136,6 +123,53 @@ struct TodayView: View {
                     .foregroundStyle(.secondary)
                     .help(generated)
             }
+        }
+    }
+
+    private var daemonStatusLabel: String {
+        switch appState.daemon.status {
+        case .running:
+            return "Brain service ready"
+        default:
+            return appState.daemon.status.label
+        }
+    }
+
+    @ViewBuilder
+    private var shadowRunStatus: some View {
+        if appState.isRunningTodayShadow {
+            TodayShadowRunStatusCard(
+                title: "Shadow run in progress",
+                detail: appState.todayShadowRunMessage
+                    ?? "Reading Calendar and Gmail without making changes…",
+                symbol: "arrow.triangle.2.circlepath",
+                tint: .accentColor,
+                showsProgress: true
+            )
+        } else if let error = appState.todayShadowRunError {
+            TodayShadowRunStatusCard(
+                title: "Shadow run needs attention",
+                detail: error,
+                footnote: "Today was refreshed with any operational state retained before the failure.",
+                symbol: "exclamationmark.triangle.fill",
+                tint: .red
+            )
+        } else if let result = appState.todayShadowRunResult,
+                  result.displayKind == .partial {
+            TodayShadowRunStatusCard(
+                title: "Shadow run finished with partial coverage",
+                detail: appState.todayShadowRunMessage ?? result.message,
+                footnote: "Review source coverage before treating the briefing as complete.",
+                symbol: "exclamationmark.circle.fill",
+                tint: .orange
+            )
+        } else if let message = appState.todayShadowRunMessage {
+            TodayShadowRunStatusCard(
+                title: "Shadow run complete",
+                detail: message,
+                symbol: "checkmark.circle.fill",
+                tint: .green
+            )
         }
     }
 
@@ -204,7 +238,11 @@ struct TodayView: View {
                 let undisplayed = briefing.urgent_overflow.count
                     - briefing.urgent_overflow.items.count
                 if undisplayed > 0 {
-                    Text("\(undisplayed) additional urgent item(s) are disclosed but not expanded.")
+                    Text(
+                        "\(undisplayed) additional urgent "
+                            + (undisplayed == 1 ? "item is" : "items are")
+                            + " disclosed but not expanded."
+                    )
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -264,18 +302,50 @@ struct TodayView: View {
             onPrepare: beginMeetingPreparation,
             onBrainRoute: appState.openTodayBrainRoute
         )
-        TodayItemSection(
-            title: "Ignored & suppressed audit",
-            subtitle: "Why an item was withheld from focus, with reversible reason codes.",
-            symbol: "checklist.unchecked",
-            items: briefing.ignored_suppressed,
-            emptyText: "No ignored or suppressed items were recorded.",
-            feedback: briefing.feedback,
-            audit: true,
-            onFeedback: beginFeedback,
-            onPrepare: beginMeetingPreparation,
-            onBrainRoute: appState.openTodayBrainRoute
-        )
+        ignoredSuppressedSection(briefing)
+    }
+
+    @ViewBuilder
+    private func ignoredSuppressedSection(_ briefing: TodayBriefing) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if briefing.ignoredSuppressedTotal == 0 {
+                Label("Ignored & suppressed audit", systemImage: "checklist.unchecked")
+                    .font(.title2.weight(.semibold))
+                Text("No ignored or suppressed items were recorded.")
+                    .foregroundStyle(.secondary)
+            } else {
+                DisclosureGroup(isExpanded: $showsSuppressedAudit) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text(
+                            "Why these items were withheld from focus, with reversible reason codes."
+                        )
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        ForEach(briefing.ignored_suppressed) { item in
+                            itemCard(item, briefing: briefing, audit: true)
+                        }
+                        let undisplayed = briefing.ignoredSuppressedTotal
+                            - briefing.ignored_suppressed.count
+                        if undisplayed > 0 {
+                            Text(
+                                "\(undisplayed) additional audit "
+                                    + (undisplayed == 1 ? "item remains" : "items remain")
+                                    + " in the local ledger."
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.top, 8)
+                } label: {
+                    Label(
+                        "Ignored & suppressed audit · \(briefing.ignoredSuppressedTotal)",
+                        systemImage: "checklist.unchecked"
+                    )
+                    .font(.title2.weight(.semibold))
+                }
+            }
+        }
     }
 
     private func calendarSection(_ briefing: TodayBriefing) -> some View {
@@ -470,6 +540,53 @@ struct TodayView: View {
     }
 }
 
+private struct TodayShadowRunStatusCard: View {
+    let title: String
+    let detail: String
+    var footnote: String? = nil
+    let symbol: String
+    let tint: Color
+    var showsProgress = false
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            if showsProgress {
+                ProgressView()
+                    .controlSize(.small)
+                    .tint(tint)
+                    .padding(.top, 2)
+            } else {
+                Image(systemName: symbol)
+                    .foregroundStyle(tint)
+                    .padding(.top, 2)
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                    .font(.headline)
+                Text(detail)
+                    .font(.callout)
+                    .textSelection(.enabled)
+                if let footnote {
+                    Text(footnote)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(tint.opacity(0.09))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(tint.opacity(0.25), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("Today.shadowRun.status")
+    }
+}
+
 private struct TodayCoverageView: View {
     let briefing: TodayBriefing
 
@@ -520,6 +637,11 @@ private struct TodayCoverageView: View {
                     }
                 }
             }
+            Text(
+                "Shadow v1 verifies handled state within each source. It does not yet infer that an email was handled through Calendar or another channel."
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
         }
     }
 
