@@ -86,6 +86,9 @@ def resolve_unrouted_candidate_routes(
     llm_provider: LLMProvider | None = None,
     provider: str | None = None,
     min_confidence: float | None = None,
+    usage_cycle_id: str | None = None,
+    usage_run_id: str | None = None,
+    usage_stage: str | None = None,
 ) -> list[dict[str, Any]]:
     effective_min_confidence = (
         float(min_confidence)
@@ -112,6 +115,9 @@ def resolve_unrouted_candidate_routes(
         batches,
         llm_provider=llm_provider,
         provider=provider,
+        usage_cycle_id=usage_cycle_id,
+        usage_run_id=usage_run_id,
+        usage_stage=usage_stage,
     )
     for batch in batches:
         decisions = decisions_by_batch.get(batch[0], {})
@@ -146,6 +152,9 @@ def resolve_route_batches(
     *,
     llm_provider: LLMProvider | None,
     provider: str | None,
+    usage_cycle_id: str | None,
+    usage_run_id: str | None,
+    usage_stage: str | None,
 ) -> dict[int, dict[int, dict[str, Any]]]:
     def resolve(batch: list[int]) -> dict[int, dict[str, Any]]:
         decisions: dict[int, dict[str, Any]] = {}
@@ -165,6 +174,9 @@ def resolve_route_batches(
                     llm_provider=llm_provider,
                     paths=paths,
                     max_attempts=1,
+                    usage_cycle_id=usage_cycle_id,
+                    usage_run_id=usage_run_id,
+                    usage_stage=usage_stage,
                 )
             except (LLMProviderError, ValueError, TypeError):
                 continue
@@ -196,6 +208,9 @@ def resolve_route_batches(
                         llm_provider=llm_provider,
                         paths=paths,
                         max_attempts=1,
+                        usage_cycle_id=usage_cycle_id,
+                        usage_run_id=usage_run_id,
+                        usage_stage=usage_stage,
                     )
                 except (LLMProviderError, ValueError, TypeError):
                     continue

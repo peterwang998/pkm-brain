@@ -112,6 +112,34 @@ public final class BrainAPIClient: Sendable {
         )
     }
 
+    public func configureConnectorAuth(
+        _ connectorID: String,
+        clientID: String,
+        clientSecret: String?
+    ) async throws -> ConnectorPayload {
+        try await put(
+            "/api/connectors/\(percentEncodePathComponent(connectorID))/auth/config",
+            payload: ConnectorAuthConfigRequest(
+                client_id: clientID,
+                client_secret: clientSecret
+            )
+        )
+    }
+
+    public func startConnectorAuth(_ connectorID: String) async throws -> ConnectorAuthStartResponse {
+        try await post(
+            "/api/connectors/\(percentEncodePathComponent(connectorID))/auth/start",
+            payload: EmptyPayload()
+        )
+    }
+
+    public func disconnectConnectorAuth(_ connectorID: String) async throws -> ConnectorPayload {
+        try await post(
+            "/api/connectors/\(percentEncodePathComponent(connectorID))/auth/disconnect",
+            payload: EmptyPayload()
+        )
+    }
+
     public func wikiPages(query: String = "") async throws -> WikiPagesResponse {
         if query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return try await get("/api/wiki/pages")
@@ -305,6 +333,11 @@ public final class BrainAPIClient: Sendable {
 }
 
 private struct EmptyPayload: Encodable {}
+
+private struct ConnectorAuthConfigRequest: Encodable {
+    let client_id: String
+    let client_secret: String?
+}
 
 private struct EntityMergeCandidateRequest: Encodable {
     let candidate: EntityMergeCandidate

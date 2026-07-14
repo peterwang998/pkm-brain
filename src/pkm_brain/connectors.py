@@ -16,6 +16,7 @@ from .capture import (
     HyprnoteAdapter,
     OpenCodeAdapter,
 )
+from .connector_auth import auth_manifest, connector_auth_status
 from .paths import BrainPaths
 from .util import now_iso
 
@@ -55,6 +56,10 @@ class ConnectorManifest:
     default_cadence_s: int
     settings_schema: list[SettingField] = field(default_factory=list)
     permissions_note: str = ""
+    lifecycle: str = "active"
+    capture_available: bool = True
+    auth: dict[str, Any] | None = None
+    activation_note: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -66,6 +71,10 @@ class ConnectorManifest:
             "default_cadence_s": self.default_cadence_s,
             "settings_schema": [field.as_dict() for field in self.settings_schema],
             "permissions_note": self.permissions_note,
+            "lifecycle": self.lifecycle,
+            "capture_available": self.capture_available,
+            "auth": dict(self.auth) if self.auth is not None else None,
+            "activation_note": self.activation_note,
         }
 
 
@@ -235,6 +244,9 @@ class FilesConnector:
         default_enabled=True,
         default_cadence_s=600,
         permissions_note="Reads files already placed in this brain's inbox/documents folder.",
+        lifecycle="passive",
+        capture_available=False,
+        activation_note="Files are ingested after they are placed in the inbox; there is no external source to poll.",
     )
 
     def preflight(self, ctx: ConnectorContext) -> PreflightReport:
@@ -351,9 +363,72 @@ def hyprnote_connector() -> Connector:
                 )
             ],
             permissions_note="Reads meeting session folders under Hyprnote application support.",
+            activation_note="Opt-in because it scans private meeting data outside the Brain home.",
         ),
         lambda ctx: HyprnoteAdapter(ctx.path_setting("root", "~/Library/Application Support/hyprnote")),
         preflight_path_key="root",
+    )
+
+
+class AuthOnlyConnector:
+    def __init__(self, manifest: ConnectorManifest) -> None:
+        self.manifest = manifest
+
+    def preflight(self, ctx: ConnectorContext) -> PreflightReport:
+        return PreflightReport(
+            ok=True,
+            warnings=["Authentication is available; capture is not implemented."],
+        )
+
+    def discover(self, ctx: ConnectorContext) -> list[AgentSessionCapture]:
+        return []
+
+    def capture(
+        self,
+        ctx: ConnectorContext,
+        candidates: list[AgentSessionCapture],
+        *,
+        dry_run: bool = False,
+        export_outbox: bool = False,
+    ) -> CaptureResult:
+        return CaptureResult(
+            warnings=["Authentication is available; capture is not implemented."],
+        )
+
+
+def gmail_connector() -> Connector:
+    return AuthOnlyConnector(
+        ConnectorManifest(
+            id="gmail",
+            display_name="Gmail",
+            description="Authorize a Google account for a future email evidence connector.",
+            source_type="gmail_message",
+            default_enabled=False,
+            default_cadence_s=900,
+            permissions_note="Identity access only; no Gmail messages or metadata are requested.",
+            lifecycle="auth_only",
+            capture_available=False,
+            auth=auth_manifest("gmail"),
+            activation_note="Capture remains unavailable until email preprocessing and privacy policy are approved.",
+        )
+    )
+
+
+def slack_connector() -> Connector:
+    return AuthOnlyConnector(
+        ConnectorManifest(
+            id="slack",
+            display_name="Slack",
+            description="Authorize a Slack account for a future conversation connector.",
+            source_type="slack_message",
+            default_enabled=False,
+            default_cadence_s=900,
+            permissions_note="Identity access only; no workspace messages or channel history are requested.",
+            lifecycle="auth_only",
+            capture_available=False,
+            auth=auth_manifest("slack"),
+            activation_note="Capture remains unavailable until Slack preprocessing and privacy policy are approved.",
+        )
     )
 
 
@@ -363,6 +438,8 @@ BUILTIN_CONNECTORS: dict[str, Callable[[], Connector]] = {
     "opencode": opencode_connector,
     "hyprnote": hyprnote_connector,
     "files": FilesConnector,
+    "gmail": gmail_connector,
+    "slack": slack_connector,
 }
 
 
@@ -435,7 +512,7 @@ def list_connectors(paths: BrainPaths) -> dict[str, Any]:
     config = load_connector_config(paths)
     registry = connector_registry()
     items = [
-        connector_payload(connector, config["connectors"][connector_id])
+        connector_payload(paths, connector, config["connectors"][connector_id])
         for connector_id, connector in sorted(registry.items())
     ]
     return {"connectors": items, "count": len(items)}
@@ -445,16 +522,18 @@ def get_connector(paths: BrainPaths, connector_id: str) -> dict[str, Any]:
     config = load_connector_config(paths)
     registry = connector_registry()
     connector = require_connector(registry, connector_id)
-    return connector_payload(connector, config["connectors"][connector_id])
+    return connector_payload(paths, connector, config["connectors"][connector_id])
 
 
 def set_connector_enabled(paths: BrainPaths, connector_id: str, enabled: bool) -> dict[str, Any]:
     config = load_connector_config(paths)
     registry = connector_registry()
     connector = require_connector(registry, connector_id)
+    if enabled and not connector.manifest.capture_available:
+        raise ValueError(f"{connector.manifest.display_name} capture is not available")
     config["connectors"][connector_id]["enabled"] = enabled
     save_connector_config(paths, config)
-    return connector_payload(connector, config["connectors"][connector_id])
+    return connector_payload(paths, connector, config["connectors"][connector_id])
 
 
 def update_connector_settings(paths: BrainPaths, connector_id: str, settings: dict[str, Any]) -> dict[str, Any]:
@@ -465,16 +544,21 @@ def update_connector_settings(paths: BrainPaths, connector_id: str, settings: di
     current.update(validate_settings(connector.manifest, settings))
     config["connectors"][connector_id]["settings"] = current
     save_connector_config(paths, config)
-    return connector_payload(connector, config["connectors"][connector_id])
+    return connector_payload(paths, connector, config["connectors"][connector_id])
 
 
-def connector_payload(connector: Connector, state: dict[str, Any]) -> dict[str, Any]:
+def connector_payload(
+    paths: BrainPaths,
+    connector: Connector,
+    state: dict[str, Any],
+) -> dict[str, Any]:
     return {
         "manifest": connector.manifest.as_dict(),
         "state": {
             "enabled": bool(state.get("enabled", connector.manifest.default_enabled)),
             "cadence_s": int(state.get("cadence_s", connector.manifest.default_cadence_s)),
             "settings": dict(state.get("settings") or {}),
+            "auth": connector_auth_status(paths, connector.manifest.id),
         },
         "health": dict(state.get("health") or default_health()),
     }
@@ -556,6 +640,9 @@ def run_connector_capture(
     for connector_id in selected_ids:
         connector = registry[connector_id]
         state = config["connectors"][connector_id]
+        if not connector.manifest.capture_available:
+            batch.add_run(skipped_run(connector_id, "capture not implemented"))
+            continue
         if respect_enabled and not bool(state.get("enabled", connector.manifest.default_enabled)):
             run = skipped_run(connector_id, "disabled")
             batch.add_run(run)

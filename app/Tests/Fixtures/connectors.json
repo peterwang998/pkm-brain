@@ -18,14 +18,19 @@
             "choices": []
           }
         ],
-        "permissions_note": ""
+        "permissions_note": "",
+        "lifecycle": "active",
+        "capture_available": true,
+        "auth": null,
+        "activation_note": ""
       },
       "state": {
         "enabled": true,
         "cadence_s": 600,
         "settings": {
           "sessions_dir": "~/.codex/sessions"
-        }
+        },
+        "auth": null
       },
       "health": {
         "status": "failing(3)",
@@ -36,7 +41,60 @@
           "status": "failed"
         }
       }
+    },
+    {
+      "manifest": {
+        "id": "gmail",
+        "display_name": "Gmail",
+        "description": "Authorize a Google account for a future email evidence connector.",
+        "source_type": "gmail_message",
+        "default_enabled": false,
+        "default_cadence_s": 900,
+        "settings_schema": [],
+        "permissions_note": "Identity access only.",
+        "lifecycle": "auth_only",
+        "capture_available": false,
+        "auth": {
+          "kind": "oauth2",
+          "provider": "gmail",
+          "phase": "identity_only",
+          "requested_scopes": ["openid", "email", "profile"],
+          "client_secret_required": false,
+          "redirect_uri": "http://127.0.0.1:53682/oauth/callback/gmail",
+          "setup_url": "https://console.cloud.google.com/apis/credentials"
+        },
+        "activation_note": "Capture is not implemented."
+      },
+      "state": {
+        "enabled": false,
+        "cadence_s": 900,
+        "settings": {},
+        "auth": {
+          "kind": "oauth2",
+          "provider": "gmail",
+          "phase": "identity_only",
+          "status": "ready",
+          "client_id": "desktop-client-id",
+          "client_secret_configured": true,
+          "connected_at": null,
+          "account_label": null,
+          "granted_scopes": [],
+          "requested_scopes": ["openid", "email", "profile"],
+          "redirect_uri": "http://127.0.0.1:53682/oauth/callback/gmail",
+          "setup_url": "https://console.cloud.google.com/apis/credentials",
+          "can_authorize": true,
+          "can_disconnect": false,
+          "last_error": null
+        }
+      },
+      "health": {
+        "status": "unknown",
+        "consecutive_failures": 0,
+        "last_run_at": null,
+        "last_error": null,
+        "last_result": null
+      }
     }
   ],
-  "count": 1
+  "count": 2
 }

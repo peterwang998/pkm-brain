@@ -1,7 +1,7 @@
 # App And Operations
 
 **Status:** canonical living feature spec; native app is primary and browser UI is an off-by-default fallback
-**Last verified:** 2026-07-13 against release `0.1.4` code snapshot `f89c70d`
+**Last verified:** 2026-07-13 against installed release `0.1.5` and the current working tree
 **Owns:** daemon, scheduler, connector operations, native/browser UI, settings, provisioning, packaging, migration, and operational retention
 
 ## Product Shape
@@ -56,14 +56,17 @@ Each connector exposes:
 
 - stable ID and display name;
 - capability/source type;
+- lifecycle (`active`, `passive`, or `auth_only`) and capture availability;
 - enabled state and cadence;
 - last run/status/error;
 - consecutive failures;
 - config schema suitable for a native form.
 
-One connector failure does not abort other connectors or the scheduler tick. Connectors only write inbox artifacts and capture state.
+One connector failure does not abort other connectors or the scheduler tick. Connectors only write inbox artifacts and capture state. An `auth_only` connector cannot be enabled, scheduled, or manually run.
 
-The Python registry exists. Full native connector configuration cards remain incomplete.
+Gmail and Slack currently stop at identity-only OAuth/OpenID authorization. Client secrets and tokens are stored in macOS Keychain under a Brain-home-scoped account; only non-secret client/status metadata is stored under `config/local/connector-auth.yaml`. Authorization uses state validation, Google PKCE, Slack nonce validation, and a fixed loopback callback at `127.0.0.1:53682`. API responses never return secrets or tokens.
+
+Native connector cards expose lifecycle and source-specific status. OAuth setup provides provider-console navigation, redirect URL copy, client credential save, browser authorization with polling, and local disconnect. Full native forms for path/cadence settings remain incomplete.
 
 ## Native Information Architecture
 
@@ -204,7 +207,7 @@ Target Ops consolidates:
 - logs;
 - runtime versions, diagnostics, and prune dry-run.
 
-Current native Ops has segmented Scheduler, Runs, Connectors, and Storage views. It supports job run-now, pause/resume, automation/ingestion history, connector enable/disable/run, active/deferred review counts, and managed/runtime/backup storage inventory through `GET /api/ops/storage`. Action-ledger revert, policy/audit/contracts, index doctor, sync, and logs still require native sections.
+Current native Ops has segmented Scheduler, Runs, Connectors, and Storage views. It supports job run-now, pause/resume, automation/ingestion history, connector enable/disable/run, auth-only Gmail/Slack account setup, active/deferred review counts, and managed/runtime/backup storage inventory through `GET /api/ops/storage`. Action-ledger revert, policy/audit/contracts, index doctor, sync, and logs still require native sections.
 
 Provider usage accounting is available operationally before the native Logs section: request events append to `<brain-home>/logs/llm-usage.log`, nightly/CoS summaries include cycle usage, and `brain llm usage` reports timestamped per-cycle and per-role totals. The report distinguishes extractor, evaluator (internal critic), auditor, and any additional instrumented role, including cached versus uncached input and requests whose provider did not report tokens.
 
@@ -230,7 +233,7 @@ The autonomy contract is defined in [Curation And Review](curation-and-review.md
 
 Open:
 
-- connector forms;
+- path/cadence connector forms beyond the implemented OAuth setup;
 - embedding model/index manager;
 - agent/MCP registration status and repair;
 - sync role/peer roster;

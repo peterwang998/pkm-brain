@@ -963,7 +963,12 @@ def propose_policy_gated_candidates(
     critic_review: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     candidates = resolve_unrouted_candidate_routes(
-        paths, candidates, load_extraction_route_targets(paths)
+        paths,
+        candidates,
+        load_extraction_route_targets(paths),
+        usage_cycle_id=run_id,
+        usage_run_id=run_id,
+        usage_stage="route_resolution",
     )
     actions: list[dict[str, Any]] = []
     pending_decisions: list[tuple[int, str]] = []

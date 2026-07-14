@@ -85,11 +85,16 @@ struct PKMBrainKitTests {
     func connectorsFixtureDecodes() throws {
         let connectors: ConnectorsResponse = try decodeFixture("connectors")
 
-        #expect(connectors.count == 1)
+        #expect(connectors.count == 2)
         #expect(connectors.connectors.first?.manifest.id == "codex")
         #expect(connectors.connectors.first?.state.settings["sessions_dir"]?.stringValue == "~/.codex/sessions")
         #expect(connectors.connectors.first?.health.consecutive_failures == 3)
         #expect(connectors.connectors.first?.health.last_error == "sessions directory unavailable")
+        let gmail = connectors.connectors.first(where: { $0.manifest.id == "gmail" })
+        #expect(gmail?.manifest.lifecycleStatus == "auth_only")
+        #expect(gmail?.manifest.canCapture == false)
+        #expect(gmail?.state.auth?.status == "ready")
+        #expect(gmail?.state.auth?.client_secret_configured == true)
     }
 
     @Test("wiki fixtures decode")

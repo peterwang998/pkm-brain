@@ -1,7 +1,7 @@
 # Capture And Knowledge
 
 **Status:** canonical living feature spec
-**Last verified:** 2026-07-13 against public release `0.1.3` code snapshot `10cf00d`
+**Last verified:** 2026-07-13 against installed release `0.1.5` and the current working tree
 **Owns:** connectors, ingest, source normalization, extraction, facts, entities, routing, gardener topology, and wiki projection
 
 ## Feature Boundary
@@ -18,7 +18,7 @@ Capture adapters and model roles never bypass ingest or write knowledge tables d
 
 ## Capture Contract
 
-Current connector adapters wrap Codex, Claude, OpenCode, Hyprnote, and filesystem capture. A connector:
+Current capture adapters wrap Codex, Claude, OpenCode, Hyprnote, and filesystem input. Gmail and Slack are registered as `auth_only` connector shells: they expose account authorization but have no discovery, capture, scheduling, or ingestion behavior. A capture-capable connector:
 
 - writes normalized Markdown or text under its `inbox/<connector_id>/` namespace;
 - advances `capture_sources` state only after a successful unit;
@@ -27,11 +27,19 @@ Current connector adapters wrap Codex, Claude, OpenCode, Hyprnote, and filesyste
 
 Agent-session snapshots are latest-state sources. Origin and logical source path prevent collisions across machines. The connector registry is extensible, but loading third-party code from outside the package is not implemented.
 
+Connector lifecycle is explicit:
+
+- `active`: scheduled or manually runnable capture;
+- `passive`: an inbox landing surface such as Files, with no external source to poll;
+- `auth_only`: account authorization exists, but capture cannot be enabled or run.
+
 Codex sessions whose title or user message begins with the pkm-brain provider-wrapper prompt are self-generated workflow traffic and are excluded during capture. Historical generated reference pages may predate this guard; they remain inspectable source artifacts but are never valid fact-routing destinations or Queue route candidates.
 
 Hyprnote capture is speaker-aware. Transcript words from independently stored channels are ordered by absolute transcript start plus word time, grouped into bounded turns, and rendered with stable `Speaker N` labels. Known calendar participants are retained as context but never treated as a speaker-name mapping by themselves. Provider speaker hints may separate multiple voices on one channel. Legacy recordings whose channels reuse the same synthetic word clock cannot be interleaved safely; those sources carry an explicit transcript note and remain grouped by speaker track instead of presenting invented turn order. The Hyprnote renderer version participates in capture state so a rendering-contract change recaptures an otherwise unchanged source.
 
-Email capture is not implemented; its proposed contract is isolated under [Future Email Adapter](#future-email-adapter).
+Hyprnote remains opt-in because it scans private meeting data under the application's support directory. Files does not supersede it: Files only represents artifacts already placed under `inbox/documents/`, while the Hyprnote adapter creates normalized meeting artifacts from Hyprnote session folders. Previously captured Hyprnote artifacts remain ingestible when scheduled Hyprnote capture is disabled.
+
+Email capture is not implemented; its proposed contract is isolated under [Future Gmail And Email Adapter](#future-gmail-and-email-adapter).
 
 ## Ingest Contract
 
@@ -234,13 +242,14 @@ The verified local gardener model is `gpt-5.6-luna`. Page/entity candidate volum
 - Typed relation edges are intentionally absent; natural-language facts plus entity links remain the knowledge graph.
 - Native Wiki rendering/provenance interaction is incomplete; see [App And Operations](app-and-operations.md).
 
-## Future Email Adapter
+## Future Gmail And Email Adapter
 
-Status: planned and paused. Only telemetry-retention prerequisites exist.
+Status: authentication shell implemented; capture planned and paused.
 
-The next approved design must be revised before implementation, but its safety constraints remain:
+An identity-only Gmail OAuth shell requests `openid`, `email`, and `profile`, stores secrets and tokens in macOS Keychain, and cannot read Gmail data. The next approved preprocessing design must revise the capture plan before Gmail scopes or ingestion are added. Its safety constraints remain:
 
-- local Maildir/mbox input; no OAuth or mail sender in the core;
+- no Gmail message scopes, mail sender, or full-corpus API capture in the auth-only phase;
+- local Maildir/mbox remains an eligible evidence input alongside a future Gmail API adapter;
 - one snapshot-replaced document per thread;
 - deterministic bulk-versus-human classification;
 - redaction before writing `inbox/` or `raw/`;
@@ -249,6 +258,14 @@ The next approved design must be revised before implementation, but its safety c
 - ephemeral logistics dropped at extraction;
 - email mentions may link to known entities but may not create entities by default;
 - strict per-run extraction and residue caps.
+
+An isolated 2026-07-13 experiment used a separate existing Google Workspace credential, not the Brain connector grant, to normalize and index 90 days of Gmail in a private test Brain. It measured 6,650 threads, 21,458 chunks, and 319.5 MB of allocated Brain growth. Deterministic bulk/transactional filtering admitted 318 threads (4.8%) to fact eligibility. A production-policy three-day sample averaged 551,224 total tokens and 172,976 uncached input tokens per selected day; scaling observed per-document cost to the 90-day mean eligible volume projects about 448,792 total tokens/day, while an all-mail full-fact-pipeline counterfactual is about 9.43 million tokens/day. The measurement and limitations are recorded in [Gmail Indexing Benchmark](../audits/gmail-indexing-benchmark-2026-07-13.md).
+
+These results narrow the future contract but do not authorize capture. A production adapter must classify before extraction, default attachment payloads out, remove quoted-history duplication, use replaceable thread snapshots, carry explicit daily document/token budgets, and leave bulk/transactional mail retrieval-only unless a narrower policy admits it.
+
+## Future Slack Adapter
+
+An identity-only Slack OpenID shell requests `openid`, `profile`, and `email`. It stores credentials in macOS Keychain and cannot request workspace-message scopes, enumerate channels, discover messages, or write inbox artifacts. Message and thread normalization, channel/DM privacy boundaries, retention, edits/deletes, reactions, attachments, bot filtering, and volume controls require an approved preprocessing spec before capture is implemented.
 
 ## Acceptance
 

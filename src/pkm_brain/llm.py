@@ -897,6 +897,9 @@ def complete_json(
     llm_provider: LLMProvider | None = None,
     paths: "BrainPaths | None" = None,
     max_attempts: int = 2,
+    usage_cycle_id: str | None = None,
+    usage_run_id: str | None = None,
+    usage_stage: str | None = None,
 ) -> dict[str, Any]:
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1")
@@ -907,7 +910,14 @@ def complete_json(
             from .paths import BrainPaths
 
             paths = BrainPaths.from_value(None)
-        active_provider = get_cos_role_provider(paths, role, provider=provider)
+        active_provider = get_cos_role_provider(
+            paths,
+            role,
+            provider=provider,
+            usage_cycle_id=usage_cycle_id,
+            usage_run_id=usage_run_id,
+            usage_stage=usage_stage,
+        )
         if active_provider is None:
             raise LLMConfigurationError(f"No CoS LLM provider configured for role: {role}")
     else:

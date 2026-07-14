@@ -43,11 +43,46 @@ final class PKMBrainUITests: XCTestCase {
                 app.typeKey(.return, modifierFlags: [])
                 XCTAssertTrue(app.windows.firstMatch.exists)
             }
+            if destination == "Ops" {
+                try captureConnectorAuthentication(in: app)
+            }
             let attachment = XCTAttachment(screenshot: app.screenshot())
             attachment.name = "destination-\(destination.lowercased())"
             attachment.lifetime = .keepAlways
             add(attachment)
         }
+    }
+
+    @MainActor
+    private func captureConnectorAuthentication(in app: XCUIApplication) throws {
+        let picker = app.radioGroups["ops-section-picker"]
+        XCTAssertTrue(picker.waitForExistence(timeout: 10), "Missing Ops section picker")
+        let connectorsSegment = picker.radioButtons["Connectors"]
+        XCTAssertTrue(connectorsSegment.waitForExistence(timeout: 10), "Missing Connectors segment")
+        connectorsSegment.click()
+
+        XCTAssertTrue(app.staticTexts["Gmail"].waitForExistence(timeout: 10), "Missing Gmail connector")
+        XCTAssertTrue(app.staticTexts["Slack"].exists, "Missing Slack connector")
+        let connectorsAttachment = XCTAttachment(screenshot: app.screenshot())
+        connectorsAttachment.name = "ops-connectors"
+        connectorsAttachment.lifetime = .keepAlways
+        add(connectorsAttachment)
+
+        let setup = app.buttons["connector-auth-gmail"]
+        XCTAssertTrue(setup.waitForExistence(timeout: 10), "Missing Gmail setup action")
+        setup.click()
+        XCTAssertTrue(
+            app.staticTexts["Connector Authentication"].waitForExistence(timeout: 10),
+            "Missing Gmail authentication sheet"
+        )
+        XCTAssertTrue(app.staticTexts["Identity only"].exists)
+        XCTAssertTrue(app.staticTexts["http://127.0.0.1:53682/oauth/callback/gmail"].exists)
+
+        let authAttachment = XCTAttachment(screenshot: app.screenshot())
+        authAttachment.name = "ops-gmail-auth"
+        authAttachment.lifetime = .keepAlways
+        add(authAttachment)
+        app.buttons["Done"].click()
     }
 
 }

@@ -730,6 +730,23 @@ public struct ConnectorManifestSummary: Codable, Equatable, Sendable {
     public let default_cadence_s: Int
     public let settings_schema: [ConnectorSettingField]
     public let permissions_note: String
+    public let lifecycle: String?
+    public let capture_available: Bool?
+    public let auth: ConnectorAuthManifest?
+    public let activation_note: String?
+
+    public var canCapture: Bool { capture_available ?? true }
+    public var lifecycleStatus: String { lifecycle ?? "active" }
+}
+
+public struct ConnectorAuthManifest: Codable, Equatable, Sendable {
+    public let kind: String
+    public let provider: String
+    public let phase: String
+    public let requested_scopes: [String]
+    public let client_secret_required: Bool
+    public let redirect_uri: String
+    public let setup_url: String
 }
 
 public struct ConnectorSettingField: Codable, Equatable, Identifiable, Sendable {
@@ -747,6 +764,32 @@ public struct ConnectorStateSummary: Codable, Equatable, Sendable {
     public let enabled: Bool
     public let cadence_s: Int
     public let settings: [String: JSONValue]
+    public let auth: ConnectorAuthState?
+}
+
+public struct ConnectorAuthState: Codable, Equatable, Sendable {
+    public let kind: String
+    public let provider: String
+    public let phase: String
+    public let status: String
+    public let client_id: String?
+    public let client_secret_configured: Bool
+    public let connected_at: String?
+    public let account_label: String?
+    public let granted_scopes: [String]
+    public let requested_scopes: [String]
+    public let redirect_uri: String
+    public let setup_url: String
+    public let can_authorize: Bool
+    public let can_disconnect: Bool
+    public let last_error: String?
+}
+
+public struct ConnectorAuthStartResponse: Codable, Equatable, Sendable {
+    public let authorization_url: String
+    public let redirect_uri: String
+    public let expires_at: String
+    public let connector: ConnectorPayload
 }
 
 public struct ConnectorHealth: Codable, Equatable, Sendable {

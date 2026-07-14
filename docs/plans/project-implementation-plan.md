@@ -1,7 +1,7 @@
 # Project Improvement Implementation Plan
 
-**Status:** execution in progress; R1-R4 complete, R5/R6 partially complete in release `0.1.4`
-**Last verified:** 2026-07-13 against release `0.1.4` code snapshot `f89c70d`
+**Status:** execution in progress; R1-R4 complete, R5/R6 partially complete in release `0.1.5`
+**Last verified:** 2026-07-13 against installed release `0.1.5` and the current working tree
 **Inputs:** [Project Audit](../audits/project-audit-2026-07-10.md) and the six [canonical feature specs](../README.md)
 
 ## Objective
@@ -30,6 +30,12 @@ Implemented in `0.1.1`:
 - structured Entity merge proposal and Ask debug/deep-link workflows;
 - Scheduler/Runs/Connectors/Storage Ops sections and rollback-safe Brain-home switching;
 - no-growth ratchets for the six largest modules plus removal of three confirmed orphans.
+
+Implemented in `0.1.5`:
+
+- explicit active/passive/auth-only connector lifecycle;
+- identity-only Gmail and Slack authorization shells with macOS Keychain storage and native setup surfaces;
+- hard capture boundary: Gmail and Slack cannot be enabled, scheduled, run, or granted message scopes before their preprocessing specs are approved.
 
 Verified rollout results, 2026-07-11:
 
@@ -199,6 +205,7 @@ Implementation checkpoint, 2026-07-13:
 - verified: policy v17 rechecked five remaining duplicate-page proposals, gardener-rejected two false duplicates, critic-routed three L2 actions, applied two and rejected one, left zero open topology proposals, and completed with zero failures;
 - verified: the first instrumented topology pass recorded 11 Luna-medium requests and 138,773 total tokens (98,560 cached input): evaluator 75,888 across six requests and gardener 62,885 across five requests;
 - verified: `0.1.4` gates pass 500 Python tests, 17 Swift tests, the module-growth ratchet, full Ruff, release build/install, and healthy schema-21 runtime `0.1.4-762bf645-828bfe17`;
+- verified: `0.1.5` gates pass 504 Python tests, 17 Swift tests, full Ruff, connector-specific XCUITest screenshots, signed build/install, and healthy schema-21 runtime `0.1.5-762bf645-50bc9fae`; the live payload keeps Gmail and Slack disabled/auth-only and Hyprnote disabled/opt-in;
 - remaining in R1: maintenance audit/report, historical comparison migration, automated overlap/state tests, and the full signed keyboard/light/dark/minimum-width acceptance matrix.
 
 ### TRUST-1 - One Queue Summary Contract
@@ -757,14 +764,23 @@ Only after topology identity/fencing:
 
 ### EMAIL-1 - Evidence-Only Email
 
-Blocked until the owner revises/approves the email spec. Then:
+Identity-only Gmail authorization is complete. Capture remains blocked until the owner revises/approves the email preprocessing and privacy spec. Then:
 
-1. decide Maildir/mbox source and privacy/redaction corpus;
-2. capture one snapshot-replaced document per thread;
-3. retrieval fixtures/negative controls;
-4. only later consider signal-gated extraction, entity link-only, ephemeral drops, and residue caps.
+1. approve Gmail API read-only versus Maildir/mbox inputs, scopes, redaction, retention, and deletion semantics;
+2. capture one snapshot-replaced document per thread with Gmail internal source dates;
+3. exclude attachment payloads and quoted reply duplication by default;
+4. label and test human/bulk/transactional classification plus retrieval negative controls;
+5. enforce separate index and extraction budgets with deferred overflow;
+6. admit likely human/evidence threads only, link known entities by default, and cap residue;
+7. reduce critic requests per clean candidate before a production rollout.
 
-No OAuth/sending/full-corpus extraction in the first release.
+The current OAuth grant is identity-only. No Gmail message scope, sending, or full-corpus extraction is authorized in this phase.
+
+Verified isolated benchmark, 2026-07-13: 90 days produced 6,650 normalized threads, 21,458 chunks, and 319.5 MB of allocated Brain index growth. Preprocessing reduced fact eligibility to 318 threads (4.8%). Three representative weekdays processed 13 eligible thread documents, generated 35 candidates and 21 applied facts, and consumed 1,653,671 combined extractor/resolver/evaluator tokens. The projected mean at observed eligible volume is about 448,792 total tokens/day; applying the full fact pipeline to every thread is rejected at an approximately 9.43-million-token/day counterfactual. See [Gmail Indexing Benchmark](../audits/gmail-indexing-benchmark-2026-07-13.md).
+
+### SLACK-1 - Evidence-Only Conversations
+
+Identity-only Slack OpenID authorization is complete. Before requesting workspace scopes, specify thread/channel/DM normalization, edits and deletions, bot and reaction handling, attachment boundaries, retention, privacy, and per-run volume limits. The auth-only connector cannot enumerate or capture workspace content.
 
 ### RETRIEVAL-1..N - Isolated Experiments
 

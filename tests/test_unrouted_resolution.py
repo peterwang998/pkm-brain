@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from pkm_brain import unrouted_resolution
 from pkm_brain.paths import BrainPaths
 from pkm_brain.service import BrainService
 from pkm_brain.unrouted_resolution import (
@@ -213,6 +214,46 @@ def test_route_resolver_routes_existing_and_creates_missing_canonical_page(
     assert all(not candidate_requires_route_resolution(item) for item in routed)
     assert "Facts from one source document" in provider.prompts[0]
     assert "needs_human" in provider.prompts[0]
+
+
+def test_route_resolver_propagates_usage_context(
+    monkeypatch, tmp_path: Path
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    captured: list[dict[str, object]] = []
+
+    def fake_complete_json(prompt: str, **kwargs: object) -> dict[str, object]:
+        captured.append(kwargs)
+        return {
+            "decisions": [
+                {
+                    "candidate_index": 0,
+                    "decision": "route_existing",
+                    "page_hint": "concepts/valid.md",
+                    "confidence": 0.95,
+                    "rationale": "Valid route.",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(unrouted_resolution, "complete_json", fake_complete_json)
+
+    routed = resolve_unrouted_candidate_routes(
+        paths,
+        [unresolved_candidate("A routed fact.")],
+        {"concepts/valid.md": {"canonical_entity": "Valid"}},
+        llm_provider=FakeRouteResolver([]),
+        usage_cycle_id="benchmark-run",
+        usage_run_id="benchmark-run",
+        usage_stage="route_resolution",
+    )
+
+    assert routed[0]["page_hint"] == "concepts/valid.md"
+    assert len(captured) == 1
+    assert captured[0]["usage_cycle_id"] == "benchmark-run"
+    assert captured[0]["usage_run_id"] == "benchmark-run"
+    assert captured[0]["usage_stage"] == "route_resolution"
 
 
 def test_route_resolver_keeps_low_confidence_or_invalid_choices_for_human_review(

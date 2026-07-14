@@ -1,14 +1,14 @@
 # PKM Brain Architecture Code Guide
 
 **Status:** current code-navigation guide
-**Last verified:** 2026-07-11 against public release `0.1.1` code snapshot `b3ba211`
+**Last verified:** 2026-07-13 against installed release `0.1.5` and the current working tree
 
 This guide answers where behavior lives. Feature requirements and open work belong in [the specs index](README.md), not here.
 
 ## System Map
 
 ```text
-capture.py / connectors.py
+capture.py / connectors.py / connector_auth.py
   -> service.py ingest
   -> db.py + migrations.py
   -> chunking.py + indexes.py + embeddings.py
@@ -29,6 +29,7 @@ sync_* modules move source files, never live DB/index state.
 |---|---|---|
 | runtime paths | `BrainPaths` rooted at one home | `paths.py` |
 | capture state | inbox files and `capture_sources` | `capture.py`, `connectors.py` |
+| connector auth | local metadata plus macOS Keychain secrets | `connector_auth.py`, `connector_api.py` |
 | source evidence | raw artifacts, `documents`, `chunks` | `service.py`, `chunking.py` |
 | lexical/vector index | FTS5 and stamped LanceDB chunks | `indexes.py`, `embeddings.py` |
 | facts | `facts` plus exact source spans/quotes | `extraction.py`, `wiki_facts.py` |
@@ -55,6 +56,8 @@ Do not create ad hoc paths or SQLite connections in UI/Swift code.
 ### Capture And Ingest
 
 - `connectors.py`: connector registry, manifests, config, health.
+- `connector_auth.py`: OAuth provider metadata, state/PKCE/nonce flow, loopback callback, and Keychain storage.
+- `connector_api.py`: bounded connector command routing for the JSON API.
 - `capture.py`: built-in agent/note capture adapters and snapshot export.
 - `service.py`: workspace initialization, source detection, ingest, chunk/index writes, quarantine, status.
 - `chunking.py`: deterministic chunk boundaries and evidence text preparation.

@@ -19,13 +19,8 @@ import yaml
 from .audit import audit_memories
 from .automation import index_status
 from .contracts import active_page_contracts, generate_initial_contracts
-from .connectors import (
-    get_connector,
-    list_connectors,
-    run_connector_capture,
-    set_connector_enabled,
-    update_connector_settings,
-)
+from .connector_api import dispatch_connector_post, dispatch_connector_put
+from .connectors import get_connector, list_connectors
 from .cos_actions import (
     action_candidate_key,
     audit_action_reviewability,
@@ -281,26 +276,13 @@ class BrainUIHandler(BaseHTTPRequestHandler):
                         enabled=parts[3] == "enable",
                     )
                 )
-            elif (
-                len(parts) == 3
-                and parts[0] == "connectors"
-                and parts[2] in {"enable", "disable"}
-            ):
+            elif parts and parts[0] == "connectors":
                 self.write_json(
-                    set_connector_enabled(
+                    dispatch_connector_post(
                         self.server.paths,
-                        parts[1],
-                        enabled=parts[2] == "enable",
+                        parts,
+                        self.read_json_body(),
                     )
-                )
-            elif len(parts) == 3 and parts[0] == "connectors" and parts[2] == "run":
-                self.write_json(
-                    run_connector_capture(
-                        self.server.paths,
-                        connector_ids=[parts[1]],
-                        respect_enabled=False,
-                        respect_cadence=False,
-                    ).as_dict()
                 )
             elif parts == ["retrieve"]:
                 payload = self.read_json_body()
@@ -387,15 +369,13 @@ class BrainUIHandler(BaseHTTPRequestHandler):
     def dispatch_put(self, path: str) -> None:
         try:
             parts = [part for part in path.removeprefix("/api/").split("/") if part]
-            if len(parts) == 3 and parts[0] == "connectors" and parts[2] == "settings":
-                payload = self.read_json_body()
-                settings = (
-                    payload.get("settings")
-                    if isinstance(payload.get("settings"), dict)
-                    else payload
-                )
+            if parts and parts[0] == "connectors":
                 self.write_json(
-                    update_connector_settings(self.server.paths, parts[1], settings)
+                    dispatch_connector_put(
+                        self.server.paths,
+                        parts,
+                        self.read_json_body(),
+                    )
                 )
                 return
             if parts == ["settings", "curation"]:

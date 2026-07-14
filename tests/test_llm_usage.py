@@ -132,3 +132,40 @@ def test_codex_provider_logs_usage_by_run_and_evaluator_alias(
     assert cycle["request_count"] == 1
     assert cycle["roles"][0]["role"] == "evaluator"
     assert cycle["roles"][0]["source_roles"] == ["critic"]
+
+
+def test_complete_json_passes_usage_context_to_role_provider(
+    monkeypatch, tmp_path: Path
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    captured: dict[str, object] = {}
+
+    class Provider:
+        def complete(self, prompt: str) -> str:
+            return '{"decision":"route_existing"}'
+
+    def fake_get_role_provider(
+        supplied_paths: BrainPaths,
+        role: str,
+        **kwargs: object,
+    ) -> Provider:
+        captured.update({"paths": supplied_paths, "role": role, **kwargs})
+        return Provider()
+
+    monkeypatch.setattr(llm, "get_cos_role_provider", fake_get_role_provider)
+
+    result = llm.complete_json(
+        "Resolve this route.",
+        role="resolver",
+        paths=paths,
+        usage_cycle_id="benchmark-run",
+        usage_run_id="benchmark-run",
+        usage_stage="route_resolution",
+    )
+
+    assert result == {"decision": "route_existing"}
+    assert captured["paths"] == paths
+    assert captured["role"] == "resolver"
+    assert captured["usage_cycle_id"] == "benchmark-run"
+    assert captured["usage_run_id"] == "benchmark-run"
+    assert captured["usage_stage"] == "route_resolution"

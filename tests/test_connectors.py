@@ -1,16 +1,28 @@
 from __future__ import annotations
 
 import http.client
+import base64
 import json
 import sqlite3
 import threading
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
+from urllib.parse import parse_qs, urlparse
 
+import pytest
 import yaml
 
 from pkm_brain.capture import AgentLogCapture
+from pkm_brain.connector_auth import (
+    MemoryCredentialStore,
+    OAuthCallbackBroker,
+    begin_connector_authorization,
+    configure_connector_auth,
+    connector_auth_status,
+    disconnect_connector_auth,
+)
 from pkm_brain.connectors import (
     BUILTIN_CONNECTORS,
     ConnectorContext,
@@ -29,6 +41,12 @@ from pkm_brain.ui_server import create_ui_server
 from test_capture import make_codex_fixture, make_hyprnote_fixture
 
 
+def encoded_id_token(claims: dict[str, object]) -> str:
+    header = base64.urlsafe_b64encode(b'{"alg":"none"}').decode("ascii").rstrip("=")
+    payload = base64.urlsafe_b64encode(json.dumps(claims).encode("utf-8")).decode("ascii").rstrip("=")
+    return f"{header}.{payload}.signature"
+
+
 def test_connector_registry_exposes_builtin_manifests(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
     BrainService(paths).init_workspace()
@@ -36,11 +54,154 @@ def test_connector_registry_exposes_builtin_manifests(tmp_path: Path) -> None:
     result = list_connectors(paths)
     manifests = {item["manifest"]["id"]: item["manifest"] for item in result["connectors"]}
 
-    assert {"codex", "claude", "opencode", "hyprnote", "files"}.issubset(manifests)
+    assert {"codex", "claude", "opencode", "hyprnote", "files", "gmail", "slack"}.issubset(
+        manifests
+    )
     assert manifests["codex"]["source_type"] == "agent_session_log"
     assert manifests["hyprnote"]["source_type"] == "hyprnote_meeting"
     assert manifests["hyprnote"]["default_enabled"] is False
     assert manifests["files"]["default_enabled"] is True
+    assert manifests["gmail"]["lifecycle"] == "auth_only"
+    assert manifests["gmail"]["capture_available"] is False
+    assert manifests["gmail"]["auth"]["requested_scopes"] == ["openid", "email", "profile"]
+    assert manifests["slack"]["auth"]["client_secret_required"] is True
+
+
+def test_auth_only_connectors_cannot_be_enabled_or_captured(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+
+    with pytest.raises(ValueError, match="Gmail capture is not available"):
+        set_connector_enabled(paths, "gmail", True)
+
+    result = run_connector_capture(
+        paths,
+        connector_ids=["gmail"],
+        respect_enabled=False,
+        respect_cadence=False,
+    ).as_dict()
+
+    assert result["captured"] == 0
+    assert result["connector_results"][0]["status"] == "skipped"
+    assert result["connector_results"][0]["reason"] == "capture not implemented"
+
+
+def test_google_oauth_identity_flow_uses_pkce_and_keeps_secrets_out_of_config(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    store = MemoryCredentialStore()
+    broker = OAuthCallbackBroker(
+        port=0,
+        token_exchanger=lambda flow, code: {
+            "access_token": "access-secret",
+            "refresh_token": "refresh-secret",
+            "scope": "openid email profile",
+            "expires_in": 3600,
+            "id_token": encoded_id_token(
+                {
+                    "aud": flow.client_id,
+                    "iss": "https://accounts.google.com",
+                    "email": "person@example.com",
+                    "exp": int((datetime.now(timezone.utc) + timedelta(hours=1)).timestamp()),
+                }
+            ),
+        },
+    )
+    configure_connector_auth(
+        paths,
+        "gmail",
+        client_id="desktop-client-id",
+        client_secret="client-secret",
+        store=store,
+    )
+    try:
+        started = begin_connector_authorization(paths, "gmail", store=store, broker=broker)
+        parsed = urlparse(started["authorization_url"])
+        query = parse_qs(parsed.query)
+
+        assert parsed.netloc == "accounts.google.com"
+        assert query["scope"] == ["openid email profile"]
+        assert query["code_challenge_method"] == ["S256"]
+        assert query["redirect_uri"] == [started["redirect_uri"]]
+
+        callback = urlparse(started["redirect_uri"])
+        connection = http.client.HTTPConnection(callback.hostname, callback.port, timeout=5)
+        connection.request("GET", f"{callback.path}?state={query['state'][0]}&code=test-code")
+        response = connection.getresponse()
+        response.read()
+        connection.close()
+
+        assert response.status == 200
+        status = connector_auth_status(paths, "gmail", store=store)
+        assert status is not None
+        assert status["status"] == "connected"
+        assert status["account_label"] == "person@example.com"
+        assert status["client_secret_configured"] is True
+
+        config_text = (paths.config_local / "connector-auth.yaml").read_text(encoding="utf-8")
+        assert "client-secret" not in config_text
+        assert "access-secret" not in config_text
+        assert "refresh-secret" not in config_text
+
+        disconnected = disconnect_connector_auth(paths, "gmail", store=store)
+        assert disconnected["status"] == "ready"
+        assert store.load("gmail") == {"client_secret": "client-secret"}
+    finally:
+        broker.shutdown()
+
+
+def test_slack_oauth_requires_client_secret(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    store = MemoryCredentialStore()
+
+    with pytest.raises(ValueError, match="Client secret is required"):
+        configure_connector_auth(
+            paths,
+            "slack",
+            client_id="slack-client-id",
+            store=store,
+        )
+
+
+def test_oauth_identity_flow_rejects_missing_identity_token(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    store = MemoryCredentialStore()
+    broker = OAuthCallbackBroker(
+        port=0,
+        token_exchanger=lambda _flow, _code: {
+            "access_token": "access-secret",
+            "scope": "openid email profile",
+        },
+    )
+    configure_connector_auth(
+        paths,
+        "gmail",
+        client_id="desktop-client-id",
+        store=store,
+    )
+    try:
+        started = begin_connector_authorization(paths, "gmail", store=store, broker=broker)
+        parsed = urlparse(started["authorization_url"])
+        query = parse_qs(parsed.query)
+        callback = urlparse(started["redirect_uri"])
+        connection = http.client.HTTPConnection(callback.hostname, callback.port, timeout=5)
+        connection.request("GET", f"{callback.path}?state={query['state'][0]}&code=test-code")
+        response = connection.getresponse()
+        response.read()
+        connection.close()
+
+        assert response.status == 400
+        status = connector_auth_status(paths, "gmail", store=store)
+        assert status is not None
+        assert status["status"] == "error"
+        assert status["last_error"] == "OAuth provider returned an invalid identity token"
+        assert store.load("gmail") == {}
+    finally:
+        broker.shutdown()
 
 
 def test_connector_capture_keeps_codex_paths_and_capture_source_keys(tmp_path: Path) -> None:
@@ -208,9 +369,11 @@ def request_json(
     return response.status, json.loads(raw)
 
 
-def test_connector_api_endpoints(tmp_path: Path) -> None:
+def test_connector_api_endpoints(tmp_path: Path, monkeypatch) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
     BrainService(paths).init_workspace()
+    store = MemoryCredentialStore()
+    monkeypatch.setattr("pkm_brain.connector_auth.credential_store_for", lambda _paths: store)
 
     with running_ui(paths) as (host, port, token):
         status, body = request_json(host, port, "GET", "/api/connectors", token=token)
@@ -239,6 +402,27 @@ def test_connector_api_endpoints(tmp_path: Path) -> None:
         status, body = request_json(host, port, "POST", "/api/connectors/codex/enable", token=token)
         assert status == 200
         assert body["state"]["enabled"] is True
+
+        status, body = request_json(
+            host,
+            port,
+            "PUT",
+            "/api/connectors/gmail/auth/config",
+            token=token,
+            payload={"client_id": "desktop-client", "client_secret": "local-secret"},
+        )
+        assert status == 200
+        assert body["state"]["auth"]["status"] == "ready"
+        assert body["state"]["auth"]["client_secret_configured"] is True
+        assert "local-secret" not in json.dumps(body)
+
+        status, body = request_json(host, port, "POST", "/api/connectors/gmail/run", token=token)
+        assert status == 200
+        assert body["connector_results"][0]["reason"] == "capture not implemented"
+
+        status, body = request_json(host, port, "POST", "/api/connectors/gmail/enable", token=token)
+        assert status == 400
+        assert body["error"] == "Gmail capture is not available"
 
 
 def test_capture_sources_unique_index_remains_compatible(tmp_path: Path) -> None:
