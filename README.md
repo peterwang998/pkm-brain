@@ -4,7 +4,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB)](pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-PKM Brain is a local-first personal knowledge system and proactive personal Chief of Staff. Its working knowledge layer ingests messy private sources, turns durable claims into a source-backed fact ledger, renders managed wiki pages, and returns bounded context to agents. The operational layer is being built on that evidence foundation to maintain current commitments, Calendar state, attention, and briefings without conflating them with durable facts.
+PKM Brain is a local-first personal knowledge system and proactive personal Chief of Staff. Its working knowledge layer ingests messy private sources, turns durable claims into a source-backed fact ledger, renders managed wiki pages, and returns bounded context to agents. Its first operational layer is implemented as a manual read-only Calendar/Gmail shadow trial that maintains current commitments, Calendar state, attention, and briefings without conflating them with durable facts.
 
 Core rule:
 
@@ -96,7 +96,9 @@ Chief of Staff is the product mission, not another app. It uses Brain's evidence
 
 The existing autonomous subsystem is Knowledge Curation: it extracts facts from eligible source windows, validates quotes/spans, routes facts to canonical pages, resolves safe duplicates, flags conflicts, applies reversible actions, samples audits, and lets the gardener propose topology cleanup. Its current `cos_*` names remain compatibility identifiers until an atomic rename; they must not be used for operational items or external side effects.
 
-The initial operational rollout is read-only: a Calendar-first shadow ledger and a coverage-aware Today briefing, followed by a separately evaluated Gmail operational detector. See [Chief-of-Staff Operations](docs/specs/chief-of-staff-operations.md).
+The initial operational rollout is read-only and manual. After the owner separately authorizes the owned-primary Calendar grant and Gmail read-only grant, **Today > Run Shadow** performs one bounded pass, shows source coverage, surfaces operational candidates, explains ignored/suppressed material, opens retained local evidence, and accepts local corrections or missing-item reports. There is no schedule and no provider write capability. Gmail knowledge capture, retrieval indexing, and durable-fact ingestion remain disabled.
+
+The implementation is ready for release verification and the first owner-started private trial; it has not yet been promoted as trusted daily guidance. See [Chief-of-Staff Operations](docs/specs/chief-of-staff-operations.md) and the [Live Shadow Trial Runbook](docs/runbooks/chief-of-staff-shadow-trial.md).
 
 Useful commands:
 

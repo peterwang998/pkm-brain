@@ -1,7 +1,7 @@
 # Chief Of Staff Operations
 
-**Status:** canonical feature spec; the isolated COS-2 kernel is in progress and no operational behavior is released
-**Last verified:** 2026-07-13 against architecture commit `a44b713` plus the current operational-kernel working tree
+**Status:** canonical feature spec; the manual Calendar/Gmail shadow implementation is complete, with release verification and the first owner-started live trial pending
+**Last verified:** 2026-07-13 against the current manual-shadow implementation; no private live result is claimed
 **Owns:** operational items, reconciliation, briefings, operational evaluation, and guarded external execution
 
 ## Mission And Product Boundary
@@ -28,6 +28,26 @@ Knowledge Curation and Chief Of Staff Operations have different lifecycles:
 Operational items MUST NOT be stored as facts merely to reuse the knowledge pipeline. Facts MUST NOT be silently converted into current work. Promotion in either direction requires an explicit, source-backed operation with its own provenance.
 
 The initial release is read-only and shadow-only. No Calendar or Gmail mutation scope is authorized by this spec.
+
+## Current Shadow Trial State
+
+The implemented evaluation slice runs only when the owner chooses **Today > Run Shadow**. It requires two separately authorized Google grants: the owned-primary Calendar grant and the Gmail read-only grant. Immediately before every run, the daemon binds each grant to the exact policy email, stable provider identity when available, and exact approved scope set. A missing, broader, changed-account, or mismatched grant fails closed.
+
+The first accepted run creates the owner-only `config/local/operations.yaml` from the approved defaults only when no policy exists. An existing policy is authoritative and is never silently rewritten. The approved defaults are:
+
+- owned primary Calendar only;
+- Gmail read-only content access for the operational shadow lane only;
+- 7-day raw resumable-cache retention and 30-day normalized-evidence retention;
+- no attachment fetching, quoted-history stripping enabled, and no external provider writes;
+- daily Calendar API, Gmail API, detector-call, detector-input-token, and detector-total-token budgets.
+
+One asynchronous run reads Calendar and Gmail independently, reconciles bounded evidence into `ops.sqlite`, saves a coverage-aware briefing snapshot, and exposes progress through Today. A second start while a run is active reuses the active run rather than starting overlapping source work. Partial pagination and bounded deferred work remain resumable through persisted source cursors; a later manual run continues from the last atomically committed checkpoint.
+
+This slice is not scheduled. It does not write `inbox/`, `brain.sqlite`, documents, chunks, facts, entities, or wiki pages. Gmail retrieval indexing and durable-knowledge ingestion remain disabled. Feedback, missing-item reports, observations, current items, and briefing snapshots are local operational records only. The owner—not an agent or background job—authorizes both grants and starts the first live run.
+
+Implementation completion does not equal promotion. The first private trial must still establish labeled recall, false-alarm, duplicate, stale, handled-state, evidence-route, coverage, and cost behavior before the briefing can be treated as trusted daily operational guidance.
+
+The owner-facing procedure is [Live Chief-of-Staff Shadow Trial](../runbooks/chief-of-staff-shadow-trial.md). Offline chronological scoring remains documented separately in [Retrospective Shadow Replay](../runbooks/chief-of-staff-shadow-replay.md).
 
 ## V1 Scope
 
@@ -332,7 +352,7 @@ The initial COS-6 schema MAY add `ops_episode_relations` plus append-only relati
 
 ## Calendar-First Connector
 
-Calendar is the first production source because its schedule, identity, updates, and cancellation state are structured and require no LLM for the core briefing.
+Calendar is the first operational source because its schedule, identity, updates, and cancellation state are structured and require no LLM for the core briefing.
 
 The first connector:
 
@@ -376,9 +396,9 @@ Today/upcoming event cards are deterministic. A model is not required to restate
 
 ## Gmail Lanes
 
-Gmail remains `auth_only` until the owner separately approves message scopes, redaction, retention, deletion, and production capture. The benchmark credential is not authorization for the Brain connector.
+The owner has approved `gmail.readonly` plus the 7/30-day retention, no-attachment, quoted-history-stripping, and no-external-write controls for the private operational shadow trial. This approval does not authorize Gmail knowledge capture, retrieval indexing, durable-fact extraction, or any Gmail mutation. The benchmark credential is not authorization for either Brain lane; the live trial requires its own separately authorized and account-bound Brain grant.
 
-Once approved, Gmail has three independent lanes over one normalized thread snapshot:
+Gmail has three independently permissioned lanes over a normalized thread snapshot:
 
 | Lane | Admission | Purpose |
 |---|---|---|
@@ -438,7 +458,7 @@ Each adapter requires its own scope/privacy decision, labeled fixtures, source-l
 
 ## Briefing Contract
 
-The briefing is a deterministic ranked projection as of a declared local time. It is generated on demand and by a configurable morning schedule.
+The briefing is a deterministic ranked projection as of a declared local time. The current shadow implementation generates it on demand only. A configurable morning schedule remains a later, separately activated capability and is not enabled by the manual trial.
 
 Sections are:
 
@@ -515,7 +535,9 @@ Packets are generated on demand or inside a bounded pre-meeting window, use the 
 Today becomes the V1 Chief-of-Staff surface without changing navigation:
 
 - the briefing leads the page;
+- **Run Shadow** starts one manual read-only Calendar/Gmail pass and shows accepted, running, complete, partial, or failed status;
 - focus shows zero to five cards, with urgent overflow and awareness visibly separate;
+- retained local evidence opens in an in-app evidence sheet, while the ignored/suppressed audit shows bounded reason codes and source references;
 - daemon, scheduler, index, sync, and review health remain a compact system pulse;
 - item actions write only through the operational service and append an event;
 - source links open the owning Brain evidence view and may offer a separately labeled validated provider route when available;
@@ -696,8 +718,9 @@ The existing user-facing Ops destination continues to mean system/runtime operat
 - `config/local/operations.yaml` is private, non-secret, schema-validated, and excluded from source control; it never stores provider tokens.
 - Each connector requests the narrowest approved read scope; write scopes are absent before guarded-execution activation.
 - Account IDs stored in SQLite are local non-secret identifiers.
-- Full provider API caches are not part of the production contract.
-- Attachment bytes are excluded by default.
+- The private trial keeps a disposable owner-only raw API cache for 7 days and normalized evidence for 30 days; neither lane is knowledge authority.
+- Attachment bytes are never fetched by the trial.
+- Quoted Gmail reply history is stripped before normalized evidence is retained.
 - Model payloads contain only the changed source material and bounded related-item context required for the decision.
 - Provider use is explicit per operational detector role; unconfigured roles skip visibly.
 - Raw model prompts/responses are not retained by default. Debug retention is opt-in, private, bounded, and reported in storage inventory.
@@ -755,7 +778,7 @@ The operational Chief-of-Staff foundation is complete when:
 9. meeting preparation is derived, evidence-linked, coverage-aware, and cannot mutate canonical state;
 10. local completion, dismissal, snooze, and correction survive restart/replay and prevent same-version resurrection;
 11. knowledge facts, curation Queue, and `cos_*` compatibility paths remain behaviorally unchanged;
-12. Calendar promotion gates pass before Gmail content access is enabled;
+12. Calendar deterministic replay gates pass independently; private Gmail shadow access does not imply Calendar or Gmail promotion;
 13. Gmail retrieval, knowledge, and operational lanes have separate admission and cost reporting;
 14. Gmail shadow evaluation includes labeled suppressed mail and passes detection, handled-state, duplicate, staleness, reconciliation, focus, evidence-link, and budget gates;
 15. cross-source episode relations are explicit and reversible, and no reply, notification, or incomplete coverage incorrectly suppresses a required action;
@@ -765,12 +788,15 @@ The operational Chief-of-Staff foundation is complete when:
 19. no external mutation scope or action is enabled by the read-only/shadow implementation;
 20. any later write capability declares a reversibility class and passes payload-bound approval, drift, verification, audit, and recovery acceptance.
 
-Primary planned verification surfaces:
+Primary release-verification surfaces:
 
 ```bash
 uv run pytest tests/test_operational_db.py tests/test_operational_state.py \
-  tests/test_calendar_connector.py tests/test_ops_briefing.py -q
-uv run brain eval run --suite operations --home <test-home>
+  tests/test_google_sources.py tests/test_google_cache.py \
+  tests/test_gmail_operations.py tests/test_shadow_trial.py \
+  tests/test_operational_briefing.py tests/test_operational_today.py \
+  tests/test_today_presentation.py -q
+uv run python -m pkm_brain.operational_replay --help
 swift test --package-path app
 scripts/build-app.sh
 ```

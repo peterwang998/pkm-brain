@@ -20,7 +20,7 @@ Operational awareness is a separate consumer of approved evidence. Calendar and 
 
 ## Capture Contract
 
-Current capture adapters wrap Codex, Claude, OpenCode, Hyprnote, and filesystem input. Gmail and Slack are registered as `auth_only` connector shells: they expose account authorization but have no discovery, capture, scheduling, or ingestion behavior. A capture-capable connector:
+Current capture adapters wrap Codex, Claude, OpenCode, Hyprnote, and filesystem input. Gmail, Calendar, and Slack are registered as `auth_only` capture connectors: they expose account authorization but have no inbox discovery, capture scheduling, or knowledge-ingestion behavior. A separately approved manual Calendar/Gmail operational shadow pass consumes bounded evidence through [Chief-of-Staff Operations](chief-of-staff-operations.md); that path does not make either connector capture-capable. A capture-capable connector:
 
 - writes normalized Markdown or text under its `inbox/<connector_id>/` namespace;
 - advances `capture_sources` state only after a successful unit;
@@ -41,7 +41,7 @@ Hyprnote capture is speaker-aware. Transcript words from independently stored ch
 
 Hyprnote remains opt-in because it scans private meeting data under the application's support directory. Files does not supersede it: Files only represents artifacts already placed under `inbox/documents/`, while the Hyprnote adapter creates normalized meeting artifacts from Hyprnote session folders. Previously captured Hyprnote artifacts remain ingestible when scheduled Hyprnote capture is disabled.
 
-Email capture is not implemented; its proposed contract is isolated under [Future Gmail And Email Adapter](#future-gmail-and-email-adapter).
+Email capture and durable-knowledge ingestion are not implemented; their proposed contract is isolated under [Future Gmail And Email Adapter](#future-gmail-and-email-adapter). The Gmail operational shadow lane is independent and does not write documents, chunks, facts, or wiki pages.
 
 ## Ingest Contract
 
@@ -250,7 +250,7 @@ The verified local gardener model is `gpt-5.6-luna`. Page/entity candidate volum
 
 ## Future Calendar Evidence Adapter
 
-Status: planned as the first read-only operational connector.
+Status: the manual read-only operational shadow adapter is implemented; Calendar capture/retrieval ingestion remains unimplemented.
 
 The initial provider is Google Calendar with a separate narrowly scoped account grant. Event snapshots enter the evidence boundary with stable account, calendar, event, recurrence, and revision identity. The adapter requests no mutation scope and does not infer a task merely because an event exists.
 
@@ -260,11 +260,11 @@ Calendar is operationally useful without LLM extraction. Its source evidence rem
 
 ## Future Gmail And Email Adapter
 
-Status: authentication shell implemented; capture planned and paused.
+Status: the manual read-only operational shadow adapter is implemented; capture, retrieval indexing, and durable-knowledge ingestion remain paused.
 
-An identity-only Gmail OAuth shell requests `openid`, `email`, and `profile`, stores secrets and tokens in macOS Keychain, and cannot read Gmail data. The next approved preprocessing design must revise the capture plan before Gmail scopes or ingestion are added. Its safety constraints remain:
+The Gmail account card can hold the separately approved `gmail.readonly` grant for the manual operational shadow trial. It stores secrets and tokens in macOS Keychain, but the capture registry remains `auth_only`: it cannot discover mail into `inbox/`, schedule capture, index mail for retrieval, or run durable-fact ingestion. Any future knowledge adapter must receive a separate product decision and revise this capture plan. Its safety constraints remain:
 
-- no Gmail message scopes, mail sender, or full-corpus API capture in the auth-only phase;
+- no mail sender, label mutation, deletion, attachment retrieval, or full-corpus knowledge capture in the operational shadow phase;
 - local Maildir/mbox remains an eligible evidence input alongside a future Gmail API adapter;
 - one snapshot-replaced document per thread;
 - deterministic bulk-versus-human classification;

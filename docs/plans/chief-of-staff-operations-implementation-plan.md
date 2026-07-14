@@ -1,7 +1,7 @@
 # Chief-of-Staff Operations Implementation Plan
 
-**Status:** execution started; COS-0/COS-1/COS-2 complete; Calendar production access remains disabled
-**Last verified:** 2026-07-13 against the COS-1 policy/evaluation and COS-2 service/recovery foundations
+**Status:** manual Calendar/Gmail shadow implementation complete; release verification and the first owner-started private trial are pending
+**Last verified:** 2026-07-13 against the current manual-shadow implementation; no live promotion result is claimed
 **Owning spec:** [Chief-of-Staff Operations](../specs/chief-of-staff-operations.md)
 
 ## Outcome
@@ -35,14 +35,14 @@ The program keeps one product, one app, one coordinator daemon, and one Brain ho
 | COS-0 | verified knowledge-layer foundation | none | complete |
 | COS-1 | canonical boundary, local policy, adapter, privacy, eval, and rollout contracts | none | complete |
 | COS-2 | separate operational kernel and deterministic lifecycle | none | complete |
-| COS-3 | read-only Calendar evidence and reconciliation | none | planned |
-| COS-4 | coverage-aware Today focus, feedback, and basic meeting preparation | none | planned |
-| COS-5 | Gmail retrieval, one-stage operational detection, and source-local satisfaction | none | gated |
+| COS-3 | read-only Calendar evidence and reconciliation | none | implemented for manual shadow; verification pending |
+| COS-4 | coverage-aware Today focus, feedback, evidence audit, and basic meeting preparation API | none | manual shadow implemented; verification pending |
+| COS-5 | one-stage Gmail operational detection and source-local satisfaction | none | manual shadow implemented; promotion pending |
 | COS-6 | reversible cross-source episodes, satisfaction, and production briefing gates | none | gated |
 | COS-7 | local draft/action plans with guarded approval protocol | none | gated |
 | COS-8 | capability-by-capability external execution | explicit only | gated |
 
-Calendar and the operational kernel precede Gmail content access. Source-local detection and satisfaction must work before cross-source aggregation. Reconciliation must work before the briefing is considered trustworthy. Optional adapters follow the same contract and cannot bypass Calendar/Gmail gates. Drafting must work before execution.
+Calendar and the operational kernel preceded Gmail implementation. The owner has separately approved Gmail read-only access for a private operational shadow trial, but that does not promote either source or enable Gmail retrieval/knowledge ingestion. Source-local detection and satisfaction must work before cross-source aggregation. Reconciliation must work before the briefing is considered trustworthy. Optional adapters follow the same contract and cannot bypass Calendar/Gmail gates. Drafting must work before execution.
 
 ## COS-0 - Knowledge Foundation Baseline
 
@@ -52,7 +52,7 @@ Completed by commit `3937316`:
 - auth-only Gmail and Slack connector shells;
 - isolated Gmail benchmark with reconciled token accounting;
 - 510 Python tests, 17 Swift tests, Ruff, and the full macOS UI acceptance path green;
-- production Gmail remains disabled and identity-only.
+- Gmail knowledge capture and durable-fact ingestion remain disabled; later operational shadow access is a separate lane and grant.
 
 The historical `audit-remediation-2026-07-12` branch is not merged because its semantic fixes were replayed into the newer main history.
 
@@ -147,7 +147,7 @@ The completed COS-2 foundation consists of:
 - one owner-only, checksummed `database_pair` recovery generation created under a fixed SQLite write barrier, with exact schema/integrity validation and a durable completion marker;
 - isolated restore that binds copied database content to the recovery manifest, preserves knowledge review plus operational feedback/cursors, and remains quarantined until a future explicit topology activation workflow.
 
-`brain init`, connectors, CLI, API, and UI still do not initialize or mutate the operational store. The daemon now owns one dormant `OperationalService` instance and exposes that same fenced instance to its server for later phases; it does not initialize `ops.sqlite` or schedule operational work. The local operations policy, adapter workers, handled assessment, focus projection, and relation layer remain unwired, so no production operational behavior or external-action authority is enabled.
+The daemon now owns and wires one fenced `OperationalService` into the manual shadow controller and Today presentation service. `ops.sqlite` is initialized only through that daemon-owned path when the owner starts Shadow; ordinary knowledge initialization and connector capture do not mutate it. Calendar/Gmail adapter work, source-unit reconciliation, handled assessments, briefing snapshots, item feedback, and missing reports use that service. No operational scheduler job or external-action authority is enabled.
 
 ### Verification
 
@@ -207,6 +207,10 @@ Stage each complete Calendar change-set before reconciliation. Map the event eta
 
 An opted-in Calendar shadow run produces no LLM calls and no external mutation, while recurrence exceptions, moves, cancellations, timezones, policy validation/versioning, local/provider evidence routing, coverage, and replay pass labeled fixtures. Invalid policy or an unvalidated provider route fails visibly without widening access.
 
+### Current implementation
+
+The manual runner now uses a separate exact-scope Calendar grant, reads only `primary` with recurring instances expanded, includes deletions, preserves recurrence/exception identity, and applies observations plus cursor progress atomically. It uses a bounded 14-day past/90-day future initial window, persists resumable page/sync checkpoints, enforces a durable daily request budget on every provider attempt, retains revision-addressed evidence, and reports incomplete coverage rather than advancing past failed work. Release verification and the first owner-started live run remain pending.
+
 ## COS-4 - Today Shadow Briefing
 
 Extend `/api/digest` with an optional briefing projection and add a narrow feedback endpoint. Do not add a navigation destination.
@@ -241,7 +245,11 @@ Add a bounded preparation packet for an operator-selected or configured upcoming
 
 A user can inspect and correct a Calendar-backed briefing for at least two weeks of shadow replay without duplicate or stale cards exceeding the configured gates. Focus never pads, urgent overflow disclosure and evidence-route validity are `100%` in fixtures, and meeting packets contain zero unsupported factual claims while partial coverage is always visible.
 
-## COS-5 - Gmail Retrieval And Operational Detection
+### Current implementation
+
+Today now exposes **Run Shadow**, polls one background run through accepted/running/terminal state, refreshes the briefing on complete or partial results, and keeps Calendar and Gmail coverage visible. The briefing includes adaptive focus, current/upcoming events, due/waiting/attention/awareness/uncertain sections, and an ignored/suppressed audit. Cards can open retained local evidence. Local confirm, correct, done, snooze, dismiss, restore, and report-missing actions write only operational feedback. The meeting-packet projection and API exist, but its final native interaction and live factual-claim evaluation remain part of release verification. There is no automatic run schedule.
+
+## COS-5 - Gmail Operational Detection
 
 This phase requires explicit approval of Gmail read-only scope, local retention, redaction, deletion, attachment, and quoted-history behavior.
 
@@ -250,6 +258,8 @@ This phase requires explicit approval of Gmail read-only scope, local retention,
 1. Retrieval indexing: approved normalized thread snapshots.
 2. Durable knowledge: the conservative human/evidence fact pipeline.
 3. Operational detection: high-recall provisional current-state operations.
+
+Only lane 3 is enabled by the current manual trial. Retrieval indexing and durable knowledge ingestion remain disabled and are not implicit side effects of operational evidence access.
 
 One changed thread is processed once, or in a failure-isolated batch of small transactional threads. Input contains new messages, bounded thread context, source-native timestamps, and compact plausibly related active items. Output is a structured operation:
 
@@ -280,6 +290,10 @@ Shadow predictions are not labels. Build a chronological, versioned set containi
 ### Exit gate
 
 Severity-weighted recall, false-alarm rate, source-date accuracy, handled-verdict accuracy, replied-but-not-fulfilled confusion, focus/overflow selection, evidence-route validity, schema-repair rate, and token/call budgets meet their approved thresholds on held-out replay. High-consequence false handled is zero, overall false handled is at most `0.01`, no incomplete authoritative-source coverage is presented as handled, and no focus slot is padded with awareness.
+
+### Current implementation
+
+The owner-approved private lane uses a separate exact `gmail.readonly` grant, a bounded recent/unread initial query, resumable mailbox/history pagination, deterministic MIME normalization, quoted-history stripping, and no attachment fetches. A restricted, tool-less detector receives bounded changed-thread content and returns schema-validated suggestions; deterministic code validates evidence and lifecycle effects before applying operational state. Daily API/call/token reservations fail visibly into partial coverage. Raw resumable payloads expire after 7 days and normalized revision evidence after 30 days. Implementation is complete for manual shadow evaluation, but the held-out promotion gate and first owner-started private trial are pending.
 
 ## COS-6 - Cross-Source Reconciliation
 

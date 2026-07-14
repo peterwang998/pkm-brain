@@ -1,7 +1,7 @@
 # PKM Brain Architecture Code Guide
 
 **Status:** current code-navigation guide
-**Last verified:** 2026-07-13 against installed release `0.1.5` and the current working tree
+**Last verified:** 2026-07-13 against the current manual Calendar/Gmail shadow working tree; release verification pending
 
 This guide answers where behavior lives. Feature requirements and open work belong in [the specs index](README.md), not here.
 
@@ -19,10 +19,13 @@ capture.py / connectors.py / connector_auth.py
   -> mcp_server.py / ui_server.py / cli.py
 
 approved operational sources
-  -> operational_state.py
-  -> operational_db.py + operational_migrations.py
+  -> google_api.py + google_sources.py + google_normalization.py
+  -> shadow_trial.py + gmail_operations.py
+  -> operational_state.py + operational_shadow.py
+  -> operational_db.py + operational_migrations.py + operational_budget.py
   -> db/ops.sqlite
-  -> future coverage-aware Today briefing
+  -> operational_briefing.py + operational_today.py
+  -> Today briefing, evidence audit, and local feedback
 
 daemon.py + automation.py schedule the same primitives.
 SwiftUI and browser assets call ui_server.py JSON endpoints.
@@ -74,6 +77,8 @@ Do not create ad hoc paths or SQLite connections in UI/Swift code.
 
 Connector output stops at `inbox/`. `BrainService.ingest` is the single entry to raw/document/chunk/index state.
 
+The manually invoked Calendar/Gmail shadow path is not capture output. It uses the separately bound read-only credentials through the operational modules below and never writes `inbox/`, documents, chunks, facts, or wiki pages.
+
 ### Embeddings And Indexes
 
 - `embeddings.py`: config resolution, hash/ST providers, unavailable sentinel, query/passsage interface.
@@ -116,9 +121,17 @@ The `cos_*` surface is a legacy physical name for Knowledge Curation. It must no
 - `operational_state.py`: immutable source observations, deterministic source-key reconciliation, operator feedback, current items, event history, and source cursors.
 - `operational_db.py`: short-lived operational connections, WAL/foreign-key setup, and bounded lock retry.
 - `operational_migrations.py`: independently versioned `ops_*` schema migrations.
+- `operations_policy.py` and `shadow_setup.py`: strict owner-only policy, approved 7/30-day privacy controls, and exact account/scope binding.
+- `google_api.py`, `google_sources.py`, `google_normalization.py`, and `google_routes.py`: bounded read-only Google transport, resumable Calendar/Gmail change reads, deterministic normalization, and safe provider routes.
+- `google_cache.py`: owner-only disposable raw and revision-addressed normalized evidence with separate retention lanes.
+- `gmail_llm.py` and `gmail_operations.py`: restricted Gmail detector provider boundary, bounded structured detection, deterministic evidence/lifecycle validation, and source-local handled assessment.
+- `operational_budget.py`: durable local-day API/call/token reservations.
+- `operational_shadow.py`: shadow runs, decisions, handled assessments, and missing reports.
+- `shadow_trial.py` and `shadow_controller.py`: one background manual Calendar/Gmail pass, atomic resume/cursor behavior, coverage, retention, and polling state.
+- `operational_briefing.py`, `operational_today.py`, and `today_presentation.py`: deterministic briefing projection, ignored/suppressed audit, evidence navigation, and local feedback contracts.
 - `paths.py`: `BrainPaths.ops_sqlite_path` resolves the operational database inside the same Brain home.
 
-This is the first provider-read-only/local-write isolated kernel. Calendar ingestion, coverage reporting, Today briefing projection, Gmail detection, and guarded execution remain later phases owned by [Chief-of-Staff Operations](specs/chief-of-staff-operations.md).
+The provider-read-only/local-write manual shadow slice is implemented. Release verification, the first owner-started private evaluation, cross-source episode linking, scheduling, and guarded execution remain gated by [Chief-of-Staff Operations](specs/chief-of-staff-operations.md).
 
 ### Retrieval And Memory
 
@@ -156,6 +169,7 @@ The primary initiates transfer. Source artifacts cross machines; databases and i
 - `app/Sources/App`: scenes, navigation, app state, menu bar, notifications.
 - `app/Sources/Kit`: API models/client, daemon supervisor, runtime provisioner, process-aware runtime retention.
 - `app/Sources/Views`: Today, Queue, Wiki, Entities, Ask, Ops, Settings.
+- `app/Sources/Views/Today/TodayView.swift` and `TodayEvidenceSheet.swift`: manual Shadow start/progress, briefing/audit sections, local feedback, missing reports, and retained evidence inspection.
 - `app/Sources/Acceptance`: headless app/runtime acceptance harness.
 - `app/UITests`: rendered navigation and Queue keyboard acceptance coverage.
 

@@ -1,7 +1,7 @@
 # PKM Brain Documentation
 
 **Status:** authoritative docs index
-**Last verified:** 2026-07-13 against knowledge-foundation commit `3937316e090a` plus the current operational working tree
+**Last verified:** 2026-07-13 against the current manual Calendar/Gmail shadow working tree; release verification pending
 
 Current requirements are organized by product feature, not implementation stream. Start with Product Foundation, then read the owning feature spec for the behavior being changed.
 
@@ -20,6 +20,8 @@ Current requirements are organized by product feature, not implementation stream
 ## Engineering And Operations
 
 - [Architecture Code Guide](architecture-code-guide.md): where behavior lives in Python/Swift.
+- [Live Chief-of-Staff Shadow Trial](runbooks/chief-of-staff-shadow-trial.md): authorize the two read-only Google grants, run Today manually, inspect/label results, and dispose of private caches.
+- [Retrospective Shadow Replay](runbooks/chief-of-staff-shadow-replay.md): score private or synthetic frozen fixtures without provider calls.
 - [Sync Acceptance Runbook](runbooks/sync-acceptance.md): real-machine validation.
 - [Project Audit - 2026-07-10](audits/project-audit-2026-07-10.md): current risks and evidence.
 - [Project Implementation Plan](plans/project-implementation-plan.md): canonical roadmap, prioritized releases, work packages, dependencies, and acceptance hits.

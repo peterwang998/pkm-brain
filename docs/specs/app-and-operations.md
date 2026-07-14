@@ -1,7 +1,7 @@
 # App And Operations
 
-**Status:** canonical living feature spec; native app is primary and browser UI is an off-by-default fallback
-**Last verified:** 2026-07-13 against knowledge-foundation commit `3937316` and the current working tree
+**Status:** canonical living feature spec; native app is primary, and the manual Calendar/Gmail shadow UI is implemented with release verification pending
+**Last verified:** 2026-07-13 against the current manual-shadow working tree; no private live result is claimed
 **Owns:** daemon, scheduler, connector operations, native/browser UI, settings, provisioning, packaging, migration, and operational retention
 
 ## Product Shape
@@ -50,7 +50,7 @@ The daemon:
 
 Current job classes include capture tick, nightly maintenance, secondary tick, and one `sync:<peer>` job per configured child on a primary. The registry derives cadence and due state from config. Pausing does not erase due state; run-now behavior is explicit.
 
-Operational detection/reconciliation is a separate job family. Calendar shadow polling is the first planned job and is disabled by default. Only a `single` or active `primary` role may write canonical operational state. An operational failure records incomplete source coverage and leaves the last valid item projection intact; it does not block capture, knowledge curation, or daemon health.
+Operational detection/reconciliation is a separate job family. The current Calendar/Gmail shadow pass is not registered as a scheduled job: it starts only from the owner's **Today > Run Shadow** action, and only one background pass may be active at a time. Only a `single` or active `primary` role may write canonical operational state. An operational failure records incomplete source coverage and leaves the last valid item projection intact; it does not block capture, knowledge curation, or daemon health.
 
 The app daemon replaces normal LaunchAgent automation. Legacy LaunchAgent commands remain only for rollback/development and must identify themselves as deprecated when an app-managed daemon exists.
 
@@ -68,11 +68,11 @@ Each connector exposes:
 - consecutive failures;
 - config schema suitable for a native form.
 
-One connector failure does not abort other connectors or the scheduler tick. Connectors only write inbox artifacts and capture state. An `auth_only` connector cannot be enabled, scheduled, or manually run.
+One capture-connector failure does not abort other connectors or the scheduler tick. Capture connectors only write inbox artifacts and capture state. An `auth_only` lifecycle means the capture registry cannot enable, schedule, or invoke that connector. It does not mean a separately approved operational shadow controller may use the same account card's credential.
 
-Gmail and Slack currently stop at identity-only OAuth/OpenID authorization. Client secrets and tokens are stored in macOS Keychain under a Brain-home-scoped account; only non-secret client/status metadata is stored under `config/local/connector-auth.yaml`. Authorization uses state validation, Google PKCE, Slack nonce validation, and a fixed loopback callback at `127.0.0.1:53682`. API responses never return secrets or tokens.
+Calendar and Gmail remain `auth_only` for capture and knowledge ingestion. Their separate Google account cards now request exact read-only operational grants: identity plus `calendar.events.owned.readonly` for Calendar, and identity plus `gmail.readonly` for Gmail. Slack remains identity-only. Client secrets and tokens are stored in macOS Keychain under a Brain-home-scoped account; only non-secret client/status metadata is stored under `config/local/connector-auth.yaml`. Authorization uses state validation, Google PKCE, Slack nonce validation, and a fixed loopback callback at `127.0.0.1:53682`. API responses never return secrets or tokens.
 
-The first operational connector is a separate read-only Calendar grant. Connector administration may share the manifest/auth/health UI, but Calendar reconciliation writes only through the operational service. It does not route event state through the knowledge action ledger.
+The manual shadow controller requires both Google grants and revalidates their exact account identities and scope sets immediately before every run. Calendar reconciliation and Gmail operational detection write only through the operational service. Neither routes evidence through inbox capture or the knowledge action ledger, and neither can send, edit, delete, label, accept, decline, or otherwise mutate provider data.
 
 Native connector cards expose lifecycle and source-specific status. OAuth setup provides provider-console navigation, redirect URL copy, client credential save, browser authorization with polling, and local disconnect. Full native forms for path/cadence settings remain incomplete.
 
@@ -114,6 +114,11 @@ Today is the only information-architecture change in the first operational relea
 
 The current implementation shows:
 
+- a manual **Run Shadow** action with accepted/running/complete/partial/failed progress;
+- per-source Calendar/Gmail freshness and complete/partial/unavailable coverage;
+- adaptive focus, urgent overflow, now/next, due, waiting, attention, awareness, uncertainty, and ignored/suppressed audit sections;
+- retained local evidence inspection plus separately labeled validated provider navigation;
+- local confirm, correct, done, snooze, dismiss, restore, and report-missing feedback where valid;
 - daemon/scheduler health;
 - latest nightly and eval/audit status;
 - index/embedding state;
@@ -123,7 +128,7 @@ The current implementation shows:
 
 Pulse items link into the owning destination. Errors remain specific and actionable. The current implementation is functional, but its Queue counts inherit the global-state reconciliation requirement above.
 
-An absent or failed source may never render as an empty all-clear. The briefing must say Calendar-only, Gmail-unavailable, stale, or incomplete as appropriate. Briefing prose and ranking are derived; `ops_items` and their source-backed transition history remain canonical.
+An absent or failed source may never render as an empty all-clear. The briefing says Calendar-only, Gmail-unavailable, stale, or incomplete as appropriate. Briefing prose and ranking are derived; `ops_items` and their source-backed transition history remain canonical. The shadow button has no schedule: the owner authorizes the grants and starts every live pass.
 
 ## Queue
 
@@ -281,8 +286,14 @@ Key UI endpoints:
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /api/digest` | implemented Today/global pulse; optional freshness-aware briefing is planned for COS-4 |
-| `POST /api/briefing/items/<id>/feedback` | planned COS-4 endpoint to correct, resolve, snooze, dismiss, or report an operational item |
+| `GET /api/digest` | existing knowledge/system pulse below Today |
+| `GET /api/v1/today` | implemented coverage-aware operational briefing |
+| `GET /api/v1/today/setup` | exact grant/policy readiness without returning secrets |
+| `POST /api/v1/today/run` and `GET /api/v1/today/run` | start one manual read-only pass and poll its state |
+| `POST /api/v1/today/items/<id>/feedback` | confirm, correct, resolve, snooze, dismiss, or restore an operational item |
+| `POST /api/v1/today/feedback/missing` | record a local shadow-evaluation miss |
+| `GET /api/ops/evidence` | read retained revision-bound Calendar/Gmail evidence through an allowlisted local route |
+| `GET /api/ops/items/<id>/meeting-packet` | derive a bounded meeting-preparation projection |
 | `GET /api/queue?kind=&sort=&limit=&cursor=` | deduplicated complete review cards |
 | `POST /api/queue/<id>/decision` | dispatch to owning primitive |
 | `POST /api/queue/undo` | guarded revert/reopen |

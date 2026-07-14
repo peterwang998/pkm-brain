@@ -1,7 +1,7 @@
 # Project Improvement Implementation Plan
 
-**Status:** knowledge-foundation program stable; operational Chief-of-Staff program started from commit `3937316`
-**Last verified:** 2026-07-13 against foundation commit `3937316` and the current working tree
+**Status:** knowledge foundation stable; manual Calendar/Gmail Chief-of-Staff shadow implementation complete with release verification pending
+**Last verified:** 2026-07-13 against foundation commit `3937316` and the current manual-shadow working tree
 **Inputs:** [Project Audit](../audits/project-audit-2026-07-10.md), the [canonical feature specs](../README.md), and the [Chief-of-Staff Operations Implementation Plan](chief-of-staff-operations-implementation-plan.md)
 
 ## Objective
@@ -15,9 +15,9 @@ Execute the improvement roadmap in releases that:
 - preserve reversible, eval-gated, local-first behavior;
 - preserve the working knowledge layer as the evidence foundation;
 - add proactive Chief-of-Staff operations through a separate Calendar-first bounded context;
-- defer Gmail content, external actions, and retrieval research until their prerequisites are real.
+- keep Gmail knowledge ingestion, external actions, and retrieval research gated independently from the approved operational shadow trial.
 
-This plan selects implementation order and interfaces. It does not authorize live data deletion, policy promotion, fact rebuilds, topology role changes, Gmail content access, or external provider mutation.
+This plan selects implementation order and interfaces. It does not authorize live data deletion, policy promotion, fact rebuilds, topology role changes, Gmail content access beyond the separately approved manual operational shadow lane, or any external provider mutation.
 
 ## Execution Snapshot
 
@@ -44,6 +44,15 @@ Knowledge foundation checkpoint `3937316`:
 - reconciled the Gmail benchmark to 1,653,671 total tokens including route resolution and corrected future source-date frontmatter;
 - passed 510 Python tests, 17 Swift tests, Ruff, and the full macOS UI acceptance path;
 - established the clean boundary for the separate operational program.
+
+Current manual-shadow implementation:
+
+- separate exact-scope owned-primary Calendar and Gmail read-only grants;
+- owner-only 7-day raw/30-day normalized evidence policy, no attachments, quoted-history stripping, and no provider writes;
+- resumable Calendar/Gmail readers, deterministic operational reconciliation, daily budgets, and a restricted one-stage Gmail detector;
+- Today run/progress, coverage-aware briefing, retained evidence inspection, ignored/suppressed audit, local feedback, and missing reports;
+- no schedule and no Gmail capture, retrieval indexing, document/chunk creation, fact extraction, or wiki mutation;
+- release verification and the first owner-authorized private run remain pending.
 
 Verified rollout results, 2026-07-11:
 
@@ -125,7 +134,7 @@ Ranks 1-8 are the original immediate knowledge-product program. Ranks 9-12 compl
 | R7 | privacy and compatibility cleanup | PRIVACY-1, LEGACY-1/2 | GROWTH-1, ARCH-1 |
 | R8 | recoverable/mobile topology | TOPO-1 through TOPO-5 | R7 data contracts |
 | R9 | new inputs and retrieval research | EMAIL-1, RETRIEVAL-1..N | explicit approval/eval gates |
-| COS-0..8 | proactive Chief-of-Staff operations | operational kernel, Calendar, Today, Gmail, reconciliation, guarded execution | foundation `3937316` and phase-specific gates |
+| COS-0..8 | proactive Chief-of-Staff operations | COS-0..2 complete; COS-3..5 manual shadow implemented/pending verification; COS-6..8 gated | foundation `3937316` and phase-specific gates |
 
 R2's UI and storage lanes may run in parallel in separate branches. The default single-agent sequence is TEST-1, GROWTH-1, then GROWTH-2.
 
@@ -774,7 +783,7 @@ Only after topology identity/fencing:
 
 ### EMAIL-1 - Superseded By Three-Lane Gmail Plan
 
-Identity-only Gmail authorization is complete. This older evidence-only package is replaced by COS-5 and COS-6 in the [Chief-of-Staff Operations Implementation Plan](chief-of-staff-operations-implementation-plan.md).
+The earlier identity-only Gmail package is superseded. The separately approved read-only operational shadow lane is now owned by COS-5, while any future evidence/retrieval or durable-knowledge lane remains independently gated by the [Chief-of-Staff Operations Implementation Plan](chief-of-staff-operations-implementation-plan.md).
 
 The replacement separates:
 
@@ -782,7 +791,7 @@ The replacement separates:
 2. conservative durable-fact admission through the existing Knowledge Curation pipeline;
 3. high-recall one-stage operational detection over changed mail without the fact critic/resolver loop.
 
-The current OAuth grant is identity-only. No Gmail message scope, sending, or full-corpus extraction is authorized in this phase.
+The manual shadow uses a separate exact `gmail.readonly` grant, bounded recent/unread access, 7/30-day retention, no attachments, and no provider writes. It does not authorize Gmail capture, retrieval indexing, durable-fact extraction, or full-corpus knowledge ingestion.
 
 Verified isolated benchmark, 2026-07-13: 90 days produced 6,650 normalized threads, 21,458 chunks, and 319.5 MB of allocated Brain index growth. Preprocessing reduced fact eligibility to 318 threads (4.8%). Three representative weekdays processed 13 eligible thread documents, generated 35 candidates and 21 applied facts, and consumed 1,653,671 combined extractor/resolver/evaluator tokens. The projected mean at observed eligible volume is about 448,792 total tokens/day; applying the full fact pipeline to every thread is rejected at an approximately 9.43-million-token/day counterfactual. See [Gmail Indexing Benchmark](../audits/gmail-indexing-benchmark-2026-07-13.md).
 
