@@ -2,6 +2,8 @@
 
 Use this runbook for the first private Calendar/Gmail evaluation in the macOS app. The trial is manual and read-only. It creates local operational state and feedback, but it cannot change Google data or add Gmail to Brain's knowledge layer.
 
+**Readiness:** local release verification completed on 2026-07-14 with Ruff green, 736 Python tests, 26 Swift tests, and a signed local app bundle built. The workflow is testing-ready; observed signed-app UI acceptance is a separate final gate. The first owner-authorized live trial and all promotion decisions remain pending, and this runbook does not claim live connector success.
+
 ## What This Trial Can Access
 
 Authorize two separate Google grants in **Ops > Connectors**:
@@ -20,7 +22,9 @@ The approved local policy is fixed at:
 - external Calendar/Gmail writes disabled;
 - bounded daily API, detector-call, and detector-token budgets.
 
-Changed Gmail thread text is sent only to the separately configured Gmail detector model in a restricted, tool-less session. Brain does not retain raw detector prompts or responses by default. The detector can suggest local operational items; deterministic code validates evidence and lifecycle effects before anything reaches `ops.sqlite`.
+Detector calls durably pre-reserve a conservative, no-refund input and total ceiling before launch. Gmail content is accepted only by the restricted Codex route, which enforces that same total as its per-process rollout cap and disables tools, network, session persistence, user configuration, rules, plugins, apps, MCP, hooks, memory, and subagents. Direct OpenAI, Anthropic, and Ollama selection fails closed. Provider-reported usage is logged separately; any positive call/input/total delta is added durably, while missing usage or an observed overage stops later calls and marks coverage partial.
+
+Changed Gmail thread text is sent only to the restricted Codex detector model in a tool-less session. Brain does not retain raw detector prompts or responses by default. The detector can suggest local operational items; deterministic code validates evidence and lifecycle effects before anything reaches `ops.sqlite`.
 
 Gmail capture, retrieval indexing, document/chunk creation, fact extraction, and wiki updates remain disabled. There is no automatic Shadow schedule. The owner—not an agent—authorizes both grants and starts every live pass.
 
@@ -35,7 +39,7 @@ Gmail capture, retrieval indexing, document/chunk creation, fact extraction, and
    - **Failed:** neither source produced usable current coverage. The displayed error is the starting point for diagnosis.
 5. Treat a partial or stale result as incomplete even when the visible focus list is empty. It is not an all-clear.
 
-The initial Calendar read is bounded to 14 days back and 90 days forward. Gmail starts with a bounded recent/unread operational window rather than importing historical mail.
+The initial Calendar read is bounded to 14 days back and 90 days forward. Gmail stays inside the most recent seven days, selecting the last two days plus unread mail, and processes at most 200 threads per manual run. Remaining work is retained as visible partial coverage for the next run rather than importing historical mail or blocking the app for an unbounded pass.
 
 ## Review What It Found
 
@@ -45,11 +49,12 @@ Use Today as the evaluation surface:
 - **Focus**, **Urgent overflow**, **Now and next**, **Due**, **Waiting**, **Attention**, **Awareness**, and **Uncertain** show what the current projection admitted.
 - **Ignored & suppressed audit** shows bounded reasons for material withheld from focus. Review this section as carefully as the surfaced items; it is where over-filtering becomes visible.
 - **Local evidence** opens the retained source revision in the app. A provider link, when shown, is a separately labeled convenience and is not the evidence authority.
+- **Prepare** on an upcoming Calendar item opens a bounded, read-only meeting packet using Calendar claims plus supported Brain facts/pages; suggestions are labeled and are never promoted to facts.
 
 For each useful sample:
 
 - choose **Looks right** when the item and next move are correct;
-- choose **Correct** and explain a wrong title, owner, date, or interpretation;
+- choose **This is wrong** and explain a wrong title, owner, date, or interpretation;
 - use **Done**, **Snooze**, **Dismiss**, or **Restore** only when that local operational action is accurate;
 - use **Report Missing** for an email or Calendar obligation that should have appeared, including a short source hint.
 
@@ -92,4 +97,4 @@ Stop testing, do not interpret the result as an all-clear, and preserve the disp
 - a provider/model budget is exceeded without a visible partial/deferred result;
 - credentials, refresh tokens, or full detector prompts appear in Brain config, logs, reports, or briefing records.
 
-Implementation is complete for this manual trial, but release verification and the first private live result remain pending until the owner performs the authorization and starts the run.
+Implementation and local release verification are complete for this manual trial. Observed signed-app UI acceptance remains a separate final gate. The first owner-authorized private live result, human review, and every promotion gate remain pending until the owner performs the authorization and starts the run.

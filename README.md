@@ -98,7 +98,7 @@ The existing autonomous subsystem is Knowledge Curation: it extracts facts from 
 
 The initial operational rollout is read-only and manual. After the owner separately authorizes the owned-primary Calendar grant and Gmail read-only grant, **Today > Run Shadow** performs one bounded pass, shows source coverage, surfaces operational candidates, explains ignored/suppressed material, opens retained local evidence, and accepts local corrections or missing-item reports. There is no schedule and no provider write capability. Gmail knowledge capture, retrieval indexing, and durable-fact ingestion remain disabled.
 
-The implementation is ready for release verification and the first owner-started private trial; it has not yet been promoted as trusted daily guidance. See [Chief-of-Staff Operations](docs/specs/chief-of-staff-operations.md) and the [Live Shadow Trial Runbook](docs/runbooks/chief-of-staff-shadow-trial.md).
+The implementation has passed local code, unit, integration, security-boundary, and signed-build verification and is ready for the first owner-started private trial. It has not yet been promoted as trusted daily guidance. See [Chief-of-Staff Operations](docs/specs/chief-of-staff-operations.md) and the [Live Shadow Trial Runbook](docs/runbooks/chief-of-staff-shadow-trial.md).
 
 Useful commands:
 

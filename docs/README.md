@@ -1,7 +1,7 @@
 # PKM Brain Documentation
 
 **Status:** authoritative docs index
-**Last verified:** 2026-07-13 against the current manual Calendar/Gmail shadow working tree; release verification pending
+**Last verified:** 2026-07-14 against the locally release-verified manual Calendar/Gmail shadow implementation; the first owner-authorized live result and promotion remain pending
 
 Current requirements are organized by product feature, not implementation stream. Start with Product Foundation, then read the owning feature spec for the behavior being changed.
 

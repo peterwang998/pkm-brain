@@ -1,7 +1,7 @@
 # App And Operations
 
-**Status:** canonical living feature spec; native app is primary, and the manual Calendar/Gmail shadow UI is implemented with release verification pending
-**Last verified:** 2026-07-13 against the current manual-shadow working tree; no private live result is claimed
+**Status:** canonical living feature spec; native app is primary, and the manual Calendar/Gmail shadow UI is locally release-verified and testing-ready, with the first owner-authorized live trial and promotion pending
+**Last verified:** 2026-07-14 with Ruff green, 736 Python tests, 26 Swift tests, and a signed local app bundle built; no private live connector result is claimed
 **Owns:** daemon, scheduler, connector operations, native/browser UI, settings, provisioning, packaging, migration, and operational retention
 
 ## Product Shape
@@ -109,7 +109,7 @@ Today is the only information-architecture change in the first operational relea
 - coverage and freshness, including which approved sources were or were not checked;
 - now/today/upcoming Calendar items;
 - commitments, waiting-on, deadlines, changes, and uncertainty once their source lanes exist;
-- evidence, why-surfaced context, confidence, and one-click correct/done/snooze/dismiss/report-missing feedback;
+- evidence, why-surfaced context, confidence, one-click **Looks right**/done/snooze/dismiss/restore/report-missing feedback, and note-required **This is wrong** correction;
 - existing Brain/system pulse below the personal briefing.
 
 The current implementation shows:
@@ -119,6 +119,7 @@ The current implementation shows:
 - adaptive focus, urgent overflow, now/next, due, waiting, attention, awareness, uncertainty, and ignored/suppressed audit sections;
 - retained local evidence inspection plus separately labeled validated provider navigation;
 - local confirm, correct, done, snooze, dismiss, restore, and report-missing feedback where valid;
+- a bounded native **Prepare** sheet for eligible Calendar items, with evidence-linked factual sections and clearly non-factual suggested talking points;
 - daemon/scheduler health;
 - latest nightly and eval/audit status;
 - index/embedding state;
@@ -232,7 +233,7 @@ Target Ops consolidates:
 - logs;
 - runtime versions, diagnostics, and prune dry-run.
 
-Current native Ops has segmented Scheduler, Runs, Connectors, and Storage views. It supports job run-now, pause/resume, automation/ingestion history, connector enable/disable/run, auth-only Gmail/Slack account setup, active/deferred review counts, and managed/runtime/backup storage inventory through `GET /api/ops/storage`. Action-ledger revert, policy/audit/contracts, index doctor, sync, and logs still require native sections.
+Current native Ops has segmented Scheduler, Runs, Connectors, and Storage views. It supports job run-now, pause/resume, automation/ingestion history, connector enable/disable/run, separate exact-scope Calendar and Gmail operational-shadow account setup, auth-only Slack account setup, active/deferred review counts, and managed/runtime/backup storage inventory through `GET /api/ops/storage`. Action-ledger revert, policy/audit/contracts, index doctor, sync, and logs still require native sections.
 
 Provider usage accounting is available operationally before the native Logs section: request events append to `<brain-home>/logs/llm-usage.log`, nightly/Knowledge Curation summaries include cycle usage, and `brain llm usage` reports timestamped per-cycle and per-role totals. The report distinguishes extractor, evaluator (internal critic), auditor, and any additional instrumented role, including cached versus uncached input and requests whose provider did not report tokens.
 
@@ -318,6 +319,8 @@ Provisioning checks bundle, local cache, then network. It smoke-tests `brain --v
 
 `scripts/build-app.sh` builds the exact project-version wheel, replaces stale runtime resources, resolves pinned Swift packages through absolute app-local cache paths, generates/builds the Xcode project, ad-hoc signs nested binaries and the app, and writes `dist/PKM Brain.app`. `scripts/install-app.sh` stages and verifies the bundle in `/Applications`, keeps one previous app rollback, refreshes the login item, and optionally activates the installed build.
 
+The 2026-07-14 local release gate completed with Ruff green, 736 Python tests and 26 Swift tests passing, and a signed `dist/PKM Brain.app` bundle built. This establishes local testing readiness only. The observed signed-app UI acceptance pass remains a separate final gate, and neither the build nor that UI gate claims successful Calendar/Gmail authorization, live source coverage, or promotion.
+
 Runtime versions are immutable deployment artifacts. Successful activation starts process-aware retention: current, one rollback, and every runtime referenced by a live process remain; inactive older versions are removed. Process inventory failure is fail-closed, and process output is drained before waiting for exit so large inventories cannot deadlock the retention task.
 
 The verified `0.1.1` activation reduced app runtimes from 36 directories and 34.71 GB to 6 directories and 5.83 GB, reclaiming about 28.9 GB. It retained the new current runtime, one rollback, and all four older runtime IDs referenced by 12 live MCP/resource-tracker processes. User-created Brain backups, migration backups, and sibling runtime backups were not deleted.
@@ -389,3 +392,5 @@ scripts/m2-clean-machine-acceptance.sh
 scripts/m3-migration-acceptance.sh
 scripts/build-app.sh
 ```
+
+The latest local result is Ruff green, 736 Python tests passing, 26 Swift tests passing, and a signed app bundle built. Observed signed-app UI acceptance remains a separate final gate; the first owner-authorized live shadow trial is an independent, pending source-evaluation step.

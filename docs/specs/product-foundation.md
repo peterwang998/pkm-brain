@@ -1,7 +1,7 @@
 # Product Foundation
 
-**Status:** canonical living feature spec
-**Last verified:** 2026-07-13 against the current knowledge-layer implementation; the operational Chief-of-Staff boundary below is the additive target contract
+**Status:** canonical living feature spec; the manual read-only Chief-of-Staff trial is locally release-verified and testing-ready, while its first owner-authorized live run and promotion remain pending
+**Last verified:** 2026-07-14 with Ruff green, 736 Python tests, 26 Swift tests, and a signed local app bundle built; no live connector result is claimed
 **Owns:** product boundaries, authority hierarchy, persistence model, privacy rules, and cross-feature invariants
 
 ## Purpose
@@ -181,6 +181,8 @@ Swift and browser clients never open either SQLite database or LanceDB directly.
 - Notifications contain status and counts, not private document contents.
 - Secrets and private key material are never written into shared config or docs.
 - Operational action scopes use the narrowest approved provider capability and keep secrets in machine-local credential storage.
+- The approved private Calendar/Gmail trial keeps separate exact-scope read-only grants, retains owner-only raw resumable payloads for 7 days and normalized revision evidence for 30 days, never fetches attachments, strips quoted Gmail history before normalized retention, and enables no external provider writes.
+- Raw operational detector prompts and responses are not retained by default; the live Gmail detector is restricted, tool-less, explicitly budgeted, and cannot bypass deterministic evidence and lifecycle validation.
 
 Allowed network activity is limited to explicitly configured LLM, connector, and guarded-action providers; dependency/runtime provisioning; model downloads; and pinned SSH sync.
 
@@ -200,7 +202,9 @@ Allowed network activity is limited to explicitly configured LLM, connector, and
 
 The core local Knowledge Curation pipeline, fact/entity ledger, action policy, managed pages, retrieval, MCP, native daemon/app, and Primary/Secondary sync are implemented. The current schema version is 21. Existing `cos_*` code and tables implement Knowledge Curation despite their historical names.
 
-The Operational Chief-of-Staff context is additive work. An isolated, independently migrated `ops.sqlite` kernel, a daemon-owned fail-closed mutation service, and coordinated database-pair recovery now exist in the implementation tree. The daemon does not initialize the operational store or schedule operational work; `brain init`, connectors, CLI, API, and UI do not mutate it. Restores publish only into a new quarantined home and cannot become a writer until a future explicit topology activation workflow. Until source integration, reconciliation evaluation, and read-only briefing gates ship, Today and the existing connector shell retain their current behavior and no external-action authority exists.
+The Operational Chief-of-Staff context now has an isolated, independently migrated `ops.sqlite` kernel, a daemon-owned fail-closed mutation service, coordinated database-pair recovery, read-only Calendar/Gmail source integration, deterministic reconciliation, a coverage-aware Today briefing, local feedback, and offline replay evaluation. The daemon initializes and serves the operational store, but does not schedule the shadow pass: the owner must authorize two exact-scope Google grants and select **Today > Run Shadow** for every live pass. Operational writes remain local to `ops.sqlite`; Calendar/Gmail knowledge ingestion and all external-action authority remain disabled. Restores publish only into a new quarantined home and cannot become a writer until a future explicit topology activation workflow.
+
+The 2026-07-14 local release gate is complete: Ruff is green, 736 Python tests and 26 Swift tests pass, and the signed local app bundle builds. That makes the manual workflow testing-ready; observed signed-app UI acceptance remains a separate final gate. Neither establishes live connector success, private-source quality, daily briefing trust, or promotion. The first owner-authorized live trial and the owning spec's empirical gates remain pending.
 
 The item lifecycle, source-specific detection, reconciliation, briefing, evaluation, and execution protocol are specified in [Chief-of-Staff Operations](chief-of-staff-operations.md). This foundation owns the boundary between that context and existing Knowledge Curation.
 

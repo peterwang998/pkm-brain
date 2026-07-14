@@ -1,7 +1,7 @@
 # PKM Brain Architecture Code Guide
 
 **Status:** current code-navigation guide
-**Last verified:** 2026-07-13 against the current manual Calendar/Gmail shadow working tree; release verification pending
+**Last verified:** 2026-07-14 against the locally release-verified manual Calendar/Gmail shadow implementation
 
 This guide answers where behavior lives. Feature requirements and open work belong in [the specs index](README.md), not here.
 
@@ -131,7 +131,7 @@ The `cos_*` surface is a legacy physical name for Knowledge Curation. It must no
 - `operational_briefing.py`, `operational_today.py`, and `today_presentation.py`: deterministic briefing projection, ignored/suppressed audit, evidence navigation, and local feedback contracts.
 - `paths.py`: `BrainPaths.ops_sqlite_path` resolves the operational database inside the same Brain home.
 
-The provider-read-only/local-write manual shadow slice is implemented. Release verification, the first owner-started private evaluation, cross-source episode linking, scheduling, and guarded execution remain gated by [Chief-of-Staff Operations](specs/chief-of-staff-operations.md).
+The provider-read-only/local-write manual shadow slice is implemented and locally release-verified. The first owner-started private evaluation, cross-source episode linking, scheduling, production trust, and guarded execution remain gated by [Chief-of-Staff Operations](specs/chief-of-staff-operations.md).
 
 ### Retrieval And Memory
 

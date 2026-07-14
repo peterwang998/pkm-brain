@@ -1,7 +1,7 @@
 # Chief Of Staff Operations
 
-**Status:** canonical feature spec; the manual Calendar/Gmail shadow implementation is complete, with release verification and the first owner-started live trial pending
-**Last verified:** 2026-07-13 against the current manual-shadow implementation; no private live result is claimed
+**Status:** canonical feature spec; the manual Calendar/Gmail shadow implementation is locally release-verified and testing-ready, with the first owner-authorized live trial and promotion still pending
+**Last verified:** 2026-07-14 with Ruff green, 736 Python tests, 26 Swift tests, and a signed local app bundle built; no private live connector result or promotion is claimed
 **Owns:** operational items, reconciliation, briefings, operational evaluation, and guarded external execution
 
 ## Mission And Product Boundary
@@ -46,6 +46,8 @@ One asynchronous run reads Calendar and Gmail independently, reconciles bounded 
 This slice is not scheduled. It does not write `inbox/`, `brain.sqlite`, documents, chunks, facts, entities, or wiki pages. Gmail retrieval indexing and durable-knowledge ingestion remain disabled. Feedback, missing-item reports, observations, current items, and briefing snapshots are local operational records only. The owner—not an agent or background job—authorizes both grants and starts the first live run.
 
 Implementation completion does not equal promotion. The first private trial must still establish labeled recall, false-alarm, duplicate, stale, handled-state, evidence-route, coverage, and cost behavior before the briefing can be treated as trusted daily operational guidance.
+
+Local release verification is complete: Ruff is green, 736 Python tests and 26 Swift tests pass, and the signed local app bundle builds. This establishes that the manual trial is testing-ready, not that either connector has succeeded against private live data. An observed signed-app UI acceptance pass remains a separate final gate. The first owner-authorized live result, its human labels, and every Calendar, Gmail, cross-source, meeting-preparation, and daily-briefing promotion gate remain pending.
 
 The owner-facing procedure is [Live Chief-of-Staff Shadow Trial](../runbooks/chief-of-staff-shadow-trial.md). Offline chronological scoring remains documented separately in [Retrospective Shadow Replay](../runbooks/chief-of-staff-shadow-replay.md).
 
@@ -438,9 +440,9 @@ V1 permits at most one semantic detector pass per changed thread, or one request
 - no truth-maintenance loop;
 - no automatic retry that multiplies calls for every ambiguity.
 
-Malformed output produces no items and remains retryable on a later connector run. Ambiguity becomes an active low-confidence item with provisional/ambiguous reconciliation metadata, or no item, not an adjudication request.
+Malformed output produces no model-authored item. Any thread admitted to semantic detection may instead receive a clearly labeled low-confidence attention fallback so detector failure is visible; direct and high-consequence obligations receive the stronger no-suppress treatment and ranking. The fallback decision is cached for that exact source revision to avoid repeated billing, and a newer revision is eligible for detection again. Deterministic ambiguity may otherwise produce a provisional item or no item, but never an adjudicated lifecycle effect.
 
-Daily request/input/token budgets are explicit configuration. Each detector attempt durably pre-reserves a conservative, no-refund input and total ceiling before launch. The restricted Codex route enforces that same total as a provider-side rollout cap. Provider-reported actual usage, when available, is recorded separately in LLM usage telemetry and does not reduce the reservation. Explicitly selected providers without an equivalent in-flight cap retain a circuit-breaker caveat: one already-running call may exceed its reservation, while later exhausted work is deferred with visible partial coverage. Overflow is never silently dropped. Production enablement requires a chronological replay demonstrating that the approved budget covers normal and high-volume days.
+Daily request/input/token budgets are explicit configuration. Each detector attempt durably pre-reserves a conservative, no-refund input and total ceiling before launch, and the only supported live provider is the restricted Codex route with its matching in-flight rollout cap. Provider-reported usage is recorded separately and any positive call/input/total delta is durably added after the attempt; missing usage or an observed overage stops later calls and makes coverage partial. Overflow is never silently dropped. Production enablement requires a chronological replay demonstrating that the approved budget covers normal and high-volume days.
 
 ## Later Read-Only Adapters
 
@@ -503,6 +505,7 @@ Every briefing item exposes:
 - handled verdict plus checked-source coverage where applicable;
 - due/start/expiry with source timezone where relevant;
 - confidence and reconciliation status;
+- a source-backed named counterparty or organization when one is asserted; generic labels such as “customer” remain explicitly unidentified rather than being presented as a specific entity;
 - bounded local evidence navigation and validated provider-native navigation where authorized;
 - local `confirm`, `done`, `dismiss`, `snooze`, and correction actions that apply to its kind/state.
 
@@ -800,5 +803,7 @@ uv run python -m pkm_brain.operational_replay --help
 swift test --package-path app
 scripts/build-app.sh
 ```
+
+Latest local release verification completed on 2026-07-14 with Ruff green, 736 Python tests passing, 26 Swift tests passing, and the signed local app bundle built. This is a build/test gate only; observed signed-app UI acceptance remains a separate final gate, and the owner-authorized live trial plus all empirical promotion gates remain open.
 
 The implementation plan owns release sequencing. This spec owns the behavior and promotion gates.

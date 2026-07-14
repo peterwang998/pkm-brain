@@ -1,7 +1,7 @@
 # Chief-of-Staff Operations Implementation Plan
 
-**Status:** manual Calendar/Gmail shadow implementation complete; release verification and the first owner-started private trial are pending
-**Last verified:** 2026-07-13 against the current manual-shadow implementation; no live promotion result is claimed
+**Status:** manual Calendar/Gmail shadow implementation is locally release-verified and testing-ready; the first owner-authorized live trial and every promotion gate remain pending
+**Last verified:** 2026-07-14 with Ruff green, 736 Python tests, 26 Swift tests, and a signed local app bundle built; no live connector result or promotion is claimed
 **Owning spec:** [Chief-of-Staff Operations](../specs/chief-of-staff-operations.md)
 
 ## Outcome
@@ -35,14 +35,16 @@ The program keeps one product, one app, one coordinator daemon, and one Brain ho
 | COS-0 | verified knowledge-layer foundation | none | complete |
 | COS-1 | canonical boundary, local policy, adapter, privacy, eval, and rollout contracts | none | complete |
 | COS-2 | separate operational kernel and deterministic lifecycle | none | complete |
-| COS-3 | read-only Calendar evidence and reconciliation | none | implemented for manual shadow; verification pending |
-| COS-4 | coverage-aware Today focus, feedback, evidence audit, and basic meeting preparation API | none | manual shadow implemented; verification pending |
-| COS-5 | one-stage Gmail operational detection and source-local satisfaction | none | manual shadow implemented; promotion pending |
+| COS-3 | read-only Calendar evidence and reconciliation | none | locally verified; owner trial and promotion pending |
+| COS-4 | coverage-aware Today focus, feedback, evidence audit, and basic meeting preparation API | none | locally verified; owner trial and promotion pending |
+| COS-5 | one-stage Gmail operational detection and source-local satisfaction | none | locally verified; owner trial and promotion pending |
 | COS-6 | reversible cross-source episodes, satisfaction, and production briefing gates | none | gated |
 | COS-7 | local draft/action plans with guarded approval protocol | none | gated |
 | COS-8 | capability-by-capability external execution | explicit only | gated |
 
 Calendar and the operational kernel preceded Gmail implementation. The owner has separately approved Gmail read-only access for a private operational shadow trial, but that does not promote either source or enable Gmail retrieval/knowledge ingestion. Source-local detection and satisfaction must work before cross-source aggregation. Reconciliation must work before the briefing is considered trustworthy. Optional adapters follow the same contract and cannot bypass Calendar/Gmail gates. Drafting must work before execution.
+
+Local release verification completed on 2026-07-14: Ruff was green, all 736 Python tests and 26 Swift tests passed, and the signed local app bundle built successfully. These checks establish testing readiness only. The observed signed-app UI acceptance pass remains a separate final gate. Neither result proves Google authorization, live source coverage, detector quality on private mail, daily briefing trust, or any promotion gate; the first owner-authorized live trial remains the next source-evaluation step.
 
 ## COS-0 - Knowledge Foundation Baseline
 
@@ -209,7 +211,7 @@ An opted-in Calendar shadow run produces no LLM calls and no external mutation, 
 
 ### Current implementation
 
-The manual runner now uses a separate exact-scope Calendar grant, reads only `primary` with recurring instances expanded, includes deletions, preserves recurrence/exception identity, and applies observations plus cursor progress atomically. It uses a bounded 14-day past/90-day future initial window, persists resumable page/sync checkpoints, enforces a durable daily request budget on every provider attempt, retains revision-addressed evidence, and reports incomplete coverage rather than advancing past failed work. Release verification and the first owner-started live run remain pending.
+The manual runner now uses a separate exact-scope Calendar grant, reads only `primary` with recurring instances expanded, includes deletions, preserves recurrence/exception identity, and applies observations plus cursor progress atomically. It uses a bounded 14-day past/90-day future initial window, persists resumable page/sync checkpoints, enforces a durable daily request budget on every provider attempt, retains revision-addressed evidence, and reports incomplete coverage rather than advancing past failed work. Local release verification is complete; the first owner-authorized live run and Calendar promotion evidence remain pending.
 
 ## COS-4 - Today Shadow Briefing
 
@@ -247,7 +249,7 @@ A user can inspect and correct a Calendar-backed briefing for at least two weeks
 
 ### Current implementation
 
-Today now exposes **Run Shadow**, polls one background run through accepted/running/terminal state, refreshes the briefing on complete or partial results, and keeps Calendar and Gmail coverage visible. The briefing includes adaptive focus, current/upcoming events, due/waiting/attention/awareness/uncertain sections, and an ignored/suppressed audit. Cards can open retained local evidence. Local confirm, correct, done, snooze, dismiss, restore, and report-missing actions write only operational feedback. The meeting-packet projection and API exist, but its final native interaction and live factual-claim evaluation remain part of release verification. There is no automatic run schedule.
+Today now exposes **Run Shadow**, polls one background run through accepted/running/terminal state, refreshes the briefing on complete or partial results, and keeps Calendar and Gmail coverage visible. The briefing includes adaptive focus, current/upcoming events, due/waiting/attention/awareness/uncertain sections, and an ignored/suppressed audit. Cards can open retained local evidence. Local confirm, note-required correction, done, snooze, dismiss, restore, and report-missing actions write only operational feedback. The meeting-packet projection, API, and native **Prepare** interaction are implemented and covered by automated/local build verification; observed signed-app UI acceptance, the first private source-backed result, and factual-claim promotion evaluation remain pending. There is no automatic run schedule.
 
 ## COS-5 - Gmail Operational Detection
 
@@ -293,7 +295,7 @@ Severity-weighted recall, false-alarm rate, source-date accuracy, handled-verdic
 
 ### Current implementation
 
-The owner-approved private lane uses a separate exact `gmail.readonly` grant, a bounded recent/unread initial query, resumable mailbox/history pagination, deterministic MIME normalization, quoted-history stripping, and no attachment fetches. A restricted, tool-less detector receives bounded changed-thread content and returns schema-validated suggestions; deterministic code validates evidence and lifecycle effects before applying operational state. Daily API/call/token reservations fail visibly into partial coverage. Raw resumable payloads expire after 7 days and normalized revision evidence after 30 days. Implementation is complete for manual shadow evaluation, but the held-out promotion gate and first owner-started private trial are pending.
+The owner-approved private lane uses a separate exact `gmail.readonly` grant, a seven-day recent/unread initial query, a 200-thread manual-run cap, resumable mailbox/history pagination, deterministic MIME normalization, quoted-history stripping, and no attachment fetches. Only the restricted, tool-less Codex detector may receive bounded changed-thread content; it returns schema-validated suggestions and deterministic code validates evidence and lifecycle effects before applying operational state. Daily API/call/token reservations, provider-reported positive usage deltas, and missing-usage/overage stops fail visibly into partial coverage. Raw resumable payloads expire after 7 days and normalized revision evidence after 30 days. The lane is locally release-verified and testing-ready, but no successful live connector result is claimed; the first owner-authorized private trial and held-out promotion gate remain pending.
 
 ## COS-6 - Cross-Source Reconciliation
 

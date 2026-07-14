@@ -1,7 +1,7 @@
 # Project Improvement Implementation Plan
 
-**Status:** knowledge foundation stable; manual Calendar/Gmail Chief-of-Staff shadow implementation complete with release verification pending
-**Last verified:** 2026-07-13 against foundation commit `3937316` and the current manual-shadow working tree
+**Status:** knowledge foundation stable; manual Calendar/Gmail Chief-of-Staff shadow implementation locally release-verified and testing-ready, with the first owner-authorized live trial and promotion pending
+**Last verified:** 2026-07-14 against foundation commit `3937316` and the locally verified manual-shadow implementation
 **Inputs:** [Project Audit](../audits/project-audit-2026-07-10.md), the [canonical feature specs](../README.md), and the [Chief-of-Staff Operations Implementation Plan](chief-of-staff-operations-implementation-plan.md)
 
 ## Objective
@@ -52,7 +52,7 @@ Current manual-shadow implementation:
 - resumable Calendar/Gmail readers, deterministic operational reconciliation, daily budgets, and a restricted one-stage Gmail detector;
 - Today run/progress, coverage-aware briefing, retained evidence inspection, ignored/suppressed audit, local feedback, and missing reports;
 - no schedule and no Gmail capture, retrieval indexing, document/chunk creation, fact extraction, or wiki mutation;
-- release verification and the first owner-authorized private run remain pending.
+- local release verification is complete; the first owner-authorized private run, human review, and every promotion gate remain pending.
 
 Verified rollout results, 2026-07-11:
 
