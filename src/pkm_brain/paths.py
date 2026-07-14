@@ -75,6 +75,26 @@ class BrainPaths:
         return self.db_dir / "ops.sqlite"
 
     @property
+    def operational_writer_lock_file(self) -> Path:
+        return self.config_local / "operational-writer.lock"
+
+    @property
+    def recovery_generation_file(self) -> Path:
+        return self.config_local / "recovery-generation"
+
+    @property
+    def restore_quarantine_file(self) -> Path:
+        return self.config_local / "restore-quarantine.json"
+
+    @property
+    def brain_identity_file(self) -> Path:
+        return self.config_shared / "brain_id"
+
+    @property
+    def recovery_root(self) -> Path:
+        return self.home / "backups" / "recovery"
+
+    @property
     def lancedb_path(self) -> Path:
         return self.indexes / "lancedb"
 

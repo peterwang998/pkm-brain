@@ -107,6 +107,7 @@ class BrainUIServer(ThreadingHTTPServer):
     daemon_runtime_id: str | None
     daemon_started_at: str | None
     daemon_scheduler: Any | None
+    daemon_operational_service: Any | None
     daemon_shutdown_enabled: bool
 
 
@@ -504,6 +505,7 @@ def create_ui_server(
     server.daemon_runtime_id = None
     server.daemon_started_at = None
     server.daemon_scheduler = None
+    server.daemon_operational_service = None
     server.daemon_shutdown_enabled = False
     return server
 

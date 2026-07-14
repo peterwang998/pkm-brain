@@ -221,7 +221,7 @@ The recovery manifest records at minimum:
 - runtime compatibility and encryption/transport metadata;
 - completion status that is written only after every member is durable.
 
-The pair is encrypted/transported under the same trust boundary and stored as a recovery artifact on children. It is not opened concurrently as the child mirror database. Restore occurs into an isolated home, verifies both databases and the manifest, and rejects a mixed or incomplete generation by default. Losing rebuildable indexes or briefing prose is acceptable; losing reviewed knowledge state, operational feedback, or execution audit is not.
+The pair is encrypted/transported under the same trust boundary and stored as a recovery artifact on children. It is not opened concurrently as the child mirror database. Restore occurs into an isolated home, verifies both databases and the manifest, and rejects a mixed or incomplete generation by default. The restored home carries a local quarantine marker: the daemon and operational service fail closed until a future explicit activation workflow validates topology and clears that marker. Losing rebuildable indexes or briefing prose is acceptable; losing reviewed knowledge state, operational feedback, or execution audit is not.
 
 ### Shared Topology Record
 

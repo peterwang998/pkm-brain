@@ -18,6 +18,7 @@ from pkm_brain.daemon import (
     SchedulerJob,
     SerialJobScheduler,
     daemon_handshake_path,
+    daemon_lock_path,
     parent_process_missing,
     scheduler_config_path,
 )
@@ -25,6 +26,7 @@ from pkm_brain.automation import run_nightly_maintenance
 from pkm_brain.connectors import load_connector_config, save_connector_config
 from pkm_brain.db import connection
 from pkm_brain.paths import BrainPaths
+from pkm_brain.operational_service import OperationalWriteRefusedError
 from pkm_brain.sync_config import PeerConfig, PrimaryConfig, SyncConfig, write_sync_config
 from pkm_brain.sync_setup import init_secondary
 
@@ -138,6 +140,104 @@ def test_daemon_health_does_not_load_sentence_transformers(tmp_path: Path) -> No
     assert body["ok"] is True
     assert elapsed < 0.05
     assert "sentence_transformers" not in sys.modules
+
+
+def test_daemon_writer_lease_fences_operational_service(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    runtime = BrainDaemon(paths, start_scheduler=False)
+
+    with pytest.raises(OperationalWriteRefusedError, match="writer lease"):
+        runtime.operational_service.initialize()
+
+    runtime.start()
+    try:
+        runtime.operational_service.initialize()
+        assert paths.ops_sqlite_path.exists()
+    finally:
+        runtime.close()
+
+    with pytest.raises(OperationalWriteRefusedError, match="writer lease"):
+        runtime.operational_service.save_source_cursor(
+            "calendar",
+            "account-1",
+            "primary",
+            source_type="google_calendar",
+            cursor="late-write",
+        )
+
+
+def test_daemon_close_waits_for_operational_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    runtime = BrainDaemon(paths, start_scheduler=False)
+    runtime._acquire_lock()
+    runtime.operational_service.initialize()
+    mutation_entered = threading.Event()
+    release_mutation = threading.Event()
+    errors: list[BaseException] = []
+
+    def blocking_save(*_args: object, **_kwargs: object) -> dict[str, bool]:
+        mutation_entered.set()
+        assert release_mutation.wait(timeout=5)
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        "pkm_brain.operational_service.save_source_cursor",
+        blocking_save,
+    )
+
+    def mutate() -> None:
+        try:
+            runtime.operational_service.save_source_cursor(
+                "calendar",
+                "account-1",
+                "primary",
+                source_type="google_calendar",
+                cursor="cursor-1",
+            )
+        except BaseException as exc:  # pragma: no cover - assertion reports it
+            errors.append(exc)
+
+    mutation = threading.Thread(target=mutate)
+    mutation.start()
+    assert mutation_entered.wait(timeout=2)
+    closing = threading.Thread(target=runtime.close)
+    closing.start()
+
+    time.sleep(0.1)
+    assert closing.is_alive()
+    replacement = BrainDaemon(paths, start_scheduler=False)
+    with pytest.raises(RuntimeError, match="already running"):
+        replacement._acquire_lock()
+
+    release_mutation.set()
+    mutation.join(timeout=2)
+    closing.join(timeout=2)
+    assert not errors
+    assert not mutation.is_alive()
+    assert not closing.is_alive()
+
+    replacement._acquire_lock()
+    replacement._release_lock()
+
+
+def test_replaced_daemon_lock_revokes_operational_writer(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    runtime = BrainDaemon(paths, start_scheduler=False)
+    runtime._acquire_lock()
+    lock_path = daemon_lock_path(paths)
+    lock_path.unlink()
+    lock_path.touch(mode=0o600)
+    replacement = BrainDaemon(paths, start_scheduler=False)
+    replacement._acquire_lock()
+    try:
+        with pytest.raises(OperationalWriteRefusedError, match="writer lease"):
+            runtime.operational_service.initialize()
+    finally:
+        replacement._release_lock()
+        runtime._release_lock()
 
 
 def test_daemon_static_ui_is_gated_by_serve_web(tmp_path: Path) -> None:

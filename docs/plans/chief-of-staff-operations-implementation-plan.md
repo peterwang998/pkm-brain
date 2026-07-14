@@ -1,7 +1,7 @@
 # Chief-of-Staff Operations Implementation Plan
 
-**Status:** execution started; COS-0 complete, COS-1/COS-2 in progress; the COS-2 isolated kernel slice is implemented
-**Last verified:** 2026-07-13 against architecture commit `a44b713` plus the current operational-kernel working tree
+**Status:** execution started; COS-0/COS-2 complete, COS-1 in progress; Calendar production access remains disabled
+**Last verified:** 2026-07-13 against contract commit `005ff63` plus the current COS-2 service/recovery working tree
 **Owning spec:** [Chief-of-Staff Operations](../specs/chief-of-staff-operations.md)
 
 ## Outcome
@@ -34,7 +34,7 @@ The program keeps one product, one app, one coordinator daemon, and one Brain ho
 |---|---|---:|---|
 | COS-0 | verified knowledge-layer foundation | none | complete |
 | COS-1 | canonical boundary, local policy, adapter, privacy, eval, and rollout contracts | none | in progress |
-| COS-2 | separate operational kernel and deterministic lifecycle | none | in progress |
+| COS-2 | separate operational kernel and deterministic lifecycle | none | complete |
 | COS-3 | read-only Calendar evidence and reconciliation | none | planned |
 | COS-4 | coverage-aware Today focus, feedback, and basic meeting preparation | none | planned |
 | COS-5 | Gmail retrieval, one-stage operational detection, and source-local satisfaction | none | gated |
@@ -79,7 +79,7 @@ Conceptual documentation changes immediately from "Chief-of-Staff curation" to "
 
 Every new operational table, job, adapter, API, and UI control has exactly one owning spec. No document describes `cos_actions` as the operational action ledger. The local operations policy and every enabled adapter validate against a versioned schema, and evaluation can distinguish item-state, handled-state, episode-link, focus-selection, and evidence-link errors.
 
-The initial architecture and privacy contracts were completed by commit `a44b713`; the operator-policy, adapter, handled-state, focus, meeting-preparation, and episode-relation amendment is the next isolated contract commit. The versioned private-eval fixture artifact remains before the COS-1 exit gate closes.
+The initial architecture and privacy contracts were completed by commit `a44b713`; the operator-policy, adapter, handled-state, focus, meeting-preparation, and episode-relation amendment was completed by commit `005ff63`. The versioned private-eval fixture artifact remains before the COS-1 exit gate closes.
 
 ## COS-2 - Operational Kernel
 
@@ -130,18 +130,24 @@ Rules:
 - `operational_migrations.py`
 - `operational_db.py`
 - `operational_state.py`
+- `operational_service.py`
+- `recovery.py`
 - `paths.py` for the operational DB path
 
 ### Current implementation
 
-The first isolated kernel slice exists in the current tree:
+The completed COS-2 foundation consists of:
 
 - independently migrated `ops.sqlite` tables and an explicit bootstrap path;
 - immutable bounded observations, canonical items, append-only hashed events, and replay-safe source cursors with generation compare-and-swap;
 - exact source-unit binding, strict UTC normalization for present timestamps, provider-authority reconciliation, stale/equal-authority protection, lifecycle feedback, and one atomic source-unit/cursor batch primitive;
-- owner-only database/WAL/SHM handling, bounded lock retry, and focused isolation/concurrency tests.
+- owner-only database/WAL/SHM handling, bounded lock retry, and focused isolation/concurrency tests;
+- a daemon-owned operational service that revalidates role, home, node identity, restore quarantine, and the active daemon lease for every mutation, with in-process and cross-process serialization;
+- fail-closed handling for secondary, malformed, missing-after-configuration, mismatched, replaced-lock, and restored-home authority states;
+- one owner-only, checksummed `database_pair` recovery generation created under a fixed SQLite write barrier, with exact schema/integrity validation and a durable completion marker;
+- isolated restore that binds copied database content to the recovery manifest, preserves knowledge review plus operational feedback/cursors, and remains quarantined until a future explicit topology activation workflow.
 
-It is intentionally not called by `brain init`, the daemon, connectors, CLI, API, or UI yet. The local operations policy, adapter workers, handled assessment, focus projection, and relation layer also remain unwired. Before COS-2 is complete, the service layer must add primary/single-role writer fencing and serialized mutation ownership, and coordinated backup/restore must cover `brain.sqlite` plus `ops.sqlite`. Until then, no production operational database or behavior is enabled.
+`brain init`, connectors, CLI, API, and UI still do not initialize or mutate the operational store. The daemon now owns one dormant `OperationalService` instance and exposes that same fenced instance to its server for later phases; it does not initialize `ops.sqlite` or schedule operational work. The local operations policy, adapter workers, handled assessment, focus projection, and relation layer remain unwired, so no production operational behavior or external-action authority is enabled.
 
 ### Verification
 
@@ -158,6 +164,8 @@ It is intentionally not called by `brain init`, the daemon, connectors, CLI, API
 ### Exit gate
 
 A deterministic fixture replay can create, update, reschedule, cancel, resolve, and dismiss one item without duplication or any `brain.sqlite` mutation. The daemon/service rejects secondary writes, and a coordinated backup/restore fixture preserves the item and its human feedback.
+
+This gate passes in the COS-2 working tree. Cross-process lease contention, daemon-close quiescence, topology fail-closed cases, matched WAL-backed recovery, tamper/mixed-generation rejection, manifest-bound isolated restore, and restored-home quarantine are covered explicitly.
 
 ## COS-3 - Read-Only Calendar
 
@@ -410,7 +418,7 @@ Use separate commits for:
 1. knowledge foundation (`3937316`);
 2. initial operational specs/plan (`a44b713`);
 3. operational DB/kernel (`03be261`);
-4. local-policy, adapter, handled-state, focus, evidence-link, meeting-preparation, and episode-relation contract amendment;
+4. local-policy, adapter, handled-state, focus, evidence-link, meeting-preparation, and episode-relation contract amendment (`005ff63`);
 5. COS-2 writer fencing plus coordinated backup/restore;
 6. Calendar adapter plus operations-policy schema/loader and safe route builder;
 7. Today focus/API/UI plus Calendar/Brain meeting preparation;

@@ -5,6 +5,7 @@ import json
 import os
 import queue
 import secrets
+import stat
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -21,6 +22,7 @@ from .automation import (
     run_secondary_tick,
 )
 from .migrations import MIGRATIONS
+from .operational_service import OperationalService, OperationalWriteRefusedError
 from .paths import BrainPaths
 from .service import BrainService
 from .sync_config import load_sync_config
@@ -392,41 +394,74 @@ class BrainDaemon:
         self.server: BrainUIServer | None = None
         self.scheduler: SerialJobScheduler | None = None
         self._lock_file: Any | None = None
+        self._lock_owner_pid: int | None = None
+        self.operational_service = OperationalService(
+            self.paths,
+            writer_guard=self._assert_writer_lease,
+        )
         self._parent_monitor_stop = threading.Event()
         self._parent_monitor_thread: threading.Thread | None = None
 
     def start(self) -> None:
-        BrainService(self.paths).init_workspace()
+        if (
+            self.paths.restore_quarantine_file.exists()
+            or self.paths.restore_quarantine_file.is_symlink()
+        ):
+            raise RuntimeError(
+                "restored Brain home is quarantined until explicit activation"
+            )
         self._acquire_lock()
-        self.scheduler = SerialJobScheduler(self.paths, tick_seconds=self.scheduler_tick_seconds)
-        self.server = create_ui_server(
-            self.paths,
-            self.host,
-            self.port,
-            token=self.token,
-            serve_static=self.serve_web,
-        )
-        self.server.daemon_version = self.version
-        self.server.daemon_runtime_id = self.runtime_id
-        self.server.daemon_started_at = self.started_at
-        self.server.daemon_scheduler = self.scheduler
-        self.server.daemon_shutdown_enabled = True
-        host, actual_port = self.server.server_address
-        payload = {
-            "pid": os.getpid(),
-            "port": int(actual_port),
-            "token": self.token,
-            "version": self.version,
-            "runtime_id": self.runtime_id,
-            "home": str(self.paths.home),
-            "started_at": self.started_at,
-            "host": str(host),
-        }
-        atomic_write_private_json(daemon_handshake_path(self.paths), payload)
-        self._log({"event": "daemon_started", "port": int(actual_port), "serve_web": self.serve_web})
-        self._start_parent_monitor()
-        if self.start_scheduler:
-            self.scheduler.start()
+        try:
+            BrainService(self.paths).init_workspace()
+            self.scheduler = SerialJobScheduler(
+                self.paths,
+                tick_seconds=self.scheduler_tick_seconds,
+            )
+            self.server = create_ui_server(
+                self.paths,
+                self.host,
+                self.port,
+                token=self.token,
+                serve_static=self.serve_web,
+            )
+            self.server.daemon_version = self.version
+            self.server.daemon_runtime_id = self.runtime_id
+            self.server.daemon_started_at = self.started_at
+            self.server.daemon_scheduler = self.scheduler
+            self.server.daemon_operational_service = self.operational_service
+            self.server.daemon_shutdown_enabled = True
+            host, actual_port = self.server.server_address
+            payload = {
+                "pid": os.getpid(),
+                "port": int(actual_port),
+                "token": self.token,
+                "version": self.version,
+                "runtime_id": self.runtime_id,
+                "home": str(self.paths.home),
+                "started_at": self.started_at,
+                "host": str(host),
+            }
+            atomic_write_private_json(daemon_handshake_path(self.paths), payload)
+            self._log(
+                {
+                    "event": "daemon_started",
+                    "port": int(actual_port),
+                    "serve_web": self.serve_web,
+                }
+            )
+            self._start_parent_monitor()
+            if self.start_scheduler:
+                self.scheduler.start()
+        except Exception:
+            self._parent_monitor_stop.set()
+            if self.scheduler is not None:
+                self.scheduler.stop()
+            if self.server is not None:
+                self.server.server_close()
+                self.server = None
+            self._remove_handshake()
+            self._release_lock()
+            raise
 
     def serve_forever(self) -> None:
         self.start()
@@ -444,18 +479,73 @@ class BrainDaemon:
             self.scheduler.stop()
         if self.server:
             self.server.server_close()
-        self._remove_handshake()
-        self._release_lock()
+        with self.operational_service.quiesce_mutations():
+            self._remove_handshake()
+            self._release_lock()
         self._log({"event": "daemon_stopped"})
+
+    def _assert_writer_lease(self) -> None:
+        if (
+            self._lock_file is None
+            or self._lock_file.closed
+            or self._lock_owner_pid != os.getpid()
+            or not self._daemon_lock_path_matches_descriptor()
+        ):
+            raise OperationalWriteRefusedError(
+                "brain daemon does not hold the writer lease"
+            )
 
     def _acquire_lock(self) -> None:
         lock_path = daemon_lock_path(self.paths)
         lock_path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock_file = lock_path.open("w", encoding="utf-8")
+        if lock_path.is_symlink():
+            raise RuntimeError(f"brain daemon lock must not be a symlink: {lock_path}")
+        flags = os.O_RDWR | os.O_CREAT
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(lock_path, flags, 0o600)
+        try:
+            self._lock_file = os.fdopen(descriptor, "a+", encoding="utf-8")
+        except Exception:
+            os.close(descriptor)
+            raise
+        descriptor_stat = os.fstat(self._lock_file.fileno())
+        if not stat.S_ISREG(descriptor_stat.st_mode):
+            self._lock_file.close()
+            self._lock_file = None
+            raise RuntimeError(f"brain daemon lock is not a regular file: {lock_path}")
+        os.fchmod(self._lock_file.fileno(), 0o600)
         try:
             fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
+            self._lock_file.close()
+            self._lock_file = None
+            self._lock_owner_pid = None
             raise RuntimeError(f"brain daemon is already running for {self.paths.home}") from exc
+        if not self._daemon_lock_path_matches_descriptor():
+            fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
+            self._lock_file.close()
+            self._lock_file = None
+            self._lock_owner_pid = None
+            raise RuntimeError("brain daemon lock path changed while acquiring the lease")
+        self._lock_owner_pid = os.getpid()
+
+    def _daemon_lock_path_matches_descriptor(self) -> bool:
+        if self._lock_file is None or self._lock_file.closed:
+            return False
+        try:
+            descriptor_stat = os.fstat(self._lock_file.fileno())
+            path_stat = os.stat(
+                daemon_lock_path(self.paths),
+                follow_symlinks=False,
+            )
+        except OSError:
+            return False
+        return (
+            stat.S_ISREG(descriptor_stat.st_mode)
+            and stat.S_ISREG(path_stat.st_mode)
+            and descriptor_stat.st_dev == path_stat.st_dev
+            and descriptor_stat.st_ino == path_stat.st_ino
+        )
 
     def _release_lock(self) -> None:
         if self._lock_file is None:
@@ -465,6 +555,7 @@ class BrainDaemon:
         finally:
             self._lock_file.close()
             self._lock_file = None
+            self._lock_owner_pid = None
 
     def _remove_handshake(self) -> None:
         path = daemon_handshake_path(self.paths)
