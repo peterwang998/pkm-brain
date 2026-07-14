@@ -549,9 +549,11 @@ def restricted_codex_command(
     command.extend(
         (
             "--config",
-            "features.rollout_budget=true",
+            "features.rollout_budget.enabled=true",
             "--config",
             f"features.rollout_budget.limit_tokens={rollout_token_ceiling}",
+            "--config",
+            "features.rollout_budget.reminder_at_remaining_tokens=[1]",
             "--config",
             "features.rollout_budget.sampling_token_weight=1.0",
             "--config",

@@ -73,7 +73,7 @@ def _thread(thread_id: str, body: str) -> NormalizedGmailThread:
     )
 
 
-def test_single_oversized_thread_is_deferred_without_crossing_batch_char_bound() -> None:
+def test_single_oversized_thread_surfaces_without_crossing_batch_char_bound() -> None:
     provider = GuardProvider()
     oversized = _thread(
         "oversized",
@@ -98,9 +98,10 @@ def test_single_oversized_thread_is_deferred_without_crossing_batch_char_bound()
 
     assert len(provider.prompts) == 1
     assert all(len(prompt) <= 5_000 for prompt in provider.prompts)
-    assert result.coverage_complete is False
-    assert result.deferred_count == 1
-    assert result.detections[0].disposition == "deferred"
-    assert result.detections[0].reason_code == "detector_prompt_oversized"
+    assert result.coverage_complete is True
+    assert result.deferred_count == 0
+    assert result.detections[0].disposition == "surfaced"
+    assert result.detections[0].reason_code == "detector_prompt_oversized_uncertain"
+    assert result.detections[0].candidates[0].reconciliation_status == "ambiguous"
     assert result.detections[1].disposition == "surfaced"
     assert result.detections[1].reason_code == "direct_obligation_model_uncertain"
