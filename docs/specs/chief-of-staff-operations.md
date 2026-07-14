@@ -64,6 +64,23 @@ Stable provider IDs take precedence over display names. A display name alone MUS
 
 Responsibility is a ranking signal, not a destructive admission filter. Out-of-area material is normally demoted, but a direct obligation or a configured high-consequence exception remains eligible. Unknown responsibility remains explicit; the system does not silently assign ownership or discard the item. Every persisted briefing or handled-state assessment records the policy version that influenced it so results are replayable after policy changes.
 
+### Shadow policy schema V1
+
+The first live-evaluation policy is intentionally narrower than the eventual multi-source policy. It has independent `schema_version`, `policy_id`, and positive `policy_version` fields and accepts only `mode=shadow_read_only`. The loader rejects unknown or credential-like fields, invalid timezones, symlinks, and group/world-readable policy files before a connector may use the policy.
+
+V1 requires:
+
+- stable Calendar and Gmail email identities with distinct local `account_key` values;
+- Calendar limited to `calendar_id=primary`, `ownership=owned`, and `calendar.events.owned.readonly`;
+- Gmail limited to `gmail.readonly`, with an additional explicit `content_access_approved` value before it may be enabled;
+- raw resumable cache retention of 7 days and normalized evidence retention of 30 days;
+- attachment fetching disabled, quoted reply history stripping enabled, and external provider writes disabled;
+- positive daily Calendar request, Gmail request, detector-call, detector-input-token, and detector-total-token budgets;
+- disjoint owned/shared/adjacent responsibility areas, out-of-area demotion rather than exclusion, explicit unknown responsibility, and direct-obligation eligibility;
+- legal, financial, security, safety, travel, and direct-commitment high-consequence categories that remain eligible and cannot be auto-suppressed.
+
+Disabling Gmail is valid and does not imply content authorization. Enabling it without explicit approval is invalid. A later policy schema may add sources or ranking controls, but it must migrate explicitly rather than accepting unknown V1 fields.
+
 ## Source Adapter Contract
 
 Every operational source implements the same failure-isolated, incremental adapter boundary. An adapter emits bounded typed source-unit batches; it does not write current item projections directly and does not depend on an unbounded model context or a transient copied-source corpus.
@@ -524,6 +541,10 @@ The local labeled corpus remains private and outside git. It includes:
 - owned, shared, adjacent, out-of-area, and configured high-consequence exception examples;
 - meeting-preparation examples with both relevant and tempting-but-unsupported context;
 - held-out dates not used to tune prompts or rules.
+
+The versioned V1 fixture schema is strict and supports either `classification=private` or `classification=synthetic`. Private fixture files are owner-only and remain outside git; synthetic fixtures may be checked in. Each chronological case separately labels source class and day volume, item admission, item kind, lifecycle state, handled verdict, priority, high-consequence status, human confirmation, owner, responsibility, due date, evidence IDs, sensitivity, focus/overflow placement, coverage, authoritative-object need/state, Calendar change class, and evidence-route requirements. Relation and meeting-claim truth use separate label records. Predictions live in a separately validated shadow-run artifact bound to the exact fixture and policy version; generated output never becomes truth merely by being recorded.
+
+The evaluator produces detection, source-class, source-date, evidence, ownership/responsibility, handled-verdict, focus/overflow, duplicate/stale/resurrection, relation, Calendar replay, meeting-claim, coverage, and budget metrics. It raises a hard stop rather than averaging away any external mutation, scope/privacy violation, nondeterministic recurring identity or cancellation/reschedule result, hidden critical/high item, high-consequence false handled result, unsafe reply/view/notification-only suppression, false human-confirmed closure, wrong-person assignment, missing high-consequence evidence, awareness padding, silent incomplete coverage, invalid required evidence route, activated false/ambiguous episode merge, unsupported meeting fact, or undisclosed budget overflow.
 
 ### Required Metrics
 

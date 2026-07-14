@@ -1,7 +1,7 @@
 # Chief-of-Staff Operations Implementation Plan
 
-**Status:** execution started; COS-0/COS-2 complete, COS-1 in progress; Calendar production access remains disabled
-**Last verified:** 2026-07-13 against contract commit `005ff63` plus the current COS-2 service/recovery working tree
+**Status:** execution started; COS-0/COS-1/COS-2 complete; Calendar production access remains disabled
+**Last verified:** 2026-07-13 against the COS-1 policy/evaluation and COS-2 service/recovery foundations
 **Owning spec:** [Chief-of-Staff Operations](../specs/chief-of-staff-operations.md)
 
 ## Outcome
@@ -33,7 +33,7 @@ The program keeps one product, one app, one coordinator daemon, and one Brain ho
 | Phase | Outcome | External writes | State |
 |---|---|---:|---|
 | COS-0 | verified knowledge-layer foundation | none | complete |
-| COS-1 | canonical boundary, local policy, adapter, privacy, eval, and rollout contracts | none | in progress |
+| COS-1 | canonical boundary, local policy, adapter, privacy, eval, and rollout contracts | none | complete |
 | COS-2 | separate operational kernel and deterministic lifecycle | none | complete |
 | COS-3 | read-only Calendar evidence and reconciliation | none | planned |
 | COS-4 | coverage-aware Today focus, feedback, and basic meeting preparation | none | planned |
@@ -79,7 +79,7 @@ Conceptual documentation changes immediately from "Chief-of-Staff curation" to "
 
 Every new operational table, job, adapter, API, and UI control has exactly one owning spec. No document describes `cos_actions` as the operational action ledger. The local operations policy and every enabled adapter validate against a versioned schema, and evaluation can distinguish item-state, handled-state, episode-link, focus-selection, and evidence-link errors.
 
-The initial architecture and privacy contracts were completed by commit `a44b713`; the operator-policy, adapter, handled-state, focus, meeting-preparation, and episode-relation amendment was completed by commit `005ff63`. The versioned private-eval fixture artifact remains before the COS-1 exit gate closes.
+The initial architecture and privacy contracts were completed by commit `a44b713`; the operator-policy, adapter, handled-state, focus, meeting-preparation, and episode-relation amendment was completed by commit `005ff63`. The implementation foundation now includes a strict owner-only `operations.yaml` V1 loader plus a versioned private/synthetic fixture loader, prediction binding, metrics, held-out promotion gates, and non-averagable hard-stop evaluation. Calendar/Gmail adapters must consume this boundary in their owning phases; they may not reimplement or weaken it.
 
 ## COS-2 - Operational Kernel
 
@@ -420,11 +420,12 @@ Use separate commits for:
 3. operational DB/kernel (`03be261`);
 4. local-policy, adapter, handled-state, focus, evidence-link, meeting-preparation, and episode-relation contract amendment (`005ff63`);
 5. COS-2 writer fencing plus coordinated backup/restore;
-6. Calendar adapter plus operations-policy schema/loader and safe route builder;
-7. Today focus/API/UI plus Calendar/Brain meeting preparation;
-8. Gmail retrieval/detection plus source-local satisfaction verification;
-9. reversible cross-source episode relations, satisfaction, and briefing gates;
-10. each optional Git, agent-session, code-host, collaboration, or work-tracker adapter as its own read-only commit;
-11. draft/execution capabilities, split again by capability and reversibility class.
+6. strict operations-policy loader plus private/synthetic shadow-evaluation schema and hard-stop scorer;
+7. Calendar adapter plus safe route builder;
+8. Today focus/API/UI plus Calendar/Brain meeting preparation;
+9. Gmail retrieval/detection plus source-local satisfaction verification;
+10. reversible cross-source episode relations, satisfaction, and briefing gates;
+11. each optional Git, agent-session, code-host, collaboration, or work-tracker adapter as its own read-only commit;
+12. draft/execution capabilities, split again by capability and reversibility class.
 
 Contract commits do not smuggle in runtime behavior. Every implementation commit updates the owning phase status and includes focused tests, private fixture/eval results where applicable, plus the full no-regression gate appropriate to its blast radius. A phase commit is pushed only after its owning gate passes; a later adapter or model regression can disable that capability without rolling back the knowledge, Calendar, or retrieval foundations.
