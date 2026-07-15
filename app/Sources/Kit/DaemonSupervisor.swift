@@ -217,7 +217,12 @@ public final class DaemonSupervisor: ObservableObject {
             restartFailures = 0
         } catch {
             restartFailures += 1
-            status = .restarting("Daemon unavailable; retry \(restartFailures)")
+            // Preserve resumable provider work through one transient loopback miss.
+            guard restartFailures >= 2 else {
+                status = .restarting("Confirming a missed daemon health check")
+                return
+            }
+            status = .restarting("Daemon unavailable; restarting")
             await restartDaemon()
         }
     }
@@ -232,7 +237,7 @@ public final class DaemonSupervisor: ObservableObject {
             return
         }
         while restartFailures <= 3 && !Task.isCancelled {
-            let delay = min(pow(2.0, Double(restartFailures - 1)), 60.0)
+            let delay = min(pow(2.0, Double(max(restartFailures - 2, 0))), 60.0)
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             guard !Task.isCancelled else {
                 return

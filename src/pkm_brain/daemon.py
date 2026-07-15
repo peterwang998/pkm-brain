@@ -21,6 +21,7 @@ from .automation import (
     run_nightly_maintenance,
     run_secondary_tick,
 )
+from .gmail_archive_sync import run_scheduled_gmail_archive_sync
 from .gmail_sync import run_scheduled_gmail_mirror_sync
 from .migrations import MIGRATIONS
 from .operational_meeting_packets import run_scheduled_meeting_preparation
@@ -41,6 +42,7 @@ DEFAULT_NIGHTLY_CHECK_CADENCE_SECONDS = 3600
 DEFAULT_SYNC_CADENCE_SECONDS = 1800
 DEFAULT_MEETING_PREPARATION_CADENCE_SECONDS = 900
 DEFAULT_GMAIL_MIRROR_SYNC_CADENCE_SECONDS = 600
+DEFAULT_GMAIL_ARCHIVE_SYNC_CADENCE_SECONDS = 600
 
 
 def package_version() -> str:
@@ -410,6 +412,18 @@ def build_role_jobs(
                 id="gmail_mirror_sync",
                 cadence_s=DEFAULT_GMAIL_MIRROR_SYNC_CADENCE_SECONDS,
                 handler=lambda: run_scheduled_gmail_mirror_sync(
+                    paths,
+                    operational_service,
+                ),
+                lane="provider_sync",
+                run_on_start=True,
+            )
+        )
+        jobs.append(
+            SchedulerJob(
+                id="gmail_archive_sync",
+                cadence_s=DEFAULT_GMAIL_ARCHIVE_SYNC_CADENCE_SECONDS,
+                handler=lambda: run_scheduled_gmail_archive_sync(
                     paths,
                     operational_service,
                 ),

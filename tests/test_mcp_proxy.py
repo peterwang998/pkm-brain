@@ -8,7 +8,7 @@ from typing import Iterator
 
 from pkm_brain.daemon import atomic_write_private_json, daemon_handshake_path
 from pkm_brain.db import connection
-from pkm_brain.mcp_proxy import BrainMCPProxy
+from pkm_brain.mcp_proxy import BrainMCPProxy, DaemonEndpoint
 from pkm_brain.paths import BrainPaths
 from pkm_brain.service import BrainService
 from pkm_brain.ui_server import create_ui_server, ensure_ui_token
@@ -107,6 +107,56 @@ def test_mcp_proxy_read_only_fallback_declines_writes(tmp_path: Path) -> None:
     with connection(paths.sqlite_path) as conn:
         count = conn.execute("SELECT COUNT(*) FROM agent_sessions").fetchone()[0]
     assert count == 0
+
+
+def test_mcp_proxy_fails_closed_for_daemon_only_mail_tools(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    proxy = BrainMCPProxy(str(paths.home), auto_launch=False)
+
+    search = proxy.call_tool("search_mail", {"query": "quarterly plan"})
+    thread = proxy.call_tool("get_mail_thread", {"thread_id": "thread-1"})
+
+    assert search == {
+        "error": (
+            "PKM Brain app is not available; encrypted Gmail history requires "
+            "the local daemon. Launch the app and retry."
+        ),
+        "code": "daemon_unavailable",
+        "tool": "search_mail",
+        "daemon_required": True,
+        "retryable": True,
+    }
+    assert thread["code"] == "daemon_unavailable"
+    assert thread["tool"] == "get_mail_thread"
+    assert thread["daemon_required"] is True
+
+
+def test_mcp_proxy_mail_tool_recovers_after_daemon_becomes_available(
+    tmp_path: Path, monkeypatch
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    proxy = BrainMCPProxy(str(paths.home), auto_launch=False)
+    endpoint = DaemonEndpoint("http://127.0.0.1:4567", "test-token")
+    resolutions = iter([None, endpoint])
+    calls: list[tuple[DaemonEndpoint, str, dict]] = []
+    monkeypatch.setattr(proxy, "resolve_endpoint", lambda: next(resolutions))
+    monkeypatch.setattr(
+        proxy,
+        "post_tool",
+        lambda current, tool, payload: (
+            calls.append((current, tool, payload))
+            or {"results": [], "content_trust": "untrusted_external_content"}
+        ),
+    )
+
+    first = proxy.call_tool("search_mail", {"query": "planning"})
+    second = proxy.call_tool("search_mail", {"query": "planning"})
+
+    assert first["code"] == "daemon_unavailable"
+    assert second["results"] == []
+    assert calls == [(endpoint, "search_mail", {"query": "planning"})]
 
 
 def test_mcp_proxy_auto_launches_but_returns_read_only_fallback(tmp_path: Path) -> None:

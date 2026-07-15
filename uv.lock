@@ -1029,9 +1029,10 @@ wheels = [
 
 [[package]]
 name = "pkm-brain"
-version = "0.1.5"
+version = "0.1.6"
 source = { editable = "." }
 dependencies = [
+    { name = "cryptography" },
     { name = "lancedb" },
     { name = "mcp" },
     { name = "pyyaml" },
@@ -1052,6 +1053,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cryptography", specifier = ">=48.0.0" },
     { name = "lancedb", specifier = ">=0.30.2" },
     { name = "mcp", specifier = ">=1.27.0" },
     { name = "pyyaml", specifier = ">=6.0.3" },

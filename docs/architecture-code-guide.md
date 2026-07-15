@@ -1,7 +1,7 @@
 # PKM Brain Architecture Code Guide
 
 **Status:** current code-navigation guide
-**Last verified:** 2026-07-14 against the release-verified and installed Gmail operational mirror/provider-sync tranche; fresh mailbox bootstrap/incremental validation remains pending
+**Last verified:** 2026-07-14 against the current Gmail operational mirror and completed encrypted 90-day archive
 
 This guide answers where behavior lives. Feature requirements and open work belong in [the specs index](README.md), not here.
 
@@ -28,6 +28,12 @@ approved operational sources
   -> operational_briefing.py + operational_today.py
   -> Today briefing, evidence audit, and local feedback
 
+encrypted Gmail archive
+  -> Gmail RAW message API -> gmail_archive_source.py
+  -> gmail_archive_sync.py -> mail/gmail-archive.sqlite
+  -> AES-256-GCM with a Keychain key
+  -> daemon-only search_mail/get_mail_thread
+
 daemon.py + automation.py schedule lane-isolated primitives.
 SwiftUI and browser assets call ui_server.py JSON endpoints.
 sync_* modules move source files, never live DB/index state.
@@ -47,6 +53,7 @@ sync_* modules move source files, never live DB/index state.
 | durable mutation | `cos_actions` plus inverse | `cos_actions.py` |
 | autonomy | versioned `cos_policy` and eval state | `cos_policy.py`, `evals.py` |
 | Gmail operational mirror | rebuildable immutable revisions/current pointers, tombstones, triage queue, and provider checkpoint | `gmail_mirror.py`, `gmail_sync.py` |
+| encrypted Gmail archive | exact RFC-2822 ciphertext plus one archive sync state | `gmail_archive.py`, `gmail_archive_source.py`, `gmail_archive_sync.py` |
 | operational current state | `db/ops.sqlite` items, observations, events, and cursors | `operational_state.py`, `operational_db.py` |
 | review residue | `open_questions`, proposed memories, audit flags | `wiki_facts.py`, `memory.py`, `ui_server.py` |
 | page projection | contracts, facts, synthesis, snapshots, Markdown | `wiki_facts.py`, `contracts.py` |
@@ -63,11 +70,12 @@ sync_* modules move source files, never live DB/index state.
 - `migrations.py`: ordered idempotent migrations 1-21.
 - `operational_db.py` and `operational_migrations.py`: the independently versioned `db/ops.sqlite` control plane and bounded lock handling.
 - `gmail_mirror.py`: the independent owner-only, rebuildable Gmail operational evidence store, atomic local-analysis queue, and content-free poison-thread quarantine at `cache/gmail-mirror/gmail-mirror.sqlite`.
+- `gmail_archive.py`, `gmail_archive_source.py`, and `gmail_archive_sync.py`: the separate encrypted raw-message store, Gmail reader, and scheduled 90-day-plus-incremental sync.
 - `config.py` and `sync_config.py`: local/shared and role-specific config.
 
 Do not create ad hoc paths or SQLite connections in UI/Swift code.
 
-`brain.sqlite` remains authoritative for knowledge. `ops.sqlite` is authoritative only for current operational state. The Gmail mirror is rebuildable operational evidence, not either authority; none of the three uses cross-database foreign keys or multi-database write transactions.
+`brain.sqlite` remains authoritative for knowledge. `ops.sqlite` is authoritative only for current operational state. The Gmail mirror is rebuildable operational evidence. The encrypted Gmail archive is a separate local evidence store and is not joined into those databases.
 
 ### Capture And Ingest
 
@@ -138,6 +146,12 @@ The `cos_*` surface is a legacy physical name for Knowledge Curation. It must no
 
 The provider-read-only/local-write slice now separates scheduled Gmail transport from manual analysis/evaluation. `gmail_mirror_sync` runs only on `single|primary`, at startup and about every 600 seconds on the dedicated `provider_sync` scheduler lane, after exact policy/content-approval/account/scope gates pass. It safely restarts rejected saved page tokens, preflights the bounded worst-case request envelope, and quarantines a malformed/oversized/conflicting thread without blocking valid peer revisions or checkpoint progress. A complete normal checkpoint may be followed by one second generation that retries at most ten due quarantine thread IDs with durable exponential backoff and parser-version bypass; retry-only failure leaves mailbox freshness intact and analysis partial. Mailbox checkpoint freshness, scheduled-job health, and analysis/quarantine backlog are independent. Fresh live mirror validation, cross-source episode linking, production trust, and guarded execution remain gated by [Chief-of-Staff Operations](specs/chief-of-staff-operations.md).
 
+### Encrypted Gmail Archive
+
+`gmail_archive_source.py` fetches exact Gmail `RAW` messages. `gmail_archive_sync.py` runs one state machine: a resumable fixed 90-day backfill followed by Gmail history incrementals; an expired history cursor restarts the full scan without deleting accepted ciphertext. `gmail_archive.py` encrypts raw messages and parsed text with AES-256-GCM using a Keychain-backed key. V1 search decrypts and scans locally rather than maintaining another search index.
+
+The archive retains local ciphertext when Gmail reports deletion. It never feeds the operational detector, Luna, Brain documents, facts, or default retrieval. Agents can reach it only through bounded daemon-backed `search_mail` and `get_mail_thread`; the direct MCP fallback does not expose either tool.
+
 ### Retrieval And Memory
 
 - `service.py`: search, layer selection, reranking, verdict/calibration, context packet, lineage, telemetry compaction.
@@ -200,6 +214,8 @@ The browser and native clients consume the same endpoints and mutation primitive
 - `scripts/install-app.sh` owns verified `/Applications` staging, rollback, activation, and login-item installation.
 - `scripts/ui-acceptance.sh` owns isolated rendered macOS UI acceptance.
 
+The mail-archive tools are an exception to the normal MCP fallback model: they require the authenticated daemon, return bounded untrusted evidence, and are unavailable when the daemon or archive is unavailable.
+
 ## Current Pressure Points
 
 Largest Python modules in the audited working tree:
@@ -239,6 +255,13 @@ When changing retrieval:
 2. measure verdict, source hit, precision, calibration, noise, and negative controls;
 3. keep provider/index degradation explicit;
 4. verify context packet size and telemetry growth.
+
+When changing the encrypted Gmail archive:
+
+1. keep raw and parsed mail encrypted outside Brain and operational databases;
+2. preserve the single backfill-to-history state machine and expired-cursor restart;
+3. keep `search_mail` and `get_mail_thread` bounded and daemon-only;
+4. verify progress reporting, provider-deletion retention, and zero LLM/fact admission.
 
 When changing UI:
 

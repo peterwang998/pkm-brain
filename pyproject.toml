@@ -1,6 +1,6 @@
 [project]
 name = "pkm-brain"
-version = "0.1.5"
+version = "0.1.6"
 description = "Local-first personal knowledge management and agent memory for MCP-aware coding agents"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -33,6 +33,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
+    "cryptography>=48.0.0",
     "lancedb>=0.30.2",
     "mcp>=1.27.0",
     "pyyaml>=6.0.3",

@@ -30,6 +30,25 @@
       "running": false
     },
     {
+      "cadence_s": 600,
+      "enabled": true,
+      "id": "gmail_archive_sync",
+      "lane": "provider_sync",
+      "last_error": null,
+      "last_result": {
+        "backfill_complete": false,
+        "message": "Copying Gmail history: 1,750 messages stored.",
+        "messages_fetched": 1750,
+        "status": "partial"
+      },
+      "last_run_at": "2026-07-08T08:02:00+00:00",
+      "last_status": "partial",
+      "next_due_at": "2026-07-08T08:12:00+00:00",
+      "queued": false,
+      "run_on_start": true,
+      "running": false
+    },
+    {
       "cadence_s": 3600,
       "enabled": true,
       "id": "nightly",

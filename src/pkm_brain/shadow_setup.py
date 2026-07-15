@@ -130,6 +130,11 @@ def default_operations_policy_payload(
                 "account_key": "gmail.primary",
                 "scope": GMAIL_READ_SCOPE,
                 "content_access_approved": True,
+                "archive": {
+                    "enabled": True,
+                    "initial_days": 90,
+                    "agent_access_approved": True,
+                },
             },
         },
         "privacy": {
@@ -142,7 +147,7 @@ def default_operations_policy_payload(
         "budgets": {
             "calendar": {"requests_per_day": 500},
             "gmail": {
-                "api_requests_per_day": 1200,
+                "api_requests_per_day": 10_000,
                 "detector_calls_per_day": 100,
                 "detector_input_tokens_per_day": 150_000,
                 "detector_total_tokens_per_day": 180_000,
@@ -277,6 +282,11 @@ def shadow_policy_status(paths: BrainPaths) -> dict[str, Any]:
             "fetch_attachments": policy.privacy.fetch_attachments,
             "strip_quoted_history": policy.privacy.strip_quoted_history,
             "external_writes": policy.privacy.external_writes,
+        },
+        "gmail_archive": {
+            "enabled": policy.sources.gmail.archive.enabled,
+            "initial_days": policy.sources.gmail.archive.initial_days,
+            "agent_access_approved": policy.sources.gmail.archive.agent_access_approved,
         },
     }
 

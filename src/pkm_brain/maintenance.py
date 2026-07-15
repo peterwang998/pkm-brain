@@ -162,6 +162,11 @@ def managed_storage_inventory(
             paths.gmail_mirror_sqlite_path,
             policy="private_rebuildable_mirror",
         ),
+        storage_entry(
+            "gmail_archive",
+            paths.gmail_archive_sqlite_path,
+            policy="encrypted_durable_evidence",
+        ),
         storage_entry("indexes", paths.indexes, policy="rebuildable"),
         storage_entry("logs", paths.logs, policy="managed_retention"),
         storage_entry("user_backups", paths.home / "backups", policy="manual_review"),

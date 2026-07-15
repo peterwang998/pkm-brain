@@ -50,6 +50,7 @@ public struct SchedulerJobState: Codable, Equatable, Identifiable, Sendable {
         case "nightly": "Nightly maintenance"
         case "meeting_preparation": "Prepare meeting briefs"
         case "gmail_mirror_sync": "Check Gmail for updates"
+        case "gmail_archive_sync": "Copy Gmail history securely"
         default:
             id.replacingOccurrences(of: "_", with: " ")
         }
@@ -71,6 +72,9 @@ public struct SchedulerJobState: Codable, Equatable, Identifiable, Sendable {
         }
         if let reason = last_result?.objectValue?["reason"]?.stringValue, !reason.isEmpty {
             return reason
+        }
+        if let message = last_result?.objectValue?["message"]?.stringValue, !message.isEmpty {
+            return message
         }
         if displayStatus == "skipped" {
             return "Skipped without a recorded reason."

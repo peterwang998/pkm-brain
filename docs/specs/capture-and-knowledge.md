@@ -1,7 +1,7 @@
 # Capture And Knowledge
 
 **Status:** canonical living feature spec
-**Last verified:** 2026-07-14 against the Gmail operational-mirror/provider-sync implementation; knowledge ingestion remains unchanged
+**Last verified:** 2026-07-14 against the current Gmail operational mirror and completed encrypted 90-day archive; knowledge ingestion remains unchanged
 **Owns:** evidence connectors, ingest, source normalization, durable-knowledge extraction, facts, entities, routing, gardener topology, and wiki projection
 
 ## Feature Boundary
@@ -41,7 +41,7 @@ Hyprnote capture is speaker-aware. Transcript words from independently stored ch
 
 Hyprnote remains opt-in because it scans private meeting data under the application's support directory. Files does not supersede it: Files only represents artifacts already placed under `inbox/documents/`, while the Hyprnote adapter creates normalized meeting artifacts from Hyprnote session folders. Previously captured Hyprnote artifacts remain ingestible when scheduled Hyprnote capture is disabled.
 
-Email capture and durable-knowledge ingestion are not implemented; their proposed contract is isolated under [Future Gmail And Email Adapter](#future-gmail-and-email-adapter). The Gmail operational shadow lane is independent and does not write documents, chunks, facts, or wiki pages.
+Email capture and durable-knowledge ingestion are not implemented; their proposed contract is isolated under [Future Gmail And Email Adapter](#future-gmail-and-email-adapter). The Gmail operational lane and encrypted local archive are independent evidence paths and do not write documents, chunks, facts, or wiki pages.
 
 ## Ingest Contract
 
@@ -260,9 +260,11 @@ Calendar is operationally useful without LLM extraction. Its source evidence rem
 
 ## Future Gmail And Email Adapter
 
-Status: the read-only Gmail operational mirror and local analysis queue are implemented; capture, retrieval indexing, and durable-knowledge ingestion remain paused.
+Status: the read-only Gmail operational mirror, local analysis queue, and separate encrypted Gmail history archive are implemented; capture, retrieval indexing, and durable-knowledge ingestion remain paused.
 
 The Gmail account card can hold the separately approved `gmail.readonly` grant for the operational mirror and Shadow evaluation. It stores secrets and tokens in macOS Keychain, but the capture registry remains `auth_only`: its capture subsystem cannot discover mail into `inbox/`, schedule knowledge capture, index mail for retrieval, or run durable-fact ingestion. A separate provider-sync job may update only the rebuildable operational mirror. Any future knowledge adapter must receive a separate product decision and revise this capture plan. Its safety constraints remain:
+
+The encrypted archive is not that future knowledge adapter. It keeps exact Gmail `RAW` messages, attachments, and parsed text encrypted in a separate local store. One state machine performs a fixed 90-day backfill and then Gmail history incrementals; an expired cursor restarts the scan, and provider deletion retains local ciphertext. V1 `search_mail` and `get_mail_thread` return bounded evidence through the daemon only. Archive sync itself invokes no LLM, fact extraction, Knowledge Curation, operational detection, or Gmail mutation; an explicit agent tool call may place only its bounded returned content in that agent's context.
 
 - no mail sender, label mutation, deletion, attachment retrieval, or full-corpus knowledge capture in the operational shadow phase;
 - local Maildir/mbox remains an eligible evidence input alongside a future Gmail API adapter;

@@ -516,7 +516,7 @@ def test_scheduler_registry_is_role_aware(tmp_path: Path) -> None:
     assert primary_jobs["sync:secondary-b"]["cadence_s"] == 1800
 
 
-def test_gmail_mirror_sync_job_is_primary_lane_startup_work(tmp_path: Path) -> None:
+def test_gmail_jobs_are_primary_lane_startup_work(tmp_path: Path) -> None:
     for role in ("single", "primary"):
         paths = BrainPaths.from_value(tmp_path / role)
         if role == "primary":
@@ -538,6 +538,13 @@ def test_gmail_mirror_sync_job_is_primary_lane_startup_work(tmp_path: Path) -> N
         assert gmail.cadence_s == 600
         assert gmail.lane == "provider_sync"
         assert gmail.run_on_start is True
+        archive = jobs["gmail_archive_sync"]
+        assert archive.cadence_s == 600
+        assert archive.lane == "provider_sync"
+        assert archive.run_on_start is True
+        assert list(jobs).index("gmail_mirror_sync") < list(jobs).index(
+            "gmail_archive_sync"
+        )
 
     secondary = BrainPaths.from_value(tmp_path / "secondary-with-ops")
     init_secondary(secondary, "secondary-node", "primary-node")
@@ -546,6 +553,7 @@ def test_gmail_mirror_sync_job_is_primary_lane_startup_work(tmp_path: Path) -> N
         job.id for job in build_role_jobs(secondary, operational_service=service)
     }
     assert "gmail_mirror_sync" not in secondary_ids
+    assert "gmail_archive_sync" not in secondary_ids
 
 
 def test_daemon_nightly_summary_matches_automation_shape(tmp_path: Path) -> None:

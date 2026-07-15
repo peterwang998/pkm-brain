@@ -58,6 +58,10 @@ def test_approved_policy_is_created_private_and_never_contains_credentials(
     assert policy.sources.calendar.calendar_id == "primary"
     assert policy.sources.calendar.scope == CALENDAR_OWNED_READ_SCOPE
     assert policy.sources.gmail.scope == GMAIL_READ_SCOPE
+    assert policy.sources.gmail.archive.enabled is True
+    assert policy.sources.gmail.archive.initial_days == 90
+    assert policy.sources.gmail.archive.agent_access_approved is True
+    assert policy.budgets.gmail.api_requests_per_day == 10_000
     assert policy.privacy.raw_cache_days == 7
     assert policy.privacy.normalized_evidence_days == 30
     assert policy.privacy.fetch_attachments is False
@@ -68,7 +72,10 @@ def test_approved_policy_is_created_private_and_never_contains_credentials(
     contents = path.read_text(encoding="utf-8")
     assert "access_token" not in contents
     assert "refresh_token" not in contents
-    assert shadow_policy_status(paths)["status"] == "ready"
+    status = shadow_policy_status(paths)
+    assert status["status"] == "ready"
+    assert status["gmail_archive"]["enabled"] is True
+    assert status["gmail_archive"]["initial_days"] == 90
 
 
 def test_existing_policy_is_loaded_without_reconsulting_auth(tmp_path: Path) -> None:

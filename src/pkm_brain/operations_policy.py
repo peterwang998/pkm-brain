@@ -64,11 +64,19 @@ class CalendarSourcePolicy:
 
 
 @dataclass(frozen=True)
+class GmailArchivePolicy:
+    enabled: bool
+    initial_days: int
+    agent_access_approved: bool
+
+
+@dataclass(frozen=True)
 class GmailSourcePolicy:
     enabled: bool
     account_key: str
     scope: str
     content_access_approved: bool
+    archive: GmailArchivePolicy
 
 
 @dataclass(frozen=True)
@@ -294,14 +302,23 @@ def _parse_sources(value: Any, operator: OperatorPolicy) -> SourcePolicy:
     gmail_data = _mapping(data.get("gmail"), "sources.gmail")
     _only_keys(
         gmail_data,
-        {"enabled", "account_key", "scope", "content_access_approved"},
+        {
+            "enabled",
+            "account_key",
+            "scope",
+            "content_access_approved",
+            "archive",
+        },
         "sources.gmail",
+        required={"enabled", "account_key", "scope", "content_access_approved"},
     )
+    archive = _parse_gmail_archive(gmail_data.get("archive"))
     gmail = GmailSourcePolicy(
         enabled=_boolean(gmail_data, "enabled"),
         account_key=_account_key(gmail_data, "account_key", "sources.gmail"),
         scope=_bounded_string(gmail_data, "scope", maximum=200),
         content_access_approved=_boolean(gmail_data, "content_access_approved"),
+        archive=archive,
     )
     if gmail.account_key != operator.gmail.account_key:
         raise OperationsPolicyError(
@@ -315,7 +332,50 @@ def _parse_sources(value: Any, operator: OperatorPolicy) -> SourcePolicy:
         raise OperationsPolicyError(
             "enabled Gmail access requires content_access_approved: true"
         )
+    if gmail.archive.enabled and not gmail.enabled:
+        raise OperationsPolicyError(
+            "enabled Gmail history requires sources.gmail.enabled: true"
+        )
+    if gmail.archive.enabled and not gmail.content_access_approved:
+        raise OperationsPolicyError(
+            "enabled Gmail history requires content_access_approved: true"
+        )
     return SourcePolicy(calendar=calendar, gmail=gmail)
+
+
+def _parse_gmail_archive(value: Any) -> GmailArchivePolicy:
+    # Policies created before the encrypted archive existed remain valid and
+    # fail closed. Enabling the archive is always an explicit policy change.
+    if value is None:
+        return GmailArchivePolicy(
+            enabled=False,
+            initial_days=90,
+            agent_access_approved=False,
+        )
+    data = _mapping(value, "sources.gmail.archive")
+    _only_keys(
+        data,
+        {
+            "enabled",
+            "initial_days",
+            "agent_access_approved",
+        },
+        "sources.gmail.archive",
+    )
+    archive = GmailArchivePolicy(
+        enabled=_boolean(data, "enabled"),
+        initial_days=_integer(data, "initial_days", minimum=1),
+        agent_access_approved=_boolean(data, "agent_access_approved"),
+    )
+    if archive.initial_days != 90:
+        raise OperationsPolicyError(
+            "sources.gmail.archive.initial_days must be 90 for this release"
+        )
+    if archive.enabled and not archive.agent_access_approved:
+        raise OperationsPolicyError(
+            "enabled Gmail archive requires agent_access_approved: true"
+        )
+    return archive
 
 
 def _parse_privacy(value: Any) -> PrivacyPolicy:

@@ -106,6 +106,9 @@ def test_strict_operations_policy_loads_from_private_local_config(
     assert policy.operator.timezone == "America/Los_Angeles"
     assert policy.sources.calendar.calendar_id == "primary"
     assert policy.sources.gmail.account_key == "gmail.personal"
+    assert policy.sources.gmail.archive.enabled is False
+    assert policy.sources.gmail.archive.initial_days == 90
+    assert policy.sources.gmail.archive.agent_access_approved is False
     assert policy.privacy.raw_cache_days == 7
     assert policy.privacy.normalized_evidence_days == 30
     assert policy.privacy.fetch_attachments is False
@@ -126,6 +129,44 @@ def test_policy_can_keep_gmail_disabled_without_implying_content_authorization()
 
     assert policy.sources.gmail.enabled is False
     assert policy.sources.gmail.content_access_approved is False
+
+
+def test_policy_accepts_explicit_complete_encrypted_gmail_history() -> None:
+    payload = valid_policy_dict()
+    payload["sources"]["gmail"]["archive"] = {
+        "enabled": True,
+        "initial_days": 90,
+        "agent_access_approved": True,
+    }
+
+    policy = OperationsPolicy.from_dict(payload)
+
+    assert policy.sources.gmail.archive.enabled is True
+    assert policy.sources.gmail.archive.initial_days == 90
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("initial_days", 30, "initial_days must be 90"),
+        ("agent_access_approved", False, "agent_access_approved"),
+    ],
+)
+def test_enabled_gmail_history_rejects_unsafe_variants(
+    field: str,
+    value: object,
+    match: str,
+) -> None:
+    payload = valid_policy_dict()
+    payload["sources"]["gmail"]["archive"] = {
+        "enabled": True,
+        "initial_days": 90,
+        "agent_access_approved": True,
+    }
+    payload["sources"]["gmail"]["archive"][field] = value
+
+    with pytest.raises(OperationsPolicyError, match=match):
+        OperationsPolicy.from_dict(payload)
 
 
 @pytest.mark.parametrize(

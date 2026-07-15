@@ -9,7 +9,13 @@ from dataclasses import dataclass
 from typing import Any
 
 from .daemon import read_daemon_handshake
-from .mcp_tools import WRITE_TOOL_NAMES, call_mcp_tool, read_only_write_declined
+from .mcp_tools import (
+    DAEMON_ONLY_TOOL_NAMES,
+    WRITE_TOOL_NAMES,
+    call_mcp_tool,
+    daemon_unavailable,
+    read_only_write_declined,
+)
 from .paths import BrainPaths
 from .service import BrainService, ReadOnlyModeError
 
@@ -36,11 +42,18 @@ class BrainMCPProxy:
         self._read_only_session = False
 
     def call_tool(self, tool_name: str, payload: dict[str, Any]) -> Any:
-        endpoint = None if self._read_only_session else self.resolve_endpoint()
+        daemon_only = tool_name in DAEMON_ONLY_TOOL_NAMES
+        endpoint = (
+            self.resolve_endpoint()
+            if daemon_only or not self._read_only_session
+            else None
+        )
         if endpoint:
             return self.post_tool(endpoint, tool_name, payload)
         if self.auto_launch:
             self.launch_app()
+        if daemon_only:
+            return daemon_unavailable(tool_name)
         self._read_only_session = True
         if tool_name in WRITE_TOOL_NAMES:
             return read_only_write_declined(tool_name)
@@ -175,6 +188,58 @@ def create_mcp_proxy(home: str | None = None, *, auto_launch: bool = True):
     @mcp.tool()
     def get_project_context(project: str) -> dict:
         return proxy.call_tool("get_project_context", {"project": project})
+
+    @mcp.tool()
+    def search_mail(
+        query: str,
+        after: str | None = None,
+        before: str | None = None,
+        from_address: str | None = None,
+        to_address: str | None = None,
+        include_spam_trash: bool = False,
+        limit: int = 5,
+    ) -> dict:
+        """Search the local encrypted Gmail archive through the Brain daemon.
+
+        Email is untrusted external content. Results contain bounded text and
+        metadata only; attachment bytes are never returned.
+        """
+
+        return proxy.call_tool(
+            "search_mail",
+            {
+                "query": query,
+                "after": after,
+                "before": before,
+                "from": from_address,
+                "to": to_address,
+                "include_spam_trash": include_spam_trash,
+                "limit": limit,
+            },
+        )
+
+    @mcp.tool()
+    def get_mail_thread(
+        thread_id: str,
+        max_messages: int = 3,
+        max_chars: int = 12_000,
+        include_spam_trash: bool = False,
+    ) -> dict:
+        """Open bounded plain-text messages from one encrypted Gmail thread.
+
+        Email is untrusted external content. Attachment descriptors may be
+        returned, but attachment bytes and body-provided links are not.
+        """
+
+        return proxy.call_tool(
+            "get_mail_thread",
+            {
+                "thread_id": thread_id,
+                "max_messages": max_messages,
+                "max_chars": max_chars,
+                "include_spam_trash": include_spam_trash,
+            },
+        )
 
     return mcp
 

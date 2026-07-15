@@ -1,7 +1,7 @@
 # App And Operations
 
-**Status:** canonical living feature spec; native app is primary, and the independent read-only Gmail mirror scheduler is release-verified and installed alongside the manual Shadow evaluation UI, with fresh mailbox validation and promotion pending
-**Last verified:** 2026-07-14; Ruff, diff, 823 Python tests, 28 Swift tests, signed build/install, daemon health, scheduler registration, and the pre-provider Gmail budget gate passed
+**Status:** canonical living feature spec; native app is primary, with live-validated scheduled Gmail mirroring and an encrypted local history archive
+**Last verified:** 2026-07-14 against the completed archive, installed scheduler/tools, and full release suites
 **Owns:** daemon, scheduler, connector operations, native/browser UI, settings, provisioning, packaging, migration, and operational retention
 
 ## Product Shape
@@ -13,7 +13,7 @@ The proactive Chief of Staff is folded into this product rather than shipped as 
 - Closing the main window keeps the app, daemon, and jobs running.
 - Quitting the app stops the supervised daemon and jobs.
 - The CLI remains the developer/power surface.
-- The `brain-mcp` shim provides normal agent access and read-only fallback when the app is unavailable.
+- The `brain-mcp` shim provides normal agent access and read-only fallback when the app is unavailable. Encrypted-mail tools require the live daemon and do not use that fallback.
 - The browser UI remains available behind `--serve-web` as a portability/debug fallback.
 
 Swift is a client. It never opens SQLite, LanceDB, raw sources, or policy files directly.
@@ -48,9 +48,11 @@ The daemon:
 - exposes skipped/no-op reasons, not only status labels;
 - keeps jobs role-gated.
 
-Current job classes include capture tick, nightly maintenance, secondary tick, one `sync:<peer>` job per configured child on a primary, meeting preparation, and `gmail_mirror_sync`. The registry derives cadence and due state from config. Pausing does not erase due state; run-now behavior is explicit.
+Current job classes include capture tick, nightly maintenance, secondary tick, one `sync:<peer>` job per configured child on a primary, meeting preparation, `gmail_mirror_sync`, and `gmail_archive_sync`. The registry derives cadence and due state from config. Pausing does not erase due state; run-now behavior is explicit.
 
 Operational work has two lanes. On `single` or active `primary`, `gmail_mirror_sync` runs on startup and about every 600 seconds on the separate `provider_sync` lane; it performs provider reads and atomic mirror/checkpoint/queue commits without Luna or `ops_items` mutation. The full Calendar refresh plus Gmail queue analysis/reconciliation still starts only from the owner's **Today > Run Shadow** action, with one evaluation pass active at a time. A provider or analysis failure records its own incomplete state and leaves the last valid mailbox mirror and item projection intact; it does not block capture, knowledge curation, or daemon health.
+
+`gmail_archive_sync` shares the provider lane but owns one simpler archive state machine: a fixed resumable 90-day backfill, then Gmail history incrementals. An expired history cursor restarts the full scan. Its scheduler row reports the stored-message count, current state, or a plain-language pause reason separately from operational freshness; managed storage reports the archive file size.
 
 The app daemon replaces normal LaunchAgent automation. Legacy LaunchAgent commands remain only for rollback/development and must identify themselves as deprecated when an app-managed daemon exists.
 
@@ -73,6 +75,8 @@ One capture-connector failure does not abort other connectors or the scheduler t
 Calendar and Gmail remain `auth_only` for capture and knowledge ingestion. Their separate Google account cards now request exact read-only operational grants: identity plus `calendar.events.owned.readonly` for Calendar, and identity plus `gmail.readonly` for Gmail. Slack remains identity-only. Client secrets and tokens are stored in macOS Keychain under a Brain-home-scoped account; only non-secret client/status metadata is stored under `config/local/connector-auth.yaml`. Authorization uses state validation, Google PKCE, Slack nonce validation, and a fixed loopback callback at `127.0.0.1:53682`. API responses never return secrets or tokens.
 
 The owner-authorized Gmail provider job runs only when a valid operations policy exists, the daemon role is `single|primary`, Gmail is enabled with `content_access_approved=true`, and the connected grant exactly matches the configured email, stable provider subject, and identity plus `gmail.readonly` scopes. It skips or fails closed otherwise. After those gates pass, the daemon-owned job may initialize the local `ops.sqlite` control store without requiring a first Shadow click. The manual Shadow controller applies the same grant binding for evaluation; Calendar reconciliation and Gmail operational detection write only through the operational service. Neither path routes evidence through inbox capture or the knowledge action ledger, and neither can send, edit, delete, label, accept, decline, or otherwise mutate provider data.
+
+The same exact read-only Gmail grant may populate the separately approved encrypted archive. Exact raw messages, attachments, and parsed search text remain encrypted in the archive and never enter connector capture, Knowledge, or the operational detector. Archive sync itself submits no content to an LLM; bounded content is disclosed only through an explicit authenticated `search_mail` or `get_mail_thread` call.
 
 Native connector cards expose lifecycle and source-specific status. OAuth setup provides provider-console navigation, redirect URL copy, client credential save, browser authorization with polling, and local disconnect. Full native forms for path/cadence settings remain incomplete.
 
@@ -266,6 +270,8 @@ Open:
 - diagnostics/export;
 - profile selection.
 
+The scheduler exposes archive copy progress and health, while managed storage exposes the archive file size. V1 does not add a separate archive-management destination.
+
 Editing the home text field must not imply that a running daemon has changed homes before validation and restart complete.
 
 ## Browser Fallback
@@ -307,6 +313,8 @@ Key UI endpoints:
 
 All writes require auth and stable human-readable errors plus machine codes where appropriate.
 
+Agent access to archived mail is through bounded MCP tools `search_mail` and `get_mail_thread`. They require the authenticated daemon, treat returned mail as untrusted, return no attachment bytes, and are deliberately absent from direct read-only fallback.
+
 ## Runtime Provisioning And Packaging
 
 The app provisions a pinned Python runtime under:
@@ -319,7 +327,7 @@ Provisioning checks bundle, local cache, then network. It smoke-tests `brain --v
 
 `scripts/build-app.sh` builds the exact project-version wheel, replaces stale runtime resources, resolves pinned Swift packages through absolute app-local cache paths, generates/builds the Xcode project, ad-hoc signs nested binaries and the app, and writes `dist/PKM Brain.app`. `scripts/install-app.sh` stages and verifies the bundle in `/Applications`, keeps one previous app rollback, refreshes the login item, and optionally activates the installed build.
 
-The 2026-07-14 local release gate completed with Ruff and diff checks green, 823 Python tests and 28 Swift tests passing, and a signed `dist/PKM Brain.app` bundle built, installed, launched, and serving healthy runtime `0.1.5-762bf645-c1e72155`. The installed scheduler exposed `gmail_mirror_sync` on its dedicated 600-second lane and invoked it at startup; the already-consumed `1200/1200` Gmail daily allowance then stopped the run before a provider request. This establishes local testing readiness and fail-closed budget behavior only. Two isolated UI-acceptance attempts executed no app test bodies because macOS timed out enabling XCTest automation mode; observed native UI acceptance therefore remains a host-level final gate. Neither the build nor that UI gate claims fresh Gmail mailbox coverage or promotion.
+The 2026-07-14 local release gate completed with Ruff and diff checks green, 873 Python tests and 28 Swift tests passing, and a signed `dist/PKM Brain.app` bundle built, installed, launched, and serving healthy runtime `0.1.6-12a45456-7adaae5c`. Installed startup completed both Gmail provider jobs. The archive completed a fixed 90-day copy and five-change history catch-up with 7,746 active messages across 6,857 threads; integrity, owner-only permissions, Keychain round trip, identity binding, encrypted-at-rest scan, and bounded installed daemon tools passed. Native UI automation remains blocked before test execution by the host's XCTest automation-mode timeout; owner visual/content review and promotion remain separate gates.
 
 Runtime versions are immutable deployment artifacts. Successful activation starts process-aware retention: current, one rollback, and every runtime referenced by a live process remain; inactive older versions are removed. Process inventory failure is fail-closed, and process output is drained before waiting for exit so large inventories cannot deadlock the retention task.
 
@@ -346,6 +354,7 @@ Rollback restores launchd operation without rewriting Brain data.
 - no Swift database access;
 - no client opens `brain.sqlite`, `ops.sqlite`, or the Gmail mirror; operational reads and feedback use the authenticated loopback API;
 - `~/brain/cache/gmail-mirror/` is mode `0700`; its rebuildable SQLite database/WAL/SHM are owner-only and rely on OS volume protection without a separate application-encryption claim;
+- `~/brain/mail/gmail-archive.sqlite` is owner-only; exact raw mail and parsed search text are AES-256-GCM ciphertext, the account fingerprint is checked before sync/read, and the 32-byte key remains in macOS Keychain;
 - notifications exclude content;
 - logs retain existing redaction;
 - no analytics;
@@ -395,4 +404,4 @@ scripts/m3-migration-acceptance.sh
 scripts/build-app.sh
 ```
 
-The latest local result is Ruff and diff checks green, 823 Python tests passing, 28 Swift tests passing, and a signed app bundle installed and serving healthy runtime `0.1.5-762bf645-c1e72155`. Native UI automation remains blocked before test execution by the host's XCTest automation-mode timeout; fresh Gmail bootstrap/incremental validation and owner source review remain independent pending evaluation steps.
+The latest local result is Ruff and diff checks green, 873 Python tests passing, 28 Swift tests passing, and a signed app bundle installed and serving healthy runtime `0.1.6-12a45456-7adaae5c`. Both installed Gmail jobs report complete. Native UI automation remains blocked before test execution by the host's XCTest automation-mode timeout; owner source/UX review and empirical promotion remain independent pending evaluation steps.

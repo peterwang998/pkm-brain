@@ -1,7 +1,7 @@
 # Chief-of-Staff Operations Implementation Plan
 
-**Status:** Gmail's owner-authorized local operational mirror and independent provider-sync lane are release-verified and installed; fresh mailbox validation, owner UX review, and every empirical promotion gate remain pending
-**Last verified:** 2026-07-14; Ruff, diff, 823 Python tests, 28 Swift tests, signed-app installation, daemon health, scheduler registration, and the pre-provider budget gate passed
+**Status:** Gmail's operational mirror and encrypted 90-day archive are release-verified and installed; owner review and promotion remain pending
+**Last verified:** 2026-07-14 against the completed live archive, installed daemon tools, and full release suites
 **Owning spec:** [Chief-of-Staff Operations](../specs/chief-of-staff-operations.md)
 
 ## Outcome
@@ -35,6 +35,9 @@ The program keeps one product, one app, one coordinator daemon, and one Brain ho
 21. Recurring Calendar-series hiding is a reversible local projection preference with a visible hidden-series disclosure and Undo; it never writes to Calendar or deletes operational evidence.
 22. Marketing updates are hidden/audit-only, while routine individual recruiter activity is Attention unless exact evidence establishes a stronger commitment, deadline, or scheduled time.
 23. Gmail transport uses a bounded owner-authorized API mirror: exact seven-day bootstrap, history-based incremental sync about every 600 seconds, atomic provider checkpoint plus durable local analysis queue, and no dependency on Luna for mailbox freshness.
+24. Gmail history is copied into a separate AES-256-GCM encrypted local archive: one 90-day backfill followed by Gmail history incrementals in one state machine.
+25. V1 archive search decrypts and scans locally. Agents can use only bounded daemon-backed `search_mail` and `get_mail_thread`; archive content never enters an LLM, operational detection, or fact extraction automatically.
+26. Gmail deletion retains the local ciphertext. The archive never mutates Gmail.
 
 ## Program Sequence
 
@@ -46,15 +49,16 @@ The program keeps one product, one app, one coordinator daemon, and one Brain ho
 | COS-3 | read-only Calendar evidence and reconciliation | none | latest live provider path complete; human review and promotion pending |
 | COS-4 | coverage-aware Today focus, feedback, evidence audit, and proactive meeting preparation | none | release-verified and installed; visual UX review and empirical promotion pending |
 | COS-5 | durable Gmail operational mirror, one-stage detection, and source-local satisfaction | none | mirror/provider-sync release-verified and installed; fresh live checkpoint/resync validation, human quality review, and promotion pending |
+| COS-5A | encrypted 90-day Gmail history archive and bounded local evidence tools | none | release-verified and installed; owner review pending |
 | COS-6 | reversible cross-source episodes, satisfaction, and production briefing gates | none | gated |
 | COS-7 | local draft/action plans with guarded approval protocol | none | gated |
 | COS-8 | capability-by-capability external execution | explicit only | gated |
 
 Calendar and the operational kernel preceded Gmail implementation. The owner has separately approved Gmail read-only access for a private operational shadow trial, but that does not promote either source or enable Gmail retrieval/knowledge ingestion. Source-local detection and satisfaction must work before cross-source aggregation. Reconciliation must work before the briefing is considered trustworthy. Optional adapters follow the same contract and cannot bypass Calendar/Gmail gates. Drafting must work before execution.
 
-Local release verification completed on 2026-07-14: Ruff and diff checks were green, all 823 Python tests and 28 Swift tests passed, and the signed local app bundle built, installed, launched, and served healthy runtime fingerprint `0.1.5-762bf645-c1e72155`. The installed restricted-Codex selection is `gpt-5.6-luna` at `high` reasoning. The `gmail_mirror_sync` job registered on its dedicated 600-second scheduler lane and ran at startup; the `executive-brief-v2` packet was verified as prepared in advance by the completed scheduler, and recurring `Family Time` hide/Undo behavior passed a live check.
+Local release verification completed on 2026-07-14: Ruff and diff checks were green, all 873 Python tests and 28 Swift tests passed, and the signed local app bundle built, installed, launched, and served healthy runtime fingerprint `0.1.6-12a45456-7adaae5c`. The installed restricted-Codex selection is `gpt-5.6-luna` at `high` reasoning. The `gmail_mirror_sync` and `gmail_archive_sync` jobs both completed after installed startup; the `executive-brief-v2` packet was previously verified as prepared in advance, and recurring `Family Time` hide/Undo behavior passed a live check.
 
-The installed `gmail_mirror_sync` startup run verified scheduler registration, lane isolation, startup execution, and fail-closed budget enforcement, but stopped before any Gmail provider read because the approved durable daily API budget was already `1200/1200`; it does not validate mailbox bootstrap, history checkpoints, restart resume, or expired-history recovery. Separately, an isolated production-code replay exercised the exact retained 200-thread page with zero model calls: 51 marketing threads suppressed, 7 tracked marketing threads kept hidden while pending reconciliation, 5 bulk threads suppressed, 3 recruiter threads filed as Attention, 134 model-dependent threads deferred, 10 plausible threads retained as Uncertain, and 3 derived observations applied. It produced no visible marketing leak and no `ObservationConflictError`. This establishes the repaired deterministic local-routing and immutable-observation release paths, not mailbox correctness, model judgment quality, or daily briefing trust. The macOS XCTest UI suite was attempted, but no UI test executed because the runner timed out while enabling automation mode; this is an environment-blocked visual-acceptance gate, not a passing result or an app assertion failure. Visual UI acceptance, owner review, continued labeling, and every empirical promotion gate remain next.
+The live `gmail_mirror_sync` checkpoint is complete in incremental mode, and the separate encrypted archive completed its fixed 90-day copy plus a five-change history catch-up. The archive holds 7,746 active messages across 6,857 threads in an encrypted database occupying about 403 MB at installed verification; its integrity, permissions, identity binding, Keychain round trip, bounded installed `search_mail`/`get_mail_thread` responses, untrusted-content labeling, and attachment-byte exclusion all passed. Separately, the retained-page operational replay still provides the deterministic local-routing evidence: marketing and bulk suppression, recruiter-to-Attention routing, and immutable observations. These results establish mailbox transport and archive correctness, not detector judgment quality or daily briefing trust. Native visual automation remains host-blocked before test execution, while owner visual/content review, continued labeling, and every empirical promotion gate remain next.
 
 ## 2026-07-14 Operator-Feedback Tranche
 
@@ -378,9 +382,26 @@ Severity-weighted recall, false-alarm rate, source-date accuracy, handled-verdic
 
 The owner-approved private lane now has the scheduled provider mirror and durable local triage queue described above. Provider units remain bounded to 200 threads, pagination/checkpoints are resumable, MIME normalization strips quoted history, and sanitized storage excludes attachment bytes. Marketing-campaign gating precedes broad keyword matching, tracked threads remain detector-eligible, routine individual recruiter activity becomes normal-priority Attention unless stronger evidence exists, and malformed batch entries are isolated per thread. Only the restricted, tool-less Codex detector may receive bounded queued thread content; the installed selection is the shared `gpt-5.6-luna`/`high` default unless a Gmail-specific override is present. Detector `gmail-operations-v6` remains subordinate to deterministic evidence/lifecycle validation. Daily provider and detector budgets fail visibly into their respective mailbox or analysis coverage instead of conflating the two.
 
-The installed mirror job stopped before any Gmail provider read at the approved `1200/1200` API cap, so the new scheduled mirror still needs fresh live bootstrap, incremental, restart, and expired-history validation. The retained-page replay is separate evidence for deterministic local routing and immutable-observation behavior, not mailbox-mirror correctness or model quality.
+The installed mirror now has a complete live incremental checkpoint and resumed safely across daemon restarts. Expired-history recovery remains fixture-tested rather than deliberately forced against the live mailbox. The retained-page replay remains separate evidence for deterministic local routing and immutable-observation behavior, not model quality.
 
 Focused release coverage must prove exact policy/grant/role gates; exact bootstrap query; dedicated scheduler lane/cadence/startup behavior; full and incremental pagination; crash-atomic mirror/queue/checkpoint commits; immutable revision/current-pointer and supersession behavior; provider-confirmed tombstones; expired-history resync that preserves old state and never deletes by absence; attachment-byte exclusion; concurrent sync serialization; queue lease/retry/restart behavior; bounded quarantine retry/backoff, parser-version bypass, schema-one upgrade, and retry-only failure isolation; Luna operation with zero Gmail calls; and separate mailbox-freshness versus analysis-backlog presentation. Run the focused mirror/sync/source/scheduler tests before the full Python, Ruff, Swift, signed-build/install, and owner live-review gates.
+
+## COS-5A - Encrypted Gmail History Archive
+
+The archive is a separate local SQLite store for exact Gmail `RAW` messages, including attachments, plus encrypted parsed text. A Keychain-backed key protects archive content with AES-256-GCM. It does not widen the sanitized operational mirror or write to Brain knowledge state.
+
+The sync job uses one durable state machine:
+
+1. copy the fixed previous 90 days with resumable pagination;
+2. transition to Gmail history incrementals for new and changed messages;
+3. restart the full scan safely when Gmail expires the history cursor;
+4. retain local ciphertext when Gmail reports a deletion.
+
+V1 search decrypts and scans locally, then returns bounded results. `search_mail` and `get_mail_thread` require the authenticated daemon, enforce response limits, return no attachment bytes, and treat all message content as untrusted. The direct MCP fallback does not expose them.
+
+The scheduler reports the stored-message count, current state, or a plain-language pause reason; Gmail's unreliable result-size estimate is not presented as a total. Managed storage reports archive file size. Acceptance requires focused encryption/sync/tool tests, a completed private 90-day backfill, one observed incremental update, an expired-cursor restart test, provider-deletion retention, and confirmation that no Gmail mutation, LLM call, operational detection, or fact extraction occurs.
+
+COS-5A passed its release gate on 2026-07-14. The fixed window copied 7,742 messages and the first history catch-up processed five changes, yielding 7,746 active messages across 6,857 threads. Original raw data totals 758,041,932 bytes; the encrypted database occupied about 403 MB at installed verification and passed `quick_check` with exactly three application tables, owner-only permissions, and a verified 32-byte Keychain key. Installed daemon calls returned bounded, untrusted search/thread payloads with provider links and no attachment bytes. Archive sync made no LLM, Knowledge, operational-detector, or Gmail-mutation call. Expired-cursor restart and provider-deletion retention remain covered by deterministic tests; owner content/UX review remains open.
 
 ## COS-6 - Cross-Source Reconciliation
 
@@ -480,6 +501,7 @@ Every shadow release records:
 - marketing-to-visible leakage, recruiter-attention classification, and suppressed-source miss rate;
 - recurring-series suppression/restore leakage and disclosure accuracy;
 - meeting-preparation factual evidence coverage, unsupported-claim rate, stale/wrong-person rate, precomposition timeliness, and revision invalidation;
+- archive stored-message progress, file size, incremental freshness, pause reasons, and bounded-tool failures;
 - corrections, dismissals, snoozes, and reported misses;
 - DB size, write latency, lock errors, backup/integrity result;
 - model/prompt/classifier versions.
@@ -491,6 +513,7 @@ No release can average away a wrong-person link, false closure of a user-confirm
 - `ops.sqlite` uses SQLite backup semantics, never a live file copy.
 - Backup manifests bind the knowledge and operational snapshots taken under one daemon-controlled recovery point.
 - Operational state is primary-only initially and is never live-rsynced.
+- The Gmail archive is primary-local encrypted evidence and is not copied by Brain source sync.
 - A secondary can render explicitly stale replicated briefing state only after coordinated snapshot support lands.
 - Immutable provider evidence allows deterministic rebuild of derived observations/items, but user corrections and approvals are canonical and must be backed up.
 - Fact promotion is an asynchronous replay-safe handoff into the normal Knowledge Curation action path.
@@ -514,6 +537,8 @@ Stop the phase and preserve the previous release when:
 - a meeting packet emits an unsupported factual claim, presents diagnostics as the primary brief, hides stale/partial coverage, uses a stale Calendar revision, or prepares a locally suppressed series;
 - duplicate, stale, false-merge, false-link, false-handled, premature-close, or high-severity-miss gates regress;
 - calls/tokens grow without a per-changed-source budget;
+- archive plaintext appears outside the encrypted store or an archive operation invokes an LLM, fact extraction, or Gmail mutation;
+- archive sync cannot resume/restart safely, provider deletion removes local ciphertext, or mail tools bypass the authenticated daemon and bounds;
 - SQLite lock/integrity or coordinated-backup tests fail;
 - an external plan lacks exact approval binding or a reversibility class;
 - planner and approver share the same authority surface.
@@ -532,8 +557,9 @@ Use separate commits for:
 8. Today focus/API/UI plus Calendar/Brain meeting preparation;
 9. Gmail retrieval/detection plus source-local satisfaction verification;
 10. operator-feedback tranche: proactive revision-bound meeting briefs, recurring Calendar-series suppression/undo, marketing hiding, recruiter Attention, and model-default inheritance;
-11. reversible cross-source episode relations, satisfaction, and briefing gates;
-12. each optional Git, agent-session, code-host, collaboration, or work-tracker adapter as its own read-only commit;
-13. draft/execution capabilities, split again by capability and reversibility class.
+11. encrypted Gmail archive, scheduler progress, and bounded daemon mail tools;
+12. reversible cross-source episode relations, satisfaction, and briefing gates;
+13. each optional Git, agent-session, code-host, collaboration, or work-tracker adapter as its own read-only commit;
+14. draft/execution capabilities, split again by capability and reversibility class.
 
 Contract commits do not smuggle in runtime behavior. Every implementation commit updates the owning phase status and includes focused tests, private fixture/eval results where applicable, plus the full no-regression gate appropriate to its blast radius. A phase commit is pushed only after its owning gate passes; a later adapter or model regression can disable that capability without rolling back the knowledge, Calendar, or retrieval foundations.
