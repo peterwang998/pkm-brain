@@ -17,7 +17,13 @@ from .extraction import (
     recent_source_cards,
 )
 from .evals import EXTRACTION_LABELS_FILENAME, load_extraction_label_cases
-from .llm import cos_provider_status
+from .fact_records import revise_stored_fact, row_to_fact
+from .llm import (
+    CRITIC_AUDITOR_MODEL_OVERLAP_WARNING,
+    cos_provider_status,
+    cos_rebuild_allows_critic_auditor_model_overlap,
+    cos_rebuild_allows_critic_proposer_model_overlap,
+)
 from .paths import BrainPaths
 from .service import BrainService
 from .util import now_iso
@@ -155,7 +161,7 @@ def rebuild_facts_from_sources(
         "source_type_filter": sorted(source_type_filter),
         "limit": limit,
         "offset": offset,
-        "provider_ready": provider_ready_summary(providers),
+        "provider_ready": rebuild_provider_ready_summary(paths, providers),
         "embedding": BrainService(paths).embedding_provider.status(check_available=False),
         "extraction_eval_gate": eval_gate,
         "scope": {
@@ -203,14 +209,16 @@ def apply_rebuild_facts_from_sources(
 ) -> dict[str, Any]:
     if not eval_gate.get("ready"):
         raise ValueError(f"rebuild-facts apply blocked: {eval_gate['reason']}")
-    provider_ready = provider_ready_summary(providers)
+    provider_ready = rebuild_provider_ready_summary(paths, providers)
     if not provider_ready["all_ready"]:
         missing = ", ".join(provider_ready["missing_or_unready_roles"])
         raise ValueError(f"rebuild-facts apply blocked: provider roles not ready: {missing}")
-    if provider_ready["warnings"]:
+    if provider_ready["blocking_warnings"]:
         raise ValueError(
             "rebuild-facts apply blocked: provider separation warnings: "
-            + "; ".join(str(warning) for warning in provider_ready["warnings"])
+            + "; ".join(
+                str(warning) for warning in provider_ready["blocking_warnings"]
+            )
         )
     run_id = f"regen_{generated_at.replace(':', '').replace('-', '').replace('+', '')}"
     artifact_dir = default_regeneration_artifact_dir(paths, generated_at)
@@ -307,7 +315,15 @@ def reset_rebuild_derived_state(paths: BrainPaths, *, run_id: str) -> dict[str, 
     timestamp = now_iso()
     managed_files = remove_managed_wiki_files(paths)
     with connection(paths.sqlite_path) as conn:
-        fact_count = int(conn.execute("SELECT COUNT(*) FROM facts WHERE status != 'archived'").fetchone()[0])
+        current_facts = list(
+            conn.execute(
+                """
+                SELECT * FROM facts
+                WHERE knowledge_to IS NULL AND status != 'archived'
+                """
+            )
+        )
+        fact_count = len(current_facts)
         entity_count = int(
             conn.execute(
                 "SELECT COUNT(*) FROM entities WHERE COALESCE(status, 'active') = 'active'"
@@ -318,28 +334,57 @@ def reset_rebuild_derived_state(paths: BrainPaths, *, run_id: str) -> dict[str, 
                 "SELECT COUNT(*) FROM open_questions WHERE status IN ('open', 'needs_human')"
             ).fetchone()[0]
         )
+        open_extractor_actions = list(
+            conn.execute(
+                """
+                SELECT id, evidence_json
+                FROM cos_actions
+                WHERE proposed_by = 'extractor'
+                  AND status IN ('proposed', 'needs_human')
+                ORDER BY created_at, id
+                """
+            )
+        )
+        archive_marker = {
+            "run_id": run_id,
+            "archived_at": timestamp,
+            "reason": "from_source_regeneration_reset",
+        }
+        for row in current_facts:
+            fact = row_to_fact(row)
+            revise_stored_fact(
+                conn,
+                str(fact["id"]),
+                {
+                    "status": "archived",
+                    "metadata": {
+                        **dict(fact.get("metadata") or {}),
+                        "regeneration_archive": archive_marker,
+                    },
+                },
+            )
+        action_reset_marker = {
+            "run_id": run_id,
+            "dismissed_at": timestamp,
+            "reason": "stale_after_from_source_regeneration_reset",
+        }
+        for row in open_extractor_actions:
+            evidence = json.loads(row["evidence_json"] or "{}")
+            evidence["regeneration_reset"] = action_reset_marker
+            conn.execute(
+                """
+                UPDATE cos_actions
+                SET status = 'dismissed', evidence_json = ?
+                WHERE id = ? AND status IN ('proposed', 'needs_human')
+                """,
+                (json.dumps(evidence, sort_keys=True), row["id"]),
+            )
         conn.execute(
             """
-            UPDATE facts
-            SET status = 'archived',
-                metadata = json_set(
-                  COALESCE(NULLIF(metadata, ''), '{}'),
-                  '$.regeneration_archive',
-                  json(?)
-                )
-            WHERE status != 'archived'
-            """,
-            (
-                json.dumps(
-                    {
-                        "run_id": run_id,
-                        "archived_at": timestamp,
-                        "reason": "from_source_regeneration_reset",
-                    }
-                ),
-            ),
+            DELETE FROM fact_entities
+            WHERE fact_id IN (SELECT id FROM facts WHERE knowledge_to IS NULL)
+            """
         )
-        conn.execute("DELETE FROM fact_entities")
         conn.execute(
             """
             UPDATE entities
@@ -375,6 +420,7 @@ def reset_rebuild_derived_state(paths: BrainPaths, *, run_id: str) -> dict[str, 
         "archived_fact_count": fact_count,
         "archived_entity_count": entity_count,
         "dismissed_open_question_count": active_question_count,
+        "dismissed_open_extractor_action_count": len(open_extractor_actions),
         "removed_managed_wiki_file_count": len(managed_files),
         "removed_managed_wiki_files": managed_files[:50],
         "cleared_fact_entity_links": True,
@@ -417,6 +463,7 @@ def active_fact_entity_keys(paths: BrainPaths) -> list[str]:
                 SELECT DISTINCT entity_key
                 FROM facts
                 WHERE status IN ('active', 'conflicted', 'needs_confirmation')
+                  AND knowledge_to IS NULL
                   AND COALESCE(entity_key, '') != ''
                 ORDER BY entity_key
                 """
@@ -438,9 +485,9 @@ def reapply_confirmed_facts(
         active_facts = rows(
             conn,
             """
-            SELECT id, statement, page_hint, source_ids, metadata
+            SELECT *
             FROM facts
-            WHERE status = 'active'
+            WHERE status = 'active' AND knowledge_to IS NULL
             ORDER BY created_at DESC, id
             """,
         )
@@ -461,20 +508,17 @@ def reapply_confirmed_facts(
                     }
                 )
                 continue
-            metadata = json.loads(match["metadata"] or "{}")
+            fact = row_to_fact(match)
+            metadata = dict(fact.get("metadata") or {})
             metadata["confirmed_by_user_reapplied"] = {
                 "run_id": run_id,
                 "old_fact_id": old_fact.get("id"),
                 "reapplied_at": now_iso(),
             }
-            conn.execute(
-                """
-                UPDATE facts
-                SET confirmed_by_user = 1,
-                    metadata = ?
-                WHERE id = ?
-                """,
-                (json.dumps(metadata, sort_keys=True), match["id"]),
+            revise_stored_fact(
+                conn,
+                str(match["id"]),
+                {"confirmed_by_user": True, "metadata": metadata},
             )
             matched_ids.append(str(match["id"]))
     return {
@@ -592,7 +636,7 @@ def human_state_payload(paths: BrainPaths, *, generated_at: str) -> dict[str, An
                 """
                 SELECT *
                 FROM facts
-                WHERE confirmed_by_user = 1
+                WHERE confirmed_by_user = 1 AND knowledge_to IS NULL
                 ORDER BY created_at, id
                 """
             )
@@ -614,7 +658,7 @@ def human_state_payload(paths: BrainPaths, *, generated_at: str) -> dict[str, An
                 """
                 SELECT *
                 FROM facts
-                WHERE status = 'conflicted'
+                WHERE status = 'conflicted' AND knowledge_to IS NULL
                 ORDER BY created_at, id
                 """
             )
@@ -725,17 +769,75 @@ def managed_wiki_page_count(paths: BrainPaths) -> int:
     )
 
 
-def provider_ready_summary(status: dict[str, Any]) -> dict[str, Any]:
+def rebuild_provider_ready_summary(
+    paths: BrainPaths, status: dict[str, Any]
+) -> dict[str, Any]:
+    return provider_ready_summary(
+        status,
+        allow_critic_auditor_model_overlap=(
+            cos_rebuild_allows_critic_auditor_model_overlap(paths)
+        ),
+        allow_critic_proposer_model_overlap=(
+            cos_rebuild_allows_critic_proposer_model_overlap(paths)
+        ),
+    )
+
+
+def provider_ready_summary(
+    status: dict[str, Any],
+    *,
+    allow_critic_auditor_model_overlap: bool = False,
+    allow_critic_proposer_model_overlap: bool = False,
+) -> dict[str, Any]:
     roles = status.get("roles") or []
     missing = [
         str(role.get("role"))
         for role in roles
         if not role.get("configured") or role.get("missing")
     ]
+    warnings = [str(warning) for warning in status.get("warnings") or []]
+    roles_by_name = {
+        str(role.get("role")): role for role in roles if isinstance(role, dict)
+    }
+    critic = roles_by_name.get("critic") or {}
+    auditor = roles_by_name.get("auditor") or {}
+    independent_auditor_ready = bool(
+        auditor.get("configured")
+        and not auditor.get("missing")
+        and auditor.get("provider")
+        and auditor.get("model")
+        and critic.get("provider")
+        and critic.get("model")
+        and (auditor.get("provider"), auditor.get("model"))
+        != (critic.get("provider"), critic.get("model"))
+    )
+    critic_proposer_warnings = {
+        f"critic uses the same provider/model as {role}; "
+        "separation of duties is not independent"
+        for role in ("extractor", "resolver", "gardener", "synthesizer")
+    }
+    allowed_warnings = [
+        warning
+        for warning in warnings
+        if (
+            allow_critic_auditor_model_overlap
+            and warning == CRITIC_AUDITOR_MODEL_OVERLAP_WARNING
+        )
+        or (
+            allow_critic_proposer_model_overlap
+            and independent_auditor_ready
+            and warning in critic_proposer_warnings
+        )
+    ]
+    blocking_warnings = [
+        warning for warning in warnings if warning not in allowed_warnings
+    ]
     return {
         "all_ready": not missing,
         "missing_or_unready_roles": missing,
-        "warnings": status.get("warnings") or [],
+        "warnings": warnings,
+        "allowed_warnings": allowed_warnings,
+        "blocking_warnings": blocking_warnings,
     }
 
 

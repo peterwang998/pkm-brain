@@ -37,10 +37,20 @@ ANTHROPIC_DEFAULT_MODEL = "claude-sonnet-4-5"
 ANTHROPIC_DEFAULT_FALLBACK_MODELS: tuple[str, ...] = ()
 CODEX_DEFAULT_MODEL = "gpt-5.6-sol"
 CODEX_DEFAULT_FALLBACK_MODELS = ("gpt-5.6-luna",)
-LLM_ROLE_ORDER = ("extractor", "resolver", "gardener", "synthesizer", "critic", "auditor")
+LLM_ROLE_ORDER = (
+    "extractor",
+    "resolver",
+    "gardener",
+    "synthesizer",
+    "critic",
+    "auditor",
+)
 LLM_ROLES = set(LLM_ROLE_ORDER)
 COS_PROPOSER_ROLES = ("extractor", "resolver", "gardener", "synthesizer")
 COS_REVIEWER_ROLES = ("critic", "auditor")
+CRITIC_AUDITOR_MODEL_OVERLAP_WARNING = (
+    "critic and auditor use the same provider/model; audit independence is reduced"
+)
 COS_LLM_CONFIG_FILENAME = "cos_llm.yaml"
 VALID_PROVIDERS = {"openai", "anthropic", "ollama", "codex"}
 _COS_ROLE_PROVIDER_LOCK = Lock()
@@ -58,8 +68,7 @@ class LLMProvider(Protocol):
     name: str
     model: str
 
-    def complete(self, prompt: str) -> str:
-        ...
+    def complete(self, prompt: str) -> str: ...
 
 
 @dataclass(frozen=True)
@@ -101,9 +110,13 @@ class OpenAIProvider:
             OPENAI_DEFAULT_FALLBACK_MODELS,
         )
         self.model = self.models[0]
-        self.base_url = os.environ.get("PKM_BRAIN_OPENAI_BASE_URL", "https://api.openai.com/v1")
+        self.base_url = os.environ.get(
+            "PKM_BRAIN_OPENAI_BASE_URL", "https://api.openai.com/v1"
+        )
         if not self.api_key:
-            raise LLMConfigurationError("OPENAI_API_KEY is required for OpenAI provider")
+            raise LLMConfigurationError(
+                "OPENAI_API_KEY is required for OpenAI provider"
+            )
 
     def complete(self, prompt: str) -> str:
         def run_once(model: str) -> str:
@@ -115,7 +128,10 @@ class OpenAIProvider:
             payload = {
                 "model": model,
                 "messages": [
-                    {"role": "system", "content": "Return only valid JSON. Do not wrap it in Markdown."},
+                    {
+                        "role": "system",
+                        "content": "Return only valid JSON. Do not wrap it in Markdown.",
+                    },
                     {"role": "user", "content": prompt},
                 ],
             }
@@ -163,9 +179,13 @@ class AnthropicProvider:
             ANTHROPIC_DEFAULT_FALLBACK_MODELS,
         )
         self.model = self.models[0]
-        self.base_url = os.environ.get("PKM_BRAIN_ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+        self.base_url = os.environ.get(
+            "PKM_BRAIN_ANTHROPIC_BASE_URL", "https://api.anthropic.com"
+        )
         if not self.api_key:
-            raise LLMConfigurationError("ANTHROPIC_API_KEY is required for Anthropic provider")
+            raise LLMConfigurationError(
+                "ANTHROPIC_API_KEY is required for Anthropic provider"
+            )
 
     def complete(self, prompt: str) -> str:
         def run_once(model: str) -> str:
@@ -189,7 +209,11 @@ class AnthropicProvider:
                         "anthropic-version": "2023-06-01",
                     },
                 )
-                content = "".join(part.get("text", "") for part in data["content"] if part.get("type") == "text")
+                content = "".join(
+                    part.get("text", "")
+                    for part in data["content"]
+                    if part.get("type") == "text"
+                )
                 self.model = model
                 status = "success"
                 return content
@@ -220,10 +244,16 @@ class OllamaProvider:
 
     def __init__(self) -> None:
         self.model = os.environ.get("PKM_BRAIN_OLLAMA_MODEL")
-        self.models = model_candidates("PKM_BRAIN_OLLAMA_MODEL", "", "PKM_BRAIN_OLLAMA_MODEL_FALLBACKS", ())
-        self.base_url = os.environ.get("PKM_BRAIN_OLLAMA_BASE_URL", "http://localhost:11434")
+        self.models = model_candidates(
+            "PKM_BRAIN_OLLAMA_MODEL", "", "PKM_BRAIN_OLLAMA_MODEL_FALLBACKS", ()
+        )
+        self.base_url = os.environ.get(
+            "PKM_BRAIN_OLLAMA_BASE_URL", "http://localhost:11434"
+        )
         if not self.models:
-            raise LLMConfigurationError("PKM_BRAIN_OLLAMA_MODEL is required for Ollama provider")
+            raise LLMConfigurationError(
+                "PKM_BRAIN_OLLAMA_MODEL is required for Ollama provider"
+            )
         self.model = self.models[0]
 
     def complete(self, prompt: str) -> str:
@@ -237,7 +267,10 @@ class OllamaProvider:
                 "model": model,
                 "stream": False,
                 "messages": [
-                    {"role": "system", "content": "Return only valid JSON. Do not wrap it in Markdown."},
+                    {
+                        "role": "system",
+                        "content": "Return only valid JSON. Do not wrap it in Markdown.",
+                    },
                     {"role": "user", "content": prompt},
                 ],
             }
@@ -287,13 +320,17 @@ class CodexProvider:
             os.environ.get("PKM_BRAIN_CODEX_REASONING_EFFORT")
         )
         if not self.binary:
-            raise LLMConfigurationError("codex executable was not found; install/login to Codex CLI first")
+            raise LLMConfigurationError(
+                "codex executable was not found; install/login to Codex CLI first"
+            )
         missing = codex_missing_configuration(self.binary)
         if missing:
             raise LLMConfigurationError(", ".join(missing))
 
     def complete(self, prompt: str) -> str:
-        return complete_with_model_fallbacks("Codex", self.models, lambda model: self._complete_once(model, prompt))
+        return complete_with_model_fallbacks(
+            "Codex", self.models, lambda model: self._complete_once(model, prompt)
+        )
 
     def _complete_once(self, model: str, prompt: str) -> str:
         started_at = now_iso()
@@ -342,7 +379,9 @@ class CodexProvider:
                     duration_ms=int((time.perf_counter() - started_clock) * 1000),
                     error_type=error_type,
                 )
-                raise LLMProviderError(f"Codex timed out after {self.timeout} seconds") from exc
+                raise LLMProviderError(
+                    f"Codex timed out after {self.timeout} seconds"
+                ) from exc
             usage, metadata = codex_jsonl_usage(completed.stdout)
             try:
                 if completed.returncode != 0:
@@ -376,7 +415,9 @@ class CodexProvider:
                 )
 
 
-def get_provider(provider: str | None = None, *, role: str | None = None) -> LLMProvider:
+def get_provider(
+    provider: str | None = None, *, role: str | None = None
+) -> LLMProvider:
     selected = selected_provider(provider, role=role)
     with role_model_environment(selected, role):
         if selected == "openai":
@@ -387,10 +428,14 @@ def get_provider(provider: str | None = None, *, role: str | None = None) -> LLM
             return OllamaProvider()
         if selected == "codex":
             return CodexProvider()
-    raise LLMConfigurationError("LLM provider must be one of: openai, anthropic, ollama, codex")
+    raise LLMConfigurationError(
+        "LLM provider must be one of: openai, anthropic, ollama, codex"
+    )
 
 
-def provider_status(provider: str | None = None, *, role: str | None = None) -> dict[str, Any]:
+def provider_status(
+    provider: str | None = None, *, role: str | None = None
+) -> dict[str, Any]:
     selected = selected_provider(provider, role=role)
     with role_model_environment(selected, role):
         return _provider_status_for_selected(selected)
@@ -398,7 +443,12 @@ def provider_status(provider: str | None = None, *, role: str | None = None) -> 
 
 def _provider_status_for_selected(selected: str) -> dict[str, Any]:
     if selected not in VALID_PROVIDERS:
-        return ProviderStatus(provider=selected or "unset", model=None, configured=False, missing=["valid provider"]).__dict__
+        return ProviderStatus(
+            provider=selected or "unset",
+            model=None,
+            configured=False,
+            missing=["valid provider"],
+        ).__dict__
     if selected == "openai":
         missing = [key for key in ["OPENAI_API_KEY"] if not os.environ.get(key)]
         models = model_candidates(
@@ -412,7 +462,9 @@ def _provider_status_for_selected(selected: str) -> dict[str, Any]:
             model=models[0],
             configured=not missing,
             missing=missing,
-            base_url=os.environ.get("PKM_BRAIN_OPENAI_BASE_URL", "https://api.openai.com/v1"),
+            base_url=os.environ.get(
+                "PKM_BRAIN_OPENAI_BASE_URL", "https://api.openai.com/v1"
+            ),
             fallback_models=models[1:],
             cost_source="OpenAI API billing; not covered by ChatGPT subscription usage",
         ).__dict__
@@ -429,7 +481,9 @@ def _provider_status_for_selected(selected: str) -> dict[str, Any]:
             model=models[0],
             configured=not missing,
             missing=missing,
-            base_url=os.environ.get("PKM_BRAIN_ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
+            base_url=os.environ.get(
+                "PKM_BRAIN_ANTHROPIC_BASE_URL", "https://api.anthropic.com"
+            ),
             fallback_models=models[1:],
             cost_source="Anthropic API billing",
         ).__dict__
@@ -454,7 +508,9 @@ def _provider_status_for_selected(selected: str) -> dict[str, Any]:
             ),
             cost_source="Codex CLI account; uses ChatGPT plan usage when Codex CLI is signed in with ChatGPT",
         ).__dict__
-    models = model_candidates("PKM_BRAIN_OLLAMA_MODEL", "", "PKM_BRAIN_OLLAMA_MODEL_FALLBACKS", ())
+    models = model_candidates(
+        "PKM_BRAIN_OLLAMA_MODEL", "", "PKM_BRAIN_OLLAMA_MODEL_FALLBACKS", ()
+    )
     missing = [] if models else ["PKM_BRAIN_OLLAMA_MODEL"]
     return ProviderStatus(
         provider="ollama",
@@ -472,11 +528,15 @@ def selected_provider(provider: str | None = None, *, role: str | None = None) -
     if role:
         role_provider = os.environ.get(role_env(role, "PROVIDER"))
     return (
-        provider
-        or role_provider
-        or os.environ.get("PKM_BRAIN_LLM_PROVIDER")
-        or DEFAULT_LLM_PROVIDER
-    ).strip().lower()
+        (
+            provider
+            or role_provider
+            or os.environ.get("PKM_BRAIN_LLM_PROVIDER")
+            or DEFAULT_LLM_PROVIDER
+        )
+        .strip()
+        .lower()
+    )
 
 
 def cos_llm_config_path(paths: "BrainPaths") -> Path:
@@ -496,6 +556,33 @@ def load_cos_llm_config(paths: "BrainPaths") -> dict[str, Any]:
     return parsed
 
 
+def cos_rebuild_allows_critic_auditor_model_overlap(paths: "BrainPaths") -> bool:
+    return cos_rebuild_boolean_flag(paths, "allow_critic_auditor_model_overlap")
+
+
+def cos_rebuild_allows_critic_proposer_model_overlap(paths: "BrainPaths") -> bool:
+    return cos_rebuild_boolean_flag(paths, "allow_critic_proposer_model_overlap")
+
+
+def cos_rebuild_boolean_flag(paths: "BrainPaths", key: str) -> bool:
+    config = load_cos_llm_config(paths)
+    rebuild_config = config.get("rebuild")
+    if rebuild_config is None:
+        return False
+    if not isinstance(rebuild_config, dict):
+        raise LLMConfigurationError(
+            "cos_llm.yaml rebuild configuration must be a YAML mapping"
+        )
+    value = rebuild_config.get(key)
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise LLMConfigurationError(
+            f"cos_llm.yaml rebuild.{key} must be true or false"
+        )
+    return value
+
+
 def resolve_cos_role_selection(
     paths: "BrainPaths",
     role: str,
@@ -508,32 +595,57 @@ def resolve_cos_role_selection(
     role_config = cos_role_config_from_mapping(config, normalized_role)
     provider_choice = first_configured_value(
         (provider, "argument"),
-        (os.environ.get(role_env(normalized_role, "PROVIDER")), f"env:{role_env(normalized_role, 'PROVIDER')}"),
+        (
+            os.environ.get(role_env(normalized_role, "PROVIDER")),
+            f"env:{role_env(normalized_role, 'PROVIDER')}",
+        ),
         (role_config.get("provider"), f"config:roles.{normalized_role}.provider"),
         (os.environ.get("PKM_BRAIN_LLM_PROVIDER"), "env:PKM_BRAIN_LLM_PROVIDER"),
         (default_config.get("provider"), "config:default.provider"),
     )
     model_choice = first_configured_value(
-        (os.environ.get(role_env(normalized_role, "MODEL")), f"env:{role_env(normalized_role, 'MODEL')}"),
+        (
+            os.environ.get(role_env(normalized_role, "MODEL")),
+            f"env:{role_env(normalized_role, 'MODEL')}",
+        ),
         (role_config.get("model"), f"config:roles.{normalized_role}.model"),
         (default_config.get("model"), "config:default.model"),
     )
     fallback_choice = first_model_fallbacks_value(
-        (os.environ.get(role_env(normalized_role, "MODEL_FALLBACKS")), f"env:{role_env(normalized_role, 'MODEL_FALLBACKS')}"),
-        (role_config.get("model_fallbacks"), f"config:roles.{normalized_role}.model_fallbacks"),
+        (
+            os.environ.get(role_env(normalized_role, "MODEL_FALLBACKS")),
+            f"env:{role_env(normalized_role, 'MODEL_FALLBACKS')}",
+        ),
+        (
+            role_config.get("model_fallbacks"),
+            f"config:roles.{normalized_role}.model_fallbacks",
+        ),
         (default_config.get("model_fallbacks"), "config:default.model_fallbacks"),
     )
     effort_choice = first_configured_value(
-        (os.environ.get(role_env(normalized_role, "REASONING_EFFORT")), f"env:{role_env(normalized_role, 'REASONING_EFFORT')}"),
-        (role_config.get("reasoning_effort"), f"config:roles.{normalized_role}.reasoning_effort"),
+        (
+            os.environ.get(role_env(normalized_role, "REASONING_EFFORT")),
+            f"env:{role_env(normalized_role, 'REASONING_EFFORT')}",
+        ),
+        (
+            role_config.get("reasoning_effort"),
+            f"config:roles.{normalized_role}.reasoning_effort",
+        ),
         (default_config.get("reasoning_effort"), "config:default.reasoning_effort"),
     )
     base_url_choice = first_configured_value(
-        (os.environ.get(role_env(normalized_role, "BASE_URL")), f"env:{role_env(normalized_role, 'BASE_URL')}"),
+        (
+            os.environ.get(role_env(normalized_role, "BASE_URL")),
+            f"env:{role_env(normalized_role, 'BASE_URL')}",
+        ),
         (role_config.get("base_url"), f"config:roles.{normalized_role}.base_url"),
         (default_config.get("base_url"), "config:default.base_url"),
     )
-    provider_name = normalize_provider_name(provider_choice[0]) if provider_choice[0] is not None else None
+    provider_name = (
+        normalize_provider_name(provider_choice[0])
+        if provider_choice[0] is not None
+        else None
+    )
     return CosRoleSelection(
         role=normalized_role,
         provider=provider_name,
@@ -544,7 +656,9 @@ def resolve_cos_role_selection(
         fallback_source=fallback_choice[1],
         reasoning_effort=normalized_reasoning_effort(effort_choice[0]),
         reasoning_effort_source=effort_choice[1],
-        base_url=str(base_url_choice[0]).strip() if base_url_choice[0] is not None else None,
+        base_url=str(base_url_choice[0]).strip()
+        if base_url_choice[0] is not None
+        else None,
         base_url_source=base_url_choice[1],
     )
 
@@ -570,7 +684,9 @@ def normalize_cos_llm_role_config(value: Any) -> dict[str, Any]:
     return output
 
 
-def first_configured_value(*candidates: tuple[Any, str]) -> tuple[Any | None, str | None]:
+def first_configured_value(
+    *candidates: tuple[Any, str],
+) -> tuple[Any | None, str | None]:
     for value, source in candidates:
         if value is None:
             continue
@@ -580,7 +696,9 @@ def first_configured_value(*candidates: tuple[Any, str]) -> tuple[Any | None, st
     return None, None
 
 
-def first_model_fallbacks_value(*candidates: tuple[Any, str]) -> tuple[list[str] | None, str | None]:
+def first_model_fallbacks_value(
+    *candidates: tuple[Any, str],
+) -> tuple[list[str] | None, str | None]:
     for value, source in candidates:
         parsed = parse_model_fallbacks_value(value)
         if parsed is not None:
@@ -671,7 +789,9 @@ def cos_role_provider_configured(
 ) -> bool:
     if llm_provider is not None:
         return True
-    return resolve_cos_role_selection(paths, role, provider=provider).provider is not None
+    return (
+        resolve_cos_role_selection(paths, role, provider=provider).provider is not None
+    )
 
 
 def get_cos_role_provider(
@@ -799,8 +919,12 @@ def cos_provider_separation_warnings(role_rows: list[dict[str, Any]]) -> list[st
                 )
     critic = by_role.get("critic")
     auditor = by_role.get("auditor")
-    if row_has_provider_model(critic) and row_has_provider_model(auditor) and same_provider_model(critic, auditor):
-        warnings.append("critic and auditor use the same provider/model; audit independence is reduced")
+    if (
+        row_has_provider_model(critic)
+        and row_has_provider_model(auditor)
+        and same_provider_model(critic, auditor)
+    ):
+        warnings.append(CRITIC_AUDITOR_MODEL_OVERLAP_WARNING)
     for warning in warnings:
         for row in role_rows:
             if str(row["role"]) in warning:
@@ -809,10 +933,14 @@ def cos_provider_separation_warnings(role_rows: list[dict[str, Any]]) -> list[st
 
 
 def row_has_provider_model(row: dict[str, Any] | None) -> bool:
-    return bool(row and row.get("role_configured") and row.get("provider") and row.get("model"))
+    return bool(
+        row and row.get("role_configured") and row.get("provider") and row.get("model")
+    )
 
 
-def same_provider_model(left: dict[str, Any] | None, right: dict[str, Any] | None) -> bool:
+def same_provider_model(
+    left: dict[str, Any] | None, right: dict[str, Any] | None
+) -> bool:
     return bool(
         left
         and right
@@ -919,7 +1047,9 @@ def complete_json(
             usage_stage=usage_stage,
         )
         if active_provider is None:
-            raise LLMConfigurationError(f"No CoS LLM provider configured for role: {role}")
+            raise LLMConfigurationError(
+                f"No CoS LLM provider configured for role: {role}"
+            )
     else:
         active_provider = get_provider(provider, role=role)
     current_prompt = json_prompt(prompt, schema=schema)
@@ -936,8 +1066,12 @@ def complete_json(
             last_error = exc
             if attempt == max_attempts - 1:
                 break
-            current_prompt = repair_json_prompt(prompt, last_response, exc, schema=schema)
-    raise LLMProviderError(f"LLM did not return valid JSON after {max_attempts} attempts: {last_error}") from last_error
+            current_prompt = repair_json_prompt(
+                prompt, last_response, exc, schema=schema
+            )
+    raise LLMProviderError(
+        f"LLM did not return valid JSON after {max_attempts} attempts: {last_error}"
+    ) from last_error
 
 
 def model_candidates(
@@ -948,12 +1082,20 @@ def model_candidates(
 ) -> list[str]:
     primary = (os.environ.get(model_env) or default_model).strip()
     fallback_value = os.environ.get(fallback_env)
-    fallback_models = list(default_fallbacks) if fallback_value is None else split_model_list(fallback_value)
+    fallback_models = (
+        list(default_fallbacks)
+        if fallback_value is None
+        else split_model_list(fallback_value)
+    )
     return dedupe_models([primary, *fallback_models])
 
 
 def json_prompt(prompt: str, *, schema: dict[str, Any] | None = None) -> str:
-    schema_text = f"\nRequired JSON shape:\n{json.dumps(schema, sort_keys=True)}\n" if schema else ""
+    schema_text = (
+        f"\nRequired JSON shape:\n{json.dumps(schema, sort_keys=True)}\n"
+        if schema
+        else ""
+    )
     return (
         "Return exactly one valid JSON object. Do not wrap it in Markdown."
         f"{schema_text}\nPrompt:\n{prompt}"
@@ -968,13 +1110,22 @@ def repair_json_prompt(
     schema: dict[str, Any] | None = None,
 ) -> str:
     clipped = invalid_response[:4000]
-    schema_text = f"\nRequired JSON shape:\n{json.dumps(schema, sort_keys=True)}\n" if schema else ""
+    schema_text = (
+        f"\nRequired JSON shape:\n{json.dumps(schema, sort_keys=True)}\n"
+        if schema
+        else ""
+    )
     return (
         "Repair the previous response so it is exactly one valid JSON object. "
-        "Return only the repaired JSON object.\n"
+        "Return only the repaired JSON object. Preserve the required top-level keys; "
+        "when the schema requires an array and there are no items, return an empty array "
+        "rather than omitting the key.\n"
         f"Parse error: {error}\n"
         f"{schema_text}"
-        f"Original prompt:\n{original_prompt[:4000]}\n"
+        # Extraction prompts put the source window after the instructions. A
+        # head-only clip removed all source evidence, making a valid retry
+        # impossible for large transcripts.
+        f"Original prompt:\n{original_prompt}\n"
         f"Invalid response:\n{clipped}"
     )
 
@@ -1015,10 +1166,47 @@ def validate_minimal_schema(value: dict[str, Any], schema: dict[str, Any]) -> No
         missing = [str(key) for key in required if str(key) not in value]
         if missing:
             raise ValueError(f"JSON object missing required keys: {', '.join(missing)}")
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return
+    for key, property_schema in properties.items():
+        if key not in value or not isinstance(property_schema, dict):
+            continue
+        expected = property_schema.get("type")
+        if expected is None or json_value_matches_type(value[key], expected):
+            continue
+        expected_text = (
+            " or ".join(str(item) for item in expected)
+            if isinstance(expected, list)
+            else str(expected)
+        )
+        raise ValueError(f"JSON property {key!r} must have type {expected_text}")
+
+
+def json_value_matches_type(value: Any, expected: Any) -> bool:
+    expected_types = expected if isinstance(expected, list) else [expected]
+    for expected_type in expected_types:
+        if expected_type == "array" and isinstance(value, list):
+            return True
+        if expected_type == "object" and isinstance(value, dict):
+            return True
+        if expected_type == "string" and isinstance(value, str):
+            return True
+        if expected_type == "boolean" and isinstance(value, bool):
+            return True
+        if expected_type == "integer" and isinstance(value, int) and not isinstance(value, bool):
+            return True
+        if expected_type == "number" and isinstance(value, (int, float)) and not isinstance(value, bool):
+            return True
+        if expected_type == "null" and value is None:
+            return True
+    return False
 
 
 def split_model_list(value: str) -> list[str]:
-    return [item.strip() for item in value.replace("\n", ",").split(",") if item.strip()]
+    return [
+        item.strip() for item in value.replace("\n", ",").split(",") if item.strip()
+    ]
 
 
 def dedupe_models(models: list[str]) -> list[str]:
@@ -1032,7 +1220,9 @@ def dedupe_models(models: list[str]) -> list[str]:
     return result
 
 
-def complete_with_model_fallbacks(provider: str, models: list[str], complete_once: Callable[[str], str]) -> str:
+def complete_with_model_fallbacks(
+    provider: str, models: list[str], complete_once: Callable[[str], str]
+) -> str:
     model_errors = []
     for index, model in enumerate(models):
         try:
@@ -1044,7 +1234,9 @@ def complete_with_model_fallbacks(provider: str, models: list[str], complete_onc
             if index < len(models) - 1:
                 continue
             detail = "; ".join(model_errors)
-            raise LLMProviderError(f"{provider} provider failed for all configured models: {detail}") from exc
+            raise LLMProviderError(
+                f"{provider} provider failed for all configured models: {detail}"
+            ) from exc
     raise LLMProviderError(f"{provider} provider has no configured models")
 
 
@@ -1074,7 +1266,9 @@ def is_model_selection_error(message: str) -> bool:
     return "model" in lower and any(marker in lower for marker in model_markers)
 
 
-def post_json(url: str, payload: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
+def post_json(
+    url: str, payload: dict[str, Any], headers: dict[str, str]
+) -> dict[str, Any]:
     encoded = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         url,

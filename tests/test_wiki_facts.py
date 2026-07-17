@@ -346,6 +346,12 @@ def test_candidate_fact_upsert_records_cos_action(tmp_path: Path) -> None:
                 "section_hint": "Summary",
                 "source_ids": ["document:doc_ledger"],
                 "observed_at": "2026-06-25T00:00:00+00:00",
+                "temporal_kind": "time_bound",
+                "valid_from": "2026-06-01",
+                "valid_to": "2026-07-01",
+                "valid_time_precision": "day",
+                "temporal_expression": "during June 2026",
+                "temporal_confidence": 0.9,
                 "confidence": 0.82,
                 "metadata": {"migration": "test"},
             }
@@ -358,11 +364,26 @@ def test_candidate_fact_upsert_records_cos_action(tmp_path: Path) -> None:
             "SELECT * FROM cos_actions WHERE action_type = 'fact_upsert'"
         ).fetchone()
         fact_count = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+        fact = conn.execute(
+            """
+            SELECT temporal_kind, valid_from, valid_to, valid_time_precision,
+                   temporal_expression, temporal_confidence
+            FROM facts
+            """
+        ).fetchone()
 
     assert fact_count == 1
     assert action is not None
     assert action["status"] == "applied"
     assert action["proposed_by"] == "wiki_fact_migration"
+    assert dict(fact) == {
+        "temporal_kind": "time_bound",
+        "valid_from": "2026-06-01",
+        "valid_to": "2026-07-01",
+        "valid_time_precision": "day",
+        "temporal_expression": "during June 2026",
+        "temporal_confidence": 0.9,
+    }
 
 
 def test_orphan_managed_page_is_archived_without_old_fact_bullets(tmp_path: Path) -> None:
@@ -625,6 +646,9 @@ def test_resolver_llm_can_supersede_clear_newer_fact(tmp_path: Path) -> None:
         "The resolver test SLA is two days.",
         observed_at="2026-06-24T00:00:00+00:00",
         confidence=0.8,
+        temporal_kind="time_bound",
+        valid_from="2026-06-01",
+        valid_to="2026-06-26",
     )
     insert_replacement_fact(
         paths,
@@ -632,6 +656,8 @@ def test_resolver_llm_can_supersede_clear_newer_fact(tmp_path: Path) -> None:
         "The resolver test SLA is three days.",
         observed_at="2026-06-26T00:00:00+00:00",
         confidence=0.92,
+        temporal_kind="ongoing",
+        valid_from="2026-06-26",
     )
 
     result = resolve_fact_groups(
@@ -754,7 +780,7 @@ def test_answer_open_question_records_resolution_action(tmp_path: Path) -> None:
 
     assert keep["status"] == "active"
     assert keep["confirmed_by_user"] == 1
-    assert superseded["status"] == "superseded"
+    assert superseded["status"] == "retracted"
     assert question["status"] == "answered"
     assert question["action_id"] == result["actions"][0]["id"]
 
@@ -787,14 +813,19 @@ def insert_replacement_fact(
     *,
     observed_at: str = "2026-06-26T00:00:00+00:00",
     confidence: float = 0.9,
+    temporal_kind: str = "unknown",
+    valid_from: str | None = None,
+    valid_to: str | None = None,
 ) -> None:
     with connection(paths.sqlite_path) as conn:
         conn.execute(
             """
             INSERT INTO facts(
               id, statement, entity_key, page_hint, section_hint, source_ids,
-              observed_at, confidence, status, metadata, created_at, truth_confidence
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              observed_at, confidence, status, metadata, created_at, truth_confidence,
+              temporal_kind, valid_from, valid_to, valid_time_precision,
+              temporal_confidence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 fact_id,
@@ -809,5 +840,10 @@ def insert_replacement_fact(
                 json.dumps({"operation": "replace_page"}),
                 observed_at,
                 confidence,
+                temporal_kind,
+                valid_from,
+                valid_to,
+                "day" if valid_from else "unknown",
+                0.95 if valid_from else None,
             ),
         )

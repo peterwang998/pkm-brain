@@ -6,9 +6,6 @@ from typing import Any
 
 import yaml
 
-from .util import now_iso
-
-
 SOURCE_DATE_FIELDS = (
     ("event_started_at", "source_event_started_at"),
     ("source_created_at", "source_created_at"),
@@ -22,6 +19,9 @@ def document_source_date_metadata(document: dict[str, Any]) -> dict[str, Any]:
     frontmatter = source_frontmatter(document)
     values = {
         "event_started_at": text_value(frontmatter.get("event_started_at")),
+        "event_ended_at": text_value(frontmatter.get("event_ended_at")),
+        "event_session_id": text_value(frontmatter.get("session_id")),
+        "source_updated_at": text_value(frontmatter.get("source_updated_at")),
         "source_created_at": text_value(frontmatter.get("created_at")),
         "captured_at": text_value(frontmatter.get("captured_at")),
         "document_created_at": text_value(document.get("created_at")),
@@ -36,9 +36,43 @@ def document_source_date_metadata(document: dict[str, Any]) -> dict[str, Any]:
             break
     return {
         **values,
+        "structured_event_metadata_trusted": trusted_hyprnote_event_metadata(
+            document, frontmatter
+        ),
         "source_date": source_date,
         "source_date_basis": source_date_basis,
     }
+
+
+def trusted_hyprnote_event_metadata(
+    document: dict[str, Any], frontmatter: dict[str, Any]
+) -> bool:
+    """Recognize captured Hyprnote metadata, not a self-declared source label alone."""
+
+    if str(document.get("source_type") or "") != "hyprnote_meeting":
+        return False
+    if text_value(frontmatter.get("source_type")) != "hyprnote_meeting":
+        return False
+    if text_value(frontmatter.get("agent")).casefold() != "hyprnote":
+        return False
+    session_id = text_value(frontmatter.get("session_id"))
+    if not session_id:
+        return False
+    captured_path_matches = any(
+        path.suffix.casefold() == ".md"
+        and path.stem == session_id
+        and path.parent.name == "hyprnote"
+        and path.parent.parent.name == "documents"
+        for path in stable_paths(document.get("source_path"), document.get("raw_path"))
+    )
+    if not captured_path_matches:
+        return False
+    original_path = Path(text_value(frontmatter.get("source_path"))).expanduser()
+    return (
+        original_path.name == session_id
+        and original_path.parent.name == "sessions"
+        and original_path.parent.parent.name == "hyprnote"
+    )
 
 
 def derive_fact_source_date(
@@ -68,13 +102,12 @@ def stamp_candidate_source_context(
     )
     metadata["document_id"] = document["document_id"]
     metadata["window_id"] = window_id
-    if candidate.get("observed_at"):
-        metadata["observed_at_basis"] = "extractor"
+    if document.get("source_created_at"):
+        candidate["observed_at"] = document["source_created_at"]
+        metadata["observed_at_basis"] = "source_created_at"
     else:
-        candidate["observed_at"] = document.get("source_date") or now_iso()
-        metadata["observed_at_basis"] = (
-            document.get("source_date_basis") or "processing_time_fallback"
-        )
+        candidate["observed_at"] = None
+        metadata["observed_at_basis"] = "unknown"
     candidate["metadata"] = metadata
 
 

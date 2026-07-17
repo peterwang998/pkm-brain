@@ -423,14 +423,40 @@ def test_entity_merge_repoints_links_denorm_and_aliases(tmp_path: Path) -> None:
             WHERE fact_id = 'fact_high_touch' AND is_primary = 1
             """
         ).fetchone()
+        revisions = conn.execute(
+            """
+            SELECT id, entity_id, status, revision_status, revision_number,
+                   created_at, knowledge_to
+            FROM facts
+            WHERE assertion_lineage_id = 'fact_high_touch'
+            ORDER BY revision_number
+            """
+        ).fetchall()
+        historical_link = conn.execute(
+            """
+            SELECT fe.entity_id
+            FROM fact_entities fe
+            JOIN facts f ON f.id = fe.fact_id
+            WHERE f.assertion_lineage_id = 'fact_high_touch'
+              AND f.knowledge_to IS NOT NULL
+              AND fe.is_primary = 1
+            """
+        ).fetchone()
 
     assert source["status"] == "merged"
     assert source["merged_into"] == canonical_id
     assert fact["entity_id"] == canonical_id
     assert link["entity_id"] == canonical_id
+    assert [row["revision_number"] for row in revisions] == [1, 2]
+    assert revisions[0]["entity_id"] == source_id
+    assert revisions[0]["status"] == "revision_closed"
+    assert revisions[0]["revision_status"] == "active"
+    assert revisions[0]["knowledge_to"] == revisions[1]["created_at"]
+    assert revisions[1]["entity_id"] == canonical_id
+    assert historical_link["entity_id"] == source_id
     assert "High Touch" in loads(canonical["aliases"], [])
     assert "restore_entities" in action["inverse_action_json"]
-    assert action["target_fact_ids"] == ["fact_high_touch"]
+    assert set(action["target_fact_ids"]) == {row["id"] for row in revisions}
 
     stale_retry = apply_action(
         svc.paths,
@@ -475,11 +501,18 @@ def test_entity_merge_repoints_links_denorm_and_aliases(tmp_path: Path) -> None:
             WHERE fact_id = 'fact_high_touch' AND is_primary = 1
             """
         ).fetchone()
+        revision_count = conn.execute(
+            """
+            SELECT COUNT(*) FROM facts
+            WHERE assertion_lineage_id = 'fact_high_touch'
+            """
+        ).fetchone()[0]
 
     assert restored_source["status"] == "active"
     assert restored_source["merged_into"] is None
     assert restored_fact["entity_id"] == source_id
     assert restored_link["entity_id"] == source_id
+    assert revision_count == 1
 
 
 def test_entity_split_restores_prior_links_and_entity_status(tmp_path: Path) -> None:
@@ -558,11 +591,30 @@ def test_entity_split_restores_prior_links_and_entity_status(tmp_path: Path) -> 
             WHERE fact_id = 'fact_high_touch' AND is_primary = 1
             """
         ).fetchone()
+        revisions = conn.execute(
+            """
+            SELECT entity_id, revision_number, status
+            FROM facts
+            WHERE assertion_lineage_id = 'fact_high_touch'
+            ORDER BY revision_number
+            """
+        ).fetchall()
 
     assert source["status"] == "active"
     assert source["merged_into"] is None
     assert fact["entity_id"] == source_id
     assert link["entity_id"] == source_id
+    assert [row["entity_id"] for row in revisions] == [
+        source_id,
+        canonical_id,
+        source_id,
+    ]
+    assert [row["revision_number"] for row in revisions] == [1, 2, 3]
+    assert [row["status"] for row in revisions] == [
+        "revision_closed",
+        "revision_closed",
+        "active",
+    ]
     assert "High Touch" not in loads(canonical["aliases"], [])
 
 

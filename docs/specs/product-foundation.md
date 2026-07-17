@@ -1,7 +1,7 @@
 # Product Foundation
 
 **Status:** canonical living feature spec; the read-only Chief-of-Staff trial, Gmail mirror, and encrypted 90-day local mail archive are locally release-verified and testing-ready, while owner review and promotion remain pending
-**Last verified:** 2026-07-14 with Ruff and diff checks green, 873 Python tests, 28 Swift tests, a signed local app installed with healthy runtime `0.1.6-12a45456-7adaae5c`, and live scheduler, mailbox, archive, and bounded agent-read verification
+**Last verified:** 2026-07-15 against the unpromoted temporal-cognition working tree based on `d5405b9`; the parity-first Brain v2 target reaches migration 24 while the 2026-07-14 installed release remains the live baseline
 **Owns:** product boundaries, authority hierarchy, persistence model, privacy rules, and cross-feature invariants
 
 ## Purpose
@@ -86,7 +86,7 @@ These are two evidence flows over shared source identity. The operational flow m
 
 ## Persistent Model
 
-`brain.sqlite` remains the Knowledge Curation control plane. The current schema applies migrations 1 through 21 idempotently. Introducing `ops.sqlite` is additive and must not change the meaning, migration history, or behavior of existing knowledge tables.
+`brain.sqlite` remains the Knowledge Curation control plane. The installed baseline applies migrations 1 through 21 idempotently; the unpromoted temporal-cognition working tree adds migrations 22-24. Introducing `ops.sqlite` is additive and must not change the meaning, migration history, or behavior of existing knowledge tables.
 
 | Migration | Durable capability |
 |---:|---|
@@ -109,11 +109,14 @@ These are two evidence flows over shared source identity. The operational flow m
 | 19 | entity mention kind |
 | 20 | document source size/mtime statistics |
 | 21 | review admission metadata and state |
+| 22 | additive temporal fact fields and valid/knowledge-time indexes; working tree only, not live-migrated |
+| 23 | fact assertion lineage and copy-before-write revision constraints; working tree only, not live-migrated |
+| 24 | nullable flattened `event_time` fields (`kind`, start, end, precision, expression) on facts; working tree only, not live-migrated |
 
 Major persistent responsibilities:
 
 - `documents` and `chunks` represent ingested sources with provenance.
-- `facts` stores atomic claims, evidence quotes/spans, routes, confidence, lifecycle state, and primary entity cache.
+- `facts` stores atomic claims, evidence quotes/spans, routes, confidence, optional predicate validity, optional event time, revision lineage, lifecycle state, and primary entity cache. The open revision retains the stable fact ID; closed revisions preserve prior exact rows and links for knowledge-time retrieval and action reversal. Temporal enrichment is additive and may never be required for base-fact admission or default retrieval.
 - `entities` and `fact_entities` provide resolved named identity and many-to-many fact links.
 - `cos_actions` is the universal reversible **Knowledge Curation** mutation ledger. The physical name is retained for compatibility until an all-at-once migration; it is not the Operational Chief-of-Staff item or execution ledger.
 - `cos_policy` records the versioned Knowledge Curation autonomy policy that decided a knowledge mutation. The same compatibility rule applies to its physical name.
@@ -200,7 +203,7 @@ Allowed network activity is limited to explicitly configured LLM, connector, and
 
 ## Current Status
 
-The core local Knowledge Curation pipeline, fact/entity ledger, action policy, managed pages, retrieval, MCP, native daemon/app, and Primary/Secondary sync are implemented. The current schema version is 21. Existing `cos_*` code and tables implement Knowledge Curation despite their historical names.
+The core local Knowledge Curation pipeline, fact/entity ledger, action policy, managed pages, retrieval, MCP, native daemon/app, and Primary/Secondary sync are implemented. The installed schema version is 21; the unpromoted temporal-cognition working tree targets 24 only in isolated homes. Existing `cos_*` code and tables implement Knowledge Curation despite their historical names.
 
 The Operational Chief-of-Staff context now has an isolated, independently migrated `ops.sqlite` kernel, a daemon-owned fail-closed mutation service, coordinated database-pair recovery, read-only Calendar/Gmail source integration, deterministic reconciliation, a coverage-aware Today briefing, local feedback, and offline replay evaluation. The full Shadow evaluation remains manual: the owner authorizes two exact-scope Google grants and selects **Today > Run Shadow** for Calendar refresh plus local Gmail analysis. Gmail transport is separate; once a valid private operations policy and exact grant exist, the primary/single daemon may initialize `ops.sqlite` and runs the fetch-only local mirror at startup and about every 600 seconds. Operational writes remain local to `ops.sqlite`; Calendar/Gmail knowledge ingestion and all external-action authority remain disabled. Restores publish only into a new quarantined home and cannot become a writer until a future explicit topology activation workflow.
 

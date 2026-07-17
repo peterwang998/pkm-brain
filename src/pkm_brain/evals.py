@@ -639,7 +639,7 @@ def conflict_fixture_cases() -> list[dict[str, Any]]:
                 "AlphaPay payment retry uses Stripe Checkout for renewal invoices.",
                 confidence=0.86,
             ),
-            "expected_auto_supersede": True,
+            "expected_auto_supersede": False,
         },
         {
             "id": "opposite_meaning_high_overlap_not_merge",
@@ -665,7 +665,7 @@ def conflict_fixture_cases() -> list[dict[str, Any]]:
                 "The Atlas Cloud monthly budget cap is 750 dollars.",
                 confidence=0.91,
             ),
-            "expected_auto_supersede": True,
+            "expected_auto_supersede": False,
         },
         {
             "id": "unsourced_change_not_auto_supersede",
@@ -681,6 +681,37 @@ def conflict_fixture_cases() -> list[dict[str, Any]]:
             ),
             "expected_auto_supersede": False,
         },
+        {
+            "id": "explicit_bounded_progression_auto_supersedes",
+            "left": "The Atlas Cloud monthly budget cap is 500 dollars.",
+            "right": "The Atlas Cloud monthly budget cap is 750 dollars.",
+            "expected_merge": False,
+            "expected_contradiction": True,
+            "newer_fact": conflict_fact(
+                "fact_bounded_new",
+                "The Atlas Cloud monthly budget cap is 750 dollars.",
+                confidence=0.92,
+                truth_confidence=0.92,
+                temporal_kind="ongoing",
+                valid_from="2026-07-01",
+                valid_time_precision="day",
+                temporal_confidence=0.95,
+            ),
+            "older_facts": [
+                conflict_fact(
+                    "fact_bounded_old",
+                    "The Atlas Cloud monthly budget cap is 500 dollars.",
+                    confidence=0.9,
+                    truth_confidence=0.9,
+                    temporal_kind="time_bound",
+                    valid_from="2026-06-01",
+                    valid_to="2026-07-01",
+                    valid_time_precision="day",
+                    temporal_confidence=0.95,
+                )
+            ],
+            "expected_auto_supersede": True,
+        },
     ]
 
 
@@ -690,6 +721,7 @@ def conflict_fact(
     *,
     confidence: float,
     source_ids: list[str] | None = None,
+    **overrides: Any,
 ) -> dict[str, Any]:
     return {
         "id": fact_id,
@@ -701,6 +733,7 @@ def conflict_fact(
         "confidence": confidence,
         "observed_at": "2026-06-26T00:00:00+00:00",
         "metadata": {"operation": "replace_page"},
+        **overrides,
     }
 
 
@@ -709,7 +742,10 @@ def evaluate_conflict_fixture_case(case: dict[str, Any]) -> dict[str, Any]:
     right_fact = conflict_fact("fact_right", str(case["right"]), confidence=0.8)
     signals = fact_similarity_signals(str(case["left"]), str(case["right"]))
     actual_merge = facts_should_merge(left_fact, right_fact)
-    actual_auto_supersede = fact_is_auto_winner(case["newer_fact"])
+    actual_auto_supersede = fact_is_auto_winner(
+        case["newer_fact"],
+        [*case.get("older_facts", []), case["newer_fact"]],
+    )
     return {
         "id": case["id"],
         "expected_merge": bool(case["expected_merge"]),

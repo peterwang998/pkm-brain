@@ -609,11 +609,40 @@ def retrieve_context(
     mode: str = typer.Option(
         "default", help="Retrieval mode: compact, default, broad, or inspect."
     ),
+    valid_as_of: Optional[str] = typer.Option(
+        None,
+        help="Return facts valid at this ISO-8601 year, month, date, or timestamp.",
+    ),
+    known_as_of: Optional[str] = typer.Option(
+        None,
+        help="Return facts Brain knew at this ISO-8601 point.",
+    ),
+    event_as_of: Optional[str] = typer.Option(
+        None,
+        help="Return event facts occurring or planned at this ISO-8601 point.",
+    ),
+    event_kind: Optional[str] = typer.Option(
+        None,
+        help="Optional event-time kind: actual or planned.",
+    ),
+    temporal_mode: Optional[str] = typer.Option(
+        None,
+        help="Temporal view: current, valid, known, bitemporal, or timeline.",
+    ),
     debug: bool = typer.Option(False, "--debug"),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
     result = service(home).retrieve_context(
-        task, project=project, budget=budget, mode=mode, debug=debug
+        task,
+        project=project,
+        budget=budget,
+        mode=mode,
+        debug=debug,
+        valid_as_of=valid_as_of,
+        known_as_of=known_as_of,
+        event_as_of=event_as_of,
+        event_kind=event_kind,
+        temporal_mode=temporal_mode,
     )
     console.print_json(json.dumps(result))
 

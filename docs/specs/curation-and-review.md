@@ -1,7 +1,7 @@
 # Curation And Review
 
 **Status:** canonical living feature spec
-**Last verified:** 2026-07-13 against knowledge-foundation commit `3937316` and the current working tree
+**Last verified:** 2026-07-16 against the temporal-cognition working tree based on rollback commit `d5405b9`; the parity-first v12 contract preserves reversible revisions while making optional annotation and temporal enrichment non-gating and event-centered
 **Owns:** knowledge-curation model roles, action/policy/audit flow, fact relations, review Queue, autonomy settings, and review-volume controls
 
 ## Operating Model
@@ -51,6 +51,8 @@ Provider roles are independently configured under `config/local/cos_llm.yaml`:
 | auditor | sampled post-apply review | `gpt-5.6-sol`, medium; Luna fallback |
 
 These are deployment settings, not hard-coded product requirements. Role config may select another supported provider. An unconfigured role skips cleanly.
+
+The isolated Brain v2 full-corpus evaluation keeps the production-like pre-apply critic on external Codex `gpt-5.6-luna` at medium reasoning and assigns the final sampled auditor/end judge to external Codex `gpt-5.6-sol` at medium reasoning. That trial setting must be recorded with the run and does not silently change the installed live deployment.
 
 The provider doctor reports same-provider/model warnings for the current critic versus all Luna proposer roles. Critic separation is therefore role/prompt/process-level, not model-independent. The Sol auditor remains model-separated. This is an explicit cost/independence tradeoff to resolve before claiming independent critic judgment.
 
@@ -131,11 +133,36 @@ A candidate-to-counterpart relation uses this vocabulary:
 | `unrelated` | lexical pair finder was noise | proceed independently |
 | `unsure` | confidence below gate | human review |
 
-Temporal scope distinguishes event, current state, interval state, stale observation, and atemporal claim. A later observation is not automatically a contradiction.
+Temporal scope distinguishes event occurrence/plan, explicit proposition validity, stale observation, and an ordinary undated claim. A later observation is not automatically a contradiction, and missing time is not a curation defect.
 
 `fact_relations.py` is the shared classifier. High-recall lexical cues may find pairs but may not decide contradiction. Classification records relation, confidence, rationale, and classifier version for audit.
 
 The current gated deterministic relation suite passed contradiction recall 1.00 and false-conflict rate 0.025 in the July 11 UTC W2a run. Broader LLM relation classification remains policy/eval gated.
+
+Temporal guards stop `observed_at` and `created_at` from making a fact appear world-dated; only explicit predicate-valid fields, legacy `effective_at`, or a date in the statement do so. Event-time identity participates only for facts whose single primary entity is an `event`: planned and actual event times remain distinguishable rather than silently overwriting one another. Equal state statements with different explicit validity intervals remain distinct. Assertion/source recency alone never selects a winner.
+
+### Temporal Resolution (Implemented Conservatively; Promotion Gates Open)
+
+Brain v2 reuses the fact ledger, `supersedes_id`, fact status, `cos_actions`, critic, and inverse ledger. It adds no generic relation table, graph database, daemon, scheduled job, or model role. Optional predicate validity may constrain a relation when both facts provide compatible evidence-grounded intervals. Optional `event_time` describes one primary event and is not generalized into a relation system.
+
+A pair is temporally comparable only when it describes the same entity, state/topic, and scope. Resolution follows these rules:
+
+- same compatible assertion and time is `duplicate` or `supports`;
+- compatible detail is `refines`;
+- a later non-overlapping state is `updates`, not `contradicts`;
+- claims are contradictory only when they are mutually exclusive and their valid intervals overlap;
+- absent, incomplete, or low-confidence time cannot create an automatic winner; the facts continue through the original curation path and go to review only when their base claims require it.
+
+Fact mutations are copy-before-write. The current fact ID remains stable, but an action first copies its exact pre-change row and entity links to a closed lineage revision, stamps that revision's `knowledge_to`, and advances the stable head. The action targets both rows and its inverse restores the exact prior head and links. This provides immutable knowledge intervals without a parallel history table.
+
+There are two distinct lifecycle meanings:
+
+1. **Natural state progression.** A source-backed, high-confidence successor may be selected automatically only when its precise interval is explicitly after every predecessor's already bounded interval. Existing status/supersession actions preserve the facts and revisions; they do not infer or close an open `valid_to`.
+2. **Correction or retraction.** A reversible status action records the prior accepted revision as closed knowledge history and advances the stable head to the corrected or retracted state. Human correction paths use `retracted` rather than pretending the old assertion was a natural world-state transition.
+
+Neither operation mutates source evidence. A new assertion time alone never proves a world-valid boundary, and a non-overlapping interval never becomes a conflict merely because the values differ.
+
+The existing nightly `capture -> ingest -> extract -> garden -> synthesis -> audit` topology remains authoritative. Temporal validation runs after base-fact validation and is non-gating: malformed predicate validity or event time is removed and diagnosed without rejecting, rerouting, or hiding the fact. High-confidence, source-supported, explicitly bounded non-overlap may pass through the existing resolver, policy, critic, action, inverse, and audit path. Automatic open-interval closure remains blocked until Brain has deterministic state-slot identity stronger than entity identity alone. Planned-to-actual event evolution uses ordinary separate facts/revisions and the same reversible lifecycle. No separate temporal worker or policy surface is introduced.
 
 ### Conflict Admission
 
@@ -182,7 +209,7 @@ A reviewer must not leave the card to decide.
 - Entity merge: both names, aliases, statuses, fact counts, and merge direction before IDs.
 - Memory/audit/anomaly: content, scope/type, provenance, finding, and exact proposed effect. A topology audit also shows merge direction, current page/contract statuses, affected counts, and representative facts, including an explicit zero-fact state.
 
-Every fact card shows a labeled source date. For a sourced fact, `source_date` prefers source-native `event_started_at`, then source-frontmatter `created_at`, then `captured_at`, then the document ledger's `created_at` and `ingested_at`. Fact `observed_at` is used only when no owning source date exists. Extraction stamps omitted `observed_at` from this same source-native hierarchy rather than the job clock. The raw ISO timestamp remains inspectable, chunk provenance resolves to the owning document, and a missing date is shown explicitly rather than silently replaced with the Queue item's creation date.
+Every fact card shows a labeled source date. For a sourced fact, `source_date` prefers source-native `event_started_at`, then source-frontmatter `created_at`, then `captured_at`, then the document ledger's `created_at` and `ingested_at`. Fact `observed_at` is used only when no owning source date exists. This display hierarchy is distinct from the source-observation clock: extractor v12 stamps `observed_at` only from trustworthy source-native assertion metadata and otherwise leaves it null. The raw ISO timestamp remains inspectable, chunk provenance resolves to the owning document, and a missing date is shown explicitly rather than silently replaced with the Queue item's creation date.
 
 A candidate-less candidate-versus-existing decision is invalid UI state. The server must either hydrate the candidate or mark the card non-approvable. Legacy `kind=conflict` groups are an explicit exception because they are symmetric comparisons: the Queue hydrates their untyped options and fact IDs into `alternatives`, labels the orientation `contested`, and never renders an empty Candidate panel.
 

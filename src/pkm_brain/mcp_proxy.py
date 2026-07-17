@@ -128,8 +128,27 @@ def create_mcp_proxy(home: str | None = None, *, auto_launch: bool = True):
         return proxy.call_tool("search_knowledge", {"query": query, "limit": limit})
 
     @mcp.tool()
-    def retrieve_context(task: str, project: str | None = None) -> dict:
-        return proxy.call_tool("retrieve_context", {"task": task, "project": project})
+    def retrieve_context(
+        task: str,
+        project: str | None = None,
+        valid_as_of: str | None = None,
+        known_as_of: str | None = None,
+        event_as_of: str | None = None,
+        event_kind: str | None = None,
+        temporal_mode: str | None = None,
+    ) -> dict:
+        return proxy.call_tool(
+            "retrieve_context",
+            {
+                "task": task,
+                "project": project,
+                "valid_as_of": valid_as_of,
+                "known_as_of": known_as_of,
+                "event_as_of": event_as_of,
+                "event_kind": event_kind,
+                "temporal_mode": temporal_mode,
+            },
+        )
 
     @mcp.tool()
     def record_context_feedback(

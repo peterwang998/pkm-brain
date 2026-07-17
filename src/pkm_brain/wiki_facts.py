@@ -10,14 +10,15 @@ import yaml
 
 from .cos_actions import apply_action, propose_action
 from .db import connection, dumps, loads, rows
+from .fact_records import row_to_fact as fact_row_to_dict
 from .llm import LLMProvider, complete_json, cos_role_provider_configured
 from .paths import BrainPaths
+from .temporal import is_safe_temporal_successor, temporal_merge_compatible, timeline_sort_key
 from .util import new_id, now_iso, slugify, stable_unique, text_sha256
 from .wiki import COMMON_SECTIONS, TYPE_SECTIONS, lint_wiki, parse_frontmatter
 
 
 REPLACEMENT_OPERATIONS = {"replace_page", "replace_section", "create_page"}
-AUTO_SUPERSEDE_CONFIDENCE = 0.85
 NEAR_DUPLICATE_SEQUENCE_RATIO = 0.88
 NEAR_DUPLICATE_TOKEN_OVERLAP = 0.82
 NEAR_DUPLICATE_TOKEN_JACCARD = 0.58
@@ -216,7 +217,7 @@ RESOLVER_SCHEMA = {
     "properties": {
         "decision": {"type": "string"},
         "fact_ids": {"type": "array"},
-        "keeper_fact_id": {"type": "string"},
+        "keeper_fact_id": {"type": ["string", "null"]},
         "rationale": {"type": "string"},
         "risk_tier": {"type": "string"},
     },
@@ -320,7 +321,7 @@ def upsert_candidate_facts(
     for candidate in candidates:
         with connection(paths.sqlite_path) as conn:
             normalized = normalized_statement(candidate["statement"])
-            existing = find_existing_fact(conn, candidate, normalized)
+            existing = find_existing_fact(conn, candidate)
             existing_fact = row_to_fact(existing) if existing else None
         if existing_fact:
             merged = merge_fact_values(existing_fact, candidate, timestamp)
@@ -355,6 +356,20 @@ def upsert_candidate_facts(
                 "extraction_method": str(candidate.get("extraction_method") or "legacy"),
                 "extractor_model": candidate.get("extractor_model"),
                 "effective_at": candidate.get("effective_at"),
+                "temporal_kind": candidate.get("temporal_kind") or "unknown",
+                "valid_from": candidate.get("valid_from"),
+                "valid_to": candidate.get("valid_to"),
+                "valid_time_precision": candidate.get("valid_time_precision")
+                or "unknown",
+                "temporal_expression": candidate.get("temporal_expression"),
+                "temporal_confidence": candidate.get("temporal_confidence"),
+                "knowledge_to": candidate.get("knowledge_to"),
+                "event_time": candidate.get("event_time"),
+                "event_time_kind": candidate.get("event_time_kind"),
+                "event_start_at": candidate.get("event_start_at"),
+                "event_end_at": candidate.get("event_end_at"),
+                "event_time_precision": candidate.get("event_time_precision"),
+                "event_time_expression": candidate.get("event_time_expression"),
                 "extraction_confidence": candidate.get("extraction_confidence"),
                 "routing_confidence": candidate.get("routing_confidence"),
                 "truth_confidence": candidate.get("truth_confidence", candidate["confidence"]),
@@ -394,16 +409,14 @@ def normalized_statement(statement: str) -> str:
     return re.sub(r"\W+", " ", statement).strip().lower()
 
 
-def find_existing_fact(
-    conn: Any, candidate: dict[str, Any], normalized: str
-) -> Any | None:
+def find_existing_fact(conn: Any, candidate: dict[str, Any]) -> Any | None:
     entity_id = str(candidate.get("entity_id") or "").strip()
     if entity_id:
         query = """
             SELECT *
             FROM facts
             WHERE (entity_id = ? OR (entity_id IS NULL AND entity_key = ?))
-              AND status != 'retracted'
+              AND status != 'retracted' AND knowledge_to IS NULL
             ORDER BY
               CASE status
                 WHEN 'active' THEN 0
@@ -420,7 +433,7 @@ def find_existing_fact(
         query = """
             SELECT *
             FROM facts
-            WHERE entity_key = ? AND status != 'retracted'
+            WHERE entity_key = ? AND status != 'retracted' AND knowledge_to IS NULL
             ORDER BY
               CASE status
                 WHEN 'active' THEN 0
@@ -434,8 +447,6 @@ def find_existing_fact(
             """
         params = (candidate["entity_key"],)
     for row in conn.execute(query, params):
-        if normalized_statement(str(row["statement"] or "")) == normalized:
-            return row
         if facts_should_merge(row_to_fact(row), candidate):
             return row
     return None
@@ -507,6 +518,32 @@ def merge_fact_values(
         "extractor_model": candidate.get("extractor_model")
         or existing.get("extractor_model"),
         "effective_at": candidate.get("effective_at") or existing.get("effective_at"),
+        "temporal_kind": candidate.get("temporal_kind")
+        or existing.get("temporal_kind")
+        or "unknown",
+        "valid_from": candidate.get("valid_from") or existing.get("valid_from"),
+        "valid_to": candidate.get("valid_to") or existing.get("valid_to"),
+        "valid_time_precision": candidate.get("valid_time_precision")
+        or existing.get("valid_time_precision")
+        or "unknown",
+        "temporal_expression": candidate.get("temporal_expression")
+        or existing.get("temporal_expression"),
+        "temporal_confidence": max_optional_float(
+            existing.get("temporal_confidence"),
+            candidate.get("temporal_confidence"),
+        ),
+        "knowledge_to": existing.get("knowledge_to"),
+        "event_time": candidate.get("event_time") or existing.get("event_time"),
+        "event_time_kind": candidate.get("event_time_kind")
+        or existing.get("event_time_kind"),
+        "event_start_at": candidate.get("event_start_at")
+        or existing.get("event_start_at"),
+        "event_end_at": candidate.get("event_end_at")
+        or existing.get("event_end_at"),
+        "event_time_precision": candidate.get("event_time_precision")
+        or existing.get("event_time_precision"),
+        "event_time_expression": candidate.get("event_time_expression")
+        or existing.get("event_time_expression"),
         "extraction_confidence": extraction_confidence,
         "routing_confidence": routing_confidence,
         "truth_confidence": truth_confidence,
@@ -763,7 +800,7 @@ def resolve_fact_groups(
                     updates.append(
                         {
                             "fact_id": fact["id"],
-                            "status": "superseded",
+                            "status": "retracted",
                             "conflict_group_id": None,
                         }
                     )
@@ -777,40 +814,6 @@ def resolve_fact_groups(
             auto_superseded += len(replacement_facts) - 1
             dismiss_resolved_conflict_questions_for(
                 paths, entity_key, keeper.get("page_hint")
-            )
-            continue
-
-        ordered = sorted(replacement_facts, key=fact_recency_key)
-        latest = ordered[-1]
-        if fact_is_auto_winner(latest):
-            older = ordered[:-1]
-            supersedes_id = older[-1]["id"] if older else None
-            updates = [
-                {
-                    "fact_id": latest["id"],
-                    "status": "active",
-                    "supersedes_id": supersedes_id,
-                    "conflict_group_id": None,
-                },
-                *[
-                    {
-                        "fact_id": fact["id"],
-                        "status": "superseded",
-                        "conflict_group_id": None,
-                    }
-                    for fact in older
-                ],
-            ]
-            apply_fact_status_action(
-                paths,
-                "fact_supersede",
-                updates,
-                proposed_by="resolve_fact_groups",
-                risk_tier="medium",
-            )
-            auto_superseded += len(older)
-            dismiss_resolved_conflict_questions_for(
-                paths, entity_key, latest.get("page_hint")
             )
             continue
 
@@ -1128,6 +1131,12 @@ def resolver_prompt(facts: list[dict[str, Any]]) -> str:
             "page_hint": fact.get("page_hint"),
             "section_hint": fact.get("section_hint"),
             "observed_at": fact.get("observed_at"),
+            "temporal_kind": fact.get("temporal_kind"),
+            "valid_from": fact.get("valid_from"),
+            "valid_to": fact.get("valid_to"),
+            "valid_time_precision": fact.get("valid_time_precision"),
+            "temporal_confidence": fact.get("temporal_confidence"),
+            "event_time": fact.get("event_time"),
             "confidence": fact.get("confidence"),
             "source_ids": fact.get("source_ids") or [],
             "confirmed_by_user": fact.get("confirmed_by_user"),
@@ -1139,6 +1148,8 @@ def resolver_prompt(facts: list[dict[str, Any]]) -> str:
         "same_claim, clear_supersession, or contradiction. "
         "same_claim means the facts assert the same truth and can be merged. "
         "clear_supersession means one fact is clearly newer/current and the others should be superseded; "
+        "choose it only for explicit, high-confidence, non-overlapping valid intervals; observed/source time alone "
+        "does not establish succession. "
         "provide keeper_fact_id. contradiction means the facts conflict or require external truth. "
         "Never choose a winner for a genuine contradiction. Return fact_ids, decision, keeper_fact_id when applicable, "
         "rationale, and risk_tier low/medium/high.\n\n"
@@ -1171,14 +1182,11 @@ def any_fact_pair_conflicts(facts: list[dict[str, Any]]) -> bool:
 def resolver_supersession_is_safe(keeper: dict[str, Any], facts: list[dict[str, Any]]) -> bool:
     if keeper.get("confirmed_by_user"):
         return True
-    if not fact_is_auto_winner(keeper):
-        return False
-    latest = sorted(facts, key=fact_recency_key)[-1]
-    return str(latest.get("id")) == str(keeper.get("id"))
+    return is_safe_temporal_successor(keeper, facts)
 
 
 def latest_non_keeper_id(facts: list[dict[str, Any]], keeper: dict[str, Any]) -> str | None:
-    older = [fact for fact in sorted(facts, key=fact_recency_key) if fact["id"] != keeper["id"]]
+    older = [fact for fact in sorted(facts, key=timeline_sort_key) if fact["id"] != keeper["id"]]
     return str(older[-1]["id"]) if older else None
 
 
@@ -1207,10 +1215,10 @@ def fact_recency_key(fact: dict[str, Any]) -> tuple[str, str]:
     return (str(fact.get("observed_at") or ""), str(fact.get("created_at") or ""))
 
 
-def fact_is_auto_winner(fact: dict[str, Any]) -> bool:
-    return float(fact.get("confidence") or 0.0) >= AUTO_SUPERSEDE_CONFIDENCE and bool(
-        fact.get("source_ids")
-    )
+def fact_is_auto_winner(
+    fact: dict[str, Any], facts: list[dict[str, Any]] | None = None
+) -> bool:
+    return bool(facts and is_safe_temporal_successor(fact, facts))
 
 
 def choose_keeper_fact(facts: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1340,6 +1348,8 @@ def dismiss_resolved_conflict_questions(
 
 
 def facts_should_merge(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    if not temporal_merge_compatible(left, right):
+        return False
     signals = fact_similarity_signals(
         str(left.get("statement") or ""), str(right.get("statement") or "")
     )
@@ -1355,7 +1365,7 @@ def facts_should_merge(left: dict[str, Any], right: dict[str, Any]) -> bool:
 def facts_are_normalized_exact(left: dict[str, Any], right: dict[str, Any]) -> bool:
     left_statement = normalized_statement(str(left.get("statement") or ""))
     right_statement = normalized_statement(str(right.get("statement") or ""))
-    return bool(left_statement and left_statement == right_statement)
+    return bool(left_statement and left_statement == right_statement and temporal_merge_compatible(left, right))
 
 
 def fact_similarity_signals(left: str, right: str) -> dict[str, Any]:
@@ -1710,7 +1720,7 @@ def answer_open_question(
             *[
                 {
                     "fact_id": fact_id,
-                    "status": "superseded",
+                    "status": "retracted",
                     "conflict_group_id": None,
                 }
                 for fact_id in fact_ids
@@ -1796,7 +1806,7 @@ def answer_open_question(
                         "updates": [
                             {
                                 "fact_id": fact_id,
-                                "status": "superseded",
+                                "status": "retracted",
                                 "conflict_group_id": None,
                             }
                             for fact_id in fact_ids
@@ -2190,7 +2200,7 @@ def create_confirmed_page_fact(
                     FROM facts
                     WHERE id IN ({placeholders})
                       AND page_hint = ?
-                      AND status != 'retracted'
+                      AND status != 'retracted' AND knowledge_to IS NULL
                     """,
                     (*supersede_fact_ids, page_hint),
                 )
@@ -2248,7 +2258,7 @@ def create_confirmed_page_fact(
             [
                 {
                     "fact_id": old_fact_id,
-                    "status": "superseded",
+                    "status": "retracted",
                     "conflict_group_id": None,
                 }
                 for old_fact_id in supersede_fact_ids
@@ -2470,7 +2480,7 @@ def canonicalize_fact_routes(paths: BrainPaths) -> dict[str, Any]:
             """
             SELECT *
             FROM facts
-            WHERE status != 'retracted'
+            WHERE status != 'retracted' AND knowledge_to IS NULL
               AND page_hint IS NOT NULL
             """,
         )
@@ -2715,7 +2725,7 @@ def facts_for_page(paths: BrainPaths, page_hint: str) -> list[dict[str, Any]]:
                 SELECT *
                 FROM facts
                 WHERE page_hint = ?
-                  AND status != 'retracted'
+                  AND status != 'retracted' AND knowledge_to IS NULL
                 ORDER BY
                   CASE status
                     WHEN 'active' THEN 0
@@ -2815,10 +2825,13 @@ def rebuild_fact_retrieval_index(conn: Any) -> None:
     conn.execute(
         """
         INSERT INTO retrieval_fts(kind, target_id, title, text, heading_path, project, tags)
-        SELECT 'fact', id, COALESCE(page_hint, entity_key), statement,
+        SELECT 'fact', id, COALESCE(page_hint, entity_key),
+               TRIM(statement || ' ' || COALESCE(temporal_expression, '') || ' ' ||
+                    COALESCE(event_time_expression, '') || ' ' ||
+                    COALESCE(event_start_at, '') || ' ' || COALESCE(event_end_at, '')),
                COALESCE(section_hint, ''), '', COALESCE(source_ids, '[]')
         FROM facts
-        WHERE status IN ('active', 'conflicted', 'needs_confirmation')
+        WHERE status IN ('active', 'conflicted', 'needs_confirmation', 'superseded', 'revision_closed')
         """
     )
 
@@ -3407,32 +3420,7 @@ def get_question(paths: BrainPaths, question_id: str) -> dict[str, Any]:
 
 
 def row_to_fact(row: Any) -> dict[str, Any]:
-    return {
-        "id": row["id"],
-        "statement": row["statement"],
-        "entity_key": row["entity_key"],
-        "entity_id": row_get(row, "entity_id"),
-        "page_hint": row["page_hint"],
-        "section_hint": row["section_hint"],
-        "source_ids": loads(row["source_ids"], []),
-        "observed_at": row["observed_at"],
-        "confidence": row["confidence"],
-        "source_spans": loads(row_get(row, "source_spans"), []),
-        "evidence_quote": row_get(row, "evidence_quote"),
-        "extraction_method": row_get(row, "extraction_method", "legacy"),
-        "extractor_model": row_get(row, "extractor_model"),
-        "effective_at": row_get(row, "effective_at"),
-        "extraction_confidence": row_get(row, "extraction_confidence"),
-        "routing_confidence": row_get(row, "routing_confidence"),
-        "truth_confidence": row_get(row, "truth_confidence", row["confidence"]),
-        "status": row["status"],
-        "supersedes_id": row["supersedes_id"],
-        "conflict_group_id": row["conflict_group_id"],
-        "confirmed_by_user": bool(row["confirmed_by_user"]),
-        "metadata": loads(row["metadata"], {}),
-        "created_at": row["created_at"],
-        "last_seen_at": row["last_seen_at"],
-    }
+    return fact_row_to_dict(row)
 
 
 def row_to_question(row: Any) -> dict[str, Any]:

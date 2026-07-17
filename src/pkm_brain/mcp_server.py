@@ -17,8 +17,28 @@ def create_mcp(home: str | None = None):
         return call_mcp_tool(service, "search_knowledge", {"query": query, "limit": limit})
 
     @mcp.tool()
-    def retrieve_context(task: str, project: str | None = None) -> dict:
-        return call_mcp_tool(service, "retrieve_context", {"task": task, "project": project})
+    def retrieve_context(
+        task: str,
+        project: str | None = None,
+        valid_as_of: str | None = None,
+        known_as_of: str | None = None,
+        event_as_of: str | None = None,
+        event_kind: str | None = None,
+        temporal_mode: str | None = None,
+    ) -> dict:
+        return call_mcp_tool(
+            service,
+            "retrieve_context",
+            {
+                "task": task,
+                "project": project,
+                "valid_as_of": valid_as_of,
+                "known_as_of": known_as_of,
+                "event_as_of": event_as_of,
+                "event_kind": event_kind,
+                "temporal_mode": temporal_mode,
+            },
+        )
 
     @mcp.tool()
     def record_context_feedback(

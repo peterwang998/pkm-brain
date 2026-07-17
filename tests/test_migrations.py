@@ -3,11 +3,13 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from pkm_brain.db import connection, init_db
-from pkm_brain.migrations import run_migrations
+from pkm_brain.migrations import MIGRATIONS, run_migrations
 
 
-EXPECTED_MIGRATIONS = list(range(1, 22))
+EXPECTED_MIGRATIONS = list(range(1, 25))
 
 
 def test_fresh_db_applies_registered_migrations(tmp_path: Path) -> None:
@@ -74,6 +76,7 @@ def test_fresh_db_applies_registered_migrations(tmp_path: Path) -> None:
 
     assert versions == EXPECTED_MIGRATIONS
     assert "relations" not in tables
+    assert "events" not in tables
     assert "review_admissions" in tables
     assert "review_admission_meta" in tables
     assert {
@@ -110,6 +113,22 @@ def test_fresh_db_applies_registered_migrations(tmp_path: Path) -> None:
         "truth_confidence",
         "routing_confidence",
         "extraction_confidence",
+        "temporal_kind",
+        "valid_from",
+        "valid_to",
+        "valid_time_precision",
+        "temporal_expression",
+        "temporal_confidence",
+        "knowledge_to",
+        "assertion_lineage_id",
+        "revision_of_id",
+        "revision_number",
+        "revision_status",
+        "event_time_kind",
+        "event_start_at",
+        "event_end_at",
+        "event_time_precision",
+        "event_time_expression",
     }.issubset(fact_columns)
     assert {"aliases", "status", "merged_into", "description"}.issubset(
         entity_columns
@@ -764,6 +783,177 @@ def test_migration_adds_mention_kind_to_existing_fact_entities_table() -> None:
 
     assert "mention_kind" in columns
     assert versions == EXPECTED_MIGRATIONS
+
+
+def test_temporal_fact_migration_is_additive_and_does_not_guess_valid_time() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        CREATE TABLE facts (
+          id TEXT PRIMARY KEY,
+          status TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          effective_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO facts(id, status, created_at, effective_at)
+        VALUES ('fact_legacy', 'active', '2026-01-02T00:00:00+00:00', '2026-01-01')
+        """
+    )
+
+    temporal_migration = next(row for row in MIGRATIONS if row[0] == 22)
+    run_migrations(conn, [temporal_migration])
+
+    row = conn.execute(
+        """
+        SELECT temporal_kind, valid_from, valid_to, valid_time_precision,
+               temporal_expression, temporal_confidence, knowledge_to
+        FROM facts
+        WHERE id = 'fact_legacy'
+        """
+    ).fetchone()
+    assert dict(row) == {
+        "temporal_kind": "unknown",
+        "valid_from": None,
+        "valid_to": None,
+        "valid_time_precision": "unknown",
+        "temporal_expression": None,
+        "temporal_confidence": None,
+        "knowledge_to": None,
+    }
+
+
+def test_fact_revision_migration_backfills_lineage_and_enforces_one_open_revision() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        CREATE TABLE facts (
+          id TEXT PRIMARY KEY,
+          status TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          knowledge_to TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO facts(id, status, created_at, knowledge_to)
+        VALUES ('fact_legacy', 'active', '2026-01-02T00:00:00+00:00', NULL)
+        """
+    )
+
+    revision_migration = next(row for row in MIGRATIONS if row[0] == 23)
+    run_migrations(conn, [revision_migration])
+
+    row = conn.execute(
+        """
+        SELECT assertion_lineage_id, revision_of_id, revision_number,
+               revision_status
+        FROM facts
+        WHERE id = 'fact_legacy'
+        """
+    ).fetchone()
+    assert dict(row) == {
+        "assertion_lineage_id": "fact_legacy",
+        "revision_of_id": None,
+        "revision_number": 1,
+        "revision_status": None,
+    }
+    indexes = {row["name"] for row in conn.execute("PRAGMA index_list(facts)")}
+    assert {
+        "idx_facts_assertion_revision",
+        "idx_facts_revision_of",
+        "idx_facts_open_assertion_lineage",
+    }.issubset(indexes)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            """
+            INSERT INTO facts(
+              id, status, created_at, knowledge_to, assertion_lineage_id,
+              revision_of_id, revision_number
+            ) VALUES (
+              'fact_2', 'active', '2026-02-02T00:00:00+00:00', NULL,
+              'fact_legacy', 'fact_legacy', 2
+            )
+            """
+        )
+
+    conn.execute(
+        """
+        UPDATE facts
+        SET knowledge_to = '2026-02-02T00:00:00+00:00',
+            revision_status = status,
+            status = 'revision_closed'
+        WHERE id = 'fact_legacy'
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO facts(
+          id, status, created_at, knowledge_to, assertion_lineage_id,
+          revision_of_id, revision_number
+        ) VALUES (
+          'fact_2', 'active', '2026-02-02T00:00:00+00:00', NULL,
+          'fact_legacy', 'fact_legacy', 2
+        )
+        """
+    )
+    assert conn.execute(
+        """
+        SELECT id
+        FROM facts
+        WHERE assertion_lineage_id = 'fact_legacy' AND knowledge_to IS NULL
+        """
+    ).fetchone()["id"] == "fact_2"
+
+
+def test_event_time_migration_is_additive_nullable_and_idempotent() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        CREATE TABLE facts (
+          id TEXT PRIMARY KEY,
+          status TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO facts(id, status, created_at)
+        VALUES ('fact_legacy', 'active', '2026-01-02T00:00:00+00:00')
+        """
+    )
+
+    event_time_migration = next(row for row in MIGRATIONS if row[0] == 24)
+    run_migrations(conn, [event_time_migration])
+    run_migrations(conn, [event_time_migration])
+
+    row = conn.execute(
+        """
+        SELECT event_time_kind, event_start_at, event_end_at,
+               event_time_precision, event_time_expression
+        FROM facts
+        WHERE id = 'fact_legacy'
+        """
+    ).fetchone()
+    assert dict(row) == {
+        "event_time_kind": None,
+        "event_start_at": None,
+        "event_end_at": None,
+        "event_time_precision": None,
+        "event_time_expression": None,
+    }
+    assert "idx_facts_event_time" in {
+        index["name"] for index in conn.execute("PRAGMA index_list(facts)")
+    }
 
 
 def test_failed_migration_rolls_back_that_migration() -> None:

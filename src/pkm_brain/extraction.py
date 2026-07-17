@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
 from typing import Any
 
+from .cos_action_runs import complete_action_run
 from .cos_actions import (
     apply_action,
     get_action,
@@ -20,10 +21,22 @@ from .db import connection, dumps, rows
 from .entities import (
     ENTITY_TYPES,
     MENTION_KINDS,
-    normalize_entity_name,
-    normalize_entity_type,
-    normalize_mention_kind,
     resolve_entity,
+)
+from .event_projection import (
+    coalesce_structured_event_candidates,
+    structured_source_event_candidate,
+)
+from .extraction_contract import (
+    COMPATIBLE_EXTRACTION_PROMPT_VERSIONS,
+    EXTRACTION_PROMPT_VERSION,
+    EXTRACTION_SCHEMA,
+)
+from .extraction_entities import (
+    normalize_extracted_entity_mentions,
+    primary_entity_surface,
+    primary_entity_type,
+    stable_unique_strings,
 )
 from .fact_relations import classify_fact_relation
 from .llm import (
@@ -34,6 +47,7 @@ from .llm import (
     get_cos_role_provider,
     load_cos_llm_config,
 )
+from .numeric_faithfulness import unsupported_statement_numbers
 from .paths import BrainPaths
 from .policy_action_batch import decide_policy_actions
 from .routing_coherence import (
@@ -49,6 +63,20 @@ from .source_evidence import (
     resolve_evidence_unit_ids,
 )
 from .source_dates import document_source_date_metadata, stamp_candidate_source_context
+from .temporal import (
+    event_time_grounding_errors,
+    normalize_event_time_candidate,
+    normalize_temporal_candidate,
+    temporal_grounding_errors,
+    temporal_merge_compatible,
+)
+from .temporal_enrichment import (
+    candidate_dedupe_key,
+    primary_named_event_is_grounded,
+    strip_event_time,
+    strip_predicate_validity,
+    temporal_enrichment_warning,
+)
 from .unrouted_resolution import (
     candidate_requires_route_resolution,
     candidate_route_metadata,
@@ -68,27 +96,6 @@ from .wiki_facts import (
 )
 
 
-EXTRACTION_SCHEMA = {
-    "type": "object",
-    "required": ["facts"],
-    "properties": {
-        "facts": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "required": [
-                    "statement",
-                    "chunk_id",
-                    "evidence_unit_ids",
-                    "claim_class",
-                    "extraction_confidence",
-                    "routing_confidence",
-                    "truth_confidence",
-                ],
-            },
-        }
-    },
-}
 CONFLICT_PRECHECK_SCHEMA = {
     "type": "object",
     "required": ["decision", "rationale"],
@@ -98,10 +105,9 @@ CONFLICT_PRECHECK_SCHEMA = {
         "rationale": {"type": "string"},
     },
 }
-EXTRACTION_PROMPT_VERSION = "extractor-evidence-units-v6-speaker-context"
-COMPATIBLE_EXTRACTION_PROMPT_VERSIONS = ("extractor-evidence-units-v5",)
 EXTRACTION_STAGE = "extractor"
 EXTRACTION_VALIDATION_ATTEMPTS = 2
+MIN_COVERAGE_RETRY_EVIDENCE_CHARS = 4_000
 MAX_EVIDENCE_UNITS_PER_FACT = 5
 DEFAULT_EXTRACTION_WINDOW_CHUNKS = 6
 DEFAULT_EXTRACTION_WINDOW_OVERLAP_CHUNKS = 1
@@ -138,7 +144,11 @@ CANONICAL_ROUTE_NAMESPACES = {
     "projects",
 }
 ROUTE_FUZZY_DUP_THRESHOLD = 0.92
-TERMINAL_EXTRACTION_WATERMARK_STATUSES = {"ok", "extracted_empty"}
+TERMINAL_EXTRACTION_WATERMARK_STATUSES = {
+    "ok",
+    "ok_with_rejections",
+    "extracted_empty",
+}
 DURABLE_CLAIM_CLASSES = {
     "decision",
     "commitment",
@@ -156,6 +166,31 @@ NON_CLAIM_CLASSES = {
     "non_claim",
 }
 CLAIM_CLASSES = DURABLE_CLAIM_CLASSES | NON_CLAIM_CLASSES
+CLAIM_CLASS_ALIASES = {
+    "action_item": "commitment",
+    "follow_up": "commitment",
+    "next_step": "commitment",
+    "task": "commitment",
+    "choice": "decision",
+    "responsibility": "role_or_responsibility",
+    "role_responsibility": "role_or_responsibility",
+    "role_and_responsibility": "role_or_responsibility",
+    "ownership": "role_or_responsibility",
+    "workload": "role_or_responsibility",
+    "milestone": "project_state",
+    "organizational_state": "project_state",
+    "project_status": "project_state",
+    "status_update": "project_state",
+    "product_state": "project_state",
+    "question": "open_question",
+    "unresolved_question": "open_question",
+    "product_claim": "factual_update",
+    "product_or_technical_claim": "factual_update",
+    "technical_claim": "factual_update",
+    "policy": "factual_update",
+    "requirement": "factual_update",
+    "workplace_norm": "factual_update",
+}
 LOW_INFORMATION_LINE_PATTERNS = (
     re.compile(r"^---+$"),
     re.compile(r"^\.\.\.+$"),
@@ -329,6 +364,14 @@ def extract_recent_documents(
         document_validation = aggregate_document_validation(
             document, window_validations, document_candidates
         )
+        document_validation["structured_event_candidate_count"] = int(
+            document_outputs[index].get("structured_event_candidate_count") or 0
+        )
+        document_validation["llm_candidate_count"] = sum(
+            str(candidate.get("extraction_method") or "llm")
+            != "structured_metadata"
+            for candidate in document_candidates
+        )
         record_extraction_watermarks(
             paths,
             [document],
@@ -342,6 +385,7 @@ def extract_recent_documents(
         )
         candidates.extend(document_candidates)
         document_validations.append(document_validation)
+    candidates = coalesce_structured_event_candidates(candidates)
     validation = aggregate_run_validation(document_validations, candidates)
     actions: list[dict[str, Any]] = []
     apply_duration_ms = 0.0
@@ -377,6 +421,16 @@ def extract_recent_documents(
     validation["extraction_duration_ms"] = timing["extraction_duration_ms"]
     validation["apply_duration_ms"] = timing["apply_duration_ms"]
     validation["worker_count"] = timing["worker_count"]
+    if not shadow and run_id:
+        complete_action_run(
+            paths,
+            run_id,
+            summary={
+                "document_count": len(documents),
+                "candidate_count": len(candidates),
+                "action_count": len(actions),
+            },
+        )
     return {
         "status": "ok",
         "shadow": shadow,
@@ -405,30 +459,12 @@ def extract_document_windows(
     for document_index, document in enumerate(documents):
         for window_index, window in enumerate(document.get("windows") or []):
             jobs.append((document_index, window_index, document, window))
-    if not jobs:
-        return outputs
-    worker_count = min(max(1, max_workers), len(jobs))
-    if worker_count == 1:
-        results = [
-            extract_window_job_safely(
-                paths,
-                job,
-                routing_hint_pool=routing_hint_pool,
-                routing_hint_limit=routing_hint_limit,
-                provider=provider,
-                llm_provider=llm_provider,
-                extractor_model=extractor_model,
-            )
-            for job in jobs
-        ]
-    else:
-        results = []
-        with ThreadPoolExecutor(
-            max_workers=worker_count, thread_name_prefix="brain-extract"
-        ) as executor:
-            futures = [
-                executor.submit(
-                    extract_window_job_safely,
+    results: list[dict[str, Any]] = []
+    if jobs:
+        worker_count = min(max(1, max_workers), len(jobs))
+        if worker_count == 1:
+            results = [
+                extract_window_job_safely(
                     paths,
                     job,
                     routing_hint_pool=routing_hint_pool,
@@ -439,14 +475,43 @@ def extract_document_windows(
                 )
                 for job in jobs
             ]
-            for future in as_completed(futures):
-                results.append(future.result())
+        else:
+            with ThreadPoolExecutor(
+                max_workers=worker_count, thread_name_prefix="brain-extract"
+            ) as executor:
+                futures = [
+                    executor.submit(
+                        extract_window_job_safely,
+                        paths,
+                        job,
+                        routing_hint_pool=routing_hint_pool,
+                        routing_hint_limit=routing_hint_limit,
+                        provider=provider,
+                        llm_provider=llm_provider,
+                        extractor_model=extractor_model,
+                    )
+                    for job in jobs
+                ]
+                for future in as_completed(futures):
+                    results.append(future.result())
     for result in sorted(
         results, key=lambda item: (item["document_index"], item["window_index"])
     ):
         output = outputs[result["document_index"]]
         output["candidates"].extend(result["candidates"])
         output["window_validations"].append(result["window_validation"])
+    for document_index, document in enumerate(documents):
+        projected = structured_source_event_candidate(document)
+        if projected is None:
+            outputs[document_index]["structured_event_candidate_count"] = 0
+            continue
+        stamp_candidate_source_context(
+            projected,
+            document,
+            f"{document['document_id']}:structured-event",
+        )
+        outputs[document_index]["candidates"].insert(0, projected)
+        outputs[document_index]["structured_event_candidate_count"] = 1
     return outputs
 
 
@@ -589,14 +654,23 @@ def extract_facts_with_validation_retry(
         if attempt_index > 0:
             accepted_from_retry_count += len(accepted) - accepted_before_attempt
         last_report = report
+        coverage_retry = (
+            attempt_index < max_validation_attempts - 1
+            and extraction_needs_coverage_retry(source_window, report)
+        )
+        if coverage_retry:
+            report["retry_reason"] = "substantive_window_returned_empty"
         attempts.append(compact_validation_report(report, attempt=attempt_index + 1))
         if best_report is None or better_extraction_report(report, best_report):
             best_report = report
-        if not extraction_needs_validation_retry(report):
+        if not extraction_needs_validation_retry(report) and not coverage_retry:
             break
         if attempt_index == max_validation_attempts - 1:
             break
-        prompt = extraction_validation_retry_prompt(source_window, parsed, report)
+        if coverage_retry:
+            prompt = extraction_coverage_retry_prompt(source_window)
+        else:
+            prompt = extraction_validation_retry_prompt(source_window, parsed, report)
     if best_report is None:
         best_report = empty_extraction_validation_report()
     validation = compact_validation_report(last_report)
@@ -604,6 +678,10 @@ def extract_facts_with_validation_retry(
     validation["attempted_fact_count"] = total_proposed_count
     validation["accepted_count"] = len(accepted)
     validation["accepted_from_retry_count"] = accepted_from_retry_count
+    validation["coverage_retry_count"] = sum(
+        attempt.get("retry_reason") == "substantive_window_returned_empty"
+        for attempt in attempts
+    )
     validation["final_rejected_count"] = int(last_report.get("rejected_count") or 0)
     validation["total_rejected_count"] = total_rejected_count
     validation["dropped_count"] = total_dropped_count
@@ -748,10 +826,44 @@ def extraction_terminal_watermark_exists(
     extractor_model: str | None,
     prompt_version: str,
 ) -> bool:
-    prompt_versions = [prompt_version]
     if prompt_version == EXTRACTION_PROMPT_VERSION:
-        prompt_versions.extend(COMPATIBLE_EXTRACTION_PROMPT_VERSIONS)
-    prompt_placeholders = ",".join("?" for _ in prompt_versions)
+        accepted_versions = (
+            prompt_version,
+            *COMPATIBLE_EXTRACTION_PROMPT_VERSIONS,
+        )
+        accepted_placeholders = ",".join("?" for _ in accepted_versions)
+        watermark_rows = conn.execute(
+            f"""
+            SELECT prompt_version, status, metadata
+            FROM cos_stage_watermarks
+            WHERE stage = ?
+              AND document_id = ?
+              AND content_hash = ?
+              AND COALESCE(model, '') = COALESCE(?, '')
+              AND prompt_version IN ({accepted_placeholders})
+            """,
+            (
+                EXTRACTION_STAGE,
+                document_id,
+                content_hash,
+                extractor_model,
+                *accepted_versions,
+            ),
+        ).fetchall()
+        for watermark in watermark_rows:
+            status = str(watermark["status"] or "")
+            watermark_prompt = str(watermark["prompt_version"] or "")
+            if watermark_prompt == prompt_version:
+                if status in TERMINAL_EXTRACTION_WATERMARK_STATUSES:
+                    return True
+                if partial_extraction_watermark_is_terminal(watermark):
+                    return True
+            elif status in {"ok", "ok_with_rejections"}:
+                return True
+        return False
+    terminal_placeholders = ",".join(
+        "?" for _ in TERMINAL_EXTRACTION_WATERMARK_STATUSES
+    )
     row = conn.execute(
         f"""
         SELECT 1
@@ -760,8 +872,8 @@ def extraction_terminal_watermark_exists(
           AND document_id = ?
           AND content_hash = ?
           AND COALESCE(model, '') = COALESCE(?, '')
-          AND prompt_version IN ({prompt_placeholders})
-          AND status IN (?, ?)
+          AND prompt_version = ?
+          AND status IN ({terminal_placeholders})
         LIMIT 1
         """,
         (
@@ -769,7 +881,7 @@ def extraction_terminal_watermark_exists(
             document_id,
             content_hash,
             extractor_model,
-            *prompt_versions,
+            prompt_version,
             *sorted(TERMINAL_EXTRACTION_WATERMARK_STATUSES),
         ),
     ).fetchone()
@@ -1348,6 +1460,11 @@ def apply_document_route_coherence(
         if selected_page_hint == current_page_hint:
             output.append(candidate)
             continue
+        if document_route_conflicts_with_named_entity(
+            candidate, selected_page_hint, route_targets
+        ):
+            output.append(candidate)
+            continue
         page_hint, resolved_routing = resolve_extraction_page_hint(
             selected_page_hint, route_targets
         )
@@ -1382,6 +1499,38 @@ def apply_document_route_coherence(
         routed["metadata"] = metadata
         output.append(routed)
     return output
+
+
+def document_route_conflicts_with_named_entity(
+    candidate: dict[str, Any],
+    selected_page_hint: str,
+    route_targets: dict[str, dict[str, Any]],
+) -> bool:
+    """Keep document priors from overriding an explicit, routable named topic."""
+
+    mentions = candidate.get("entity_mentions")
+    if not isinstance(mentions, list):
+        return False
+    named_token_sets = [
+        routing_signal_tokens(str(mention.get("surface") or ""))
+        for mention in mentions
+        if isinstance(mention, dict)
+        and str(mention.get("mention_kind") or "").strip().lower() == "named"
+    ]
+    named_token_sets = [tokens for tokens in named_token_sets if tokens]
+    if not named_token_sets:
+        return False
+    selected = route_targets.get(selected_page_hint) or {"page_hint": selected_page_hint}
+    selected_tokens = routing_signal_tokens(routing_hint_text(selected))
+    if any(tokens & selected_tokens for tokens in named_token_sets):
+        return False
+    for page_hint, hint in route_targets.items():
+        if page_hint == selected_page_hint:
+            continue
+        target_tokens = routing_signal_tokens(routing_hint_text(hint))
+        if any(tokens & target_tokens for tokens in named_token_sets):
+            return True
+    return False
 
 
 def reclaim_route_tokens(value: str) -> set[str]:
@@ -2522,7 +2671,9 @@ def find_exact_duplicate_fact(
         )
     for row in fact_rows:
         fact = row_to_fact(row)
-        if normalized_statement_key(str(fact.get("statement") or "")) == statement_key:
+        if normalized_statement_key(
+            str(fact.get("statement") or "")
+        ) == statement_key and temporal_merge_compatible(fact, candidate):
             return fact
     return None
 
@@ -3121,15 +3272,42 @@ def extraction_prompt(source_window: dict[str, Any]) -> str:
         "Also include entity_key as the primary entity surface string when available.\n"
         "claim_class must be one of: decision, commitment, preference, role_or_responsibility, "
         "project_state, factual_update, open_question, event_metadata, transcript_mechanic, "
-        "pleasantry, boilerplate, non_claim.\n"
+        "pleasantry, boilerplate, non_claim. Never invent a narrower class label; use factual_update "
+        "when none of the other durable classes fits.\n"
         "entities must be a list of extracted entity mentions. Each mention must include surface, "
-        "type, mention_kind, and is_primary. type must be one of: "
+        "type, mention_kind, and is_primary. Every list item must be an object, never a string. "
+        "type must be one of: "
         f"{', '.join(sorted(ENTITY_TYPES))}. mention_kind must be one of: "
         f"{', '.join(sorted(MENTION_KINDS))}. Use mention_kind='named' for a specific person, "
         "company, product, project, place, event, or other proper referent; 'concept' for a durable "
         "technical/topic concept; 'generic' for role classes/common nouns like engineers or customers; "
         "and 'deictic' for context-relative phrases like our team, their partner, or this group. "
         "Mark exactly one primary entity for each fact.\n"
+        "Coverage rules:\n"
+        "- Scan the full source window and return every distinct durable, source-backed decision, commitment, "
+        "preference, role or responsibility, project state, and factual update—not merely a short summary or a "
+        "fixed number of highlights. Keep each returned fact atomic.\n"
+        "- Missing or uncertain time is never a reason to omit a durable fact. Temporal enrichment is optional.\n"
+        "Optional event-time rules:\n"
+        "- Include one event_time object only when this atomic statement is about exactly one primary named "
+        "entity whose type is event. event_time is timing of that event, not the validity of the fact.\n"
+        "- event_time.kind is actual when the event occurred and planned when it is scheduled, targeted, or due. "
+        "Provide at least one ISO-8601 start_at/end_at bound; if both are present, end_at must be later.\n"
+        "- event_time.precision must be exact, day, month, or year. event_time.expression must copy the smallest "
+        "exact cited source phrase supporting model-derived bounds. Omit event_time when the timing is relative, "
+        "ambiguous, or does not resolve to the primary event.\n"
+        "- Multiple schedules or an actual occurrence after a plan are separate atomic facts or revisions, each "
+        "with at most one event_time object. An absolute deadline may be planned with only end_at; a not-before "
+        "bound may use only start_at. Relative constraints such as 'before the summit' stay in statement text.\n"
+        "- A durable named event is an entity with type='event'. Use claim_class=factual_update for an atomic "
+        "occurrence or schedule claim. event_metadata is only mechanical headings, frontmatter, participant lists, "
+        "or transcript logistics and is dropped. Status, participants, location, and outcome remain ordinary facts.\n"
+        "Optional predicate-validity compatibility:\n"
+        "- Only when evidence explicitly says when a non-event state or assertion itself is true, you may include "
+        "temporal_kind plus valid_from/valid_to, valid_time_precision, temporal_expression, and temporal_confidence. "
+        "Normally omit them. A meeting date, event date, target, or deadline is not predicate validity.\n"
+        "- Never derive event time, predicate validity, or source assertion time from capture, ingestion, processing, "
+        "or job time. Unsupported temporal enrichment will be discarded without discarding the base fact.\n"
         "Only propose durable claims worth future retrieval. Omit event metadata, transcript mechanics, "
         "pleasantries, boilerplate, and non-claims when possible. If you include one, label it accurately; "
         "deterministic policy will drop it.\n"
@@ -3137,6 +3315,9 @@ def extraction_prompt(source_window: dict[str, Any]) -> str:
         "- Every part of the statement must be directly entailed by the cited evidence units. Do not add "
         "reasonable background knowledge, implications, titles, customer/investor impact, active-application "
         "status, locations, or causal explanations unless the cited unit text says them.\n"
+        "- When a statement names a person, organization, product, project, or event, the cited units must "
+        "identify that referent or explicitly link the cited pronoun or setting to it. A matching name elsewhere "
+        "in the same chunk or document is not sufficient by itself.\n"
         "- Keep statements atomic. If the units support only one side of a combined claim, return only the "
         "supported side; do not join it with an unsupported inference.\n"
         "- Preserve uncertainty and negation from the source. If the source says a speaker was confused, unsure, "
@@ -3180,16 +3361,57 @@ def extraction_validation_retry_prompt(
         f"Use 1 to {MAX_EVIDENCE_UNITS_PER_FACT} unit ids. Do not return evidence_quote or source_spans.\n\n"
         "Every corrected statement must be directly entailed by the cited units. Drop or narrow any fact that "
         "adds an unsupported title, role, business impact, location, active-process status, or causal explanation. "
+        "If the statement names an entity, the cited units must identify it or explicitly link the cited pronoun "
+        "or setting to it; a matching name elsewhere in the chunk or document is not enough by itself. "
         "Preserve negation and uncertainty exactly when the source is ambiguous or says a process is not continuing.\n\n"
         "For transcript facts, keep the source speaker label unless the source window directly establishes the "
         "speaker's name. Do not infer speaker identity from a participant list alone.\n\n"
         "For every returned entity mention, include mention_kind as one of named, concept, generic, deictic. "
-        "Use generic/deictic rather than forcing role classes or speaker-relative phrases into named entities.\n\n"
+        "Use generic/deictic rather than forcing role classes or speaker-relative phrases into named entities. "
+        "entities MUST be an array of objects, never an array of strings. Every object must contain surface, "
+        "type, mention_kind, and is_primary; type must be one of concept, event, organization, other, person, "
+        "place, product, project.\n\n"
+        "claim_class MUST be exactly one of decision, commitment, preference, role_or_responsibility, "
+        "project_state, factual_update, open_question, event_metadata, transcript_mechanic, pleasantry, "
+        "boilerplate, non_claim. Do not invent a narrower label; use factual_update when no other durable "
+        "class fits.\n\n"
+        "Temporal enrichment is optional and must never be added merely to satisfy the schema. If a corrected fact "
+        "is about one primary event, event_time may contain kind actual|planned, at least one supported ISO start_at "
+        "or end_at, precision exact|day|month|year, and the exact supporting expression. Otherwise omit it. Optional "
+        "non-event valid_from/valid_to describe when the proposition itself is true, never a meeting date, target, "
+        "deadline, source date, or job time.\n\n"
         "Validation failures JSON:\n"
         f"{json.dumps(compact_validation_report(validation_report), ensure_ascii=False, indent=2)}\n\n"
         "Previous failed facts JSON:\n"
         f"{json.dumps(failed_facts_from_response(previous_response, validation_report), ensure_ascii=False, indent=2)[:12000]}\n\n"
         "Do not repeat already accepted facts.\n\n"
+        "Source window JSON:\n"
+        f"{json.dumps(source_window, ensure_ascii=False, indent=2)}"
+    )
+
+
+def extraction_coverage_retry_prompt(source_window: dict[str, Any]) -> str:
+    return (
+        "Coverage audit: the first pass returned no facts from a substantive source window. "
+        "Read the entire window again and return a JSON object with a facts array. Return every distinct "
+        "durable, source-backed decision, commitment, preference, role or responsibility, project state, "
+        "product or technical claim, and factual update. Do not limit the answer to highlights. "
+        "A hypothetical design discussion can support facts about what a speaker proposed or preferred; "
+        "preserve that framing instead of presenting the proposal as deployed reality. Temporal uncertainty "
+        "is not a reason to omit a fact; omit temporal enrichment. Return facts=[] only when "
+        "no evidence unit supports any durable claim.\n\n"
+        "Each fact must include statement, chunk_id, evidence_unit_ids, page_hint, section_hint, claim_class, "
+        "entities, extraction_confidence, routing_confidence, and truth_confidence. claim_class must use the "
+        "exact fixed enum from the initial contract; use factual_update instead of inventing a narrower class. "
+        "entities must be an array of objects with surface, type, mention_kind, and is_primary, never strings. "
+        "Use exact chunk and unit IDs from the source. Cite "
+        f"1 to {MAX_EVIDENCE_UNITS_PER_FACT} units and keep the statement directly entailed and atomic. "
+        "When a statement names an entity, its cited units must identify it or explicitly link the cited pronoun "
+        "or setting to it; a matching name elsewhere in the source window is not enough by itself. "
+        "Preserve uncertainty, negation, and unresolved Speaker N identity. Prefer a supplied routing hint; "
+        "otherwise use concepts/extracted-facts.md. Include event_time only for a primary event entity and only "
+        "with source-supported actual/planned bounds. Do not derive time from the meeting, capture, processing, "
+        "or job date. Invalid or absent time must not suppress a fact.\n\n"
         "Source window JSON:\n"
         f"{json.dumps(source_window, ensure_ascii=False, indent=2)}"
     )
@@ -3240,6 +3462,8 @@ def validate_extracted_facts_with_report(
     candidates: list[dict[str, Any]] = []
     rejections: list[dict[str, Any]] = []
     dropped: list[dict[str, Any]] = []
+    enrichment_warnings: list[dict[str, Any]] = []
+    contract_recovery_warnings: list[dict[str, Any]] = []
     for index, item in enumerate(raw_facts):
         reasons: list[str] = []
         if not isinstance(item, dict):
@@ -3252,14 +3476,13 @@ def validate_extracted_facts_with_report(
             )
             continue
         statement = str(item.get("statement") or "").strip()
-        claim_class = normalize_claim_class(item.get("claim_class"))
+        raw_claim_class = normalize_claim_class(item.get("claim_class"))
+        claim_class = canonical_claim_class(raw_claim_class)
         evidence_ref, evidence_ref_errors = fact_evidence_ref(item)
         if not statement:
             reasons.append("missing statement")
         if claim_class is None:
             reasons.append("missing claim_class")
-        elif claim_class not in CLAIM_CLASSES:
-            reasons.append(f"unknown claim_class: {clip_text(claim_class, 80)}")
         elif claim_class in NON_CLAIM_CLASSES:
             dropped.append(
                 {
@@ -3270,6 +3493,18 @@ def validate_extracted_facts_with_report(
                 }
             )
             continue
+        if raw_claim_class and claim_class != raw_claim_class:
+            contract_recovery_warnings.append(
+                temporal_enrichment_warning(
+                    index,
+                    statement,
+                    enrichment="claim_class",
+                    reasons=[
+                        f"normalized unsupported claim_class {raw_claim_class!r} "
+                        f"to {claim_class!r}"
+                    ],
+                )
+            )
         if low_value_fact_statement(statement):
             dropped.append(
                 {
@@ -3329,14 +3564,14 @@ def validate_extracted_facts_with_report(
             chunk_context_by_id,
         )
         if entity_errors:
-            rejections.append(
-                {
-                    "index": index,
-                    "statement": clip_text(statement),
-                    "reasons": entity_errors,
-                }
+            contract_recovery_warnings.append(
+                temporal_enrichment_warning(
+                    index,
+                    statement,
+                    enrichment="entities",
+                    reasons=entity_errors,
+                )
             )
-            continue
         faithfulness_reasons = statement_faithfulness_reasons(
             statement,
             "\n".join(valid_quotes),
@@ -3368,8 +3603,17 @@ def validate_extracted_facts_with_report(
             if valid_quotes
             else None,
             "evidence_unit_ids": [unit["unit_id"] for unit in evidence_unit_refs],
-            "observed_at": item.get("observed_at"),
+            # Source assertion time is stamped from trusted document metadata
+            # after validation; the extractor must not invent this clock.
+            "observed_at": None,
             "effective_at": item.get("effective_at"),
+            "valid_from": item.get("valid_from"),
+            "valid_to": item.get("valid_to"),
+            "temporal_kind": item.get("temporal_kind"),
+            "valid_time_precision": item.get("valid_time_precision"),
+            "temporal_expression": item.get("temporal_expression"),
+            "temporal_confidence": item.get("temporal_confidence"),
+            "event_time": item.get("event_time"),
             "confidence": confidence_values["truth_confidence"],
             "extraction_confidence": confidence_values["extraction_confidence"],
             "routing_confidence": confidence_values["routing_confidence"],
@@ -3399,6 +3643,20 @@ def validate_extracted_facts_with_report(
                     if entity_mentions
                     else {}
                 ),
+                **(
+                    {
+                        "contract_recovery_warnings": [
+                            warning
+                            for warning in contract_recovery_warnings
+                            if warning["index"] == index
+                        ]
+                    }
+                    if any(
+                        warning["index"] == index
+                        for warning in contract_recovery_warnings
+                    )
+                    else {}
+                ),
             },
         }
         if model_entity_key:
@@ -3407,6 +3665,53 @@ def validate_extracted_facts_with_report(
             candidate["entity_type"] = primary_type
         if entity_mentions:
             candidate["entity_mentions"] = entity_mentions
+        candidate, temporal_errors = normalize_temporal_candidate(candidate)
+        temporal_errors.extend(
+            temporal_grounding_errors(candidate, "\n".join(valid_quotes))
+        )
+        if temporal_errors:
+            enrichment_warnings.append(
+                temporal_enrichment_warning(
+                    index,
+                    statement,
+                    enrichment="predicate_validity",
+                    reasons=temporal_errors,
+                )
+            )
+            candidate = strip_predicate_validity(candidate)
+        candidate, event_time_errors = normalize_event_time_candidate(
+            candidate,
+            primary_entity_is_event=primary_named_event_is_grounded(
+                entity_mentions, valid_spans
+            ),
+        )
+        event_time_errors.extend(
+            event_time_grounding_errors(candidate, "\n".join(valid_quotes))
+        )
+        if event_time_errors:
+            enrichment_warnings.append(
+                temporal_enrichment_warning(
+                    index,
+                    statement,
+                    enrichment="event_time",
+                    reasons=event_time_errors,
+                )
+            )
+            candidate = strip_event_time(candidate)
+        candidate["metadata"] = {
+            **candidate["metadata"],
+            **(
+                {
+                    "temporal_enrichment_warnings": [
+                        warning
+                        for warning in enrichment_warnings
+                        if warning["index"] == index
+                    ]
+                }
+                if any(warning["index"] == index for warning in enrichment_warnings)
+                else {}
+            ),
+        }
         candidates.append(candidate)
     return {
         "candidates": candidates,
@@ -3418,6 +3723,10 @@ def validate_extracted_facts_with_report(
         "schema_errors": [],
         "rejections": rejections,
         "dropped": dropped,
+        "contract_recovery_warning_count": len(contract_recovery_warnings),
+        "contract_recovery_warnings": contract_recovery_warnings,
+        "temporal_enrichment_warning_count": len(enrichment_warnings),
+        "temporal_enrichment_warnings": enrichment_warnings,
     }
 
 
@@ -3505,430 +3814,6 @@ def compact_surface_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.casefold())
 
 
-NUMBER_TOKEN_RE = re.compile(r"\$?\d+(?:,\d{3})*(?:\.\d+)?(?:[%kKmMbB])?|[A-Za-z]+")
-NUMBER_WORD_VALUES = {
-    "zero": 0,
-    "one": 1,
-    "two": 2,
-    "three": 3,
-    "four": 4,
-    "five": 5,
-    "six": 6,
-    "seven": 7,
-    "eight": 8,
-    "nine": 9,
-    "ten": 10,
-    "eleven": 11,
-    "twelve": 12,
-    "thirteen": 13,
-    "fourteen": 14,
-    "fifteen": 15,
-    "sixteen": 16,
-    "seventeen": 17,
-    "eighteen": 18,
-    "nineteen": 19,
-    "twenty": 20,
-    "thirty": 30,
-    "forty": 40,
-    "fifty": 50,
-    "sixty": 60,
-    "seventy": 70,
-    "eighty": 80,
-    "ninety": 90,
-}
-NUMBER_SCALE_WORDS = {
-    "hundred": 100,
-    "thousand": 1_000,
-    "k": 1_000,
-    "million": 1_000_000,
-    "m": 1_000_000,
-    "billion": 1_000_000_000,
-    "bn": 1_000_000_000,
-    "b": 1_000_000_000,
-}
-
-
-def unsupported_statement_numbers(statement: str, evidence_text: str) -> list[str]:
-    statement_numbers = extract_numeric_mentions(statement)
-    if not statement_numbers:
-        return []
-    evidence_numbers = extract_numeric_mentions(evidence_text)
-    unsupported: list[str] = []
-    for statement_number in statement_numbers:
-        if not any(
-            number_values_match(statement_number, evidence_number)
-            for evidence_number in evidence_numbers
-        ):
-            unsupported.append(statement_number["surface"])
-    return stable_unique_strings(unsupported)
-
-
-def extract_numeric_mentions(text: str) -> list[dict[str, Any]]:
-    mentions: list[dict[str, Any]] = []
-    tokens = [
-        (match.group(0), match.start(), match.end())
-        for match in NUMBER_TOKEN_RE.finditer(text)
-    ]
-    consumed_word_indexes: set[int] = set()
-    for index, (raw, start, end) in enumerate(tokens):
-        if re.search(r"\d", raw) and digit_token_is_identifierish(text, start, end):
-            continue
-        parsed = parse_digit_number_token(
-            raw, tokens[index + 1][0] if index + 1 < len(tokens) else ""
-        )
-        if parsed is not None:
-            value, kind = parsed
-            mentions.append({"surface": raw, "value": value, "kind": kind})
-            continue
-        if index in consumed_word_indexes:
-            continue
-        parsed_words = parse_number_word_sequence(tokens, index)
-        if parsed_words is None:
-            continue
-        value, kind, end_index = parsed_words
-        if number_word_sequence_is_idiom(tokens, index, end_index):
-            continue
-        consumed_word_indexes.update(range(index, end_index + 1))
-        surface = text[start : tokens[end_index][2]]
-        mentions.append({"surface": surface, "value": value, "kind": kind})
-    return mentions
-
-
-def digit_token_is_identifierish(text: str, start: int, end: int) -> bool:
-    before = text[start - 1] if start > 0 else ""
-    after = text[end] if end < len(text) else ""
-    if before.isalnum() or after.isalnum():
-        return True
-    if before == "/" or after == "/":
-        return True
-    if before == "-" and any(
-        char.isalpha() for char in text[max(0, start - 12) : start]
-    ):
-        return True
-    if after == "-" and any(
-        char.isalpha() for char in text[end : min(len(text), end + 12)]
-    ):
-        return True
-    return False
-
-
-def parse_digit_number_token(raw: str, next_token: str) -> tuple[float, str] | None:
-    token = raw.strip()
-    has_currency = token.startswith("$")
-    token = token.lstrip("$").replace(",", "")
-    suffix = ""
-    if token and token[-1] in "%kKmMbB":
-        suffix = token[-1].lower()
-        token = token[:-1]
-    if not re.fullmatch(r"\d+(?:\.\d+)?", token):
-        return None
-    value = float(token)
-    kind = "number"
-    if suffix == "%":
-        kind = "percent"
-    elif suffix in {"k", "m", "b"}:
-        value *= {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000}[suffix]
-    else:
-        scale = NUMBER_SCALE_WORDS.get(next_token.casefold())
-        if scale and scale >= 1_000:
-            value *= scale
-    if has_currency:
-        kind = "number"
-    return value, kind
-
-
-def parse_number_word_sequence(
-    tokens: list[tuple[str, int, int]],
-    start_index: int,
-) -> tuple[float, str, int] | None:
-    total = 0.0
-    current = 0.0
-    index = start_index
-    consumed = False
-    kind = "number"
-    while index < len(tokens):
-        word = tokens[index][0].casefold().replace("-", " ")
-        if word in {"and", "a"} and consumed:
-            index += 1
-            continue
-        if word == "point" and consumed:
-            decimal_digits: list[str] = []
-            index += 1
-            while index < len(tokens):
-                digit_word = tokens[index][0].casefold()
-                if (
-                    digit_word not in NUMBER_WORD_VALUES
-                    or NUMBER_WORD_VALUES[digit_word] > 9
-                ):
-                    break
-                decimal_digits.append(str(NUMBER_WORD_VALUES[digit_word]))
-                index += 1
-            if decimal_digits:
-                current += float("0." + "".join(decimal_digits))
-                continue
-            break
-        if word in NUMBER_WORD_VALUES:
-            current += NUMBER_WORD_VALUES[word]
-            consumed = True
-            index += 1
-            continue
-        if word == "half" and consumed:
-            current += 0.5
-            index += 1
-            continue
-        if word in NUMBER_SCALE_WORDS and consumed:
-            scale = NUMBER_SCALE_WORDS[word]
-            if scale == 100:
-                current = max(1.0, current) * scale
-            else:
-                total += max(1.0, current) * scale
-                current = 0.0
-            consumed = True
-            index += 1
-            continue
-        if word in {"percent", "percentage"} and consumed:
-            kind = "percent"
-            index += 1
-            break
-        break
-    if not consumed:
-        return None
-    return total + current, kind, index - 1
-
-
-def number_word_sequence_is_idiom(
-    tokens: list[tuple[str, int, int]],
-    start_index: int,
-    end_index: int,
-) -> bool:
-    words = [tokens[index][0].casefold() for index in range(start_index, end_index + 1)]
-    previous_words = [
-        tokens[index][0].casefold()
-        for index in range(max(0, start_index - 2), start_index)
-    ]
-    next_words = [
-        tokens[index][0].casefold()
-        for index in range(end_index + 1, min(len(tokens), end_index + 3))
-    ]
-    if words == ["zero"] and next_words[:2] == ["to", "one"]:
-        return True
-    if previous_words[-2:] == ["zero", "to"] and words == ["one"]:
-        return True
-    if words == ["one"] and next_words[:2] == ["on", "one"]:
-        return True
-    if previous_words[-2:] == ["one", "on"] and words == ["one"]:
-        return True
-    if previous_words[-1:] == ["day"] and words == ["one"]:
-        return True
-    return False
-
-
-def number_values_match(left: dict[str, Any], right: dict[str, Any]) -> bool:
-    if left.get("kind") != right.get("kind"):
-        return False
-    left_value = float(left.get("value") or 0.0)
-    right_value = float(right.get("value") or 0.0)
-    tolerance = max(1.0, abs(left_value) * 0.05)
-    return abs(left_value - right_value) <= tolerance
-
-
-def normalize_extracted_entity_mentions(
-    item: dict[str, Any],
-    valid_spans: list[dict[str, Any]],
-    chunk_context_by_id: dict[str, dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[str]]:
-    raw_mentions = item.get("entities")
-    if raw_mentions is None:
-        raw_mentions = item.get("entity_mentions")
-    if raw_mentions is None:
-        return [], []
-    if not isinstance(raw_mentions, list):
-        return [], ["entities must be an array"]
-    mentions: list[dict[str, Any]] = []
-    errors: list[str] = []
-    primary_seen = False
-    for index, raw in enumerate(raw_mentions):
-        if not isinstance(raw, dict):
-            errors.append(f"entities[{index}] must be an object")
-            continue
-        surface = str(
-            raw.get("surface")
-            or raw.get("mention")
-            or raw.get("name")
-            or raw.get("entity_key")
-            or ""
-        ).strip()
-        if not surface:
-            errors.append(f"entities[{index}].surface is required")
-            continue
-        raw_type = (
-            raw.get("type") if raw.get("type") is not None else raw.get("entity_type")
-        )
-        entity_type = normalize_entity_type(str(raw_type or ""))
-        if entity_type is None:
-            errors.append(
-                f"entities[{index}].type must be one of: {', '.join(sorted(ENTITY_TYPES))}"
-            )
-            continue
-        raw_kind = (
-            raw.get("mention_kind")
-            if raw.get("mention_kind") is not None
-            else raw.get("kind")
-        )
-        mention_kind = normalize_mention_kind(raw_kind)
-        if raw_kind is not None and mention_kind is None:
-            errors.append(
-                f"entities[{index}].mention_kind must be one of: "
-                f"{', '.join(sorted(MENTION_KINDS))}"
-            )
-            continue
-        is_primary = raw_entity_mention_is_primary(raw) and not primary_seen
-        if is_primary:
-            primary_seen = True
-        mentions.append(
-            {
-                "surface": surface,
-                "entity_type": entity_type,
-                "mention_kind": mention_kind,
-                "is_primary": is_primary,
-                "mention_span": derive_mention_span(
-                    surface, raw, valid_spans, chunk_context_by_id
-                ),
-                "confidence": optional_float(raw.get("confidence")),
-            }
-        )
-    if errors:
-        return [], errors
-    if mentions and not any(mention["is_primary"] for mention in mentions):
-        mentions[0]["is_primary"] = True
-    return dedupe_entity_mentions(mentions), []
-
-
-def raw_entity_mention_is_primary(raw: dict[str, Any]) -> bool:
-    if "is_primary" in raw:
-        return bool(raw.get("is_primary"))
-    role = str(raw.get("role") or "").strip().lower()
-    return role in {"primary", "main", "subject"}
-
-
-def derive_mention_span(
-    surface: str,
-    raw: dict[str, Any],
-    valid_spans: list[dict[str, Any]],
-    chunk_context_by_id: dict[str, dict[str, Any]],
-) -> dict[str, Any] | None:
-    chunk_ids = stable_unique_strings(
-        [
-            str(raw.get("chunk_id") or "").strip(),
-            *[str(span.get("chunk_id") or "").strip() for span in valid_spans],
-        ]
-    )
-    for chunk_id in chunk_ids:
-        chunk_context = chunk_context_by_id.get(chunk_id)
-        if chunk_context is None:
-            continue
-        span = find_quote_span(str(chunk_context["text"]), surface)
-        if span is None:
-            span = find_casefold_span(str(chunk_context["text"]), surface)
-        if span is not None:
-            start, end = span
-            return {"chunk_id": chunk_id, "start": start, "end": end}
-    return None
-
-
-def find_casefold_span(text: str, quote: str) -> tuple[int, int] | None:
-    stripped = quote.strip()
-    if not stripped:
-        return None
-    start = text.casefold().find(stripped.casefold())
-    if start < 0:
-        return None
-    return start, start + len(stripped)
-
-
-def dedupe_entity_mentions(mentions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    output: list[dict[str, Any]] = []
-    seen: set[tuple[str, str | None]] = set()
-    for mention in mentions:
-        key = (
-            normalize_entity_name(mention.get("surface")),
-            mention.get("entity_type"),
-            mention.get("mention_kind"),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        output.append(mention)
-    if output and not any(mention["is_primary"] for mention in output):
-        output[0]["is_primary"] = True
-    return output
-
-
-def primary_entity_surface(item: dict[str, Any], mentions: list[dict[str, Any]]) -> str:
-    for mention in mentions:
-        if mention.get("is_primary"):
-            return str(mention.get("surface") or "").strip()
-    return str(item.get("entity_key") or item.get("entity_mention") or "").strip()
-
-
-def primary_entity_type(mentions: list[dict[str, Any]]) -> str | None:
-    for mention in mentions:
-        if mention.get("is_primary"):
-            return normalize_entity_type(mention.get("entity_type"))
-    return None
-
-
-def stable_unique_strings(values: list[str]) -> list[str]:
-    output: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        if not value or value in seen:
-            continue
-        output.append(value)
-        seen.add(value)
-    return output
-
-
-def find_quote_span(text: str, quote: str) -> tuple[int, int] | None:
-    stripped = quote.strip()
-    if not stripped:
-        return None
-    exact_start = text.find(stripped)
-    if exact_start >= 0:
-        return exact_start, exact_start + len(stripped)
-    normalized_text, index_map = normalize_with_index_map(text)
-    normalized_quote, _ = normalize_with_index_map(stripped)
-    if not normalized_quote:
-        return None
-    normalized_start = normalized_text.find(normalized_quote)
-    if normalized_start < 0:
-        return None
-    normalized_end = normalized_start + len(normalized_quote) - 1
-    if normalized_start >= len(index_map) or normalized_end >= len(index_map):
-        return None
-    return index_map[normalized_start], index_map[normalized_end] + 1
-
-
-def normalize_with_index_map(value: str) -> tuple[str, list[int]]:
-    output: list[str] = []
-    index_map: list[int] = []
-    in_whitespace = False
-    for index, char in enumerate(value):
-        if char.isspace():
-            if output and not in_whitespace:
-                output.append(" ")
-                index_map.append(index)
-            in_whitespace = True
-            continue
-        output.append(char)
-        index_map.append(index)
-        in_whitespace = False
-    if output and output[-1] == " ":
-        output.pop()
-        index_map.pop()
-    return "".join(output), index_map
-
-
 def failed_facts_from_response(
     previous_response: dict[str, Any],
     validation_report: dict[str, Any],
@@ -3942,18 +3827,6 @@ def failed_facts_from_response(
         if isinstance(index, int) and 0 <= index < len(facts):
             failed.append(facts[index])
     return failed
-
-
-def candidate_dedupe_key(candidate: dict[str, Any]) -> tuple[Any, ...]:
-    spans = tuple(
-        (
-            span.get("chunk_id"),
-            span.get("start"),
-            span.get("end"),
-        )
-        for span in candidate.get("source_spans") or []
-    )
-    return (candidate.get("statement"), candidate.get("page_hint"), spans)
 
 
 def route_validation_metrics(candidates: list[dict[str, Any]]) -> dict[str, Any]:
@@ -4023,6 +3896,14 @@ def aggregate_document_validation(
         "dropped_count": sum(
             int(item.get("dropped_count") or 0) for item in window_validations
         ),
+        "contract_recovery_warning_count": sum(
+            int(item.get("contract_recovery_warning_count") or 0)
+            for item in window_validations
+        ),
+        "temporal_enrichment_warning_count": sum(
+            int(item.get("temporal_enrichment_warning_count") or 0)
+            for item in window_validations
+        ),
         **route_validation_metrics(candidates),
         "attempt_count": sum(
             int(item.get("attempt_count") or len(item.get("attempts") or []))
@@ -4070,6 +3951,16 @@ def aggregate_document_validation(
             for item in window_validations
             for dropped in (item.get("dropped") or [])
         ][:8],
+        "contract_recovery_warnings": [
+            warning
+            for item in window_validations
+            for warning in (item.get("contract_recovery_warnings") or [])
+        ][:8],
+        "temporal_enrichment_warnings": [
+            warning
+            for item in window_validations
+            for warning in (item.get("temporal_enrichment_warnings") or [])
+        ][:8],
         "windows": window_validations,
         "skipped_windows": skipped_windows,
     }
@@ -4094,11 +3985,23 @@ def aggregate_run_validation(
             int(item.get("raw_fact_count") or 0) for item in document_validations
         ),
         "accepted_count": len(candidates),
+        "structured_event_candidate_count": sum(
+            int(item.get("structured_event_candidate_count") or 0)
+            for item in document_validations
+        ),
         "rejected_count": sum(
             int(item.get("rejected_count") or 0) for item in document_validations
         ),
         "dropped_count": sum(
             int(item.get("dropped_count") or 0) for item in document_validations
+        ),
+        "contract_recovery_warning_count": sum(
+            int(item.get("contract_recovery_warning_count") or 0)
+            for item in document_validations
+        ),
+        "temporal_enrichment_warning_count": sum(
+            int(item.get("temporal_enrichment_warning_count") or 0)
+            for item in document_validations
         ),
         **route_validation_metrics(candidates),
         "attempt_count": sum(
@@ -4144,6 +4047,16 @@ def aggregate_run_validation(
             for item in document_validations
             for dropped in (item.get("dropped") or [])
         ][:8],
+        "contract_recovery_warnings": [
+            warning
+            for item in document_validations
+            for warning in (item.get("contract_recovery_warnings") or [])
+        ][:8],
+        "temporal_enrichment_warnings": [
+            warning
+            for item in document_validations
+            for warning in (item.get("temporal_enrichment_warnings") or [])
+        ][:8],
     }
 
 
@@ -4157,6 +4070,10 @@ def empty_extraction_validation_report() -> dict[str, Any]:
         "schema_errors": [],
         "rejections": [],
         "dropped": [],
+        "contract_recovery_warning_count": 0,
+        "contract_recovery_warnings": [],
+        "temporal_enrichment_warning_count": 0,
+        "temporal_enrichment_warnings": [],
     }
 
 
@@ -4173,6 +4090,18 @@ def compact_validation_report(
         "schema_errors": list(report.get("schema_errors") or []),
         "rejections": list(report.get("rejections") or [])[:8],
         "dropped": list(report.get("dropped") or [])[:8],
+        "contract_recovery_warning_count": int(
+            report.get("contract_recovery_warning_count") or 0
+        ),
+        "contract_recovery_warnings": list(
+            report.get("contract_recovery_warnings") or []
+        )[:8],
+        "temporal_enrichment_warning_count": int(
+            report.get("temporal_enrichment_warning_count") or 0
+        ),
+        "temporal_enrichment_warnings": list(
+            report.get("temporal_enrichment_warnings") or []
+        )[:8],
     }
     for key in (
         "duration_ms",
@@ -4188,6 +4117,7 @@ def compact_validation_report(
         "new_canonical_route_count",
         "fuzzy_snapped_route_count",
         "route_resolution_counts",
+        "retry_reason",
     ):
         if key in report:
             output[key] = report[key]
@@ -4218,6 +4148,24 @@ def extraction_needs_validation_retry(report: dict[str, Any]) -> bool:
     return any(
         extraction_rejection_is_retryable(rejection)
         for rejection in report.get("rejections") or []
+    )
+
+
+def extraction_needs_coverage_retry(
+    source_window: dict[str, Any], report: dict[str, Any]
+) -> bool:
+    if int(report.get("raw_fact_count") or 0) != 0:
+        return False
+    return source_window_evidence_char_count(source_window) >= (
+        MIN_COVERAGE_RETRY_EVIDENCE_CHARS
+    )
+
+
+def source_window_evidence_char_count(source_window: dict[str, Any]) -> int:
+    return sum(
+        len(str(unit.get("text") or "").strip())
+        for chunk in ((source_window.get("window") or {}).get("chunks") or [])
+        for unit in (chunk.get("units") or [])
     )
 
 
@@ -4255,19 +4203,107 @@ def extraction_watermark_status(
     validation: dict[str, Any],
     candidates: list[dict[str, Any]],
 ) -> str:
-    if (
-        validation.get("schema_errors")
-        or int(validation.get("rejected_count") or 0) > 0
-    ):
+    if validation.get("schema_errors"):
         return "invalid"
-    if candidates:
+    llm_candidate_count = int(
+        validation.get("llm_candidate_count")
+        if validation.get("llm_candidate_count") is not None
+        else sum(
+            str(candidate.get("extraction_method") or "llm")
+            != "structured_metadata"
+            for candidate in candidates
+        )
+    )
+    if llm_candidate_count > 0:
+        if int(validation.get("rejected_count") or 0) > 0:
+            return "ok_with_rejections"
         return "ok"
+    if int(validation.get("rejected_count") or 0) > 0:
+        return "invalid"
     return "extracted_empty"
+
+
+def partial_extraction_watermark_is_terminal(watermark: Any) -> bool:
+    """Recognize legacy partial-success rows without replaying applied candidates."""
+
+    if str(watermark["status"] or "") != "invalid":
+        return False
+    try:
+        metadata = json.loads(watermark["metadata"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if int(metadata.get("candidate_count") or 0) <= 0:
+        return False
+    validation = metadata.get("validation")
+    if not isinstance(validation, dict) or validation.get("schema_errors"):
+        return False
+    llm_candidate_count = validation.get("llm_candidate_count")
+    if llm_candidate_count is None:
+        llm_candidate_count = max(
+            0,
+            int(metadata.get("candidate_count") or 0)
+            - int(validation.get("structured_event_candidate_count") or 0),
+        )
+    if int(llm_candidate_count or 0) <= 0:
+        return False
+    rejections = validation.get("rejections")
+    return bool(rejections) and all(
+        isinstance(rejection, dict)
+        and not extraction_rejection_is_retryable(rejection)
+        for rejection in rejections
+    )
 
 
 def normalize_claim_class(value: Any) -> str | None:
     normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
     return normalized or None
+
+
+def canonical_claim_class(value: str | None) -> str | None:
+    """Recover durable facts when the extractor invents a nearby class label.
+
+    Claim classification is routing metadata, not evidence. A novel label must
+    not discard an otherwise grounded fact; unknown durable-looking labels fall
+    back to factual_update while known mechanical/non-claim labels still drop.
+    """
+
+    if value is None or value in CLAIM_CLASSES:
+        return value
+    alias = CLAIM_CLASS_ALIASES.get(value)
+    if alias is not None:
+        return alias
+    if "question" in value:
+        return "open_question"
+    if any(token in value for token in ("preference", "preferred")):
+        return "preference"
+    if any(
+        token in value
+        for token in ("commitment", "action_item", "follow_up", "next_step", "task")
+    ):
+        return "commitment"
+    if any(token in value for token in ("decision", "choice")):
+        return "decision"
+    if any(
+        token in value
+        for token in ("responsibility", "ownership", "workload", "role")
+    ):
+        return "role_or_responsibility"
+    if any(
+        token in value
+        for token in ("project", "milestone", "roadmap", "status", "state")
+    ):
+        return "project_state"
+    if any(token in value for token in ("transcript", "speaker_mechanic")):
+        return "transcript_mechanic"
+    if any(token in value for token in ("pleasantry", "greeting", "small_talk")):
+        return "pleasantry"
+    if "boilerplate" in value:
+        return "boilerplate"
+    if any(token in value for token in ("non_claim", "nonclaim")):
+        return "non_claim"
+    if "event_metadata" in value or "meeting_metadata" in value:
+        return "event_metadata"
+    return "factual_update"
 
 
 def normalized_extraction_content_hash(chunks: list[dict[str, Any]]) -> str:

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import date
 from typing import Any
 
+from .temporal import temporal_interval_relation, temporal_merge_compatible
 from .wiki_facts import fact_tokens, facts_directly_conflict, facts_should_merge
 
 
@@ -34,7 +36,13 @@ DATE_RE = re.compile(
     r"\b(?:20\d{2}|19\d{2}|\d{4}-\d{2}-\d{2}|jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b",
     re.IGNORECASE,
 )
-VALUE_RE = re.compile(r"(?<![A-Za-z0-9])(?:\$?\d+(?:[.,]\d+)?%?|\d+(?:st|nd|rd|th))(?![A-Za-z0-9])")
+AS_OF_ISO_DATE_RE = re.compile(
+    r"\bas of\s+((?:19|20)\d{2}-\d{2}-\d{2})\b",
+    re.IGNORECASE,
+)
+VALUE_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:\$?\d+(?:[.,]\d+)?%?|\d+(?:st|nd|rd|th))(?![A-Za-z0-9])"
+)
 PROGRESSION_WORDS = {
     "became",
     "becomes",
@@ -119,8 +127,27 @@ def classify_fact_relation(
     contradiction_signal = facts_directly_conflict(
         existing, candidate
     ) and claims_overlap_for_verdict(candidate_statement, existing_statement)
+    interval_relation = temporal_interval_relation(candidate, existing)
 
-    if normalize_statement(candidate_statement) == normalize_statement(existing_statement):
+    if normalize_statement(candidate_statement) == normalize_statement(
+        existing_statement
+    ):
+        if not temporal_merge_compatible(candidate, existing):
+            if interval_relation == "after":
+                return fact_relation(
+                    "updates",
+                    0.9,
+                    "same assertion recurs in a later non-overlapping valid interval",
+                    candidate_id=candidate_id,
+                    existing_id=existing_id,
+                )
+            return fact_relation(
+                "complementary",
+                0.78,
+                "same assertion has a distinct valid-time scope and must remain separate",
+                candidate_id=candidate_id,
+                existing_id=existing_id,
+            )
         if disjoint_sources(candidate, existing):
             return fact_relation(
                 "supports",
@@ -137,7 +164,21 @@ def classify_fact_relation(
             existing_id=existing_id,
         )
 
-    if same_entity and has_progression_language(candidate_statement, existing_statement) and overlap >= 0.2:
+    if same_entity and interval_relation == "after" and overlap >= 0.2:
+        return fact_relation(
+            "updates",
+            0.9,
+            "candidate follows the existing fact in a non-overlapping valid interval",
+            candidate_id=candidate_id,
+            existing_id=existing_id,
+        )
+
+    if (
+        same_entity
+        and not contradiction_signal
+        and has_progression_language(candidate_statement, existing_statement)
+        and overlap >= 0.2
+    ):
         return fact_relation(
             "complementary",
             0.7,
@@ -147,6 +188,22 @@ def classify_fact_relation(
         )
 
     if contradiction_signal and same_entity:
+        if interval_relation == "after":
+            return fact_relation(
+                "updates",
+                0.92,
+                "mutually exclusive states occur in non-overlapping valid intervals",
+                candidate_id=candidate_id,
+                existing_id=existing_id,
+            )
+        if interval_relation == "before":
+            return fact_relation(
+                "complementary",
+                0.78,
+                "candidate is an earlier non-overlapping state, not a current contradiction",
+                candidate_id=candidate_id,
+                existing_id=existing_id,
+            )
         if negation_conflict:
             return fact_relation(
                 "contradicts",
@@ -155,15 +212,18 @@ def classify_fact_relation(
                 candidate_id=candidate_id,
                 existing_id=existing_id,
             )
-        if explicitly_dated(candidate) and explicitly_dated(existing) and overlap >= 0.35:
+        if explicitly_later_assertion_date(candidate, existing) and overlap >= 0.35:
             return fact_relation(
                 "updates",
                 0.72,
-                "same entity with dated succession signal; keep deterministic apply for later gate",
+                "same entity with an explicitly later as-of state date",
                 candidate_id=candidate_id,
                 existing_id=existing_id,
             )
-        if has_progression_language(candidate_statement, existing_statement) and overlap >= 0.25:
+        if (
+            has_progression_language(candidate_statement, existing_statement)
+            and overlap >= 0.25
+        ):
             return fact_relation(
                 "complementary",
                 0.66,
@@ -179,7 +239,9 @@ def classify_fact_relation(
             existing_id=existing_id,
         )
 
-    if same_entity and statement_refines(candidate_statement, existing_statement, candidate_tokens, existing_tokens):
+    if same_entity and statement_refines(
+        candidate_statement, existing_statement, candidate_tokens, existing_tokens
+    ):
         return fact_relation(
             "refines",
             0.74,
@@ -305,7 +367,11 @@ def claims_overlap_for_verdict(left: str, right: str) -> bool:
 def disjoint_sources(candidate: dict[str, Any], existing: dict[str, Any]) -> bool:
     candidate_sources = source_id_set(candidate.get("source_ids"))
     existing_sources = source_id_set(existing.get("source_ids"))
-    return bool(candidate_sources and existing_sources and not candidate_sources & existing_sources)
+    return bool(
+        candidate_sources
+        and existing_sources
+        and not candidate_sources & existing_sources
+    )
 
 
 def source_id_set(value: Any) -> set[str]:
@@ -323,10 +389,28 @@ def source_id_set(value: Any) -> set[str]:
 
 
 def explicitly_dated(fact: dict[str, Any]) -> bool:
-    for key in ("effective_at", "observed_at", "created_at"):
+    for key in ("valid_from", "valid_to", "effective_at"):
         if DATE_RE.search(str(fact.get(key) or "")):
             return True
     return DATE_RE.search(str(fact.get("statement") or "")) is not None
+
+
+def explicitly_later_assertion_date(
+    candidate: dict[str, Any], existing: dict[str, Any]
+) -> bool:
+    candidate_date = assertion_as_of_date(candidate)
+    existing_date = assertion_as_of_date(existing)
+    return bool(candidate_date and existing_date and candidate_date > existing_date)
+
+
+def assertion_as_of_date(fact: dict[str, Any]) -> date | None:
+    match = AS_OF_ISO_DATE_RE.search(str(fact.get("statement") or ""))
+    if match is None:
+        return None
+    try:
+        return date.fromisoformat(match.group(1))
+    except ValueError:
+        return None
 
 
 def has_progression_language(*statements: str) -> bool:
@@ -348,10 +432,16 @@ def statement_refines(
 ) -> bool:
     candidate_norm = normalize_statement(candidate_statement)
     existing_norm = normalize_statement(existing_statement)
-    if existing_norm and existing_norm in candidate_norm and len(candidate_tokens) > len(existing_tokens):
+    if (
+        existing_norm
+        and existing_norm in candidate_norm
+        and len(candidate_tokens) > len(existing_tokens)
+    ):
         return True
     existing_values = set(VALUE_RE.findall(existing_statement))
     candidate_values = set(VALUE_RE.findall(candidate_statement))
     if existing_values and candidate_values and existing_values != candidate_values:
         return False
-    return token_overlap(candidate_tokens, existing_tokens) >= 0.45 and len(candidate_tokens) > len(existing_tokens)
+    return token_overlap(candidate_tokens, existing_tokens) >= 0.45 and len(
+        candidate_tokens
+    ) > len(existing_tokens)

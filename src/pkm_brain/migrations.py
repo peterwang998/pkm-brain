@@ -719,6 +719,154 @@ def _migration_021_review_admission(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_022_temporal_facts(conn: sqlite3.Connection) -> None:
+    if not _table_exists(conn, "facts"):
+        return
+    _ensure_column(
+        conn,
+        "facts",
+        "temporal_kind",
+        "TEXT NOT NULL DEFAULT 'unknown'",
+    )
+    _ensure_column(conn, "facts", "valid_from", "TEXT")
+    _ensure_column(conn, "facts", "valid_to", "TEXT")
+    _ensure_column(
+        conn,
+        "facts",
+        "valid_time_precision",
+        "TEXT NOT NULL DEFAULT 'unknown'",
+    )
+    _ensure_column(conn, "facts", "temporal_expression", "TEXT")
+    _ensure_column(conn, "facts", "temporal_confidence", "REAL")
+    _ensure_column(conn, "facts", "knowledge_to", "TEXT")
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_facts_valid_time
+        ON facts(temporal_kind, valid_from, valid_to, status)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_facts_knowledge_time
+        ON facts(created_at, knowledge_to, status)
+        """
+    )
+    if _table_exists(conn, "retrieval_fts"):
+        conn.execute("DELETE FROM retrieval_fts WHERE kind = 'fact'")
+        conn.execute(
+            """
+            INSERT INTO retrieval_fts(
+              kind, target_id, title, text, heading_path, project, tags
+            )
+            SELECT 'fact', id, COALESCE(page_hint, entity_key),
+                   TRIM(statement || ' ' || COALESCE(temporal_expression, '')),
+                   COALESCE(section_hint, ''), '', COALESCE(source_ids, '[]')
+            FROM facts
+            WHERE status IN (
+              'active', 'conflicted', 'needs_confirmation', 'superseded',
+              'revision_closed'
+            )
+            """
+        )
+
+
+def _migration_023_fact_revisions(conn: sqlite3.Connection) -> None:
+    if not _table_exists(conn, "facts"):
+        return
+    _ensure_column(conn, "facts", "assertion_lineage_id", "TEXT")
+    _ensure_column(conn, "facts", "revision_of_id", "TEXT")
+    _ensure_column(
+        conn,
+        "facts",
+        "revision_number",
+        "INTEGER NOT NULL DEFAULT 1",
+    )
+    _ensure_column(conn, "facts", "revision_status", "TEXT")
+    conn.execute(
+        """
+        UPDATE facts
+        SET assertion_lineage_id = id,
+            revision_number = 1
+        WHERE assertion_lineage_id IS NULL
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_assertion_revision
+        ON facts(assertion_lineage_id, revision_number)
+        WHERE assertion_lineage_id IS NOT NULL
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_facts_revision_of
+        ON facts(revision_of_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_open_assertion_lineage
+        ON facts(assertion_lineage_id)
+        WHERE assertion_lineage_id IS NOT NULL AND knowledge_to IS NULL
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_facts_default_assertion_lineage
+        AFTER INSERT ON facts
+        WHEN NEW.assertion_lineage_id IS NULL
+        BEGIN
+          UPDATE facts
+          SET assertion_lineage_id = NEW.id, revision_number = 1
+          WHERE id = NEW.id;
+        END
+        """
+    )
+
+
+def _migration_024_event_time(conn: sqlite3.Connection) -> None:
+    """Add one optional event-time envelope to an ordinary fact row.
+
+    Migration 22 remains readable for predicate-validity compatibility.  Event
+    time is deliberately separate: a past occurrence or future plan does not
+    make the underlying fact non-current.
+    """
+
+    if not _table_exists(conn, "facts"):
+        return
+    _ensure_column(conn, "facts", "event_time_kind", "TEXT")
+    _ensure_column(conn, "facts", "event_start_at", "TEXT")
+    _ensure_column(conn, "facts", "event_end_at", "TEXT")
+    _ensure_column(conn, "facts", "event_time_precision", "TEXT")
+    _ensure_column(conn, "facts", "event_time_expression", "TEXT")
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_facts_event_time
+        ON facts(event_time_kind, event_start_at, event_end_at, status)
+        """
+    )
+    if _table_exists(conn, "retrieval_fts"):
+        conn.execute("DELETE FROM retrieval_fts WHERE kind = 'fact'")
+        conn.execute(
+            """
+            INSERT INTO retrieval_fts(
+              kind, target_id, title, text, heading_path, project, tags
+            )
+            SELECT 'fact', id, COALESCE(page_hint, entity_key),
+                   TRIM(statement || ' ' || COALESCE(temporal_expression, '') ||
+                        ' ' || COALESCE(event_time_expression, '') ||
+                        ' ' || COALESCE(event_start_at, '') ||
+                        ' ' || COALESCE(event_end_at, '')),
+                   COALESCE(section_hint, ''), '', COALESCE(source_ids, '[]')
+            FROM facts
+            WHERE status IN (
+              'active', 'conflicted', 'needs_confirmation', 'superseded',
+              'revision_closed'
+            )
+            """
+        )
+
+
 MIGRATIONS: list[Migration] = [
     (1, "add_origin_identity", _migration_001_add_origin_identity),
     (2, "create_sync_runs", _migration_002_create_sync_runs),
@@ -745,6 +893,9 @@ MIGRATIONS: list[Migration] = [
     (19, "fact_entity_mention_kind", _migration_019_fact_entity_mention_kind),
     (20, "document_source_stats", _migration_020_document_source_stats),
     (21, "review_admission", _migration_021_review_admission),
+    (22, "temporal_facts", _migration_022_temporal_facts),
+    (23, "fact_revisions", _migration_023_fact_revisions),
+    (24, "event_time", _migration_024_event_time),
 ]
 
 

@@ -1,7 +1,7 @@
 # Retrieval And Memory
 
 **Status:** canonical living feature spec
-**Last verified:** 2026-07-13 against the current knowledge retrieval implementation; operational retrieval below is the additive target contract
+**Last verified:** 2026-07-15 against the temporal-cognition working tree based on rollback commit `d5405b9`; the Brain v2 target adds explicit temporal modes while preserving original Brain fact eligibility when temporal controls are omitted
 **Owns:** knowledge search, operational retrieval, context packets, ranking/calibration, embeddings, retrieval telemetry, evals, and reviewed memories
 
 ## Retrieval Contract
@@ -40,6 +40,47 @@ The current hybrid path combines:
 Source-aware penalties keep agent-session traces from dominating ordinary knowledge queries. Agent-intent queries may relax those penalties.
 
 Facts, pages, memories, and chunks retain separate caps and trust treatment. A high lexical score in one noisy layer is not sufficient by itself to claim `found`.
+
+## Temporal Retrieval
+
+### Implemented Modes (Not Promoted)
+
+`retrieve_context` preserves existing callers and accepts explicit clock controls:
+
+```text
+retrieve_context(
+  task, project, *,
+  valid_as_of=None, known_as_of=None,
+  event_as_of=None, event_kind=None, temporal_mode=None
+)
+```
+
+The closed explicit modes are `current`, `valid`, `known`, `bitemporal`, and `timeline`. When all temporal controls are omitted, retrieval uses the original Brain status eligibility, scoring, and packet budget: optional or malformed temporal enrichment cannot make an otherwise eligible fact disappear. Explicit ISO year, month, date, or timestamp inputs win over conservative task inference. `current` applies world-valid-now only when explicitly selected, `valid` applies a supplied world-valid time, `known` applies the revision's `[created_at, knowledge_to)` interval, and `bitemporal` applies both clocks. `timeline` returns at most the latest eligible revision per assertion lineage in ascending temporal order; supplied clocks may narrow it.
+
+Mode behavior is deliberately asymmetric:
+
+- omitted temporal controls preserve baseline retrieval, including active facts with absent, unknown, or rejected temporal enrichment;
+- explicit `current` is world-valid now, but also retains active facts without predicate validity so event-time parsing and missing dates never become a recall filter; explicit future and expired predicate-valid facts are excluded;
+- `valid` and unclocked `timeline` use the latest open assertion revision, including bounded superseded states; closed revisions participate only when an explicit knowledge clock selects their `[created_at, knowledge_to)` interval, so a later correction cannot be resurrected by a valid-time query;
+- bounded predicate-valid intervals use `[valid_from, valid_to)`; active facts without predicate validity do not match an explicit `valid_as_of` constraint but remain visible in baseline/current retrieval;
+- `event_time` is a queryable event projection, not proposition validity: `event_as_of` independently filters facts with one primary event entity, optional `event_kind=actual|planned` distinguishes occurrence from schedule, and event filters combine with fact-validity and knowledge filters using AND rather than substituting for either clock;
+- timeline ordering prefers predicate-valid time when present and otherwise uses event time, so event facts do not become undated merely because their proposition itself is not validity-bounded;
+- an unbounded superseded fact is excluded because its historical end cannot be inferred safely;
+- historical modes disable recency boosting and omit current wiki pages, active/candidate memories, and open questions because those projections are not versioned;
+- `known` and `bitemporal` also omit supporting chunks so a later source cannot leak into an earlier knowledge-time answer; `valid` and `timeline` may include chunks as source evidence, not as a historical projection;
+- each fact exposes a temporal-match label and currentness reason without changing its base relevance score merely because time is absent.
+
+Fact search pages through FTS candidates until it has enough clock-eligible facts, exhausts results, or reaches a bounded hard cap. Ineligible current or historical rows therefore do not consume the initial top-N pool. Scoring and packet budgets still apply after eligibility. The packet reports its mode, clocks, coverage, inference state, and omitted layers. CLI and MCP forward the same optional controls without changing old defaults.
+
+### Remaining Gates
+
+These modes are working-tree behavior, not a live release. Promotion still requires:
+
+- fresh-home and representative schema-21 upgrade acceptance;
+- broader no-future-leakage and negative-control evaluation;
+- a verified live backup and rollback rehearsal before migration or backfill.
+
+Recency remains query-conditioned rather than a universal decay. Unversioned current projections stay omitted rather than being presented as historical truth.
 
 ## Operational Retrieval
 

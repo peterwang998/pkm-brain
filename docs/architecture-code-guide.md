@@ -1,7 +1,7 @@
 # PKM Brain Architecture Code Guide
 
 **Status:** current code-navigation guide
-**Last verified:** 2026-07-14 against the current Gmail operational mirror and completed encrypted 90-day archive
+**Last verified:** 2026-07-15 against the unpromoted temporal-cognition working tree based on rollback commit `d5405b9`; the Brain v2 target reaches schema 24 while the installed release remains on schema 21
 
 This guide answers where behavior lives. Feature requirements and open work belong in [the specs index](README.md), not here.
 
@@ -48,7 +48,7 @@ sync_* modules move source files, never live DB/index state.
 | connector auth | local metadata plus macOS Keychain secrets | `connector_auth.py`, `connector_api.py` |
 | source evidence | raw artifacts, `documents`, `chunks` | `service.py`, `chunking.py` |
 | lexical/vector index | FTS5 and stamped LanceDB chunks | `indexes.py`, `embeddings.py` |
-| facts | `facts` plus exact source spans/quotes | `extraction.py`, `wiki_facts.py` |
+| facts | `facts` plus exact source spans/quotes, optional predicate validity, optional flattened event time, and revision lineage | `extraction.py`, `temporal.py`, `fact_records.py`, `wiki_facts.py` |
 | entity identity | `entities` and `fact_entities` | `entities.py` |
 | durable mutation | `cos_actions` plus inverse | `cos_actions.py` |
 | autonomy | versioned `cos_policy` and eval state | `cos_policy.py`, `evals.py` |
@@ -57,7 +57,7 @@ sync_* modules move source files, never live DB/index state.
 | operational current state | `db/ops.sqlite` items, observations, events, and cursors | `operational_state.py`, `operational_db.py` |
 | review residue | `open_questions`, proposed memories, audit flags | `wiki_facts.py`, `memory.py`, `ui_server.py` |
 | page projection | contracts, facts, synthesis, snapshots, Markdown | `wiki_facts.py`, `contracts.py` |
-| retrieval packet | facts/pages/chunks/memories plus verdict/lineage | `service.py` |
+| retrieval packet | current/valid/known/bitemporal/timeline facts plus eligible evidence layers | `service.py`, `fact_retrieval.py`, `temporal.py` |
 | automation | jobs and `automation_runs` | `daemon.py`, `automation.py` |
 | sync | source outbox/staging/mirror and `sync_runs` | `sync_*.py` |
 
@@ -67,7 +67,7 @@ sync_* modules move source files, never live DB/index state.
 
 - `paths.py`: all home-relative paths, node identity, lock/token/handshake paths.
 - `db.py`: base schema, connection helpers, FTS setup, row helpers.
-- `migrations.py`: ordered idempotent migrations 1-21.
+- `migrations.py`: ordered idempotent migrations 1-24 in the unpromoted Brain v2 target; the installed baseline ends at 21.
 - `operational_db.py` and `operational_migrations.py`: the independently versioned `db/ops.sqlite` control plane and bounded lock handling.
 - `gmail_mirror.py`: the independent owner-only, rebuildable Gmail operational evidence store, atomic local-analysis queue, and content-free poison-thread quarantine at `cache/gmail-mirror/gmail-mirror.sqlite`.
 - `gmail_archive.py`, `gmail_archive_source.py`, and `gmail_archive_sync.py`: the separate encrypted raw-message store, Gmail reader, and scheduled 90-day-plus-incremental sync.
@@ -101,7 +101,16 @@ Provider mismatch must disable/refuse the vector channel; never mix spaces or si
 ### Facts, Entities, And Pages
 
 - `extraction.py`: document/window selection, prompts, evidence units, validation/retry, watermarks, critic/conflict helpers.
+- `extraction_contract.py`: complete v12 response schema, fixed enums, and prompt-version identity; older extraction watermarks are intentionally revisited once.
+- `extraction_entities.py`: fail-soft entity-annotation normalization; malformed optional mentions cannot discard an evidence-backed base fact.
+- `event_projection.py`: deterministic, evidence-backed projection of trusted source-native meeting times into ordinary event facts.
+- `temporal_enrichment.py`: fail-open stripping/reporting for optional predicate/event time and event-aware candidate deduplication.
+- `fact_event_integrity.py`: persistence-time event-entity enforcement and temporal merge guards.
 - `fact_relations.py`: typed candidate/counterpart relation classifier.
+- `numeric_faithfulness.py`: cited-number parsing and support checks, excluding speaker identifiers and non-count existentials.
+- `temporal.py`: independent validation for optional predicate validity and the single-event `event_time` shape, clock predicates, request modes, interval comparison, and conservative succession gates. Temporal validation may discard enrichment but may not reject a valid base fact.
+- `fact_records.py`: exact fact-row serialization, revision metadata, lifecycle status, and inverse snapshots.
+- `fact_retrieval.py`: paged FTS fact eligibility, historical-status handling, lineage deduplication, and timeline ordering.
 - `source_evidence.py`: source-date and source-document evidence normalization shared by review projections.
 - `routing_coherence.py`: source-document routing priors used without overriding contradictory fact evidence.
 - `entities.py`: normalization, resolution, type/mention gates, aliases, link helpers.
@@ -112,9 +121,13 @@ Provider mismatch must disable/refuse the vector channel; never mix spaces or si
 
 Entity identity is not a page path. `fact_entities` is link authority; `facts.entity_id` is a primary-link cache.
 
+Fact actions use copy-before-write revisions. The current row keeps its stable fact ID; before a semantic update, its exact row and entity links are copied to a closed `factrev_*` history row, then the stable head advances to the next open revision. Migration 23 supplies assertion lineage, predecessor, revision number/status, and one-open-revision constraints. Migration 24 adds nullable `event_time_kind`, `event_start_at`, `event_end_at`, `event_time_precision`, and `event_time_expression` columns; the extractor/API exposes them as one nested object tied to exactly one primary event entity. Closed revisions remain searchable for temporal retrieval and reversible through the existing action inverse.
+
 ### Actions, Policy, Audit, And Evals
 
 - `cos_actions.py`: action type registry, proposal/application, inverse capture, guarded revert, sibling retirement.
+- `critic_context.py`: bounded, source-grounded cross-chunk entity attribution context for critic review.
+- `policy_action_batch.py`: parallel critic preparation with ordered, independently committed action finalization.
 - `cos_policy.py`: risk features, ordered policy matching, version activation/demotion.
 - `curation_settings.py`: strict/balanced/lenient future-action presets.
 - `cos_audit.py`: sampled action audit and demotion.

@@ -104,13 +104,9 @@ def reconcile_policy_escalations(
         "resolved_question_count": sum(
             len(item["question_ids"])
             for item in eligible
-            if str(item["action"]["id"]) in {
-                str(result["id"]) for result in resolved
-            }
+            if str(item["action"]["id"]) in {str(result["id"]) for result in resolved}
         ),
-        "closed_stale_question_count": sum(
-            len(item["question_ids"]) for item in stale
-        ),
+        "closed_stale_question_count": sum(len(item["question_ids"]) for item in stale),
         "result_status_counts": dict(
             sorted(Counter(str(result["status"]) for result in resolved).items())
         ),
@@ -176,7 +172,11 @@ def classify_policy_escalations(
             action = action_rows.get(action_id)
             if action is None:
                 missing_actions.extend(
-                    {"question_id": question_id, "action_id": action_id, "reason": "missing_action"}
+                    {
+                        "question_id": question_id,
+                        "action_id": action_id,
+                        "reason": "missing_action",
+                    }
                     for question_id in question_ids
                 )
                 continue
@@ -188,9 +188,7 @@ def classify_policy_escalations(
                     str(action["action_type"]),
                     action.get("action_features") or {},
                 )
-                outcome = (
-                    "redecide" if decision.autonomy_level != "L3" else "retain_l3"
-                )
+                outcome = "redecide" if decision.autonomy_level != "L3" else "retain_l3"
             else:
                 outcome = "close_stale"
             grouped.append(
@@ -243,7 +241,11 @@ def redecide_policy_actions(
                     reviews[action_id] = future.result()
                 except Exception as exc:
                     failures.append(
-                        {"action_id": action_id, "phase": "critic", "error": str(exc)[:500]}
+                        {
+                            "action_id": action_id,
+                            "phase": "critic",
+                            "error": str(exc)[:500],
+                        }
                     )
 
     failed_action_ids = {item["action_id"] for item in failures}
@@ -252,22 +254,27 @@ def redecide_policy_actions(
         if action_id in failed_action_ids:
             continue
         critic_result = reviews.get(action_id)
+        critic_kwargs: dict[str, Any] = {}
+        if critic_result:
+            if critic_result.get("decision") == "evidence_incomplete":
+                critic_kwargs = {
+                    "precomputed_critic_review": critic_result,
+                    "critic_llm_provider": critic_llm_provider,
+                }
+            else:
+                critic_kwargs = {
+                    "critic_by": critic_result.get("critic_by"),
+                    "critic_decision": critic_result.get("decision"),
+                    "critic_rationale": critic_result.get("rationale"),
+                }
         try:
             decided[action_id] = retry_sqlite_lock(
                 lambda: decide_action(
                     paths,
                     action_id,
-                    critic_by=critic_result.get("critic_by")
-                    if critic_result
-                    else None,
-                    critic_decision=critic_result.get("decision")
-                    if critic_result
-                    else None,
-                    critic_rationale=critic_result.get("rationale")
-                    if critic_result
-                    else None,
                     critic_timeout_seconds=timeout_seconds,
                     critic_disagreement_mode=disagreement_mode,
+                    **critic_kwargs,
                 )
             )
         except Exception as exc:

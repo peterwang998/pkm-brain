@@ -774,11 +774,11 @@ def test_v2_queue_models_legacy_conflicts_as_selectable_alternatives(
                 (latest["id"], existing["id"], supporting["id"]),
             )
         }
-    assert statuses == {
-        latest["id"]: ("active", 1),
-        existing["id"]: ("superseded", 0),
-        supporting["id"]: ("active", 1),
-    }
+        assert statuses == {
+            latest["id"]: ("active", 1),
+            existing["id"]: ("retracted", 0),
+            supporting["id"]: ("active", 1),
+        }
 
 
 def test_v2_queue_extraction_anomaly_uses_alert_decisions(tmp_path: Path) -> None:

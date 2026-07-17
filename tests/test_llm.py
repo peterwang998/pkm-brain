@@ -9,7 +9,12 @@ from typer.testing import CliRunner
 
 from pkm_brain.cli import app
 from pkm_brain import llm
-from pkm_brain.llm import CodexProvider, LLMConfigurationError, LLMProviderError, OpenAIProvider
+from pkm_brain.llm import (
+    CodexProvider,
+    LLMConfigurationError,
+    LLMProviderError,
+    OpenAIProvider,
+)
 from pkm_brain.paths import BrainPaths
 
 
@@ -21,7 +26,9 @@ def test_codex_defaults_use_current_sol_and_luna_tiers() -> None:
     assert llm.CODEX_DEFAULT_FALLBACK_MODELS == ("gpt-5.6-luna",)
 
 
-def test_openai_provider_falls_back_on_model_selection_error(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_openai_provider_falls_back_on_model_selection_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("PKM_BRAIN_OPENAI_MODEL", "missing-model")
     monkeypatch.setenv("PKM_BRAIN_OPENAI_MODEL_FALLBACKS", "gpt-5.4-mini,gpt-5")
@@ -30,7 +37,9 @@ def test_openai_provider_falls_back_on_model_selection_error(monkeypatch: pytest
     def fake_post_json(url: str, payload: dict, headers: dict) -> dict:
         calls.append(payload["model"])
         if payload["model"] == "missing-model":
-            raise LLMProviderError("The model `missing-model` does not exist or you do not have access to it.")
+            raise LLMProviderError(
+                "The model `missing-model` does not exist or you do not have access to it."
+            )
         return {"choices": [{"message": {"content": '{"ok": true}'}}]}
 
     monkeypatch.setattr(llm, "post_json", fake_post_json)
@@ -41,7 +50,9 @@ def test_openai_provider_falls_back_on_model_selection_error(monkeypatch: pytest
     assert provider.model == "gpt-5.4-mini"
 
 
-def test_openai_provider_does_not_hide_auth_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_openai_provider_does_not_hide_auth_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("PKM_BRAIN_OPENAI_MODEL", "missing-model")
     monkeypatch.setenv("PKM_BRAIN_OPENAI_MODEL_FALLBACKS", "gpt-5.4-mini")
@@ -58,7 +69,9 @@ def test_openai_provider_does_not_hide_auth_errors(monkeypatch: pytest.MonkeyPat
     assert calls == ["missing-model"]
 
 
-def test_codex_provider_falls_back_on_model_selection_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_codex_provider_falls_back_on_model_selection_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     monkeypatch.setenv("PKM_BRAIN_CODEX_BIN", str(tmp_path / "codex"))
     monkeypatch.setenv("PKM_BRAIN_CODEX_MODEL", "missing-model")
     monkeypatch.setenv("PKM_BRAIN_CODEX_MODEL_FALLBACKS", "gpt-5.4-mini,gpt-5")
@@ -87,7 +100,9 @@ def test_codex_provider_falls_back_on_model_selection_error(monkeypatch: pytest.
         model = command[command.index("--model") + 1]
         calls.append(model)
         if model == "missing-model":
-            return Completed(1, stderr="invalid value 'missing-model' for '--model <MODEL>'")
+            return Completed(
+                1, stderr="invalid value 'missing-model' for '--model <MODEL>'"
+            )
         output_path = Path(command[command.index("--output-last-message") + 1])
         output_path.write_text('{"ok": true}', encoding="utf-8")
         return Completed(0)
@@ -121,7 +136,67 @@ def test_complete_json_repairs_malformed_response() -> None:
     assert provider.calls == 2
 
 
-def test_role_specific_provider_model_overrides_global(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_complete_json_schema_repair_preserves_large_prompt_tail() -> None:
+    source_tail = "SOURCE-WINDOW-TAIL-MARKER"
+
+    class FakeProvider:
+        name = "fake"
+        model = "fake-model"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def complete(self, prompt: str) -> str:
+            self.calls += 1
+            if self.calls == 1:
+                return '{"summary": "no facts key"}'
+            assert source_tail in prompt
+            assert "return an empty array rather than omitting the key" in prompt
+            return '{"facts": []}'
+
+    provider = FakeProvider()
+    prompt = "instructions\n" + ("x" * 5000) + "\n" + source_tail
+
+    assert llm.complete_json(
+        prompt,
+        schema={"type": "object", "required": ["facts"]},
+        llm_provider=provider,
+    ) == {"facts": []}
+    assert provider.calls == 2
+
+
+def test_complete_json_repairs_wrong_required_property_type() -> None:
+    class FakeProvider:
+        name = "fake"
+        model = "fake-model"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def complete(self, prompt: str) -> str:
+            self.calls += 1
+            if self.calls == 1:
+                return '{"facts": {"statement": "wrong container"}}'
+            assert "JSON property 'facts' must have type array" in prompt
+            return '{"facts": [{"statement": "repaired"}]}'
+
+    provider = FakeProvider()
+
+    assert llm.complete_json(
+        "extract facts",
+        schema={
+            "type": "object",
+            "required": ["facts"],
+            "properties": {"facts": {"type": "array"}},
+        },
+        llm_provider=provider,
+    ) == {"facts": [{"statement": "repaired"}]}
+    assert provider.calls == 2
+
+
+def test_role_specific_provider_model_overrides_global(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("PKM_BRAIN_LLM_PROVIDER", "openai")
     monkeypatch.setenv("PKM_BRAIN_OPENAI_MODEL", "global-model")
@@ -192,8 +267,62 @@ default:
 
     report = llm.cos_provider_status(paths)
 
-    assert any("auditor uses the same provider/model as extractor" in warning for warning in report["warnings"])
-    assert any("critic uses the same provider/model as resolver" in warning for warning in report["warnings"])
+    assert any(
+        "auditor uses the same provider/model as extractor" in warning
+        for warning in report["warnings"]
+    )
+    assert any(
+        "critic uses the same provider/model as resolver" in warning
+        for warning in report["warnings"]
+    )
+
+
+def test_cos_rebuild_critic_auditor_overlap_opt_in_requires_boolean(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    paths.config_local.mkdir(parents=True)
+    config_path = paths.config_local / "cos_llm.yaml"
+    config_path.write_text(
+        "rebuild:\n  allow_critic_auditor_model_overlap: true\n",
+        encoding="utf-8",
+    )
+
+    assert llm.cos_rebuild_allows_critic_auditor_model_overlap(paths) is True
+
+    config_path.write_text(
+        "rebuild:\n  allow_critic_auditor_model_overlap: yes-please\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        LLMConfigurationError,
+        match="allow_critic_auditor_model_overlap must be true or false",
+    ):
+        llm.cos_rebuild_allows_critic_auditor_model_overlap(paths)
+
+
+def test_cos_rebuild_critic_proposer_overlap_opt_in_requires_boolean(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    paths.config_local.mkdir(parents=True)
+    config_path = paths.config_local / "cos_llm.yaml"
+    config_path.write_text(
+        "rebuild:\n  allow_critic_proposer_model_overlap: true\n",
+        encoding="utf-8",
+    )
+
+    assert llm.cos_rebuild_allows_critic_proposer_model_overlap(paths) is True
+
+    config_path.write_text(
+        "rebuild:\n  allow_critic_proposer_model_overlap: unsafe\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        LLMConfigurationError,
+        match="allow_critic_proposer_model_overlap must be true or false",
+    ):
+        llm.cos_rebuild_allows_critic_proposer_model_overlap(paths)
 
 
 def test_complete_json_resolves_provider_from_cos_config(
@@ -224,7 +353,9 @@ roles:
         def complete(self, prompt: str) -> str:
             return json.dumps({"ok": True})
 
-    def fake_get_provider(provider: str | None = None, *, role: str | None = None) -> FakeProvider:
+    def fake_get_provider(
+        provider: str | None = None, *, role: str | None = None
+    ) -> FakeProvider:
         calls.append((provider, role, os.environ.get("PKM_BRAIN_CODEX_MODEL")))
         assert os.environ.get("PKM_BRAIN_CODEX_REASONING_EFFORT") == "medium"
         return FakeProvider()
@@ -245,7 +376,9 @@ def test_complete_json_with_unconfigured_cos_role_raises(
         llm.complete_json("return ok", role="extractor", paths=paths)
 
 
-def test_cos_providers_cli_reports_json(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_cos_providers_cli_reports_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     clear_cos_llm_env(monkeypatch)
     paths = BrainPaths.from_value(tmp_path / "brain")
     paths.config_local.mkdir(parents=True)
@@ -259,7 +392,9 @@ default:
         encoding="utf-8",
     )
 
-    result = runner.invoke(app, ["cos", "providers", "--json", "--home", str(paths.home)])
+    result = runner.invoke(
+        app, ["cos", "providers", "--json", "--home", str(paths.home)]
+    )
 
     assert result.exit_code == 0
     payload = json.loads(result.stdout)
@@ -272,5 +407,11 @@ default:
 def clear_cos_llm_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("PKM_BRAIN_LLM_PROVIDER", raising=False)
     for role in llm.LLM_ROLE_ORDER:
-        for suffix in ("PROVIDER", "MODEL", "MODEL_FALLBACKS", "BASE_URL", "REASONING_EFFORT"):
+        for suffix in (
+            "PROVIDER",
+            "MODEL",
+            "MODEL_FALLBACKS",
+            "BASE_URL",
+            "REASONING_EFFORT",
+        ):
             monkeypatch.delenv(llm.role_env(role, suffix), raising=False)

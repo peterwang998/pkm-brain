@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Iterator
 
 from .cos_actions import (
     critic_review as review_action_with_critic,
@@ -33,16 +33,18 @@ def decide_policy_actions(
         timeout_seconds=timeout_seconds,
     )
     disagreement_mode = str(critic_review.get("disagreement_mode") or "needs_human")
-    return [
-        finalize_policy_action(
-            paths,
-            action_id,
-            preparation,
-            critic_timeout_seconds=timeout_seconds,
-            critic_disagreement_mode=disagreement_mode,
+    decided: list[dict[str, Any]] = []
+    for action_id, preparation in zip(action_ids, preparations):
+        decided.append(
+            finalize_policy_action(
+                paths,
+                action_id,
+                preparation,
+                critic_timeout_seconds=timeout_seconds,
+                critic_disagreement_mode=disagreement_mode,
+            )
         )
-        for action_id, preparation in zip(action_ids, preparations)
-    ]
+    return decided
 
 
 def prepare_action_reviews(
@@ -51,34 +53,30 @@ def prepare_action_reviews(
     *,
     worker_count: int,
     timeout_seconds: int | None,
-) -> list[dict[str, Any]]:
+) -> Iterator[dict[str, Any]]:
     if worker_count <= 1:
-        return [
-            prepare_policy_action_review_safely(
+        for action_id in action_ids:
+            yield prepare_policy_action_review_safely(
                 paths, action_id, critic_timeout_seconds=timeout_seconds
             )
-            for action_id in action_ids
-        ]
-    results: dict[int, dict[str, Any]] = {}
+        return
     with ThreadPoolExecutor(
         max_workers=worker_count, thread_name_prefix="brain-critic"
     ) as executor:
-        futures = {
+        futures = [
             executor.submit(
                 prepare_policy_action_review_safely,
                 paths,
                 action_id,
                 critic_timeout_seconds=timeout_seconds,
-            ): index
-            for index, action_id in enumerate(action_ids)
-        }
-        for future in as_completed(futures):
-            index = futures[future]
+            )
+            for action_id in action_ids
+        ]
+        for future in futures:
             try:
-                results[index] = future.result()
+                yield future.result()
             except Exception as exc:
-                results[index] = {"error": exc}
-    return [results[index] for index in range(len(action_ids))]
+                yield {"error": exc}
 
 
 def prepare_policy_action_review_safely(
@@ -120,6 +118,7 @@ def prepare_policy_action_review(
         "critic_by": review.get("critic_by"),
         "critic_decision": review.get("decision"),
         "critic_rationale": review.get("rationale"),
+        "precomputed_critic_review": review,
     }
 
 
@@ -138,7 +137,11 @@ def finalize_policy_action(
         "critic_timeout_seconds": critic_timeout_seconds,
         "critic_disagreement_mode": critic_disagreement_mode,
     }
-    if preparation.get("critic_decision") != "evidence_incomplete":
+    if preparation.get("critic_decision") == "evidence_incomplete":
+        kwargs["precomputed_critic_review"] = preparation.get(
+            "precomputed_critic_review"
+        )
+    else:
         kwargs.update(
             {
                 key: preparation[key]

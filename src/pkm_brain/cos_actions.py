@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from .critic_context import critic_named_entity_context
 from .cos_policy import PolicyDecision, classify_action_risk, evaluate_policy
 from .db import connection, dumps, loads
 from .entities import (
@@ -16,6 +17,16 @@ from .entities import (
     normalize_mention_kind,
     replace_fact_entity_links,
     resolve_entity,
+)
+from .fact_event_integrity import (
+    event_time_for_resolved_primary_event,
+    reject_incompatible_fact_merge,
+)
+from .fact_records import (
+    merge_fact_inverse,
+    revise_stored_fact,
+    stored_fact_entity_links,
+    write_versioned_fact,
 )
 from .llm import (
     LLMProviderError,
@@ -352,6 +363,7 @@ def decide_action(
     critic_by: str | None = None,
     critic_decision: str | None = None,
     critic_rationale: str | None = None,
+    precomputed_critic_review: dict[str, Any] | None = None,
     critic_llm_provider: LLMProvider | None = None,
     critic_provider: str | None = None,
     critic_timeout_seconds: int | None = None,
@@ -367,13 +379,17 @@ def decide_action(
             conn, action["action_type"], action.get("action_features") or {}
         )
     if decision.critic_required and critic_decision is None:
-        review = critic_review(
-            paths,
-            action,
-            decision,
-            llm_provider=critic_llm_provider,
-            provider=critic_provider,
-            timeout_seconds=critic_timeout_seconds,
+        review = (
+            normalize_precomputed_critic_review(precomputed_critic_review)
+            if precomputed_critic_review is not None
+            else critic_review(
+                paths,
+                action,
+                decision,
+                llm_provider=critic_llm_provider,
+                provider=critic_provider,
+                timeout_seconds=critic_timeout_seconds,
+            )
         )
         if review["decision"] == "evidence_incomplete":
             initial_review = dict(review)
@@ -510,7 +526,9 @@ def critic_review(
             "rationale": "No CoS LLM provider configured for critic role",
         }
     active_provider = get_cos_action_provider(
-        paths, "critic", action,
+        paths,
+        "critic",
+        action,
         provider=provider,
         llm_provider=llm_provider,
         stage="evaluation",
@@ -594,15 +612,26 @@ def critic_prompt(
         "Review this Chief-of-Staff action before autonomous application. "
         "For fact_upsert actions, answer only the narrow support question: is the proposed statement "
         "directly entailed by the cited evidence in the payload, with negation, uncertainty, entity, "
-        "quantity, and attribution preserved? Return decision 'agree' when the currently cited evidence "
-        "directly supports the statement, even if the fact is mundane or you would not have written it "
-        "yourself. Return 'evidence_incomplete' only when the statement is directly supported by the "
+        "quantity, attribution, and any optional predicate-validity or event-time fields preserved? Return "
+        "'agree' when the cited evidence directly supports the statement, even if the fact is mundane or "
+        "you would not have written it yourself. Missing temporal enrichment is valid and must not count against "
+        "the fact. Require direct support for any returned valid_from/valid_to; source, meeting, capture, ingestion, "
+        "and job time are not predicate validity unless the claim explicitly connects them. A plan's target or "
+        "deadline is not valid_from. event_time is allowed only for the primary event entity, with kind actual or "
+        "planned and source-supported start/end bounds. Trusted structured_metadata projections may use exact "
+        "event_started_at/event_ended_at frontmatter as direct support for a named meeting occurrence. "
+        "Return 'evidence_incomplete' only when the statement "
+        "is directly supported by the "
         "repairable context units from the same chunk but the current citation omitted necessary units; "
         "then return up to 5 repaired_evidence_unit_ids using only ids in repairable_units. You may return "
         "only omitted units; deterministic repair unions them with the current citation. Return 'disagree' "
         "when the statement remains unsupported, over-broad, misattributed, or contradictory after "
         "considering context. Document titles and participant lists are context, not proof of a substantive "
         "claim. Speaker identity context may establish attribution but cannot establish the claim itself. "
+        "Named-entity attribution context may clarify spelling or an explicitly linked pronoun, but the mere "
+        "presence of a name elsewhere in the same chunk or document does not prove that the cited predicate "
+        "belongs to that entity. If a necessary attribution unit is available in repairable_units, return "
+        "'evidence_incomplete'; otherwise return 'disagree' for an unsupported named attribution. "
         "For non-fact actions, require the payload, targets, policy, and risk features to support safe application. "
         "The Policy card is the matched authorization record; do not require the action payload to repeat policy fields or invent another requirement. Judge whether the evidence and targets satisfy it. Do not rewrite the action.\n\n"
         f"Action:\n{action_card}\n\nSource context:\n{source_context_card}\n\nPolicy:\n{policy_card}"
@@ -632,6 +661,20 @@ def normalize_critic_decision(value: Any) -> str:
     }:
         return "evidence_incomplete"
     return "unavailable"
+
+
+def normalize_precomputed_critic_review(value: dict[str, Any]) -> dict[str, Any]:
+    review: dict[str, Any] = {
+        "critic_by": str(value.get("critic_by") or "critic:provided"),
+        "decision": normalize_critic_decision(value.get("decision")),
+        "rationale": str(value.get("rationale") or "")[:1000],
+    }
+    repair_unit_ids = stable_critic_repair_unit_ids(
+        value.get("repaired_evidence_unit_ids")
+    )
+    if repair_unit_ids:
+        review["repaired_evidence_unit_ids"] = repair_unit_ids
+    return review
 
 
 def stable_critic_repair_unit_ids(value: Any) -> list[str]:
@@ -725,6 +768,9 @@ def critic_fact_source_context(
         "repairable_units": repairable_units,
         "speaker_identity_context": critic_speaker_identity_context(
             document_chunks, relevant_speakers
+        ),
+        "named_entity_attribution_context": critic_named_entity_context(
+            document_chunks, fact
         ),
         "known_participants": critic_known_participants(document_chunks),
     }
@@ -851,9 +897,22 @@ def repair_fact_action_evidence(
     original_unit_ids = critic_fact_evidence_unit_ids(
         (action_payload(action).get("fact") or {})
     )
-    repaired_unit_ids = stable_critic_repair_unit_ids(
-        [*original_unit_ids, *requested_unit_ids]
-    )
+    repaired_unit_ids = stable_unique_strings([*original_unit_ids, *requested_unit_ids])
+    if len(repaired_unit_ids) > MAX_CRITIC_REPAIR_EVIDENCE_UNITS:
+        return {
+            "status": "not_repaired",
+            "reason": (
+                "critic evidence repair exceeds the maximum citation size; "
+                "a bounded repair may not silently discard cited units"
+            ),
+            "requested_evidence_unit_ids": requested_unit_ids,
+        }
+    if repaired_unit_ids == original_unit_ids:
+        return {
+            "status": "not_repaired",
+            "reason": "critic evidence repair did not add any citation units",
+            "requested_evidence_unit_ids": requested_unit_ids,
+        }
     repairable_ids = {
         str(unit.get("unit_id") or "")
         for unit in context.get("repairable_units") or []
@@ -1023,13 +1082,13 @@ def apply_action(
         target_page_paths = list(action.get("target_page_paths") or [])
 
         if action["action_type"] == "fact_upsert":
-            fact_id, inverse = apply_fact_upsert(
+            fact_ids, inverse = apply_fact_upsert(
                 conn,
                 payload,
                 paths=paths,
                 allow_llm_entity_resolution=allow_llm_entity_resolution,
             )
-            target_fact_ids = stable_unique([*target_fact_ids, fact_id])
+            target_fact_ids = stable_unique([*target_fact_ids, *fact_ids])
         elif action["action_type"] in {"fact_supersede", "resolve_conflict"}:
             fact_ids, inverse = apply_fact_updates(conn, payload)
             target_fact_ids = stable_unique([*target_fact_ids, *fact_ids])
@@ -1445,17 +1504,14 @@ def apply_fact_upsert(
     *,
     paths: BrainPaths | None = None,
     allow_llm_entity_resolution: bool = True,
-) -> tuple[str, dict[str, Any]]:
-    from .wiki_facts import rebuild_fact_retrieval_index, row_to_fact
+    record_revision: bool = True,
+) -> tuple[list[str], dict[str, Any]]:
+    from .wiki_facts import rebuild_fact_retrieval_index
 
-    fact = payload.get("fact") if isinstance(payload.get("fact"), dict) else payload
+    raw_fact = payload.get("fact") if isinstance(payload.get("fact"), dict) else payload
+    fact = dict(raw_fact)
     fact_id = str(fact.get("id") or new_id("fact"))
     existing = conn.execute("SELECT * FROM facts WHERE id = ?", (fact_id,)).fetchone()
-    inverse = (
-        {"restore_fact": row_to_fact(existing)}
-        if existing
-        else {"delete_fact_ids": [fact_id]}
-    )
     fact, entity_links = fact_with_entity_links(
         conn,
         fact,
@@ -1463,39 +1519,17 @@ def apply_fact_upsert(
         paths=paths,
         allow_llm_entity_resolution=allow_llm_entity_resolution,
     )
-    values = fact_values(fact, fact_id, existing)
-    if existing:
-        update_values = (*values[1:14], values[15], *values[16:], fact_id)
-        conn.execute(
-            """
-            UPDATE facts
-            SET statement = ?, entity_key = ?, entity_id = ?, page_hint = ?, section_hint = ?,
-                source_ids = ?, observed_at = ?, confidence = ?, status = ?,
-                supersedes_id = ?, conflict_group_id = ?, confirmed_by_user = ?,
-                metadata = ?, last_seen_at = ?, source_spans = ?,
-                evidence_quote = ?, extraction_method = ?, extractor_model = ?,
-                effective_at = ?, extraction_confidence = ?, routing_confidence = ?,
-                truth_confidence = ?
-            WHERE id = ?
-            """,
-            update_values,
-        )
-    else:
-        conn.execute(
-            """
-            INSERT INTO facts(
-              id, statement, entity_key, entity_id, page_hint, section_hint, source_ids,
-              observed_at, confidence, status, supersedes_id, conflict_group_id,
-              confirmed_by_user, metadata, created_at, last_seen_at, source_spans,
-              evidence_quote, extraction_method, extractor_model, effective_at,
-              extraction_confidence, routing_confidence, truth_confidence
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            values,
-        )
-    replace_fact_entity_links(conn, fact_id=fact_id, links=entity_links)
+    fact = event_time_for_resolved_primary_event(conn, fact, entity_links)
+    touched_ids, inverse = write_versioned_fact(
+        conn,
+        fact,
+        fact_id,
+        existing,
+        entity_links,
+        record_revision=record_revision,
+    )
     rebuild_fact_retrieval_index(conn)
-    return fact_id, inverse
+    return touched_ids, inverse
 
 
 def fact_with_entity_links(
@@ -1751,40 +1785,6 @@ def entity_exists(conn: Any, entity_id: str) -> bool:
     )
 
 
-def fact_values(
-    fact: dict[str, Any], fact_id: str, existing: Any | None
-) -> tuple[Any, ...]:
-    timestamp = now_iso()
-    existing_get = existing_value_getter(existing)
-    confidence = float(fact.get("confidence", existing_get("confidence", 0.0)) or 0.0)
-    return (
-        fact_id,
-        str(fact.get("statement", existing_get("statement", ""))),
-        str(fact.get("entity_key", existing_get("entity_key", "manual:fact"))),
-        fact.get("entity_id", existing_get("entity_id")),
-        fact.get("page_hint", existing_get("page_hint")),
-        fact.get("section_hint", existing_get("section_hint")),
-        dumps(fact.get("source_ids", loads(existing_get("source_ids"), []))),
-        fact.get("observed_at", existing_get("observed_at")),
-        confidence,
-        str(fact.get("status", existing_get("status", "active"))),
-        fact.get("supersedes_id", existing_get("supersedes_id")),
-        fact.get("conflict_group_id", existing_get("conflict_group_id")),
-        1 if fact.get("confirmed_by_user", existing_get("confirmed_by_user", 0)) else 0,
-        dumps(fact.get("metadata", loads(existing_get("metadata"), {}))),
-        existing_get("created_at", timestamp),
-        timestamp,
-        dumps(fact.get("source_spans", loads(existing_get("source_spans"), []))),
-        fact.get("evidence_quote", existing_get("evidence_quote")),
-        str(fact.get("extraction_method", existing_get("extraction_method", "legacy"))),
-        fact.get("extractor_model", existing_get("extractor_model")),
-        fact.get("effective_at", existing_get("effective_at")),
-        fact.get("extraction_confidence", existing_get("extraction_confidence")),
-        fact.get("routing_confidence", existing_get("routing_confidence")),
-        fact.get("truth_confidence", existing_get("truth_confidence", confidence)),
-    )
-
-
 def optional_float(value: Any) -> float | None:
     if value is None:
         return None
@@ -1800,7 +1800,9 @@ def apply_rehome_fact(conn: Any, payload: dict[str, Any]) -> tuple[str, dict[str
     fact_id = str(payload.get("fact_id") or "")
     if not fact_id:
         raise ValueError("rehome_fact requires fact_id")
-    row = conn.execute("SELECT * FROM facts WHERE id = ?", (fact_id,)).fetchone()
+    row = conn.execute(
+        "SELECT * FROM facts WHERE id = ? AND knowledge_to IS NULL", (fact_id,)
+    ).fetchone()
     if not row:
         raise ValueError(f"fact not found: {fact_id}")
     old = row_to_fact(row)
@@ -1850,27 +1852,28 @@ def apply_fact_updates(
     updates = payload.get("updates") if isinstance(payload.get("updates"), list) else []
     if not updates:
         raise ValueError("fact update action requires updates")
-    old_facts: list[dict[str, Any]] = []
+    valid_updates = [update for update in updates if isinstance(update, dict)]
+    update_fact_ids = [str(update.get("fact_id") or "") for update in valid_updates]
+    if not valid_updates or any(not fact_id for fact_id in update_fact_ids):
+        raise ValueError("fact update requires fact_id")
+    if len(set(update_fact_ids)) != len(update_fact_ids):
+        raise ValueError("fact update action requires distinct fact_ids")
     fact_ids: list[str] = []
-    for update in updates:
-        if not isinstance(update, dict):
-            continue
-        fact_id = str(update.get("fact_id") or "")
-        if not fact_id:
-            raise ValueError("fact update requires fact_id")
+    inverse: dict[str, Any] = {}
+    for update, fact_id in zip(valid_updates, update_fact_ids):
         row = conn.execute("SELECT * FROM facts WHERE id = ?", (fact_id,)).fetchone()
         if not row:
             raise ValueError(f"fact not found: {fact_id}")
         old = row_to_fact(row)
-        old_facts.append(old)
         merged = dict(old)
         for key, value in update.items():
             if key != "fact_id":
                 merged[key] = value
-        apply_fact_upsert(conn, {"fact": merged})
-        fact_ids.append(fact_id)
+        touched, fragment = apply_fact_upsert(conn, {"fact": merged})
+        fact_ids.extend(touched)
+        merge_fact_inverse(inverse, fragment)
     rebuild_fact_retrieval_index(conn)
-    return stable_unique(fact_ids), {"restore_facts": old_facts}
+    return stable_unique(fact_ids), inverse
 
 
 def apply_fact_merge(
@@ -1890,18 +1893,28 @@ def apply_fact_merge(
     fact_ids = stable_unique([keeper_id, *superseded_fact_ids])
     if not keeper_id or not superseded_fact_ids:
         raise ValueError("fact_merge requires keeper_fact.id and superseded_fact_ids")
+    if len(set(superseded_fact_ids)) != len(superseded_fact_ids):
+        raise ValueError("fact_merge requires distinct superseded_fact_ids")
+    if keeper_id in superseded_fact_ids:
+        raise ValueError("fact_merge keeper cannot supersede itself")
     old_facts: list[dict[str, Any]] = []
     for fact_id in fact_ids:
         row = conn.execute("SELECT * FROM facts WHERE id = ?", (fact_id,)).fetchone()
         if not row:
             raise ValueError(f"fact not found: {fact_id}")
         old_facts.append(row_to_fact(row))
-    apply_fact_upsert(
+    stored_keeper = next(fact for fact in old_facts if fact["id"] == keeper_id)
+    proposed_keeper = {**stored_keeper, **keeper}
+    reject_incompatible_fact_merge(proposed_keeper, old_facts)
+    inverse: dict[str, Any] = {}
+    touched, fragment = apply_fact_upsert(
         conn, {"fact": {**keeper, "status": keeper.get("status") or "active"}}
     )
+    fact_ids.extend(touched)
+    merge_fact_inverse(inverse, fragment)
     for fact_id in superseded_fact_ids:
         old = next(fact for fact in old_facts if fact["id"] == fact_id)
-        apply_fact_upsert(
+        touched, fragment = apply_fact_upsert(
             conn,
             {
                 "fact": {
@@ -1911,8 +1924,10 @@ def apply_fact_merge(
                 }
             },
         )
+        fact_ids.extend(touched)
+        merge_fact_inverse(inverse, fragment)
     rebuild_fact_retrieval_index(conn)
-    return fact_ids, {"restore_facts": old_facts}
+    return stable_unique(fact_ids), inverse
 
 
 def apply_display_contested(
@@ -1928,18 +1943,20 @@ def apply_display_contested(
     conflict_group_id = str(payload.get("conflict_group_id") or new_id("factconflict"))
     if len(fact_ids) < 2:
         raise ValueError("display_contested requires at least two fact_ids")
-    old_facts: list[dict[str, Any]] = []
+    if len(set(fact_ids)) != len(fact_ids):
+        raise ValueError("display_contested requires distinct fact_ids")
     facts: list[dict[str, Any]] = []
+    touched_fact_ids: list[str] = list(fact_ids)
+    inverse: dict[str, Any] = {}
     for fact_id in fact_ids:
         row = conn.execute("SELECT * FROM facts WHERE id = ?", (fact_id,)).fetchone()
         if not row:
             raise ValueError(f"fact not found: {fact_id}")
         fact = row_to_fact(row)
-        old_facts.append(fact)
         facts.append(
             {**fact, "status": "conflicted", "conflict_group_id": conflict_group_id}
         )
-        apply_fact_upsert(
+        touched, fragment = apply_fact_upsert(
             conn,
             {
                 "fact": {
@@ -1949,14 +1966,15 @@ def apply_display_contested(
                 }
             },
         )
+        touched_fact_ids.extend(touched)
+        merge_fact_inverse(inverse, fragment)
     question_id = ensure_open_conflict_question(
         conn, conflict_group_id, facts, fact_ids, action_id=action_id
     )
     rebuild_fact_retrieval_index(conn)
-    inverse: dict[str, Any] = {"restore_facts": old_facts}
     if question_id:
         inverse["delete_question_ids"] = [question_id]
-    return fact_ids, inverse
+    return stable_unique(touched_fact_ids), inverse
 
 
 def apply_entity_merge(
@@ -2024,20 +2042,28 @@ def apply_entity_merge(
             for row in denorm_rows
         ],
     }
-
+    denorm_fact_ids = {str(row["id"]) for row in denorm_rows}
+    touched_fact_ids: list[str] = []
+    source_id_set = set(source_ids)
+    for fact_id in affected_fact_ids:
+        revised_links = [
+            {
+                **link,
+                "entity_id": canonical_id
+                if str(link.get("entity_id") or "") in source_id_set
+                else link.get("entity_id"),
+            }
+            for link in stored_fact_entity_links(conn, fact_id)
+        ]
+        touched, fragment = revise_stored_fact(
+            conn,
+            fact_id,
+            {"entity_id": canonical_id} if fact_id in denorm_fact_ids else {},
+            entity_links=revised_links,
+        )
+        touched_fact_ids.extend(touched)
+        merge_fact_inverse(inverse, fragment)
     placeholders = ",".join("?" for _ in source_ids)
-    conn.execute(
-        f"UPDATE fact_entities SET entity_id = ? WHERE entity_id IN ({placeholders})",
-        [canonical_id, *source_ids],
-    )
-    conn.execute(
-        f"""
-        UPDATE facts
-        SET entity_id = ?
-        WHERE entity_id IN ({placeholders})
-        """,
-        [canonical_id, *source_ids],
-    )
     canonical_updates = merged_canonical_entity_updates(
         canonical,
         [entity_rows[source_id] for source_id in source_ids],
@@ -2060,18 +2086,83 @@ def apply_entity_merge(
         [canonical_id, *source_ids],
     )
     rebuild_fact_retrieval_index(conn)
-    return affected_fact_ids, inverse
+    return stable_unique(touched_fact_ids), inverse
 
 
 def apply_entity_split(
     conn: Any, payload: dict[str, Any]
 ) -> tuple[list[str], dict[str, Any]]:
+    from .wiki_facts import rebuild_fact_retrieval_index
+
     restore_payload = entity_split_restore_payload(payload)
     if not entity_restore_payload_has_content(restore_payload):
         raise ValueError("entity_split requires merge_inverse or restore_* payload")
-    inverse = capture_entity_restore_state(conn, restore_payload)
-    affected_fact_ids = restore_entity_merge_inverse(conn, restore_payload)
-    return affected_fact_ids, inverse
+    desired_entities = [
+        row
+        for row in restore_payload.get("restore_entities") or []
+        if isinstance(row, dict)
+    ]
+    desired_facts = {
+        str(row.get("id")): row
+        for row in restore_payload.get("restore_facts") or []
+        if isinstance(row, dict) and row.get("id")
+    }
+    desired_entity_ids = {
+        str(row.get("fact_id")): row.get("entity_id")
+        for row in restore_payload.get("restore_fact_entity_denorms") or []
+        if isinstance(row, dict) and row.get("fact_id")
+    }
+    desired_links: dict[str, list[dict[str, Any]]] = {}
+    for restore in restore_payload.get("restore_revision_head_links") or []:
+        if isinstance(restore, dict) and restore.get("fact_id"):
+            desired_links[str(restore["fact_id"])] = list(restore.get("links") or [])
+    versioned_link_fact_ids = set(desired_links)
+    for row in restore_payload.get("restore_fact_entity_links") or []:
+        if not isinstance(row, dict) or not row.get("fact_id"):
+            continue
+        fact_id = str(row["fact_id"])
+        if fact_id in versioned_link_fact_ids:
+            continue
+        mention_span = row.get("mention_span")
+        desired_links.setdefault(fact_id, []).append(
+            {
+                **row,
+                "mention_span": loads(mention_span, None)
+                if isinstance(mention_span, str)
+                else mention_span,
+            }
+        )
+    fact_ids = stable_unique([*desired_facts, *desired_entity_ids, *desired_links])
+    entity_ids = [str(row.get("id") or "") for row in desired_entities]
+    inverse: dict[str, Any] = {
+        "restore_entities": [
+            dict(row) for row in entity_rows_by_id(conn, entity_ids).values()
+        ]
+    }
+    touched_fact_ids: list[str] = []
+    for fact_id in fact_ids:
+        desired_fact = desired_facts.get(fact_id) or {}
+        updates = (
+            {"entity_id": desired_fact.get("entity_id")}
+            if "entity_id" in desired_fact
+            else (
+                {"entity_id": desired_entity_ids[fact_id]}
+                if fact_id in desired_entity_ids
+                else {}
+            )
+        )
+        touched, fragment = revise_stored_fact(
+            conn,
+            fact_id,
+            updates,
+            entity_links=desired_links.get(fact_id),
+        )
+        touched_fact_ids.extend(touched)
+        merge_fact_inverse(inverse, fragment)
+    for row in desired_entities:
+        restore_entity_row(conn, row)
+    rebuild_fact_retrieval_index(conn)
+    return stable_unique(touched_fact_ids), inverse
 
 
 def entity_merge_source_ids(payload: dict[str, Any], canonical_id: str) -> list[str]:
@@ -2131,30 +2222,14 @@ def fact_entity_rows_for_entity_ids(conn: Any, entity_ids: list[str]) -> list[An
     return list(
         conn.execute(
             f"""
-            SELECT *
-            FROM fact_entities
-            WHERE entity_id IN ({placeholders})
-            ORDER BY fact_id, is_primary DESC, id
+            SELECT fe.*
+            FROM fact_entities fe
+            JOIN facts f ON f.id = fe.fact_id
+            WHERE fe.entity_id IN ({placeholders})
+              AND f.knowledge_to IS NULL
+            ORDER BY fe.fact_id, fe.is_primary DESC, fe.id
             """,
             entity_ids,
-        )
-    )
-
-
-def fact_entity_rows_for_link_ids(conn: Any, link_ids: list[str]) -> list[Any]:
-    link_ids = stable_unique(link_ids)
-    if not link_ids:
-        return []
-    placeholders = ",".join("?" for _ in link_ids)
-    return list(
-        conn.execute(
-            f"""
-            SELECT *
-            FROM fact_entities
-            WHERE id IN ({placeholders})
-            ORDER BY fact_id, is_primary DESC, id
-            """,
-            link_ids,
         )
     )
 
@@ -2170,27 +2245,10 @@ def fact_denorm_rows_for_entity_ids(conn: Any, entity_ids: list[str]) -> list[An
             SELECT id, entity_id
             FROM facts
             WHERE entity_id IN ({placeholders})
+              AND knowledge_to IS NULL
             ORDER BY id
             """,
             entity_ids,
-        )
-    )
-
-
-def fact_denorm_rows_for_fact_ids(conn: Any, fact_ids: list[str]) -> list[Any]:
-    fact_ids = stable_unique(fact_ids)
-    if not fact_ids:
-        return []
-    placeholders = ",".join("?" for _ in fact_ids)
-    return list(
-        conn.execute(
-            f"""
-            SELECT id, entity_id
-            FROM facts
-            WHERE id IN ({placeholders})
-            ORDER BY id
-            """,
-            fact_ids,
         )
     )
 
@@ -2264,38 +2322,6 @@ def entity_restore_payload_has_content(payload: dict[str, Any]) -> bool:
     )
 
 
-def capture_entity_restore_state(
-    conn: Any, restore_payload: dict[str, Any]
-) -> dict[str, Any]:
-    entity_ids = [
-        str(row.get("id") or "")
-        for row in restore_payload.get("restore_entities") or []
-        if isinstance(row, dict) and row.get("id")
-    ]
-    link_ids = [
-        str(row.get("id") or "")
-        for row in restore_payload.get("restore_fact_entity_links") or []
-        if isinstance(row, dict) and row.get("id")
-    ]
-    fact_ids = [
-        str(row.get("fact_id") or "")
-        for row in restore_payload.get("restore_fact_entity_denorms") or []
-        if isinstance(row, dict) and row.get("fact_id")
-    ]
-    return {
-        "restore_entities": [
-            dict(row) for row in entity_rows_by_id(conn, entity_ids).values()
-        ],
-        "restore_fact_entity_links": [
-            dict(row) for row in fact_entity_rows_for_link_ids(conn, link_ids)
-        ],
-        "restore_fact_entity_denorms": [
-            {"fact_id": str(row["id"]), "entity_id": row["entity_id"]}
-            for row in fact_denorm_rows_for_fact_ids(conn, fact_ids)
-        ],
-    }
-
-
 def restore_entity_merge_inverse(conn: Any, inverse: dict[str, Any]) -> list[str]:
     from .wiki_facts import rebuild_fact_retrieval_index
 
@@ -2314,24 +2340,31 @@ def restore_entity_merge_inverse(conn: Any, inverse: dict[str, Any]) -> list[str
     ]
     for row in entity_rows:
         restore_entity_row(conn, row)
-    for row in link_rows:
-        restore_fact_entity_link(conn, row)
-    affected_fact_ids: list[str] = []
-    for row in denorm_rows:
-        fact_id = str(row.get("fact_id") or "")
-        if not fact_id:
-            continue
-        conn.execute(
-            "UPDATE facts SET entity_id = ? WHERE id = ?",
-            (row.get("entity_id"), fact_id),
-        )
-        affected_fact_ids.append(fact_id)
     affected_fact_ids = stable_unique(
         [
-            *affected_fact_ids,
+            *[str(row.get("fact_id") or "") for row in denorm_rows],
             *[str(row.get("fact_id") or "") for row in link_rows],
         ]
     )
+    if not inverse.get("restore_facts"):
+        for fact_id in affected_fact_ids:
+            links = [
+                {
+                    **row,
+                    "mention_span": loads(row.get("mention_span"), None)
+                    if isinstance(row.get("mention_span"), str)
+                    else row.get("mention_span"),
+                }
+                for row in link_rows
+                if str(row.get("fact_id")) == fact_id
+            ]
+            if links:
+                replace_fact_entity_links(conn, fact_id=fact_id, links=links)
+        for row in denorm_rows:
+            conn.execute(
+                "UPDATE facts SET entity_id = ? WHERE id = ? AND knowledge_to IS NULL",
+                (row.get("entity_id"), row.get("fact_id")),
+            )
     rebuild_fact_retrieval_index(conn)
     return affected_fact_ids
 
@@ -2371,47 +2404,6 @@ def restore_entity_row(conn: Any, row: dict[str, Any]) -> None:
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (entity_id, *values),
-    )
-
-
-def restore_fact_entity_link(conn: Any, row: dict[str, Any]) -> None:
-    link_id = str(row.get("id") or "")
-    if not link_id:
-        return
-    existing = conn.execute(
-        "SELECT 1 FROM fact_entities WHERE id = ?", (link_id,)
-    ).fetchone()
-    values = (
-        row.get("fact_id"),
-        row.get("entity_id"),
-        1 if row.get("is_primary") else 0,
-        row.get("mention_text"),
-        row.get("mention_span"),
-        row.get("mention_kind"),
-        row.get("resolution_method"),
-        row.get("confidence"),
-        row.get("created_at") or now_iso(),
-    )
-    if existing:
-        conn.execute(
-            """
-            UPDATE fact_entities
-            SET fact_id = ?, entity_id = ?, is_primary = ?, mention_text = ?,
-                mention_span = ?, mention_kind = ?, resolution_method = ?,
-                confidence = ?, created_at = ?
-            WHERE id = ?
-            """,
-            (*values, link_id),
-        )
-        return
-    conn.execute(
-        """
-        INSERT INTO fact_entities(
-          id, fact_id, entity_id, is_primary, mention_text, mention_span,
-          mention_kind, resolution_method, confidence, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (link_id, *values),
     )
 
 
@@ -2670,7 +2662,7 @@ def apply_rename_page(
         """
         UPDATE facts
         SET page_hint = ?, metadata = ?, last_seen_at = ?
-        WHERE page_hint = ?
+        WHERE page_hint = ? AND knowledge_to IS NULL
         """,
         (
             destination,
@@ -2804,6 +2796,7 @@ def facts_for_page_hints(
             SELECT *
             FROM facts
             WHERE page_hint IN ({page_placeholders})
+              AND knowledge_to IS NULL
             {status_clause}
             ORDER BY page_hint, id
             """,
@@ -2946,16 +2939,24 @@ def apply_inverse(conn: Any, inverse: dict[str, Any]) -> None:
     for fact_id in inverse.get("delete_fact_ids") or []:
         conn.execute("DELETE FROM facts WHERE id = ?", (fact_id,))
     for fact in inverse.get("restore_facts") or []:
-        apply_fact_upsert(conn, {"fact": fact})
+        apply_fact_upsert(conn, {"fact": fact}, record_revision=False)
     if inverse.get("restore_fact"):
-        apply_fact_upsert(conn, {"fact": inverse["restore_fact"]})
+        apply_fact_upsert(
+            conn, {"fact": inverse["restore_fact"]}, record_revision=False
+        )
+    for restore in inverse.get("restore_revision_head_links") or []:
+        replace_fact_entity_links(
+            conn,
+            fact_id=str(restore.get("fact_id") or ""),
+            links=restore.get("links") or [],
+        )
     for routing in inverse.get("restore_fact_routing") or []:
         conn.execute(
             """
             UPDATE facts
             SET page_hint = ?, entity_key = ?, section_hint = ?,
                 metadata = COALESCE(?, metadata), last_seen_at = ?
-            WHERE id = ?
+            WHERE id = ? AND knowledge_to IS NULL
             """,
             (
                 routing.get("old_page_hint"),

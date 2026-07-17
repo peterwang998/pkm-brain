@@ -1,7 +1,7 @@
 # PKM Brain Documentation
 
 **Status:** authoritative docs index
-**Last verified:** 2026-07-14 against the current Gmail operational mirror and completed encrypted 90-day Gmail archive; owner content review and promotion remain pending
+**Last verified:** 2026-07-16 against the unpromoted temporal-cognition working tree based on rollback commit `d5405b9`; the parity-first Brain v2 contract targets migrations 22-24 and extractor v12, with no live migration, backfill, or promotion
 
 Current requirements are organized by product feature, not implementation stream. Start with Product Foundation, then read the owning feature spec for the behavior being changed.
 
@@ -27,6 +27,7 @@ Current requirements are organized by product feature, not implementation stream
 - [Project Audit - 2026-07-10](audits/project-audit-2026-07-10.md): current risks and evidence.
 - [Project Implementation Plan](plans/project-implementation-plan.md): canonical roadmap, prioritized releases, work packages, dependencies, and acceptance hits.
 - [Chief-of-Staff Operations Implementation Plan](plans/chief-of-staff-operations-implementation-plan.md): Calendar-first operational rollout, reconciliation gates, and guarded-execution sequence.
+- [Temporal Cognition Implementation Plan](plans/temporal-cognition-implementation-plan.md): parity-first fact extraction, universal source/knowledge clocks, optional predicate validity, one event-centered time shape, retrieval compatibility, rollout, and rollback.
 - [Project Improvement Plan](plans/project-improvement-plan.md): compatibility pointer retained for old links.
 
 ## History

@@ -79,13 +79,43 @@ def test_mcp_proxy_read_only_fallback_does_not_record_retrieval_events(tmp_path:
 
     result = BrainMCPProxy(str(paths.home), auto_launch=False).call_tool(
         "retrieve_context",
-        {"task": "find context while app is down", "project": "pkm-brain"},
+        {
+            "task": "find context while app is down",
+            "project": "pkm-brain",
+            "valid_as_of": "2026-06-01",
+            "event_as_of": "2026-06-15",
+            "event_kind": "actual",
+        },
     )
 
     assert result["retrieval_event_id"] is None
+    assert result["temporal"]["mode"] == "valid"
+    assert result["temporal"]["valid_as_of"].startswith("2026-06-01T23:59:59")
+    assert result["temporal"]["event_as_of"] == "2026-06-15"
+    assert result["temporal"]["event_kind"] == "actual"
     with connection(paths.sqlite_path) as conn:
         count = conn.execute("SELECT COUNT(*) FROM retrieval_events").fetchone()[0]
     assert count == 0
+
+
+def test_mcp_proxy_propagates_knowledge_time_request(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+
+    result = BrainMCPProxy(str(paths.home), auto_launch=False).call_tool(
+        "retrieve_context",
+        {
+            "task": "find prior context while app is down",
+            "known_as_of": "2026-05-01",
+            "temporal_mode": "known",
+        },
+    )
+
+    assert result["temporal"]["mode"] == "known"
+    assert result["temporal"]["known_as_of"].startswith(
+        "2026-05-01T23:59:59"
+    )
+    assert result["supporting_chunks"] == []
 
 
 def test_mcp_proxy_read_only_fallback_declines_writes(tmp_path: Path) -> None:

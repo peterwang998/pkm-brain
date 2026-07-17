@@ -69,6 +69,11 @@ def call_mcp_tool(service: BrainService, tool_name: str, payload: dict[str, Any]
         return service.retrieve_context(
             task=str(payload.get("task") or ""),
             project=payload.get("project"),
+            valid_as_of=payload.get("valid_as_of"),
+            known_as_of=payload.get("known_as_of"),
+            event_as_of=payload.get("event_as_of"),
+            event_kind=payload.get("event_kind"),
+            temporal_mode=payload.get("temporal_mode"),
         )
     if tool_name == "record_context_feedback":
         return service.record_context_feedback(

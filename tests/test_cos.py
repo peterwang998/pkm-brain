@@ -12,7 +12,11 @@ from pkm_brain.cos_actions import (
     ACTION_TYPE_SPECS,
     apply_action,
     apply_decided_action,
+    apply_display_contested,
+    apply_fact_merge,
+    apply_fact_updates,
     critic_prompt,
+    critic_named_entity_context,
     decide_action,
     get_action,
     mark_action_residue,
@@ -41,17 +45,21 @@ from pkm_brain.extraction import (
     extraction_prompt,
     extract_recent_documents,
     normalized_extraction_content,
+    recent_source_cards,
     record_critic_block_rate_anomalies,
     reclaim_unrouted_facts,
     reconcile_fact_conflict_reviews,
     resolver_precheck_conflict,
+    structured_source_event_candidate,
     validate_extraction_payload,
     validate_extracted_facts,
     validate_extracted_facts_with_report,
 )
 from pkm_brain.llm import LLMProviderError, role_env
+from pkm_brain.numeric_faithfulness import extract_numeric_mentions
 from pkm_brain.paths import BrainPaths
 from pkm_brain.service import BrainService
+from pkm_brain.temporal import TemporalRetrievalRequest
 
 
 def service_for(tmp_path: Path) -> BrainService:
@@ -79,6 +87,15 @@ def test_extraction_prompt_requires_direct_entailment_for_clean_facts() -> None:
     assert "do not join it with an unsupported inference" in prompt
     assert "Preserve uncertainty and negation" in prompt
     assert "document coherence is a preference, not an absolute rule" in prompt
+    assert "Temporal enrichment is optional" in prompt
+    assert "Include one event_time object only" in prompt
+    assert "Invalid or absent time must not suppress a fact" not in prompt
+    assert "durable named event is an entity with type='event'" in prompt
+    assert "Use claim_class=factual_update" in prompt
+    assert "deadline is not predicate validity" in prompt
+    assert "Unsupported temporal enrichment will be discarded" in prompt
+    assert "return every distinct durable" in prompt
+    assert "Missing or uncertain time is never a reason to omit" in prompt
 
 
 def test_evidence_units_propagate_speaker_identity_across_sentences() -> None:
@@ -275,6 +292,49 @@ def test_document_route_coherence_does_not_force_split_document_topics() -> None
     }
 
     routed = apply_document_route_coherence([*candidates, uncertain], route_targets)
+
+    assert routed[-1]["page_hint"] == "concepts/extracted-facts.md"
+
+
+def test_document_route_coherence_does_not_override_routable_named_topic() -> None:
+    route_targets = {
+        page_hint: {
+            "page_hint": page_hint,
+            "canonical_entity": page_hint.removeprefix("projects/").removesuffix(
+                ".md"
+            ),
+            "page_scope": page_hint,
+            "retrieval_purpose": page_hint,
+        }
+        for page_hint in ("projects/juicebox.md", "projects/sierra.md")
+    }
+    siblings = [
+        {
+            "statement": f"Juicebox recruiting detail {index}.",
+            "page_hint": "projects/juicebox.md",
+            "section_hint": "Summary",
+            "routing_confidence": 0.95,
+            "metadata": {"routing": {"route_destination_valid": True}},
+        }
+        for index in range(3)
+    ]
+    uncertain = {
+        "statement": "A participant accepted an agent PM role at Sierra.",
+        "page_hint": "concepts/extracted-facts.md",
+        "section_hint": "Summary",
+        "routing_confidence": 0.3,
+        "entity_mentions": [
+            {
+                "surface": "Sierra",
+                "mention_kind": "named",
+                "entity_type": "organization",
+                "is_primary": False,
+            }
+        ],
+        "metadata": {"routing": {"route_destination_valid": False}},
+    }
+
+    routed = apply_document_route_coherence([*siblings, uncertain], route_targets)
 
     assert routed[-1]["page_hint"] == "concepts/extracted-facts.md"
 
@@ -829,6 +889,208 @@ def test_fact_upsert_revert_round_trip_and_drift_refusal(tmp_path: Path) -> None
     assert residue["kind"] == "revert_drift"
 
 
+def test_fact_upsert_copy_before_write_preserves_knowledge_history_and_reverts(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    initial = propose_action(
+        svc.paths,
+        "fact_upsert",
+        action_payload={
+            "fact": {
+                "id": "fact_revision_head",
+                "statement": "Atlas is in beta.",
+                "entity_key": "project:atlas:phase",
+                "page_hint": "projects/atlas.md",
+                "section_hint": "Status",
+                "source_ids": ["document:initial"],
+                "confidence": 0.9,
+                "temporal_kind": "ongoing",
+                "valid_from": "2026-03-01",
+                "valid_time_precision": "day",
+            }
+        },
+        action_features={"reversible": True},
+    )
+    apply_action(svc.paths, initial["id"])
+    revision = propose_action(
+        svc.paths,
+        "fact_upsert",
+        action_payload={
+            "fact": {
+                "id": "fact_revision_head",
+                "statement": "Atlas is generally available.",
+                "entity_key": "project:atlas:phase",
+                "page_hint": "projects/atlas.md",
+                "section_hint": "Status",
+                "source_ids": ["document:revision"],
+                "confidence": 0.95,
+                "temporal_kind": "ongoing",
+                "valid_from": "2026-04-01",
+                "valid_time_precision": "day",
+            }
+        },
+        action_features={"reversible": True},
+        target_fact_ids=["fact_revision_head"],
+    )
+
+    applied = apply_action(svc.paths, revision["id"])
+
+    with connection(svc.paths.sqlite_path) as conn:
+        rows = list(
+            conn.execute(
+                """
+                SELECT id, statement, status, revision_status, knowledge_to,
+                       assertion_lineage_id, revision_of_id, revision_number,
+                       created_at
+                FROM facts
+                WHERE assertion_lineage_id = 'fact_revision_head'
+                ORDER BY revision_number, status
+                """
+            )
+        )
+    assert len(rows) == 2
+    history = next(row for row in rows if row["status"] == "revision_closed")
+    head = next(row for row in rows if row["id"] == "fact_revision_head")
+    assert history["statement"] == "Atlas is in beta."
+    assert history["revision_status"] == "active"
+    assert history["knowledge_to"] is not None
+    assert head["statement"] == "Atlas is generally available."
+    assert head["revision_of_id"] == history["id"]
+    assert head["revision_number"] == 2
+    assert set(applied["target_fact_ids"]) == {
+        "fact_revision_head",
+        history["id"],
+    }
+
+    before_revision = TemporalRetrievalRequest.resolve(
+        "ignored", known_as_of=history["created_at"]
+    )
+    after_revision = TemporalRetrievalRequest.resolve(
+        "ignored", known_as_of=head["created_at"]
+    )
+    assert [
+        fact["statement"]
+        for fact in svc.search_facts("Atlas beta", temporal_request=before_revision)
+    ] == ["Atlas is in beta."]
+    assert (
+        svc.search_facts("Atlas generally available", temporal_request=before_revision)
+        == []
+    )
+    assert [
+        fact["statement"]
+        for fact in svc.search_facts(
+            "Atlas generally available", temporal_request=after_revision
+        )
+    ] == ["Atlas is generally available."]
+
+    reverted = revert_action(svc.paths, revision["id"])
+
+    assert reverted["status"] == "reverted"
+    with connection(svc.paths.sqlite_path) as conn:
+        restored = list(
+            conn.execute(
+                """
+                SELECT id, statement, status, knowledge_to, revision_number
+                FROM facts
+                WHERE assertion_lineage_id = 'fact_revision_head'
+                """
+            )
+        )
+    assert [dict(row) for row in restored] == [
+        {
+            "id": "fact_revision_head",
+            "statement": "Atlas is in beta.",
+            "status": "active",
+            "knowledge_to": None,
+            "revision_number": 1,
+        }
+    ]
+
+
+def test_multi_fact_actions_reject_duplicate_revision_targets(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+
+    with connection(svc.paths.sqlite_path) as conn:
+        with pytest.raises(ValueError, match="distinct fact_ids"):
+            apply_fact_updates(
+                conn,
+                {
+                    "updates": [
+                        {"fact_id": "fact_same", "status": "active"},
+                        {"fact_id": "fact_same", "status": "superseded"},
+                    ]
+                },
+            )
+        with pytest.raises(ValueError, match="keeper cannot supersede itself"):
+            apply_fact_merge(
+                conn,
+                {
+                    "keeper_fact": {"id": "fact_same"},
+                    "superseded_fact_ids": ["fact_same"],
+                },
+            )
+        with pytest.raises(ValueError, match="distinct fact_ids"):
+            apply_display_contested(
+                conn,
+                {"fact_ids": ["fact_same", "fact_same"]},
+                "action_duplicate_targets",
+            )
+
+
+def test_fact_merge_rejects_planned_and_actual_event_identity(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    with connection(svc.paths.sqlite_path) as conn:
+        event = resolve_entity(
+            conn,
+            "Atlas Launch",
+            type_hint="event",
+            mention_kind="named",
+        )
+        assert event is not None
+    for fact_id, kind in (("fact_launch_planned", "planned"), ("fact_launch_actual", "actual")):
+        action = propose_action(
+            svc.paths,
+            "fact_upsert",
+            action_payload={
+                "fact": {
+                    "id": fact_id,
+                    "statement": f"Atlas Launch is {kind} for May 1.",
+                    "entity_key": "events:atlas-launch:summary",
+                    "entity_id": event.entity_id,
+                    "entity_mention": "Atlas Launch",
+                    "entity_type": "event",
+                    "page_hint": "events/atlas-launch.md",
+                    "section_hint": "Summary",
+                    "source_ids": [f"manual:{fact_id}"],
+                    "confidence": 0.9,
+                    "event_time": {
+                        "kind": kind,
+                        "start_at": "2026-05-01",
+                        "end_at": None,
+                        "precision": "day",
+                        "expression": "May 1",
+                    },
+                }
+            },
+            action_features={"reversible": True},
+        )
+        apply_action(svc.paths, action["id"])
+
+    with connection(svc.paths.sqlite_path) as conn:
+        with pytest.raises(ValueError, match="temporally compatible"):
+            apply_fact_merge(
+                conn,
+                {
+                    "keeper_fact": {"id": "fact_launch_actual"},
+                    "superseded_fact_ids": ["fact_launch_planned"],
+                },
+            )
+
+
 def test_repair_refused_fact_audit_revert_restores_reviewable_action(
     tmp_path: Path,
 ) -> None:
@@ -981,6 +1243,19 @@ def test_page_merge_apply_and_revert_round_trip(tmp_path: Path) -> None:
         "Right fact.",
         page_hint="concepts/alpha-payments.md",
     )
+    apply_action(
+        svc.paths,
+        propose_action(
+            svc.paths,
+            "fact_upsert",
+            action_payload={
+                "fact": {
+                    "id": "fact_merge_left",
+                    "statement": "Left fact, revised.",
+                }
+            },
+        )["id"],
+    )
     insert_test_contract(svc.paths, "contract_left", "concepts/alpha-payment.md")
     action = propose_action(
         svc.paths,
@@ -1008,7 +1283,18 @@ def test_page_merge_apply_and_revert_round_trip(tmp_path: Path) -> None:
         contract = conn.execute(
             "SELECT status FROM page_contracts WHERE id = 'contract_left'"
         ).fetchone()
+        revision_pages = conn.execute(
+            """
+            SELECT page_hint FROM facts
+            WHERE assertion_lineage_id = 'fact_merge_left'
+            ORDER BY revision_number
+            """
+        ).fetchall()
     assert left["page_hint"] == "concepts/alpha-payments.md"
+    assert [row["page_hint"] for row in revision_pages] == [
+        "concepts/alpha-payment.md",
+        "concepts/alpha-payments.md",
+    ]
     assert contract["status"] == "superseded"
 
     reverted = revert_action(svc.paths, action["id"])
@@ -1194,7 +1480,7 @@ def test_extraction_watermark_skips_unchanged_document(tmp_path: Path) -> None:
         )
 
 
-def test_extraction_accepts_v5_watermark_without_global_rebuild(
+def test_extraction_v12_revisits_previous_success_watermark(
     tmp_path: Path,
 ) -> None:
     svc = service_for(tmp_path)
@@ -1207,13 +1493,41 @@ def test_extraction_accepts_v5_watermark_without_global_rebuild(
     with connection(svc.paths.sqlite_path) as conn:
         conn.execute(
             "UPDATE cos_stage_watermarks SET prompt_version = ?",
-            ("extractor-evidence-units-v5",),
+            ("extractor-evidence-units-v10-coverage-recovery",),
         )
 
     second = extract_recent_documents(svc.paths, shadow=True, llm_provider=provider)
 
     assert len(first["documents"]) == 1
-    assert second["documents"] == []
+    assert len(second["documents"]) == 1
+    assert provider.calls == 2
+
+
+def test_extraction_revisits_compatible_prompt_empty_watermark(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "source.md"
+    note.write_text("# Source\n\nWatermarked extraction marker.", encoding="utf-8")
+    svc.ingest()
+    empty_provider = EmptyExtractorProvider()
+    first = extract_recent_documents(
+        svc.paths, shadow=True, llm_provider=empty_provider
+    )
+    with connection(svc.paths.sqlite_path) as conn:
+        conn.execute(
+            "UPDATE cos_stage_watermarks SET prompt_version = ?",
+            ("extractor-evidence-units-v9-comprehensive-temporal",),
+        )
+
+    provider = FakeExtractorProvider()
+    second = extract_recent_documents(svc.paths, shadow=True, llm_provider=provider)
+
+    assert first["candidates"] == []
+    assert second["candidates"][0]["statement"] == (
+        "Watermarked extraction marker is present."
+    )
     assert provider.calls == 1
 
 
@@ -1244,6 +1558,73 @@ def test_extraction_retries_semantically_invalid_response(tmp_path: Path) -> Non
     assert provider.calls == 2
 
 
+def test_extraction_retries_empty_substantive_window_for_coverage(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "source.md"
+    note.write_text(
+        "# Source\n\n" + ("Substantive coverage marker. " * 250),
+        encoding="utf-8",
+    )
+    svc.ingest()
+    provider = EmptyThenCoverageExtractorProvider()
+
+    result = extract_recent_documents(svc.paths, shadow=True, llm_provider=provider)
+
+    validation = result["document_validations"][0]["windows"][0]
+    assert provider.calls == 2
+    assert result["candidates"][0]["statement"] == (
+        "Substantive coverage marker is present."
+    )
+    assert validation["coverage_retry_count"] == 1
+    assert validation["attempts"][0]["retry_reason"] == (
+        "substantive_window_returned_empty"
+    )
+    assert validation["attempts"][1]["accepted_count"] == 1
+
+
+def test_extraction_accepts_empty_short_window_without_coverage_retry(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "source.md"
+    note.write_text("# Source\n\nShort social aside.", encoding="utf-8")
+    svc.ingest()
+    provider = EmptyExtractorProvider()
+
+    result = extract_recent_documents(svc.paths, shadow=True, llm_provider=provider)
+
+    assert provider.calls == 1
+    assert result["candidates"] == []
+    assert result["document_validations"][0]["windows"][0][
+        "coverage_retry_count"
+    ] == 0
+
+
+def test_extraction_records_only_the_retry_that_actually_ran(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "source.md"
+    note.write_text(
+        "# Source\n\n" + ("No durable coverage result. " * 250),
+        encoding="utf-8",
+    )
+    svc.ingest()
+    provider = EmptyExtractorProvider()
+
+    result = extract_recent_documents(svc.paths, shadow=True, llm_provider=provider)
+
+    validation = result["document_validations"][0]["windows"][0]
+    assert provider.calls == 2
+    assert validation["coverage_retry_count"] == 1
+    assert "retry_reason" not in validation["attempts"][1]
+
+
 def test_extraction_does_not_mark_all_invalid_batch_ok(tmp_path: Path) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()
@@ -1264,6 +1645,44 @@ def test_extraction_does_not_mark_all_invalid_batch_ok(tmp_path: Path) -> None:
         ).fetchone()
     assert watermark["status"] == "invalid"
     assert json.loads(watermark["metadata"])["validation"]["rejected_count"] == 1
+
+
+def test_extraction_partial_success_is_terminal_and_legacy_invalid_does_not_replay(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "source.md"
+    note.write_text(
+        "# Source\n\nWatermarked extraction marker. "
+        "Alex expects probably sixty seven hours a week of work.",
+        encoding="utf-8",
+    )
+    svc.ingest()
+    provider = PartialValidExtractorProvider()
+
+    first = extract_recent_documents(svc.paths, shadow=True, llm_provider=provider)
+    second = extract_recent_documents(svc.paths, shadow=True, llm_provider=provider)
+
+    assert len(first["candidates"]) == 1
+    assert first["validation"]["rejected_count"] == 1
+    assert second["documents"] == []
+    assert provider.calls == 1
+    with connection(svc.paths.sqlite_path) as conn:
+        watermark = conn.execute(
+            "SELECT status FROM cos_stage_watermarks WHERE stage = 'extractor'"
+        ).fetchone()
+        assert watermark["status"] == "ok_with_rejections"
+        conn.execute(
+            "UPDATE cos_stage_watermarks SET status = 'invalid' WHERE stage = 'extractor'"
+        )
+
+    legacy_second = extract_recent_documents(
+        svc.paths, shadow=True, llm_provider=provider
+    )
+
+    assert legacy_second["documents"] == []
+    assert provider.calls == 1
 
 
 def test_extraction_isolates_malformed_provider_response(tmp_path: Path) -> None:
@@ -1573,7 +1992,12 @@ def test_extraction_reference_page_hint_becomes_unrouted_residue(
         page_hint="wiki/references/agent_session_log/reference-route.md",
     )
 
-    result = extract_recent_documents(svc.paths, shadow=False, llm_provider=provider)
+    result = extract_recent_documents(
+        svc.paths,
+        shadow=False,
+        llm_provider=provider,
+        run_id="cosrun_extraction_complete",
+    )
 
     assert result["status"] == "ok"
     assert result["candidates"][0]["page_hint"] == "concepts/extracted-facts.md"
@@ -1618,7 +2042,12 @@ def test_extraction_normalizes_wiki_prefix_for_canonical_route(
         page_hint="wiki/projects/databridge.md",
     )
 
-    result = extract_recent_documents(svc.paths, shadow=False, llm_provider=provider)
+    result = extract_recent_documents(
+        svc.paths,
+        shadow=False,
+        llm_provider=provider,
+        run_id="cosrun_extraction_complete",
+    )
 
     assert result["status"] == "ok"
     assert result["candidates"][0]["page_hint"] == "projects/databridge.md"
@@ -1626,7 +2055,13 @@ def test_extraction_normalizes_wiki_prefix_for_canonical_route(
     assert result["actions"][0]["status"] == "auto_applied"
     with connection(svc.paths.sqlite_path) as conn:
         fact = conn.execute("SELECT page_hint FROM facts").fetchone()
+        run = conn.execute(
+            "SELECT status, summary FROM wiki_curation_runs WHERE id = ?",
+            ("cosrun_extraction_complete",),
+        ).fetchone()
     assert fact["page_hint"] == "projects/databridge.md"
+    assert run["status"] == "complete"
+    assert json.loads(run["summary"])["action_count"] == 1
 
 
 def test_extraction_fuzzy_snaps_near_duplicate_canonical_route(
@@ -1828,6 +2263,349 @@ def test_llm_extraction_requires_explicit_confidence_fields(tmp_path: Path) -> N
         "missing truth_confidence",
     }.issubset(set(missing["rejections"][0]["reasons"]))
     assert accepted["accepted_count"] == 1
+    assert accepted["candidates"][0]["event_time"] is None
+
+
+def test_invalid_optional_predicate_validity_is_stripped_without_rejecting_fact(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "source.md"
+    note.write_text(
+        "# Source\n\nAtlas was in beta from March 1 to April 1, 2026.",
+        encoding="utf-8",
+    )
+    svc.ingest()
+    with connection(svc.paths.sqlite_path) as conn:
+        chunk = conn.execute("SELECT id, text FROM chunks LIMIT 1").fetchone()
+    base = {
+        "statement": "Atlas was in beta from March 1 to April 1, 2026.",
+        "chunk_id": chunk["id"],
+        "evidence_unit_ids": evidence_unit_ids_containing(chunk["text"], "Atlas"),
+        "claim_class": "project_state",
+        **valid_extraction_confidences(),
+        "temporal_kind": "time_bound",
+        "valid_from": "2026-03-01",
+        "valid_to": "2026-04-01",
+        "valid_time_precision": "day",
+        "temporal_confidence": 0.95,
+    }
+
+    accepted = validate_extraction_payload(
+        svc.paths,
+        {
+            "facts": [
+                {
+                    **base,
+                    "temporal_expression": "from March 1 to April 1, 2026",
+                    "observed_at": "2099-01-01T00:00:00+00:00",
+                }
+            ]
+        },
+    )
+    stripped = validate_extraction_payload(
+        svc.paths,
+        {"facts": [{**base, "temporal_expression": "during February 2026"}]},
+    )
+
+    assert accepted["accepted_count"] == 1
+    assert accepted["candidates"][0]["valid_from"] == "2026-03-01"
+    assert accepted["candidates"][0]["effective_at"] == "2026-03-01"
+    assert accepted["candidates"][0]["observed_at"] is None
+    assert stripped["accepted_count"] == 1
+    assert stripped["candidates"][0]["valid_from"] is None
+    assert stripped["candidates"][0]["temporal_kind"] == "unknown"
+    assert stripped["temporal_enrichment_warning_count"] == 1
+    assert (
+        "temporal_expression is not present in cited evidence"
+        in stripped["temporal_enrichment_warnings"][0]["reasons"]
+    )
+
+
+def test_event_time_requires_primary_event_but_never_rejects_base_fact(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "source.md"
+    note.write_text(
+        "# Source\n\nAtlas Launch is planned for May 2026.", encoding="utf-8"
+    )
+    svc.ingest()
+    with connection(svc.paths.sqlite_path) as conn:
+        chunk = conn.execute("SELECT id, text FROM chunks LIMIT 1").fetchone()
+    base = {
+        "statement": "Atlas Launch is planned for May 2026.",
+        "chunk_id": chunk["id"],
+        "evidence_unit_ids": evidence_unit_ids_containing(chunk["text"], "Atlas"),
+        "claim_class": "factual_update",
+        **valid_extraction_confidences(),
+        "event_time": {
+            "kind": "planned",
+            "start_at": "2026-05",
+            "end_at": "2026-06",
+            "precision": "month",
+            "expression": "May 2026",
+        },
+    }
+    event = validate_extraction_payload(
+        svc.paths,
+        {
+            "facts": [
+                {
+                    **base,
+                    "entities": [
+                        {
+                            "surface": "Atlas Launch",
+                            "type": "event",
+                            "mention_kind": "named",
+                            "is_primary": True,
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+    non_event = validate_extraction_payload(
+        svc.paths,
+        {
+            "facts": [
+                {
+                    **base,
+                    "entities": [
+                        {
+                            "surface": "Atlas",
+                            "type": "project",
+                            "mention_kind": "named",
+                            "is_primary": True,
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+    generic_event = validate_extraction_payload(
+        svc.paths,
+        {
+            "facts": [
+                {
+                    **base,
+                    "entities": [
+                        {
+                            "surface": "Atlas Launch",
+                            "type": "event",
+                            "mention_kind": "generic",
+                            "is_primary": True,
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+    hallucinated_event = validate_extraction_payload(
+        svc.paths,
+        {
+            "facts": [
+                {
+                    **base,
+                    "entities": [
+                        {
+                            "surface": "Phoenix Launch Gala",
+                            "type": "event",
+                            "mention_kind": "named",
+                            "is_primary": True,
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+
+    assert event["accepted_count"] == 1
+    assert event["candidates"][0]["event_time_kind"] == "planned"
+    assert event["candidates"][0]["event_start_at"] == "2026-05"
+    assert non_event["accepted_count"] == 1
+    assert non_event["candidates"][0]["event_time"] is None
+    assert non_event["temporal_enrichment_warning_count"] == 1
+    assert generic_event["accepted_count"] == 1
+    assert generic_event["candidates"][0]["event_time"] is None
+    assert hallucinated_event["accepted_count"] == 1
+    assert hallucinated_event["candidates"][0]["event_time"] is None
+
+
+def test_structured_meeting_metadata_projects_exact_actual_event(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    session_id = "228ce77f-8098-4ded-b4d8-80ad76d9a232"
+    note = svc.paths.inbox / "documents" / "hyprnote" / f"{session_id}.md"
+    note.parent.mkdir(parents=True)
+    note.write_text(
+        """---
+source_type: "hyprnote_meeting"
+agent: "hyprnote"
+session_id: "228ce77f-8098-4ded-b4d8-80ad76d9a232"
+source_path: "/Users/Peter/Library/Application Support/hyprnote/sessions/228ce77f-8098-4ded-b4d8-80ad76d9a232"
+title: "CloudZero Recruiter Screen"
+created_at: "2026-05-01T17:00:50.501Z"
+source_updated_at: "2026-05-01T17:30:01+00:00"
+event_started_at: "2026-05-01T17:00:00+00:00"
+event_ended_at: "2026-05-01T17:30:00+00:00"
+---
+
+# Meeting: CloudZero Recruiter Screen
+
+The recruiter discussed CloudZero.
+""",
+        encoding="utf-8",
+    )
+    svc.ingest()
+
+    documents = recent_source_cards(svc.paths, limit=10)
+    candidate = structured_source_event_candidate(documents[0])
+
+    assert candidate is not None
+    assert candidate["statement"] == (
+        "CloudZero Recruiter Screen (2026-05-01T17:00:00+00:00) occurred."
+    )
+    assert candidate["entity_type"] == "event"
+    assert candidate["event_time"] == {
+        "kind": "actual",
+        "start_at": "2026-05-01T17:00:00+00:00",
+        "end_at": "2026-05-01T17:30:00+00:00",
+        "precision": "exact",
+        "expression": (
+            'event_started_at: "2026-05-01T17:00:00+00:00"\n'
+            'event_ended_at: "2026-05-01T17:30:00+00:00"'
+        ),
+    }
+    assert candidate["source_spans"]
+    assert "event_started_at" in candidate["evidence_quote"]
+
+    action = propose_action(
+        svc.paths,
+        "fact_upsert",
+        action_payload={"fact": candidate},
+        action_features={"reversible": True},
+    )
+    apply_action(svc.paths, action["id"])
+    with connection(svc.paths.sqlite_path) as conn:
+        stored = conn.execute(
+            """
+            SELECT f.event_time_kind, f.event_start_at, f.event_end_at,
+                   e.entity_type, fe.is_primary
+            FROM facts f
+            JOIN fact_entities fe ON fe.fact_id = f.id
+            JOIN entities e ON e.id = fe.entity_id
+            """
+        ).fetchone()
+    assert dict(stored) == {
+        "event_time_kind": "actual",
+        "event_start_at": "2026-05-01T17:00:00+00:00",
+        "event_end_at": "2026-05-01T17:30:00+00:00",
+        "entity_type": "event",
+        "is_primary": 1,
+    }
+
+
+def test_untrusted_self_declared_meeting_does_not_project_event(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "forged-meeting.md"
+    note.write_text(
+        """---
+source_type: "hyprnote_meeting"
+agent: "hyprnote"
+session_id: "forged-session"
+source_path: "/tmp/not-hyprnote/forged-session"
+title: "Forged Meeting"
+event_started_at: "2026-05-01T17:00:00+00:00"
+---
+
+# Meeting: Forged Meeting
+""",
+        encoding="utf-8",
+    )
+    svc.ingest()
+
+    document = recent_source_cards(svc.paths, limit=10)[0]
+
+    assert document["structured_event_metadata_trusted"] is False
+    assert structured_source_event_candidate(document) is None
+
+
+def test_event_time_is_stripped_when_primary_entity_does_not_resolve_to_event(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    with connection(svc.paths.sqlite_path) as conn:
+        organization = resolve_entity(
+            conn,
+            "Atlas Labs",
+            type_hint="organization",
+            mention_kind="named",
+        )
+        assert organization is not None
+    event_time = {
+        "kind": "planned",
+        "start_at": "2026-05-01",
+        "end_at": None,
+        "precision": "day",
+        "expression": "May 1",
+    }
+    facts = [
+        {
+            "id": "fact_event_wrong_entity_type",
+            "statement": "Atlas Labs will hold a launch on May 1.",
+            "entity_key": "organizations:atlas-labs:summary",
+            "entity_id": organization.entity_id,
+            "entity_mention": "Atlas Labs",
+            "entity_type": "event",
+            "page_hint": "organizations/atlas-labs.md",
+            "section_hint": "Summary",
+            "source_ids": ["manual:event-test"],
+            "confidence": 0.9,
+            "event_time": event_time,
+        },
+        {
+            "id": "fact_event_without_entity",
+            "statement": "A launch is planned for May 1.",
+            "entity_key": "concepts:launch:summary",
+            "page_hint": "concepts/launch.md",
+            "section_hint": "Summary",
+            "source_ids": ["manual:event-test"],
+            "confidence": 0.9,
+            "event_time": event_time,
+        },
+    ]
+    for fact in facts:
+        action = propose_action(
+            svc.paths,
+            "fact_upsert",
+            action_payload={"fact": fact},
+            action_features={"reversible": True},
+        )
+        apply_action(svc.paths, action["id"])
+
+    with connection(svc.paths.sqlite_path) as conn:
+        stored = list(
+            conn.execute(
+                """
+                SELECT id, statement, event_time_kind, event_start_at
+                FROM facts
+                WHERE id IN (?, ?)
+                ORDER BY id
+                """,
+                ("fact_event_wrong_entity_type", "fact_event_without_entity"),
+            )
+        )
+    assert len(stored) == 2
+    assert all(row["statement"] for row in stored)
+    assert all(row["event_time_kind"] is None for row in stored)
+    assert all(row["event_start_at"] is None for row in stored)
 
 
 def test_extraction_accepts_structured_entity_mentions(tmp_path: Path) -> None:
@@ -2008,6 +2786,92 @@ def test_extraction_ignores_identifier_like_numbers_in_faithfulness_gate(
         "unsupported number" in reason
         for rejection in report["rejections"]
         for reason in rejection["reasons"]
+    )
+
+
+def test_numeric_gate_ignores_speaker_ids_and_existential_people() -> None:
+    assert extract_numeric_mentions("Speaker 2 said the team will pilot it.") == []
+    assert extract_numeric_mentions("One participant proposed a pilot.") == []
+    assert [
+        mention["surface"]
+        for mention in extract_numeric_mentions(
+            "Exactly one participant proposed a $200M plan for 60 hours."
+        )
+    ] == ["one", "$200M", "60"]
+
+
+@pytest.mark.parametrize(
+    ("source_text", "statement", "needle"),
+    [
+        (
+            "Speaker 2: The team will pilot the workflow.",
+            "Speaker 2 said the team will pilot the workflow.",
+            "team will pilot",
+        ),
+        (
+            "A participant proposed a pilot.",
+            "One participant proposed a pilot.",
+            "participant proposed",
+        ),
+    ],
+)
+def test_extraction_accepts_non_quantitative_speaker_phrasing(
+    tmp_path: Path, source_text: str, statement: str, needle: str
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    (svc.paths.inbox / "source.md").write_text(
+        f"# Source\n\n{source_text}", encoding="utf-8"
+    )
+    svc.ingest()
+    with connection(svc.paths.sqlite_path) as conn:
+        chunk = conn.execute("SELECT id, text FROM chunks LIMIT 1").fetchone()
+
+    report = validate_extracted_facts_with_report(
+        svc.paths,
+        [
+            {
+                "statement": statement,
+                "chunk_id": chunk["id"],
+                "evidence_unit_ids": evidence_unit_ids_containing(
+                    chunk["text"], needle
+                ),
+                "claim_class": "factual_update",
+            }
+        ],
+    )
+
+    assert report["accepted_count"] == 1
+    assert report["rejections"] == []
+
+
+def test_extraction_keeps_explicit_people_counts_quantitative(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    (svc.paths.inbox / "source.md").write_text(
+        "# Source\n\nThree participants attended.", encoding="utf-8"
+    )
+    svc.ingest()
+    with connection(svc.paths.sqlite_path) as conn:
+        chunk = conn.execute("SELECT id, text FROM chunks LIMIT 1").fetchone()
+
+    report = validate_extracted_facts_with_report(
+        svc.paths,
+        [
+            {
+                "statement": "Exactly one participant attended.",
+                "chunk_id": chunk["id"],
+                "evidence_unit_ids": evidence_unit_ids_containing(
+                    chunk["text"], "participants attended"
+                ),
+                "claim_class": "factual_update",
+            }
+        ],
+    )
+
+    assert report["accepted_count"] == 0
+    assert any(
+        "unsupported number" in reason for reason in report["rejections"][0]["reasons"]
     )
 
 
@@ -3478,6 +4342,62 @@ def test_critic_repairs_incomplete_fact_citation_before_apply(tmp_path: Path) ->
     assert repair_record["final_review"]["decision"] == "agree"
 
 
+def test_critic_refuses_evidence_repair_that_would_overflow_citation(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "source.md"
+    note.write_text(
+        "# Source\n\nSpeaker 1: Alpha. Bravo. Charlie. Delta. Echo. Foxtrot.",
+        encoding="utf-8",
+    )
+    svc.ingest()
+    with connection(svc.paths.sqlite_path) as conn:
+        chunk = conn.execute("SELECT id, text FROM chunks LIMIT 1").fetchone()
+    unit_ids = [unit["unit_id"] for unit in evidence_units_for_text(chunk["text"])]
+    candidate = validate_extracted_facts(
+        svc.paths,
+        [
+            {
+                "statement": "The source lists named markers.",
+                "chunk_id": chunk["id"],
+                "evidence_unit_ids": unit_ids[:5],
+                "claim_class": "factual_update",
+                "page_hint": "concepts/markers.md",
+            }
+        ],
+    )[0]
+    insert_critic_policy(
+        svc.paths,
+        "policy_test_fact_evidence_overflow",
+        "L2",
+        "needs_fact_evidence_overflow",
+        action_type="fact_upsert",
+    )
+    action = propose_action(
+        svc.paths,
+        "fact_upsert",
+        action_payload={"fact": candidate},
+        action_features={"needs_fact_evidence_overflow": True},
+        target_page_paths=[candidate["page_hint"]],
+    )
+    provider = RepairingCriticProvider([unit_ids[5]])
+
+    decided = decide_action(
+        svc.paths,
+        action["id"],
+        critic_llm_provider=provider,
+        critic_disagreement_mode="reject",
+    )
+
+    assert provider.calls == 1
+    assert decided["status"] == "rejected"
+    repair = decided["evidence_json"]["critic_evidence_repair"]["repair"]
+    assert repair["status"] == "not_repaired"
+    assert "exceeds the maximum citation size" in repair["reason"]
+
+
 def test_critic_llm_disagreement_blocks_l2_apply(tmp_path: Path) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()
@@ -3666,6 +4586,200 @@ def test_decide_policy_actions_parallel_preserves_order(
     ]
     assert sorted(review_calls) == ["action_1", "action_2", "action_3", "action_4"]
     assert decision_calls == ["action_1", "action_2", "action_3", "action_4"]
+
+
+def test_decide_policy_actions_commits_each_action_before_next_finalization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pkm_brain.policy_action_batch as policy_action_batch
+
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    actions = [
+        propose_action(
+            svc.paths,
+            "fact_upsert",
+            action_payload={"fact": {"statement": f"Crash boundary fact {index}."}},
+        )
+        for index in range(2)
+    ]
+    real_finalize = policy_action_batch.finalize_policy_action
+    finalized_ids: list[str] = []
+
+    class SimulatedProcessCrash(RuntimeError):
+        pass
+
+    def crash_after_first_commit(
+        paths: BrainPaths,
+        action_id: str,
+        preparation: dict[str, object],
+        **kwargs: object,
+    ) -> dict[str, object]:
+        real_finalize(paths, action_id, preparation, **kwargs)
+        finalized_ids.append(action_id)
+        raise SimulatedProcessCrash("crashed after first durable decision")
+
+    monkeypatch.setattr(
+        policy_action_batch, "finalize_policy_action", crash_after_first_commit
+    )
+
+    with pytest.raises(SimulatedProcessCrash):
+        decide_policy_actions(
+            svc.paths,
+            [action["id"] for action in actions],
+            critic_review={"max_workers": 2, "disagreement_mode": "reject"},
+        )
+
+    with connection(svc.paths.sqlite_path) as conn:
+        rows = {
+            str(row["id"]): row
+            for row in conn.execute(
+                "SELECT id, status, policy_version FROM cos_actions"
+            )
+        }
+        residue_count = conn.execute(
+            "SELECT COUNT(*) FROM open_questions WHERE action_id = ?",
+            (actions[0]["id"],),
+        ).fetchone()[0]
+
+    assert finalized_ids == [actions[0]["id"]]
+    assert rows[actions[0]["id"]]["status"] == "needs_human"
+    assert rows[actions[0]["id"]]["policy_version"] == 1
+    assert residue_count == 1
+    assert rows[actions[1]["id"]]["status"] == "proposed"
+    assert rows[actions[1]["id"]]["policy_version"] is None
+
+
+def test_decide_policy_actions_persists_lock_failure_and_continues(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlite3
+
+    import pkm_brain.policy_action_batch as policy_action_batch
+
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    actions = [
+        propose_action(
+            svc.paths,
+            "fact_upsert",
+            action_payload={"fact": {"statement": f"Lock boundary fact {index}."}},
+        )
+        for index in range(2)
+    ]
+    real_decide_action = policy_action_batch.decide_action
+
+    def locked_first_action(
+        paths: BrainPaths, action_id: str, **kwargs: object
+    ) -> dict[str, object]:
+        if action_id == actions[0]["id"]:
+            raise sqlite3.OperationalError("database is locked")
+        return real_decide_action(paths, action_id, **kwargs)
+
+    monkeypatch.setattr(
+        policy_action_batch, "decide_action", locked_first_action
+    )
+
+    decided = decide_policy_actions(
+        svc.paths,
+        [action["id"] for action in actions],
+        critic_review={"max_workers": 2, "disagreement_mode": "reject"},
+    )
+
+    with connection(svc.paths.sqlite_path) as conn:
+        stored_statuses = {
+            str(row["id"]): str(row["status"])
+            for row in conn.execute("SELECT id, status FROM cos_actions")
+        }
+
+    assert [action["status"] for action in decided] == ["failed", "needs_human"]
+    assert stored_statuses[actions[0]["id"]] == "failed"
+    assert stored_statuses[actions[1]["id"]] == "needs_human"
+
+
+def test_decide_policy_actions_preserves_structured_evidence_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "source.md"
+    note.write_text(
+        "# Source\n\n"
+        "Speaker 1: The product is available in Europe. "
+        "It is also available in Canada.",
+        encoding="utf-8",
+    )
+    svc.ingest()
+    with connection(svc.paths.sqlite_path) as conn:
+        chunk = conn.execute("SELECT id, text FROM chunks LIMIT 1").fetchone()
+    europe_ids = evidence_unit_ids_containing(chunk["text"], "Europe")
+    canada_ids = evidence_unit_ids_containing(chunk["text"], "Canada")
+    candidate = validate_extracted_facts(
+        svc.paths,
+        [
+            {
+                "statement": "The product is available in Europe and Canada.",
+                "chunk_id": chunk["id"],
+                "evidence_unit_ids": europe_ids,
+                "claim_class": "factual_update",
+                "page_hint": "concepts/product-availability.md",
+            }
+        ],
+    )[0]
+    insert_critic_policy(
+        svc.paths,
+        "policy_test_batch_evidence_repair",
+        "L2",
+        "needs_batch_evidence_repair",
+        action_type="fact_upsert",
+    )
+    action = propose_action(
+        svc.paths,
+        "fact_upsert",
+        action_payload={"fact": candidate},
+        action_features={"needs_batch_evidence_repair": True},
+        target_page_paths=[candidate["page_hint"]],
+    )
+    prepared_review = {
+        "critic_by": "fake:prepared",
+        "decision": "evidence_incomplete",
+        "rationale": "The Canada unit is required.",
+        "repaired_evidence_unit_ids": canada_ids,
+    }
+    monkeypatch.setattr(
+        "pkm_brain.policy_action_batch.prepare_policy_action_review",
+        lambda *_args, **_kwargs: {
+            "critic_by": prepared_review["critic_by"],
+            "critic_decision": prepared_review["decision"],
+            "critic_rationale": prepared_review["rationale"],
+            "precomputed_critic_review": prepared_review,
+        },
+    )
+    review_calls = 0
+
+    def agree_after_repair(*_args, **_kwargs) -> dict[str, str]:
+        nonlocal review_calls
+        review_calls += 1
+        return {
+            "critic_by": "fake:second-pass",
+            "decision": "agree",
+            "rationale": "The repaired citation supports both locations.",
+        }
+
+    monkeypatch.setattr("pkm_brain.cos_actions.critic_review", agree_after_repair)
+
+    decided = decide_policy_actions(
+        svc.paths,
+        [action["id"]],
+        critic_review={"max_workers": 1, "disagreement_mode": "reject"},
+    )[0]
+
+    assert review_calls == 1
+    assert decided["status"] == "applied"
+    assert decided["critic_decision"] == "agree"
+    repaired_fact = decided["evidence_json"]["payload"]["fact"]
+    assert repaired_fact["evidence_unit_ids"] == [*europe_ids, *canada_ids]
+    assert "Canada" in repaired_fact["evidence_quote"]
 
 
 def test_decide_policy_actions_isolates_worker_failure(
@@ -4021,7 +5135,56 @@ def test_critic_prompt_for_fact_upsert_is_narrow_entailment_review() -> None:
     assert "even if the fact is mundane" in prompt
     assert "Policy card is the matched authorization record" in prompt
     assert "do not require the action payload to repeat policy fields" in prompt
+    assert "Missing temporal enrichment is valid" in prompt
+    assert "deadline is not valid_from" in prompt
+    assert "event_started_at/event_ended_at frontmatter" in prompt
+    assert "mere presence of a name elsewhere" in prompt
+    assert "unsupported named attribution" in prompt
     assert "should be human-reviewed" not in prompt
+
+
+def test_critic_named_entity_context_uses_grounded_cross_chunk_span() -> None:
+    anchor_text = "The speaker is describing product work at High Touch."
+    start = anchor_text.index("High Touch")
+    context = critic_named_entity_context(
+        [
+            {"id": "chunk_anchor", "text": anchor_text},
+            {"id": "chunk_claim", "text": "Product sits at the center."},
+        ],
+        {
+            "metadata": {
+                "model_entity_mentions": [
+                    {
+                        "surface": "High Touch",
+                        "mention_kind": "named",
+                        "mention_span": {
+                            "chunk_id": "chunk_anchor",
+                            "start": start,
+                            "end": start + len("High Touch"),
+                        },
+                    },
+                    {
+                        "surface": "product team",
+                        "mention_kind": "generic",
+                        "mention_span": {
+                            "chunk_id": "chunk_claim",
+                            "start": 0,
+                            "end": 7,
+                        },
+                    },
+                ]
+            }
+        },
+    )
+
+    assert context == [
+        {
+            "entity": "High Touch",
+            "chunk_id": "chunk_anchor",
+            "unit_id": "u0",
+            "text": anchor_text,
+        }
+    ]
 
 
 def first_evidence_ref_from_prompt(
@@ -4036,7 +5199,7 @@ def first_evidence_ref_from_prompt(
     return "missing", ["u0"]
 
 
-def valid_extraction_confidences() -> dict[str, float]:
+def valid_extraction_confidences() -> dict[str, object]:
     return {
         "extraction_confidence": 0.95,
         "routing_confidence": 0.9,
@@ -4064,6 +5227,48 @@ class FakeExtractorProvider:
                         "statement": "Watermarked extraction marker is present.",
                         "chunk_id": chunk_id,
                         "evidence_unit_ids": unit_ids,
+                        "claim_class": "factual_update",
+                        **valid_extraction_confidences(),
+                    }
+                ]
+            }
+        )
+
+
+class EmptyExtractorProvider:
+    name = "fake-extractor"
+    model = "fake-extractor-model"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def complete(self, prompt: str) -> str:
+        self.calls += 1
+        return json.dumps({"facts": []})
+
+
+class EmptyThenCoverageExtractorProvider:
+    name = "fake-extractor"
+    model = "fake-extractor-model"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def complete(self, prompt: str) -> str:
+        self.calls += 1
+        if self.calls == 1:
+            return json.dumps({"facts": []})
+        assert "Coverage audit" in prompt
+        chunk_id, unit_ids = first_evidence_ref_from_prompt(
+            prompt, "Substantive coverage marker"
+        )
+        return json.dumps(
+            {
+                "facts": [
+                    {
+                        "statement": "Substantive coverage marker is present.",
+                        "chunk_id": chunk_id,
+                        "evidence_unit_ids": unit_ids[:1],
                         "claim_class": "factual_update",
                         **valid_extraction_confidences(),
                     }
@@ -4201,6 +5406,43 @@ class UnsupportedNumberExtractorProvider:
         )
 
 
+class PartialValidExtractorProvider:
+    name = "fake-extractor"
+    model = "fake-extractor-model"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def complete(self, prompt: str) -> str:
+        self.calls += 1
+        valid_chunk, valid_units = first_evidence_ref_from_prompt(
+            prompt, "Watermarked extraction marker"
+        )
+        number_chunk, number_units = first_evidence_ref_from_prompt(
+            prompt, "sixty seven"
+        )
+        return json.dumps(
+            {
+                "facts": [
+                    {
+                        "statement": "Watermarked extraction marker is present.",
+                        "chunk_id": valid_chunk,
+                        "evidence_unit_ids": valid_units,
+                        "claim_class": "factual_update",
+                        **valid_extraction_confidences(),
+                    },
+                    {
+                        "statement": "Alex expects probably sixty hours a week of work.",
+                        "chunk_id": number_chunk,
+                        "evidence_unit_ids": number_units,
+                        "claim_class": "factual_update",
+                        **valid_extraction_confidences(),
+                    },
+                ]
+            }
+        )
+
+
 class MarkerExtractorProvider:
     name = "fake-extractor"
     model = "fake-extractor-model"
@@ -4244,9 +5486,9 @@ class MarkerExtractorProvider:
                                 "entity_key": self.page_hint.removesuffix(
                                     ".md"
                                 ).replace("/", ":"),
+                                **valid_extraction_confidences(),
                                 "extraction_confidence": 0.99,
                                 "routing_confidence": 0.8,
-                                "truth_confidence": 0.95,
                                 **(
                                     {"entity_mentions": self.entity_mentions}
                                     if self.entity_mentions is not None

@@ -8,14 +8,20 @@ from typer.testing import CliRunner
 
 from pkm_brain.cli import app
 from pkm_brain.cos_actions import decide_action, propose_action
-from pkm_brain.cos_policy import PolicyDecision, promote_policy_for_autonomy
+from pkm_brain.cos_policy import (
+    PolicyDecision,
+    evaluate_policy,
+    promote_policy_for_autonomy,
+)
 from pkm_brain.db import connection
+from pkm_brain.extraction import validate_extracted_facts
 from pkm_brain.paths import BrainPaths
 from pkm_brain.policy_reconciliation import (
     reconcile_policy_escalations,
     redecide_policy_actions,
 )
 from pkm_brain.service import BrainService
+from pkm_brain.source_evidence import evidence_units_for_text
 
 
 class AgreeCriticProvider:
@@ -28,6 +34,35 @@ class AgreeCriticProvider:
             {
                 "decision": "agree",
                 "rationale": "The statement is directly supported by the payload evidence.",
+            }
+        )
+
+
+class EvidenceRepairCriticProvider:
+    name = "fake-critic"
+    model = "fake-model"
+
+    def __init__(self, repaired_unit_ids: list[str]) -> None:
+        self.repaired_unit_ids = repaired_unit_ids
+        self.calls = 0
+
+    def complete(self, prompt: str) -> str:
+        self.calls += 1
+        assert "repairable_units" in prompt
+        if self.calls == 1:
+            return json.dumps(
+                {
+                    "decision": "evidence_incomplete",
+                    "rationale": "The Canada sentence must be added to the citation.",
+                    "repaired_evidence_unit_ids": self.repaired_unit_ids,
+                }
+            )
+        assert self.calls == 2
+        assert "critic_evidence_repaired" in prompt
+        return json.dumps(
+            {
+                "decision": "agree",
+                "rationale": "The repaired citation directly supports both locations.",
             }
         )
 
@@ -128,9 +163,7 @@ def test_policy_reconciliation_retries_locked_ledger_write_without_new_critic(
     monkeypatch.setattr(
         "pkm_brain.policy_reconciliation.decide_action", flaky_decide_action
     )
-    monkeypatch.setattr(
-        "pkm_brain.db.SQLITE_LOCK_RETRY_DELAYS_SECONDS", (0.0,)
-    )
+    monkeypatch.setattr("pkm_brain.db.SQLITE_LOCK_RETRY_DELAYS_SECONDS", (0.0,))
     monkeypatch.setattr("pkm_brain.db.time.sleep", lambda _delay: None)
     eligible = [
         {
@@ -155,6 +188,104 @@ def test_policy_reconciliation_retries_locked_ledger_write_without_new_critic(
     assert calls == 2
     assert decided["action_retry"]["status"] == "applied"
     assert failures == []
+
+
+def test_redecide_policy_actions_repairs_structured_incomplete_fact_evidence(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    service = BrainService(paths)
+    service.init_workspace()
+    note = paths.inbox / "source.md"
+    note.write_text(
+        "# Source\n\n"
+        "Speaker 1: The product is available in Europe. "
+        "It is also available in Canada.",
+        encoding="utf-8",
+    )
+    service.ingest()
+    with connection(paths.sqlite_path) as conn:
+        chunk = conn.execute("SELECT id, text FROM chunks LIMIT 1").fetchone()
+
+    evidence_units = evidence_units_for_text(str(chunk["text"]))
+    current_unit_ids = [
+        str(unit["unit_id"]) for unit in evidence_units if "Europe" in str(unit["text"])
+    ]
+    additional_unit_ids = [
+        str(unit["unit_id"]) for unit in evidence_units if "Canada" in str(unit["text"])
+    ]
+    candidate = validate_extracted_facts(
+        paths,
+        [
+            {
+                "statement": "The product is available in Europe and Canada.",
+                "chunk_id": chunk["id"],
+                "evidence_unit_ids": current_unit_ids,
+                "claim_class": "factual_update",
+                "page_hint": "concepts/product-availability.md",
+                "section_hint": "Summary",
+                "extraction_confidence": 0.95,
+                "routing_confidence": 0.95,
+                "truth_confidence": 0.95,
+            }
+        ],
+        extractor_model="fake-extractor-model",
+    )[0]
+    action = propose_action(
+        paths,
+        "fact_upsert",
+        action_payload={"fact": candidate},
+        action_features={
+            "risk_tier": "medium",
+            "clean_fact_upsert": True,
+            "fact_upsert_resolution": "new_clean_fact",
+            "quote_backed": True,
+            "fallback_route": False,
+            "resolver_precheck": "passed",
+        },
+        target_page_paths=[candidate["page_hint"]],
+        confidence=0.95,
+        risk_tier="medium",
+    )
+    with connection(paths.sqlite_path) as conn:
+        promote_policy_for_autonomy(
+            conn,
+            reason="test structured critic evidence repair",
+            strictness="lenient",
+            minimum_auto_confidence=0.6,
+        )
+        decision = evaluate_policy(
+            conn, action["action_type"], action["action_features"]
+        )
+    assert decision.autonomy_level == "L2"
+    assert decision.critic_required is True
+
+    provider = EvidenceRepairCriticProvider(additional_unit_ids)
+    decided, failures = redecide_policy_actions(
+        paths,
+        [{"action": action, "decision": decision}],
+        critic_review={"max_workers": 1, "disagreement_mode": "reject"},
+        critic_llm_provider=provider,
+    )
+
+    assert failures == []
+    assert provider.calls == 2
+    result = decided[action["id"]]
+    assert result["status"] == "applied"
+    assert result["critic_decision"] == "agree"
+    repaired_fact = result["evidence_json"]["payload"]["fact"]
+    assert repaired_fact["evidence_unit_ids"] == [
+        *current_unit_ids,
+        *additional_unit_ids,
+    ]
+    assert "Canada" in repaired_fact["evidence_quote"]
+    repair_record = result["evidence_json"]["critic_evidence_repair"]
+    assert repair_record["initial_review"]["decision"] == "evidence_incomplete"
+    assert repair_record["initial_review"]["repaired_evidence_unit_ids"] == (
+        additional_unit_ids
+    )
+    assert repair_record["repair"]["status"] == "repaired"
+    assert repair_record["final_review"]["decision"] == "agree"
 
 
 def propose_clean_fact(paths: BrainPaths, fact_id: str) -> dict[str, object]:

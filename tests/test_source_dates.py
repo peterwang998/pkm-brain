@@ -101,3 +101,19 @@ def test_extraction_uses_source_date_when_model_omits_observed_at(
 
     assert candidate["observed_at"] == "2026-06-18T09:30:00+00:00"
     assert candidate["metadata"]["observed_at_basis"] == "source_created_at"
+
+
+def test_extraction_does_not_use_document_or_ingest_time_as_assertion_time() -> None:
+    document = {
+        "document_id": "doc_processing_only",
+        "created_at": "2026-07-13T08:00:00+00:00",
+        "ingested_at": "2026-07-13T08:01:00+00:00",
+    }
+    document.update(document_source_date_metadata(document))
+    candidate = {"statement": "A durable source-backed claim.", "metadata": {}}
+
+    stamp_candidate_source_context(candidate, document, "window-1")
+
+    assert document["source_date"] == "2026-07-13T08:00:00+00:00"
+    assert candidate["observed_at"] is None
+    assert candidate["metadata"]["observed_at_basis"] == "unknown"

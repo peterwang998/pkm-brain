@@ -30,6 +30,7 @@ from pkm_brain.service import (
     stored_citation_snapshots,
     stored_retrieval_debug,
 )
+from pkm_brain.temporal import TemporalRetrievalRequest
 from pkm_brain.title_utils import MAX_DOCUMENT_TITLE_CHARS, TITLE_TRUNCATION_SUFFIX
 from pkm_brain.util import text_sha256, token_count
 from pkm_brain.wiki import lint_wiki, parse_frontmatter
@@ -2466,6 +2467,466 @@ def test_retrieve_context_returns_facts_and_contested_pairs(tmp_path: Path) -> N
     assert {fact["id"] for fact in backfill_positive_context["relevant_facts"]} == {
         "fact_legacy_backfill"
     }
+
+
+def test_retrieve_context_filters_facts_by_explicit_valid_time(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    with connection(svc.paths.sqlite_path) as conn:
+        for fact in [
+            {
+                "id": "fact_beta",
+                "statement": "Atlas temporal marker phase was beta.",
+                "status": "superseded",
+                "temporal_kind": "time_bound",
+                "valid_from": "2026-01-01",
+                "valid_to": "2026-03-01",
+            },
+            {
+                "id": "fact_general",
+                "statement": "Atlas temporal marker phase is general availability.",
+                "status": "active",
+                "temporal_kind": "ongoing",
+                "valid_from": "2026-03-01",
+                "valid_to": None,
+            },
+            {
+                "id": "fact_atemporal",
+                "statement": "Atlas temporal marker is a software project.",
+                "status": "active",
+                "temporal_kind": "atemporal",
+                "valid_from": None,
+                "valid_to": None,
+            },
+            {
+                "id": "fact_unknown",
+                "statement": "Atlas temporal marker had an unspecified phase.",
+                "status": "active",
+                "temporal_kind": "unknown",
+                "valid_from": None,
+                "valid_to": None,
+            },
+        ]:
+            conn.execute(
+                """
+                INSERT INTO facts(
+                  id, statement, entity_key, page_hint, section_hint, source_ids,
+                  confidence, status, metadata, created_at, truth_confidence,
+                  temporal_kind, valid_from, valid_to, valid_time_precision
+                ) VALUES (?, ?, ?, ?, ?, '[]', 0.9, ?, '{}', ?, 0.9, ?, ?, ?, 'day')
+                """,
+                (
+                    fact["id"],
+                    fact["statement"],
+                    "project:atlas:phase",
+                    "projects/atlas.md",
+                    "Status",
+                    fact["status"],
+                    "2026-04-01T00:00:00+00:00",
+                    fact["temporal_kind"],
+                    fact["valid_from"],
+                    fact["valid_to"],
+                ),
+            )
+        rebuild_fact_retrieval_index(conn)
+
+    current = svc.retrieve_context("Atlas temporal marker phase")
+    historical = svc.retrieve_context(
+        "Atlas temporal marker phase",
+        valid_as_of="2026-02-15",
+    )
+    known_context = svc.retrieve_context(
+        "What did we know as of 2026-02-15 about Atlas temporal marker?"
+    )
+
+    assert {fact["id"] for fact in current["relevant_facts"]} == {
+        "fact_general",
+        "fact_atemporal",
+        "fact_unknown",
+    }
+    assert {fact["id"] for fact in historical["relevant_facts"]} == {
+        "fact_beta",
+        "fact_atemporal",
+    }
+    assert historical["temporal"] == {
+        "mode": "valid",
+        "valid_as_of": "2026-02-15T23:59:59.999999+00:00",
+        "known_as_of": None,
+        "inferred": False,
+        "valid_inferred": False,
+        "known_inferred": False,
+        "warning": None,
+        "fact_coverage": "explicit_valid_time_only",
+        "omitted_current_state_layers": [
+            "wiki_pages",
+            "memories",
+            "open_questions",
+        ],
+    }
+    assert historical["relevant_wiki_pages"] == []
+    assert historical["active_memories"] == []
+    assert known_context["temporal"] == {
+        "mode": "known",
+        "valid_as_of": None,
+        "known_as_of": "2026-02-15T23:59:59.999999+00:00",
+        "inferred": True,
+        "valid_inferred": False,
+        "known_inferred": True,
+        "warning": None,
+        "fact_coverage": "explicit_knowledge_time_only",
+        "omitted_current_state_layers": [
+            "wiki_pages",
+            "memories",
+            "open_questions",
+            "supporting_chunks",
+        ],
+    }
+    assert known_context["relevant_facts"] == []
+    assert known_context["supporting_chunks"] == []
+    assert known_context["citation_snapshots"] == []
+
+
+def test_historical_fact_search_pages_past_ineligible_fts_candidates(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    with connection(svc.paths.sqlite_path) as conn:
+        for index in range(40):
+            conn.execute(
+                """
+                INSERT INTO facts(
+                  id, statement, entity_key, page_hint, section_hint, source_ids,
+                  confidence, status, metadata, created_at, truth_confidence,
+                  temporal_kind, valid_from, valid_time_precision
+                ) VALUES (?, ?, ?, ?, ?, '[]', 0.9, 'active', '{}', ?, 0.9,
+                          'ongoing', '2027-01-01', 'day')
+                """,
+                (
+                    f"a_future_{index:02d}",
+                    "Paged temporal marker belongs to Atlas.",
+                    "project:atlas:paged",
+                    "projects/atlas.md",
+                    "Status",
+                    "2026-04-01T00:00:00+00:00",
+                ),
+            )
+        conn.execute(
+            """
+            INSERT INTO facts(
+              id, statement, entity_key, page_hint, section_hint, source_ids,
+              confidence, status, metadata, created_at, truth_confidence,
+              temporal_kind, valid_from, valid_to, valid_time_precision
+            ) VALUES (
+              'z_historical', 'Paged temporal marker belongs to Atlas.',
+              'project:atlas:paged', 'projects/atlas.md', 'Status', '[]',
+              0.9, 'superseded', '{}', '2026-01-01T00:00:00+00:00', 0.9,
+              'time_bound', '2026-01-01', '2026-03-01', 'day'
+            )
+            """
+        )
+        rebuild_fact_retrieval_index(conn)
+
+    facts = svc.search_facts(
+        "Paged temporal marker",
+        limit=1,
+        valid_as_of="2026-02-15",
+    )
+
+    assert [fact["id"] for fact in facts] == ["z_historical"]
+    assert facts[0]["status"] == "superseded"
+    assert facts[0]["authoritative"] is False
+    assert facts[0]["temporal_match"] == "valid_as_of"
+
+
+def test_closed_revisions_cannot_starve_current_fact_search(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    statement = "Revision saturation marker belongs to Atlas."
+    with connection(svc.paths.sqlite_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO facts(
+              id, statement, entity_key, page_hint, section_hint, source_ids,
+              confidence, status, metadata, created_at, truth_confidence,
+              temporal_kind, knowledge_to, revision_status
+            ) VALUES (?, ?, 'project:atlas:revisions', 'projects/atlas.md',
+                      'Status', '[]', 0.9, 'revision_closed', '{}',
+                      '2026-01-01T00:00:00+00:00', 0.9, 'unknown',
+                      '2026-02-01T00:00:00+00:00', 'active')
+            """,
+            [(f"fact_revision_{index:04d}", statement) for index in range(513)],
+        )
+        conn.execute(
+            """
+            INSERT INTO facts(
+              id, statement, entity_key, page_hint, section_hint, source_ids,
+              confidence, status, metadata, created_at, truth_confidence,
+              temporal_kind
+            ) VALUES ('fact_zzzz_active', ?, 'project:atlas:revisions',
+                      'projects/atlas.md', 'Status', '[]', 0.9, 'active', '{}',
+                      '2026-03-01T00:00:00+00:00', 0.9, 'unknown')
+            """,
+            (statement,),
+        )
+        rebuild_fact_retrieval_index(conn)
+
+    facts = svc.search_facts("Revision saturation marker", limit=1)
+
+    assert [fact["id"] for fact in facts] == ["fact_zzzz_active"]
+
+
+def test_knowledge_time_context_omits_later_source_chunks(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "later-temporal-source.md"
+    note.write_text(
+        "---\n"
+        'source_type: "manual_note"\n'
+        'title: "Later temporal source"\n'
+        "---\n\n"
+        "The Quasar chronology marker was documented after the requested cutoff.\n",
+        encoding="utf-8",
+    )
+    svc.ingest()
+
+    current = svc.retrieve_context("Quasar chronology marker")
+    known = svc.retrieve_context(
+        "Quasar chronology marker",
+        known_as_of="2026-01-01",
+        temporal_mode="known",
+        debug=True,
+    )
+
+    assert current["supporting_chunks"]
+    assert known["supporting_chunks"] == []
+    assert all(
+        snapshot["type"] != "chunk" for snapshot in known["citation_snapshots"]
+    )
+    assert "supporting_chunks" in known["temporal"][
+        "omitted_current_state_layers"
+    ]
+    assert known["retrieval_debug"]["fanout"]["candidate_ids"] == []
+    assert known["retrieval_debug"]["reranked_candidates"] == []
+
+
+def test_fact_search_applies_knowledge_and_bitemporal_requests(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    with connection(svc.paths.sqlite_path) as conn:
+        for fact in [
+            {
+                "id": "fact_revision_1",
+                "status": "revision_closed",
+                "revision_status": "active",
+                "revision_number": 1,
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "knowledge_to": "2026-04-01T00:00:00+00:00",
+            },
+            {
+                "id": "fact_revision_2",
+                "status": "active",
+                "revision_status": None,
+                "revision_number": 2,
+                "created_at": "2026-04-01T00:00:00+00:00",
+                "knowledge_to": None,
+            },
+        ]:
+            conn.execute(
+                """
+                INSERT INTO facts(
+                  id, statement, entity_key, page_hint, section_hint, source_ids,
+                  confidence, status, metadata, created_at, truth_confidence,
+                  temporal_kind, valid_time_precision, knowledge_to,
+                  assertion_lineage_id, revision_number, revision_status
+                ) VALUES (?, 'Revision clock marker belongs to Atlas.',
+                          'project:atlas:revision', 'projects/atlas.md', 'Status',
+                          '[]', 0.9, ?, '{}', ?, 0.9, 'atemporal', 'unknown',
+                          ?, 'lineage_atlas_revision', ?, ?)
+                """,
+                (
+                    fact["id"],
+                    fact["status"],
+                    fact["created_at"],
+                    fact["knowledge_to"],
+                    fact["revision_number"],
+                    fact["revision_status"],
+                ),
+            )
+        rebuild_fact_retrieval_index(conn)
+
+    known = TemporalRetrievalRequest.resolve(
+        "ignored", known_as_of="2026-02-01"
+    )
+    bitemporal = TemporalRetrievalRequest.resolve(
+        "ignored",
+        valid_as_of="2026-03-01",
+        known_as_of="2026-02-01",
+    )
+
+    assert [
+        fact["id"]
+        for fact in svc.search_facts(
+            "Revision clock marker", temporal_request=known
+        )
+    ] == ["fact_revision_1"]
+    assert [
+        fact["id"]
+        for fact in svc.search_facts(
+            "Revision clock marker", temporal_request=bitemporal
+        )
+    ] == ["fact_revision_1"]
+    assert [
+        fact["id"] for fact in svc.search_facts("Revision clock marker")
+    ] == ["fact_revision_2"]
+
+
+def test_valid_and_timeline_views_do_not_resurrect_corrected_revision(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    with connection(svc.paths.sqlite_path) as conn:
+        for fact in [
+            (
+                "fact_corrected_history",
+                "revision_closed",
+                "active",
+                "2026-01-01T00:00:00+00:00",
+                "2026-04-01T00:00:00+00:00",
+                1,
+            ),
+            (
+                "fact_corrected_head",
+                "retracted",
+                None,
+                "2026-04-01T00:00:00+00:00",
+                None,
+                2,
+            ),
+        ]:
+            conn.execute(
+                """
+                INSERT INTO facts(
+                  id, statement, entity_key, page_hint, section_hint, source_ids,
+                  confidence, status, metadata, created_at, truth_confidence,
+                  temporal_kind, valid_from, valid_to, valid_time_precision,
+                  knowledge_to, assertion_lineage_id, revision_number,
+                  revision_status
+                ) VALUES (?, 'Corrected chronology marker belongs to Atlas.',
+                          'project:atlas:correction', 'projects/atlas.md',
+                          'Status', '[]', 0.9, ?, '{}', ?, 0.9, 'time_bound',
+                          '2026-01-01', '2026-03-01', 'day', ?,
+                          'lineage_atlas_correction', ?, ?)
+                """,
+                (fact[0], fact[1], fact[3], fact[4], fact[5], fact[2]),
+            )
+        rebuild_fact_retrieval_index(conn)
+
+    valid = TemporalRetrievalRequest.resolve(
+        "ignored", valid_as_of="2026-02-01"
+    )
+    bitemporal_before_correction = TemporalRetrievalRequest.resolve(
+        "ignored",
+        valid_as_of="2026-02-01",
+        known_as_of="2026-02-01",
+    )
+    timeline = TemporalRetrievalRequest.resolve(
+        "ignored", temporal_mode="timeline"
+    )
+
+    assert svc.search_facts(
+        "Corrected chronology marker", temporal_request=valid
+    ) == []
+    assert svc.search_facts(
+        "Corrected chronology marker", temporal_request=timeline
+    ) == []
+    assert [
+        fact["id"]
+        for fact in svc.search_facts(
+            "Corrected chronology marker",
+            temporal_request=bitemporal_before_correction,
+        )
+    ] == ["fact_corrected_history"]
+
+
+def test_timeline_fact_search_keeps_latest_revision_and_sorts_by_valid_time(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    with connection(svc.paths.sqlite_path) as conn:
+        for fact in [
+            (
+                "lineage_one_old",
+                "lineage_one",
+                1,
+                "revision_closed",
+                "active",
+                "2026-03-01",
+                "2026-01-01T00:00:00+00:00",
+                "2026-02-01T00:00:00+00:00",
+            ),
+            (
+                "lineage_one_latest",
+                "lineage_one",
+                2,
+                "active",
+                None,
+                "2026-04-01",
+                "2026-02-01T00:00:00+00:00",
+                None,
+            ),
+            (
+                "lineage_two",
+                "lineage_two",
+                1,
+                "active",
+                None,
+                "2026-02-01",
+                "2026-01-15T00:00:00+00:00",
+                None,
+            ),
+        ]:
+            conn.execute(
+                """
+                INSERT INTO facts(
+                  id, statement, entity_key, page_hint, section_hint, source_ids,
+                  confidence, status, metadata, created_at, truth_confidence,
+                  temporal_kind, valid_from, valid_time_precision, knowledge_to,
+                  assertion_lineage_id, revision_number, revision_status
+                ) VALUES (?, 'Timeline ordering marker belongs to Atlas.',
+                          'project:atlas:timeline', 'projects/atlas.md', 'Status',
+                          '[]', 0.9, ?, '{}', ?, 0.9, 'ongoing', ?, 'day', ?,
+                          ?, ?, ?)
+                """,
+                (
+                    fact[0],
+                    fact[3],
+                    fact[6],
+                    fact[5],
+                    fact[7],
+                    fact[1],
+                    fact[2],
+                    fact[4],
+                ),
+            )
+        rebuild_fact_retrieval_index(conn)
+
+    timeline = TemporalRetrievalRequest.resolve(
+        "Show the timeline", temporal_mode="timeline"
+    )
+    facts = svc.search_facts(
+        "Timeline ordering marker",
+        temporal_request=timeline,
+    )
+
+    assert [fact["id"] for fact in facts] == [
+        "lineage_two",
+        "lineage_one_latest",
+    ]
 
 
 def test_agent_session_write(tmp_path: Path) -> None:

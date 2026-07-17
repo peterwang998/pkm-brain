@@ -15,6 +15,8 @@ from pkm_brain.regeneration import (
     backup_runtime_brain,
     export_human_state,
     rebuild_facts_from_sources,
+    rebuild_provider_ready_summary,
+    reset_rebuild_derived_state,
 )
 from pkm_brain.service import BrainService
 
@@ -132,6 +134,56 @@ def test_backup_runtime_brain_includes_committed_wal_pages(tmp_path: Path) -> No
     assert value == "committed-in-wal"
 
 
+def test_reset_dismisses_only_open_extractor_actions(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+
+    def proposed_action(label: str, proposed_by: str) -> dict[str, object]:
+        return propose_action(
+            paths,
+            "fact_upsert",
+            action_payload={"fact": {"statement": f"{label} fact."}},
+            proposed_by=proposed_by,
+        )
+
+    extractor_proposed = proposed_action("Extractor proposed", "extractor")
+    extractor_review = proposed_action("Extractor review", "extractor")
+    extractor_applied = proposed_action("Extractor applied", "extractor")
+    manual_proposed = proposed_action("Manual proposed", "user")
+    with connection(paths.sqlite_path) as conn:
+        conn.execute(
+            "UPDATE cos_actions SET status = 'needs_human' WHERE id = ?",
+            (extractor_review["id"],),
+        )
+        conn.execute(
+            "UPDATE cos_actions SET status = 'applied' WHERE id = ?",
+            (extractor_applied["id"],),
+        )
+
+    result = reset_rebuild_derived_state(paths, run_id="regen_reset_test")
+
+    with connection(paths.sqlite_path) as conn:
+        actions = {
+            str(row["id"]): row
+            for row in conn.execute(
+                "SELECT id, status, evidence_json FROM cos_actions"
+            )
+        }
+
+    assert result["dismissed_open_extractor_action_count"] == 2
+    for action in (extractor_proposed, extractor_review):
+        row = actions[str(action["id"])]
+        evidence = json.loads(row["evidence_json"])
+        assert row["status"] == "dismissed"
+        assert evidence["payload"] == action["evidence_json"]["payload"]
+        marker = evidence["regeneration_reset"]
+        assert marker["dismissed_at"]
+        assert marker["reason"] == "stale_after_from_source_regeneration_reset"
+        assert marker["run_id"] == "regen_reset_test"
+    assert actions[str(extractor_applied["id"])]["status"] == "applied"
+    assert actions[str(manual_proposed["id"])]["status"] == "proposed"
+
+
 def test_rebuild_facts_dry_run_reports_scope_without_mutating(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
     BrainService(paths).init_workspace()
@@ -222,6 +274,83 @@ def test_rebuild_facts_dry_run_reports_labeled_eval_gate_ready(tmp_path: Path) -
     assert result["extraction_eval_gate"]["ready"] is True
     assert result["extraction_eval_gate"]["label_policy"] == "labeled"
     assert result["extraction_eval_gate"]["label_case_count"] == 1
+
+
+def test_rebuild_provider_readiness_only_allows_configured_reviewer_overlap(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    paths.config_local.mkdir(parents=True)
+    (paths.config_local / "cos_llm.yaml").write_text(
+        "rebuild:\n  allow_critic_auditor_model_overlap: true\n",
+        encoding="utf-8",
+    )
+    reviewer_overlap = (
+        "critic and auditor use the same provider/model; audit independence is reduced"
+    )
+    proposer_overlap = (
+        "auditor uses the same provider/model as extractor; "
+        "separation of duties is not independent"
+    )
+    status = ready_provider_status(paths)
+    status["warnings"] = [reviewer_overlap, proposer_overlap]
+
+    summary = rebuild_provider_ready_summary(paths, status)
+
+    assert summary["warnings"] == [reviewer_overlap, proposer_overlap]
+    assert summary["allowed_warnings"] == [reviewer_overlap]
+    assert summary["blocking_warnings"] == [proposer_overlap]
+
+
+def test_rebuild_allows_luna_critic_overlap_only_with_independent_auditor(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    paths.config_local.mkdir(parents=True)
+    (paths.config_local / "cos_llm.yaml").write_text(
+        "rebuild:\n  allow_critic_proposer_model_overlap: true\n",
+        encoding="utf-8",
+    )
+    warning = (
+        "critic uses the same provider/model as extractor; "
+        "separation of duties is not independent"
+    )
+    roles = [
+        {
+            "role": "extractor",
+            "configured": True,
+            "missing": [],
+            "provider": "codex",
+            "model": "gpt-5.6-luna",
+        },
+        {
+            "role": "critic",
+            "configured": True,
+            "missing": [],
+            "provider": "codex",
+            "model": "gpt-5.6-luna",
+        },
+        {
+            "role": "auditor",
+            "configured": True,
+            "missing": [],
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+        },
+    ]
+
+    independent = rebuild_provider_ready_summary(
+        paths, {"roles": roles, "warnings": [warning]}
+    )
+    assert independent["allowed_warnings"] == [warning]
+    assert independent["blocking_warnings"] == []
+
+    roles[-1]["model"] = "gpt-5.6-luna"
+    correlated = rebuild_provider_ready_summary(
+        paths, {"roles": roles, "warnings": [warning]}
+    )
+    assert correlated["allowed_warnings"] == []
+    assert correlated["blocking_warnings"] == [warning]
 
 
 def test_rebuild_facts_apply_resets_with_contract_seed_and_reapplies_confirmation(
@@ -342,6 +471,22 @@ def test_rebuild_facts_apply_resets_with_contract_seed_and_reapplies_confirmatio
         fact_entity_count = conn.execute("SELECT COUNT(*) FROM fact_entities WHERE id = 'fe_legacy'").fetchone()[0]
         legacy_question = conn.execute("SELECT status FROM open_questions WHERE id = 'question_legacy'").fetchone()
         contract_count = conn.execute("SELECT COUNT(*) FROM page_contracts WHERE status = 'active'").fetchone()[0]
+        legacy_revisions = conn.execute(
+            """
+            SELECT status, revision_status, revision_number, created_at, knowledge_to
+            FROM facts
+            WHERE assertion_lineage_id = 'fact_legacy'
+            ORDER BY revision_number
+            """
+        ).fetchall()
+        rebuilt_revisions = conn.execute(
+            """
+            SELECT confirmed_by_user, revision_number, created_at, knowledge_to
+            FROM facts
+            WHERE assertion_lineage_id = 'fact_rebuilt'
+            ORDER BY revision_number
+            """
+        ).fetchall()
 
     assert legacy["status"] == "archived"
     assert rebuilt["status"] == "active"
@@ -350,6 +495,13 @@ def test_rebuild_facts_apply_resets_with_contract_seed_and_reapplies_confirmatio
     assert fact_entity_count == 0
     assert legacy_question["status"] == "dismissed"
     assert contract_count == 1
+    assert [row["revision_number"] for row in legacy_revisions] == [1, 2]
+    assert legacy_revisions[0]["status"] == "revision_closed"
+    assert legacy_revisions[0]["revision_status"] == "active"
+    assert legacy_revisions[0]["knowledge_to"] == legacy_revisions[1]["created_at"]
+    assert [row["confirmed_by_user"] for row in rebuilt_revisions] == [0, 1]
+    assert [row["revision_number"] for row in rebuilt_revisions] == [1, 2]
+    assert rebuilt_revisions[0]["knowledge_to"] == rebuilt_revisions[1]["created_at"]
 
 
 def test_rebuild_facts_apply_continuation_does_not_reset_existing_rebuilt_state(

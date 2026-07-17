@@ -28,6 +28,8 @@ from .embeddings import (
     passage_embedding_text,
     resolve_embedding_provider,
 )
+from .fact_records import fact_citation_snapshots, slim_fact_for_context
+from .fact_retrieval import search_temporal_facts
 from .indexes import (
     VectorIndexUnavailable,
     delete_vectors,
@@ -41,6 +43,7 @@ from .indexes import (
     vector_chunk_ids,
 )
 from .paths import BrainPaths, local_node_id
+from .temporal import TemporalRetrievalRequest
 from .title_utils import bounded_document_title
 from .util import file_sha256, new_id, now_iso, slugify, token_count as estimate_tokens
 
@@ -236,7 +239,6 @@ MEMORY_CANDIDATE_SCORE_FLOOR = 2
 FACT_SCORE_FLOOR = 12.0
 FACT_TRUTH_CONFIDENCE_FLOOR = 0.5
 FACT_FTS_SCORE_CAP = 12.0
-FACT_CANDIDATE_MULTIPLIER = 4
 FACT_KNEE_DROP = 10.0
 FACT_KNEE_MIN_RANK = 3
 NEGATIVE_CONTROL_CONTEXT_MARKERS = (
@@ -1772,38 +1774,83 @@ class BrainService:
         mode: str = DEFAULT_RETRIEVAL_MODE,
         debug: bool = False,
         *,
+        valid_as_of: str | None = None,
+        known_as_of: str | None = None,
+        event_as_of: str | None = None,
+        event_kind: str | None = None,
+        temporal_mode: str | None = None,
         record_telemetry: bool = True,
     ) -> dict[str, Any]:
         self._ensure_workspace()
         policy = retrieval_policy(mode, budget)
         query = f"{project or ''} {task}".strip()
-        chunk_candidates, fanout_debug = self._fanout_chunk_candidates(query, limit=60)
+        temporal = TemporalRetrievalRequest.resolve(
+            task,
+            valid_as_of,
+            known_as_of=known_as_of,
+            event_as_of=event_as_of,
+            event_kind=event_kind,
+            temporal_mode=temporal_mode,
+        )
+        if temporal.include_supporting_chunks:
+            chunk_candidates, fanout_debug = self._fanout_chunk_candidates(
+                query, limit=60
+            )
+        else:
+            chunk_candidates = []
+            fanout_debug = {
+                "lexical": [],
+                "vector": [],
+                "vector_unavailable_reason": None,
+                "fused": [],
+                "candidate_ids": [],
+                "temporal_omission": "knowledge_time",
+            }
         lineage_scores = self._lineage_scores_for_chunks(chunk_candidates)
         reranked_chunks = rerank_chunks(
-            query, chunk_candidates, fanout_debug, lineage_scores=lineage_scores
-        )
-        relevant_facts = self.search_facts(query, limit=min(8, policy.max_chunks))
-        supporting_chunks = select_context_chunks(
-            suppress_chunks_covered_by_facts(reranked_chunks, relevant_facts),
-            query=query,
-            policy=policy,
-        )
-        wiki_pages = self.select_wiki_pages(
-            query, supporting_chunks, limit=policy.max_wiki_pages
-        )
-        memories = relevant_memories_for_query(
-            self.active_memories(project),
             query,
-            limit=policy.max_memories,
-            score_floor=MEMORY_ACTIVE_SCORE_FLOOR,
+            chunk_candidates,
+            fanout_debug,
+            lineage_scores=lineage_scores,
+            apply_recency=temporal.include_current_layers,
         )
-        candidate_memories = relevant_memories_for_query(
-            self.candidate_memories(project),
+        relevant_facts = self.search_facts(
             query,
-            limit=min(policy.max_memories, 3),
-            score_floor=MEMORY_CANDIDATE_SCORE_FLOOR,
+            limit=min(8, policy.max_chunks),
+            temporal_request=temporal,
         )
-        open_questions = self.relevant_open_questions(query, limit=5)
+        supporting_chunks = (
+            []
+            if not temporal.include_supporting_chunks
+            else select_context_chunks(
+                suppress_chunks_covered_by_facts(reranked_chunks, relevant_facts),
+                query=query,
+                policy=policy,
+            )
+        )
+        if temporal.include_current_layers:
+            wiki_pages = self.select_wiki_pages(
+                query, supporting_chunks, limit=policy.max_wiki_pages
+            )
+            memories = relevant_memories_for_query(
+                self.active_memories(project),
+                query,
+                limit=policy.max_memories,
+                score_floor=MEMORY_ACTIVE_SCORE_FLOOR,
+            )
+            candidate_memories = relevant_memories_for_query(
+                self.candidate_memories(project),
+                query,
+                limit=min(policy.max_memories, 3),
+                score_floor=MEMORY_CANDIDATE_SCORE_FLOOR,
+            )
+            open_questions = self.relevant_open_questions(query, limit=5)
+        else:
+            # These projections are current-state artifacts without version history.
+            wiki_pages = []
+            memories = []
+            candidate_memories = []
+            open_questions = []
         citation_snapshots = (
             fact_citation_snapshots(relevant_facts)
             + chunk_citation_snapshots(supporting_chunks)
@@ -1826,6 +1873,7 @@ class BrainService:
             debug=debug,
         )
         retrieval_debug["assessment"] = assessment
+        retrieval_debug["temporal"] = temporal.debug()
         if fanout_debug.get("vector_unavailable_reason"):
             assessment["reasons"].append(
                 f"vector_search unavailable: {fanout_debug['vector_unavailable_reason']}"
@@ -1873,6 +1921,7 @@ class BrainService:
             "retrieval_verdict": assessment["verdict"],
             "retrieval_confidence": assessment["confidence"],
             "retrieval_reasons": assessment["reasons"],
+            "temporal": temporal.envelope(),
             "active_memories": memories,
             "candidate_memories": candidate_memories,
             "relevant_wiki_pages": wiki_pages,
@@ -2288,105 +2337,37 @@ class BrainService:
         )
         return results[:limit]
 
-    def search_facts(self, query: str, limit: int = 8) -> list[dict[str, Any]]:
+    def search_facts(
+        self,
+        query: str,
+        limit: int = 8,
+        *,
+        valid_as_of: str | None = None,
+        temporal_request: TemporalRetrievalRequest | None = None,
+    ) -> list[dict[str, Any]]:
         self.init_workspace()
         fts_query = build_fts_query(query)
-        if not fts_query:
+        if not fts_query or limit <= 0:
             return []
+        if temporal_request is not None and valid_as_of is not None:
+            raise ValueError(
+                "temporal_request and valid_as_of cannot both be provided"
+            )
+        temporal = temporal_request or TemporalRetrievalRequest.resolve(
+            query, valid_as_of
+        )
         with connection(self.paths.sqlite_path) as conn:
-            candidate_limit = max(limit * FACT_CANDIDATE_MULTIPLIER, limit)
-            found = rows(
+            return search_temporal_facts(
                 conn,
-                """
-                SELECT target_id AS fact_id, bm25(retrieval_fts) AS score
-                FROM retrieval_fts
-                WHERE retrieval_fts MATCH ?
-                  AND kind = 'fact'
-                ORDER BY score
-                LIMIT ?
-                """,
-                (fts_query, candidate_limit),
+                fts_query=fts_query,
+                query=query,
+                limit=limit,
+                request=temporal,
+                truth_confidence_floor=FACT_TRUTH_CONFIDENCE_FLOOR,
+                row_to_retrieval_fact=row_to_retrieval_fact,
+                score_fact=score_retrieval_fact_for_query,
+                cut_facts=dynamic_fact_cut,
             )
-            fact_ids = [str(row["fact_id"]) for row in found if row["fact_id"]]
-            fts_scores = {
-                str(row["fact_id"]): float(row["score"] or 0.0) for row in found
-            }
-            if not fact_ids:
-                return []
-            placeholders = ",".join("?" for _ in fact_ids)
-            fact_rows = rows(
-                conn,
-                f"""
-                SELECT *
-                FROM facts
-                WHERE id IN ({placeholders})
-                  AND status IN ('active', 'conflicted')
-                  AND COALESCE(truth_confidence, confidence, 0) >= ?
-                """,
-                [*fact_ids, FACT_TRUTH_CONFIDENCE_FLOOR],
-            )
-            facts_by_id = {}
-            for row in fact_rows:
-                fact_id = str(row["id"])
-                fact = row_to_retrieval_fact(
-                    row,
-                    0.0,
-                    fts_score=fts_scores.get(fact_id, 0.0),
-                )
-                scored_fact = score_retrieval_fact_for_query(
-                    fact,
-                    query,
-                    fts_scores.get(fact_id, 0.0),
-                )
-                if scored_fact:
-                    facts_by_id[fact_id] = scored_fact
-            conflict_group_ids = sorted(
-                {
-                    str(fact.get("conflict_group_id") or "")
-                    for fact in facts_by_id.values()
-                    if fact.get("status") == "conflicted"
-                    and fact.get("conflict_group_id")
-                }
-            )
-            contested_by_group: dict[str, list[dict[str, Any]]] = {}
-            if conflict_group_ids:
-                group_placeholders = ",".join("?" for _ in conflict_group_ids)
-                for row in conn.execute(
-                    f"""
-                    SELECT *
-                    FROM facts
-                    WHERE conflict_group_id IN ({group_placeholders})
-                      AND status = 'conflicted'
-                      AND COALESCE(truth_confidence, confidence, 0) >= ?
-                    ORDER BY created_at
-                    """,
-                    [*conflict_group_ids, FACT_TRUTH_CONFIDENCE_FLOOR],
-                ):
-                    fact_id = str(row["id"])
-                    fact = row_to_retrieval_fact(
-                        row,
-                        0.0,
-                        fts_score=fts_scores.get(fact_id, 0.0),
-                    )
-                    contested_by_group.setdefault(
-                        str(row["conflict_group_id"]), []
-                    ).append(fact)
-            ordered = [
-                facts_by_id[fact_id] for fact_id in fact_ids if fact_id in facts_by_id
-            ]
-            ordered.sort(
-                key=lambda fact: (
-                    -float(fact.get("retrieval_score") or 0.0),
-                    float(fact.get("fts_score") or 0.0),
-                    str(fact.get("id") or ""),
-                )
-            )
-            ordered = dynamic_fact_cut(ordered, limit)
-        for fact in ordered:
-            group_id = str(fact.get("conflict_group_id") or "")
-            if group_id and group_id in contested_by_group:
-                fact["contested_facts"] = contested_by_group[group_id]
-        return ordered
 
     def select_wiki_pages(
         self,
@@ -3024,6 +3005,8 @@ def rerank_chunks(
     chunks: list[dict[str, Any]],
     fanout_debug: dict[str, Any],
     lineage_scores: dict[str, dict[str, Any]] | None = None,
+    *,
+    apply_recency: bool = True,
 ) -> list[dict[str, Any]]:
     terms = important_query_terms(query)
     specific_terms = specific_query_terms(query)
@@ -3169,7 +3152,7 @@ def rerank_chunks(
             score -= 4.0
             reasons.append("agent log downranked for non-agent query (-4)")
 
-        if not suppressed:
+        if not suppressed and apply_recency:
             recency_boost, recency_reason = recency_score(candidate)
             if recency_boost:
                 if recency_intent:
@@ -3405,39 +3388,6 @@ def slim_wiki_page_for_context(page: dict[str, Any]) -> dict[str, Any]:
             "managed": page.get("managed"),
         }
     )
-
-
-def slim_fact_for_context(fact: dict[str, Any]) -> dict[str, Any]:
-    output = keep_present(
-        {
-            "id": fact.get("id"),
-            "statement": fact.get("statement"),
-            "entity_key": fact.get("entity_key"),
-            "page_hint": fact.get("page_hint"),
-            "section_hint": fact.get("section_hint"),
-            "source_ids": list(fact.get("source_ids") or [])[:3],
-            "observed_at": fact.get("observed_at"),
-            "confidence": fact.get("confidence"),
-            "source_spans": fact.get("source_spans"),
-            "evidence_quote": truncate_for_packet(
-                str(fact.get("evidence_quote") or ""), 1200
-            ),
-            "extraction_method": fact.get("extraction_method"),
-            "extractor_model": fact.get("extractor_model"),
-            "truth_confidence": fact.get("truth_confidence"),
-            "status": fact.get("status"),
-            "retrieval_score": fact.get("retrieval_score"),
-            "authoritative": fact.get("authoritative"),
-            "contested": fact.get("contested"),
-            "conflict_group_id": fact.get("conflict_group_id"),
-        }
-    )
-    contested = fact.get("contested_facts")
-    if isinstance(contested, list):
-        output["contested_facts"] = [
-            slim_fact_for_context(row) for row in contested[:3] if isinstance(row, dict)
-        ]
-    return output
 
 
 def slim_chunk_for_context(chunk: dict[str, Any]) -> dict[str, Any]:
@@ -4242,6 +4192,10 @@ def score_retrieval_fact_for_query(
             str(fact.get("section_hint") or ""),
             str(fact.get("entity_key") or ""),
             str(fact.get("evidence_quote") or ""),
+            str(fact.get("temporal_expression") or ""),
+            str(fact.get("event_time_expression") or ""),
+            str(fact.get("event_start_at") or ""),
+            str(fact.get("event_end_at") or ""),
             " ".join(str(source_id) for source_id in fact.get("source_ids") or []),
         ]
     )
@@ -4372,26 +4326,6 @@ def row_value(row: Any, key: str, default: Any = None) -> Any:
 
 def _descending_text_sort_key(value: str) -> tuple[int, ...]:
     return tuple(-ord(char) for char in value)
-
-
-def fact_citation_snapshots(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    snapshots: list[dict[str, Any]] = []
-    for fact in facts:
-        snapshots.append(
-            {
-                "type": "fact",
-                "fact_id": fact.get("id"),
-                "statement": fact.get("statement"),
-                "status": fact.get("status"),
-                "page_hint": fact.get("page_hint"),
-                "source_ids": fact.get("source_ids") or [],
-                "source_spans": fact.get("source_spans") or [],
-                "truth_confidence": fact.get("truth_confidence"),
-                "contested": bool(fact.get("contested")),
-                "conflict_group_id": fact.get("conflict_group_id"),
-            }
-        )
-    return snapshots
 
 
 def insert_context_lineage_event(

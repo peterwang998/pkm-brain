@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from pkm_brain.evals import relation_from_answer, run_eval
-from pkm_brain.fact_relations import classify_fact_relation
+from pkm_brain.fact_relations import classify_fact_relation, explicitly_dated
 from pkm_brain.paths import BrainPaths
 from pkm_brain.service import BrainService
 
@@ -28,7 +28,9 @@ def test_relation_classifier_treats_progression_as_complementary() -> None:
     assert result.compatible is True
 
 
-def test_relation_classifier_does_not_conflict_distinct_claims_on_broad_entity() -> None:
+def test_relation_classifier_does_not_conflict_distinct_claims_on_broad_entity() -> (
+    None
+):
     existing = {
         "id": "fact_401k",
         "statement": "Northwind's 401(k) match was 100% on contributions up to 1% of base salary.",
@@ -83,7 +85,86 @@ def test_relation_classifier_respects_explicit_entity_mismatch() -> None:
     assert result.relation == "unrelated"
 
 
-def test_relation_eval_does_not_treat_generic_rejection_as_contradiction_label() -> None:
+def test_source_and_knowledge_timestamps_do_not_make_fact_world_dated() -> None:
+    fact = {
+        "statement": "Atlas is in beta.",
+        "observed_at": "2026-03-01T12:00:00+00:00",
+        "created_at": "2026-03-02T12:00:00+00:00",
+    }
+
+    assert explicitly_dated(fact) is False
+    assert explicitly_dated({**fact, "valid_from": "2026-03-01"}) is True
+
+
+def test_same_statement_in_distinct_intervals_is_update_not_duplicate() -> None:
+    existing = {
+        "id": "fact_march",
+        "statement": "Atlas is in beta.",
+        "entity_key": "project:atlas:phase",
+        "temporal_kind": "time_bound",
+        "valid_from": "2026-03-01",
+        "valid_to": "2026-04-01",
+        "valid_time_precision": "day",
+    }
+    candidate = {
+        **existing,
+        "id": "fact_may",
+        "valid_from": "2026-05-01",
+        "valid_to": "2026-06-01",
+    }
+
+    relation = classify_fact_relation(candidate, existing)
+
+    assert relation.relation == "updates"
+
+
+def test_conflicting_deadline_dates_do_not_imply_temporal_update() -> None:
+    existing = {
+        "id": "fact_deadline_july_20",
+        "statement": "The Atlas proposal deadline is July 20, 2026.",
+        "entity_key": "project:atlas:deadline",
+        "page_hint": "projects/atlas.md",
+    }
+    candidate = {
+        "id": "fact_deadline_july_30",
+        "statement": "The Atlas proposal deadline is July 30, 2026.",
+        "entity_key": "project:atlas:deadline",
+        "page_hint": "projects/atlas.md",
+    }
+
+    relation = classify_fact_relation(candidate, existing)
+
+    assert relation.relation == "contradicts"
+    assert relation.compatible is False
+
+
+def test_deadline_change_with_non_overlapping_valid_intervals_is_update() -> None:
+    existing = {
+        "id": "fact_deadline_july_20",
+        "statement": "The Atlas proposal deadline is July 20, 2026.",
+        "entity_key": "project:atlas:deadline",
+        "page_hint": "projects/atlas.md",
+        "temporal_kind": "time_bound",
+        "valid_from": "2026-07-01",
+        "valid_to": "2026-07-21",
+        "valid_time_precision": "day",
+    }
+    candidate = {
+        **existing,
+        "id": "fact_deadline_july_30",
+        "statement": "The Atlas proposal deadline is July 30, 2026.",
+        "valid_from": "2026-07-21",
+        "valid_to": "2026-08-01",
+    }
+
+    relation = classify_fact_relation(candidate, existing)
+
+    assert relation.relation == "updates"
+
+
+def test_relation_eval_does_not_treat_generic_rejection_as_contradiction_label() -> (
+    None
+):
     assert relation_from_answer({"decision": "dismiss", "reason": "not useful"}) is None
     assert relation_from_answer({"decision": "keep_existing"}) is None
     assert relation_from_answer({"decision": "both_true"}) == "complementary"
