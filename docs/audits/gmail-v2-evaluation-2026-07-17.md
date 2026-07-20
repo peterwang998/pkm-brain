@@ -1,6 +1,8 @@
 # Gmail Brain v2 Evaluation — 2026-07-17
 
 **Status:** isolated corpus and filtering evaluation complete; fact-quality and temporal-recall acceptance not met
+
+**Follow-up:** the content-safe full-history replay and relaxed promotion gates are recorded in [Historical Gmail Temporal Evaluation — 2026-07-19](gmail-temporal-history-evaluation-2026-07-19.md). That replay confirms admission parity and deterministic safety while localizing the remaining failure to temporal association recall.
 **Environment:** `/Users/Peter/brain-v2`; the live Brain was not modified
 **Models:** external Codex CLI only — `gpt-5.6-luna` low for extraction, `gpt-5.6-luna` medium for critic and route resolution, and `gpt-5.6-sol` medium for the final sampled judge
 
@@ -111,7 +113,7 @@ The current temporal path has useful structural safeguards:
 
 These constraints stopped several earlier cross-occurrence paths, but they are too brittle for ordinary email prose. None of the fresh v6 run's 42 candidates retained a structured event time, even though the source gate intentionally selected important-temporal material, and nine temporal warnings remained. The architecture is structurally safer and empirically low-recall. It should stay isolated until a broader labeled set demonstrates both event-identity precision and useful recall for natural-language dates, ranges, timezones, cancellations, and reschedules.
 
-The four fresh Sol failures showed the deeper version of the route problem: even a real existing event page cannot substitute for occurrence evidence in the current source. The post-run repair now makes Gmail routing consume only a structured `event_time` that survived Gmail temporal validation, or an already applied, critic-agreed same-source occurrence anchor. It cannot recreate a rejected time from looser regexes over model-authored statements. This closes the observed deterministic path in tests, but it does not repair the zero-recall temporal parser and has not yet passed another external Gmail audit.
+The four fresh Sol failures showed the deeper version of the route problem: even a real existing event page cannot substitute for occurrence evidence in the current source. The post-run repair makes Gmail routing consume only a structured `event_time` that survived Gmail temporal validation and cannot recreate a rejected time from looser regexes over model-authored statements. A 2026-07-19 follow-up found that precheck can identify an already applied, critic-agreed same-source occurrence anchor, but final apply does not yet have a replayable provenance contract for that anchor; it therefore remains review-only and is not claimed as apply-eligible. The structured-time guard closes the observed deterministic path in tests, but it does not repair the low-recall temporal parser or replace another external Gmail audit.
 
 ## Privacy Incident, Rollback, And Boundary
 

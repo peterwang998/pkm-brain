@@ -28,9 +28,8 @@ from .event_projection import (
     structured_source_event_candidate,
 )
 from .event_routing import (
-    enrich_event_route_targets,
-    guard_event_candidate_route,
-    guard_event_candidate_routes,
+    enrich_event_route_targets, mint_stabilized_gmail_event_time,
+    guard_event_candidate_route, guard_event_candidate_routes,
 )
 from .extraction_contract import (
     COMPATIBLE_EXTRACTION_PROMPT_VERSIONS,
@@ -3795,6 +3794,7 @@ def validate_extracted_facts_with_report(
                 )
             )
             candidate = strip_event_time(candidate)
+        candidate = mint_stabilized_gmail_event_time(candidate, stabilization=gmail_event_time)
         candidate = guard_event_candidate_route(candidate, route_targets)
         candidate["metadata"] = {
             **candidate["metadata"],

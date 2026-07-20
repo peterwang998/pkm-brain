@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import re
 from datetime import date, timedelta
 from pathlib import Path
@@ -16,6 +19,14 @@ EVENT_ROUTE_REVIEW_REASONS = {
     "event_temporal_identity_unresolved",
 }
 _EVENT_ROUTE_GUARD = "event_temporal_identity_v1"
+_GMAIL_EVENT_TIME_PROVENANCE = "gmail_event_time_provenance_v1"
+_EVENT_TIME_FLAT_FIELDS = (
+    "event_time_kind",
+    "event_start_at",
+    "event_end_at",
+    "event_time_precision",
+    "event_time_expression",
+)
 _MONTHS = {
     "jan": 1,
     "january": 1,
@@ -426,6 +437,7 @@ def guard_event_page_attachment(
 def assert_extraction_event_route_safe(conn: Any, fact: dict[str, Any]) -> None:
     """Defense in depth for action paths that bypass extraction decisions."""
 
+    assert_gmail_event_time_apply_safe(conn, fact)
     if not extraction_event_candidate(fact):
         return
     current_page = str(fact.get("page_hint") or "")
@@ -463,10 +475,10 @@ def extraction_event_candidate(candidate: dict[str, Any]) -> bool:
 
 def candidate_event_intervals(candidate: dict[str, Any]) -> list[EventInterval]:
     raw_event_time = candidate.get("event_time")
-    is_gmail = (
-        str(candidate_metadata(candidate).get("source_type") or "")
-        == "gmail_thread"
-    )
+    is_gmail = candidate_is_gmail(candidate)
+    if is_gmail and raw_event_time is not None:
+        if not gmail_event_time_provenance_is_valid(candidate):
+            return []
     start_at: str | None = None
     end_at: str | None = None
     expression: str | None = None
@@ -504,6 +516,11 @@ def candidate_event_intervals(candidate: dict[str, Any]) -> list[EventInterval]:
 
 def candidate_event_bounds(candidate: dict[str, Any]) -> list[tuple[str, str]]:
     raw_event_time = candidate.get("event_time")
+    if candidate_is_gmail(candidate):
+        if not isinstance(raw_event_time, dict):
+            return []
+        if not gmail_event_time_provenance_is_valid(candidate):
+            return []
     if isinstance(raw_event_time, dict):
         start = canonical_event_bound(str(raw_event_time.get("start_at") or ""))
         end = canonical_event_bound(str(raw_event_time.get("end_at") or ""))
@@ -511,6 +528,321 @@ def candidate_event_bounds(candidate: dict[str, Any]) -> list[tuple[str, str]]:
         start = canonical_event_bound(str(candidate.get("event_start_at") or ""))
         end = canonical_event_bound(str(candidate.get("event_end_at") or ""))
     return [(start, end or "")] if start else []
+
+
+def mint_stabilized_gmail_event_time(
+    candidate: dict[str, Any], *, stabilization: Any
+) -> dict[str, Any]:
+    """Bind a deterministic Gmail temporal result to its exact evidence.
+
+    The extraction adapter constructs candidate metadata itself, so model output
+    cannot mint this receipt.  The receipt detects mutation while the independent
+    apply-time replay below remains the authority across persisted action payloads.
+    """
+
+    if not candidate_is_gmail(candidate) or candidate.get("event_time") is None:
+        return candidate
+    from .gmail_temporal import GmailEventTimeStabilization
+
+    metadata = candidate_metadata(candidate)
+    audit = metadata.get("gmail_event_time_stabilization")
+    if (
+        not isinstance(stabilization, GmailEventTimeStabilization)
+        or not _stabilized_gmail_audit(audit)
+        or stabilization.audit != audit
+        or _canonical_gmail_event_time(stabilization.event_time)
+        != _canonical_gmail_event_time(candidate.get("event_time"))
+        or _primary_event_receipt(stabilization.entity_mentions)
+        != _primary_event_receipt(_candidate_entity_mentions(candidate))
+    ):
+        return candidate
+    minted = dict(candidate)
+    metadata["gmail_event_time_provenance"] = {
+        "version": _GMAIL_EVENT_TIME_PROVENANCE,
+        "digest_sha256": _gmail_event_time_provenance_digest(candidate),
+    }
+    minted["metadata"] = metadata
+    return minted
+
+
+def gmail_event_time_provenance_is_valid(candidate: dict[str, Any]) -> bool:
+    """Return whether a Gmail event clock still matches its trusted receipt."""
+
+    if not candidate_is_gmail(candidate) or not isinstance(
+        candidate.get("event_time"), dict
+    ):
+        return False
+    if not _gmail_event_time_flats_match_nested(candidate):
+        return False
+    metadata = candidate_metadata(candidate)
+    if not _stabilized_gmail_audit(
+        metadata.get("gmail_event_time_stabilization")
+    ):
+        return False
+    provenance = metadata.get("gmail_event_time_provenance")
+    if not isinstance(provenance, dict) or provenance.get("version") != (
+        _GMAIL_EVENT_TIME_PROVENANCE
+    ):
+        return False
+    supplied = str(provenance.get("digest_sha256") or "")
+    expected = _gmail_event_time_provenance_digest(candidate)
+    return bool(supplied) and hmac.compare_digest(supplied, expected)
+
+
+def assert_gmail_event_time_apply_safe(conn: Any, fact: dict[str, Any]) -> None:
+    """Replay Gmail temporal stabilization from stored cited source text.
+
+    This check intentionally does not trust ``source_type``, the stabilization
+    audit, or its digest in the action payload.  Cited chunk ownership is loaded
+    from SQLite, closing direct-action and metadata-spoofing entry points.
+    """
+
+    has_nested_event_time = isinstance(fact.get("event_time"), dict)
+    has_flat_event_time = _has_nonempty_event_time_flats(fact)
+    if not has_nested_event_time and not has_flat_event_time:
+        return
+    spans = _candidate_chunk_spans(fact)
+    span_chunk_ids = {str(span["chunk_id"]) for span in spans}
+    referenced_chunk_ids = {
+        source_id.removeprefix("chunk:")
+        for source_id in candidate_source_ids(fact)
+        if source_id.startswith("chunk:")
+    }
+    chunk_ids = sorted(span_chunk_ids | referenced_chunk_ids)
+    document_ids = sorted(_candidate_document_ids(fact))
+    contexts: dict[str, dict[str, Any]] = {}
+    source_types: set[str] = set()
+    document_source_types: set[str] = set()
+    if chunk_ids:
+        placeholders = ",".join("?" for _ in chunk_ids)
+        for row in conn.execute(
+            f"""
+            SELECT c.id, c.text, d.source_type
+            FROM chunks c
+            JOIN documents d ON d.id = c.document_id
+            WHERE c.id IN ({placeholders})
+            """,
+            chunk_ids,
+        ):
+            chunk_id = str(row["id"])
+            contexts[chunk_id] = {"text": str(row["text"] or "")}
+            source_types.add(str(row["source_type"] or ""))
+    if document_ids:
+        placeholders = ",".join("?" for _ in document_ids)
+        for row in conn.execute(
+            f"SELECT source_type FROM documents WHERE id IN ({placeholders})",
+            document_ids,
+        ):
+            document_source_types.add(str(row["source_type"] or ""))
+    has_gmail_evidence = "gmail_thread" in (
+        source_types | document_source_types
+    )
+    if not candidate_is_gmail(fact) and not has_gmail_evidence:
+        return
+    if not has_nested_event_time:
+        raise ValueError(
+            "Gmail flat event_time fields require a receipt-backed nested event_time"
+        )
+    if not _gmail_event_time_flats_match_nested(fact):
+        raise ValueError("Gmail flat event_time fields conflict with nested event_time")
+    if not gmail_event_time_provenance_is_valid(fact):
+        raise ValueError(
+            "Gmail event_time lacks valid deterministic stabilization provenance"
+        )
+    if not spans or len(contexts) != len(chunk_ids) or source_types != {
+        "gmail_thread"
+    }:
+        raise ValueError("Gmail event_time cited source chunks are unavailable or mixed")
+    source_ids = candidate_source_ids(fact)
+    if any(f"chunk:{chunk_id}" not in source_ids for chunk_id in chunk_ids):
+        raise ValueError("Gmail event_time provenance is not bound to every cited chunk")
+    evidence_parts: list[str] = []
+    cited_spans: list[dict[str, Any]] = []
+    for span in spans:
+        chunk_id = str(span["chunk_id"])
+        text = str(contexts[chunk_id]["text"])
+        start, end = int(span["start"]), int(span["end"])
+        if start < 0 or end <= start or end > len(text):
+            raise ValueError("Gmail event_time cited source span is invalid")
+        evidence_parts.append(text[start:end])
+        cited_spans.append({"chunk_id": chunk_id, "start": start, "end": end})
+    from .gmail_temporal import stabilize_gmail_event_time
+
+    replay = stabilize_gmail_event_time(
+        source_type="gmail_thread",
+        raw_event_time=fact["event_time"],
+        evidence_text="\n...\n".join(evidence_parts),
+        entity_mentions=_candidate_entity_mentions(fact),
+        cited_spans=cited_spans,
+        chunk_context_by_id=contexts,
+    )
+    if (
+        replay.errors
+        or _canonical_gmail_event_time(replay.event_time)
+        != _canonical_gmail_event_time(fact.get("event_time"))
+        or not _stabilized_gmail_audit(replay.audit)
+        or replay.audit
+        != candidate_metadata(fact).get("gmail_event_time_stabilization")
+        or _primary_event_receipt(replay.entity_mentions)
+        != _primary_event_receipt(_candidate_entity_mentions(fact))
+    ):
+        raise ValueError(
+            "Gmail event_time could not be reproduced from cited source evidence"
+        )
+
+
+def candidate_is_gmail(candidate: dict[str, Any]) -> bool:
+    return str(candidate_metadata(candidate).get("source_type") or "") == (
+        "gmail_thread"
+    )
+
+
+def _gmail_event_time_provenance_digest(candidate: dict[str, Any]) -> str:
+    metadata = candidate_metadata(candidate)
+    payload = {
+        "version": _GMAIL_EVENT_TIME_PROVENANCE,
+        "source_type": metadata.get("source_type"),
+        "statement": str(candidate.get("statement") or ""),
+        "event_time": _canonical_gmail_event_time(candidate.get("event_time")),
+        "primary_event": _primary_event_receipt(_candidate_entity_mentions(candidate)),
+        "evidence_quote": str(candidate.get("evidence_quote") or ""),
+        "source_ids": sorted(candidate_source_ids(candidate)),
+        "source_spans": candidate.get("source_spans"),
+        "stabilization": metadata.get("gmail_event_time_stabilization"),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _canonical_gmail_event_time(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    return {
+        "kind": str(value.get("kind") or "").strip().lower(),
+        "start_at": canonical_event_bound(str(value.get("start_at") or "")),
+        "end_at": canonical_event_bound(str(value.get("end_at") or "")),
+        "precision": str(value.get("precision") or "").strip().lower(),
+        "expression": str(value.get("expression") or "").strip() or None,
+    }
+
+
+def _has_nonempty_event_time_flats(candidate: dict[str, Any]) -> bool:
+    return any(
+        candidate.get(key) is not None and str(candidate.get(key)).strip()
+        for key in _EVENT_TIME_FLAT_FIELDS
+    )
+
+
+def _gmail_event_time_flats_match_nested(candidate: dict[str, Any]) -> bool:
+    nested = _canonical_gmail_event_time(candidate.get("event_time"))
+    if nested is None:
+        return not _has_nonempty_event_time_flats(candidate)
+    normalized_flats = {
+        "event_time_kind": str(candidate.get("event_time_kind") or "")
+        .strip()
+        .lower()
+        or None,
+        "event_start_at": canonical_event_bound(
+            str(candidate.get("event_start_at") or "")
+        ),
+        "event_end_at": canonical_event_bound(
+            str(candidate.get("event_end_at") or "")
+        ),
+        "event_time_precision": str(candidate.get("event_time_precision") or "")
+        .strip()
+        .lower()
+        or None,
+        "event_time_expression": str(candidate.get("event_time_expression") or "")
+        .strip()
+        or None,
+    }
+    nested_by_flat = {
+        "event_time_kind": nested["kind"],
+        "event_start_at": nested["start_at"],
+        "event_end_at": nested["end_at"],
+        "event_time_precision": nested["precision"],
+        "event_time_expression": nested["expression"],
+    }
+    return all(
+        value is None or value == nested_by_flat[key]
+        for key, value in normalized_flats.items()
+    )
+
+
+def _candidate_entity_mentions(candidate: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = candidate.get("entity_mentions")
+    if not isinstance(raw, list):
+        raw = candidate_metadata(candidate).get("model_entity_mentions")
+    return [dict(item) for item in raw or [] if isinstance(item, dict)]
+
+
+def _primary_event_receipt(mentions: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for mention in mentions:
+        if not mention.get("is_primary"):
+            continue
+        if str(mention.get("entity_type") or "").strip().lower() != "event":
+            continue
+        span = mention.get("mention_span")
+        return {
+            "surface": str(mention.get("surface") or "").strip(),
+            "entity_type": "event",
+            "mention_kind": str(mention.get("mention_kind") or "named")
+            .strip()
+            .lower(),
+            "mention_span": {
+                "chunk_id": str(span.get("chunk_id") or ""),
+                "start": span.get("start"),
+                "end": span.get("end"),
+            }
+            if isinstance(span, dict)
+            else None,
+        }
+    return None
+
+
+def _candidate_chunk_spans(candidate: dict[str, Any]) -> list[dict[str, Any]]:
+    spans: list[dict[str, Any]] = []
+    for raw in candidate.get("source_spans") or []:
+        if not isinstance(raw, dict) or not str(raw.get("chunk_id") or ""):
+            continue
+        try:
+            start, end = int(raw["start"]), int(raw["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        spans.append(
+            {"chunk_id": str(raw["chunk_id"]), "start": start, "end": end}
+        )
+    return sorted(spans, key=lambda item: (item["chunk_id"], item["start"], item["end"]))
+
+
+def _candidate_document_ids(candidate: dict[str, Any]) -> set[str]:
+    document_ids = {
+        source_id.removeprefix("document:")
+        for source_id in candidate_source_ids(candidate)
+        if source_id.startswith("document:")
+    }
+    for span in candidate.get("source_spans") or []:
+        if isinstance(span, dict) and str(span.get("document_id") or "").strip():
+            document_ids.add(str(span["document_id"]).strip())
+    metadata = candidate_metadata(candidate)
+    direct_id = str(candidate.get("document_id") or metadata.get("document_id") or "")
+    if direct_id.strip():
+        document_ids.add(direct_id.strip())
+    raw_source_document_ids = metadata.get("source_document_ids")
+    if isinstance(raw_source_document_ids, list):
+        document_ids.update(
+            str(item).strip() for item in raw_source_document_ids if str(item).strip()
+        )
+    document_ids.discard("")
+    return document_ids
+
+
+def _stabilized_gmail_audit(value: Any) -> bool:
+    return bool(
+        isinstance(value, dict)
+        and value.get("status") == "stabilized"
+        and value.get("basis") == "literal_cited_expression"
+    )
 
 
 def explicit_date_intervals(value: str) -> list[EventInterval]:

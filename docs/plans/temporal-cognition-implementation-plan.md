@@ -1,7 +1,7 @@
 # Temporal Cognition Implementation Plan
 
-**Status:** T0-T5 implemented and evaluated in isolated Brain v2; live migration, optional backfill, and controlled promotion remain open
-**Last verified:** 2026-07-17 against the unpromoted temporal-cognition working tree based on baseline commit `d5405b9`; the isolated full-corpus rebuild, targeted repair, final Sol-medium audit, wiki/index refresh, and 963-test suite are complete
+**Status:** T0-T5 implemented and evaluated in isolated Brain v2; T5A evidence-first Gmail discovery, apply-time provenance, and historical replay are complete but Gmail temporal-recall gates failed; T5B association recall, labeled calibration, live lifecycle validation, optional backfill, and controlled promotion remain open
+**Last verified:** 2026-07-19 against the unpromoted temporal-cognition branch based on baseline commit `d5405b9`; the content-safe replay validated all 42,533 Gmail projection files, preserved current fact-admission parity, exposed insufficient direct-grammar temporal coverage, and the full 1,177-test suite passed
 **Owning specs:** [Capture And Knowledge](../specs/capture-and-knowledge.md), [Curation And Review](../specs/curation-and-review.md), and [Retrieval And Memory](../specs/retrieval-and-memory.md)
 
 ## Objective
@@ -24,7 +24,7 @@ Success means:
 - No required temporal classification for every fact.
 - No duplicate fact-extraction pipeline, daemon, scheduled job, provider, or model role.
 - No automatic conversion of operational Calendar items in `ops.sqlite` into durable facts.
-- No processing-time fallback for `observed_at`, guessed historical dates, or implicit resolution of relative phrases.
+- No processing-time fallback for `observed_at`. Inferred-year or relative expressions may be normalized only against the trusted source-message clock with an explicit resolution basis, and remain review-only until their own historical calibration passes.
 - No temporal parse failure may become a base-fact validation failure.
 - No default-retrieval recall loss is acceptable.
 - No destructive legacy cleanup in this tranche.
@@ -36,7 +36,7 @@ Success means:
 
 Extractor v12 proposes the same durable fact as original Brain: statement, evidence-unit references, claim class, entities, route, and extraction/routing/truth confidence. Deterministic validation decides whether that base fact is admissible before considering optional annotation and temporal enrichment. Unsupported durable claim labels and malformed entity annotations fail soft so an evidence-backed base fact survives.
 
-Temporal parsing is a subordinate step. If it fails, Brain records a diagnostic and persists the accepted base fact without the malformed temporal fields.
+Temporal parsing is a subordinate step. Evidence-first discovery may identify exact temporal spans before or independently of model extraction; deterministic normalization owns bounds and provenance, while the model may only associate cited spans with a named event and actual/planned semantics. If discovery, association, or validation fails, Brain records a diagnostic and persists the accepted base fact without malformed temporal fields.
 
 ### 2. Universal Deterministic Clocks
 
@@ -85,7 +85,7 @@ Rules:
 - one atomic fact has at most one `event_time`;
 - a missing, non-event, or ambiguous primary entity invalidates only `event_time`.
 
-`actual` covers occurrence. `planned` covers a schedule, deadline (end only), not-before boundary (start only), or planned window (both). Multiple schedules and plan-to-actual changes are separate source-backed facts/revisions. Relative statements such as “before the summit” remain ordinary facts in this release. Structured meeting bounds default to `planned`; trusted source-artifact update at or after the start is required to project `actual`. Capture and ingestion timestamps do not prove occurrence.
+`actual` covers occurrence. `planned` covers a schedule, deadline (end only), not-before boundary (start only), or planned window (both). Multiple schedules and plan-to-actual changes are separate source-backed facts/revisions. Relative constraints between events remain ordinary facts in this release; a relative calendar expression anchored to one trusted Gmail message clock may be discovered but is review-only. Structured meeting bounds default to `planned`; trusted source-artifact update at or after the start is required to project `actual`. Capture and ingestion timestamps do not prove occurrence.
 
 Migration 24 flattens the object into nullable `event_time_kind`, `event_start_at`, `event_end_at`, `event_time_precision`, and `event_time_expression` columns. Flattening is a storage detail; extractor and service payloads use the nested shape.
 
@@ -212,6 +212,39 @@ T5 gate: no live-home mutation, no material original-capability regression, no u
 
 T5 outcome: complete in the isolated `/Users/Peter/brain-v2` runtime. The final audit snapshot has 1,378 active facts (1,313 Luna semantic facts and 65 structured-event facts), all 19 previously collapsed substantive documents recovered, and zero active timed-fact integrity violations. Sol medium sampled 75 actions, identified two weak named-entity attributions that were reverted, and passed a non-overlapping 25-action post-fix sample. This demonstrates recovered single-model coverage and structural temporal safety; it does not authorize live promotion or establish broad free-text temporal recall.
 
+### T5A — Evidence-First Gmail Discovery And Historical Replay
+
+The full Gmail import is the primary discovery and lifecycle evaluation surface: approximately 6,960 current threads plus every retained immutable revision. This replaces a requirement to wait weeks merely to accumulate coverage, but historical heuristics remain proxy labels rather than human truth.
+
+Deliverables:
+
+- discover temporal expressions deterministically per trusted Gmail message, with exact half-open evidence offsets and no page routing or fact persistence;
+- normalize explicit dates/ranges first, record `resolution_basis` for inferred-year, relative, and timezone decisions, and keep lower-confidence classes review-only;
+- parse structured Calendar/ICS evidence before prose once that attachment projection is available;
+- require an evidence-bound integrity checksum before Gmail event time can route, then independently reload cited chunks and reproduce the clock, primary event, and complete stabilizer audit at apply time;
+- replay both latest-per-thread state and historical revisions, reporting only aggregate funnels, lifecycle cues, proxy coverage, opaque sample hashes, and content-safety status;
+- expose configurable historical gates and clearly distinguish measured gold metrics, classifier-derived proxies, and unavailable metrics.
+
+Historical replay relaxes evaluation volume and waiting-period gates, not safety invariants. Initial calibration may use a 100-item blinded stratified sample rather than 500 manually labeled threads, and a successful full-history replay may reduce the live shadow requirement to a bounded 72-hour incremental canary. Wrong-occurrence routing, private-content leakage, unintended writes, and nondeterministic replay remain zero-tolerance failures.
+
+T5A outcome: the read-only evaluator validated all 42,533 projection files, collapsed 28,306 renderer/classifier variants, and replayed 14,227 unique source revisions across 7,125 opaque thread lineages with zero detector nondeterminism or aggregate-output privacy violations. Current selection exactly matched the isolated runtime: 6,960 active threads, 165 deleted threads, and 356 fact-eligible threads (5.11%, only 0.31 percentage points above the original 4.8% benchmark). The current direct association grammar produced 96 candidates across 77 threads, but only two of 265 classifier-marked important-temporal threads and none of 288 same-message explicit-date proxy threads. All 263 important-temporal misses still contained a temporal-form proxy and temporal cue, demonstrating an association-recall gap rather than absent source time. This is a proxy diagnosis, not labeled recall.
+
+Historical lifecycle depth was weaker than expected. After semantic projection variants were collapsed, all 7,102 adjacent source-revision transitions had identical retained source evidence. The import is therefore a strong cross-sectional syntax, filtering, privacy, and determinism surface, but it cannot validate cancellation/reschedule ordering or incremental freshness. The bounded live canary remains required.
+
+### T5B — Review-Only Temporal Association Recall
+
+Deliverables:
+
+- inventory temporal expressions independently of source classification, including exact spans, normalized options, ambiguity, and resolution basis;
+- inventory event and deadline/action mentions independently of dates, then record association mode as `direct_grammar`, `structured_artifact`, `subject_singleton`, or `classifier_prior_only`;
+- use `important_temporal` only to prioritize an unresolved review lane, never to invent a relation, entity, or date pairing and never as self-validating recall evidence;
+- admit a review-only singleton association only within one trusted message with exactly one supported expression and one event/action mention, no lifecycle cue, and no competing date or event;
+- keep arrival, ending, completion, cancellation, and reschedule semantics out of occurrence-start auto-application; a parent event's terminal boundary is not its start;
+- project and parse Calendar/ICS bodies with UID, sequence, status, DTSTART/DTEND, and timezone before making structured schedules auto-eligible;
+- create a blinded 100-120 item stratified calibration set spanning direct hits, important-temporal misses, explicit-proxy misses, human-mail leads, lifecycle language, and bulk/advertising negatives;
+- freeze the HMAC-opaque cohort before labeling, require complete labels for every selected record, and treat sparse, selectively omitted, duplicate, or stale cohort membership as failed or not evaluated rather than extrapolating from favorable annotations;
+- keep every new association sidecar-only until class-specific calibration succeeds; temporal misses must never suppress the accepted base fact.
+
 ### T6 — Controlled Promotion And Optional Backfill
 
 Deliverables:
@@ -225,7 +258,7 @@ Historical backfill is optional and never implicit. Unknown/absent time is a val
 
 ## Promotion Gates
 
-The feature is promotable only when:
+Hard gates remain mandatory:
 
 - migrations 22-24 are additive, idempotent, and fixture-upgrade tested;
 - extractor v12 preserves base-fact recall and source provenance;
@@ -237,6 +270,17 @@ The feature is promotable only when:
 - existing extraction, relation, retrieval, action-inverse, daemon, and architecture-boundary suites pass;
 - the isolated full-corpus report explains yield and rejection differences;
 - live migration/backfill remains blocked until backup and recovery verification succeeds.
+
+Historical evidence gates are deliberately pragmatic and configurable. They reduce waiting and annotation volume, but proxy breadth never substitutes for correctness:
+
+- the evaluator processes the complete current projection and retained history without emitting private fields or raw expressions;
+- independent direct-association coverage over classifier-marked important-temporal current threads is reported against an 85% review-queue target, explicitly labeled as a proxy rather than recall; classifier-assisted leads are reported separately and cannot satisfy this target by construction;
+- a blinded human-grounded cohort of at least 100 records is frozen before labeling, contains at least five records in each required deterministic stratum, is 100% annotated, and reaches at least 85% human-labeled temporal recall plus 95% supported-time precision with zero critical occurrence, timezone, cancellation, or reschedule errors;
+- the independent `gpt-5.6-sol` medium audit accepts at least 95% of the review-eligible sample with zero critical errors rather than requiring every stylistic judgment to pass;
+- base-fact acceptance and default retrieval remain within two percentage points of the original Brain benchmark, temporal failure never removes a valid base fact, and advertising produces zero auto-applied facts;
+- deterministic replay across retained revisions produces no duplicate active occurrence and preserves cancellation/reschedule order;
+- after cross-sectional historical gates pass, a 72-hour incremental shadow can replace the earlier two-week waiting period before a review-only canary; the canary must still exercise real content-changing revisions because this historical projection did not;
+- automatic application remains limited to separately calibrated direct/structured classes with zero critical errors and at least 99% observed supported-time precision; inferred-year, relative, unzoned, abbreviation-based, cross-span, multi-event, lifecycle, and classifier-assisted associations remain review-only in this release.
 
 ## Cleanup Policy
 

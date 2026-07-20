@@ -1,25 +1,110 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
 
 from pkm_brain.cos_actions import apply_action, decide_action, get_action, propose_action
-from pkm_brain.db import connection
+from pkm_brain.db import connection, dumps
 from pkm_brain.entities import resolve_entity
 from pkm_brain.event_routing import (
+    _gmail_event_time_provenance_digest,
+    candidate_event_bounds,
     candidate_event_intervals,
     explicit_date_intervals,
+    gmail_event_time_provenance_is_valid,
     guard_event_candidate_route,
     guard_event_candidate_routes,
     intervals_compatible,
+    mint_stabilized_gmail_event_time,
+)
+from pkm_brain.extraction import (
+    evidence_units_for_text,
+    validate_extracted_facts_with_report,
 )
 from pkm_brain.paths import BrainPaths
 from pkm_brain.service import BrainService
+from pkm_brain.gmail_temporal import stabilize_gmail_event_time
 
 
 def service_for(tmp_path: Path) -> BrainService:
     return BrainService(BrainPaths.from_value(tmp_path / "brain"))
+
+
+def insert_gmail_temporal_chunk(paths: BrainPaths, text: str) -> None:
+    with connection(paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO documents(
+              id, source_type, title, source_path, raw_path, content_hash,
+              created_at, ingested_at, tags, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "doc_event_route_gmail",
+                "gmail_thread",
+                "Synthetic event route source",
+                "raw/gmail/event-route.md",
+                "raw/gmail/event-route.md",
+                "doc-event-route-hash",
+                "2026-07-19T00:00:00+00:00",
+                "2026-07-19T00:00:00+00:00",
+                dumps(
+                    [
+                        "gmail:delivery:transactional",
+                        "gmail:importance:important-temporal",
+                        "gmail:fact-eligible",
+                    ]
+                ),
+                "active",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO chunks(
+              id, document_id, chunk_index, corpus_type, text, heading_path,
+              start_offset, end_offset, token_count, content_hash, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "chunk_event_route_gmail",
+                "doc_event_route_gmail",
+                0,
+                "raw",
+                text,
+                "",
+                0,
+                len(text),
+                20,
+                "chunk-event-route-hash",
+                "2026-07-19T00:00:00+00:00",
+            ),
+        )
+
+
+def insert_document_only(paths: BrainPaths, document_id: str, source_type: str) -> None:
+    with connection(paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO documents(
+              id, source_type, title, source_path, raw_path, content_hash,
+              created_at, ingested_at, tags, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                document_id,
+                source_type,
+                "Synthetic document-only source",
+                f"raw/{document_id}.md",
+                f"raw/{document_id}.md",
+                f"hash-{document_id}",
+                "2026-07-20T00:00:00+00:00",
+                "2026-07-20T00:00:00+00:00",
+                "[]",
+                "active",
+            ),
+        )
 
 
 def event_candidate(
@@ -29,6 +114,7 @@ def event_candidate(
     start_at: str | None,
     end_at: str | None,
     source_id: str = "gmail:thread-one",
+    expression: str = "July 28-30, 2026",
 ) -> dict[str, object]:
     event_time = (
         {
@@ -36,7 +122,7 @@ def event_candidate(
             "start_at": start_at,
             "end_at": end_at,
             "precision": "day",
-            "expression": "July 28-30, 2026",
+            "expression": expression,
         }
         if start_at
         else None
@@ -89,6 +175,31 @@ def grand_hall_target() -> dict[str, dict[str, object]]:
             "_event_occurrence_intervals": [["2026-07-25", "2026-07-27"]],
         }
     }
+
+
+def minted_gmail_event_candidate(**kwargs: object) -> dict[str, object]:
+    candidate = event_candidate(**kwargs)
+    evidence = str(candidate["evidence_quote"])
+    stabilization = stabilize_gmail_event_time(
+        source_type="gmail_thread",
+        raw_event_time=candidate["event_time"],
+        evidence_text=evidence,
+        entity_mentions=candidate["entity_mentions"],
+        cited_spans=[{"chunk_id": "chunk", "start": 0, "end": len(evidence)}],
+        chunk_context_by_id={"chunk": {"text": evidence}},
+    )
+    candidate["event_time"] = stabilization.event_time
+    candidate["event_start_at"] = stabilization.event_time["start_at"]
+    candidate["event_end_at"] = stabilization.event_time["end_at"]
+    candidate["entity_mentions"] = stabilization.entity_mentions
+    primary = next(item for item in stabilization.entity_mentions if item["is_primary"])
+    candidate["entity_mention"] = primary["surface"]
+    candidate["metadata"]["model_entity_key"] = primary["surface"]
+    candidate["metadata"]["source_type"] = "gmail_thread"
+    candidate["metadata"]["gmail_event_time_stabilization"] = stabilization.audit
+    return mint_stabilized_gmail_event_time(
+        candidate, stabilization=stabilization
+    )
 
 
 def attached_entity_candidate(
@@ -224,6 +335,514 @@ def test_gmail_route_cannot_recreate_time_rejected_by_temporal_repair() -> None:
     assert guarded["metadata"]["routing"]["route_review_reason"] == (
         "event_temporal_identity_unresolved"
     )
+
+
+def test_gmail_nested_event_time_requires_minted_provenance() -> None:
+    candidate = event_candidate(
+        statement="Summit at Grand Hall runs July 28-30, 2026.",
+        evidence_quote="Summit at Grand Hall runs July 28-30, 2026.",
+        start_at="2026-07-28",
+        end_at="2026-07-31",
+    )
+    candidate["metadata"]["source_type"] = "gmail_thread"
+    candidate["metadata"]["gmail_event_time_stabilization"] = {
+        "status": "stabilized",
+        "basis": "literal_cited_expression",
+    }
+    candidate["metadata"]["gmail_event_time_provenance"] = {
+        "version": "gmail_event_time_provenance_v1",
+        "digest_sha256": "0" * 64,
+    }
+
+    guarded = guard_event_candidate_route(candidate, {})
+
+    assert candidate_event_intervals(candidate) == []
+    assert guarded["metadata"]["routing"]["route_destination_valid"] is False
+    assert guarded["metadata"]["routing"]["route_review_reason"] == (
+        "event_temporal_identity_unresolved"
+    )
+
+
+def test_gmail_flat_only_event_time_never_routes_or_supplies_bounds() -> None:
+    candidate = event_candidate(
+        statement="Summit at Grand Hall is scheduled.",
+        evidence_quote="Summit at Grand Hall is scheduled.",
+        start_at=None,
+        end_at=None,
+    )
+    candidate["metadata"]["source_type"] = "gmail_thread"
+    candidate.update(
+        {
+            "event_time_kind": "planned",
+            "event_start_at": "2026-07-28",
+            "event_end_at": "2026-07-29",
+            "event_time_precision": "day",
+            "event_time_expression": "July 28, 2026",
+        }
+    )
+
+    guarded = guard_event_candidate_route(candidate, {})
+
+    assert candidate_event_intervals(candidate) == []
+    assert candidate_event_bounds(candidate) == []
+    assert guarded["metadata"]["routing"]["route_destination_valid"] is False
+    assert guarded["metadata"]["routing"]["route_review_reason"] == (
+        "event_temporal_identity_unresolved"
+    )
+
+
+def test_gmail_minted_provenance_is_bound_to_clock_statement_and_evidence() -> None:
+    candidate = minted_gmail_event_candidate(
+        statement=(
+            "Summit Workshop at Grand Hall is scheduled from July 28, 2026 "
+            "through July 30, 2026."
+        ),
+        evidence_quote=(
+            "Summit Workshop at Grand Hall is scheduled from July 28, 2026 "
+            "through July 30, 2026."
+        ),
+        start_at="2026-07-28",
+        end_at="2026-07-31",
+        expression="July 28, 2026 through July 30, 2026",
+    )
+
+    assert gmail_event_time_provenance_is_valid(candidate)
+    assert candidate_event_intervals(candidate) == [("2026-07-28", "2026-07-30")]
+
+    for field, value in (
+        ("statement", "A different event runs July 28-30, 2026."),
+        ("evidence_quote", "Different cited evidence."),
+    ):
+        tampered = deepcopy(candidate)
+        tampered[field] = value
+        assert not gmail_event_time_provenance_is_valid(tampered)
+        assert candidate_event_intervals(tampered) == []
+    tampered_clock = deepcopy(candidate)
+    tampered_clock["event_time"]["start_at"] = "2026-08-28"
+    assert not gmail_event_time_provenance_is_valid(tampered_clock)
+    assert candidate_event_intervals(tampered_clock) == []
+    tampered_flat = deepcopy(candidate)
+    tampered_flat["event_start_at"] = "2026-08-28"
+    assert not gmail_event_time_provenance_is_valid(tampered_flat)
+    assert candidate_event_intervals(tampered_flat) == []
+
+
+def test_applied_minted_gmail_occurrence_can_anchor_same_source_sibling() -> None:
+    occurrence = minted_gmail_event_candidate(
+        statement=(
+            "Summit Workshop at Grand Hall is scheduled from July 28, 2026 "
+            "through July 30, 2026."
+        ),
+        evidence_quote=(
+            "Summit Workshop at Grand Hall is scheduled from July 28, 2026 "
+            "through July 30, 2026."
+        ),
+        start_at="2026-07-28",
+        end_at="2026-07-31",
+        expression="July 28, 2026 through July 30, 2026",
+    )
+    attached = attached_entity_candidate(
+        entity_type="person",
+        entity_surface="Jordan Vale",
+        statement="Jordan Vale checked in at Grand Hall.",
+    )
+    attached["metadata"]["source_type"] = "gmail_thread"
+
+    guarded = guard_event_candidate_routes(
+        [attached], {}, accepted_anchor_candidates=[occurrence]
+    )[0]
+
+    assert guarded["page_hint"] == (
+        "events/summit-workshop-at-grand-hall-2026-07-28.md"
+    )
+    assert guarded["metadata"]["routing"]["route_resolution"] == (
+        "event_source_occurrence_coherence"
+    )
+
+
+def test_apply_replays_minted_gmail_time_from_stored_source(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    evidence = "Northwind Planning Workshop is scheduled for July 28, 2026."
+    insert_gmail_temporal_chunk(svc.paths, evidence)
+    unit_id = evidence_units_for_text(evidence)[0]["unit_id"]
+    report = validate_extracted_facts_with_report(
+        svc.paths,
+        [
+            {
+                "chunk_id": "chunk_event_route_gmail",
+                "statement": evidence,
+                "evidence_unit_ids": [unit_id],
+                "claim_class": "factual_update",
+                "page_hint": "events/northwind-planning-workshop.md",
+                "section_hint": "Summary",
+                "extraction_confidence": 0.95,
+                "routing_confidence": 0.95,
+                "truth_confidence": 0.95,
+                "entities": [
+                    {
+                        "surface": "Northwind Planning Workshop",
+                        "type": "event",
+                        "mention_kind": "named",
+                        "is_primary": True,
+                    }
+                ],
+                "event_time": {
+                    "kind": "planned",
+                    "start_at": "2026-07-28",
+                    "end_at": None,
+                    "precision": "day",
+                    "expression": "July 28, 2026",
+                },
+            }
+        ],
+    )
+    fact = report["candidates"][0]
+    assert gmail_event_time_provenance_is_valid(fact)
+    action = propose_action(
+        svc.paths,
+        "fact_upsert",
+        action_payload={"fact": fact},
+        action_features={"reversible": True},
+        decide=False,
+    )
+
+    applied = apply_action(
+        svc.paths, action["id"], allow_llm_entity_resolution=False
+    )
+
+    assert applied["status"] == "applied"
+
+
+def test_apply_rejects_recalculated_receipt_for_unsupported_gmail_clock(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    evidence = "Northwind Planning Workshop is scheduled for July 28, 2026."
+    insert_gmail_temporal_chunk(svc.paths, evidence)
+    unit_id = evidence_units_for_text(evidence)[0]["unit_id"]
+    report = validate_extracted_facts_with_report(
+        svc.paths,
+        [
+            {
+                "chunk_id": "chunk_event_route_gmail",
+                "statement": evidence,
+                "evidence_unit_ids": [unit_id],
+                "claim_class": "factual_update",
+                "page_hint": "events/northwind-planning-workshop.md",
+                "section_hint": "Summary",
+                "extraction_confidence": 0.95,
+                "routing_confidence": 0.95,
+                "truth_confidence": 0.95,
+                "entities": [
+                    {
+                        "surface": "Northwind Planning Workshop",
+                        "type": "event",
+                        "mention_kind": "named",
+                        "is_primary": True,
+                    }
+                ],
+                "event_time": {
+                    "kind": "planned",
+                    "start_at": "2026-07-28",
+                    "end_at": None,
+                    "precision": "day",
+                    "expression": "July 28, 2026",
+                },
+            }
+        ],
+    )
+    forged = deepcopy(report["candidates"][0])
+    forged["event_time"]["start_at"] = "2026-08-28"
+    forged["event_start_at"] = "2026-08-28"
+    forged["metadata"]["gmail_event_time_provenance"]["digest_sha256"] = (
+        _gmail_event_time_provenance_digest(forged)
+    )
+    assert gmail_event_time_provenance_is_valid(forged)
+    action = propose_action(
+        svc.paths,
+        "fact_upsert",
+        action_payload={"fact": forged},
+        action_features={"reversible": True},
+        decide=False,
+    )
+
+    with pytest.raises(ValueError, match="could not be reproduced"):
+        apply_action(svc.paths, action["id"], allow_llm_entity_resolution=False)
+
+
+def test_apply_rejects_recalculated_checksum_for_altered_stabilizer_audit(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    evidence = "Northwind Planning Workshop is scheduled for July 28, 2026."
+    insert_gmail_temporal_chunk(svc.paths, evidence)
+    unit_id = evidence_units_for_text(evidence)[0]["unit_id"]
+    report = validate_extracted_facts_with_report(
+        svc.paths,
+        [
+            {
+                "chunk_id": "chunk_event_route_gmail",
+                "statement": evidence,
+                "evidence_unit_ids": [unit_id],
+                "claim_class": "factual_update",
+                "page_hint": "events/northwind-planning-workshop.md",
+                "section_hint": "Summary",
+                "extraction_confidence": 0.95,
+                "routing_confidence": 0.95,
+                "truth_confidence": 0.95,
+                "entities": [
+                    {
+                        "surface": "Northwind Planning Workshop",
+                        "type": "event",
+                        "mention_kind": "named",
+                        "is_primary": True,
+                    }
+                ],
+                "event_time": {
+                    "kind": "planned",
+                    "start_at": "2026-07-28",
+                    "end_at": None,
+                    "precision": "day",
+                    "expression": "July 28, 2026",
+                },
+            }
+        ],
+    )
+    altered = deepcopy(report["candidates"][0])
+    altered["metadata"]["gmail_event_time_stabilization"]["diagnostic"] = (
+        "caller-authored"
+    )
+    altered["metadata"]["gmail_event_time_provenance"]["digest_sha256"] = (
+        _gmail_event_time_provenance_digest(altered)
+    )
+    assert gmail_event_time_provenance_is_valid(altered)
+    action = propose_action(
+        svc.paths,
+        "fact_upsert",
+        action_payload={"fact": altered},
+        action_features={"reversible": True},
+        decide=False,
+    )
+
+    with pytest.raises(ValueError, match="could not be reproduced"):
+        apply_action(svc.paths, action["id"], allow_llm_entity_resolution=False)
+
+
+def test_apply_uses_cited_chunk_type_when_payload_hides_gmail_origin(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    evidence = "Northwind Planning Workshop is scheduled for July 28, 2026."
+    insert_gmail_temporal_chunk(svc.paths, evidence)
+    candidate = event_candidate(
+        statement=evidence,
+        evidence_quote=evidence,
+        start_at="2026-07-28",
+        end_at=None,
+        source_id="chunk:chunk_event_route_gmail",
+    )
+    candidate["source_spans"] = [
+        {
+            "chunk_id": "chunk_event_route_gmail",
+            "start": 0,
+            "end": len(evidence),
+        }
+    ]
+    candidate["metadata"]["source_type"] = "note"
+    action = propose_action(
+        svc.paths,
+        "fact_upsert",
+        action_payload={"fact": candidate},
+        action_features={"reversible": True},
+        decide=False,
+    )
+
+    with pytest.raises(ValueError, match="lacks valid deterministic"):
+        apply_action(svc.paths, action["id"], allow_llm_entity_resolution=False)
+
+
+def test_apply_rejects_flat_only_clock_when_payload_hides_gmail_origin(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    evidence = "Northwind Planning Workshop is scheduled for July 28, 2026."
+    insert_gmail_temporal_chunk(svc.paths, evidence)
+    candidate = event_candidate(
+        statement=evidence,
+        evidence_quote=evidence,
+        start_at=None,
+        end_at=None,
+        source_id="chunk:chunk_event_route_gmail",
+    )
+    candidate["source_spans"] = [
+        {
+            "chunk_id": "chunk_event_route_gmail",
+            "start": 0,
+            "end": len(evidence),
+        }
+    ]
+    candidate["metadata"]["source_type"] = "note"
+    candidate.update(
+        {
+            "event_time_kind": "planned",
+            "event_start_at": "2026-07-28",
+            "event_time_precision": "day",
+            "event_time_expression": "July 28, 2026",
+        }
+    )
+    action = propose_action(
+        svc.paths,
+        "fact_upsert",
+        action_payload={"fact": candidate},
+        action_features={"reversible": True},
+        decide=False,
+    )
+
+    with pytest.raises(ValueError, match="flat event_time fields require"):
+        apply_action(svc.paths, action["id"], allow_llm_entity_resolution=False)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_apply_rejects_gmail_document_only_temporal_evidence(
+    tmp_path: Path, nested: bool
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    insert_document_only(svc.paths, "doc_gmail_only", "gmail_thread")
+    fact: dict[str, object] = {
+        "statement": "A document-level temporal claim.",
+        "page_hint": "concepts/manual-temporal.md",
+        "section_hint": "Summary",
+        "source_ids": ["document:doc_gmail_only"],
+        "source_spans": [
+            {"document_id": "doc_gmail_only", "start": 0, "end": 20}
+        ],
+        "metadata": {"source_type": "note"},
+    }
+    if nested:
+        fact["event_time"] = {
+            "kind": "planned",
+            "start_at": "2026-07-28",
+            "end_at": None,
+            "precision": "day",
+            "expression": "July 28, 2026",
+        }
+    else:
+        fact.update(
+            {
+                "event_time_kind": "planned",
+                "event_start_at": "2026-07-28",
+                "event_time_precision": "day",
+                "event_time_expression": "July 28, 2026",
+            }
+        )
+    action = propose_action(
+        svc.paths,
+        "fact_upsert",
+        action_payload={"fact": fact},
+        action_features={"reversible": True},
+        decide=False,
+    )
+
+    expected = "lacks valid deterministic" if nested else "flat event_time fields"
+    with pytest.raises(ValueError, match=expected):
+        apply_action(svc.paths, action["id"], allow_llm_entity_resolution=False)
+
+
+def test_gmail_document_receipt_cannot_replace_exact_chunk_spans(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    insert_document_only(svc.paths, "doc_gmail_receipt_only", "gmail_thread")
+    fact = {
+        "statement": "A document-level temporal claim.",
+        "page_hint": "concepts/manual-temporal.md",
+        "section_hint": "Summary",
+        "source_ids": ["document:doc_gmail_receipt_only"],
+        "source_spans": [
+            {"document_id": "doc_gmail_receipt_only", "start": 0, "end": 20}
+        ],
+        "event_time": {
+            "kind": "planned",
+            "start_at": "2026-07-28",
+            "end_at": None,
+            "precision": "day",
+            "expression": "July 28, 2026",
+        },
+        "metadata": {
+            "source_type": "gmail_thread",
+            "gmail_event_time_stabilization": {
+                "status": "stabilized",
+                "basis": "literal_cited_expression",
+            },
+            "gmail_event_time_provenance": {
+                "version": "gmail_event_time_provenance_v1",
+            },
+        },
+    }
+    fact["metadata"]["gmail_event_time_provenance"]["digest_sha256"] = (
+        _gmail_event_time_provenance_digest(fact)
+    )
+    assert gmail_event_time_provenance_is_valid(fact)
+    action = propose_action(
+        svc.paths,
+        "fact_upsert",
+        action_payload={"fact": fact},
+        action_features={"reversible": True},
+        decide=False,
+    )
+
+    with pytest.raises(ValueError, match="source chunks are unavailable"):
+        apply_action(svc.paths, action["id"], allow_llm_entity_resolution=False)
+
+
+def test_non_gmail_document_only_flat_time_keeps_manual_fact_behavior(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    insert_document_only(svc.paths, "doc_note_only", "note")
+    fact = {
+        "id": "fact_note_document_time",
+        "statement": "A manually curated note has a planned date.",
+        "page_hint": "concepts/manual-temporal.md",
+        "section_hint": "Summary",
+        "source_ids": ["document:doc_note_only"],
+        "source_spans": [
+            {"document_id": "doc_note_only", "start": 0, "end": 20}
+        ],
+        "event_time_kind": "planned",
+        "event_start_at": "2026-07-28",
+        "event_time_precision": "day",
+        "event_time_expression": "July 28, 2026",
+        "metadata": {"source_type": "note"},
+    }
+    action = propose_action(
+        svc.paths,
+        "fact_upsert",
+        action_payload={"fact": fact},
+        action_features={"reversible": True},
+        decide=False,
+    )
+
+    applied = apply_action(
+        svc.paths, action["id"], allow_llm_entity_resolution=False
+    )
+    with connection(svc.paths.sqlite_path) as conn:
+        stored = conn.execute(
+            "SELECT event_start_at FROM facts WHERE id = ?",
+            ("fact_note_document_time",),
+        ).fetchone()
+
+    assert applied["status"] == "applied"
+    assert stored is not None
+    assert stored["event_start_at"] == "2026-07-28"
 
 
 def test_half_open_end_does_not_overlap_an_adjacent_day_occurrence() -> None:
