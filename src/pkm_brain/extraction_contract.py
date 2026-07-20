@@ -112,8 +112,8 @@ EXTRACTION_SCHEMA: dict[str, Any] = {
     },
 }
 
-EXTRACTION_PROMPT_VERSION = "extractor-evidence-units-v12-parity-recovery"
-# v12 restores ordinary-fact recall with a complete output contract and
-# enrichment-failure isolation. Older success watermarks must therefore be
-# revisited exactly once under the v12 watermark.
+EXTRACTION_PROMPT_VERSION = "extractor-evidence-units-v15-gmail-event-time"
+# v15 adds evidence-grounded Gmail event-time stabilization on top of the v14
+# speech-act and durability gates. Older successes must be revisited exactly
+# once so previously stripped or unsafe event clocks are re-evaluated.
 COMPATIBLE_EXTRACTION_PROMPT_VERSIONS: tuple[str, ...] = ()

@@ -9,6 +9,7 @@ from pathlib import Path
 
 from pkm_brain.automation import (
     MAX_STORED_ERROR_CHARS,
+    _redact_gmail_capture_artifacts,
     record_automation_finish,
     record_automation_start,
     render_launch_agent,
@@ -37,6 +38,29 @@ def make_service(tmp_path: Path) -> BrainService:
     svc = BrainService(BrainPaths.from_value(tmp_path / "brain"))
     svc.init_workspace()
     return svc
+
+
+def test_gmail_capture_output_hides_thread_artifact_paths() -> None:
+    result = _redact_gmail_capture_artifacts(
+        {
+            "captured": 2,
+            "artifacts": ["gmail/thread-a.md", "gmail/thread-b.md"],
+            "outbox_artifacts": [],
+            "connector_results": [
+                {
+                    "id": "gmail",
+                    "artifacts": ["gmail/thread-a.md", "gmail/thread-b.md"],
+                    "outbox_artifacts": [],
+                }
+            ],
+        }
+    )
+
+    assert "artifacts" not in result
+    assert result["artifact_count"] == 2
+    connector = result["connector_results"][0]
+    assert "artifacts" not in connector
+    assert connector["artifact_count"] == 2
 
 
 def make_codex_fixture(tmp_path: Path) -> Path:

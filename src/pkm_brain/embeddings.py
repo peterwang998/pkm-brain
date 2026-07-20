@@ -175,6 +175,54 @@ def load_embedding_config(paths: Any | None = None) -> EmbeddingConfig:
     )
 
 
+def save_embedding_config(
+    paths: Any,
+    *,
+    provider: str,
+    model: str | None = None,
+    query_instruction: str | None = None,
+) -> EmbeddingConfig:
+    """Persist an embedding choice without discarding unrelated local config."""
+
+    normalized_provider = normalize_provider_name(provider)
+    if normalized_provider not in {HASH_PROVIDER, SENTENCE_TRANSFORMER_PROVIDER}:
+        raise ValueError(
+            "embedding provider must be 'hash' or 'sentence-transformer'"
+        )
+    config_path = paths.config_file
+    data: dict[str, Any] = {}
+    if config_path.exists():
+        loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        if isinstance(loaded, dict):
+            data = loaded
+    embedding = data.get("embedding")
+    if not isinstance(embedding, dict):
+        embedding = {}
+        data["embedding"] = embedding
+    embedding["provider"] = normalized_provider
+    if model is not None:
+        embedding["model"] = model.strip() or DEFAULT_SENTENCE_TRANSFORMER_MODEL
+    elif not embedding.get("model"):
+        embedding["model"] = DEFAULT_SENTENCE_TRANSFORMER_MODEL
+    if query_instruction is not None:
+        embedding["query_instruction"] = query_instruction
+
+    config_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(config_path.parent, 0o700)
+    temporary = config_path.with_name(f".{config_path.name}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    descriptor = os.open(temporary, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            yaml.safe_dump(data, handle, sort_keys=True, allow_unicode=False)
+        os.replace(temporary, config_path)
+        os.chmod(config_path, 0o600)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return load_embedding_config(paths)
+
+
 def resolve_embedding_provider(config: EmbeddingConfig, *, cache_only: bool = True) -> EmbeddingProvider:
     if config.provider == HASH_PROVIDER:
         return EmbeddingProvider()

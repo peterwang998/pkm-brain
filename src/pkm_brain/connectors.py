@@ -17,6 +17,13 @@ from .capture import (
     OpenCodeAdapter,
 )
 from .connector_auth import auth_manifest, connector_auth_status
+from .gmail_archive import GmailArchiveStore
+from .gmail_knowledge import (
+    GMAIL_KNOWLEDGE_SOURCE_TYPE,
+    GmailKnowledgeCapture,
+    secure_gmail_knowledge_workspace,
+)
+from .operations_policy import load_operations_policy
 from .paths import BrainPaths
 from .util import now_iso
 
@@ -108,13 +115,13 @@ class Connector(Protocol):
     def preflight(self, ctx: ConnectorContext) -> PreflightReport:
         ...
 
-    def discover(self, ctx: ConnectorContext) -> list[AgentSessionCapture]:
+    def discover(self, ctx: ConnectorContext) -> list[Any]:
         ...
 
     def capture(
         self,
         ctx: ConnectorContext,
-        candidates: list[AgentSessionCapture],
+        candidates: list[Any],
         *,
         dry_run: bool = False,
         export_outbox: bool = False,
@@ -192,6 +199,9 @@ class ConnectorBatchResult:
         self.artifacts.extend(run.artifacts)
         self.outbox_artifacts.extend(run.outbox_artifacts)
         if run.status == "failed":
+            self.errors.extend(
+                f"{run.connector_id}: {error}" for error in run.errors
+            )
             self.warnings.append(f"{run.connector_id}: failed; see connector_results")
         self.connector_results.append(run.as_dict())
 
@@ -396,33 +406,150 @@ class AuthOnlyConnector:
         )
 
 
-def gmail_connector() -> Connector:
-    return AuthOnlyConnector(
-        ConnectorManifest(
-            id="gmail",
-            display_name="Gmail",
-            description=(
-                "Authorize a separate read-only Gmail grant for the local "
-                "Chief of Staff mail mirror."
+class GmailKnowledgeConnector:
+    manifest = ConnectorManifest(
+        id="gmail",
+        display_name="Gmail",
+        description=(
+            "Project the approved encrypted local Gmail archive into private, "
+            "immutable Brain thread revisions."
+        ),
+        source_type=GMAIL_KNOWLEDGE_SOURCE_TYPE,
+        default_enabled=False,
+        default_cadence_s=600,
+        settings_schema=[
+            SettingField(
+                "source_home",
+                "Source Brain home",
+                "path",
+                None,
+                "Brain home that owns the encrypted Gmail archive. Defaults to this Brain home.",
             ),
-            source_type="gmail_message",
-            default_enabled=False,
-            default_cadence_s=600,
-            permissions_note=(
-                "Read-only Gmail access; sending, mutation, deletion, labels, and attachment "
-                "download are unavailable."
+            SettingField(
+                "account_key",
+                "Archive account key",
+                "string",
+                None,
+                "Defaults to the approved Gmail account key in the source operations policy.",
             ),
-            lifecycle="auth_only",
-            capture_available=False,
-            auth=auth_manifest("gmail"),
-            activation_note=(
-                "After the owner enables Gmail in the local operations policy, Brain "
-                "keeps a private local operational mirror current about every 10 minutes. "
-                "Today > Run Shadow analyzes queued local revisions. Gmail knowledge "
-                "ingestion remains unavailable."
+            SettingField(
+                "operator_email",
+                "Owner email",
+                "string",
+                None,
+                "Optional direction fallback when older archive rows do not contain Gmail labels.",
             ),
-        )
+            SettingField(
+                "batch_size",
+                "Threads per run",
+                "choice",
+                "500",
+                "Bound each scheduled plaintext projection; use all only for an explicit backfill.",
+                choices=["100", "500", "2000", "all"],
+            ),
+        ],
+        permissions_note=(
+            "Reads only the owner-approved encrypted local archive. Normalized message text "
+            "is stored owner-only and may be sent to the configured extraction model; "
+            "attachments, Gmail mutation, sending, deletion, and label changes remain unavailable."
+        ),
+        lifecycle="active",
+        capture_available=True,
+        auth=auth_manifest("gmail"),
+        activation_note=(
+            "Opt-in and disabled by default. The encrypted archive remains independent. "
+            "When enabled, new immutable thread revisions are projected and ingested about "
+            "every 10 minutes; only likely-human threads and high-confidence time-sensitive "
+            "transactional threads enter fact extraction."
+        ),
     )
+
+    def preflight(self, ctx: ConnectorContext) -> PreflightReport:
+        try:
+            source_paths, account_key, _operator_email, _batch_size = self._settings(ctx)
+            policy = load_operations_policy(source_paths)
+            gmail = policy.sources.gmail
+            if not (
+                gmail.enabled
+                and gmail.content_access_approved
+                and gmail.archive.enabled
+                and gmail.archive.agent_access_approved
+            ):
+                return PreflightReport(
+                    ok=False,
+                    errors=["The source Gmail archive is not approved for local agent access."],
+                )
+            store = GmailArchiveStore.for_paths(source_paths)
+            status = store.status(account_key)
+            if status.key_state != "available":
+                return PreflightReport(
+                    ok=False,
+                    errors=[f"The encrypted Gmail archive key is {status.key_state}."],
+                )
+            warnings = []
+            if status.state is None or not status.state.coverage_complete:
+                warnings.append(
+                    "The Gmail archive backfill is incomplete; captured coverage is partial."
+                )
+            return PreflightReport(warnings=warnings)
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            return PreflightReport(ok=False, errors=[str(exc)])
+
+    def discover(self, ctx: ConnectorContext) -> list[Any]:
+        source_paths, account_key, _operator_email, _batch_size = self._settings(ctx)
+        return GmailArchiveStore.for_paths(source_paths).list_thread_snapshots(account_key)
+
+    def capture(
+        self,
+        ctx: ConnectorContext,
+        candidates: list[Any],
+        *,
+        dry_run: bool = False,
+        export_outbox: bool = False,
+    ) -> CaptureResult:
+        source_paths, account_key, operator_email, batch_size = self._settings(ctx)
+        if not dry_run:
+            secure_gmail_knowledge_workspace(ctx.paths)
+        adapter = GmailKnowledgeCapture(
+            ctx.paths,
+            GmailArchiveStore.for_paths(source_paths),
+            account_key=account_key,
+            operator_email=operator_email,
+            batch_size=batch_size,
+        )
+        return adapter.capture(
+            candidates,
+            dry_run=dry_run,
+            export_outbox=export_outbox,
+        )
+
+    def _settings(
+        self, ctx: ConnectorContext
+    ) -> tuple[BrainPaths, str, str, int | None]:
+        source_home = str(ctx.settings.get("source_home") or "").strip()
+        source_paths = BrainPaths.from_value(source_home or ctx.paths.home)
+        policy = load_operations_policy(source_paths)
+        approved_account_key = str(policy.sources.gmail.account_key).strip()
+        account_key = str(ctx.settings.get("account_key") or approved_account_key).strip()
+        if not account_key or account_key != approved_account_key:
+            raise ValueError(
+                "Gmail Knowledge account_key must match the approved source policy account"
+            )
+        approved_operator_email = str(policy.operator.gmail.email).strip().casefold()
+        operator_email = str(
+            ctx.settings.get("operator_email") or approved_operator_email
+        ).strip().casefold()
+        if not operator_email or operator_email != approved_operator_email:
+            raise ValueError(
+                "Gmail Knowledge operator_email must match the approved source policy identity"
+            )
+        raw_batch_size = str(ctx.settings.get("batch_size") or "500").strip()
+        batch_size = None if raw_batch_size == "all" else int(raw_batch_size)
+        return source_paths, account_key, operator_email, batch_size
+
+
+def gmail_connector() -> Connector:
+    return GmailKnowledgeConnector()
 
 
 def calendar_connector() -> Connector:
@@ -713,7 +840,21 @@ def run_one_connector(
     export_outbox: bool,
 ) -> ConnectorRun:
     started_at = now_iso()
-    preflight = connector.preflight(ctx)
+    try:
+        preflight = connector.preflight(ctx)
+    except Exception as exc:
+        failed_preflight = PreflightReport(
+            ok=False,
+            errors=[_connector_exception_detail(connector.manifest.id, exc)],
+        )
+        return ConnectorRun(
+            connector_id=connector.manifest.id,
+            status="failed",
+            started_at=started_at,
+            finished_at=now_iso(),
+            preflight=failed_preflight.as_dict(),
+            errors=list(failed_preflight.errors),
+        )
     if not preflight.ok:
         return ConnectorRun(
             connector_id=connector.manifest.id,
@@ -734,7 +875,7 @@ def run_one_connector(
             started_at=started_at,
             finished_at=now_iso(),
             preflight=preflight.as_dict(),
-            errors=[str(exc)],
+            errors=[_connector_exception_detail(connector.manifest.id, exc)],
             warnings=list(preflight.warnings),
         )
     status = "failed" if result.errors else "ok"
@@ -753,6 +894,14 @@ def run_one_connector(
         artifacts=list(result.artifacts),
         outbox_artifacts=list(result.outbox_artifacts),
     )
+
+
+def _connector_exception_detail(connector_id: str, error: Exception) -> str:
+    if connector_id == "gmail":
+        # Provider identifiers can appear in arbitrary adapter exception strings.
+        # Health/output needs the failure category, not private mailbox lineage.
+        return f"Gmail connector failed ({type(error).__name__})"
+    return str(error)
 
 
 def skipped_run(connector_id: str, reason: str) -> ConnectorRun:

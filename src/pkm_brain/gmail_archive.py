@@ -43,7 +43,8 @@ GMAIL_ARCHIVE_MAX_PENDING_IDS = 10_000
 GMAIL_ARCHIVE_DIRECTORY_MODE = 0o700
 GMAIL_ARCHIVE_FILE_MODE = 0o600
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
+_LEGACY_SCHEMA_VERSION = 1
 _VERIFIER_PLAINTEXT = b"pkm-brain gmail archive key verifier v1"
 _VERIFIER_AAD = b"pkm-brain/gmail-archive/verifier/v1"
 _CODE = re.compile(r"^[a-zA-Z0-9_.-]{1,128}$")
@@ -367,8 +368,15 @@ class ArchiveOpenedMessage:
     from_addresses: tuple[str, ...]
     to_addresses: tuple[str, ...]
     cc_addresses: tuple[str, ...]
+    label_ids: tuple[str, ...]
+    list_id: str | None
+    list_unsubscribe: str | None
+    precedence: str | None
+    auto_submitted: str | None
     body_text: str
     attachments: tuple[ArchiveAttachment, ...]
+    account_key: str = ""
+    body_truncated: bool = False
 
 
 @dataclass(frozen=True)
@@ -377,6 +385,24 @@ class ArchiveThreadResult:
     total_messages: int
     messages: tuple[ArchiveOpenedMessage, ...]
     truncated: bool
+    account_key: str = ""
+    omitted_message_count: int = 0
+    body_truncated_message_count: int = 0
+
+
+@dataclass(frozen=True)
+class ArchiveThreadSnapshot:
+    thread_id: str
+    source_revision: str
+    total_message_count: int
+    visible_message_count: int
+    deleted_message_count: int
+    hidden_message_count: int
+    created_at: str | None
+    updated_at: str | None
+    archive_updated_at: str
+    raw_size: int
+    account_key: str = ""
 
 
 @dataclass(frozen=True)
@@ -397,7 +423,12 @@ class _ParsedMessage:
     from_addresses: tuple[str, ...]
     to_addresses: tuple[str, ...]
     cc_addresses: tuple[str, ...]
+    list_id: str | None
+    list_unsubscribe: str | None
+    precedence: str | None
+    auto_submitted: str | None
     body_text: str
+    body_truncated: bool
     attachments: tuple[ArchiveAttachment, ...]
 
 
@@ -410,6 +441,8 @@ class _PreparedMessage:
     raw_ciphertext: bytes
     text_nonce: bytes
     text_ciphertext: bytes
+    raw_digest: str
+    metadata_digest: str
 
 
 class GmailArchiveStore:
@@ -467,6 +500,8 @@ class GmailArchiveStore:
                     text_nonce BLOB NOT NULL,
                     text_ciphertext BLOB NOT NULL,
                     raw_size INTEGER NOT NULL,
+                    raw_digest TEXT,
+                    metadata_digest TEXT,
                     stored_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (account_key, message_id)
@@ -488,11 +523,14 @@ class GmailArchiveStore:
                 """,
                 (_SCHEMA_VERSION, _now_iso()),
             )
+            _add_revision_digest_columns(conn)
             _verify_schema(conn)
+        self._try_migrate_archive_schema()
         _secure_archive_files(self.db_path)
 
     def provision_key(self) -> None:
         self.initialize()
+        key: bytes
         with self._connect(write=True) as conn:
             row = conn.execute(
                 "SELECT verifier_nonce, verifier_ciphertext FROM archive_meta WHERE id=1"
@@ -501,18 +539,21 @@ class GmailArchiveStore:
             if row[0] is not None or row[1] is not None:
                 key = self._load_key()
                 _verify_key(key, bytes(row[0]), bytes(row[1]))
-                return
-            key = _validated_key(self.key_provider.load_or_create_key())
-            nonce = secrets.token_bytes(GMAIL_ARCHIVE_NONCE_BYTES)
-            ciphertext = AESGCM(key).encrypt(nonce, _VERIFIER_PLAINTEXT, _VERIFIER_AAD)
-            conn.execute(
-                """
-                UPDATE archive_meta
-                SET verifier_nonce=?, verifier_ciphertext=?
-                WHERE id=1 AND verifier_nonce IS NULL AND verifier_ciphertext IS NULL
-                """,
-                (nonce, ciphertext),
-            )
+            else:
+                key = _validated_key(self.key_provider.load_or_create_key())
+                nonce = secrets.token_bytes(GMAIL_ARCHIVE_NONCE_BYTES)
+                ciphertext = AESGCM(key).encrypt(
+                    nonce, _VERIFIER_PLAINTEXT, _VERIFIER_AAD
+                )
+                conn.execute(
+                    """
+                    UPDATE archive_meta
+                    SET verifier_nonce=?, verifier_ciphertext=?
+                    WHERE id=1 AND verifier_nonce IS NULL AND verifier_ciphertext IS NULL
+                    """,
+                    (nonce, ciphertext),
+                )
+        self._migrate_archive_schema(key)
 
     def get_state(self, account_key: str) -> ArchiveState | None:
         account_key = _identifier(account_key, "account key")
@@ -523,6 +564,53 @@ class GmailArchiveStore:
                 (account_key,),
             ).fetchone()
         return _state_from_json(str(row[0])) if row is not None else None
+
+    def list_thread_snapshots(
+        self,
+        account_key: str,
+    ) -> tuple[ArchiveThreadSnapshot, ...]:
+        """Return a metadata-only, immutable manifest for every stored thread."""
+
+        account_key = _identifier(account_key, "account key")
+        self._require_initialized()
+        self._ensure_revision_digests()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT thread_id, message_id, internal_date, hidden, deleted,
+                       raw_size, updated_at, raw_digest, metadata_digest
+                FROM messages
+                WHERE account_key=?
+                ORDER BY thread_id, message_id
+                """,
+                (account_key,),
+            ).fetchall()
+        return _thread_snapshots(account_key, rows)
+
+    def get_thread_snapshot(
+        self,
+        account_key: str,
+        thread_id: str,
+    ) -> ArchiveThreadSnapshot | None:
+        """Return one thread manifest entry without decrypting message content."""
+
+        account_key = _identifier(account_key, "account key")
+        thread_id = _identifier(thread_id, "thread id")
+        self._require_initialized()
+        self._ensure_revision_digests()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT thread_id, message_id, internal_date, hidden, deleted,
+                       raw_size, updated_at, raw_digest, metadata_digest
+                FROM messages
+                WHERE account_key=? AND thread_id=?
+                ORDER BY message_id
+                """,
+                (account_key, thread_id),
+            ).fetchall()
+        snapshots = _thread_snapshots(account_key, rows)
+        return snapshots[0] if snapshots else None
 
     def apply_batch(
         self,
@@ -544,6 +632,7 @@ class GmailArchiveStore:
         now = _canonical_timestamp(state.updated_at)
         inserted = updated = deleted = 0
         with self._connect(write=True) as conn:
+            self._migrate_archive_schema_in_connection(conn, key)
             conn.execute("BEGIN IMMEDIATE")
             try:
                 for item in prepared:
@@ -568,8 +657,9 @@ class GmailArchiveStore:
                         INSERT INTO messages(
                             account_key, message_id, thread_id, internal_date,
                             hidden, deleted, raw_nonce, raw_ciphertext,
-                            text_nonce, text_ciphertext, raw_size, stored_at, updated_at
-                        ) VALUES(?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
+                            text_nonce, text_ciphertext, raw_size, stored_at, updated_at,
+                            raw_digest, metadata_digest
+                        ) VALUES(?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(account_key, message_id) DO UPDATE SET
                             thread_id=excluded.thread_id,
                             internal_date=excluded.internal_date,
@@ -580,6 +670,8 @@ class GmailArchiveStore:
                             text_nonce=excluded.text_nonce,
                             text_ciphertext=excluded.text_ciphertext,
                             raw_size=excluded.raw_size,
+                            raw_digest=excluded.raw_digest,
+                            metadata_digest=excluded.metadata_digest,
                             updated_at=excluded.updated_at
                         """,
                         (
@@ -595,6 +687,8 @@ class GmailArchiveStore:
                             len(source.raw_rfc822),
                             stored_at,
                             now,
+                            item.raw_digest,
+                            item.metadata_digest,
                         ),
                     )
                     inserted += int(exists is None)
@@ -741,7 +835,8 @@ class GmailArchiveStore:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT message_id, internal_date, raw_nonce, raw_ciphertext, raw_size
+                SELECT message_id, internal_date, raw_nonce, raw_ciphertext, raw_size,
+                       text_nonce, text_ciphertext
                 FROM messages
                 WHERE account_key=? AND thread_id=? AND deleted=0
                 """
@@ -750,9 +845,13 @@ class GmailArchiveStore:
                 (account_key, thread_id),
             ).fetchall()
         total = len(rows)
+        selected_rows = rows[-max_messages:]
         opened: list[ArchiveOpenedMessage] = []
         remaining = max_body_chars
-        for row in rows[:max_messages]:
+        # Spend the body budget from newest to oldest, then restore chronological
+        # order for callers.  The former oldest-first loop could consume the full
+        # budget before the messages that explain the thread's current state.
+        for row in reversed(selected_rows):
             raw = _decrypt_raw(
                 key,
                 account_key,
@@ -762,6 +861,13 @@ class GmailArchiveStore:
                 int(row[4]),
             )
             parsed = _parse_message(raw, body_limit=remaining)
+            encrypted_metadata = _decrypt_search_payload(
+                key,
+                account_key,
+                str(row[0]),
+                bytes(row[5]),
+                bytes(row[6]),
+            )
             remaining = max(0, remaining - len(parsed.body_text))
             opened.append(
                 ArchiveOpenedMessage(
@@ -773,15 +879,30 @@ class GmailArchiveStore:
                     from_addresses=parsed.from_addresses,
                     to_addresses=parsed.to_addresses,
                     cc_addresses=parsed.cc_addresses,
+                    label_ids=tuple(encrypted_metadata["label_ids"]),
+                    list_id=parsed.list_id,
+                    list_unsubscribe=parsed.list_unsubscribe,
+                    precedence=parsed.precedence,
+                    auto_submitted=parsed.auto_submitted,
                     body_text=parsed.body_text,
                     attachments=parsed.attachments,
+                    account_key=account_key,
+                    body_truncated=parsed.body_truncated,
                 )
             )
+        opened.reverse()
+        omitted_message_count = max(0, total - len(opened))
+        body_truncated_message_count = sum(
+            int(message.body_truncated) for message in opened
+        )
         return ArchiveThreadResult(
             thread_id=thread_id,
             total_messages=total,
             messages=tuple(opened),
-            truncated=total > len(opened) or remaining == 0,
+            truncated=bool(omitted_message_count or body_truncated_message_count),
+            account_key=account_key,
+            omitted_message_count=omitted_message_count,
+            body_truncated_message_count=body_truncated_message_count,
         )
 
     def status(self, account_key: str) -> ArchiveStatus:
@@ -833,6 +954,7 @@ class GmailArchiveStore:
             "cc_addresses": list(parsed.cc_addresses),
             "body_text": parsed.body_text,
             "attachment_filenames": [item.filename for item in parsed.attachments],
+            "label_ids": list(labels),
         }
         raw_nonce = secrets.token_bytes(GMAIL_ARCHIVE_NONCE_BYTES)
         text_nonce = secrets.token_bytes(GMAIL_ARCHIVE_NONCE_BYTES)
@@ -854,6 +976,110 @@ class GmailArchiveStore:
             raw_ciphertext=raw_ciphertext,
             text_nonce=text_nonce,
             text_ciphertext=text_ciphertext,
+            raw_digest=hashlib.sha256(raw).hexdigest(),
+            metadata_digest=_message_metadata_digest(
+                thread_id=source.thread_id,
+                internal_date=_internal_date(source.internal_date),
+                label_ids=labels,
+            ),
+        )
+
+    def _ensure_revision_digests(self) -> None:
+        with self._connect() as conn:
+            version = _archive_schema_version(conn)
+            columns = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(messages)")
+            }
+            missing = (
+                conn.execute(
+                    """
+                    SELECT 1 FROM messages
+                    WHERE raw_digest IS NULL OR metadata_digest IS NULL
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if {"raw_digest", "metadata_digest"} <= columns
+                else True
+            )
+        if version == _SCHEMA_VERSION and missing is None:
+            return
+        self._migrate_archive_schema(self._require_key())
+
+    def _try_migrate_archive_schema(self) -> None:
+        try:
+            key = self._load_key()
+        except GmailArchiveLockedError:
+            return
+        with self._connect() as conn:
+            verifier = conn.execute(
+                "SELECT verifier_nonce, verifier_ciphertext FROM archive_meta WHERE id=1"
+            ).fetchone()
+        if verifier is None or verifier[0] is None or verifier[1] is None:
+            return
+        _verify_key(key, bytes(verifier[0]), bytes(verifier[1]))
+        self._migrate_archive_schema(key)
+
+    def _migrate_archive_schema(self, key: bytes) -> None:
+        with self._connect(write=True) as conn:
+            self._migrate_archive_schema_in_connection(conn, key)
+
+    def _migrate_archive_schema_in_connection(
+        self,
+        conn: sqlite3.Connection,
+        key: bytes,
+    ) -> None:
+        _add_revision_digest_columns(conn)
+        rows = conn.execute(
+            """
+            SELECT account_key, message_id, thread_id, internal_date,
+                   raw_nonce, raw_ciphertext, text_nonce, text_ciphertext, raw_size
+            FROM messages
+            WHERE raw_digest IS NULL OR metadata_digest IS NULL
+            ORDER BY account_key, message_id
+            """
+        ).fetchall()
+        for row in rows:
+            account_key = str(row["account_key"])
+            message_id = str(row["message_id"])
+            raw = _decrypt_raw(
+                key,
+                account_key,
+                message_id,
+                bytes(row["raw_nonce"]),
+                bytes(row["raw_ciphertext"]),
+                int(row["raw_size"]),
+            )
+            search_payload = _decrypt_search_payload(
+                key,
+                account_key,
+                message_id,
+                bytes(row["text_nonce"]),
+                bytes(row["text_ciphertext"]),
+            )
+            conn.execute(
+                """
+                UPDATE messages
+                SET raw_digest=?, metadata_digest=?
+                WHERE account_key=? AND message_id=?
+                """,
+                (
+                    hashlib.sha256(raw).hexdigest(),
+                    _message_metadata_digest(
+                        thread_id=str(row["thread_id"]),
+                        internal_date=(
+                            str(row["internal_date"])
+                            if row["internal_date"] is not None
+                            else None
+                        ),
+                        label_ids=tuple(search_payload["label_ids"]),
+                    ),
+                    account_key,
+                    message_id,
+                ),
+            )
+        conn.execute(
+            "UPDATE archive_meta SET schema_version=? WHERE id=1",
+            (_SCHEMA_VERSION,),
         )
 
     def _require_initialized(self) -> None:
@@ -934,11 +1160,30 @@ def _verify_schema(conn: sqlite3.Connection) -> None:
     }
     if tables != {"archive_meta", "messages", "sync_state"}:
         raise GmailArchiveError("Gmail archive schema is unsupported")
-    version = conn.execute(
+    version = _archive_schema_version(conn)
+    if version not in {_LEGACY_SCHEMA_VERSION, _SCHEMA_VERSION}:
+        raise GmailArchiveError("Gmail archive schema version is unsupported")
+    if version == _SCHEMA_VERSION:
+        columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(messages)")
+        }
+        if not {"raw_digest", "metadata_digest"} <= columns:
+            raise GmailArchiveError("Gmail archive schema is missing revision digests")
+
+
+def _archive_schema_version(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
         "SELECT schema_version FROM archive_meta WHERE id=1"
     ).fetchone()
-    if version is None or int(version[0]) != _SCHEMA_VERSION:
-        raise GmailArchiveError("Gmail archive schema version is unsupported")
+    return int(row[0]) if row is not None else 0
+
+
+def _add_revision_digest_columns(conn: sqlite3.Connection) -> None:
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(messages)")}
+    if "raw_digest" not in columns:
+        conn.execute("ALTER TABLE messages ADD COLUMN raw_digest TEXT")
+    if "metadata_digest" not in columns:
+        conn.execute("ALTER TABLE messages ADD COLUMN metadata_digest TEXT")
 
 
 def _prepare_archive_file(path: Path) -> None:
@@ -1131,29 +1376,42 @@ def _parse_message(raw: bytes, *, body_limit: int) -> _ParsedMessage:
     from_addresses = _addresses(message, "From")
     to_addresses = _addresses(message, "To")
     cc_addresses = _addresses(message, "Cc")
+    list_id = _header(message, "List-Id")
+    list_unsubscribe = _header(message, "List-Unsubscribe")
+    precedence = _header(message, "Precedence")
+    auto_submitted = _header(message, "Auto-Submitted")
     attachments: list[ArchiveAttachment] = []
     plain: list[str] = []
     html: list[str] = []
-    for part in message.walk():
-        if part.is_multipart():
-            continue
+
+    def visit(part: Message) -> None:
+        if len(attachments) >= 1_000:
+            return
         disposition = (part.get_content_disposition() or "").casefold()
         filename = part.get_filename()
-        if disposition == "attachment" or filename:
+        content_type = part.get_content_type().casefold()
+        if disposition == "attachment" or filename or content_type == "message/rfc822":
             payload = part.get_payload(decode=True)
             attachments.append(
                 ArchiveAttachment(
                     filename=_bounded(filename, 8_000),
-                    content_type=_bounded(part.get_content_type(), 255) or "application/octet-stream",
+                    content_type=_bounded(content_type, 255)
+                    or "application/octet-stream",
                     size=len(payload) if isinstance(payload, bytes) else None,
                 )
             )
-            if len(attachments) >= 1_000:
-                break
-            continue
-        content_type = part.get_content_type().casefold()
+            # An attached multipart or message/rfc822 may itself contain text
+            # parts. It is evidence bytes, not part of the parent message body.
+            return
+        if part.is_multipart():
+            payload = part.get_payload()
+            if isinstance(payload, list):
+                for child in payload:
+                    if isinstance(child, Message):
+                        visit(child)
+            return
         if content_type not in {"text/plain", "text/html"}:
-            continue
+            return
         try:
             content = part.get_content()
         except Exception:
@@ -1162,17 +1420,26 @@ def _parse_message(raw: bytes, *, body_limit: int) -> _ParsedMessage:
             content = payload.decode(charset, errors="replace")
         value = str(content)
         (plain if content_type == "text/plain" else html).append(value)
+
+    visit(message)
     body = "\n".join(plain)
     if not body.strip() and html:
         body = _html_text("\n".join(html))
-    body = body.replace("\x00", "")[:body_limit]
+    body = body.replace("\x00", "")
+    body_truncated = len(body) > body_limit
+    body = body[:body_limit]
     return _ParsedMessage(
         subject=subject,
         date_header=date_header,
         from_addresses=from_addresses,
         to_addresses=to_addresses,
         cc_addresses=cc_addresses,
+        list_id=list_id,
+        list_unsubscribe=list_unsubscribe,
+        precedence=precedence,
+        auto_submitted=auto_submitted,
         body_text=body,
+        body_truncated=body_truncated,
         attachments=tuple(attachments),
     )
 
@@ -1222,6 +1489,26 @@ def _json_bytes(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
 
 
+def _message_metadata_digest(
+    *,
+    thread_id: str,
+    internal_date: str | None,
+    label_ids: Sequence[str],
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"pkm-brain/gmail-archive/message-metadata/v1\0")
+    digest.update(
+        _json_bytes(
+            {
+                "thread_id": str(thread_id),
+                "internal_date": internal_date,
+                "label_ids": sorted(set(_labels(label_ids))),
+            }
+        )
+    )
+    return digest.hexdigest()
+
+
 def _decrypt_search_payload(
     key: bytes,
     account_key: str,
@@ -1247,9 +1534,79 @@ def _decrypt_search_payload(
         for field in ("from_addresses", "to_addresses", "cc_addresses", "attachment_filenames"):
             if not isinstance(value[field], list):
                 raise ValueError
+        label_ids = value.get("label_ids", [])
+        if not isinstance(label_ids, list) or not all(
+            isinstance(item, str) for item in label_ids
+        ):
+            raise ValueError
+        value["label_ids"] = list(_labels(label_ids))
         return value
     except (InvalidTag, ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise GmailArchiveIntegrityError("Encrypted Gmail search text is corrupt") from exc
+
+
+def _thread_snapshots(
+    account_key: str,
+    rows: Sequence[sqlite3.Row],
+) -> tuple[ArchiveThreadSnapshot, ...]:
+    grouped: dict[str, list[sqlite3.Row]] = {}
+    for row in rows:
+        grouped.setdefault(str(row["thread_id"]), []).append(row)
+
+    output: list[ArchiveThreadSnapshot] = []
+    for thread_id, thread_rows in grouped.items():
+        source_dates = [
+            str(row["internal_date"])
+            for row in thread_rows
+            if row["internal_date"] is not None
+        ]
+        digest = hashlib.sha256()
+        digest.update(b"pkm-brain/gmail-archive/thread-revision/v2\0")
+        for row in thread_rows:
+            digest.update(
+                _json_bytes(
+                    [
+                        str(row["message_id"]),
+                        (
+                            str(row["internal_date"])
+                            if row["internal_date"] is not None
+                            else None
+                        ),
+                        bool(row["deleted"]),
+                        bool(row["hidden"]),
+                        int(row["raw_size"]),
+                        str(row["raw_digest"]),
+                        str(row["metadata_digest"]),
+                    ]
+                )
+            )
+            digest.update(b"\n")
+        output.append(
+            ArchiveThreadSnapshot(
+                thread_id=thread_id,
+                source_revision=digest.hexdigest(),
+                total_message_count=len(thread_rows),
+                visible_message_count=sum(
+                    int(not bool(row["deleted"]) and not bool(row["hidden"]))
+                    for row in thread_rows
+                ),
+                deleted_message_count=sum(
+                    int(bool(row["deleted"])) for row in thread_rows
+                ),
+                hidden_message_count=sum(
+                    int(not bool(row["deleted"]) and bool(row["hidden"]))
+                    for row in thread_rows
+                ),
+                created_at=min(source_dates) if source_dates else None,
+                updated_at=max(source_dates) if source_dates else None,
+                archive_updated_at=max(
+                    str(row["updated_at"]) for row in thread_rows
+                ),
+                raw_size=sum(int(row["raw_size"]) for row in thread_rows),
+                account_key=account_key,
+            )
+        )
+    return tuple(output)
 
 
 def _decrypt_raw(

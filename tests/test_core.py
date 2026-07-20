@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from pkm_brain.audit import audit_memories, provenance_check
-from pkm_brain.chunking import chunk_text, sanitize_agent_session_log
+from pkm_brain.chunking import Chunk, chunk_text, sanitize_agent_session_log
 from pkm_brain.db import connection
 from pkm_brain.embeddings import (
     EmbeddingProviderUnavailable,
@@ -479,6 +479,43 @@ def test_search_reports_vector_stamp_mismatch_and_uses_fts(tmp_path: Path) -> No
     )
     assert doctor["status"] == "rebuild_recommended"
     assert doctor["embedding_stamp"]["matches"] is False
+
+
+def test_ingest_embeds_new_chunks_in_bounded_batches(
+    tmp_path: Path, monkeypatch
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "large-ingest.md"
+    note.write_text("# Large ingest\n\nBody\n", encoding="utf-8")
+    fake_chunks = [
+        Chunk(
+            chunk_index=index,
+            text=f"bounded embedding chunk {index}",
+            heading_path="Large ingest",
+            start_offset=index,
+            end_offset=index + 1,
+            token_count=4,
+            content_hash=f"hash-{index}",
+        )
+        for index in range(300)
+    ]
+    monkeypatch.setattr(
+        "pkm_brain.service.chunk_text",
+        lambda _text, _source_type: fake_chunks,
+    )
+    batch_sizes: list[int] = []
+
+    def fake_upsert(_path, rows, _provider) -> int:
+        batch_sizes.append(len(rows))
+        return len(rows)
+
+    monkeypatch.setattr("pkm_brain.service.upsert_vectors", fake_upsert)
+
+    result = svc.ingest(source=note)
+
+    assert result.embeddings_created == 300
+    assert batch_sizes == [128, 128, 44]
 
 
 def test_configured_model_provider_skips_vector_writes_without_hash_fallback(
@@ -1338,6 +1375,34 @@ def test_reranking_suppresses_indexed_negative_control_fixture_mentions() -> Non
     assert selected == []
     assert reranked[0]["suppressed"] is True
     assert "retrieval negative-control fixture" in reranked[0]["suppress_reasons"]
+
+
+def test_reranking_suppresses_bulk_gmail_outside_explicit_mail_search() -> None:
+    query = "Acme product strategy"
+    chunk = {
+        "chunk_id": "chunk_bulk_gmail",
+        "document_id": "doc_bulk_gmail",
+        "chunk_index": 0,
+        "title": "Acme weekly offers",
+        "source_type": "gmail_thread",
+        "tags": '["gmail:delivery:bulk", "gmail:importance:advertising"]',
+        "text": "Acme product strategy savings and weekly offers.",
+        "heading_path": "",
+        "token_count": 10,
+        "document_created_at": "2026-07-17T00:00:00+00:00",
+        "document_ingested_at": "2026-07-17T00:00:00+00:00",
+    }
+    fanout = {
+        "lexical": [{"chunk_id": "chunk_bulk_gmail"}],
+        "vector": [{"chunk_id": "chunk_bulk_gmail"}],
+    }
+
+    generic = rerank_chunks(query, [chunk], fanout)
+    explicit = rerank_chunks("Acme newsletter", [chunk], fanout)
+
+    assert generic[0]["suppressed"] is True
+    assert "bulk or advertising Gmail thread" in generic[0]["suppress_reasons"]
+    assert explicit[0]["suppressed"] is False
 
 
 def test_retrieve_context_prefers_managed_pages_and_ignores_agent_title_drag(

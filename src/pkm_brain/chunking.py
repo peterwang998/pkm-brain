@@ -62,7 +62,7 @@ def chunk_text(
     overlap_tokens: int = DEFAULT_OVERLAP_TOKENS,
 ) -> list[Chunk]:
     text = prepare_text_for_indexing(text, source_type)
-    if source_type == "markdown_note":
+    if source_type in {"markdown_note", "gmail_thread"}:
         return chunk_markdown(text, target_tokens, overlap_tokens)
     return chunk_blocks(text, target_tokens, overlap_tokens)
 
@@ -70,6 +70,8 @@ def chunk_text(
 def prepare_text_for_indexing(text: str, source_type: str) -> str:
     if source_type == "agent_session_log":
         return sanitize_agent_session_log(text)
+    if source_type == "gmail_thread":
+        return strip_frontmatter(text)
     return text
 
 

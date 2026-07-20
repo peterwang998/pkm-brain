@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import traceback
@@ -30,6 +31,11 @@ from .embeddings import (
 )
 from .fact_records import fact_citation_snapshots, slim_fact_for_context
 from .fact_retrieval import search_temporal_facts
+from .gmail_retrieval_policy import (
+    gmail_document_tags,
+    gmail_retrieval_noise_reasons,
+    secure_gmail_raw_directories,
+)
 from .indexes import (
     VectorIndexUnavailable,
     delete_vectors,
@@ -204,6 +210,7 @@ AGENT_QUERY_TERMS = {
 
 SOURCE_TYPE_WEIGHTS = {
     "hyprnote_meeting": 4.0,
+    "gmail_thread": 0.0,
     "markdown_note": 3.0,
     "meeting_transcript": 2.0,
     "web_clip": 3.0,
@@ -452,7 +459,15 @@ class BrainService:
         self.init_workspace()
         with connection(self.paths.sqlite_path) as conn:
             sqlite_chunk_ids = {
-                row["id"] for row in conn.execute("SELECT id FROM chunks")
+                row["id"]
+                for row in conn.execute(
+                    """
+                    SELECT c.id
+                    FROM chunks c
+                    JOIN documents d ON d.id = c.document_id
+                    WHERE d.status = 'active'
+                    """
+                )
             }
         stats = lancedb_stats(self.paths.lancedb_path)
         stamp_report = embedding_stamp_report(
@@ -707,7 +722,13 @@ class BrainService:
         with connection(self.paths.sqlite_path) as conn:
             chunk_rows = rows(
                 conn,
-                "SELECT id, document_id, text, heading_path FROM chunks ORDER BY document_id, chunk_index",
+                """
+                SELECT c.id, c.document_id, c.text, c.heading_path
+                FROM chunks c
+                JOIN documents d ON d.id = c.document_id
+                WHERE d.status = 'active'
+                ORDER BY c.document_id, c.chunk_index
+                """,
             )
 
         if not embedding_status["available"]:
@@ -721,9 +742,17 @@ class BrainService:
                 "embedding": embedding_status,
             }
 
+        stale_vectors_removed = 0
         if missing_only:
             try:
                 existing_ids = vector_chunk_ids(self.paths.lancedb_path)
+                active_ids = {str(row["id"]) for row in chunk_rows}
+                stale_ids = sorted(existing_ids - active_ids)
+                for offset in range(0, len(stale_ids), 500):
+                    stale_vectors_removed += delete_vectors(
+                        self.paths.lancedb_path, stale_ids[offset : offset + 500]
+                    )
+                existing_ids.difference_update(stale_ids)
                 target_rows = [
                     row for row in chunk_rows if row["id"] not in existing_ids
                 ]
@@ -773,6 +802,7 @@ class BrainService:
                 "after": after,
                 "embedding": embedding_status,
                 "missing_only": missing_only,
+                "stale_vectors_removed": stale_vectors_removed,
                 "backup_path": str(backup_path) if backup_path else None,
                 "backup_retained": backup_retained,
             }
@@ -790,6 +820,7 @@ class BrainService:
                 "after": lancedb_stats(self.paths.lancedb_path),
                 "embedding": embedding_status,
                 "missing_only": missing_only,
+                "stale_vectors_removed": stale_vectors_removed,
                 "backup_path": str(backup_path) if backup_path else None,
                 "failed_path": str(failed_path) if failed_path else None,
             }
@@ -847,7 +878,17 @@ class BrainService:
                 "DELETE FROM context_lineage_events WHERE retrieval_event_id IS NOT NULL"
             ).rowcount
             delete_all_chunk_fts(conn)
-            chunks_deleted = conn.execute("DELETE FROM chunks").rowcount
+            active_document_ids = [
+                str(document["id"]) for document in document_rows
+            ]
+            if active_document_ids:
+                placeholders = ",".join("?" for _ in active_document_ids)
+                chunks_deleted = conn.execute(
+                    f"DELETE FROM chunks WHERE document_id IN ({placeholders})",
+                    active_document_ids,
+                ).rowcount
+            else:
+                chunks_deleted = 0
 
             for plan in plans:
                 document = plan["document"]
@@ -951,7 +992,7 @@ class BrainService:
                    MAX(LENGTH(c.text)) AS max_chunk_bytes
             FROM documents d
             JOIN chunks c ON c.document_id = d.id
-            WHERE d.source_type = ?
+            WHERE d.source_type = ? AND d.status = 'active'
             GROUP BY d.id
             """
             params: tuple[Any, ...] = (source_type,)
@@ -1217,17 +1258,17 @@ class BrainService:
                     source_mtime_ns = int(stat.st_mtime_ns)
                     source_size = int(stat.st_size)
                     origin, logical_source_key = self._origin_identity_for_path(
-                        path, origin_node_id
+                        path, origin_node_id, source_type
                     )
                     existing = conn.execute(
                         """
                         SELECT id, source_type, title, content_hash, raw_path, source_mtime_ns, source_size
                         FROM documents
-                        WHERE origin_node_id = ? AND logical_source_key = ?
-                        ORDER BY ingested_at DESC
+                        WHERE logical_source_key = ? AND (origin_node_id = ? OR (? = 'gmail_thread' AND ? = 'gmail-knowledge'))
+                        ORDER BY CASE WHEN origin_node_id = ? THEN 0 ELSE 1 END, ingested_at DESC
                         LIMIT 1
                         """,
-                        (origin, logical_source_key),
+                        (logical_source_key, origin, source_type, origin, origin),
                     ).fetchone()
                     if existing and existing_document_matches_source_stats(
                         existing,
@@ -1259,6 +1300,7 @@ class BrainService:
                     content_hash = file_sha256(path)
                     text = path.read_text(encoding="utf-8", errors="replace")
                     title = document_title_for_text(text, path)
+                    document_tags = gmail_document_tags(text, source_type)
                     if existing:
                         if existing["content_hash"] == content_hash:
                             if source_type == "agent_session_log":
@@ -1328,7 +1370,7 @@ class BrainService:
                             ingested_at,
                             ingested_at,
                             None,
-                            dumps([]),
+                            dumps(document_tags),
                             1,
                             "active",
                         ),
@@ -1401,10 +1443,13 @@ class BrainService:
                 "attempted": len(vector_source_rows),
             }
             try:
-                vector_rows = self._vector_rows_for_chunks(vector_source_rows)
-                embeddings_created = upsert_vectors(
-                    self.paths.lancedb_path, vector_rows, self.embedding_provider
-                )
+                for offset in range(0, len(vector_source_rows), 128):
+                    batch = vector_source_rows[offset : offset + 128]
+                    embeddings_created += upsert_vectors(
+                        self.paths.lancedb_path,
+                        self._vector_rows_for_chunks(batch),
+                        self.embedding_provider,
+                    )
                 vector_writes["written"] = embeddings_created
             except (EmbeddingProviderUnavailable, VectorIndexUnavailable) as exc:
                 vector_writes = {
@@ -1607,23 +1652,23 @@ class BrainService:
     ) -> Path:
         date = ingested_at[:10].split("-")
         target_dir = self.paths.raw / source_type / date[0] / date[1]
-        target_dir.mkdir(parents=True, exist_ok=True)
+        target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(target_dir, 0o700)
+        secure_gmail_raw_directories(target_dir, self.paths.raw, source_type)
         target = (
             target_dir / f"{slugify(source.stem)}-{content_hash[:12]}{source.suffix}"
         )
         shutil.copy2(source, target)
         return target
 
-    def _origin_identity_for_path(
-        self, path: Path, origin_node_id: str | None = None
-    ) -> tuple[str, str]:
+    def _origin_identity_for_path(self, path: Path, origin_node_id: str | None = None, source_type: str | None = None) -> tuple[str, str]:
         try:
             external_relative = path.resolve().relative_to(
                 (self.paths.inbox / "external").resolve()
             )
         except ValueError:
             external_relative = None
-        origin = origin_node_id or local_node_id(self.paths)
+        origin = origin_node_id or ("gmail-knowledge" if source_type == "gmail_thread" else local_node_id(self.paths))
         if external_relative and external_relative.parts:
             origin = origin_node_id or external_relative.parts[0]
             if len(external_relative.parts) > 1:
@@ -2252,14 +2297,13 @@ class BrainService:
                 created_at=created_at,
             )
 
-    def _fanout_chunk_candidates(
-        self, query: str, limit: int
-    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        lexical = self._search_fts(query, limit)
+    def _fanout_chunk_candidates(self, query: str, limit: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        raw_limit = min(1000, max(240, limit * 16))
+        lexical = self._search_fts(query, raw_limit)
         vector_unavailable_reason = None
         try:
             vector = search_vectors(
-                self.paths.lancedb_path, self.embedding_provider, query, limit
+                self.paths.lancedb_path, self.embedding_provider, query, raw_limit
             )
         except (EmbeddingProviderUnavailable, VectorIndexUnavailable) as exc:
             vector = []
@@ -2277,7 +2321,10 @@ class BrainService:
         vector_ids = [row["chunk_id"] for row in vector if row.get("chunk_id")]
         fused_ids = reciprocal_rank_fusion(lexical_ids, vector_ids)
         candidate_ids = dedupe_preserve_order(fused_ids + lexical_ids + vector_ids)
-        return self._chunks_by_ids(candidate_ids), {
+        candidates = self._chunks_by_ids(candidate_ids)
+        candidates = [row for row in candidates if not gmail_retrieval_noise_reasons(row, query)][:limit]
+        candidate_ids = [row["chunk_id"] for row in candidates]
+        return candidates, {
             "lexical": lexical,
             "vector": vector_debug,
             "vector_unavailable_reason": vector_unavailable_reason,
@@ -2767,10 +2814,14 @@ class BrainService:
                 found = rows(
                     conn,
                     """
-                    SELECT target_id AS chunk_id, bm25(retrieval_fts) AS score
+                    SELECT retrieval_fts.target_id AS chunk_id,
+                           bm25(retrieval_fts) AS score
                     FROM retrieval_fts
+                    JOIN chunks c ON c.id = retrieval_fts.target_id
+                    JOIN documents d ON d.id = c.document_id
                     WHERE retrieval_fts MATCH ?
-                      AND kind = 'chunk'
+                      AND retrieval_fts.kind = 'chunk'
+                      AND d.status = 'active'
                     ORDER BY score
                     LIMIT ?
                     """,
@@ -2781,9 +2832,12 @@ class BrainService:
             found = rows(
                 conn,
                 """
-                SELECT chunk_id, bm25(chunk_fts) AS score
+                SELECT chunk_fts.chunk_id, bm25(chunk_fts) AS score
                 FROM chunk_fts
+                JOIN chunks c ON c.id = chunk_fts.chunk_id
+                JOIN documents d ON d.id = c.document_id
                 WHERE chunk_fts MATCH ?
+                  AND d.status = 'active'
                 ORDER BY score
                 LIMIT ?
                 """,
@@ -2802,11 +2856,12 @@ class BrainService:
                 SELECT c.id AS chunk_id, c.text, c.heading_path, c.chunk_index, c.token_count,
                        c.content_hash, c.created_at AS chunk_created_at,
                        d.id AS document_id, d.title, d.source_type, d.source_path, d.raw_path,
-                       d.origin_node_id, d.logical_source_key,
+                       d.origin_node_id, d.logical_source_key, d.tags,
                        d.created_at AS document_created_at, d.ingested_at AS document_ingested_at
                 FROM chunks c
                 JOIN documents d ON d.id = c.document_id
                 WHERE c.id IN ({placeholders})
+                  AND d.status = 'active'
                 """,
                 chunk_ids,
             )
@@ -2940,6 +2995,7 @@ def retrieval_policy(mode: str, budget: int | None = None) -> RetrievalPolicy:
             default_chunk_cap=900,
             source_caps={
                 "agent_session_log": 600,
+                "gmail_thread": 900,
                 "hyprnote_meeting": 900,
                 "markdown_note": 1000,
             },
@@ -2953,6 +3009,7 @@ def retrieval_policy(mode: str, budget: int | None = None) -> RetrievalPolicy:
             default_chunk_cap=1400,
             source_caps={
                 "agent_session_log": 1000,
+                "gmail_thread": 1400,
                 "hyprnote_meeting": 1400,
                 "markdown_note": 1800,
             },
@@ -2966,6 +3023,7 @@ def retrieval_policy(mode: str, budget: int | None = None) -> RetrievalPolicy:
             default_chunk_cap=2200,
             source_caps={
                 "agent_session_log": 1800,
+                "gmail_thread": 2200,
                 "hyprnote_meeting": 2500,
                 "markdown_note": 3000,
             },
@@ -2979,6 +3037,7 @@ def retrieval_policy(mode: str, budget: int | None = None) -> RetrievalPolicy:
             default_chunk_cap=16000,
             source_caps={
                 "agent_session_log": 16000,
+                "gmail_thread": 16000,
                 "hyprnote_meeting": 16000,
                 "markdown_note": 16000,
             },
@@ -3126,6 +3185,7 @@ def rerank_chunks(
             reasons.append(f"source_type {source_type} ({source_weight:+g})")
 
         noise_reasons = chunk_noise_reasons(candidate)
+        noise_reasons.extend(gmail_retrieval_noise_reasons(candidate, query))
         if retrieval_negative_control_fixture_mention(
             text_lower, terms, local_specific_hits
         ):
@@ -4497,6 +4557,10 @@ def detect_source_type(path: Path) -> str | None:
     suffix = path.suffix.lower()
     if suffix == ".md":
         text = path.read_text(encoding="utf-8", errors="replace")[:2000].lower()
+        if re.search(
+            r"source_type:\s*['\"]?gmail_thread", text
+        ) or "/documents/gmail/" in str(path):
+            return "gmail_thread"
         if re.search(
             r"source_type:\s*['\"]?hyprnote_meeting", text
         ) or "/documents/hyprnote/" in str(path):

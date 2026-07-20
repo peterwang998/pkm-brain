@@ -327,6 +327,8 @@ def mark_unresolved_route_decision(
 def candidate_requires_route_resolution(candidate: dict[str, Any]) -> bool:
     page_hint = normalize_page_hint(candidate.get("page_hint"))
     routing = candidate_route_metadata(candidate)
+    if routing.get("event_temporal_identity_guard_locked") is True:
+        return False
     return bool(
         not page_hint
         or page_hint in FALLBACK_PAGE_HINTS

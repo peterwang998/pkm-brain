@@ -27,18 +27,46 @@ from .event_projection import (
     coalesce_structured_event_candidates,
     structured_source_event_candidate,
 )
+from .event_routing import (
+    enrich_event_route_targets,
+    guard_event_candidate_route,
+    guard_event_candidate_routes,
+)
 from .extraction_contract import (
     COMPATIBLE_EXTRACTION_PROMPT_VERSIONS,
     EXTRACTION_PROMPT_VERSION,
     EXTRACTION_SCHEMA,
 )
+from .extraction_evidence import (
+    MAX_EVIDENCE_UNITS_PER_FACT,
+    empty_resolved_evidence as empty_resolved_evidence,
+    fact_evidence_ref,
+    failed_facts_from_response,
+    resolve_evidence_units,
+    statement_faithfulness_reasons,
+)
 from .extraction_entities import (
     normalize_extracted_entity_mentions,
     primary_entity_surface,
     primary_entity_type,
-    stable_unique_strings,
+)
+from .extraction_source_policy import (
+    DEFAULT_EXTRACTION_MAX_WORKERS,
+    extraction_policy_for_source_type,
+    filter_source_extraction_chunks,
+    normalize_extraction_max_workers,
+    source_extraction_admission,
+    source_prompt_safety_rule,
 )
 from .fact_relations import classify_fact_relation
+from .gmail_fact_quality import evaluate_gmail_fact_quality
+from .gmail_sensitive_data import (
+    gmail_payload_contains_sensitive_mask,
+    gmail_payload_contains_sensitive_value,
+    gmail_sensitive_values,
+    sanitize_gmail_model_payload,
+)
+from .gmail_temporal import gmail_temporal_review_reason, stabilize_gmail_event_time
 from .llm import (
     LLMProvider,
     LLMProviderError,
@@ -47,7 +75,6 @@ from .llm import (
     get_cos_role_provider,
     load_cos_llm_config,
 )
-from .numeric_faithfulness import unsupported_statement_numbers
 from .paths import BrainPaths
 from .policy_action_batch import decide_policy_actions
 from .routing_coherence import (
@@ -60,7 +87,6 @@ from .routing_coherence import (
 from .source_evidence import (
     evidence_units_for_text,
     extraction_confidence_values,
-    resolve_evidence_unit_ids,
 )
 from .source_dates import document_source_date_metadata, stamp_candidate_source_context
 from .temporal import (
@@ -108,18 +134,14 @@ CONFLICT_PRECHECK_SCHEMA = {
 EXTRACTION_STAGE = "extractor"
 EXTRACTION_VALIDATION_ATTEMPTS = 2
 MIN_COVERAGE_RETRY_EVIDENCE_CHARS = 4_000
-MAX_EVIDENCE_UNITS_PER_FACT = 5
 DEFAULT_EXTRACTION_WINDOW_CHUNKS = 6
 DEFAULT_EXTRACTION_WINDOW_OVERLAP_CHUNKS = 1
-DEFAULT_EXTRACTION_MAX_WORKERS = 1
-MAX_EXTRACTION_MAX_WORKERS = 16
 DEFAULT_CRITIC_REVIEW_MAX_WORKERS = 4
 DEFAULT_CRITIC_REVIEW_TIMEOUT_SECONDS = 300
 DEFAULT_CRITIC_BLOCK_RATE_ANOMALY_THRESHOLD = 0.8
 DEFAULT_CRITIC_BLOCK_RATE_ANOMALY_MIN_REVIEWED = 5
 DEFAULT_ROUTING_HINT_LIMIT = 80
 ROUTING_HINT_POOL_LIMIT = 2000
-DEFAULT_SKIPPED_SOURCE_TYPES = {"agent_session_log"}
 DEFAULT_FALLBACK_PAGE_HINTS = {"concepts/extracted-facts.md"}
 REFERENCE_ROUTE_PREFIXES = ("references/", "wiki/references/")
 INVALID_ROUTE_PREFIXES = (
@@ -357,8 +379,11 @@ def extract_recent_documents(
     document_validations: list[dict[str, Any]] = []
     route_targets = load_extraction_route_targets(paths)
     for index, document in enumerate(documents):
-        document_candidates = apply_document_route_coherence(
+        document_candidates = guard_event_candidate_routes(
             document_outputs[index]["candidates"], route_targets
+        )
+        document_candidates = apply_document_route_coherence(
+            document_candidates, route_targets
         )
         window_validations = document_outputs[index]["window_validations"]
         document_validation = aggregate_document_validation(
@@ -743,6 +768,9 @@ def recent_source_cards(
             )
             if not policy["extract"]:
                 continue
+            admitted, source_metadata = source_extraction_admission(dict(document), policy)
+            if not admitted:
+                continue
             chunk_rows = rows(
                 conn,
                 """
@@ -758,11 +786,16 @@ def recent_source_cards(
                     "chunk_id": row["id"],
                     "chunk_index": row["chunk_index"],
                     "heading_path": row["heading_path"],
+                    "start_offset": row["start_offset"],
+                    "end_offset": row["end_offset"],
                     "token_count": row["token_count"],
                     "text": row["text"],
                 }
                 for row in chunk_rows
             ]
+            chunks = filter_source_extraction_chunks(
+                str(document["source_type"]), chunks, source_metadata
+            )
             normalized_content = normalized_extraction_content(chunks)
             normalized_content_hash = normalized_extraction_content_hash(chunks)
             if changed_only and extraction_terminal_watermark_exists(
@@ -803,6 +836,7 @@ def recent_source_cards(
                     "title": document["title"],
                     "source_type": document["source_type"],
                     "source_id": f"document:{document['id']}",
+                    **source_metadata,
                     **document_source_date_metadata(dict(document)),
                     "content_hash": normalized_content_hash,
                     "raw_content_hash": document["content_hash"],
@@ -927,44 +961,6 @@ def load_extraction_config(paths: BrainPaths) -> dict[str, Any]:
     }
 
 
-def extraction_policy_for_source_type(
-    config: dict[str, Any], source_type: str
-) -> dict[str, Any]:
-    source_types = (
-        config.get("source_types")
-        if isinstance(config.get("source_types"), dict)
-        else {}
-    )
-    policy = {
-        "extract": source_type not in DEFAULT_SKIPPED_SOURCE_TYPES,
-        "full_coverage": True,
-    }
-    default_policy = source_types.get("default")
-    if isinstance(default_policy, dict):
-        policy.update(normalize_extraction_policy(default_policy))
-    source_policy = source_types.get(source_type)
-    if isinstance(source_policy, dict):
-        policy.update(normalize_extraction_policy(source_policy))
-    return policy
-
-
-def normalize_extraction_policy(value: dict[str, Any]) -> dict[str, bool]:
-    output: dict[str, bool] = {}
-    if "extract" in value:
-        output["extract"] = bool(value["extract"])
-    if "full_coverage" in value:
-        output["full_coverage"] = bool(value["full_coverage"])
-    return output
-
-
-def normalize_extraction_max_workers(value: Any) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        parsed = DEFAULT_EXTRACTION_MAX_WORKERS
-    return min(MAX_EXTRACTION_MAX_WORKERS, max(1, parsed))
-
-
 def normalize_critic_review_config(value: Any) -> dict[str, Any]:
     raw = value if isinstance(value, dict) else {}
     return {
@@ -1074,14 +1070,16 @@ def propose_policy_gated_candidates(
     run_id: str | None,
     critic_review: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    route_targets = load_extraction_route_targets(paths)
     candidates = resolve_unrouted_candidate_routes(
         paths,
         candidates,
-        load_extraction_route_targets(paths),
+        route_targets,
         usage_cycle_id=run_id,
         usage_run_id=run_id,
         usage_stage="route_resolution",
     )
+    candidates = guard_event_candidate_routes(candidates, route_targets)
     actions: list[dict[str, Any]] = []
     pending_decisions: list[tuple[int, str]] = []
     review = critic_review or default_critic_review_config()
@@ -1420,6 +1418,9 @@ def apply_document_route_coherence(
     output: list[dict[str, Any]] = []
     for candidate in candidates:
         routing = candidate_route_metadata(candidate)
+        if routing.get("event_temporal_identity_guard_locked") is True:
+            output.append(candidate)
+            continue
         confidence = optional_float(candidate.get("routing_confidence"))
         current_page_hint = normalize_extraction_page_hint(
             str(candidate.get("page_hint") or "")
@@ -2497,6 +2498,9 @@ def apply_simple_autonomy_candidates(
     run_id: str | None,
     simple_autonomy: dict[str, Any],
 ) -> list[dict[str, Any]]:
+    candidates = guard_event_candidate_routes(
+        candidates, load_extraction_route_targets(paths)
+    )
     actions: list[dict[str, Any]] = []
     for candidate in candidates:
         decision = simple_fact_decision(paths, candidate, simple_autonomy)
@@ -2568,6 +2572,8 @@ def simple_fact_decision(
             "weak_evidence_fact",
             "Candidate does not have unit-derived source spans.",
         )
+    if temporal_review_reason := gmail_temporal_review_reason(candidate):
+        return simple_residue_decision("gmail_temporal_review", temporal_review_reason)
     low_confidence_reason = simple_low_confidence_reason(candidate, simple_autonomy)
     if low_confidence_reason:
         return simple_residue_decision("low_confidence_fact", low_confidence_reason)
@@ -3114,6 +3120,7 @@ def load_extraction_route_targets(paths: BrainPaths) -> dict[str, dict[str, Any]
                 "_route_target_exists": True,
                 "_route_target_managed": True,
             }
+        hints_by_page = enrich_event_route_targets(conn, hints_by_page)
     return hints_by_page
 
 
@@ -3265,9 +3272,12 @@ def record_extraction_watermarks(
 
 
 def extraction_prompt(source_window: dict[str, Any]) -> str:
+    untrusted_source_rule = source_prompt_safety_rule(source_window)
+    model_source_window = extraction_source_window_for_model(source_window)
     return (
         "Extract atomic source-backed facts from this single source window.\n"
-        "Each fact must include: statement, chunk_id, evidence_unit_ids, page_hint, section_hint, "
+        + untrusted_source_rule
+        + "Each fact must include: statement, chunk_id, evidence_unit_ids, page_hint, section_hint, "
         "claim_class, entities, extraction_confidence, routing_confidence, and truth_confidence. "
         "Also include entity_key as the primary entity surface string when available.\n"
         "claim_class must be one of: decision, commitment, preference, role_or_responsibility, "
@@ -3344,7 +3354,7 @@ def extraction_prompt(source_window: dict[str, Any]) -> str:
         "- Use concepts/extracted-facts.md only when no canonical routing target fits.\n"
         "- Never use references/*.md, wiki/references/*.md, agent_session_log pages, absolute file paths, "
         "raw source paths, or docs/*.md audit file paths as page_hint.\n\n"
-        f"Source window JSON:\n{json.dumps(source_window, ensure_ascii=False, indent=2)}"
+        f"Source window JSON:\n{json.dumps(model_source_window, ensure_ascii=False, indent=2)}"
     )
 
 
@@ -3353,6 +3363,12 @@ def extraction_validation_retry_prompt(
     previous_response: dict[str, Any],
     validation_report: dict[str, Any],
 ) -> str:
+    model_source_window = extraction_source_window_for_model(source_window)
+    validation_failures = validation_report
+    failed_facts = failed_facts_from_response(previous_response, validation_report)
+    if extraction_source_type(source_window) == "gmail_thread":
+        validation_failures = sanitize_gmail_model_payload(validation_failures)
+        failed_facts = sanitize_gmail_model_payload(failed_facts)
     return (
         "The previous extractor response did not pass deterministic validation. "
         "Return a corrected full JSON object with a facts array containing only corrected or replacement "
@@ -3381,16 +3397,17 @@ def extraction_validation_retry_prompt(
         "non-event valid_from/valid_to describe when the proposition itself is true, never a meeting date, target, "
         "deadline, source date, or job time.\n\n"
         "Validation failures JSON:\n"
-        f"{json.dumps(compact_validation_report(validation_report), ensure_ascii=False, indent=2)}\n\n"
+        f"{json.dumps(compact_validation_report(validation_failures), ensure_ascii=False, indent=2)}\n\n"
         "Previous failed facts JSON:\n"
-        f"{json.dumps(failed_facts_from_response(previous_response, validation_report), ensure_ascii=False, indent=2)[:12000]}\n\n"
+        f"{json.dumps(failed_facts, ensure_ascii=False, indent=2)[:12000]}\n\n"
         "Do not repeat already accepted facts.\n\n"
         "Source window JSON:\n"
-        f"{json.dumps(source_window, ensure_ascii=False, indent=2)}"
+        f"{json.dumps(model_source_window, ensure_ascii=False, indent=2)}"
     )
 
 
 def extraction_coverage_retry_prompt(source_window: dict[str, Any]) -> str:
+    model_source_window = extraction_source_window_for_model(source_window)
     return (
         "Coverage audit: the first pass returned no facts from a substantive source window. "
         "Read the entire window again and return a JSON object with a facts array. Return every distinct "
@@ -3413,8 +3430,19 @@ def extraction_coverage_retry_prompt(source_window: dict[str, Any]) -> str:
         "with source-supported actual/planned bounds. Do not derive time from the meeting, capture, processing, "
         "or job date. Invalid or absent time must not suppress a fact.\n\n"
         "Source window JSON:\n"
-        f"{json.dumps(source_window, ensure_ascii=False, indent=2)}"
+        f"{json.dumps(model_source_window, ensure_ascii=False, indent=2)}"
     )
+
+
+def extraction_source_type(source_window: dict[str, Any]) -> str:
+    return str((source_window.get("document") or {}).get("source_type") or "")
+
+
+def extraction_source_window_for_model(source_window: dict[str, Any]) -> dict[str, Any]:
+    if extraction_source_type(source_window) != "gmail_thread":
+        return source_window
+    sanitized = sanitize_gmail_model_payload(source_window)
+    return sanitized if isinstance(sanitized, dict) else source_window
 
 
 def validate_extracted_facts(
@@ -3464,6 +3492,7 @@ def validate_extracted_facts_with_report(
     dropped: list[dict[str, Any]] = []
     enrichment_warnings: list[dict[str, Any]] = []
     contract_recovery_warnings: list[dict[str, Any]] = []
+    gmail_sensitive_values_by_chunk: dict[str, tuple[str, ...]] = {}
     for index, item in enumerate(raw_facts):
         reasons: list[str] = []
         if not isinstance(item, dict):
@@ -3476,6 +3505,26 @@ def validate_extracted_facts_with_report(
             )
             continue
         statement = str(item.get("statement") or "").strip()
+        item_chunk_id = str(item.get("chunk_id") or "").strip()
+        item_chunk_context = chunk_context_by_id.get(item_chunk_id) or {}
+        item_source_type = str(item_chunk_context.get("source_type") or "")
+        if item_source_type == "gmail_thread":
+            if item_chunk_id not in gmail_sensitive_values_by_chunk:
+                gmail_sensitive_values_by_chunk[item_chunk_id] = (
+                    gmail_sensitive_values(str(item_chunk_context.get("text") or ""))
+                )
+            source_values = gmail_sensitive_values_by_chunk[item_chunk_id]
+            if gmail_payload_contains_sensitive_mask(
+                item
+            ) or gmail_payload_contains_sensitive_value(item, source_values=source_values):
+                rejections.append(
+                    {
+                        "index": index,
+                        "statement": "[redacted Gmail credential claim]",
+                        "reasons": ["sensitive_gmail_credential_fact"],
+                    }
+                )
+                continue
         raw_claim_class = normalize_claim_class(item.get("claim_class"))
         claim_class = canonical_claim_class(raw_claim_class)
         evidence_ref, evidence_ref_errors = fact_evidence_ref(item)
@@ -3534,6 +3583,7 @@ def validate_extracted_facts_with_report(
         valid_quotes = []
         evidence_unit_refs = []
         evidence_reasons: list[str] = []
+        evidence_sanitization: dict[str, Any] | None = None
         if evidence_ref is not None:
             resolved = resolve_evidence_units(chunk_context_by_id, evidence_ref)
             valid_spans.extend(resolved["source_spans"])
@@ -3541,6 +3591,9 @@ def validate_extracted_facts_with_report(
             source_ids.extend(resolved["source_ids"])
             evidence_unit_refs.extend(resolved["evidence_units"])
             evidence_reasons.extend(resolved["reasons"])
+            raw_sanitization = resolved.get("evidence_sanitization")
+            if isinstance(raw_sanitization, dict):
+                evidence_sanitization = raw_sanitization
         if not valid_spans:
             rejections.append(
                 {
@@ -3572,6 +3625,15 @@ def validate_extracted_facts_with_report(
                     reasons=entity_errors,
                 )
             )
+        gmail_event_time = stabilize_gmail_event_time(
+            source_type=item_source_type,
+            raw_event_time=item.get("event_time"),
+            evidence_text="\n".join(valid_quotes),
+            entity_mentions=entity_mentions,
+            cited_spans=valid_spans,
+            chunk_context_by_id=chunk_context_by_id,
+        )
+        entity_mentions = gmail_event_time.entity_mentions
         faithfulness_reasons = statement_faithfulness_reasons(
             statement,
             "\n".join(valid_quotes),
@@ -3583,6 +3645,33 @@ def validate_extracted_facts_with_report(
                     "index": index,
                     "statement": clip_text(statement),
                     "reasons": faithfulness_reasons,
+                }
+            )
+            continue
+        gmail_quality = evaluate_gmail_fact_quality(
+            source_type=item_source_type,
+            source_tags=item_chunk_context.get("source_tags"),
+            statement=statement,
+            claim_class=claim_class,
+            evidence_text="\n".join(valid_quotes),
+            entities=entity_mentions,
+        )
+        if gmail_quality.disposition == "reject":
+            rejections.append(
+                {
+                    "index": index,
+                    "statement": clip_text(statement),
+                    "reasons": [str(gmail_quality.reason)],
+                }
+            )
+            continue
+        if gmail_quality.disposition == "drop":
+            dropped.append(
+                {
+                    "index": index,
+                    "statement": clip_text(statement),
+                    "claim_class": claim_class,
+                    "reason": str(gmail_quality.reason),
                 }
             )
             continue
@@ -3613,7 +3702,7 @@ def validate_extracted_facts_with_report(
             "valid_time_precision": item.get("valid_time_precision"),
             "temporal_expression": item.get("temporal_expression"),
             "temporal_confidence": item.get("temporal_confidence"),
-            "event_time": item.get("event_time"),
+            "event_time": gmail_event_time.event_time,
             "confidence": confidence_values["truth_confidence"],
             "extraction_confidence": confidence_values["extraction_confidence"],
             "routing_confidence": confidence_values["routing_confidence"],
@@ -3622,9 +3711,15 @@ def validate_extracted_facts_with_report(
             "extractor_model": item.get("extractor_model") or extractor_model,
             "metadata": {
                 "source": "source_to_facts_extraction",
+                "source_type": item_source_type,
                 "claim_class": claim_class,
                 "evidence_units": evidence_unit_refs,
                 "routing": route_metadata,
+                **(
+                    {"evidence_sanitization": evidence_sanitization}
+                    if evidence_sanitization
+                    else {}
+                ),
                 **(
                     {
                         "evidence_unit_truncation": {
@@ -3638,6 +3733,7 @@ def validate_extracted_facts_with_report(
                     else {}
                 ),
                 **({"model_entity_key": model_entity_key} if model_entity_key else {}),
+                **gmail_event_time.audit_metadata,
                 **(
                     {"model_entity_mentions": entity_mentions}
                     if entity_mentions
@@ -3685,6 +3781,7 @@ def validate_extracted_facts_with_report(
                 entity_mentions, valid_spans
             ),
         )
+        event_time_errors.extend(gmail_event_time.errors)
         event_time_errors.extend(
             event_time_grounding_errors(candidate, "\n".join(valid_quotes))
         )
@@ -3698,6 +3795,7 @@ def validate_extracted_facts_with_report(
                 )
             )
             candidate = strip_event_time(candidate)
+        candidate = guard_event_candidate_route(candidate, route_targets)
         candidate["metadata"] = {
             **candidate["metadata"],
             **(
@@ -3730,103 +3828,8 @@ def validate_extracted_facts_with_report(
     }
 
 
-def fact_evidence_ref(item: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
-    errors: list[str] = []
-    chunk_id = str(item.get("chunk_id") or "").strip()
-    raw_unit_ids = item.get("evidence_unit_ids")
-    if not chunk_id:
-        errors.append("missing chunk_id")
-    if not isinstance(raw_unit_ids, list):
-        errors.append("missing evidence_unit_ids")
-        return None, errors
-    unit_ids = stable_unique_strings([str(unit_id).strip() for unit_id in raw_unit_ids])
-    if not unit_ids:
-        errors.append("missing evidence_unit_ids")
-    if errors:
-        return None, errors
-    selected_unit_ids = unit_ids[:MAX_EVIDENCE_UNITS_PER_FACT]
-    return {
-        "chunk_id": chunk_id,
-        "unit_ids": selected_unit_ids,
-        "original_unit_count": len(unit_ids),
-        "truncated_unit_count": max(0, len(unit_ids) - len(selected_unit_ids)),
-    }, []
-
-
-def resolve_evidence_units(
-    chunk_context_by_id: dict[str, dict[str, Any]],
-    evidence_ref: dict[str, Any],
-) -> dict[str, Any]:
-    chunk_id = str(evidence_ref.get("chunk_id") or "").strip()
-    unit_ids = [str(unit_id).strip() for unit_id in evidence_ref.get("unit_ids") or []]
-    chunk_context = chunk_context_by_id.get(chunk_id)
-    if chunk_context is None:
-        return empty_resolved_evidence([f"unknown chunk_id: {clip_text(chunk_id, 80)}"])
-    text = str(chunk_context["text"])
-    resolved = resolve_evidence_unit_ids(
-        text,
-        chunk_id=chunk_id,
-        unit_ids=unit_ids,
-    )
-    missing = resolved["missing_unit_ids"]
-    if missing:
-        return empty_resolved_evidence(
-            [
-                f"unknown evidence_unit_id for {clip_text(chunk_id, 80)}: "
-                f"{', '.join(missing)}"
-            ]
-        )
-    return {
-        "source_spans": resolved["source_spans"],
-        "quotes": resolved["quotes"],
-        "source_ids": resolved["source_ids"],
-        "evidence_units": resolved["evidence_units"],
-        "reasons": [],
-    }
-
-
-def empty_resolved_evidence(reasons: list[str]) -> dict[str, Any]:
-    return {
-        "source_spans": [],
-        "quotes": [],
-        "source_ids": [],
-        "evidence_units": [],
-        "reasons": reasons,
-    }
-
-
-def statement_faithfulness_reasons(
-    statement: str,
-    evidence_text: str,
-    entity_mentions: list[dict[str, Any]],
-) -> list[str]:
-    reasons: list[str] = []
-    unsupported_numbers = unsupported_statement_numbers(statement, evidence_text)
-    if unsupported_numbers:
-        reasons.append(
-            "statement_not_supported_by_evidence: unsupported number(s): "
-            + ", ".join(unsupported_numbers)
-        )
-    return reasons
-
-
 def compact_surface_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.casefold())
-
-
-def failed_facts_from_response(
-    previous_response: dict[str, Any],
-    validation_report: dict[str, Any],
-) -> list[Any]:
-    facts = previous_response.get("facts")
-    if not isinstance(facts, list):
-        return []
-    failed = []
-    for rejection in validation_report.get("rejections") or []:
-        index = rejection.get("index")
-        if isinstance(index, int) and 0 <= index < len(facts):
-            failed.append(facts[index])
-    return failed
 
 
 def route_validation_metrics(candidates: list[dict[str, Any]]) -> dict[str, Any]:
@@ -4372,8 +4375,17 @@ def load_chunk_contexts(paths: BrainPaths) -> dict[str, dict[str, Any]]:
         return {
             str(row["id"]): {
                 "text": str(row["text"] or ""),
+                "source_type": str(row["source_type"] or ""),
+                "source_tags": str(row["source_tags"] or "[]"),
             }
-            for row in conn.execute("SELECT id, text FROM chunks")
+            for row in conn.execute(
+                """
+                SELECT chunks.id, chunks.text, documents.source_type,
+                       documents.tags AS source_tags
+                FROM chunks
+                JOIN documents ON documents.id = chunks.document_id
+                """
+            )
         }
 
 

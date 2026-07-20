@@ -14,6 +14,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 import yaml
 
+import pkm_brain.automation as automation
 from pkm_brain.capture import AgentLogCapture
 from pkm_brain.connector_auth import (
     MemoryCredentialStore,
@@ -39,9 +40,11 @@ from pkm_brain.connectors import (
 )
 from pkm_brain.db import connection
 from pkm_brain.paths import BrainPaths
-from pkm_brain.service import BrainService
+from pkm_brain.gmail_knowledge import GmailRevisionReconciliation
+from pkm_brain.service import BrainService, IngestResult
 from pkm_brain.ui_server import create_ui_server
 from test_capture import make_codex_fixture, make_hyprnote_fixture
+from test_operations_policy import valid_policy_dict, write_policy
 
 
 def encoded_id_token(claims: dict[str, object]) -> str:
@@ -71,12 +74,12 @@ def test_connector_registry_exposes_builtin_manifests(tmp_path: Path) -> None:
     assert manifests["hyprnote"]["source_type"] == "hyprnote_meeting"
     assert manifests["hyprnote"]["default_enabled"] is False
     assert manifests["files"]["default_enabled"] is True
-    assert manifests["gmail"]["lifecycle"] == "auth_only"
-    assert manifests["gmail"]["capture_available"] is False
+    assert manifests["gmail"]["lifecycle"] == "active"
+    assert manifests["gmail"]["capture_available"] is True
+    assert manifests["gmail"]["source_type"] == "gmail_thread"
     assert manifests["gmail"]["default_cadence_s"] == 600
-    assert "Today > Run Shadow" in manifests["gmail"]["activation_note"]
-    assert "local operational mirror" in manifests["gmail"]["activation_note"]
-    assert "knowledge ingestion remain" in manifests["gmail"]["activation_note"]
+    assert "disabled by default" in manifests["gmail"]["activation_note"]
+    assert "likely-human" in manifests["gmail"]["activation_note"]
     assert manifests["gmail"]["auth"]["phase"] == "read_only"
     assert manifests["gmail"]["auth"]["requested_scopes"] == [
         "openid",
@@ -96,12 +99,14 @@ def test_connector_registry_exposes_builtin_manifests(tmp_path: Path) -> None:
     assert manifests["slack"]["auth"]["client_secret_required"] is True
 
 
-def test_auth_only_connectors_cannot_be_enabled_or_captured(tmp_path: Path) -> None:
+def test_gmail_knowledge_connector_is_opt_in_and_fails_closed_without_archive_policy(
+    tmp_path: Path,
+) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
     BrainService(paths).init_workspace()
 
-    with pytest.raises(ValueError, match="Gmail capture is not available"):
-        set_connector_enabled(paths, "gmail", True)
+    enabled = set_connector_enabled(paths, "gmail", True)
+    assert enabled["state"]["enabled"] is True
 
     result = run_connector_capture(
         paths,
@@ -111,8 +116,193 @@ def test_auth_only_connectors_cannot_be_enabled_or_captured(tmp_path: Path) -> N
     ).as_dict()
 
     assert result["captured"] == 0
-    assert result["connector_results"][0]["status"] == "skipped"
-    assert result["connector_results"][0]["reason"] == "capture not implemented"
+    assert result["connector_results"][0]["status"] == "failed"
+    assert result["connector_results"][0]["preflight"]["ok"] is False
+
+
+class _StaticCaptureBatch:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.payload = payload
+
+    def as_dict(self) -> dict[str, object]:
+        return self.payload
+
+
+def test_gmail_ingest_does_not_reconcile_after_capture_preflight_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    capture = {
+        "captured": 0,
+        "errors": ["gmail: source unavailable"],
+        "connector_results": [
+            {
+                "connector_id": "gmail",
+                "status": "failed",
+                "captured": 0,
+                "preflight": {"ok": False},
+                "errors": ["source unavailable"],
+            }
+        ],
+    }
+    reconciled = False
+
+    def fail_if_reconciled(_paths: BrainPaths) -> GmailRevisionReconciliation:
+        nonlocal reconciled
+        reconciled = True
+        raise AssertionError("stale Gmail files must not be reconciled")
+
+    monkeypatch.setattr(
+        automation,
+        "run_connector_capture",
+        lambda *_args, **_kwargs: _StaticCaptureBatch(capture),
+    )
+    monkeypatch.setattr(
+        automation,
+        "reconcile_gmail_document_revisions",
+        fail_if_reconciled,
+    )
+
+    result = automation.run_gmail_knowledge_ingest(paths, respect_enabled=False)
+
+    assert result["status"] == "failed"
+    assert result["reason"] == "Gmail capture preflight failed"
+    assert reconciled is False
+
+
+@pytest.mark.parametrize(
+    ("ingest_errors", "vector_writes"),
+    [
+        (["one ingest failure"], {"status": "ok", "attempted": 0}),
+        ([], {"status": "skipped", "attempted": 2, "written": 0}),
+    ],
+)
+def test_gmail_ingest_propagates_ingest_and_vector_partial_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ingest_errors: list[str],
+    vector_writes: dict[str, object],
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    capture = {
+        "captured": 1,
+        "errors": [],
+        "connector_results": [
+            {
+                "connector_id": "gmail",
+                "status": "ok",
+                "captured": 1,
+                "preflight": {"ok": True},
+                "errors": [],
+            }
+        ],
+    }
+    ingest = IngestResult(
+        "run-1",
+        1,
+        1,
+        0,
+        2,
+        0,
+        ingest_errors,
+        vector_writes=vector_writes,
+    )
+    monkeypatch.setattr(
+        automation,
+        "run_connector_capture",
+        lambda *_args, **_kwargs: _StaticCaptureBatch(capture),
+    )
+    monkeypatch.setattr(BrainService, "ingest", lambda self, **_kwargs: ingest)
+    monkeypatch.setattr(
+        automation,
+        "reconcile_gmail_document_revisions",
+        lambda _paths: GmailRevisionReconciliation(1, 0, 0, 0, 0),
+    )
+
+    result = automation.run_gmail_knowledge_ingest(paths, respect_enabled=False)
+
+    assert result["status"] == "partial"
+
+
+def test_gmail_ingest_reports_held_revision_as_partial(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    capture = {
+        "captured": 1,
+        "errors": [],
+        "connector_results": [
+            {
+                "connector_id": "gmail",
+                "status": "ok",
+                "captured": 1,
+                "preflight": {"ok": True},
+                "errors": [],
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        automation,
+        "run_connector_capture",
+        lambda *_args, **_kwargs: _StaticCaptureBatch(capture),
+    )
+    monkeypatch.setattr(
+        BrainService,
+        "ingest",
+        lambda self, **_kwargs: IngestResult(
+            "run-1", 1, 1, 0, 1, 1, [], vector_writes={"status": "ok"}
+        ),
+    )
+    monkeypatch.setattr(
+        automation,
+        "reconcile_gmail_document_revisions",
+        lambda _paths: GmailRevisionReconciliation(
+            0, 1, 0, 0, 0, held_documents=1
+        ),
+    )
+
+    result = automation.run_gmail_knowledge_ingest(paths, respect_enabled=False)
+
+    assert result["status"] == "partial"
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"account_key": "gmail.unapproved"},
+        {"operator_email": "other@example.com"},
+    ],
+)
+def test_gmail_knowledge_connector_rejects_policy_identity_mismatch(
+    tmp_path: Path,
+    settings: dict[str, str],
+) -> None:
+    source_paths = BrainPaths.from_value(tmp_path / "source")
+    target_paths = BrainPaths.from_value(tmp_path / "target")
+    BrainService(target_paths).init_workspace()
+    payload = valid_policy_dict()
+    payload["sources"]["gmail"]["archive"] = {
+        "enabled": True,
+        "initial_days": 90,
+        "agent_access_approved": True,
+    }
+    write_policy(source_paths.home, payload)
+    connector = BUILTIN_CONNECTORS["gmail"]()
+
+    report = connector.preflight(
+        ConnectorContext(
+            paths=target_paths,
+            settings={"source_home": str(source_paths.home), **settings},
+        )
+    )
+
+    assert report.ok is False
+    assert "must match the approved source policy" in report.errors[0]
 
 
 def test_google_oauth_identity_flow_uses_pkce_and_keeps_secrets_out_of_config(
@@ -432,6 +622,25 @@ class BrokenConnector:
         raise AssertionError("discover should fail first")
 
 
+class LeakyGmailConnector(BrokenConnector):
+    manifest = ConnectorManifest(
+        id="gmail",
+        display_name="Gmail",
+        description="Fails without exposing provider lineage.",
+        source_type="gmail_thread",
+        default_enabled=True,
+        default_cadence_s=600,
+    )
+
+    def discover(self, ctx: ConnectorContext):
+        raise RuntimeError("provider-thread-secret must stay private")
+
+
+class LeakyGmailPreflightConnector(LeakyGmailConnector):
+    def preflight(self, ctx: ConnectorContext) -> PreflightReport:
+        raise RuntimeError("provider-thread-secret leaked during preflight")
+
+
 def test_connector_failure_is_isolated(tmp_path: Path, monkeypatch) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
     BrainService(paths).init_workspace()
@@ -450,11 +659,58 @@ def test_connector_failure_is_isolated(tmp_path: Path, monkeypatch) -> None:
     assert runs["broken"]["status"] == "failed"
     assert runs["codex"]["status"] == "ok"
     assert result["captured"] == 1
-    assert result["errors"] == []
+    assert result["errors"] == ["broken: boom"]
     assert any("broken: failed" in warning for warning in result["warnings"])
 
     config = yaml.safe_load(connector_config_path(paths).read_text(encoding="utf-8"))
     assert config["connectors"]["broken"]["health"]["status"] == "failing(1)"
+
+
+def test_gmail_connector_exception_hides_provider_thread_from_errors_and_health(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    monkeypatch.setitem(BUILTIN_CONNECTORS, "gmail", LeakyGmailConnector)
+
+    result = run_connector_capture(
+        paths,
+        connector_ids=["gmail"],
+        respect_enabled=False,
+        respect_cadence=False,
+    ).as_dict()
+    config = yaml.safe_load(connector_config_path(paths).read_text(encoding="utf-8"))
+    serialized = json.dumps(
+        {
+            "result": result,
+            "health": config["connectors"]["gmail"]["health"],
+        }
+    )
+
+    assert "provider-thread-secret" not in serialized
+    assert "Gmail connector failed (RuntimeError)" in serialized
+
+
+def test_gmail_preflight_exception_is_failed_and_sanitized(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    monkeypatch.setitem(BUILTIN_CONNECTORS, "gmail", LeakyGmailPreflightConnector)
+
+    result = run_connector_capture(
+        paths,
+        connector_ids=["gmail"],
+        respect_enabled=False,
+        respect_cadence=False,
+    ).as_dict()
+
+    assert result["connector_results"][0]["preflight"]["ok"] is False
+    serialized = json.dumps(result)
+    assert "provider-thread-secret" not in serialized
+    assert "Gmail connector failed (RuntimeError)" in serialized
 
 
 @contextmanager
@@ -541,11 +797,12 @@ def test_connector_api_endpoints(tmp_path: Path, monkeypatch) -> None:
 
         status, body = request_json(host, port, "POST", "/api/connectors/gmail/run", token=token)
         assert status == 200
-        assert body["connector_results"][0]["reason"] == "capture not implemented"
+        assert body["connector_results"][0]["status"] == "failed"
+        assert body["connector_results"][0]["preflight"]["ok"] is False
 
         status, body = request_json(host, port, "POST", "/api/connectors/gmail/enable", token=token)
-        assert status == 400
-        assert body["error"] == "Gmail capture is not available"
+        assert status == 200
+        assert body["state"]["enabled"] is True
 
 
 def test_capture_sources_unique_index_remains_compatible(tmp_path: Path) -> None:

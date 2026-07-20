@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 import sqlite3
 import subprocess
@@ -10,6 +11,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from pkm_brain.gmail_archive import (
     ArchiveMessage,
@@ -332,6 +334,372 @@ def test_updates_delete_in_place_and_retain_ciphertext(tmp_path: Path) -> None:
     )
     assert (applied.inserted, applied.updated) == (0, 1)
     assert store.search("gmail.primary", "restored")[0].message_id == "m1"
+
+
+def test_thread_snapshot_revision_tracks_updates_and_deletion(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.initialize()
+    store.provision_key()
+    store.apply_batch(
+        "gmail.primary",
+        messages=(_message("m1", "t1", subject="One", body="first"),),
+        state=_state(processed=1),
+    )
+
+    initial = store.get_thread_snapshot("gmail.primary", "t1")
+    assert initial is not None
+    assert initial.total_message_count == 1
+    assert initial.account_key == "gmail.primary"
+    assert initial.visible_message_count == 1
+    assert initial.deleted_message_count == 0
+    assert initial.hidden_message_count == 0
+    assert initial.created_at == initial.updated_at
+    assert initial.archive_updated_at == "2026-07-14T18:00:00.000+00:00"
+    assert initial.raw_size == len(
+        _message("m1", "t1", subject="One", body="first").raw_rfc822
+    )
+    assert store.list_thread_snapshots("gmail.primary") == (initial,)
+
+    store.apply_batch(
+        "gmail.primary",
+        messages=(_message("m1", "t1", subject="Two", body="second body"),),
+        state=_state(updated_at="2026-07-14T18:05:00+00:00", processed=2),
+    )
+    updated = store.get_thread_snapshot("gmail.primary", "t1")
+    assert updated is not None
+    assert updated.source_revision != initial.source_revision
+    assert updated.archive_updated_at == "2026-07-14T18:05:00.000+00:00"
+
+    store.apply_batch(
+        "gmail.primary",
+        deleted_message_ids=("m1",),
+        state=_state(updated_at="2026-07-14T18:10:00+00:00", processed=2),
+    )
+    deleted = store.get_thread_snapshot("gmail.primary", "t1")
+    assert deleted is not None
+    assert deleted.source_revision != updated.source_revision
+    assert deleted.total_message_count == 1
+    assert deleted.visible_message_count == 0
+    assert deleted.deleted_message_count == 1
+    assert deleted.hidden_message_count == 0
+    assert deleted.archive_updated_at == "2026-07-14T18:10:00.000+00:00"
+    assert store.get_thread_snapshot("gmail.primary", "missing") is None
+
+
+def test_thread_revision_tracks_same_size_same_clock_content_and_labels(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    store.initialize()
+    store.provision_key()
+    first_message = _message(
+        "m1", "t1", subject="Alpha", body="first-value", labels=("INBOX",)
+    )
+    second_message = _message(
+        "m1", "t1", subject="Bravo", body="other-value", labels=("INBOX",)
+    )
+    assert len(first_message.raw_rfc822) == len(second_message.raw_rfc822)
+    store.apply_batch(
+        "gmail.primary", messages=(first_message,), state=_state(processed=1)
+    )
+    first = store.get_thread_snapshot("gmail.primary", "t1")
+    assert first is not None
+
+    store.apply_batch(
+        "gmail.primary", messages=(second_message,), state=_state(processed=2)
+    )
+    content_changed = store.get_thread_snapshot("gmail.primary", "t1")
+    assert content_changed is not None
+    assert content_changed.archive_updated_at == first.archive_updated_at
+    assert content_changed.raw_size == first.raw_size
+    assert content_changed.source_revision != first.source_revision
+
+    store.apply_batch(
+        "gmail.primary",
+        messages=(replace(second_message, label_ids=("INBOX", "STARRED")),),
+        state=_state(processed=3),
+    )
+    labels_changed = store.get_thread_snapshot("gmail.primary", "t1")
+    assert labels_changed is not None
+    assert labels_changed.source_revision != content_changed.source_revision
+
+
+def test_thread_revision_is_deterministic_across_archive_rebuilds(
+    tmp_path: Path,
+) -> None:
+    revisions: list[str] = []
+    message = _message(
+        "m1",
+        "t1",
+        subject="Deterministic projection",
+        body="Stable source content",
+        labels=("INBOX", "CATEGORY_UPDATES"),
+    )
+    for index, updated_at in enumerate(
+        ("2026-07-14T18:00:00+00:00", "2026-07-15T09:30:00+00:00")
+    ):
+        root = tmp_path / f"rebuild-{index}"
+        root.mkdir()
+        store = _store(root)
+        store.initialize()
+        store.provision_key()
+        store.apply_batch(
+            "gmail.primary",
+            messages=(
+                replace(message, label_ids=tuple(reversed(message.label_ids)))
+                if index
+                else message,
+            ),
+            state=_state(updated_at=updated_at, processed=1),
+        )
+        snapshot = store.get_thread_snapshot("gmail.primary", "t1")
+        assert snapshot is not None
+        revisions.append(snapshot.source_revision)
+
+    assert revisions[0] == revisions[1]
+
+
+def test_legacy_archive_revision_digests_are_backfilled_once(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.initialize()
+    store.provision_key()
+    store.apply_batch(
+        "gmail.primary",
+        messages=(
+            _message(
+                "m1",
+                "t1",
+                subject="Legacy digest migration",
+                body="Stable encrypted source",
+                labels=("INBOX",),
+            ),
+        ),
+        state=_state(processed=1),
+    )
+    before = store.get_thread_snapshot("gmail.primary", "t1")
+    assert before is not None
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("UPDATE archive_meta SET schema_version=1 WHERE id=1")
+        conn.execute(
+            "UPDATE messages SET raw_digest=NULL, metadata_digest=NULL WHERE message_id='m1'"
+        )
+
+    migrated = store.get_thread_snapshot("gmail.primary", "t1")
+
+    assert migrated == before
+    with sqlite3.connect(store.db_path) as conn:
+        version = conn.execute(
+            "SELECT schema_version FROM archive_meta WHERE id=1"
+        ).fetchone()[0]
+        digests = conn.execute(
+            "SELECT raw_digest, metadata_digest FROM messages WHERE message_id='m1'"
+        ).fetchone()
+    assert version == 2
+    assert all(len(str(value)) == 64 for value in digests)
+
+
+def test_open_thread_retains_newest_messages_and_reports_truncation_counts(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    store.initialize()
+    store.provision_key()
+    messages = tuple(
+        replace(
+            _message(
+                f"m{index}",
+                "t1",
+                subject=f"Message {index}",
+                body=f"body-{index}-" * 5,
+            ),
+            internal_date=f"178405200{index}000",
+        )
+        for index in range(1, 4)
+    )
+    store.apply_batch(
+        "gmail.primary",
+        messages=messages,
+        state=_state(processed=3),
+    )
+
+    thread = store.open_thread(
+        "gmail.primary",
+        "t1",
+        max_messages=2,
+        max_body_chars=45,
+    )
+
+    assert thread.account_key == "gmail.primary"
+    assert thread.total_messages == 3
+    assert thread.omitted_message_count == 1
+    assert thread.body_truncated_message_count == 1
+    assert thread.truncated is True
+    assert [message.message_id for message in thread.messages] == ["m2", "m3"]
+    assert thread.messages[1].body_text == "body-3-" * 5 + "\r\n"
+    assert thread.messages[1].body_truncated is False
+    assert thread.messages[0].body_truncated is True
+    assert all(message.account_key == "gmail.primary" for message in thread.messages)
+
+
+def test_thread_snapshots_include_hidden_only_and_tombstoned_threads(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    store.initialize()
+    store.provision_key()
+    store.apply_batch(
+        "gmail.primary",
+        messages=(
+            _message(
+                "hidden-message",
+                "hidden-thread",
+                subject="Hidden",
+                body="spam",
+                labels=("SPAM",),
+            ),
+            _message(
+                "deleted-message",
+                "deleted-thread",
+                subject="Deleted",
+                body="gone",
+            ),
+        ),
+        state=_state(processed=2),
+    )
+    store.apply_batch(
+        "gmail.primary",
+        deleted_message_ids=("deleted-message",),
+        state=_state(updated_at="2026-07-14T18:05:00+00:00", processed=2),
+    )
+
+    snapshots = {
+        item.thread_id: item for item in store.list_thread_snapshots("gmail.primary")
+    }
+    assert set(snapshots) == {"deleted-thread", "hidden-thread"}
+    assert (
+        snapshots["hidden-thread"].total_message_count,
+        snapshots["hidden-thread"].visible_message_count,
+        snapshots["hidden-thread"].deleted_message_count,
+        snapshots["hidden-thread"].hidden_message_count,
+    ) == (1, 0, 0, 1)
+    assert (
+        snapshots["deleted-thread"].total_message_count,
+        snapshots["deleted-thread"].visible_message_count,
+        snapshots["deleted-thread"].deleted_message_count,
+        snapshots["deleted-thread"].hidden_message_count,
+    ) == (1, 0, 1, 0)
+
+
+def test_labels_are_encrypted_and_old_payloads_default_to_no_labels(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    store.initialize()
+    store.provision_key()
+    secret_label = "TOP-SECRET-LABEL-9917"
+    store.apply_batch(
+        "gmail.primary",
+        messages=(
+            _message(
+                "m1",
+                "t1",
+                subject="Labels",
+                body="body",
+                labels=(secret_label, "INBOX"),
+            ),
+        ),
+        state=_state(processed=1),
+    )
+    assert store.open_thread("gmail.primary", "t1").messages[0].label_ids == (
+        secret_label,
+        "INBOX",
+    )
+
+    for candidate in (
+        store.db_path,
+        Path(f"{store.db_path}-wal"),
+        Path(f"{store.db_path}-shm"),
+    ):
+        if candidate.exists():
+            assert secret_label.encode() not in candidate.read_bytes()
+
+    # Recreate the encrypted text payload shape written by schema-v1 archives
+    # before labels were included. Opening it must remain backward compatible.
+    with sqlite3.connect(store.db_path) as conn:
+        nonce, ciphertext = conn.execute(
+            "SELECT text_nonce, text_ciphertext FROM messages WHERE message_id='m1'"
+        ).fetchone()
+        aad = b"pkm-brain/gmail-archive/v1/text/gmail.primary/m1"
+        payload = json.loads(AESGCM(KEY).decrypt(nonce, ciphertext, aad))
+        payload.pop("label_ids")
+        replacement_nonce = b"n" * 12
+        replacement_ciphertext = AESGCM(KEY).encrypt(
+            replacement_nonce,
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(),
+            aad,
+        )
+        conn.execute(
+            """
+            UPDATE messages SET text_nonce=?, text_ciphertext=?
+            WHERE message_id='m1'
+            """,
+            (replacement_nonce, replacement_ciphertext),
+        )
+
+    assert store.open_thread("gmail.primary", "t1").messages[0].label_ids == ()
+
+
+def test_attached_rfc822_text_is_not_exposed_as_parent_body(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.initialize()
+    store.provision_key()
+    raw = (
+        "From: Alice <alice@example.com>\r\n"
+        "To: Peter <peter@example.com>\r\n"
+        "Subject: Outer message\r\n"
+        "Date: Tue, 14 Jul 2026 10:00:00 -0700\r\n"
+        "List-Id: Example List <example.list.example.com>\r\n"
+        "List-Unsubscribe: <mailto:leave@example.com>\r\n"
+        "Precedence: bulk\r\n"
+        "Auto-Submitted: auto-generated\r\n"
+        "MIME-Version: 1.0\r\n"
+        'Content-Type: multipart/mixed; boundary="outer"\r\n\r\n'
+        "--outer\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n\r\n"
+        "visible parent text\r\n"
+        "--outer\r\n"
+        "Content-Type: message/rfc822\r\n"
+        'Content-Disposition: attachment; filename="forwarded.eml"\r\n\r\n'
+        "From: Nested <nested@example.com>\r\n"
+        "To: Alice <alice@example.com>\r\n"
+        "Subject: Nested secret\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n\r\n"
+        "nested-secret-body-must-not-leak\r\n"
+        "--outer--\r\n"
+    ).encode()
+    store.apply_batch(
+        "gmail.primary",
+        messages=(
+            ArchiveMessage(
+                message_id="m1",
+                thread_id="t1",
+                raw_rfc822=raw,
+                internal_date="1784052000000",
+            ),
+        ),
+        state=_state(processed=1),
+    )
+
+    opened = store.open_thread("gmail.primary", "t1").messages[0]
+    assert "visible parent text" in opened.body_text
+    assert "nested-secret-body-must-not-leak" not in opened.body_text
+    assert opened.attachments[0].filename == "forwarded.eml"
+    assert opened.attachments[0].content_type == "message/rfc822"
+    assert opened.list_id == "Example List <example.list.example.com>"
+    assert opened.list_unsubscribe == "<mailto:leave@example.com>"
+    assert opened.precedence == "bulk"
+    assert opened.auto_submitted == "auto-generated"
+    assert store.search("gmail.primary", "nested-secret-body-must-not-leak") == ()
 
 
 def test_missing_or_wrong_key_never_reprovisions_existing_archive(tmp_path: Path) -> None:

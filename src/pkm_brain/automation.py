@@ -23,6 +23,7 @@ from .cos_audit import run_sampled_audit
 from .db import connection, dumps
 from .extraction import extract_recent_documents
 from .gardener import generate_gardener_candidates
+from .gmail_knowledge import reconcile_gmail_document_revisions
 from .google_cache import GoogleEvidenceCache
 from .indexes import lancedb_stats, optimize_vectors, should_optimize_vectors
 from .llm import (
@@ -171,6 +172,128 @@ def run_agent_log_ingest(
             capture=capture_result.as_dict(),
             ingest=ingest_result.__dict__,
         )
+
+
+def run_gmail_knowledge_ingest(
+    paths: BrainPaths,
+    *,
+    source_home: Path | None = None,
+    batch_size: str | int = "500",
+    respect_enabled: bool = True,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Capture and ingest Gmail revisions without touching the provider sync path."""
+
+    service = BrainService(paths)
+    service.init_workspace()
+    lock_path = paths.logs / "gmail-knowledge-ingest.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("w") as lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return {
+                "status": "skipped",
+                "reason": "another Gmail Knowledge run is already active",
+            }
+        settings: dict[str, Any] = {"batch_size": str(batch_size)}
+        if source_home is not None:
+            settings["source_home"] = str(source_home)
+        capture_result = run_connector_capture(
+            paths,
+            connector_ids=["gmail"],
+            respect_enabled=respect_enabled,
+            respect_cadence=False,
+            dry_run=dry_run,
+            export_outbox=False,
+            settings_overrides={"gmail": settings},
+        )
+        capture = capture_result.as_dict()
+        runs = capture.get("connector_results") or []
+        gmail_run = runs[0] if runs else {}
+        if gmail_run.get("status") == "skipped":
+            return {
+                "status": "skipped",
+                "reason": gmail_run.get("reason"),
+                "capture": _redact_gmail_capture_artifacts(capture),
+            }
+        capture_failed = gmail_run.get("status") == "failed"
+        preflight = gmail_run.get("preflight") or {}
+        preflight_failed = capture_failed and preflight.get("ok") is False
+        capture_has_output = int(gmail_run.get("captured") or 0) > 0
+        if not runs or preflight_failed or (capture_failed and not capture_has_output):
+            return {
+                "status": "failed",
+                "reason": (
+                    "Gmail capture preflight failed"
+                    if preflight_failed
+                    else "Gmail capture did not complete"
+                ),
+                "capture": _redact_gmail_capture_artifacts(capture),
+            }
+        if dry_run:
+            return {
+                "status": "partial" if capture.get("errors") else "success",
+                "dry_run": True,
+                "capture": _redact_gmail_capture_artifacts(capture),
+            }
+        gmail_inbox = paths.inbox / "documents" / "gmail"
+        try:
+            ingest_result = service.ingest(source=gmail_inbox)
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "reason": f"Gmail ingest failed ({type(exc).__name__})",
+                "capture": _redact_gmail_capture_artifacts(capture),
+            }
+        vector_writes = ingest_result.vector_writes or {}
+        vector_incomplete = (
+            int(vector_writes.get("attempted") or 0) > 0
+            and vector_writes.get("status") != "ok"
+        )
+        try:
+            reconciliation = reconcile_gmail_document_revisions(paths)
+        except Exception as exc:
+            return {
+                "status": "partial",
+                "reason": f"Gmail revision reconciliation failed ({type(exc).__name__})",
+                "capture": _redact_gmail_capture_artifacts(capture),
+                "ingest": ingest_result.__dict__,
+            }
+        partial = bool(
+            capture.get("errors")
+            or ingest_result.errors
+            or vector_incomplete
+            or reconciliation.errors
+            or reconciliation.held_documents
+        )
+        return {
+            "status": "partial" if partial else "success",
+            "capture": _redact_gmail_capture_artifacts(capture),
+            "ingest": ingest_result.__dict__,
+            "revision_reconciliation": reconciliation.as_dict(),
+        }
+
+
+def _redact_gmail_capture_artifacts(capture: dict[str, Any]) -> dict[str, Any]:
+    """Keep Gmail thread identifiers out of CLI, daemon, and job-result output."""
+
+    redacted = dict(capture)
+    for field in ("artifacts", "outbox_artifacts"):
+        values = redacted.pop(field, None)
+        if isinstance(values, list):
+            redacted[f"{field[:-1]}_count"] = len(values)
+    connector_results: list[dict[str, Any]] = []
+    for item in redacted.get("connector_results") or []:
+        connector = dict(item)
+        for field in ("artifacts", "outbox_artifacts"):
+            values = connector.pop(field, None)
+            if isinstance(values, list):
+                connector[f"{field[:-1]}_count"] = len(values)
+        connector_results.append(connector)
+    if "connector_results" in redacted:
+        redacted["connector_results"] = connector_results
+    return redacted
 
 
 def run_secondary_tick(

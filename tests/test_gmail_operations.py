@@ -1001,6 +1001,43 @@ def _candidate_response(
     }
 
 
+def test_detector_masks_secret_but_accepts_model_visible_exact_quote() -> None:
+    body = "Can you review the plan? Verification code 123 456."
+    masked_quote = (
+        "Can you review the plan? Verification code "
+        f"{'█' * 3} {'█' * 3}."
+    )
+    incoming = thread(
+        "masked-evidence",
+        "Review the plan",
+        (message("masked-evidence-1", body),),
+    )
+    provider = FakeProvider(
+        [
+            _candidate_response(
+                incoming.thread_id,
+                _candidate(
+                    message_id="masked-evidence-1",
+                    quote=masked_quote,
+                ),
+            )
+        ]
+    )
+
+    result = detect_gmail_threads(
+        [incoming],
+        operator_emails=("operator@example.com",),
+        timezone_name="America/Los_Angeles",
+        policy_version="operations-v1@1",
+        budget=GmailDetectorBudget(),
+        llm_provider=provider,
+    )
+
+    assert "123 456" not in provider.prompts[0]
+    assert result.detections[0].disposition == "surfaced"
+    assert len(result.detections[0].candidates) == 1
+
+
 def test_one_invalid_thread_does_not_discard_valid_batch_results() -> None:
     valid_body = "Can you review the plan?"
     invalid_body = "Can you review the budget?"

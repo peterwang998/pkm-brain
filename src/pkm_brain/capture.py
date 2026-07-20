@@ -190,7 +190,8 @@ class AgentLogCapture:
                 result.captured += 1
                 result.artifacts.append(str(output))
                 continue
-            output.parent.mkdir(parents=True, exist_ok=True)
+            output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(output.parent, 0o700)
             write_text_atomic(output, session.markdown)
             self._record_capture(session, output, "captured", None)
             result.captured += 1
@@ -210,10 +211,20 @@ class AgentLogCapture:
         state_hash = capture_state_hash(session.source_hash)
         with connection(self.paths.sqlite_path) as conn:
             row = conn.execute(
-                "SELECT source_hash, status FROM capture_sources WHERE id = ?",
+                """
+                SELECT source_hash, status, captured_path
+                FROM capture_sources
+                WHERE id = ?
+                """,
                 (capture_id,),
             ).fetchone()
-        return bool(row and row["source_hash"] == state_hash and row["status"] == "captured")
+        return bool(
+            row
+            and row["source_hash"] == state_hash
+            and row["status"] == "captured"
+            and str(row["captured_path"] or "").strip()
+            and Path(str(row["captured_path"])).is_file()
+        )
 
     def _record_capture(
         self,
@@ -585,10 +596,12 @@ def link_or_copy_if_changed(source: Path, target: Path, content_hash: str | None
 
 
 def write_text_atomic(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     tmp = path.with_name(f".{path.name}.tmp")
     tmp.write_text(text, encoding="utf-8")
+    os.chmod(tmp, 0o600)
     os.replace(tmp, path)
+    os.chmod(path, 0o600)
 
 
 def update_outbox_manifest(manifest_path: Path, row: dict[str, Any]) -> bool:

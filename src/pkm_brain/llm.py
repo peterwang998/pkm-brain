@@ -347,6 +347,7 @@ class CodexProvider:
                 "never",
                 *codex_reasoning_effort_args(self.reasoning_effort),
                 "exec",
+                "--ephemeral",
                 "--json",
                 "--sandbox",
                 "read-only",

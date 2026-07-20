@@ -19,6 +19,7 @@ class GuardProvider:
     def complete(self, prompt: str) -> str:
         self.prompts.append(prompt)
         assert "OVERSIZED_SECRET" not in prompt
+        assert "123 456" not in prompt
         return json.dumps(
             {
                 "threads": [
@@ -79,7 +80,10 @@ def test_single_oversized_thread_surfaces_without_crossing_batch_char_bound() ->
         "oversized",
         "Please review OVERSIZED_SECRET " + ("x" * 10_000),
     )
-    small = _thread("small", "Please review the attached plan by Friday.")
+    small = _thread(
+        "small",
+        "Please review the attached plan by Friday. Verification code 123 456.",
+    )
 
     result = detect_gmail_threads(
         [oversized, small],

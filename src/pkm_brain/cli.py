@@ -23,6 +23,7 @@ from .automation import (
     uninstall_nightly_launch_agent,
     run_agent_log_ingest,
     run_cos_once,
+    run_gmail_knowledge_ingest,
     run_nightly_maintenance,
     run_secondary_tick,
 )
@@ -39,6 +40,7 @@ from .connectors import (
     runtime_settings,
 )
 from .db import connection, rows
+from .embeddings import save_embedding_config
 from .evals import purge_retrieval_eval_telemetry, run_eval
 from .extraction import (
     critic_review_config,
@@ -52,6 +54,7 @@ from .fact_review_volume import (
     reconcile_backlog_w2b_dry_run,
     write_reconcile_report,
 )
+from .cos_audit import run_sampled_audit
 from .cos_policy import (
     CURATION_STRICTNESS_PROFILES,
     normalize_curation_strictness,
@@ -833,6 +836,38 @@ def embeddings_status(
     console.print_json(json.dumps(svc.embedding_provider.status(check_available=check)))
 
 
+@embeddings_app.command("configure")
+def embeddings_configure(
+    provider: str = typer.Option(..., "--provider"),
+    model: Optional[str] = typer.Option(None, "--model"),
+    query_instruction: Optional[str] = typer.Option(
+        None, "--query-instruction"
+    ),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    paths = BrainPaths.from_value(home)
+    try:
+        configured = save_embedding_config(
+            paths,
+            provider=provider,
+            model=model,
+            query_instruction=query_instruction,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print_json(
+        json.dumps(
+            {
+                "status": "configured",
+                "provider": configured.provider,
+                "model": configured.model,
+                "query_instruction": configured.query_instruction,
+                "rebuild_required": True,
+            }
+        )
+    )
+
+
 @embeddings_app.command("download")
 def embeddings_download(home: Optional[Path] = typer.Option(None)) -> None:
     result = service(home).download_embedding_model()
@@ -1139,6 +1174,36 @@ def cos_providers(
         console.print("Warnings:")
         for warning in result["warnings"]:
             console.print(f"- {warning}")
+
+
+@cos_app.command("audit-actions")
+def cos_audit_actions(
+    limit: int = typer.Option(25, "--limit", min=1, max=500),
+    action_run_id: Optional[str] = typer.Option(
+        None,
+        "--action-run-id",
+        help="Audit only unaudited applied actions created by this CoS action run.",
+    ),
+    action_id: Optional[list[str]] = typer.Option(
+        None,
+        "--action-id",
+        help="Audit an explicit applied action ID; may be repeated.",
+    ),
+    provider: Optional[str] = typer.Option(
+        None, help="Override the configured auditor provider."
+    ),
+    auto_revert_bad: bool = typer.Option(False, "--auto-revert-bad"),
+    home: Optional[Path] = typer.Option(None, help="Brain home directory."),
+) -> None:
+    result = run_sampled_audit(
+        BrainPaths.from_value(home),
+        limit=limit,
+        auto_revert_bad=auto_revert_bad,
+        provider=provider,
+        action_run_id=action_run_id,
+        action_ids=action_id or [],
+    )
+    console.print_json(json.dumps(result))
 
 
 @cos_app.command("promote-policy")
@@ -2188,6 +2253,33 @@ def capture_agents(
         )
         return
     console.print_json(json.dumps(result.as_dict()))
+
+
+@capture_app.command("gmail")
+def capture_gmail(
+    source_home: Optional[Path] = typer.Option(
+        None,
+        "--source-home",
+        help="Brain home that owns the approved encrypted Gmail archive.",
+    ),
+    batch_size: str = typer.Option(
+        "500",
+        "--batch-size",
+        help="Changed thread revisions per run: 100, 500, 2000, or all.",
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    if batch_size not in {"100", "500", "2000", "all"}:
+        raise typer.BadParameter("batch size must be 100, 500, 2000, or all")
+    result = run_gmail_knowledge_ingest(
+        BrainPaths.from_value(home),
+        source_home=source_home,
+        batch_size=batch_size,
+        respect_enabled=False,
+        dry_run=dry_run,
+    )
+    console.print_json(json.dumps(result))
 
 
 @automation_app.command("run-agent-log-ingest")

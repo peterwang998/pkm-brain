@@ -545,6 +545,10 @@ def test_gmail_jobs_are_primary_lane_startup_work(tmp_path: Path) -> None:
         assert list(jobs).index("gmail_mirror_sync") < list(jobs).index(
             "gmail_archive_sync"
         )
+        knowledge = jobs["gmail_knowledge_ingest"]
+        assert knowledge.cadence_s == 600
+        assert knowledge.lane == "knowledge_ingest"
+        assert knowledge.run_on_start is False
 
     secondary = BrainPaths.from_value(tmp_path / "secondary-with-ops")
     init_secondary(secondary, "secondary-node", "primary-node")
@@ -554,6 +558,7 @@ def test_gmail_jobs_are_primary_lane_startup_work(tmp_path: Path) -> None:
     }
     assert "gmail_mirror_sync" not in secondary_ids
     assert "gmail_archive_sync" not in secondary_ids
+    assert "gmail_knowledge_ingest" not in secondary_ids
 
 
 def test_daemon_nightly_summary_matches_automation_shape(tmp_path: Path) -> None:

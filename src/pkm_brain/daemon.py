@@ -18,6 +18,7 @@ import yaml
 from .automation import (
     as_jsonable,
     run_agent_log_ingest,
+    run_gmail_knowledge_ingest,
     run_nightly_maintenance,
     run_secondary_tick,
 )
@@ -43,6 +44,7 @@ DEFAULT_SYNC_CADENCE_SECONDS = 1800
 DEFAULT_MEETING_PREPARATION_CADENCE_SECONDS = 900
 DEFAULT_GMAIL_MIRROR_SYNC_CADENCE_SECONDS = 600
 DEFAULT_GMAIL_ARCHIVE_SYNC_CADENCE_SECONDS = 600
+DEFAULT_GMAIL_KNOWLEDGE_INGEST_CADENCE_SECONDS = 600
 
 
 def package_version() -> str:
@@ -429,6 +431,14 @@ def build_role_jobs(
                 ),
                 lane="provider_sync",
                 run_on_start=True,
+            )
+        )
+        jobs.append(
+            SchedulerJob(
+                id="gmail_knowledge_ingest",
+                cadence_s=DEFAULT_GMAIL_KNOWLEDGE_INGEST_CADENCE_SECONDS,
+                handler=lambda: run_gmail_knowledge_ingest(paths),
+                lane="knowledge_ingest",
             )
         )
         jobs.append(
