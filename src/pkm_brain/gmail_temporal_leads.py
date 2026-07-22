@@ -270,6 +270,7 @@ _COARSE_RELATIVE_RE = re.compile(
     r"\b(?:(?:today|tomorrow|this)\s+"
     r"(?:morning|afternoon|evening|noon|midday|midnight|lunch|"
     r"end\s+of\s+day|close\s+of\s+business)|"
+    r"that\s+(?:morning|afternoon|evening|night)|"
     r"(?:morning|afternoon|evening|noon|midday|midnight|lunch|"
     r"end\s+of\s+day|close\s+of\s+business)\s+(?:today|tomorrow)|"
     r"(?:this|next|last)\s+(?:week|month|quarter|weekend)|"
@@ -318,8 +319,48 @@ _ACTION_MENTION_RE = re.compile(
     re.IGNORECASE,
 )
 _EVENT_PREDICATE_RE = re.compile(
-    r"\b(?:attend|catch\s+up|check\s+in|connect|host|join|meet|present|speak|sync|"
-    r"talk)\b",
+    r"\b(?:attend|became\s+effective|becomes?\s+effective|catch\s+up|"
+    r"check\s+in|closed|closes|connect|host|is\s+effective|join|meet|opened|"
+    r"opens|present|speak|sync|takes?\s+effect|talk|took\s+effect|"
+    r"went\s+into\s+effect|"
+    r"will\s+(?:be\s+effective|become\s+effective|close|open|take\s+effect))\b",
+    re.IGNORECASE,
+)
+_EFFECTIVE_STATE_PREDICATE_RE = re.compile(
+    r"(?:became\s+effective|becomes?\s+effective|is\s+effective|"
+    r"takes?\s+effect|took\s+effect|went\s+into\s+effect|"
+    r"will\s+(?:be\s+effective|become\s+effective|take\s+effect))\Z",
+    re.IGNORECASE,
+)
+_EFFECTIVE_STATE_OBSERVATION_RE = re.compile(r"is\s+effective\Z", re.IGNORECASE)
+_OPENING_PREDICATE_RE = re.compile(r"(?:opened|opens|will\s+open)\Z", re.IGNORECASE)
+_ACTUAL_OPENING_PREDICATE_RE = re.compile(r"opened\Z", re.IGNORECASE)
+_CLOSING_PREDICATE_RE = re.compile(r"(?:closed|closes|will\s+close)\Z", re.IGNORECASE)
+_ACTUAL_CLOSING_PREDICATE_RE = re.compile(r"closed\Z", re.IGNORECASE)
+_OPENING_PREDICATE_SCAN_RE = re.compile(
+    r"\b(?:opened|opens|will\s+open)\b", re.IGNORECASE
+)
+_TRAILING_COORDINATION_RE = re.compile(r"(?:,\s*)?(?:and|but|then)\s*\Z", re.IGNORECASE)
+_CLOSURE_SUBJECT_SEPARATOR_RE = re.compile(
+    r"(?:[,;:\r\n]+|\b(?:and|but|then)\b)\s*", re.IGNORECASE
+)
+_DEADLINE_CLOSURE_SUBJECT_RE = re.compile(
+    r"\b(?:"
+    r"applications(?:\s+(?:window|period|portal|cycle|intake))?|"
+    r"application\s+(?:window|period|portal|cycle|intake)|"
+    r"entries(?:\s+(?:window|period|portal|cycle|intake))?|"
+    r"entry\s+(?:window|period|portal|cycle|intake)|"
+    r"enrollment(?:\s+(?:window|period|portal|cycle|intake))?|"
+    r"nominations(?:\s+(?:window|period|portal|cycle|intake))?|"
+    r"nomination\s+(?:window|period|portal|cycle|intake)|"
+    r"registration(?:\s+(?:window|period|portal|cycle|intake))?|"
+    r"rsvp(?:\s+(?:window|period|portal|cycle|intake))?|"
+    r"sign[ -]?ups?(?:\s+(?:window|period|portal|cycle|intake))?|"
+    r"submissions(?:\s+(?:window|period|portal|cycle|intake))?|"
+    r"submission\s+(?:window|period|portal|cycle|intake)"
+    r")\b"
+    r"(?:\s+(?:for|to)\s+(?:(?!\b(?:and|but|then)\b)[^,;.!?\r\n]){1,80})?"
+    r"\s*\Z",
     re.IGNORECASE,
 )
 _EVENT_TITLE_LABEL_RE = re.compile(
@@ -420,12 +461,14 @@ _STRUCTURAL_LABEL_PATTERNS = (
 )
 _PLANNED_CONTEXT_RE = re.compile(
     r"\b(?:booked|confirmed|planned|rescheduled|scheduled|targeted|upcoming)\b"
-    r"|\bwill\s+(?:attend|begin|connect|depart|happen|host|join|meet|occur|"
-    r"present|speak|start|sync|take\s+place|talk)\b",
+    r"|\bwill\s+(?:attend|be\s+effective|become\s+effective|begin|close|"
+    r"connect|depart|happen|host|join|meet|occur|open|present|speak|start|"
+    r"sync|take\s+effect|take\s+place|talk)\b",
     re.IGNORECASE,
 )
 _ACTUAL_CONTEXT_RE = re.compile(
-    r"\b(?:began|departed|happened|occurred|started|took\s+place|was\s+held)\b",
+    r"\b(?:became\s+effective|began|closed|departed|happened|occurred|opened|"
+    r"started|took\s+effect|took\s+place|was\s+held|went\s+into\s+effect)\b",
     re.IGNORECASE,
 )
 _DEADLINE_ASSOCIATION_RE = re.compile(
@@ -985,6 +1028,26 @@ def _unresolved_temporal_drafts(
     output: list[_ExpressionDraft] = []
     for match in _COARSE_RELATIVE_RE.finditer(text):
         raw = re.sub(r"\s+", " ", match.group(0).strip().casefold())
+        if raw.startswith("that "):
+            output.append(
+                _ExpressionDraft(
+                    match.start(),
+                    match.end(),
+                    "coarse_relative",
+                    (),
+                    "coarse",
+                    (
+                        "anaphoric_coarse_relative_expression",
+                        "coarse_time_of_day_expression",
+                    ),
+                    (
+                        "anaphoric_reference_unresolved",
+                        "time_of_day_unresolved",
+                        "coarse_relative_unresolved",
+                    ),
+                )
+            )
+            continue
         anchored_day = next(
             (value for value in ("today", "tomorrow") if value in raw.split()),
             None,
@@ -1243,17 +1306,69 @@ def _mentions(
         )
     for match in _EVENT_PREDICATE_RE.finditer(text):
         field = _field_for_span(fields, match.start(), match.end())
-        kind = _context_kind(text, fields, field, match.start(), match.end())
+        surface = match.group(0)
+        predicate_blockers = ["predicate_mention_review_only"]
+        if _OPENING_PREDICATE_RE.fullmatch(surface):
+            relation: TemporalRelation = "occurrence"
+            kind: TemporalKind | None = (
+                "actual"
+                if _ACTUAL_OPENING_PREDICATE_RE.fullmatch(surface)
+                else "planned"
+            )
+            boundary_role = "occurrence_start"
+        elif _CLOSING_PREDICATE_RE.fullmatch(surface):
+            closing_kind: TemporalKind = (
+                "actual"
+                if _ACTUAL_CLOSING_PREDICATE_RE.fullmatch(surface)
+                else "planned"
+            )
+            if _deadline_closure_context(
+                text,
+                fields,
+                field,
+                match.start(),
+                match.end(),
+            ):
+                relation = "deadline"
+                kind = closing_kind
+                boundary_role = "deadline"
+            else:
+                relation = "occurrence"
+                kind = (
+                    closing_kind
+                    if _ACTUAL_CLOSING_PREDICATE_RE.fullmatch(surface)
+                    else _context_kind(
+                        text,
+                        fields,
+                        field,
+                        match.start(),
+                        match.end(),
+                    )
+                )
+                boundary_role = "terminal_boundary"
+                predicate_blockers.append("terminal_boundary_not_occurrence_start")
+        elif _EFFECTIVE_STATE_PREDICATE_RE.fullmatch(surface):
+            relation = "occurrence"
+            kind = _context_kind(text, fields, field, match.start(), match.end())
+            if _EFFECTIVE_STATE_OBSERVATION_RE.fullmatch(surface):
+                boundary_role = None
+                predicate_blockers.append("effective_state_not_transition")
+            else:
+                boundary_role = "occurrence_start"
+        else:
+            relation = "occurrence"
+            kind = _context_kind(text, fields, field, match.start(), match.end())
+            boundary_role = "occurrence_start" if kind else None
         drafts.append(
             _MentionDraft(
                 match.start(),
                 match.end(),
                 "event_predicate",
-                "occurrence",
+                relation,
                 kind,
-                "occurrence_start" if kind else None,
+                boundary_role,
                 None,
-                ("predicate_mention_review_only",),
+                tuple(predicate_blockers),
             )
         )
     for match in _DEADLINE_MENTION_RE.finditer(text):
@@ -1480,10 +1595,7 @@ def _event_title_drafts(
         segment_id = _segment_id_for_span(segments, span[0], span[1])
         if not any(
             expression.segment_id == segment_id
-            or _span_distance(
-                span[0], span[1], expression.start, expression.end
-            )
-            <= 600
+            or _span_distance(span[0], span[1], expression.start, expression.end) <= 600
             for expression in expressions
         ):
             continue
@@ -1533,7 +1645,9 @@ def _event_title_span_is_eligible(
         return False
     if not re.search(r"[A-Za-z][A-Za-z]", value):
         return False
-    if not re.search(r"[A-Za-z]", re.sub(r"\b(?:am|pm|utc|gmt)\b", "", value, flags=re.IGNORECASE)):
+    if not re.search(
+        r"[A-Za-z]", re.sub(r"\b(?:am|pm|utc|gmt)\b", "", value, flags=re.IGNORECASE)
+    ):
         return False
     # A structured proper title is a more useful event-identity candidate than
     # the generic event noun it may contain (for example, "Orchid Interview"
@@ -1601,10 +1715,9 @@ def _associate(
     broad_edge_mentions = _spatially_bounded(
         edge_mentions, _MAX_BROAD_ASSOCIATION_MENTIONS
     )
-    association_inventory_truncated = (
-        len(broad_expressions) != len(expressions)
-        or len(broad_edge_mentions) != len(edge_mentions)
-    )
+    association_inventory_truncated = len(broad_expressions) != len(expressions) or len(
+        broad_edge_mentions
+    ) != len(edge_mentions)
     omitted_expression_count = len(expressions) - len(broad_expressions)
     omitted_mention_count = len(edge_mentions) - len(broad_edge_mentions)
     graph_truncated = association_inventory_truncated
@@ -1972,9 +2085,7 @@ def _spatially_bounded(items: tuple[_T, ...], limit: int) -> tuple[_T, ...]:
         return items
     if limit <= 1:
         return items[:1]
-    indexes = {
-        (index * (len(items) - 1)) // (limit - 1) for index in range(limit)
-    }
+    indexes = {(index * (len(items) - 1)) // (limit - 1) for index in range(limit)}
     return tuple(items[index] for index in sorted(indexes))
 
 
@@ -1985,12 +2096,8 @@ def _retain_mutual_nearest_edges(
 ) -> tuple[list[tuple[int, TemporalExpression, TemporalMention]], bool]:
     """Keep at most two mutually near alternatives at each endpoint."""
 
-    by_expression: dict[
-        str, list[tuple[int, TemporalExpression, TemporalMention]]
-    ] = {}
-    by_mention: dict[
-        str, list[tuple[int, TemporalExpression, TemporalMention]]
-    ] = {}
+    by_expression: dict[str, list[tuple[int, TemporalExpression, TemporalMention]]] = {}
+    by_mention: dict[str, list[tuple[int, TemporalExpression, TemporalMention]]] = {}
     for edge in edges:
         by_expression.setdefault(edge[1].expression_id, []).append(edge)
         by_mention.setdefault(edge[2].mention_id, []).append(edge)
@@ -2071,8 +2178,26 @@ def _association_blockers(
         blockers.append("invalid_normalized_value")
     pair_start = min(expression.start, mention.start)
     pair_end = max(expression.end, mention.end)
+    cross_field_subject_context = (
+        mode in {"subject_body_bridge", "subject_singleton"}
+        and expression.field == "body"
+        and mention.field == "subject"
+    )
     for other in mentions:
         if other.field != expression.field:
+            continue
+        if cross_field_subject_context:
+            # The subject names the candidate event, but contextual blockers
+            # belong to the sentence containing the body expression. Requiring
+            # the subject endpoint to share that segment makes every bridge
+            # context-free; allowing other body segments leaks stale lifecycle
+            # or artifact semantics across sentences.
+            same_context_segment = other.segment_id == expression.segment_id
+        else:
+            same_context_segment = (
+                expression.segment_id == mention.segment_id == other.segment_id
+            )
+        if not same_context_segment:
             continue
         distance = _span_distance(pair_start, pair_end, other.start, other.end)
         if mode == "direct_grammar":
@@ -2210,9 +2335,7 @@ def _quoted_or_forwarded_ranges(text: str) -> tuple[tuple[int, int], ...]:
     checks deterministic without discarding any endpoint inventory.
     """
 
-    ranges = [
-        (match.start(), match.end()) for match in _QUOTED_LINE_RE.finditer(text)
-    ]
+    ranges = [(match.start(), match.end()) for match in _QUOTED_LINE_RE.finditer(text)]
     marker = _FORWARDED_ORIGINAL_MARKER_RE.search(text)
     if marker is not None:
         ranges.append((marker.start(), len(text)))
@@ -2234,7 +2357,9 @@ def _quoted_or_forwarded_blocker(
     end: int,
     ranges: tuple[tuple[int, int], ...],
 ) -> tuple[str, ...]:
-    if any(range_start < end and start < range_end for range_start, range_end in ranges):
+    if any(
+        range_start < end and start < range_end for range_start, range_end in ranges
+    ):
         return ("quoted_or_forwarded_context",)
     return ()
 
@@ -2336,6 +2461,52 @@ def _context_kind(
     if planned == actual:
         return None
     return "planned" if planned else "actual"
+
+
+def _deadline_closure_context(
+    text: str,
+    fields: tuple[_FieldRange, ...],
+    field_name: TemporalField,
+    start: int,
+    end: int,
+) -> bool:
+    """Limit deadline semantics to a source-bound intake-window subject."""
+
+    field = next((item for item in fields if item.name == field_name), None)
+    lower_bound = field.start if field else 0
+    upper_bound = field.end if field else len(text)
+    lower, _upper = _clause_window(
+        text,
+        start,
+        end,
+        padding=100,
+        lower_bound=lower_bound,
+        upper_bound=upper_bound,
+    )
+    prefix = text[lower:start]
+    if _deadline_closure_subject(prefix):
+        return True
+
+    # Preserve an explicitly shared subject in "Registration opens ... and
+    # closes ...". The trailing coordinator must be empty of a new subject,
+    # and the earlier predicate must itself be an opening transition.
+    coordinator = _TRAILING_COORDINATION_RE.search(prefix)
+    if coordinator is None:
+        return False
+    before_coordinator = prefix[: coordinator.start()]
+    openings = tuple(_OPENING_PREDICATE_SCAN_RE.finditer(before_coordinator))
+    if not openings:
+        return False
+    return _deadline_closure_subject(before_coordinator[: openings[-1].start()])
+
+
+def _deadline_closure_subject(prefix: str) -> bool:
+    """Return whether the final coordinated subject is an intake window."""
+
+    subject = _CLOSURE_SUBJECT_SEPARATOR_RE.split(prefix)[-1].strip()
+    if not subject:
+        return False
+    return _DEADLINE_CLOSURE_SUBJECT_RE.search(subject) is not None
 
 
 def _numeric_order_dates(

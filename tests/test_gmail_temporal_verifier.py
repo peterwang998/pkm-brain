@@ -19,6 +19,15 @@ def test_temporal_verifier_policy_is_pinned_and_content_free() -> None:
     assert "represents unresolved clusters without exact citations" in (
         GMAIL_TEMPORAL_CANDIDATE_VERIFIER_CONTRACT
     )
+    assert "field_near_review_only and long_association_gap" in (
+        GMAIL_TEMPORAL_CANDIDATE_VERIFIER_CONTRACT
+    )
+    assert "mutually exclusive possibilities" in (
+        GMAIL_TEMPORAL_CANDIDATE_VERIFIER_CONTRACT
+    )
+    assert "effective date for a consequential policy" in (
+        GMAIL_TEMPORAL_CANDIDATE_VERIFIER_CONTRACT
+    )
 
 
 def test_temporal_verifier_policy_fingerprint_is_stable() -> None:

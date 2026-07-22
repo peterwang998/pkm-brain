@@ -81,9 +81,7 @@ def parent_cluster_candidate_ids(page_plan):
 
 
 def test_frontier_is_deterministic_bounded_and_validator_backed() -> None:
-    analysis, plan = analyze_and_plan(
-        "The interview is scheduled for May 14, 2027."
-    )
+    analysis, plan = analyze_and_plan("The interview is scheduled for May 14, 2027.")
     batch = plan.batches[0]
 
     first = build_gmail_temporal_candidate_frontier(
@@ -101,9 +99,9 @@ def test_frontier_is_deterministic_bounded_and_validator_backed() -> None:
     assert first.analysis_fingerprint == analysis.snapshot_fingerprint
     assert first.complete is True
     assert first.omitted_candidate_mention_count == 0
-    assert len(first.candidates) == 2
+    assert len(first.candidates) == 1
     assert len({item.binding_id for item in first.candidates}) == 1
-    assert {item.lifecycle for item in first.candidates} == {"none", "scheduled"}
+    assert {item.lifecycle for item in first.candidates} == {"scheduled"}
     assert all(item.relation == "occurrence" for item in first.candidates)
     assert all(item.kind == "planned" for item in first.candidates)
     assert all(item.normalized_value == "2027-05-14" for item in first.candidates)
@@ -111,6 +109,45 @@ def test_frontier_is_deterministic_bounded_and_validator_backed() -> None:
     assert first.routable is False
     with pytest.raises(FrozenInstanceError):
         first.complete = False  # type: ignore[misc]
+
+
+@pytest.mark.parametrize("lifecycle", ("cancelled", "completed"))
+def test_exact_terminal_lifecycle_omits_redundant_base(lifecycle: str) -> None:
+    analysis, plan = analyze_and_plan(f"The meeting was {lifecycle} on May 14, 2027.")
+    frontier = build_gmail_temporal_candidate_frontier(
+        analysis=analysis,
+        batch=plan.batches[0],
+    )
+
+    assert {item.lifecycle for item in frontier.candidates} == {lifecycle}
+
+
+def test_deferred_lifecycle_retains_base_for_recall() -> None:
+    analysis, plan = analyze_and_plan(
+        "The interview is scheduled for May 14, 2027 at 4:30 PM."
+    )
+    frontier = build_gmail_temporal_candidate_frontier(
+        analysis=analysis,
+        batch=plan.batches[0],
+    )
+
+    assert {item.lifecycle for item in frontier.candidates} == {"none", "scheduled"}
+    assert all(item.requires_defer is True for item in frontier.candidates)
+
+
+def test_terminal_lifecycle_keeps_distinct_direct_actual_occurrence() -> None:
+    analysis, plan = analyze_and_plan(
+        "The meeting took place on May 14, 2027 and was completed."
+    )
+    frontier = build_gmail_temporal_candidate_frontier(
+        analysis=analysis,
+        batch=plan.batches[0],
+    )
+
+    assert {item.lifecycle for item in frontier.candidates} == {"none", "completed"}
+    occurrence = next(item for item in frontier.candidates if item.lifecycle == "none")
+    assert (occurrence.relation, occurrence.kind) == ("occurrence", "actual")
+    assert occurrence.requires_defer is False
 
 
 def test_frontier_payload_contains_candidates_not_source_surfaces() -> None:
@@ -177,10 +214,7 @@ def test_frontier_choice_resolves_only_current_authorized_candidate() -> None:
 
 
 def test_frontier_recovers_citable_subjects_without_lead_hints() -> None:
-    text = (
-        "Subject: Orchid Interview\n\n"
-        "The meeting is scheduled for May 14, 2027."
-    )
+    text = "Subject: Orchid Interview\n\nThe meeting is scheduled for May 14, 2027."
     analysis, plan = analyze_and_plan(
         text,
         caps=GmailTemporalBatchCaps(max_lead_hints_per_batch=1),
@@ -195,8 +229,7 @@ def test_frontier_recovers_citable_subjects_without_lead_hints() -> None:
     candidate_subjects = {item.subject_mention_id for item in frontier.candidates}
     assert candidate_subjects - hinted_subjects
     assert any(
-        item.subject_mention_id not in hinted_subjects
-        and item.selected_lead_id is None
+        item.subject_mention_id not in hinted_subjects and item.selected_lead_id is None
         for item in frontier.candidates
     )
 
@@ -224,11 +257,7 @@ def test_frontier_reports_candidate_endpoint_truncation_without_silent_loss() ->
 
 
 def test_frontier_reports_subject_bridge_hidden_by_context_cap() -> None:
-    text = (
-        "Subject: "
-        + ("Update " * 50)
-        + "Meeting\n\nWhen: May 14, 2027"
-    )
+    text = "Subject: " + ("Update " * 50) + "Meeting\n\nWhen: May 14, 2027"
     analysis, plan = analyze_and_plan(text)
     batch = plan.batches[0]
 
@@ -310,6 +339,461 @@ def test_page_plan_clusters_reducer_equivalent_title_aliases() -> None:
     )
 
 
+def test_missing_benchmark_predicates_produce_nonempty_frontiers() -> None:
+    texts = (
+        "The new benefits policy becomes effective August 1, 2027.",
+        "Registration opens August 12, 2027 and closes August 20, 2027.",
+    )
+    expected_frontier_counts = (1, 2)
+
+    for text, expected_count in zip(texts, expected_frontier_counts, strict=True):
+        analysis, plan = analyze_and_plan(text)
+        frontiers = tuple(
+            build_gmail_temporal_candidate_frontier(
+                analysis=analysis,
+                batch=batch,
+            )
+            for batch in plan.batches
+        )
+
+        assert len(frontiers) == expected_count
+        assert all(frontier.candidates for frontier in frontiers)
+
+
+def test_page_plan_clusters_adjacent_compound_event_nouns() -> None:
+    text = "The review meeting is scheduled for May 14, 2027."
+    analysis, plan = analyze_and_plan(text)
+    page_plan = plan_gmail_temporal_candidate_pages(
+        analysis=analysis,
+        batch=plan.batches[0],
+    )
+    event_ids = {
+        item.mention_id
+        for item in analysis.mentions
+        if item.mention_type == "event"
+        and text[item.start : item.end].casefold() in {"review", "meeting"}
+    }
+
+    assert any(
+        event_ids.issubset(cluster.subject_mention_ids)
+        for page in page_plan.pages
+        for cluster in page.clusters
+    )
+
+
+@pytest.mark.parametrize(
+    ("body", "expected_same_cluster"),
+    (
+        ("Orchid Interview is scheduled for May 14, 2027.", True),
+        ("ORCHID   INTERVIEW is scheduled for May 14, 2027.", True),
+        ("The interview is scheduled for May 14, 2027.", False),
+    ),
+)
+def test_subject_title_alias_requires_exact_local_phrase(
+    body: str,
+    expected_same_cluster: bool,
+) -> None:
+    text = f"Subject: Orchid Interview\n\n{body}"
+    analysis, plan = analyze_and_plan(text)
+    page_plan = plan_gmail_temporal_candidate_pages(
+        analysis=analysis,
+        batch=plan.batches[0],
+    )
+    title = next(
+        item
+        for item in analysis.mentions
+        if item.mention_type == "event_title_candidate"
+    )
+    body_event = next(
+        item
+        for item in analysis.mentions
+        if item.mention_type == "event" and item.field == "body"
+    )
+    same_cluster = any(
+        {title.mention_id, body_event.mention_id}.issubset(cluster.subject_mention_ids)
+        for page in page_plan.pages
+        for cluster in page.clusters
+    )
+
+    assert same_cluster is expected_same_cluster
+
+
+@pytest.mark.parametrize(
+    "subject",
+    (
+        "Atlas Interview Update",
+        "Reminder: Atlas Interview",
+        "Atlas Interview Confirmation",
+    ),
+)
+def test_subject_title_common_wrapper_aliases_terminal_body_event(subject: str) -> None:
+    text = f"Subject: {subject}\n\nYour Atlas interview is scheduled for May 14, 2027."
+    analysis, plan = analyze_and_plan(text)
+    page_plan = plan_gmail_temporal_candidate_pages(
+        analysis=analysis,
+        batch=plan.batches[0],
+    )
+    title = next(
+        item
+        for item in analysis.mentions
+        if item.mention_type == "event_title_candidate"
+    )
+    body_event = next(
+        item
+        for item in analysis.mentions
+        if item.mention_type == "event" and item.field == "body"
+    )
+
+    assert any(
+        {title.mention_id, body_event.mention_id}.issubset(cluster.subject_mention_ids)
+        for page in page_plan.pages
+        for cluster in page.clusters
+    )
+
+
+def test_subject_title_wrapper_does_not_alias_conflicting_body_modifier() -> None:
+    text = (
+        "Subject: Atlas Interview Update\n\n"
+        "The Beta interview is scheduled for May 14, 2027."
+    )
+    analysis, plan = analyze_and_plan(text)
+    page_plan = plan_gmail_temporal_candidate_pages(
+        analysis=analysis,
+        batch=plan.batches[0],
+    )
+    title = next(
+        item
+        for item in analysis.mentions
+        if item.mention_type == "event_title_candidate"
+    )
+    body_event = next(
+        item
+        for item in analysis.mentions
+        if item.mention_type == "event" and item.field == "body"
+    )
+
+    assert not any(
+        {title.mention_id, body_event.mention_id}.issubset(cluster.subject_mention_ids)
+        for page in page_plan.pages
+        for cluster in page.clusters
+    )
+
+
+def test_page_plan_does_not_cluster_unrecognized_adjacent_event_nouns() -> None:
+    text = "The meeting workshop is scheduled for May 14, 2027."
+    analysis, plan = analyze_and_plan(text)
+    page_plan = plan_gmail_temporal_candidate_pages(
+        analysis=analysis,
+        batch=plan.batches[0],
+    )
+    event_ids = {
+        item.mention_id
+        for item in analysis.mentions
+        if item.mention_type == "event"
+        and text[item.start : item.end].casefold() in {"meeting", "workshop"}
+    }
+
+    assert len(event_ids) == 2
+    assert not any(
+        event_ids.issubset(cluster.subject_mention_ids)
+        for page in page_plan.pages
+        for cluster in page.clusters
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_lifecycle"),
+    (
+        ("The meeting and workshop are scheduled May 14, 2027.", "scheduled"),
+        ("The meeting and workshop were cancelled May 14, 2027.", "cancelled"),
+    ),
+)
+def test_frontier_preserves_both_source_verified_coordinated_subjects(
+    text: str,
+    expected_lifecycle: str,
+) -> None:
+    analysis, plan = analyze_and_plan(text)
+    frontier = build_gmail_temporal_candidate_frontier(
+        analysis=analysis,
+        batch=plan.batches[0],
+    )
+    subject_ids = {
+        item.mention_id for item in analysis.mentions if item.mention_type == "event"
+    }
+    lifecycle_candidates = tuple(
+        item
+        for item in frontier.candidates
+        if item.lifecycle == expected_lifecycle
+        and item.subject_mention_id in subject_ids
+    )
+
+    assert {item.subject_mention_id for item in lifecycle_candidates} == subject_ids
+    assert all(item.requires_defer is False for item in lifecycle_candidates)
+
+
+def test_frontier_does_not_carry_lifecycle_backward_across_clause_subject() -> None:
+    text = "The meeting was scheduled and the workshop is May 14, 2027."
+    analysis, plan = analyze_and_plan(text)
+    frontier = build_gmail_temporal_candidate_frontier(
+        analysis=analysis,
+        batch=plan.batches[0],
+    )
+    workshop = next(
+        item
+        for item in analysis.mentions
+        if item.mention_type == "event"
+        and text[item.start : item.end].casefold() == "workshop"
+    )
+    lifecycle_candidate = next(
+        item
+        for item in frontier.candidates
+        if item.subject_mention_id == workshop.mention_id
+        and item.lifecycle_mention_id is not None
+    )
+
+    assert lifecycle_candidate.lifecycle == "unknown"
+    assert lifecycle_candidate.requires_defer is True
+    assert "lifecycle_clause_direction_conflict" in lifecycle_candidate.blockers
+
+
+def test_frontier_prunes_dense_cross_clause_pair_without_losing_true_members() -> None:
+    text = (
+        "Alpha interview is scheduled for August 14, 2027 at 9:00 AM, "
+        "Beta workshop is scheduled for August 16, 2027 at 2:00 PM, "
+        "and please submit the board packet by August 18, 2027."
+    )
+    analysis, plan = analyze_and_plan(text)
+    expressions = {item.calendar_date_options[0]: item for item in analysis.expressions}
+    mentions = {
+        text[item.start : item.end].casefold(): item
+        for item in analysis.mentions
+        if item.mention_type in {"event", "action"}
+    }
+    frontiers = tuple(
+        build_gmail_temporal_candidate_frontier(analysis=analysis, batch=batch)
+        for batch in plan.batches
+    )
+    candidates = tuple(
+        candidate for frontier in frontiers for candidate in frontier.candidates
+    )
+
+    assert not any(
+        candidate.expression_id
+        in {
+            expressions["2027-08-14"].expression_id,
+            expressions["2027-08-16"].expression_id,
+        }
+        and candidate.subject_mention_id == mentions["submit"].mention_id
+        for candidate in candidates
+    )
+    assert any(
+        candidate.expression_id == expressions["2027-08-14"].expression_id
+        and candidate.subject_mention_id == mentions["interview"].mention_id
+        and candidate.relation == "occurrence"
+        for candidate in candidates
+    )
+    assert any(
+        candidate.expression_id == expressions["2027-08-16"].expression_id
+        and candidate.subject_mention_id == mentions["workshop"].mention_id
+        and candidate.relation == "occurrence"
+        for candidate in candidates
+    )
+    assert any(
+        candidate.expression_id == expressions["2027-08-18"].expression_id
+        and candidate.subject_mention_id == mentions["submit"].mention_id
+        and candidate.relation == "deadline"
+        for candidate in candidates
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "On August 16, 2027, please submit the packet by August 18, 2027.",
+        "The workshop is August 16, 2027, and please submit the packet.",
+    ),
+)
+def test_frontier_keeps_scope_rule_counterexamples(text: str) -> None:
+    analysis, plan = analyze_and_plan(text)
+    first_expression = analysis.expressions[0]
+    submit = next(
+        item
+        for item in analysis.mentions
+        if item.mention_type == "action"
+        and text[item.start : item.end].casefold() == "submit"
+    )
+    first_batch = next(
+        batch
+        for batch in plan.batches
+        if batch.expressions[0].expression_id == first_expression.expression_id
+    )
+    frontier = build_gmail_temporal_candidate_frontier(
+        analysis=analysis,
+        batch=first_batch,
+    )
+
+    assert any(
+        candidate.subject_mention_id == submit.mention_id
+        for candidate in frontier.candidates
+    )
+
+
+def test_anaphoric_completion_has_an_independent_frontier_and_cluster() -> None:
+    text = (
+        "The review meeting took place on August 9, 2027 and was completed "
+        "that afternoon."
+    )
+    analysis, plan = analyze_and_plan(text)
+    assert len(analysis.expressions) == 2
+    assert len(plan.batches) == 2
+    date_expression = next(
+        item for item in analysis.expressions if item.form == "explicit_date"
+    )
+    anaphoric_expression = next(
+        item for item in analysis.expressions if item.form == "coarse_relative"
+    )
+    batch_by_expression = {
+        batch.expressions[0].expression_id: batch for batch in plan.batches
+    }
+    date_batch = batch_by_expression[date_expression.expression_id]
+    anaphoric_batch = batch_by_expression[anaphoric_expression.expression_id]
+    date_frontier = build_gmail_temporal_candidate_frontier(
+        analysis=analysis,
+        batch=date_batch,
+    )
+    anaphoric_frontier = build_gmail_temporal_candidate_frontier(
+        analysis=analysis,
+        batch=anaphoric_batch,
+    )
+    meeting = next(
+        item
+        for item in analysis.mentions
+        if item.mention_type == "event"
+        and text[item.start : item.end].casefold() == "meeting"
+    )
+
+    date_occurrence = next(
+        candidate
+        for candidate in date_frontier.candidates
+        if (
+            candidate.subject_mention_id == meeting.mention_id
+            and candidate.lifecycle_mention_id is None
+            and candidate.relation == "occurrence"
+            and candidate.kind == "actual"
+            and candidate.lifecycle == "none"
+        )
+    )
+    cross_expression_completion = next(
+        candidate
+        for candidate in date_frontier.candidates
+        if candidate.subject_mention_id == meeting.mention_id
+        and candidate.lifecycle_mention_id is not None
+    )
+    anaphoric_completion = next(
+        candidate
+        for candidate in anaphoric_frontier.candidates
+        if (
+            candidate.lifecycle == "completed"
+            and candidate.normalized_value is None
+            and candidate.requires_defer is True
+        )
+    )
+
+    date_pages = plan_gmail_temporal_candidate_pages(
+        analysis=analysis,
+        batch=date_batch,
+    )
+    anaphoric_pages = plan_gmail_temporal_candidate_pages(
+        analysis=analysis,
+        batch=anaphoric_batch,
+    )
+    date_cluster = next(
+        cluster
+        for page in date_pages.pages
+        for cluster in page.clusters
+        if date_occurrence.candidate_id in cluster.candidate_ids
+    )
+    anaphoric_cluster = next(
+        cluster
+        for page in anaphoric_pages.pages
+        for cluster in page.clusters
+        if anaphoric_completion.candidate_id in cluster.candidate_ids
+    )
+
+    assert date_pages.pages
+    assert anaphoric_pages.pages
+    assert date_occurrence.requires_defer is False
+    assert cross_expression_completion.lifecycle == "unknown"
+    assert cross_expression_completion.requires_defer is True
+    assert "lifecycle_expression_scope_conflict" in cross_expression_completion.blockers
+    assert date_cluster.cluster_id != anaphoric_cluster.cluster_id
+    assert date_pages.pages[0].page_fingerprint != (
+        anaphoric_pages.pages[0].page_fingerprint
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "The meeting was cancelled on August 14, 2027 after being scheduled for "
+        "August 10, 2027.",
+        "The meeting on August 14, 2027 was cancelled after being scheduled for "
+        "August 10, 2027.",
+    ),
+)
+def test_frontier_prunes_crossed_lifecycle_cues_and_keeps_local_bindings(
+    text: str,
+) -> None:
+    analysis, plan = analyze_and_plan(text)
+    expressions = {item.calendar_date_options[0]: item for item in analysis.expressions}
+    lifecycles = {
+        item.lifecycle_role: item
+        for item in analysis.mentions
+        if item.mention_type == "lifecycle"
+    }
+    candidates = tuple(
+        candidate
+        for batch in plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+    )
+
+    assert len(candidates) == 2
+    assert {item.lifecycle for item in candidates} == {"cancelled", "scheduled"}
+
+    cancellation = next(
+        candidate
+        for candidate in candidates
+        if candidate.expression_id == expressions["2027-08-14"].expression_id
+        and candidate.lifecycle_mention_id == lifecycles["cancelled"].mention_id
+    )
+    scheduled = next(
+        candidate
+        for candidate in candidates
+        if candidate.expression_id == expressions["2027-08-10"].expression_id
+        and candidate.lifecycle_mention_id == lifecycles["scheduled"].mention_id
+    )
+
+    assert cancellation.lifecycle == "cancelled"
+    assert cancellation.normalized_value == "2027-08-14"
+    assert cancellation.requires_defer is False
+    assert scheduled.lifecycle == "scheduled"
+    assert scheduled.normalized_value == "2027-08-10"
+    assert scheduled.requires_defer is False
+    assert not any(
+        candidate.expression_id == expressions["2027-08-10"].expression_id
+        and candidate.lifecycle_mention_id == lifecycles["cancelled"].mention_id
+        for candidate in candidates
+    )
+    assert not any(
+        candidate.expression_id == expressions["2027-08-14"].expression_id
+        and candidate.lifecycle_mention_id == lifecycles["scheduled"].mention_id
+        for candidate in candidates
+    )
+
+
 def test_page_plan_pages_every_cluster_without_cap_loss() -> None:
     text = (
         "Meeting interview workshop conference appointment session event call "
@@ -356,9 +840,7 @@ def test_page_plan_pages_every_cluster_without_cap_loss() -> None:
 
 def test_page_payload_is_bound_to_frontier_and_contains_no_source_text() -> None:
     private_marker = "PRIVATE-SYNTHETIC-MARKER"
-    analysis, plan = analyze_and_plan(
-        f"The {private_marker} meeting is May 14, 2027."
-    )
+    analysis, plan = analyze_and_plan(f"The {private_marker} meeting is May 14, 2027.")
     batch = plan.batches[0]
     frontier = build_gmail_temporal_candidate_frontier(
         analysis=analysis,
@@ -454,12 +936,15 @@ def test_page_plan_splits_lifecycle_variants_under_count_and_byte_bounds() -> No
     }
     for page in page_plan.pages:
         assert sum(len(item.candidate_ids) for item in page.clusters) <= 5
-        assert len(
-            gmail_temporal_candidate_page_payload(
-                frontier=frontier,
-                page=page,
-            ).encode("utf-8")
-        ) <= 5_500
+        assert (
+            len(
+                gmail_temporal_candidate_page_payload(
+                    frontier=frontier,
+                    page=page,
+                ).encode("utf-8")
+            )
+            <= 5_500
+        )
 
 
 def test_page_plan_fails_closed_when_one_candidate_exceeds_byte_bound() -> None:
@@ -475,7 +960,7 @@ def test_page_plan_fails_closed_when_one_candidate_exceeds_byte_bound() -> None:
 
 def test_split_alias_cluster_has_page_unique_decision_units() -> None:
     analysis, plan = analyze_and_plan(
-        "The interview is scheduled for May 14, 2027."
+        "The interview is scheduled for May 14, 2027 at 4:30 PM."
     )
 
     page_plan = plan_gmail_temporal_candidate_pages(
@@ -492,9 +977,7 @@ def test_split_alias_cluster_has_page_unique_decision_units() -> None:
 
 
 def test_verdict_set_requires_complete_pages_and_projects_support() -> None:
-    analysis, plan = analyze_and_plan(
-        "The interview is scheduled for May 14, 2027."
-    )
+    analysis, plan = analyze_and_plan("The interview is scheduled for May 14, 2027.")
     batch = plan.batches[0]
     page_plan = plan_gmail_temporal_candidate_pages(
         analysis=analysis,
@@ -546,9 +1029,7 @@ def test_verdict_set_uncertain_or_incomplete_frontier_forces_defer() -> None:
     assert len(result.uncertain_clusters) == 1
     uncertainty = result.uncertain_clusters[0]
     assert uncertainty.version == "gmail_temporal_candidate_cluster_uncertainty_v1"
-    assert uncertainty.plausible_candidate_ids == (
-        page_plan.covered_candidate_ids[0],
-    )
+    assert uncertainty.plausible_candidate_ids == (page_plan.covered_candidate_ids[0],)
     assert uncertainty.reason == "model_uncertain"
     assert uncertainty.requires_defer is True
     assert uncertainty.routable is False
@@ -676,7 +1157,7 @@ def test_verdict_set_all_unsupported_has_no_projection_or_uncertainty() -> None:
 
 def test_supported_plus_uncertain_cluster_becomes_model_uncertainty() -> None:
     analysis, plan = analyze_and_plan(
-        "The interview is scheduled for May 14, 2027."
+        "The interview is scheduled for May 14, 2027 at 4:30 PM."
     )
     batch = plan.batches[0]
     page_plan = plan_gmail_temporal_candidate_pages(
@@ -712,7 +1193,7 @@ def test_supported_plus_uncertain_cluster_becomes_model_uncertainty() -> None:
 
 def test_multiple_supported_candidates_become_conflict_uncertainty() -> None:
     analysis, plan = analyze_and_plan(
-        "The interview is scheduled for May 14, 2027."
+        "The interview is scheduled for May 14, 2027 at 4:30 PM."
     )
     batch = plan.batches[0]
     page_plan = plan_gmail_temporal_candidate_pages(
@@ -741,10 +1222,7 @@ def test_multiple_supported_candidates_become_conflict_uncertainty() -> None:
     )
     assert result.uncertain_clusters[0].cluster_id == cluster_id
     assert result.uncertain_clusters[0].plausible_candidate_ids == candidate_ids
-    assert (
-        result.uncertain_clusters[0].reason
-        == "conflicting_supported_candidates"
-    )
+    assert result.uncertain_clusters[0].reason == "conflicting_supported_candidates"
     assert result.requires_defer is True
 
 
@@ -768,9 +1246,7 @@ def test_alias_cluster_uncertainty_aggregates_across_page_fragments() -> None:
     }
     assert alias_cluster_ids
     cluster_id, candidate_ids = next(
-        item
-        for item in clusters
-        if item[0] in alias_cluster_ids and len(item[1]) >= 3
+        item for item in clusters if item[0] in alias_cluster_ids and len(item[1]) >= 3
     )
     pages_by_candidate = {
         candidate_id: page.page_fingerprint
@@ -788,8 +1264,7 @@ def test_alias_cluster_uncertainty_aggregates_across_page_fragments() -> None:
         },
     )
     reversed_rows_and_verdicts = tuple(
-        replace(row, verdicts=tuple(reversed(row.verdicts)))
-        for row in reversed(rows)
+        replace(row, verdicts=tuple(reversed(row.verdicts))) for row in reversed(rows)
     )
 
     result = validate_gmail_temporal_candidate_verdict_set(
@@ -886,7 +1361,7 @@ def test_exact_cluster_remains_citable_beside_uncertain_cluster() -> None:
 
 def test_verdict_set_v2_serialization_separates_raw_rows_from_sidecars() -> None:
     analysis, plan = analyze_and_plan(
-        "The interview is scheduled for May 14, 2027."
+        "The interview is scheduled for May 14, 2027 at 4:30 PM."
     )
     batch = plan.batches[0]
     page_plan = plan_gmail_temporal_candidate_pages(
@@ -981,8 +1456,19 @@ def test_unresolved_reschedule_variants_never_become_precise() -> None:
     ]
     assert len(rescheduled) == 2
     assert all(item.lifecycle == "unknown" for item in rescheduled)
-    assert all((item.relation, item.kind) == ("unspecified", "unspecified") for item in rescheduled)
+    assert all(
+        (item.relation, item.kind) == ("unspecified", "unspecified")
+        for item in rescheduled
+    )
     assert all(item.requires_defer is True for item in rescheduled)
+    lifecycle_free = [
+        candidate
+        for frontier in frontiers
+        for candidate in frontier.candidates
+        if candidate.lifecycle_mention_id is None
+    ]
+    assert len(lifecycle_free) == 2
+    assert all(item.lifecycle == "none" for item in lifecycle_free)
 
 
 def test_unrelated_lifecycle_cue_is_not_crossed_into_other_segment() -> None:
@@ -994,7 +1480,7 @@ def test_unrelated_lifecycle_cue_is_not_crossed_into_other_segment() -> None:
         batch=plan.batches[0],
     )
 
-    assert {item.lifecycle for item in frontier.candidates} == {"none", "scheduled"}
+    assert {item.lifecycle for item in frontier.candidates} == {"scheduled"}
 
 
 @pytest.mark.parametrize("value", (0, -1, True, 1.5))

@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
+from pkm_brain.gmail_temporal_batching import plan_gmail_temporal_selector_batches
 from pkm_brain.gmail_temporal_leads import analyze_gmail_temporal_leads
 from pkm_brain.gmail_temporal_selection import (
     GMAIL_TEMPORAL_SELECTION_SCHEMA,
     GmailTemporalSelectionError,
+    classify_gmail_temporal_subject_pair,
     gmail_temporal_selection_contract,
     validate_gmail_temporal_selection,
 )
@@ -44,9 +46,12 @@ def matching_lead(value, expression_id: str, subject_mention_id: str):
     return next(
         item
         for item in value.leads
-        if item.expression_id == expression_id
-        and item.mention_id == subject_mention_id
+        if item.expression_id == expression_id and item.mention_id == subject_mention_id
     )
+
+
+def batch_for(text: str, value):
+    return plan_gmail_temporal_selector_batches(text=text, analysis=value).batches[0]
 
 
 def association_payload(
@@ -147,9 +152,7 @@ def test_model_authored_semantics_confidence_or_time_are_rejected() -> None:
         payload = association_payload(value)
         payload[field] = authored
         with pytest.raises(GmailTemporalSelectionError, match="invalid fields"):
-            validate_gmail_temporal_selection(
-                value, selection_payload(value, payload)
-            )
+            validate_gmail_temporal_selection(value, selection_payload(value, payload))
     envelope = selection_payload(value, association_payload(value))
     envelope["confidence"] = "high"
     with pytest.raises(GmailTemporalSelectionError, match="invalid fields"):
@@ -260,16 +263,143 @@ def test_terminal_lifecycle_derives_unspecified_relation_and_kind() -> None:
         "unspecified",
         "cancelled",
     )
-    assert association.repair_flags == (
-        "terminal_semantics_derived_as_unspecified",
+    assert association.repair_flags == ("terminal_semantics_derived_as_unspecified",)
+
+
+def test_terminal_lifecycle_does_not_bind_backward_over_its_own_expression() -> None:
+    text = (
+        "The review meeting took place on August 9, 2027 and was completed "
+        "that afternoon."
     )
+    value = analysis(text)
+    batch_by_expression = {
+        batch.expressions[0].expression_id: batch
+        for batch in plan_gmail_temporal_selector_batches(
+            text=text,
+            analysis=value,
+        ).batches
+    }
+    date_expression = next(
+        item for item in value.expressions if item.form == "explicit_date"
+    )
+    anaphoric_expression = next(
+        item for item in value.expressions if item.form == "coarse_relative"
+    )
+    meeting = next(
+        item
+        for item in value.mentions
+        if item.mention_type == "event"
+        and text[item.start : item.end].casefold() == "meeting"
+    )
+    lifecycle = next(
+        item for item in value.mentions if item.lifecycle_role == "completed"
+    )
+
+    date_result = validate_gmail_temporal_selection(
+        value,
+        selection_payload(
+            value,
+            association_payload(
+                value,
+                expression_id=date_expression.expression_id,
+                subject_mention_id=meeting.mention_id,
+                lifecycle_mention_id=lifecycle.mention_id,
+            ),
+        ),
+        batch=batch_by_expression[date_expression.expression_id],
+    )
+    anaphoric_result = validate_gmail_temporal_selection(
+        value,
+        selection_payload(
+            value,
+            association_payload(
+                value,
+                expression_id=anaphoric_expression.expression_id,
+                subject_mention_id=meeting.mention_id,
+                lifecycle_mention_id=lifecycle.mention_id,
+            ),
+        ),
+        batch=batch_by_expression[anaphoric_expression.expression_id],
+    )
+
+    date_association = date_result.associations[0]
+    anaphoric_association = anaphoric_result.associations[0]
+    assert date_result.decision == "defer_ambiguous"
+    assert date_association.lifecycle == "unknown"
+    assert "lifecycle_expression_scope_conflict" in date_association.blockers
+    assert anaphoric_result.decision == "defer_ambiguous"
+    assert anaphoric_association.lifecycle == "completed"
+    assert anaphoric_association.normalized_value is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "The meeting was cancelled on August 14, 2027 after being scheduled for "
+        "August 10, 2027.",
+        "The meeting on August 14, 2027 was cancelled after being scheduled for "
+        "August 10, 2027.",
+    ),
+)
+def test_distinct_lifecycle_cues_bind_only_their_locally_governed_expression(
+    text: str,
+) -> None:
+    value = analysis(text)
+    expressions = {item.calendar_date_options[0]: item for item in value.expressions}
+    lifecycles = {
+        item.lifecycle_role: item
+        for item in value.mentions
+        if item.mention_type == "lifecycle"
+    }
+    meeting = next(item for item in value.mentions if item.mention_type == "event")
+    batches = {
+        batch.expressions[0].expression_id: batch
+        for batch in plan_gmail_temporal_selector_batches(
+            text=text,
+            analysis=value,
+        ).batches
+    }
+
+    results = {}
+    for calendar_date, lifecycle_role in (
+        ("2027-08-14", "cancelled"),
+        ("2027-08-10", "scheduled"),
+        ("2027-08-10", "cancelled"),
+        ("2027-08-14", "scheduled"),
+    ):
+        expression = expressions[calendar_date]
+        lifecycle = lifecycles[lifecycle_role]
+        results[(calendar_date, lifecycle_role)] = validate_gmail_temporal_selection(
+            value,
+            selection_payload(
+                value,
+                association_payload(
+                    value,
+                    expression_id=expression.expression_id,
+                    subject_mention_id=meeting.mention_id,
+                    lifecycle_mention_id=lifecycle.mention_id,
+                ),
+            ),
+            batch=batches[expression.expression_id],
+        )
+
+    cancellation = results[("2027-08-14", "cancelled")]
+    scheduled = results[("2027-08-10", "scheduled")]
+    assert cancellation.decision == scheduled.decision == "select_for_review"
+    assert cancellation.associations[0].lifecycle == "cancelled"
+    assert cancellation.associations[0].normalized_value == "2027-08-14"
+    assert scheduled.associations[0].lifecycle == "scheduled"
+    assert scheduled.associations[0].normalized_value == "2027-08-10"
+
+    for key in (("2027-08-10", "cancelled"), ("2027-08-14", "scheduled")):
+        mismatch = results[key]
+        assert mismatch.decision == "defer_ambiguous"
+        assert mismatch.associations[0].lifecycle == "unknown"
+        assert "competing_lifecycle_expression_cue" in mismatch.associations[0].blockers
 
 
 def test_lifecycle_cue_is_not_bound_to_a_farther_competing_event() -> None:
-    text = (
-        "Alpha meeting was cancelled May 14, 2027. "
-        "Beta meeting is May 15, 2027."
-    )
+    text = "Alpha meeting was cancelled May 14, 2027. Beta meeting is May 15, 2027."
     value = analysis(text)
     expression = value.expressions[0]
     subjects = [
@@ -307,10 +437,7 @@ def test_lifecycle_cue_is_not_bound_to_a_farther_competing_event() -> None:
 
 
 def test_lifecycle_binding_ignores_competing_event_in_a_different_segment() -> None:
-    text = (
-        "Alpha meeting was cancelled May 14, 2027. "
-        "Beta workshop is May 15, 2027."
-    )
+    text = "Alpha meeting was cancelled May 14, 2027. Beta workshop is May 15, 2027."
     value = analysis(text)
     expression = value.expressions[0]
     subject = next(
@@ -344,12 +471,8 @@ def test_lifecycle_binding_ignores_competing_event_in_a_different_segment() -> N
     assert "competing_lifecycle_subject" not in association.blockers
 
 
-def test_lifecycle_cue_with_multiple_events_is_deferred_at_any_distance() -> None:
-    text = (
-        "The meeting "
-        + ("with an extended descriptive agenda and invited attendees " * 8)
-        + "was scheduled and the workshop is May 14, 2027."
-    )
+def test_lifecycle_clause_direction_prevents_backward_cross_binding() -> None:
+    text = "The meeting was scheduled and the workshop is May 14, 2027."
     value = analysis(text)
     expression = value.expressions[0]
     subject = next(
@@ -378,7 +501,223 @@ def test_lifecycle_cue_with_multiple_events_is_deferred_at_any_distance() -> Non
     association = result.associations[0]
     assert result.decision == "defer_ambiguous"
     assert association.lifecycle == "unknown"
-    assert "competing_lifecycle_subject" in association.blockers
+    assert "lifecycle_clause_direction_conflict" in association.blockers
+
+
+def test_coordinated_clause_scope_rejects_neighboring_dense_cross_pair() -> None:
+    text = (
+        "Alpha interview is scheduled for August 14, 2027 at 9:00 AM, "
+        "Beta workshop is scheduled for August 16, 2027 at 2:00 PM, "
+        "and please submit the board packet by August 18, 2027."
+    )
+    value = analysis(text)
+    expression = next(
+        item
+        for item in value.expressions
+        if item.calendar_date_options == ("2027-08-16",)
+    )
+    submit = next(
+        item
+        for item in value.mentions
+        if item.mention_type == "action"
+        and text[item.start : item.end].casefold() == "submit"
+    )
+    batch = next(
+        item
+        for item in plan_gmail_temporal_selector_batches(
+            text=text,
+            analysis=value,
+        ).batches
+        if item.expressions[0].expression_id == expression.expression_id
+    )
+
+    result = validate_gmail_temporal_selection(
+        value,
+        selection_payload(
+            value,
+            association_payload(
+                value,
+                expression_id=expression.expression_id,
+                subject_mention_id=submit.mention_id,
+            ),
+        ),
+        batch=batch,
+    )
+
+    assert result.decision == "defer_ambiguous"
+    assert "expression_subject_clause_scope_conflict" in result.associations[0].blockers
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "On August 16, 2027, please submit the packet by August 18, 2027.",
+        "The workshop is August 16, 2027, and please submit the packet.",
+    ),
+)
+def test_clause_scope_rule_preserves_bounded_counterexamples(text: str) -> None:
+    value = analysis(text)
+    expression = value.expressions[0]
+    submit = next(
+        item
+        for item in value.mentions
+        if item.mention_type == "action"
+        and text[item.start : item.end].casefold() == "submit"
+    )
+    batch = next(
+        item
+        for item in plan_gmail_temporal_selector_batches(
+            text=text,
+            analysis=value,
+        ).batches
+        if item.expressions[0].expression_id == expression.expression_id
+    )
+
+    result = validate_gmail_temporal_selection(
+        value,
+        selection_payload(
+            value,
+            association_payload(
+                value,
+                expression_id=expression.expression_id,
+                subject_mention_id=submit.mention_id,
+            ),
+        ),
+        batch=batch,
+    )
+
+    assert (
+        "expression_subject_clause_scope_conflict"
+        not in result.associations[0].blockers
+    )
+
+
+def test_adjacent_compound_event_nouns_are_lifecycle_aliases() -> None:
+    text = "The review meeting is scheduled for May 14, 2027."
+    value = analysis(text)
+    expression = value.expressions[0]
+    review = next(
+        item
+        for item in value.mentions
+        if item.mention_type == "event"
+        and text[item.start : item.end].casefold() == "review"
+    )
+    lifecycle = next(
+        item for item in value.mentions if item.lifecycle_role == "scheduled"
+    )
+    lead = matching_lead(value, expression.expression_id, review.mention_id)
+    batch = batch_for(text, value)
+
+    result = validate_gmail_temporal_selection(
+        value,
+        selection_payload(
+            value,
+            association_payload(
+                value,
+                expression_id=expression.expression_id,
+                subject_mention_id=review.mention_id,
+                lifecycle_mention_id=lifecycle.mention_id,
+                selected_lead_id=lead.lead_id,
+            ),
+        ),
+        batch=batch,
+    )
+
+    association = result.associations[0]
+    assert association.lifecycle == "scheduled"
+    assert "competing_lifecycle_subject" not in association.blockers
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_lifecycle"),
+    (
+        ("The meeting and workshop are scheduled May 14, 2027.", "scheduled"),
+        ("The meeting and workshop were cancelled May 14, 2027.", "cancelled"),
+    ),
+)
+def test_source_verified_coordination_binds_lifecycle_to_both_subjects(
+    text: str,
+    expected_lifecycle: str,
+) -> None:
+    value = analysis(text)
+    expression = value.expressions[0]
+    lifecycle = next(
+        item for item in value.mentions if item.lifecycle_role == expected_lifecycle
+    )
+    subjects = tuple(item for item in value.mentions if item.mention_type == "event")
+    batch = batch_for(text, value)
+
+    assert (
+        classify_gmail_temporal_subject_pair(
+            subjects[0],
+            subjects[1],
+            batch=batch,
+            lifecycle=lifecycle,
+        )
+        == "coordinated"
+    )
+    for subject in subjects:
+        lead = next(
+            (
+                item
+                for item in value.leads
+                if item.expression_id == expression.expression_id
+                and item.mention_id == subject.mention_id
+            ),
+            None,
+        )
+        result = validate_gmail_temporal_selection(
+            value,
+            selection_payload(
+                value,
+                association_payload(
+                    value,
+                    subject_mention_id=subject.mention_id,
+                    lifecycle_mention_id=lifecycle.mention_id,
+                    selected_lead_id=lead.lead_id if lead is not None else None,
+                ),
+            ),
+            batch=batch,
+        )
+
+        association = result.associations[0]
+        assert result.decision == "select_for_review"
+        assert association.lifecycle == expected_lifecycle
+        assert "multiple_association_mentions" not in association.blockers
+
+
+def test_generic_event_adjacency_is_not_an_alias_without_lexical_evidence() -> None:
+    text = "The meeting workshop is scheduled for May 14, 2027."
+    value = analysis(text)
+    subjects = tuple(item for item in value.mentions if item.mention_type == "event")
+    lifecycle = next(
+        item for item in value.mentions if item.lifecycle_role == "scheduled"
+    )
+
+    assert len(subjects) == 2
+    assert (
+        classify_gmail_temporal_subject_pair(
+            subjects[0],
+            subjects[1],
+            batch=batch_for(text, value),
+            lifecycle=lifecycle,
+        )
+        == "distinct"
+    )
+
+
+def test_selection_rejects_mutated_subject_relation_batch() -> None:
+    text = "The meeting and workshop are scheduled May 14, 2027."
+    value = analysis(text)
+    batch = batch_for(text, value)
+    mutated = replace(batch, sequence=batch.sequence + 1)
+
+    with pytest.raises(GmailTemporalSelectionError, match="batch endpoint packet"):
+        validate_gmail_temporal_selection(
+            value,
+            selection_payload(value, association_payload(value)),
+            batch=mutated,
+        )
 
 
 def test_terminal_boundary_subject_is_never_promoted_as_occurrence_start() -> None:
@@ -407,9 +746,7 @@ def test_terminal_boundary_subject_is_never_promoted_as_occurrence_start() -> No
 
 
 def test_broad_reschedule_role_is_not_guessed_as_old_or_replacement() -> None:
-    value = analysis(
-        "The meeting was rescheduled from July 20, 2027 to July 22, 2027."
-    )
+    value = analysis("The meeting was rescheduled from July 20, 2027 to July 22, 2027.")
     expression = value.expressions[0]
     subject = subject_mention(value)
     lifecycle = next(
@@ -455,17 +792,14 @@ def test_same_expression_subject_pair_cannot_be_shotgunned() -> None:
 
 def test_unknown_endpoints_fail_closed_and_bad_optional_lead_fails_soft() -> None:
     value = analysis(
-        "The interview is scheduled for May 14, 2027 and "
-        "the workshop for May 15, 2027."
+        "The interview is scheduled for May 14, 2027 and the workshop for May 15, 2027."
     )
     with pytest.raises(GmailTemporalSelectionError, match="unknown"):
         validate_gmail_temporal_selection(
             value,
             selection_payload(
                 value,
-                association_payload(
-                    value, expression_id="gtl_0123456789abcdef:e99"
-                ),
+                association_payload(value, expression_id="gtl_0123456789abcdef:e99"),
             ),
         )
 
@@ -531,8 +865,7 @@ def test_temporal_rescue_selection_is_always_low_confidence_and_deferred() -> No
 
 def test_quoted_temporal_association_is_forced_to_low_confidence_deferral() -> None:
     value = analysis(
-        "Subject: Status update\n\n"
-        "> Meeting is scheduled for May 14, 2027."
+        "Subject: Status update\n\n> Meeting is scheduled for May 14, 2027."
     )
     expression = value.expressions[0]
     subject = subject_mention(value)
@@ -555,9 +888,7 @@ def test_quoted_temporal_association_is_forced_to_low_confidence_deferral() -> N
 
 
 def test_anonymous_content_addressed_analysis_cannot_create_associations() -> None:
-    value = analysis(
-        "The meeting is scheduled for May 14, 2027.", chunk_id=""
-    )
+    value = analysis("The meeting is scheduled for May 14, 2027.", chunk_id="")
 
     assert value.scope_bound is False
     with pytest.raises(GmailTemporalSelectionError, match="opaque evidence scope"):
@@ -597,9 +928,7 @@ def test_artifacts_and_lifecycle_mentions_cannot_be_used_as_subjects() -> None:
 
     lifecycle_value = analysis("Cancelled on May 14, 2027")
     lifecycle = next(
-        item
-        for item in lifecycle_value.mentions
-        if item.mention_type == "lifecycle"
+        item for item in lifecycle_value.mentions if item.mention_type == "lifecycle"
     )
     payload = {
         "expression_id": lifecycle_value.expressions[0].expression_id,
@@ -614,18 +943,14 @@ def test_artifacts_and_lifecycle_mentions_cannot_be_used_as_subjects() -> None:
 
     label_value = analysis("When: May 14, 2027")
     label = next(
-        item
-        for item in label_value.mentions
-        if item.mention_type == "structural_label"
+        item for item in label_value.mentions if item.mention_type == "structural_label"
     )
     with pytest.raises(GmailTemporalSelectionError, match="supported temporal subject"):
         validate_gmail_temporal_selection(
             label_value,
             selection_payload(
                 label_value,
-                association_payload(
-                    label_value, subject_mention_id=label.mention_id
-                ),
+                association_payload(label_value, subject_mention_id=label.mention_id),
             ),
         )
 
@@ -637,9 +962,7 @@ def test_invalid_optional_lifecycle_reference_is_discarded_and_deferred() -> Non
         value,
         selection_payload(
             value,
-            association_payload(
-                value, lifecycle_mention_id=subject.mention_id
-            ),
+            association_payload(value, lifecycle_mention_id=subject.mention_id),
         ),
     )
 
@@ -670,9 +993,7 @@ def test_stale_selection_is_rejected_before_endpoint_rebinding() -> None:
         ("selected_lead_id", "gtl_0123456789abcdef:e1"),
     ),
 )
-def test_evidence_ids_are_strictly_bounded_and_typed(
-    field: str, invalid: str
-) -> None:
+def test_evidence_ids_are_strictly_bounded_and_typed(field: str, invalid: str) -> None:
     value = analysis("The meeting is scheduled for May 14, 2027.")
     payload = association_payload(value)
     payload[field] = invalid
@@ -696,9 +1017,10 @@ def test_contract_and_schema_expose_only_bounded_endpoint_citation() -> None:
     association_properties = GMAIL_TEMPORAL_SELECTION_SCHEMA["properties"][
         "associations"
     ]["items"]["properties"]
-    assert "uniqueItems" not in GMAIL_TEMPORAL_SELECTION_SCHEMA["properties"][
-        "associations"
-    ]
+    assert (
+        "uniqueItems"
+        not in GMAIL_TEMPORAL_SELECTION_SCHEMA["properties"]["associations"]
+    )
     assert set(association_properties) == {
         "expression_id",
         "subject_mention_id",
@@ -706,7 +1028,7 @@ def test_contract_and_schema_expose_only_bounded_endpoint_citation() -> None:
         "selected_lead_id",
     }
     assert GMAIL_TEMPORAL_SELECTION_SCHEMA["additionalProperties"] is False
-    assert GMAIL_TEMPORAL_SELECTION_SCHEMA["properties"]["associations"][
-        "maxItems"
-    ] == 8
+    assert (
+        GMAIL_TEMPORAL_SELECTION_SCHEMA["properties"]["associations"]["maxItems"] == 8
+    )
     assert "Never author" in gmail_temporal_selection_contract()

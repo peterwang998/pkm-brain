@@ -12,11 +12,13 @@ from .gmail_temporal_batching import (
     validate_gmail_temporal_batch_citation,
     validate_gmail_temporal_batch_manifest,
 )
-from .gmail_temporal_leads import TemporalLeadAnalysis
+from .gmail_temporal_leads import TemporalLead, TemporalLeadAnalysis
 from .gmail_temporal_selection import (
+    GMAIL_TEMPORAL_HARD_SCOPE_BLOCKERS,
     GMAIL_TEMPORAL_SUBJECT_TYPES,
     GmailTemporalSelectionError,
     SelectedTemporalAssociation,
+    classify_gmail_temporal_subject_pair,
     validate_gmail_temporal_selection,
 )
 
@@ -28,8 +30,7 @@ _PAGE_VERSION = "gmail_temporal_candidate_page_v1"
 _CLUSTER_UNCERTAINTY_VERSION = "gmail_temporal_candidate_cluster_uncertainty_v1"
 _VERDICT_SET_VERSION = "gmail_temporal_candidate_verdict_set_v2"
 _VERDICTS = {"supported", "unsupported", "uncertain"}
-
-
+_SUBSUMING_EXPLICIT_LIFECYCLES = frozenset({"cancelled", "completed", "scheduled"})
 ClusterUncertaintyReason = Literal[
     "model_uncertain",
     "conflicting_supported_candidates",
@@ -185,9 +186,7 @@ def build_gmail_temporal_candidate_frontier(
         )
 
     lifecycle_ids = tuple(
-        item.mention_id
-        for item in batch.mentions
-        if item.mention_type == "lifecycle"
+        item.mention_id for item in batch.mentions if item.mention_type == "lifecycle"
     )
     candidates: list[GmailTemporalVerificationCandidate] = []
     for expression in batch.expressions:
@@ -213,9 +212,13 @@ def build_gmail_temporal_candidate_frontier(
                 if lifecycle_candidate is not None:
                     candidates.append(lifecycle_candidate)
 
+    simplified = _omit_subsumed_lifecycle_free_bases(
+        analysis=analysis,
+        candidates=tuple(candidates),
+    )
     ordered = tuple(
         sorted(
-            candidates,
+            simplified,
             key=lambda item: (
                 item.expression_id,
                 item.subject_mention_id,
@@ -238,14 +241,17 @@ def build_gmail_temporal_candidate_frontier(
         "omitted_mention_count": batch.omitted_mention_count,
         "omitted_candidate_mention_count": omitted_candidate_mention_count,
     }
-    fingerprint = "gtf_" + hashlib.sha256(
-        json.dumps(
-            material,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-    ).hexdigest()
+    fingerprint = (
+        "gtf_"
+        + hashlib.sha256(
+            json.dumps(
+                material,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+    )
     return GmailTemporalCandidateFrontier(
         version="gmail_temporal_candidate_frontier_v1",
         frontier_fingerprint=fingerprint,
@@ -256,6 +262,76 @@ def build_gmail_temporal_candidate_frontier(
         omitted_mention_count=batch.omitted_mention_count,
         omitted_candidate_mention_count=omitted_candidate_mention_count,
     )
+
+
+def _omit_subsumed_lifecycle_free_bases(
+    *,
+    analysis: TemporalLeadAnalysis,
+    candidates: tuple[GmailTemporalVerificationCandidate, ...],
+) -> tuple[GmailTemporalVerificationCandidate, ...]:
+    """Remove only a base binding fully represented by an exact lifecycle.
+
+    Unknown, deferred, and reschedule lifecycle variants never subsume their
+    lifecycle-free base. A directly grounded actual occurrence is also retained
+    beside a terminal lifecycle because it can represent a distinct endpoint.
+    """
+
+    by_binding: dict[str, list[GmailTemporalVerificationCandidate]] = {}
+    for candidate in candidates:
+        by_binding.setdefault(candidate.binding_id, []).append(candidate)
+    leads = {item.lead_id: item for item in analysis.leads}
+    omitted: set[str] = set()
+    for values in by_binding.values():
+        explicit = tuple(
+            candidate
+            for candidate in values
+            if candidate.lifecycle_mention_id is not None
+            and candidate.lifecycle in _SUBSUMING_EXPLICIT_LIFECYCLES
+            and not candidate.requires_defer
+        )
+        if not explicit:
+            continue
+        for base in values:
+            if base.lifecycle_mention_id is not None or base.lifecycle != "none":
+                continue
+            if any(
+                _explicit_lifecycle_subsumes_base(
+                    lifecycle=candidate,
+                    base=base,
+                    leads=leads,
+                )
+                for candidate in explicit
+            ):
+                omitted.add(base.candidate_id)
+    return tuple(
+        candidate for candidate in candidates if candidate.candidate_id not in omitted
+    )
+
+
+def _explicit_lifecycle_subsumes_base(
+    *,
+    lifecycle: GmailTemporalVerificationCandidate,
+    base: GmailTemporalVerificationCandidate,
+    leads: dict[str, TemporalLead],
+) -> bool:
+    if lifecycle.normalized_value != base.normalized_value:
+        return False
+    if lifecycle.lifecycle == "scheduled":
+        return (
+            lifecycle.relation == base.relation == "occurrence"
+            and lifecycle.kind == base.kind == "planned"
+        )
+    if lifecycle.lifecycle not in {"cancelled", "completed"}:
+        return False
+    lead = leads.get(base.selected_lead_id or "")
+    distinct_actual_endpoint = (
+        base.relation == "occurrence"
+        and base.kind == "actual"
+        and lead is not None
+        and lead.association_mode == "direct_grammar"
+        and lead.confidence_tier == "strict_direct"
+    )
+    return not distinct_actual_endpoint
 
 
 def gmail_temporal_candidate_frontier_payload(
@@ -320,9 +396,7 @@ def plan_gmail_temporal_candidate_pages(
                 proposed,
                 sequence=len(pages) + 1,
             )
-            proposed_candidate_count = sum(
-                len(item.candidate_ids) for item in proposed
-            )
+            proposed_candidate_count = sum(len(item.candidate_ids) for item in proposed)
             fits = (
                 len(proposed) <= max_clusters_per_page
                 and proposed_candidate_count <= max_candidates_per_page
@@ -463,11 +537,7 @@ def validate_gmail_temporal_candidate_page_choice(
         raise GmailTemporalFrontierError("candidate frontier fingerprint is stale")
     if page_fingerprint != page.page_fingerprint:
         raise GmailTemporalFrontierError("candidate page fingerprint is stale")
-    allowed = {
-        value
-        for cluster in page.clusters
-        for value in cluster.candidate_ids
-    }
+    allowed = {value for cluster in page.clusters for value in cluster.candidate_ids}
     if candidate_id not in allowed:
         raise GmailTemporalFrontierError(
             "candidate ID was not presented on the cited page"
@@ -574,10 +644,9 @@ def validate_gmail_temporal_candidate_verdict_set(
                     )
                 page_by_candidate[candidate_id] = page
                 candidate_ids_by_cluster[cluster.cluster_id].append(candidate_id)
-    if (
-        set(page_by_candidate) != set(plan.covered_candidate_ids)
-        or set(page_by_candidate) != set(candidates)
-    ):
+    if set(page_by_candidate) != set(plan.covered_candidate_ids) or set(
+        page_by_candidate
+    ) != set(candidates):
         raise GmailTemporalFrontierError(
             "candidate cluster index does not cover the frontier exactly"
         )
@@ -602,10 +671,9 @@ def validate_gmail_temporal_candidate_verdict_set(
             for candidate_id in cluster.candidate_ids
         )
         actual_candidate_ids = tuple(item.candidate_id for item in row.verdicts)
-        if (
-            len(actual_candidate_ids) != len(set(actual_candidate_ids))
-            or set(actual_candidate_ids) != set(expected_candidate_ids)
-        ):
+        if len(actual_candidate_ids) != len(set(actual_candidate_ids)) or set(
+            actual_candidate_ids
+        ) != set(expected_candidate_ids):
             raise GmailTemporalFrontierError(
                 "candidate verdict row does not cover its page exactly once"
             )
@@ -763,6 +831,7 @@ def _candidate(
                     }
                 ],
             },
+            batch=batch,
         )
     except (GmailTemporalBatchAuthorityError, GmailTemporalSelectionError):
         return None
@@ -770,6 +839,8 @@ def _candidate(
         return None
     derived = selection.associations[0]
     if derived.lifecycle_mention_id != lifecycle_mention_id:
+        return None
+    if GMAIL_TEMPORAL_HARD_SCOPE_BLOCKERS.intersection(derived.blockers):
         return None
     candidate_id = _candidate_id(batch, citation, derived)
     return GmailTemporalVerificationCandidate(
@@ -812,14 +883,17 @@ def _candidate_id(
         "risk_features": derived.risk_features,
         "repair_flags": derived.repair_flags,
     }
-    return "gtvc_" + hashlib.sha256(
-        json.dumps(
-            material,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-    ).hexdigest()[:32]
+    return (
+        "gtvc_"
+        + hashlib.sha256(
+            json.dumps(
+                material,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()[:32]
+    )
 
 
 def _binding_id(
@@ -939,9 +1013,9 @@ def _validate_page_integrity(
         "frontier_fingerprint": page.frontier_fingerprint,
         "clusters": [asdict(item) for item in page.clusters],
     }
-    expected_fingerprint = "gtfp_" + hashlib.sha256(
-        _canonical_bytes(material)
-    ).hexdigest()
+    expected_fingerprint = (
+        "gtfp_" + hashlib.sha256(_canonical_bytes(material)).hexdigest()
+    )
     if page.page_fingerprint != expected_fingerprint:
         raise GmailTemporalFrontierError("candidate page fingerprint is stale")
 
@@ -960,8 +1034,7 @@ def _validate_page_integrity(
             or not cluster.expression_id
             or not isinstance(cluster.subject_mention_ids, tuple)
             or not cluster.subject_mention_ids
-            or len(cluster.subject_mention_ids)
-            != len(set(cluster.subject_mention_ids))
+            or len(cluster.subject_mention_ids) != len(set(cluster.subject_mention_ids))
             or not isinstance(cluster.candidate_ids, tuple)
             or not cluster.candidate_ids
             or len(cluster.candidate_ids) != len(set(cluster.candidate_ids))
@@ -1004,9 +1077,7 @@ def _alias_clusters(
     batch: GmailTemporalSelectorBatch,
     frontier: GmailTemporalCandidateFrontier,
 ) -> tuple[GmailTemporalCandidateCluster, ...]:
-    candidates_by_binding: dict[
-        str, list[GmailTemporalVerificationCandidate]
-    ] = {}
+    candidates_by_binding: dict[str, list[GmailTemporalVerificationCandidate]] = {}
     for candidate in frontier.candidates:
         candidates_by_binding.setdefault(candidate.binding_id, []).append(candidate)
     if not candidates_by_binding:
@@ -1041,13 +1112,13 @@ def _alias_clusters(
             if expression_by_binding[first_id] != expression_by_binding[second_id]:
                 continue
             second = mentions[subject_by_binding[second_id]]
-            types = {first.mention_type, second.mention_type}
             aliases = (
-                first.field == second.field
-                and "event_title_candidate" in types
-                and bool(types & {"event", "event_predicate"})
-                and first.start < second.end
-                and second.start < first.end
+                classify_gmail_temporal_subject_pair(
+                    first,
+                    second,
+                    batch=batch,
+                )
+                == "alias"
             )
             if aliases:
                 union(first_id, second_id)
@@ -1055,9 +1126,7 @@ def _alias_clusters(
     components: dict[str, list[str]] = {}
     for binding_id in binding_ids:
         components.setdefault(find(binding_id), []).append(binding_id)
-    mention_rank = {
-        item.mention_id: index for index, item in enumerate(batch.mentions)
-    }
+    mention_rank = {item.mention_id: index for index, item in enumerate(batch.mentions)}
     output: list[GmailTemporalCandidateCluster] = []
     for component in components.values():
         ordered_bindings = tuple(
@@ -1099,7 +1168,10 @@ def _alias_clusters(
         sorted(
             output,
             key=lambda item: (
-                min(mention_rank.get(value, 1_000_000) for value in item.subject_mention_ids),
+                min(
+                    mention_rank.get(value, 1_000_000)
+                    for value in item.subject_mention_ids
+                ),
                 item.expression_id,
                 item.cluster_id,
             ),

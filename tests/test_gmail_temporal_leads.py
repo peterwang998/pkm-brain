@@ -139,9 +139,10 @@ def test_subject_and_message_singleton_fallbacks_are_explicit() -> None:
         "subject_body_bridge",
     ]
     subject_mentions = {item.mention_id: item.mention_type for item in subject.mentions}
-    assert {
-        subject_mentions[item.mention_id] for item in subject.leads
-    } == {"event", "event_title_candidate"}
+    assert {subject_mentions[item.mention_id] for item in subject.leads} == {
+        "event",
+        "event_title_candidate",
+    }
     assert all(item.confidence_tier == "review_ambiguous" for item in subject.leads)
     assert [item.association_mode for item in message.leads] == ["message_singleton"]
     assert message.leads[0].gap_chars > 60
@@ -161,9 +162,10 @@ def test_subject_body_bridge_keeps_multiple_date_alternatives_review_only() -> N
         "subject_body_bridge",
     ]
     mention_types = {item.mention_id: item.mention_type for item in result.mentions}
-    assert {
-        mention_types[item.mention_id] for item in result.leads
-    } == {"event", "event_title_candidate"}
+    assert {mention_types[item.mention_id] for item in result.leads} == {
+        "event",
+        "event_title_candidate",
+    }
     assert all(
         "subject_body_bridge_review_only" in item.blockers for item in result.leads
     )
@@ -172,6 +174,55 @@ def test_subject_body_bridge_keeps_multiple_date_alternatives_review_only() -> N
     )
     assert all(item.confidence_tier == "review_ambiguous" for item in result.leads)
     assert all(item.routable is False for item in result.leads)
+
+
+@pytest.mark.parametrize(
+    ("body", "expected_blockers"),
+    (
+        (
+            "The meeting notes were completed on July 22, 2027.",
+            {"artifact_context", "lifecycle_completed"},
+        ),
+        (
+            "The flight arrives July 22, 2027.",
+            {"terminal_boundary_not_occurrence_start"},
+        ),
+    ),
+)
+def test_subject_body_bridge_uses_context_from_the_expression_segment(
+    body: str,
+    expected_blockers: set[str],
+) -> None:
+    result = analyze(f"Subject: Orchid Meeting\n\n{body}")
+    bridge_leads = [
+        item for item in result.leads if item.association_mode == "subject_body_bridge"
+    ]
+
+    assert bridge_leads
+    assert all(expected_blockers.issubset(item.blockers) for item in bridge_leads)
+    assert all(item.confidence_tier == "review_ambiguous" for item in bridge_leads)
+
+
+def test_subject_body_bridge_context_does_not_cross_body_sentence_segments() -> None:
+    result = analyze(
+        "Subject: Orchid Meeting\n\n"
+        "July 22, 2027. Notes completed, and the flight arrives."
+    )
+    bridge_leads = [
+        item for item in result.leads if item.association_mode == "subject_body_bridge"
+    ]
+
+    assert bridge_leads
+    assert all(
+        set(item.blockers).isdisjoint(
+            {
+                "artifact_context",
+                "lifecycle_completed",
+                "terminal_boundary_not_occurrence_start",
+            }
+        )
+        for item in bridge_leads
+    )
 
 
 def test_subject_body_bridge_graph_is_degree_bounded_and_reports_truncation() -> None:
@@ -198,7 +249,7 @@ def test_near_field_edges_are_bounded_review_hints_with_visible_risks() -> None:
 
     assert [item.association_mode for item in sentence.leads] == ["field_near"]
     assert "sentence_punctuation_crossing" in sentence.leads[0].risk_features
-    assert "artifact_context" in sentence.leads[0].blockers
+    assert "artifact_context" not in sentence.leads[0].blockers
 
 
 def test_lifecycle_mentions_are_edgeable_without_inventing_start_semantics() -> None:
@@ -235,9 +286,7 @@ def test_lifecycle_mentions_are_edgeable_without_inventing_start_semantics() -> 
 def test_actual_occurrence_cues_are_not_completion_lifecycle(text: str) -> None:
     result = analyze(text)
 
-    assert not any(
-        item.lifecycle_role == "completed" for item in result.mentions
-    )
+    assert not any(item.lifecycle_role == "completed" for item in result.mentions)
     assert any(
         lead.relation == "occurrence"
         and lead.kind == "actual"
@@ -290,9 +339,7 @@ def test_structured_when_label_creates_deferred_subject_event_title_candidate() 
     result = analyze(text)
 
     title = next(
-        item
-        for item in result.mentions
-        if item.mention_type == "event_title_candidate"
+        item for item in result.mentions if item.mention_type == "event_title_candidate"
     )
     assert text[title.start : title.end] == "Q3 Leadership Forum"
     assert title.field == "subject"
@@ -310,9 +357,7 @@ def test_specific_event_title_coexists_with_its_generic_event_noun() -> None:
     result = analyze(text)
 
     title = next(
-        item
-        for item in result.mentions
-        if item.mention_type == "event_title_candidate"
+        item for item in result.mentions if item.mention_type == "event_title_candidate"
     )
     generic = next(
         item
@@ -329,9 +374,7 @@ def test_specific_subject_event_title_can_use_an_unlabeled_body_time() -> None:
     result = analyze(text)
 
     title = next(
-        item
-        for item in result.mentions
-        if item.mention_type == "event_title_candidate"
+        item for item in result.mentions if item.mention_type == "event_title_candidate"
     )
 
     assert text[title.start : title.end] == "Orchid Interview"
@@ -361,16 +404,12 @@ def test_structured_time_label_does_not_turn_non_event_subject_into_event_title(
     result = analyze(f"Subject: {subject}\n\nWhen: May 14, 2027")
 
     assert not any(
-        item.mention_type == "event_title_candidate"
-        for item in result.mentions
+        item.mention_type == "event_title_candidate" for item in result.mentions
     )
 
 
 def test_sentence_segments_are_preserved_on_expression_and_mention_endpoints() -> None:
-    text = (
-        "Alpha meeting was cancelled May 14, 2027. "
-        "Beta workshop is May 15, 2027."
-    )
+    text = "Alpha meeting was cancelled May 14, 2027. Beta workshop is May 15, 2027."
     result = analyze(text)
 
     assert len({item.segment_id for item in result.expressions}) == 2
@@ -537,7 +576,9 @@ def test_coarse_time_of_day_can_precede_its_relative_day(
     expected_day: str,
 ) -> None:
     result = analyze(text)
-    expression = next(item for item in result.expressions if item.form == "coarse_relative")
+    expression = next(
+        item for item in result.expressions if item.form == "coarse_relative"
+    )
     deadline_lead = next(item for item in result.leads if item.relation == "deadline")
 
     assert text[expression.start : expression.end] == surface
@@ -545,6 +586,50 @@ def test_coarse_time_of_day_can_precede_its_relative_day(
     assert "relative_to_message_time" in expression.blockers
     assert "time_of_day_unresolved" in expression.blockers
     assert deadline_lead.expression_id == expression.expression_id
+
+
+@pytest.mark.parametrize(
+    "surface",
+    ("that morning", "that afternoon", "that evening", "that night"),
+)
+def test_anaphoric_coarse_time_of_day_is_never_normalized(surface: str) -> None:
+    text = f"The review was completed {surface}."
+    expression = analyze(text, admitted=False).expressions[0]
+
+    assert text[expression.start : expression.end] == surface
+    assert expression.form == "coarse_relative"
+    assert expression.normalized_options == ()
+    assert expression.calendar_date_options == ()
+    assert expression.resolution_status == "unresolved"
+    assert {
+        "anaphoric_reference_unresolved",
+        "time_of_day_unresolved",
+        "coarse_relative_unresolved",
+    }.issubset(expression.blockers)
+
+
+def test_anaphoric_coarse_time_of_day_keeps_lifecycle_lead_deferred() -> None:
+    result = analyze("The review was completed that afternoon.")
+    expression = result.expressions[0]
+    lifecycle = next(
+        item
+        for item in result.mentions
+        if item.mention_type == "lifecycle" and item.lifecycle_role == "completed"
+    )
+    lead = next(
+        item
+        for item in result.leads
+        if item.expression_id == expression.expression_id
+        and item.mention_id == lifecycle.mention_id
+    )
+
+    assert {
+        "anaphoric_reference_unresolved",
+        "coarse_relative_unresolved",
+        "lifecycle_completed",
+        "normalization_not_single_complete_value",
+    }.issubset(lead.blockers)
+    assert lead.confidence_tier == "review_ambiguous"
 
 
 def test_weekday_conventions_are_preserved_as_options_not_guessed() -> None:
@@ -586,6 +671,223 @@ def test_action_deadlines_are_recognized_in_either_order() -> None:
     assert date_first.leads[0].kind == "planned"
 
 
+def test_effective_opening_and_closing_predicates_are_inventoried() -> None:
+    effective_text = "The new benefits policy becomes effective August 1, 2027."
+    registration_text = "Registration opens August 12, 2027 and closes August 20, 2027."
+    effective = analyze(effective_text)
+    registration = analyze(registration_text)
+
+    effective_predicate = next(
+        item
+        for item in effective.mentions
+        if effective_text[item.start : item.end] == "becomes effective"
+    )
+    registration_predicates = {
+        registration_text[item.start : item.end]: item
+        for item in registration.mentions
+        if item.mention_type == "event_predicate"
+    }
+
+    assert (
+        effective_predicate.mention_type,
+        effective_predicate.relation,
+    ) == ("event_predicate", "occurrence")
+    assert (
+        registration_predicates["opens"].relation,
+        registration_predicates["opens"].kind,
+        registration_predicates["opens"].boundary_role,
+    ) == ("occurrence", "planned", "occurrence_start")
+    assert (
+        registration_predicates["closes"].relation,
+        registration_predicates["closes"].kind,
+        registration_predicates["closes"].boundary_role,
+    ) == ("deadline", "planned", "deadline")
+
+
+@pytest.mark.parametrize(
+    ("surface", "expected_kind", "expected_boundary", "expected_blocker"),
+    (
+        ("became effective", "actual", "occurrence_start", None),
+        ("went into effect", "actual", "occurrence_start", None),
+        ("took effect", "actual", "occurrence_start", None),
+        ("is effective", None, None, "effective_state_not_transition"),
+        ("will be effective", "planned", "occurrence_start", None),
+    ),
+)
+def test_effective_predicate_morphology_preserves_transition_certainty(
+    surface: str,
+    expected_kind: str | None,
+    expected_boundary: str | None,
+    expected_blocker: str | None,
+) -> None:
+    text = f"The benefits policy {surface} August 1, 2027."
+    result = analyze(text)
+    predicate = next(
+        item
+        for item in result.mentions
+        if item.mention_type == "event_predicate"
+        and text[item.start : item.end] == surface
+    )
+
+    assert predicate.relation == "occurrence"
+    assert predicate.kind == expected_kind
+    assert predicate.boundary_role == expected_boundary
+    if expected_blocker is None:
+        assert "effective_state_not_transition" not in predicate.blockers
+    else:
+        assert expected_blocker in predicate.blockers
+
+
+def test_will_open_and_deadline_window_will_close_are_planned() -> None:
+    opening_text = "Registration will open August 12, 2027."
+    closing_text = "Applications will close August 20, 2027."
+    opening = analyze(opening_text)
+    closing = analyze(closing_text)
+    opening_predicate = next(
+        item for item in opening.mentions if item.mention_type == "event_predicate"
+    )
+    closing_predicate = next(
+        item for item in closing.mentions if item.mention_type == "event_predicate"
+    )
+
+    assert (
+        opening_text[opening_predicate.start : opening_predicate.end],
+        opening_predicate.relation,
+        opening_predicate.kind,
+        opening_predicate.boundary_role,
+    ) == ("will open", "occurrence", "planned", "occurrence_start")
+    assert (
+        closing_text[closing_predicate.start : closing_predicate.end],
+        closing_predicate.relation,
+        closing_predicate.kind,
+        closing_predicate.boundary_role,
+    ) == ("will close", "deadline", "planned", "deadline")
+
+
+def test_opened_and_closed_predicates_are_actual_transitions() -> None:
+    opening_text = "Registration opened August 12, 2027."
+    closing_text = "Applications closed August 20, 2027."
+    opening = analyze(opening_text)
+    closing = analyze(closing_text)
+    opening_predicate = next(
+        item for item in opening.mentions if item.mention_type == "event_predicate"
+    )
+    closing_predicate = next(
+        item for item in closing.mentions if item.mention_type == "event_predicate"
+    )
+
+    assert (
+        opening_text[opening_predicate.start : opening_predicate.end],
+        opening_predicate.relation,
+        opening_predicate.kind,
+        opening_predicate.boundary_role,
+    ) == ("opened", "occurrence", "actual", "occurrence_start")
+    assert (
+        closing_text[closing_predicate.start : closing_predicate.end],
+        closing_predicate.relation,
+        closing_predicate.kind,
+        closing_predicate.boundary_role,
+    ) == ("closed", "deadline", "actual", "deadline")
+
+
+@pytest.mark.parametrize(
+    ("text", "surface", "expected_kind"),
+    (
+        ("Registration closes August 20, 2027.", "closes", "planned"),
+        (
+            "The application window will close August 20, 2027.",
+            "will close",
+            "planned",
+        ),
+        ("The submission window closed August 20, 2027.", "closed", "actual"),
+        (
+            "Registration opened August 12, 2027 and closed August 20, 2027.",
+            "closed",
+            "actual",
+        ),
+    ),
+)
+def test_only_intake_window_subjects_make_closure_a_deadline(
+    text: str,
+    surface: str,
+    expected_kind: str,
+) -> None:
+    result = analyze(text)
+    predicate = next(
+        item
+        for item in result.mentions
+        if item.mention_type == "event_predicate"
+        and text[item.start : item.end] == surface
+    )
+
+    assert (predicate.relation, predicate.kind, predicate.boundary_role) == (
+        "deadline",
+        expected_kind,
+        "deadline",
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "surface", "expected_kind"),
+    (
+        (
+            "We reviewed your application and the gallery closes August 20, 2027.",
+            "closes",
+            None,
+        ),
+        ("Our registration office closes August 20, 2027.", "closes", None),
+        ("The application exhibit closed August 20, 2027.", "closed", "actual"),
+    ),
+)
+def test_nearby_intake_words_do_not_retype_unrelated_closures_as_deadlines(
+    text: str,
+    surface: str,
+    expected_kind: str | None,
+) -> None:
+    result = analyze(text)
+    predicate = next(
+        item
+        for item in result.mentions
+        if item.mention_type == "event_predicate"
+        and text[item.start : item.end] == surface
+    )
+
+    assert predicate.relation == "occurrence"
+    assert predicate.kind == expected_kind
+    assert predicate.boundary_role == "terminal_boundary"
+    assert "terminal_boundary_not_occurrence_start" in predicate.blockers
+
+
+@pytest.mark.parametrize(
+    ("text", "surface", "expected_kind"),
+    (
+        ("The gallery closes August 20, 2027.", "closes", None),
+        ("The gallery will close August 20, 2027.", "will close", "planned"),
+        ("The gallery closed August 20, 2027.", "closed", "actual"),
+    ),
+)
+def test_generic_closure_is_a_deferred_terminal_occurrence(
+    text: str,
+    surface: str,
+    expected_kind: str | None,
+) -> None:
+    result = analyze(text)
+    predicate = next(
+        item for item in result.mentions if item.mention_type == "event_predicate"
+    )
+
+    assert text[predicate.start : predicate.end] == surface
+    assert predicate.relation == "occurrence"
+    assert predicate.kind == expected_kind
+    assert predicate.boundary_role == "terminal_boundary"
+    assert "terminal_boundary_not_occurrence_start" in predicate.blockers
+    predicate_leads = [
+        item for item in result.leads if item.mention_id == predicate.mention_id
+    ]
+    assert predicate_leads
+    assert all(item.confidence_tier == "review_ambiguous" for item in predicate_leads)
+
+
 def test_lifecycle_artifact_boundary_and_multiple_options_are_blockers() -> None:
     artifact = analyze("The meeting notes were completed on July 22, 2027.")
     lifecycle = analyze(
@@ -619,11 +921,27 @@ def test_marker_backed_footer_is_blocked_but_generic_tail_is_not_invented() -> N
     assert not any(mention.mention_type == "artifact" for mention in generic.mentions)
 
 
-def test_quoted_line_temporal_evidence_is_inventoried_and_blocked() -> None:
-    text = (
-        "Subject: Status update\n\n"
-        "> Meeting is scheduled for May 14, 2027."
+def test_context_blockers_do_not_cross_segment_boundaries() -> None:
+    text = "Meeting May 14, 2027. Notes completed, flight arrives."
+    result = analyze(text)
+    meeting = next(
+        item
+        for item in result.mentions
+        if text[item.start : item.end].casefold() == "meeting"
     )
+    lead = next(item for item in result.leads if item.mention_id == meeting.mention_id)
+
+    assert set(lead.blockers).isdisjoint(
+        {
+            "artifact_context",
+            "lifecycle_completed",
+            "terminal_boundary_not_occurrence_start",
+        }
+    )
+
+
+def test_quoted_line_temporal_evidence_is_inventoried_and_blocked() -> None:
+    text = "Subject: Status update\n\n> Meeting is scheduled for May 14, 2027."
     result = analyze(text)
 
     assert result.expressions
@@ -648,10 +966,7 @@ def test_quoted_line_temporal_evidence_is_inventoried_and_blocked() -> None:
 def test_forwarded_or_original_tail_temporal_evidence_is_blocked(
     marker: str,
 ) -> None:
-    text = (
-        f"Subject: Status update\n\n{marker}\n"
-        "Meeting is scheduled for May 14, 2027."
-    )
+    text = f"Subject: Status update\n\n{marker}\nMeeting is scheduled for May 14, 2027."
     result = analyze(text)
 
     assert result.expressions
@@ -924,7 +1239,9 @@ def test_large_inventories_are_lossless_but_hint_construction_is_bounded() -> No
     result = analyze(text)
 
     assert len(result.expressions) == 400
-    assert len([item for item in result.mentions if item.mention_type == "event"]) >= 160
+    assert (
+        len([item for item in result.mentions if item.mention_type == "event"]) >= 160
+    )
     assert result.graph_truncated is True
     assert result.candidate_edge_count_exact is False
     assert result.omitted_expression_count > 0

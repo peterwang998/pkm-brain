@@ -5,6 +5,12 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Literal, Mapping
 
+from .gmail_temporal_batching import (
+    GmailTemporalBatchAuthorityError,
+    GmailTemporalBatchMention,
+    GmailTemporalSelectorBatch,
+    validate_gmail_temporal_batch_manifest,
+)
 from .gmail_temporal_leads import (
     TemporalExpression,
     TemporalLead,
@@ -20,6 +26,7 @@ SelectionDecision = Literal[
     "reject_nonmaterial",
 ]
 SelectionConfidence = Literal["high", "medium", "low"]
+TemporalSubjectPairRelation = Literal["alias", "coordinated", "distinct"]
 SelectionRelation = Literal["occurrence", "deadline", "unspecified"]
 SelectionKind = Literal["planned", "actual", "unspecified"]
 SelectionLifecycle = Literal[
@@ -62,6 +69,50 @@ _HARD_RISK_FEATURES = {
     "subject_body_bridge_review_only",
 }
 _LIFECYCLE_SUBJECT_MAX_GAP = 120
+_COMPOUND_EVENT_NOUN_PAIRS = frozenset(
+    {
+        ("conference", "call"),
+        ("demo", "call"),
+        ("review", "meeting"),
+        ("screening", "interview"),
+        ("training", "session"),
+    }
+)
+_SUBJECT_EVENT_WRAPPERS = frozenset({"confirmation", "reminder", "update"})
+_COORDINATED_CLAUSE_PREFIX_RE = re.compile(
+    r"[,;]\s*(?:and|but|then)\s+"
+    r"(?:(?:also|kindly|now|please)\s+)*\Z",
+    re.IGNORECASE,
+)
+GMAIL_TEMPORAL_HARD_SCOPE_BLOCKERS = frozenset(
+    {
+        "competing_lifecycle_expression_cue",
+        "expression_subject_clause_scope_conflict",
+    }
+)
+_COORDINATING_SUBJECT_SEPARATOR_RE = re.compile(
+    r"\s*(?:,\s*)?(?:and|&)\s*",
+    re.IGNORECASE,
+)
+_COORDINATING_LIFECYCLE_LINK_RE = re.compile(
+    r"\s*(?:(?:are|were|have\s+been|will\s+be)\s+(?:both\s+)?)",
+    re.IGNORECASE,
+)
+_SUBJECT_LIFECYCLE_LINK_RE = re.compile(
+    r"\s*(?:(?:is|was|were|has\s+been|had\s+been|will\s+be)\s+)",
+    re.IGNORECASE,
+)
+_LIFECYCLE_EXPRESSION_FORWARD_LINK_RE = re.compile(
+    r"\s*(?:(?:at|by|for|from|on|through|to|until)\s*)?",
+    re.IGNORECASE,
+)
+_EXPRESSION_LIFECYCLE_FORWARD_LINK_RE = re.compile(
+    r"\s*(?:(?:is|was|were|has\s+been|had\s+been|will\s+be)\s*)?",
+    re.IGNORECASE,
+)
+_LIFECYCLE_CONTEXT_BLOCKERS = frozenset(
+    {"lifecycle_cancelled", "lifecycle_completed", "lifecycle_rescheduled"}
+)
 _LIFECYCLE_SUBJECT_TYPES = {
     "event",
     "event_title_candidate",
@@ -69,9 +120,7 @@ _LIFECYCLE_SUBJECT_TYPES = {
     "deadline",
     "action",
 }
-GMAIL_TEMPORAL_SUBJECT_TYPES = frozenset(
-    (*_LIFECYCLE_SUBJECT_TYPES, "boundary")
-)
+GMAIL_TEMPORAL_SUBJECT_TYPES = frozenset((*_LIFECYCLE_SUBJECT_TYPES, "boundary"))
 _TEMPORAL_SUBJECT_TYPES = GMAIL_TEMPORAL_SUBJECT_TYPES
 _LEAD_TIER_RANK = {
     "strict_direct": 0,
@@ -177,6 +226,8 @@ class GmailTemporalSelection:
 def validate_gmail_temporal_selection(
     analysis: TemporalLeadAnalysis,
     value: Mapping[str, Any],
+    *,
+    batch: GmailTemporalSelectorBatch | None = None,
 ) -> GmailTemporalSelection:
     """Bind model-cited endpoints to deterministic temporal semantics.
 
@@ -192,6 +243,20 @@ def validate_gmail_temporal_selection(
         raise GmailTemporalSelectionError(
             "selection does not match the current analysis snapshot"
         )
+    if batch is not None:
+        try:
+            validate_gmail_temporal_batch_manifest(batch)
+        except GmailTemporalBatchAuthorityError as exc:
+            raise GmailTemporalSelectionError(
+                "selection batch endpoint packet is invalid"
+            ) from exc
+        if (
+            batch.manifest.analysis_fingerprint != analysis.snapshot_fingerprint
+            or batch.manifest.source_sha256 != analysis.source_sha256
+        ):
+            raise GmailTemporalSelectionError(
+                "selection batch does not match the current analysis snapshot"
+            )
     requested_decision = _enum(value.get("decision"), _DECISIONS, "decision")
     raw_associations = value.get("associations")
     if not isinstance(raw_associations, list) or len(raw_associations) > 8:
@@ -270,6 +335,25 @@ def validate_gmail_temporal_selection(
             leads=leads,
             repair_flags=repair_flags,
         )
+        coordinated_subject_present = _has_coordinated_subject(
+            subject=subject,
+            lifecycle=lifecycle,
+            mentions=mentions,
+            batch=batch,
+        )
+        coordinated_supporting_lead = _coordinated_supporting_lead(
+            expression_id=expression_id,
+            subject=subject,
+            lifecycle=lifecycle,
+            mentions=mentions,
+            leads=leads,
+            batch=batch,
+        )
+        lifecycle_subject_grammar_supported = _subject_lifecycle_has_local_grammar(
+            subject,
+            lifecycle,
+            batch=batch,
+        )
         lifecycle_lead = (
             _best_matching_lead(
                 leads,
@@ -282,13 +366,25 @@ def validate_gmail_temporal_selection(
         normalized_value, normalization_blockers = _deterministic_normalization(
             expression
         )
+        grammatical_scope_blockers = _expression_subject_binding_blockers(
+            expression=expression,
+            expressions=expressions,
+            subject=subject,
+            leads=leads,
+            supporting_lead=supporting_lead,
+            batch=batch,
+        )
         lifecycle_binding_blockers = _lifecycle_subject_binding_blockers(
             expression=expression,
+            expressions=expressions,
             subject=subject,
             lifecycle=lifecycle,
             mentions=mentions,
             supporting_lead=supporting_lead,
+            coordinated_supporting_lead=coordinated_supporting_lead,
+            lifecycle_subject_grammar_supported=lifecycle_subject_grammar_supported,
             lifecycle_lead=lifecycle_lead,
+            batch=batch,
         )
         relation, kind, lifecycle_value, semantic_blockers, semantic_repairs = (
             _deterministic_semantics(
@@ -312,7 +408,24 @@ def validate_gmail_temporal_selection(
                 *expression.blockers,
                 *subject.blockers,
                 *(lifecycle.blockers if lifecycle is not None else ()),
-                *(supporting_lead.blockers if supporting_lead is not None else ()),
+                *(
+                    tuple(
+                        blocker
+                        for blocker in supporting_lead.blockers
+                        if not (
+                            coordinated_subject_present
+                            and blocker == "multiple_association_mentions"
+                        )
+                        and not (
+                            lifecycle is not None
+                            and blocker in _LIFECYCLE_CONTEXT_BLOCKERS
+                            and blocker not in lifecycle.blockers
+                        )
+                    )
+                    if supporting_lead is not None
+                    else ()
+                ),
+                *grammatical_scope_blockers,
                 *lifecycle_binding_blockers,
                 *normalization_blockers,
                 *semantic_blockers,
@@ -321,9 +434,10 @@ def validate_gmail_temporal_selection(
         )
         risk_features = _ordered_unique(
             (
+                *(supporting_lead.risk_features if supporting_lead is not None else ()),
                 *(
-                    supporting_lead.risk_features
-                    if supporting_lead is not None
+                    coordinated_supporting_lead.risk_features
+                    if coordinated_supporting_lead is not None
                     else ()
                 ),
                 *(lifecycle_lead.risk_features if lifecycle_lead is not None else ()),
@@ -337,6 +451,8 @@ def validate_gmail_temporal_selection(
             risk_features=risk_features,
             repair_flags=tuple(repair_flags),
             supporting_lead=supporting_lead,
+            coordinated_supporting_lead=coordinated_supporting_lead,
+            lifecycle_subject_grammar_supported=lifecycle_subject_grammar_supported,
         )
         must_defer = must_defer or association_must_defer
         associations.append(
@@ -432,9 +548,7 @@ def _optional_lifecycle_mention(
 ) -> TemporalMention | None:
     if value is None:
         return None
-    mention_id = _required_evidence_id(
-        value, "lifecycle_mention_id", _MENTION_ID_RE
-    )
+    mention_id = _required_evidence_id(value, "lifecycle_mention_id", _MENTION_ID_RE)
     mention = mentions.get(mention_id)
     if mention is None:
         repair_flags.append("lifecycle_mention_reference_discarded")
@@ -497,6 +611,79 @@ def _best_matching_lead(
     )
 
 
+def _coordinated_supporting_lead(
+    *,
+    expression_id: str,
+    subject: TemporalMention,
+    lifecycle: TemporalMention | None,
+    mentions: dict[str, TemporalMention],
+    leads: dict[str, TemporalLead],
+    batch: GmailTemporalSelectorBatch | None,
+) -> TemporalLead | None:
+    """Recover a lead only across source-verified coordinated subjects.
+
+    The recovered lead remains internal evidence. It is never returned as the
+    selected subject's lead because its mention endpoint belongs to the other
+    coordinated subject.
+    """
+
+    if lifecycle is None or batch is None:
+        return None
+    candidates: list[TemporalLead] = []
+    for candidate in mentions.values():
+        if candidate.mention_id == subject.mention_id:
+            continue
+        if (
+            classify_gmail_temporal_subject_pair(
+                subject,
+                candidate,
+                batch=batch,
+                lifecycle=lifecycle,
+            )
+            != "coordinated"
+        ):
+            continue
+        lead = _best_matching_lead(
+            leads,
+            expression_id=expression_id,
+            mention_id=candidate.mention_id,
+        )
+        if lead is not None:
+            candidates.append(lead)
+    return min(
+        candidates,
+        key=lambda lead: (
+            _LEAD_TIER_RANK[lead.confidence_tier],
+            _LEAD_MODE_RANK[lead.association_mode],
+            lead.gap_chars,
+            lead.lead_id,
+        ),
+        default=None,
+    )
+
+
+def _has_coordinated_subject(
+    *,
+    subject: TemporalMention,
+    lifecycle: TemporalMention | None,
+    mentions: dict[str, TemporalMention],
+    batch: GmailTemporalSelectorBatch | None,
+) -> bool:
+    if lifecycle is None or batch is None:
+        return False
+    return any(
+        candidate.mention_id != subject.mention_id
+        and classify_gmail_temporal_subject_pair(
+            subject,
+            candidate,
+            batch=batch,
+            lifecycle=lifecycle,
+        )
+        == "coordinated"
+        for candidate in mentions.values()
+    )
+
+
 def _deterministic_normalization(
     expression: TemporalExpression,
 ) -> tuple[str | None, tuple[str, ...]]:
@@ -511,21 +698,86 @@ def _deterministic_normalization(
     return value, ()
 
 
+def _expression_subject_binding_blockers(
+    *,
+    expression: TemporalExpression,
+    expressions: dict[str, TemporalExpression],
+    subject: TemporalMention,
+    leads: dict[str, TemporalLead],
+    supporting_lead: TemporalLead | None,
+    batch: GmailTemporalSelectorBatch | None,
+) -> tuple[str, ...]:
+    """Reject a backward cross-clause pair shadowed by direct local grammar.
+
+    This intentionally requires all three signals: the expression precedes the
+    subject, their source slice is a coordinated clause boundary, and a later
+    expression has a direct-grammar lead to that subject. A mere comma or a
+    later date is insufficient, preserving recall for introductory dates and
+    multi-time assertions.
+    """
+
+    if (
+        batch is None
+        or expression.field != subject.field
+        or expression.segment_id != subject.segment_id
+        or expression.end > subject.start
+        or (
+            supporting_lead is not None
+            and supporting_lead.association_mode == "direct_grammar"
+        )
+    ):
+        return ()
+    separator = _source_slice(
+        batch,
+        expression.end,
+        subject.start,
+        field=expression.field,
+    )
+    if separator is None or _COORDINATED_CLAUSE_PREFIX_RE.search(separator) is None:
+        return ()
+    if any(
+        candidate.expression_id != expression.expression_id
+        and candidate.field == subject.field
+        and candidate.segment_id == subject.segment_id
+        and candidate.start >= subject.end
+        and (
+            candidate_lead := _best_matching_lead(
+                leads,
+                expression_id=candidate.expression_id,
+                mention_id=subject.mention_id,
+            )
+        )
+        is not None
+        and candidate_lead.association_mode == "direct_grammar"
+        for candidate in expressions.values()
+    ):
+        return ("expression_subject_clause_scope_conflict",)
+    return ()
+
+
 def _lifecycle_subject_binding_blockers(
     *,
     expression: TemporalExpression,
+    expressions: dict[str, TemporalExpression],
     subject: TemporalMention,
     lifecycle: TemporalMention | None,
     mentions: dict[str, TemporalMention],
     supporting_lead: TemporalLead | None,
+    coordinated_supporting_lead: TemporalLead | None,
+    lifecycle_subject_grammar_supported: bool,
     lifecycle_lead: TemporalLead | None,
+    batch: GmailTemporalSelectorBatch | None,
 ) -> tuple[str, ...]:
     """Require lifecycle evidence to bind both time and the selected subject."""
 
     if lifecycle is None:
         return ()
     blockers: list[str] = []
-    if supporting_lead is None:
+    if (
+        supporting_lead is None
+        and coordinated_supporting_lead is None
+        and not lifecycle_subject_grammar_supported
+    ):
         blockers.append("lifecycle_subject_pair_unlinked")
     if lifecycle_lead is None:
         blockers.append("lifecycle_expression_unlinked")
@@ -535,22 +787,343 @@ def _lifecycle_subject_binding_blockers(
         blockers.append("lifecycle_subject_cross_segment")
     if lifecycle.segment_id != expression.segment_id:
         blockers.append("lifecycle_expression_cross_segment")
-    selected_gap = _mention_gap(subject, lifecycle)
-    if selected_gap > _LIFECYCLE_SUBJECT_MAX_GAP:
-        blockers.append("lifecycle_subject_too_distant")
-    if any(
-        candidate.mention_id != subject.mention_id
-        and candidate.mention_type in _LIFECYCLE_SUBJECT_TYPES
+    if expression.end <= lifecycle.start and any(
+        candidate.expression_id != expression.expression_id
         and candidate.field == lifecycle.field
         and candidate.segment_id == lifecycle.segment_id
-        and (
-            candidate.end <= subject.start
-            or subject.end <= candidate.start
+        and candidate.start >= lifecycle.end
+        and _span_gap(candidate.start, candidate.end, lifecycle.start, lifecycle.end)
+        < _span_gap(expression.start, expression.end, lifecycle.start, lifecycle.end)
+        for candidate in expressions.values()
+    ):
+        blockers.append("lifecycle_expression_scope_conflict")
+    if not (lifecycle.lifecycle_role or "").startswith("rescheduled") and any(
+        candidate.mention_id != lifecycle.mention_id
+        and candidate.mention_type == "lifecycle"
+        and candidate.field == expression.field
+        and candidate.segment_id == expression.segment_id
+        and _mention_gap(candidate, expression) < _mention_gap(lifecycle, expression)
+        and _lifecycle_expression_has_local_grammar(
+            candidate,
+            expression,
+            batch=batch,
         )
         for candidate in mentions.values()
     ):
+        blockers.append("competing_lifecycle_expression_cue")
+    selected_gap = _mention_gap(subject, lifecycle)
+    if selected_gap > _LIFECYCLE_SUBJECT_MAX_GAP:
+        blockers.append("lifecycle_subject_too_distant")
+    competitors = tuple(
+        candidate
+        for candidate in mentions.values()
+        if candidate.mention_id != subject.mention_id
+        and candidate.mention_type in _LIFECYCLE_SUBJECT_TYPES
+        and candidate.field == lifecycle.field
+        and candidate.segment_id == lifecycle.segment_id
+        and classify_gmail_temporal_subject_pair(
+            subject,
+            candidate,
+            batch=batch,
+            lifecycle=lifecycle,
+        )
+        == "distinct"
+    )
+    if any(
+        _mention_gap(candidate, lifecycle) <= selected_gap for candidate in competitors
+    ):
         blockers.append("competing_lifecycle_subject")
+    if subject.start >= lifecycle.end and any(
+        candidate.end <= lifecycle.start for candidate in competitors
+    ):
+        blockers.append("lifecycle_clause_direction_conflict")
     return _ordered_unique(tuple(blockers))
+
+
+def _subject_lifecycle_has_local_grammar(
+    subject: TemporalMention,
+    lifecycle: TemporalMention | None,
+    *,
+    batch: GmailTemporalSelectorBatch | None,
+) -> bool:
+    if (
+        lifecycle is None
+        or batch is None
+        or subject.field != lifecycle.field
+        or subject.segment_id != lifecycle.segment_id
+        or subject.end > lifecycle.start
+    ):
+        return False
+    separator = _source_slice(
+        batch,
+        subject.end,
+        lifecycle.start,
+        field=subject.field,
+    )
+    return (
+        separator is not None
+        and _SUBJECT_LIFECYCLE_LINK_RE.fullmatch(separator) is not None
+    )
+
+
+def _lifecycle_expression_has_local_grammar(
+    lifecycle: TemporalMention,
+    expression: TemporalExpression,
+    *,
+    batch: GmailTemporalSelectorBatch | None,
+) -> bool:
+    if (
+        batch is None
+        or lifecycle.field != expression.field
+        or lifecycle.segment_id != expression.segment_id
+    ):
+        return False
+    if lifecycle.end <= expression.start:
+        separator = _source_slice(
+            batch,
+            lifecycle.end,
+            expression.start,
+            field=lifecycle.field,
+        )
+        return (
+            separator is not None
+            and _LIFECYCLE_EXPRESSION_FORWARD_LINK_RE.fullmatch(separator) is not None
+        )
+    if expression.end <= lifecycle.start:
+        separator = _source_slice(
+            batch,
+            expression.end,
+            lifecycle.start,
+            field=lifecycle.field,
+        )
+        return (
+            separator is not None
+            and _EXPRESSION_LIFECYCLE_FORWARD_LINK_RE.fullmatch(separator) is not None
+        )
+    return False
+
+
+def classify_gmail_temporal_subject_pair(
+    first: TemporalMention,
+    second: TemporalMention,
+    *,
+    batch: GmailTemporalSelectorBatch | None,
+    lifecycle: TemporalMention | None = None,
+) -> TemporalSubjectPairRelation:
+    """Classify only source-verifiable alias and coordination relations.
+
+    Span adjacency alone is intentionally not an alias signal. When source
+    context is unavailable, only overlapping endpoints can be considered the
+    same subject; all other pairs remain distinct and therefore conservative.
+    """
+
+    if first.start < second.end and second.start < first.end:
+        return "alias"
+    if batch is None:
+        return "distinct"
+    batch_mentions = {item.mention_id: item for item in batch.mentions}
+    if (
+        first.mention_type == second.mention_type == "event"
+        and first.field == second.field
+        and first.segment_id == second.segment_id
+        and _compound_event_alias(
+            first,
+            second,
+            batch=batch,
+            batch_mentions=batch_mentions,
+        )
+    ):
+        return "alias"
+    if _subject_title_surrounds_local_event(
+        first,
+        second,
+        batch=batch,
+        batch_mentions=batch_mentions,
+    ):
+        return "alias"
+    if lifecycle is not None and _subjects_are_lifecycle_coordinated(
+        first,
+        second,
+        lifecycle=lifecycle,
+        batch=batch,
+    ):
+        return "coordinated"
+    return "distinct"
+
+
+def _compound_event_alias(
+    first: TemporalMention,
+    second: TemporalMention,
+    *,
+    batch: GmailTemporalSelectorBatch,
+    batch_mentions: dict[str, GmailTemporalBatchMention],
+) -> bool:
+    earlier, later = sorted((first, second), key=lambda item: item.start)
+    if earlier.end > later.start:
+        return False
+    earlier_view = batch_mentions.get(earlier.mention_id)
+    later_view = batch_mentions.get(later.mention_id)
+    if earlier_view is None or later_view is None:
+        return False
+    pair = (earlier_view.surface.casefold(), later_view.surface.casefold())
+    if pair not in _COMPOUND_EVENT_NOUN_PAIRS:
+        return False
+    separator = _source_slice(batch, earlier.end, later.start, field=earlier.field)
+    return (
+        separator is not None
+        and bool(separator)
+        and all(value.isspace() or value in "-–—" for value in separator)
+    )
+
+
+def _subject_title_surrounds_local_event(
+    first: TemporalMention,
+    second: TemporalMention,
+    *,
+    batch: GmailTemporalSelectorBatch,
+    batch_mentions: dict[str, GmailTemporalBatchMention],
+) -> bool:
+    if first.mention_type == "event_title_candidate" and second.mention_type == "event":
+        title, event = first, second
+    elif (
+        second.mention_type == "event_title_candidate" and first.mention_type == "event"
+    ):
+        title, event = second, first
+    else:
+        return False
+    if (
+        title.field != "subject"
+        or event.field != batch.field
+        or event.field == "subject"
+    ):
+        return False
+    title_view = batch_mentions.get(title.mention_id)
+    event_view = batch_mentions.get(event.mention_id)
+    if (
+        title_view is None
+        or event_view is None
+        or not title_view.surface.strip()
+        or not event_view.surface.strip()
+    ):
+        return False
+    tokens = tuple(title_view.surface.split())
+    if not tokens:
+        return False
+    pattern = re.compile(
+        r"(?<!\w)" + r"\s+".join(re.escape(token) for token in tokens) + r"(?!\w)",
+        re.IGNORECASE,
+    )
+    for context in batch.contexts:
+        if context.role != "local" or context.field != event.field:
+            continue
+        for match in pattern.finditer(context.surface):
+            phrase_start = context.start + match.start()
+            phrase_end = context.start + match.end()
+            if phrase_start <= event.start and event.end <= phrase_end:
+                return True
+    wrapped_core = _wrapped_subject_title_core(
+        title_view.surface,
+        event_view.surface,
+    )
+    if wrapped_core is not None:
+        wrapped_pattern = re.compile(
+            r"(?<!\w)"
+            + r"\s+".join(re.escape(token) for token in wrapped_core)
+            + r"(?!\w)",
+            re.IGNORECASE,
+        )
+        for context in batch.contexts:
+            if context.role != "local" or context.field != event.field:
+                continue
+            for match in wrapped_pattern.finditer(context.surface):
+                phrase_start = context.start + match.start()
+                phrase_end = context.start + match.end()
+                if phrase_start <= event.start and event.end <= phrase_end:
+                    return True
+    return False
+
+
+def _wrapped_subject_title_core(title: str, event: str) -> tuple[str, ...] | None:
+    """Return a bounded stripped title only when its terminal event agrees."""
+
+    title_words = tuple(re.findall(r"\w+", title.casefold()))
+    event_words = tuple(re.findall(r"\w+", event.casefold()))
+    if not title_words or not event_words:
+        return None
+    stripped = title_words
+    wrapper_removed = False
+    if stripped and stripped[0] in _SUBJECT_EVENT_WRAPPERS:
+        stripped = stripped[1:]
+        wrapper_removed = True
+    if stripped and stripped[-1] in _SUBJECT_EVENT_WRAPPERS:
+        stripped = stripped[:-1]
+        wrapper_removed = True
+    if (
+        not wrapper_removed
+        or len(stripped) < len(event_words)
+        or stripped[-len(event_words) :] != event_words
+    ):
+        return None
+    return stripped
+
+
+def _subjects_are_lifecycle_coordinated(
+    first: TemporalMention,
+    second: TemporalMention,
+    *,
+    lifecycle: TemporalMention,
+    batch: GmailTemporalSelectorBatch,
+) -> bool:
+    if (
+        first.mention_type not in _LIFECYCLE_SUBJECT_TYPES
+        or second.mention_type not in _LIFECYCLE_SUBJECT_TYPES
+        or first.field != second.field
+        or first.field != lifecycle.field
+        or first.segment_id != second.segment_id
+        or first.segment_id != lifecycle.segment_id
+    ):
+        return False
+    earlier, later = sorted((first, second), key=lambda item: item.start)
+    if later.end > lifecycle.start:
+        return False
+    subject_separator = _source_slice(
+        batch,
+        earlier.end,
+        later.start,
+        field=earlier.field,
+    )
+    lifecycle_link = _source_slice(
+        batch,
+        later.end,
+        lifecycle.start,
+        field=later.field,
+    )
+    return (
+        subject_separator is not None
+        and lifecycle_link is not None
+        and _COORDINATING_SUBJECT_SEPARATOR_RE.fullmatch(subject_separator) is not None
+        and _COORDINATING_LIFECYCLE_LINK_RE.fullmatch(lifecycle_link) is not None
+    )
+
+
+def _source_slice(
+    batch: GmailTemporalSelectorBatch,
+    start: int,
+    end: int,
+    *,
+    field: str,
+) -> str | None:
+    if end < start:
+        return None
+    containing = tuple(
+        context
+        for context in batch.contexts
+        if context.field == field and context.start <= start and end <= context.end
+    )
+    if not containing:
+        return None
+    context = min(containing, key=lambda item: (item.end - item.start, item.context_id))
+    return context.surface[start - context.start : end - context.start]
 
 
 def _mention_gap(first: TemporalMention, second: TemporalMention) -> int:
@@ -558,6 +1131,19 @@ def _mention_gap(first: TemporalMention, second: TemporalMention) -> int:
         return second.start - first.end
     if second.end <= first.start:
         return first.start - second.end
+    return 0
+
+
+def _span_gap(
+    first_start: int,
+    first_end: int,
+    second_start: int,
+    second_end: int,
+) -> int:
+    if first_end <= second_start:
+        return second_start - first_end
+    if second_end <= first_start:
+        return first_start - second_end
     return 0
 
 
@@ -668,10 +1254,14 @@ def _association_requires_defer(
     risk_features: tuple[str, ...],
     repair_flags: tuple[str, ...],
     supporting_lead: TemporalLead | None,
+    coordinated_supporting_lead: TemporalLead | None,
+    lifecycle_subject_grammar_supported: bool,
 ) -> bool:
-    if supporting_lead is None or any(
-        flag not in _NON_DEFER_REPAIRS for flag in repair_flags
-    ):
+    if (
+        supporting_lead is None
+        and coordinated_supporting_lead is None
+        and not lifecycle_subject_grammar_supported
+    ) or any(flag not in _NON_DEFER_REPAIRS for flag in repair_flags):
         return True
     if relation == "unspecified" and lifecycle not in _TERMINAL_LIFECYCLES:
         return True
@@ -679,11 +1269,7 @@ def _association_requires_defer(
         return True
     if lifecycle == "unknown":
         return True
-    ignored = (
-        _HANDLED_TERMINAL_BLOCKERS
-        if lifecycle in _TERMINAL_LIFECYCLES
-        else set()
-    )
+    ignored = _HANDLED_TERMINAL_BLOCKERS if lifecycle in _TERMINAL_LIFECYCLES else set()
     if any(blocker not in ignored for blocker in blockers):
         return True
     return any(feature in _HARD_RISK_FEATURES for feature in risk_features)
