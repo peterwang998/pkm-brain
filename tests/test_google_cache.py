@@ -33,11 +33,11 @@ def test_cache_round_trips_private_raw_and_normalized_evidence(tmp_path: Path) -
         cached_at=NOW,
     )
 
-    assert cache.read_raw("gmail", "thread/one") == {
+    assert cache.read_raw("gmail", "thread/one", now=NOW) == {
         "id": "thread-1",
         "messages": [],
     }
-    assert cache.read_normalized("calendar", "primary:event-1") == {
+    assert cache.read_normalized("calendar", "primary:event-1", now=NOW) == {
         "event_id": "event-1",
         "title": "Review",
     }

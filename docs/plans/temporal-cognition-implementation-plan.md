@@ -1,7 +1,7 @@
 # Temporal Cognition Implementation Plan
 
-**Status:** T0-T5 implemented and evaluated in isolated Brain v2; T5A evidence-first Gmail discovery, apply-time provenance, and historical replay are complete but Gmail temporal-recall gates failed; T5B association recall, labeled calibration, live lifecycle validation, optional backfill, and controlled promotion remain open
-**Last verified:** 2026-07-19 against the unpromoted temporal-cognition branch based on baseline commit `d5405b9`; the content-safe replay validated all 42,533 Gmail projection files, preserved current fact-admission parity, exposed insufficient direct-grammar temporal coverage, and the full 1,177-test suite passed
+**Status:** T0-T5 implemented and evaluated in isolated Brain v2; T5A evidence-first Gmail discovery, apply-time provenance, and historical replay are complete; the T5B review-only association prototype and development replay are implemented, but human-grounded calibration, live lifecycle validation, optional backfill, and controlled promotion remain open
+**Last verified:** 2026-07-20 against the unpromoted temporal-cognition branch based on baseline commit `d5405b9`; the content-safe replay preserved current fact-admission parity, the bounded current-source replay covered all 265 important-temporal proxy threads, and the full 1,241-test suite passed while promotion remained blocked on accuracy evidence
 **Owning specs:** [Capture And Knowledge](../specs/capture-and-knowledge.md), [Curation And Review](../specs/curation-and-review.md), and [Retrieval And Memory](../specs/retrieval-and-memory.md)
 
 ## Objective
@@ -236,7 +236,7 @@ Historical lifecycle depth was weaker than expected. After semantic projection v
 Deliverables:
 
 - inventory temporal expressions independently of source classification, including exact spans, normalized options, ambiguity, and resolution basis;
-- inventory event and deadline/action mentions independently of dates, then record association mode as `direct_grammar`, `structured_artifact`, `subject_singleton`, or `classifier_prior_only`;
+- inventory event, deadline/action, boundary, lifecycle, and artifact mentions independently of dates, then retain bounded association hints with explicit modes and risk features; hints rank review work but never define the selector's recall boundary;
 - use `important_temporal` only to prioritize an unresolved review lane, never to invent a relation, entity, or date pairing and never as self-validating recall evidence;
 - admit a review-only singleton association only within one trusted message with exactly one supported expression and one event/action mention, no lifecycle cue, and no competing date or event;
 - keep arrival, ending, completion, cancellation, and reschedule semantics out of occurrence-start auto-application; a parent event's terminal boundary is not its start;
@@ -244,6 +244,12 @@ Deliverables:
 - create a blinded 100-120 item stratified calibration set spanning direct hits, important-temporal misses, explicit-proxy misses, human-mail leads, lifecycle language, and bulk/advertising negatives;
 - freeze the HMAC-opaque cohort before labeling, require complete labels for every selected record, and treat sparse, selectively omitted, duplicate, or stale cohort membership as failed or not evaluated rather than extrapolating from favorable annotations;
 - keep every new association sidecar-only until class-specific calibration succeeds; temporal misses must never suppress the accepted base fact.
+
+The implemented selector deliberately has less authority than the earlier design. It may decide materiality and cite only an inventoried temporal expression, an event/action subject, an optional lifecycle cue, and an optional matching hint. It cannot author relation, planned/actual kind, lifecycle, normalization, confidence, source text, spans, dates, or explanations. Deterministic validation binds every response to an exact versioned analysis fingerprint, derives all semantics, rejects stale or unknown evidence, and converts incomplete, risky, or conflicting assertions to `defer_ambiguous`. Endpoint IDs are content-bound, duplicate expression/subject pairs are rejected, and terminal boundaries can never become occurrence starts.
+
+The first 120-record stratified cohort is now a development set because it was reused while the analyzer, graph, prompt, and selector were changing. It is useful for architecture comparison, not for satisfying the human-grounded promotion gate. The winning development architecture, its aggregate results, and the required fresh holdout are recorded in [Gmail Temporal Recall Exploration](../audits/gmail-temporal-recall-exploration-2026-07-20.md).
+
+T5B development outcome: the endpoint-only arm preserved a 68.7% Sol-supported material-record rate while raising the Sol-supported proposal rate from 63.4% to 80.0% and reducing critical-error labels from 23 to 15. These are independent-model support rates on reused development data, not human-grounded recall or precision. A diagnostic remap through the stricter final validator then produced a 62.4% supported material-record rate, an 80.6% supported proposal rate, and 14 critical-error labels; it removed eight proposals but exposed the coverage cost of fail-closed repair. This is a useful stability improvement, not a passed gate. No free-text class can emit high confidence or route automatically. Production batching, segment and quote identity, structured ICS extraction, stable lifecycle identity with a separate reconciliation pass, review-rescue admission, a fresh human holdout, and a live content-changing canary remain required.
 
 ### T6 — Controlled Promotion And Optional Backfill
 

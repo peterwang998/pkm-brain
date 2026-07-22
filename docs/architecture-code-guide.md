@@ -1,7 +1,7 @@
 # PKM Brain Architecture Code Guide
 
 **Status:** current code-navigation guide
-**Last verified:** 2026-07-19 against the unpromoted temporal-cognition branch based on rollback commit `d5405b9`; the Brain v2 target reaches schema 24 while the installed release remains on schema 21
+**Last verified:** 2026-07-20 against the unpromoted temporal-cognition branch based on rollback commit `d5405b9`; the Brain v2 target reaches schema 24 while the installed release remains on schema 21
 
 This guide answers where behavior lives. Feature requirements and open work belong in [the specs index](README.md), not here.
 
@@ -105,6 +105,8 @@ Provider mismatch must disable/refuse the vector channel; never mix spaces or si
 - `extraction_entities.py`: fail-soft entity-annotation normalization; malformed optional mentions cannot discard an evidence-backed base fact.
 - `event_projection.py`: deterministic, evidence-backed projection of trusted source-native meeting times into ordinary event facts.
 - `gmail_temporal_discovery.py`: deterministic, message-local Gmail temporal expression discovery with exact evidence spans and explicit resolution bases; output is a non-routable sidecar lead.
+- `gmail_temporal_leads.py`: content-free, snapshot-bound inventories of temporal expressions and event/action/lifecycle mentions plus bounded review-only association hints. Expressions preserve calendar dates, local wall times, ambiguity, blockers, and exact source offsets without pretending an unzoned time is an instant. Admission gates association hints but never changes either inventory. Oversized hint graphs retain the lossless inventories but expose omitted endpoint counts and mark candidate-edge counts as lower bounds.
+- `gmail_temporal_selection.py`: the endpoint-only semantic authority boundary. An external selector may cite an expression, an event/action subject, an optional lifecycle cue, and an optional matching lead; deterministic code derives normalization, relation, planned/actual kind, lifecycle, confidence, blockers, and deferral. Snapshot fingerprints and content-bound IDs reject stale responses, and every result remains non-routable.
 - `gmail_temporal_evaluation.py`: read-only current/history replay, aggregate recall diagnostics, frozen HMAC-opaque calibration cohorts, complete-label/stratification gates, and determinism checks for the private Gmail projection.
 - `event_routing.py`: event-page coherence plus Gmail's evidence-bound temporal-integrity checksum; application reloads exact cited chunks and requires the recomputed clock, primary event, and complete stabilizer audit before accepting event time.
 - `temporal_enrichment.py`: fail-open stripping/reporting for optional predicate/event time and event-aware candidate deduplication.
