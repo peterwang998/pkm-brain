@@ -9,7 +9,7 @@
 
 The remaining Gmail problem is association selection, not broad date discovery. The current deterministic analyzer still finds at least one temporal expression, subject mention, and candidate association in all 265 current messages classified as `important_temporal`. Relaxing the terminal-boundary schema alone did not reach the target. The implementation therefore moved to one-expression, segment-local selector packets, an explicit review-only rescue lane, and association-isolated deterministic reduction.
 
-The production-shaped local pieces are implemented and regression-tested. A fresh external Luna/Sol pass over the full-text 120-message development cohort is not yet reported here: the execution security gate requires explicit informed approval before private Gmail text may be transmitted to those external models. No attempt was made to bypass that gate.
+The production-shaped local pieces are implemented and regression-tested. The selector boundary now also exposes a deterministic candidate frontier and lossless alias-aware pages, so the model can classify every legal expression-subject binding instead of having to invent endpoint pairs. A fresh external Luna/Sol pass over the full-text 120-message development cohort is not yet reported here: the execution security gate requires explicit informed approval before private Gmail text may be transmitted to those external models. No attempt was made to bypass that gate.
 
 ## Evidence
 
@@ -38,6 +38,28 @@ After excluding records the same judge said should be suppressed, useful-record 
 
 The result rules out a validator-only fix. A permissive whole-message selector still chooses the wrong occurrence or lifecycle often enough that post-hoc repair cannot recover the missing binding.
 
+### Offline recall ceiling and policy sweep
+
+The older independently labeled endpoint cohort contains 82 records the judge marked both material and admissible. Sixty-one of those have at least one explicit judged-best lead; across all strata there are 68 judged-best endpoint pairs. Reanalyzing the exact saved evidence with the current code showed:
+
+- all 68 of 68 judged-best pairs are present in a current expression packet and independently validate;
+- six of those valid pairs are absent from the packet's bounded lead hints, confirming that hints cannot be a recall boundary;
+- of 13 useful misses for which the old judge supplied both supported endpoint sets, 12 endpoint combinations are colocated and 11 are legal current subjects;
+- the resulting endpoint oracle ceiling is 72 of 82 useful records, or 87.8%. The additional 11 are endpoint-set ceilings rather than independently judged pairs, so this is not a measured recall result.
+
+The content-free candidate sweep found this production-safe Pareto point:
+
+| Candidate policy | Judged-best pairs retained | Additional endpoint-set recovery | Base bindings |
+|---|---:|---:|---:|
+| Valid packet subjects | 68/68 | 11/13 | 1,595 |
+| Hint-only | 62/68 | 11/13 | 660 |
+| Unclustered cap four | 68/68 | 11/13 | 1,196 |
+| Alias-clustered local + subject bridge, cap four | 68/68 | 11/13 alias-aware | 1,122 |
+
+The last policy reduces base candidate volume by 29.7% without losing a known semantic binding. Local-only was smaller on this cohort but was rejected as the production choice because it excludes cross-field subject bridges. The implementation uses four clusters as a page width rather than a destructive final cap: every overflow cluster receives a later page.
+
+This candidate pruning does not solve materiality precision. Every recall-preserving arm still exposed plausible bindings in 15 of 36 records the judge said should be suppressed. A grouped out-of-fold deterministic endpoint-feature verifier also found no operating point at both 90% supported-proposal precision and 85% useful-record recall. Materiality and semantic support therefore remain explicit model judgments, with deterministic negative gating only when no legal subject can be cited.
+
 ### Fresh full-text development cohort
 
 A new 120-message, HMAC-opaque development cohort was rebuilt with untruncated source text. The deterministic planner produced:
@@ -50,6 +72,8 @@ A new 120-message, HMAC-opaque development cohort was rebuilt with untruncated s
 - 35 source-suppressed records eligible only for the non-routable temporal-rescue lane.
 
 The cohort is still development data, not a frozen human holdout. Reanalysis of the exact saved text found zero stale endpoint inventories, zero invalid spans, zero context truncations, and zero packet omissions. Those checks demonstrate lossless expression planning under bounds; they do not demonstrate semantic quality.
+
+Replaying the new validator-backed frontier over the same cohort produced 2,155 lifecycle-aware candidates in 1,440 alias clusters. Four-cluster lossless paging produced 605 verifier pages; 152 expression packets had an empty complete frontier and can be deterministically deferred without a model call. Fourteen packets explicitly reported omitted candidate endpoints and therefore cannot be skipped; two of those had an empty visible frontier. Seventy-seven packets required overflow pages. Every page stayed at or below four alias fragments, 12 candidate variants, and 12,000 candidate-payload bytes; the observed maximum was 11,754 bytes. These are bounded execution diagnostics, not quality measurements.
 
 ## Implemented Architecture
 
@@ -88,26 +112,32 @@ Each proposed association is checked against its packet manifest and then passed
 
 This is the key stability change: recall is expanded before admission and selection, while unsafe ambiguity changes review state rather than inventing a precise temporal fact.
 
-### 5. Event-centered temporal memory
+### 5. Explicit candidate verification
+
+`gmail_temporal_frontier.py` enumerates every independently valid expression-subject binding in a finalized packet. It derives relation, planned/actual kind, lifecycle, normalization, blockers, risk features, and required deferral through the same deterministic semantic validator used after selection. Stable candidate and frontier fingerprints bind any later verdict to the exact analysis and packet manifest.
+
+Reducer-equivalent overlapping event-title/event aliases become one decision cluster. Clusters are paged four at a time, but overflow is never discarded; candidate-count and byte bounds can split a large cluster into page-unique decision units without reusing response authority. A verifier must return one supported, unsupported, or uncertain verdict for every presented candidate, and at most one non-negative lifecycle variant per exact expression-subject binding. The plan-level validator recomputes the immutable page plan, requires every page and candidate exactly once, rejects stale or cross-page choices, and propagates incomplete-frontier deferral into both deterministic projections. Complete empty frontiers are safe deterministic deferrals; incomplete empty frontiers remain unknown. The frontier and pages remain non-routable and contain no source surfaces of their own; the separately signed expression packet remains the sole text authority.
+
+### 6. Event-centered temporal memory
 
 The selector output remains a non-routable evidence sidecar. A resolved occurrence should ultimately reference a stable event entity. Schedules, deadlines, cancellations, completions, and replacements should update an append-only event lifecycle only after event identity is reconciled. Ordinary durable facts remain ordinary facts; they are not required to carry a temporal object merely because their source email contains a date.
 
 ## Verification
 
-- 120 focused lead/selection/batching/reduction tests pass.
-- The complete repository suite passes: 1,297 tests.
+- 147 focused lead/selection/batching/frontier/reduction tests pass.
+- The complete repository suite passes: 1,324 tests.
 - Ruff passes for all changed temporal modules and tests.
 - The historical replay and fresh packet planner print aggregates only.
-- The new planner and reducer are non-routable and make no external calls by themselves.
+- The new planner, frontier, verdict validator, and reducer are non-routable and make no external calls by themselves.
 
 ## What Remains Before A Release Claim
 
-1. With explicit informed approval, run the 672 packets through restricted ephemeral Luna-medium and judge the resulting proposals independently with restricted ephemeral Sol-medium.
-2. Report useful-record recall, supported-proposal precision, critical-error rate, rescued-record recall, and selected-noise rate. Do not reinterpret model-judge support as human-gold accuracy.
-3. If proposal support remains below 90%, add a pairwise verifier over the selector's small candidate set rather than shrinking the discovery inventory.
-4. If recall remains below 85%, inspect misses by admission, expression inventory, subject inventory, and selector abstention before expanding any grammar.
+1. With explicit informed approval, run the lossless candidate pages through restricted ephemeral Luna-medium and preserve raw supported/unsupported/uncertain verdicts.
+2. Deterministically project both a supported-only precision arm and a supported-plus-uncertain recall arm, then judge both independently with restricted ephemeral Sol-medium.
+3. Report useful-record recall, supported-proposal precision, critical-error rate, rescued-record recall, selected-noise rate, candidate-frontier coverage, and page completeness. Do not reinterpret model-judge support as human-gold accuracy.
+4. If the two projections bracket but do not jointly meet the target, add a second pairwise Luna verification pass only for uncertain clusters; do not narrow discovery or silently discard overflow candidates.
 5. Freeze the winning code, prompt, schema, and model configuration, then label a fresh thread- and sender-grouped human holdout. The existing formal promotion gate remains stricter than this exploratory personal-use target.
 
 ## Current Decision
 
-Keep expression discovery broad and deterministic; keep temporal references event-centered; put ambiguity into a review state; and move model judgment to small, exact, expression-local endpoint packets. Do not promote the whole-message endpoint selector, exhaustive edge graphs, heuristic auto-selection, or model-authored temporal semantics.
+Keep expression discovery broad and deterministic; keep temporal references event-centered; put ambiguity into a review state; and make model judgment classify a complete, validator-backed, expression-local candidate frontier. Preserve subject bridges, cluster reducer-equivalent aliases, page overflow losslessly, and keep supported-only versus recall-biased uncertain policies measurable. Do not promote the whole-message endpoint selector, lead-only recall, heuristic auto-selection, silent candidate caps, or model-authored temporal semantics.

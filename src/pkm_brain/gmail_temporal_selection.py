@@ -69,7 +69,10 @@ _LIFECYCLE_SUBJECT_TYPES = {
     "deadline",
     "action",
 }
-_TEMPORAL_SUBJECT_TYPES = frozenset((*_LIFECYCLE_SUBJECT_TYPES, "boundary"))
+GMAIL_TEMPORAL_SUBJECT_TYPES = frozenset(
+    (*_LIFECYCLE_SUBJECT_TYPES, "boundary")
+)
+_TEMPORAL_SUBJECT_TYPES = GMAIL_TEMPORAL_SUBJECT_TYPES
 _LEAD_TIER_RANK = {
     "strict_direct": 0,
     "review_resolved": 1,
