@@ -267,7 +267,11 @@ _RELATIVE_RE = re.compile(
     re.IGNORECASE,
 )
 _COARSE_RELATIVE_RE = re.compile(
-    r"\b(?:(?:today|tomorrow|this)\s+(?:morning|afternoon|evening)|"
+    r"\b(?:(?:today|tomorrow|this)\s+"
+    r"(?:morning|afternoon|evening|noon|midday|midnight|lunch|"
+    r"end\s+of\s+day|close\s+of\s+business)|"
+    r"(?:morning|afternoon|evening|noon|midday|midnight|lunch|"
+    r"end\s+of\s+day|close\s+of\s+business)\s+(?:today|tomorrow)|"
     r"(?:this|next|last)\s+(?:week|month|quarter|weekend)|"
     r"within\s+(?:\d{1,3}|a|one|two|three|few)\s+(?:business\s+)?days?|"
     r"in\s+(?:a\s+)?few\s+days?)\b",
@@ -981,15 +985,34 @@ def _unresolved_temporal_drafts(
     output: list[_ExpressionDraft] = []
     for match in _COARSE_RELATIVE_RE.finditer(text):
         raw = re.sub(r"\s+", " ", match.group(0).strip().casefold())
-        day_prefix = raw.split(" ", 1)[0]
-        if day_prefix in {"today", "tomorrow", "this"}:
+        anchored_day = next(
+            (value for value in ("today", "tomorrow") if value in raw.split()),
+            None,
+        )
+        has_coarse_time_of_day = any(
+            value in raw
+            for value in (
+                "morning",
+                "afternoon",
+                "evening",
+                "noon",
+                "midday",
+                "midnight",
+                "lunch",
+                "end of day",
+                "close of business",
+            )
+        )
+        if has_coarse_time_of_day and (
+            anchored_day is not None or raw.startswith("this ")
+        ):
             options: tuple[str, ...] = ()
             blockers: tuple[str, ...]
             basis = "coarse_relative_expression"
             if anchor is None:
                 blockers = ("missing_relative_anchor", "time_of_day_unresolved")
             else:
-                offset = 1 if day_prefix == "tomorrow" else 0
+                offset = 1 if anchored_day == "tomorrow" else 0
                 options = ((anchor.date() + timedelta(days=offset)).isoformat(),)
                 basis = (
                     "relative_tomorrow_from_message_internal_at"

@@ -25,8 +25,15 @@ _FRONTIER_VERSION = "gmail_temporal_candidate_frontier_v1"
 _CANDIDATE_VERSION = "gmail_temporal_verification_candidate_v1"
 _PAGE_PLAN_VERSION = "gmail_temporal_candidate_page_plan_v1"
 _PAGE_VERSION = "gmail_temporal_candidate_page_v1"
-_VERDICT_SET_VERSION = "gmail_temporal_candidate_verdict_set_v1"
+_CLUSTER_UNCERTAINTY_VERSION = "gmail_temporal_candidate_cluster_uncertainty_v1"
+_VERDICT_SET_VERSION = "gmail_temporal_candidate_verdict_set_v2"
 _VERDICTS = {"supported", "unsupported", "uncertain"}
+
+
+ClusterUncertaintyReason = Literal[
+    "model_uncertain",
+    "conflicting_supported_candidates",
+]
 
 
 class GmailTemporalFrontierError(ValueError):
@@ -131,17 +138,28 @@ class GmailTemporalCandidatePageVerdicts:
 
 
 @dataclass(frozen=True)
+class GmailTemporalCandidateClusterUncertainty:
+    """Non-routable plausible candidates retained for one parent cluster."""
+
+    version: Literal["gmail_temporal_candidate_cluster_uncertainty_v1"]
+    cluster_id: str
+    plausible_candidate_ids: tuple[str, ...]
+    reason: ClusterUncertaintyReason
+    requires_defer: Literal[True] = True
+    routable: Literal[False] = False
+
+
+@dataclass(frozen=True)
 class GmailTemporalCandidateVerdictSet:
     """Plan-complete, page-authorized verdicts for deterministic projection."""
 
-    version: Literal["gmail_temporal_candidate_verdict_set_v1"]
+    version: Literal["gmail_temporal_candidate_verdict_set_v2"]
     plan_fingerprint: str
     frontier_fingerprint: str
     supported_candidate_ids: tuple[str, ...]
-    uncertain_candidate_ids: tuple[str, ...]
-    unsupported_candidate_count: int
     supported_citations: tuple[VerifiedGmailTemporalBatchCitation, ...]
-    uncertain_citations: tuple[VerifiedGmailTemporalBatchCitation, ...]
+    uncertain_clusters: tuple[GmailTemporalCandidateClusterUncertainty, ...]
+    unsupported_candidate_count: int
     page_count: int
     complete: bool
     requires_defer: bool
@@ -527,24 +545,43 @@ def validate_gmail_temporal_candidate_verdict_set(
         sorted(rows, key=lambda item: pages[item.page_fingerprint].sequence)
     )
     seen_pages: set[str] = set()
-    supported_ids: list[str] = []
-    uncertain_ids: list[str] = []
-    supported_citations: list[VerifiedGmailTemporalBatchCitation] = []
-    uncertain_citations: list[VerifiedGmailTemporalBatchCitation] = []
     unsupported_count = 0
-    accepted_by_binding: dict[str, str] = {}
-    accepted_by_cluster: dict[str, str] = {}
     frontier = build_gmail_temporal_candidate_frontier(
         analysis=analysis,
         batch=batch,
     )
     candidates = {item.candidate_id: item for item in frontier.candidates}
-    cluster_by_candidate = {
-        candidate_id: cluster.cluster_id
-        for page in plan.pages
-        for cluster in page.clusters
-        for candidate_id in cluster.candidate_ids
-    }
+    cluster_order: list[str] = []
+    candidate_ids_by_cluster: dict[str, list[str]] = {}
+    cluster_signatures: dict[str, tuple[str, tuple[str, ...]]] = {}
+    page_by_candidate: dict[str, GmailTemporalCandidatePage] = {}
+    for page in plan.pages:
+        for cluster in page.clusters:
+            signature = (cluster.expression_id, cluster.subject_mention_ids)
+            existing_signature = cluster_signatures.get(cluster.cluster_id)
+            if existing_signature is None:
+                cluster_order.append(cluster.cluster_id)
+                candidate_ids_by_cluster[cluster.cluster_id] = []
+                cluster_signatures[cluster.cluster_id] = signature
+            elif existing_signature != signature:
+                raise GmailTemporalFrontierError(
+                    "candidate cluster fragments disagree on parent authority"
+                )
+            for candidate_id in cluster.candidate_ids:
+                if candidate_id in page_by_candidate:
+                    raise GmailTemporalFrontierError(
+                        "candidate page plan contains duplicate candidates"
+                    )
+                page_by_candidate[candidate_id] = page
+                candidate_ids_by_cluster[cluster.cluster_id].append(candidate_id)
+    if (
+        set(page_by_candidate) != set(plan.covered_candidate_ids)
+        or set(page_by_candidate) != set(candidates)
+    ):
+        raise GmailTemporalFrontierError(
+            "candidate cluster index does not cover the frontier exactly"
+        )
+    verdict_by_candidate: dict[str, str] = {}
 
     for row in ordered_rows:
         if (
@@ -582,54 +619,105 @@ def validate_gmail_temporal_candidate_verdict_set(
                 )
             if verdict.verdict == "unsupported":
                 unsupported_count += 1
-                continue
-            candidate = candidates[candidate_id]
-            existing = accepted_by_binding.get(candidate.binding_id)
-            if existing is not None:
-                raise GmailTemporalFrontierError(
-                    "multiple candidate variants accepted for one binding"
-                )
-            accepted_by_binding[candidate.binding_id] = candidate_id
-            cluster_id = cluster_by_candidate[candidate_id]
-            if cluster_id in accepted_by_cluster:
-                raise GmailTemporalFrontierError(
-                    "multiple candidate variants accepted for one alias cluster"
-                )
-            accepted_by_cluster[cluster_id] = candidate_id
-            citation = validate_gmail_temporal_candidate_page_choice(
-                analysis=analysis,
-                batch=batch,
-                page=page,
-                frontier_fingerprint=row.frontier_fingerprint,
-                page_fingerprint=row.page_fingerprint,
-                candidate_id=candidate_id,
-            )
-            if verdict.verdict == "supported":
-                supported_ids.append(candidate_id)
-                supported_citations.append(citation)
-            else:
-                uncertain_ids.append(candidate_id)
-                uncertain_citations.append(citation)
+            verdict_by_candidate[candidate_id] = verdict.verdict
 
     if seen_pages != set(pages):
         raise GmailTemporalFrontierError(
             "candidate verdict set omits one or more planned pages"
         )
+    if set(verdict_by_candidate) != set(plan.covered_candidate_ids):
+        raise GmailTemporalFrontierError(
+            "candidate verdict set does not account for the frontier exactly"
+        )
+
+    supported_ids: list[str] = []
+    supported_citations: list[VerifiedGmailTemporalBatchCitation] = []
+    uncertain_clusters: list[GmailTemporalCandidateClusterUncertainty] = []
+    for cluster_id in cluster_order:
+        cluster_candidate_ids = candidate_ids_by_cluster[cluster_id]
+        supported = tuple(
+            candidate_id
+            for candidate_id in cluster_candidate_ids
+            if verdict_by_candidate[candidate_id] == "supported"
+        )
+        uncertain = tuple(
+            candidate_id
+            for candidate_id in cluster_candidate_ids
+            if verdict_by_candidate[candidate_id] == "uncertain"
+        )
+        if uncertain:
+            plausible = tuple(
+                candidate_id
+                for candidate_id in cluster_candidate_ids
+                if verdict_by_candidate[candidate_id] != "unsupported"
+            )
+            uncertain_clusters.append(
+                GmailTemporalCandidateClusterUncertainty(
+                    version="gmail_temporal_candidate_cluster_uncertainty_v1",
+                    cluster_id=cluster_id,
+                    plausible_candidate_ids=plausible,
+                    reason="model_uncertain",
+                )
+            )
+            continue
+        if len(supported) > 1:
+            uncertain_clusters.append(
+                GmailTemporalCandidateClusterUncertainty(
+                    version="gmail_temporal_candidate_cluster_uncertainty_v1",
+                    cluster_id=cluster_id,
+                    plausible_candidate_ids=supported,
+                    reason="conflicting_supported_candidates",
+                )
+            )
+            continue
+        if len(supported) == 1:
+            candidate_id = supported[0]
+            page = page_by_candidate[candidate_id]
+            citation = validate_gmail_temporal_candidate_page_choice(
+                analysis=analysis,
+                batch=batch,
+                page=page,
+                frontier_fingerprint=plan.frontier_fingerprint,
+                page_fingerprint=page.page_fingerprint,
+                candidate_id=candidate_id,
+            )
+            supported_ids.append(candidate_id)
+            supported_citations.append(citation)
+
+    accounted_candidate_ids = [
+        candidate_id
+        for candidate_id, verdict in verdict_by_candidate.items()
+        if verdict == "unsupported"
+    ]
+    accounted_candidate_ids.extend(supported_ids)
+    accounted_candidate_ids.extend(
+        candidate_id
+        for uncertainty in uncertain_clusters
+        for candidate_id in uncertainty.plausible_candidate_ids
+    )
+    if (
+        len(accounted_candidate_ids) != len(set(accounted_candidate_ids))
+        or set(accounted_candidate_ids) != set(plan.covered_candidate_ids)
+        or unsupported_count
+        != sum(value == "unsupported" for value in verdict_by_candidate.values())
+    ):
+        raise GmailTemporalFrontierError(
+            "candidate verdict aggregation does not account for the plan exactly"
+        )
     return GmailTemporalCandidateVerdictSet(
-        version="gmail_temporal_candidate_verdict_set_v1",
+        version="gmail_temporal_candidate_verdict_set_v2",
         plan_fingerprint=plan.plan_fingerprint,
         frontier_fingerprint=plan.frontier_fingerprint,
         supported_candidate_ids=tuple(supported_ids),
-        uncertain_candidate_ids=tuple(uncertain_ids),
-        unsupported_candidate_count=unsupported_count,
         supported_citations=tuple(supported_citations),
-        uncertain_citations=tuple(uncertain_citations),
+        uncertain_clusters=tuple(uncertain_clusters),
+        unsupported_candidate_count=unsupported_count,
         page_count=len(plan.pages),
         complete=plan.complete,
         requires_defer=(
             not plan.complete
             or not plan.covered_candidate_ids
-            or bool(uncertain_ids)
+            or bool(uncertain_clusters)
             or any(candidates[value].requires_defer for value in supported_ids)
         ),
     )

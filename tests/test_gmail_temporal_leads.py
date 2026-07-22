@@ -449,6 +449,12 @@ def test_high_recall_expression_inventory(
             "coarse_relative_unresolved",
         ),
         (
+            "The workshop is this week.",
+            "this week",
+            "coarse_relative",
+            "coarse_relative_unresolved",
+        ),
+        (
             "Please reply within three days.",
             "within three days",
             "coarse_relative",
@@ -503,6 +509,42 @@ def test_coarse_time_of_day_preserves_its_anchored_calendar_day(
     assert expression.resolution_status == "resolved"
     assert "relative_to_message_time" in expression.blockers
     assert "time_of_day_unresolved" in expression.blockers
+
+
+@pytest.mark.parametrize(
+    ("text", "surface", "expected_day"),
+    (
+        (
+            "Please send the report before lunch tomorrow.",
+            "lunch tomorrow",
+            "2026-12-30",
+        ),
+        (
+            "Please reply by end of day today.",
+            "end of day today",
+            "2026-12-29",
+        ),
+        (
+            "Please confirm before close of business tomorrow.",
+            "close of business tomorrow",
+            "2026-12-30",
+        ),
+    ),
+)
+def test_coarse_time_of_day_can_precede_its_relative_day(
+    text: str,
+    surface: str,
+    expected_day: str,
+) -> None:
+    result = analyze(text)
+    expression = next(item for item in result.expressions if item.form == "coarse_relative")
+    deadline_lead = next(item for item in result.leads if item.relation == "deadline")
+
+    assert text[expression.start : expression.end] == surface
+    assert expression.normalized_options == (expected_day,)
+    assert "relative_to_message_time" in expression.blockers
+    assert "time_of_day_unresolved" in expression.blockers
+    assert deadline_lead.expression_id == expression.expression_id
 
 
 def test_weekday_conventions_are_preserved_as_options_not_guessed() -> None:

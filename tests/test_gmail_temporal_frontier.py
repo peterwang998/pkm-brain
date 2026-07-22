@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, asdict, replace
 
 import pytest
 
@@ -66,6 +66,17 @@ def page_verdict_rows(
             ),
         )
         for page in page_plan.pages
+    )
+
+
+def parent_cluster_candidate_ids(page_plan):
+    ordered: dict[str, list[str]] = {}
+    for page in page_plan.pages:
+        for cluster in page.clusters:
+            ordered.setdefault(cluster.cluster_id, []).extend(cluster.candidate_ids)
+    return tuple(
+        (cluster_id, tuple(candidate_ids))
+        for cluster_id, candidate_ids in ordered.items()
     )
 
 
@@ -502,8 +513,9 @@ def test_verdict_set_requires_complete_pages_and_projects_support() -> None:
         rows=tuple(reversed(rows)),
     )
 
+    assert result.version == "gmail_temporal_candidate_verdict_set_v2"
     assert result.supported_candidate_ids == (candidate_ids[0],)
-    assert result.uncertain_candidate_ids == ()
+    assert result.uncertain_clusters == ()
     assert result.unsupported_candidate_count == len(candidate_ids) - 1
     assert len(result.supported_citations) == 1
     assert result.complete is True
@@ -529,7 +541,17 @@ def test_verdict_set_uncertain_or_incomplete_frontier_forces_defer() -> None:
         plan=page_plan,
         rows=rows,
     )
-    assert len(result.uncertain_citations) == 1
+    assert result.supported_candidate_ids == ()
+    assert result.supported_citations == ()
+    assert len(result.uncertain_clusters) == 1
+    uncertainty = result.uncertain_clusters[0]
+    assert uncertainty.version == "gmail_temporal_candidate_cluster_uncertainty_v1"
+    assert uncertainty.plausible_candidate_ids == (
+        page_plan.covered_candidate_ids[0],
+    )
+    assert uncertainty.reason == "model_uncertain"
+    assert uncertainty.requires_defer is True
+    assert uncertainty.routable is False
     assert result.requires_defer is True
 
     dense_analysis, dense_plan = analyze_and_plan(
@@ -589,7 +611,7 @@ def test_supported_candidate_preserves_deterministic_defer_requirement() -> None
     assert result.requires_defer is True
 
 
-def test_verdict_set_rejects_omitted_pages_candidates_and_variant_conflicts() -> None:
+def test_verdict_set_rejects_omitted_pages_and_candidates() -> None:
     text = (
         "Meeting interview workshop conference appointment session event call "
         "visit tour presentation are scheduled for May 14, 2027."
@@ -629,51 +651,289 @@ def test_verdict_set_rejects_omitted_pages_candidates_and_variant_conflicts() ->
             rows=(missing_candidate, *rows[1:]),
         )
 
-    simple_analysis, simple_plan = analyze_and_plan(
+
+def test_verdict_set_all_unsupported_has_no_projection_or_uncertainty() -> None:
+    analysis, plan = analyze_and_plan("The meeting is May 14, 2027.")
+    batch = plan.batches[0]
+    page_plan = plan_gmail_temporal_candidate_pages(
+        analysis=analysis,
+        batch=batch,
+    )
+
+    result = validate_gmail_temporal_candidate_verdict_set(
+        analysis=analysis,
+        batch=batch,
+        plan=page_plan,
+        rows=page_verdict_rows(page_plan),
+    )
+
+    assert result.supported_candidate_ids == ()
+    assert result.supported_citations == ()
+    assert result.uncertain_clusters == ()
+    assert result.unsupported_candidate_count == len(page_plan.covered_candidate_ids)
+    assert result.requires_defer is False
+
+
+def test_supported_plus_uncertain_cluster_becomes_model_uncertainty() -> None:
+    analysis, plan = analyze_and_plan(
         "The interview is scheduled for May 14, 2027."
     )
-    simple_batch = simple_plan.batches[0]
-    simple_pages = plan_gmail_temporal_candidate_pages(
-        analysis=simple_analysis,
-        batch=simple_batch,
+    batch = plan.batches[0]
+    page_plan = plan_gmail_temporal_candidate_pages(
+        analysis=analysis,
+        batch=batch,
     )
-    both = {
-        candidate_id: "supported"
-        for candidate_id in simple_pages.covered_candidate_ids
-    }
-    with pytest.raises(GmailTemporalFrontierError, match="multiple"):
-        validate_gmail_temporal_candidate_verdict_set(
-            analysis=simple_analysis,
-            batch=simple_batch,
-            plan=simple_pages,
-            rows=page_verdict_rows(simple_pages, overrides=both),
-        )
+    ((cluster_id, candidate_ids),) = parent_cluster_candidate_ids(page_plan)
+    assert len(candidate_ids) == 2
 
-    alias_analysis, alias_plan = analyze_and_plan(
-        "Subject: Q3 Leadership Forum\n\nWhen: May 14, 2027"
+    result = validate_gmail_temporal_candidate_verdict_set(
+        analysis=analysis,
+        batch=batch,
+        plan=page_plan,
+        rows=page_verdict_rows(
+            page_plan,
+            overrides={
+                candidate_ids[0]: "supported",
+                candidate_ids[1]: "uncertain",
+            },
+        ),
     )
-    alias_batch = alias_plan.batches[0]
-    alias_frontier = build_gmail_temporal_candidate_frontier(
-        analysis=alias_analysis,
-        batch=alias_batch,
+
+    assert result.supported_candidate_ids == ()
+    assert result.supported_citations == ()
+    assert result.unsupported_candidate_count == 0
+    assert len(result.uncertain_clusters) == 1
+    uncertainty = result.uncertain_clusters[0]
+    assert uncertainty.cluster_id == cluster_id
+    assert uncertainty.plausible_candidate_ids == candidate_ids
+    assert uncertainty.reason == "model_uncertain"
+    assert result.requires_defer is True
+
+
+def test_multiple_supported_candidates_become_conflict_uncertainty() -> None:
+    analysis, plan = analyze_and_plan(
+        "The interview is scheduled for May 14, 2027."
     )
-    alias_pages = plan_gmail_temporal_candidate_pages(
-        analysis=alias_analysis,
-        batch=alias_batch,
+    batch = plan.batches[0]
+    page_plan = plan_gmail_temporal_candidate_pages(
+        analysis=analysis,
+        batch=batch,
     )
-    base_by_binding = {}
-    for candidate in alias_frontier.candidates:
-        if candidate.lifecycle_mention_id is None:
-            base_by_binding.setdefault(candidate.binding_id, candidate.candidate_id)
-    assert len(base_by_binding) > 1
-    alias_supported = {value: "supported" for value in base_by_binding.values()}
-    with pytest.raises(GmailTemporalFrontierError, match="alias cluster"):
-        validate_gmail_temporal_candidate_verdict_set(
-            analysis=alias_analysis,
-            batch=alias_batch,
-            plan=alias_pages,
-            rows=page_verdict_rows(alias_pages, overrides=alias_supported),
-        )
+    ((cluster_id, candidate_ids),) = parent_cluster_candidate_ids(page_plan)
+    assert len(candidate_ids) == 2
+
+    result = validate_gmail_temporal_candidate_verdict_set(
+        analysis=analysis,
+        batch=batch,
+        plan=page_plan,
+        rows=page_verdict_rows(
+            page_plan,
+            overrides={candidate_id: "supported" for candidate_id in candidate_ids},
+        ),
+    )
+
+    assert result.supported_candidate_ids == ()
+    assert result.supported_citations == ()
+    assert len(result.uncertain_clusters) == 1
+    assert (
+        result.uncertain_clusters[0].version
+        == "gmail_temporal_candidate_cluster_uncertainty_v1"
+    )
+    assert result.uncertain_clusters[0].cluster_id == cluster_id
+    assert result.uncertain_clusters[0].plausible_candidate_ids == candidate_ids
+    assert (
+        result.uncertain_clusters[0].reason
+        == "conflicting_supported_candidates"
+    )
+    assert result.requires_defer is True
+
+
+def test_alias_cluster_uncertainty_aggregates_across_page_fragments() -> None:
+    analysis, plan = analyze_and_plan(
+        "Subject: Q3 Leadership Forum\n\n"
+        "The Q3 Leadership Forum is scheduled for May 14, 2027."
+    )
+    batch = plan.batches[0]
+    page_plan = plan_gmail_temporal_candidate_pages(
+        analysis=analysis,
+        batch=batch,
+        max_candidates_per_page=1,
+    )
+    clusters = parent_cluster_candidate_ids(page_plan)
+    alias_cluster_ids = {
+        cluster.cluster_id
+        for page in page_plan.pages
+        for cluster in page.clusters
+        if len(cluster.subject_mention_ids) > 1
+    }
+    assert alias_cluster_ids
+    cluster_id, candidate_ids = next(
+        item
+        for item in clusters
+        if item[0] in alias_cluster_ids and len(item[1]) >= 3
+    )
+    pages_by_candidate = {
+        candidate_id: page.page_fingerprint
+        for page in page_plan.pages
+        for cluster in page.clusters
+        for candidate_id in cluster.candidate_ids
+    }
+    assert pages_by_candidate[candidate_ids[0]] != pages_by_candidate[candidate_ids[1]]
+    rows = page_verdict_rows(
+        page_plan,
+        overrides={
+            candidate_ids[0]: "supported",
+            candidate_ids[1]: "supported",
+            candidate_ids[2]: "uncertain",
+        },
+    )
+    reversed_rows_and_verdicts = tuple(
+        replace(row, verdicts=tuple(reversed(row.verdicts)))
+        for row in reversed(rows)
+    )
+
+    result = validate_gmail_temporal_candidate_verdict_set(
+        analysis=analysis,
+        batch=batch,
+        plan=page_plan,
+        rows=reversed_rows_and_verdicts,
+    )
+
+    assert result.supported_citations == ()
+    assert len(result.uncertain_clusters) == 1
+    uncertainty = result.uncertain_clusters[0]
+    assert uncertainty.cluster_id == cluster_id
+    assert uncertainty.plausible_candidate_ids == candidate_ids[:3]
+    assert uncertainty.reason == "model_uncertain"
+
+
+def test_uncertainty_sidecars_follow_canonical_parent_cluster_order() -> None:
+    analysis, plan = analyze_and_plan(
+        "Meeting interview workshop are scheduled for May 14, 2027."
+    )
+    batch = plan.batches[0]
+    page_plan = plan_gmail_temporal_candidate_pages(
+        analysis=analysis,
+        batch=batch,
+        max_clusters_per_page=1,
+        max_candidates_per_page=1,
+    )
+    clusters = tuple(
+        item for item in parent_cluster_candidate_ids(page_plan) if len(item[1]) >= 2
+    )
+    assert len(clusters) >= 2
+    first_cluster, second_cluster = clusters[:2]
+    overrides = {
+        first_cluster[1][0]: "supported",
+        first_cluster[1][1]: "supported",
+        second_cluster[1][0]: "uncertain",
+    }
+
+    result = validate_gmail_temporal_candidate_verdict_set(
+        analysis=analysis,
+        batch=batch,
+        plan=page_plan,
+        rows=tuple(reversed(page_verdict_rows(page_plan, overrides=overrides))),
+    )
+
+    assert tuple(item.cluster_id for item in result.uncertain_clusters) == (
+        first_cluster[0],
+        second_cluster[0],
+    )
+    assert result.uncertain_clusters[0].plausible_candidate_ids == first_cluster[1]
+    assert result.uncertain_clusters[1].plausible_candidate_ids == (
+        second_cluster[1][0],
+    )
+
+
+def test_exact_cluster_remains_citable_beside_uncertain_cluster() -> None:
+    analysis, plan = analyze_and_plan(
+        "Meeting and workshop are scheduled for May 14, 2027."
+    )
+    batch = plan.batches[0]
+    page_plan = plan_gmail_temporal_candidate_pages(
+        analysis=analysis,
+        batch=batch,
+        max_candidates_per_page=1,
+    )
+    clusters = parent_cluster_candidate_ids(page_plan)
+    assert len(clusters) >= 2
+    exact_cluster, uncertain_cluster = clusters[:2]
+    exact_candidate_id = exact_cluster[1][0]
+    uncertain_candidate_id = uncertain_cluster[1][0]
+
+    result = validate_gmail_temporal_candidate_verdict_set(
+        analysis=analysis,
+        batch=batch,
+        plan=page_plan,
+        rows=page_verdict_rows(
+            page_plan,
+            overrides={
+                exact_candidate_id: "supported",
+                uncertain_candidate_id: "uncertain",
+            },
+        ),
+    )
+
+    assert result.supported_candidate_ids == (exact_candidate_id,)
+    assert len(result.supported_citations) == 1
+    assert result.uncertain_clusters[0].cluster_id == uncertain_cluster[0]
+    assert result.uncertain_clusters[0].plausible_candidate_ids == (
+        uncertain_candidate_id,
+    )
+    assert result.requires_defer is True
+
+
+def test_verdict_set_v2_serialization_separates_raw_rows_from_sidecars() -> None:
+    analysis, plan = analyze_and_plan(
+        "The interview is scheduled for May 14, 2027."
+    )
+    batch = plan.batches[0]
+    page_plan = plan_gmail_temporal_candidate_pages(
+        analysis=analysis,
+        batch=batch,
+    )
+    candidate_ids = page_plan.covered_candidate_ids
+    rows = page_verdict_rows(
+        page_plan,
+        overrides={
+            candidate_ids[0]: "supported",
+            candidate_ids[1]: "uncertain",
+        },
+    )
+
+    raw_row = asdict(rows[0])
+    assert set(raw_row) == {
+        "frontier_fingerprint",
+        "page_fingerprint",
+        "verdicts",
+        "routable",
+    }
+    assert set(raw_row["verdicts"][0]) == {
+        "candidate_id",
+        "verdict",
+        "routable",
+    }
+    result = validate_gmail_temporal_candidate_verdict_set(
+        analysis=analysis,
+        batch=batch,
+        plan=page_plan,
+        rows=rows,
+    )
+    serialized = asdict(result)
+
+    assert serialized["version"] == "gmail_temporal_candidate_verdict_set_v2"
+    assert "uncertain_candidate_ids" not in serialized
+    assert "uncertain_citations" not in serialized
+    assert serialized["supported_citations"] == ()
+    assert serialized["uncertain_clusters"][0] == {
+        "version": "gmail_temporal_candidate_cluster_uncertainty_v1",
+        "cluster_id": result.uncertain_clusters[0].cluster_id,
+        "plausible_candidate_ids": candidate_ids,
+        "reason": "model_uncertain",
+        "requires_defer": True,
+        "routable": False,
+    }
 
 
 @pytest.mark.parametrize(

@@ -9,7 +9,9 @@
 
 The remaining Gmail problem is association selection, not broad date discovery. The current deterministic analyzer still finds at least one temporal expression, subject mention, and candidate association in all 265 current messages classified as `important_temporal`. Relaxing the terminal-boundary schema alone did not reach the target. The implementation therefore moved to one-expression, segment-local selector packets, an explicit review-only rescue lane, and association-isolated deterministic reduction.
 
-The production-shaped local pieces are implemented and regression-tested. The selector boundary now also exposes a deterministic candidate frontier and lossless alias-aware pages, so the model can classify every legal expression-subject binding instead of having to invent endpoint pairs. A fresh external Luna/Sol pass over the full-text 120-message development cohort is not yet reported here: the execution security gate requires explicit informed approval before private Gmail text may be transmitted to those external models. No attempt was made to bypass that gate.
+The production-shaped local pieces are implemented and regression-tested. The selector boundary now also exposes a deterministic candidate frontier and lossless alias-aware pages, so the model can classify every legal expression-subject binding instead of having to invent endpoint pairs.
+
+A non-private 36-message adversarial benchmark now clears the personal-use target under the requested external models. The winning recall-biased Luna-medium pass selected 22 of 24 useful records; Sol-medium supported all 28 presented proposals, reported no critical errors, and agreed with the embedded materiality/filter gold on all 36 records. None of the 12 advertising or routine-noise records was selected. This is a synthetic acceptance result, not a production-distribution claim. A fresh external Luna/Sol pass over the full-text 120-message Gmail development cohort is still not reported here: the execution security gate requires explicit informed approval before private Gmail text may be transmitted to those external models. No attempt was made to bypass that gate.
 
 ## Evidence
 
@@ -75,6 +77,27 @@ The cohort is still development data, not a frozen human holdout. Reanalysis of 
 
 Replaying the new validator-backed frontier over the same cohort produced 2,155 lifecycle-aware candidates in 1,440 alias clusters. Four-cluster lossless paging produced 605 verifier pages; 152 expression packets had an empty complete frontier and can be deterministically deferred without a model call. Fourteen packets explicitly reported omitted candidate endpoints and therefore cannot be skipped; two of those had an empty visible frontier. Seventy-seven packets required overflow pages. Every page stayed at or below four alias fragments, 12 candidate variants, and 12,000 candidate-payload bytes; the observed maximum was 11,754 bytes. These are bounded execution diagnostics, not quality measurements.
 
+### Non-private synthetic external iteration
+
+The reusable benchmark generator produced 36 wholly synthetic email messages: 24 useful temporal records and 12 promotions or routine notices. It covers planned and actual occurrences, deadlines, subject/body bridges, lifecycle transitions, reschedules, ranges, recurrence, locale and timezone ambiguity, terminal boundaries, quoted history, and candidate-bearing noise. It contains no Gmail-derived text and can therefore exercise the restricted external selector and judge without transmitting private mail.
+
+Three Luna-medium iterations isolated two distinct problems. The first prompt treated deterministic deferral as epistemic uncertainty. The second separated evidential support from downstream handling but admitted a routine login-code expiration. The winning policy keeps ranges, recurrence, coarse expressions, and missing timezones eligible when their expression-subject binding is direct; reserves `uncertain` for genuine relationship, lifecycle, or materiality ambiguity; treats terminal boundaries as boundaries rather than occurrence starts; and explicitly suppresses routine no-action security metadata.
+
+The third pass used four verifier pages per external process and one new deterministic expression rule: phrases such as `before lunch tomorrow`, `by end of day today`, and `before close of business tomorrow` are inventoried as one coarse, deferred temporal expression instead of losing the time-of-day boundary. The requested Sol-medium end judge reported:
+
+| Projection | Useful-record recall | Supported-proposal precision | Critical errors | Selected noise |
+|---|---:|---:|---:|---:|
+| Supported only | 19/24 (79.2%) | 23/23 (100%) | 0/36 | 0/12 |
+| Supported + uncertain | **22/24 (91.7%)** | **28/28 (100%)** | **0/36** | **0/12** |
+
+The recall-biased projection therefore clears the exploratory gate of at least 85% recall, at least 90% supported-proposal precision, and less than 1% critical semantic error. Its two misses are explicit representation/discovery gaps: an effective policy/state-change date and registration opening/closing boundaries. All ordinary high-confidence, lifecycle, and ambiguous-event strata were recovered.
+
+Revalidating the exact raw Luna verdict rows through the hardened v2 aggregate produced 23 exact supported citations across 19 records plus five non-routable uncertainty clusters across three additional records. Those clusters contain five plausible candidates and expose no exact-citation surface. Thus the same 22-of-24 review recall is preserved while alternatives, subject aliases, and unresolved reschedule endpoints can no longer masquerade as exact facts.
+
+Sol is useful as the requested independent diagnostic, but it is not stable enough to become synthetic ground truth by itself. Earlier arm comparisons produced different semantic judgments for byte-identical proposal sets, including misclassifying a two-date alternative as a lifecycle error. The benchmark therefore embeds immutable record-level materiality and filtering gold; the scorer fails if Sol disagrees with it, and future candidate-level gold should use semantic locators rather than content-derived IDs. The winning pass had zero such record-level disagreements.
+
+The winning evidence is bound to protocol fingerprint `gtfproto_54922ff40db39868eb88cdb419e9c51974fff9ab4dfec16fa3be40d539d03c73`. The exact synthetic source SHA-256 is `0f7267cbfc8bd1f9e24ca6804a7eafaff8afcdb0e80f72433d792d1e42da3332`; the Luna checkpoint SHA-256 is `0de5bcf9e0ca430f2c691b231642ca30e29d84614c3d668ac845906225ecd9b2`; and the recall-arm Sol labels SHA-256 is `d492aa9fa19da7147e42adb0fd9adb5dff42a2d696cfad1edd44b80d2c7b59e2`. Every artifact remains mode `0600`, and neither runner printed message content.
+
 ## Implemented Architecture
 
 ### 1. Lossless evidence inventory
@@ -116,7 +139,7 @@ This is the key stability change: recall is expanded before admission and select
 
 `gmail_temporal_frontier.py` enumerates every independently valid expression-subject binding in a finalized packet. It derives relation, planned/actual kind, lifecycle, normalization, blockers, risk features, and required deferral through the same deterministic semantic validator used after selection. Stable candidate and frontier fingerprints bind any later verdict to the exact analysis and packet manifest.
 
-Reducer-equivalent overlapping event-title/event aliases become one decision cluster. Clusters are paged four at a time, but overflow is never discarded; candidate-count and byte bounds can split a large cluster into page-unique decision units without reusing response authority. A verifier must return one supported, unsupported, or uncertain verdict for every presented candidate, and at most one non-negative lifecycle variant per exact expression-subject binding. The plan-level validator recomputes the immutable page plan, requires every page and candidate exactly once, rejects stale or cross-page choices, and propagates incomplete-frontier deferral into both deterministic projections. Complete empty frontiers are safe deterministic deferrals; incomplete empty frontiers remain unknown. The frontier and pages remain non-routable and contain no source surfaces of their own; the separately signed expression packet remains the sole text authority.
+Reducer-equivalent overlapping event-title/event aliases become one decision cluster. Clusters are paged four at a time, but overflow is never discarded; candidate-count and byte bounds can split a large cluster into page-unique decision units without reusing response authority. A verifier must return one supported, unsupported, or uncertain verdict for every presented candidate. The plan-level validator recomputes the immutable page plan, requires every page and candidate exactly once, rejects stale or cross-page choices, and aggregates fragments by stable parent cluster. Exactly one supported candidate and no uncertainty in a cluster can yield an exact citation. Any uncertain candidate, supported-plus-uncertain mixture, or multiple-supported conflict becomes one non-routable cluster sidecar containing the authorized plausible candidate IDs and no citation. Complete empty frontiers are safe deterministic deferrals; incomplete empty frontiers remain unknown. The frontier, pages, and uncertainty sidecars contain no source surfaces of their own; the separately signed expression packet remains the sole text authority.
 
 ### 6. Event-centered temporal memory
 
@@ -124,20 +147,20 @@ The selector output remains a non-routable evidence sidecar. A resolved occurren
 
 ## Verification
 
-- 147 focused lead/selection/batching/frontier/reduction tests pass.
-- The complete repository suite passes: 1,324 tests.
+- 162 focused lead/selection/batching/frontier/reduction/verifier/benchmark tests pass.
+- The complete repository suite passes: 1,339 tests.
 - Ruff passes for all changed temporal modules and tests.
 - The historical replay and fresh packet planner print aggregates only.
 - The new planner, frontier, verdict validator, and reducer are non-routable and make no external calls by themselves.
 
 ## What Remains Before A Release Claim
 
-1. With explicit informed approval, run the lossless candidate pages through restricted ephemeral Luna-medium and preserve raw supported/unsupported/uncertain verdicts.
-2. Deterministically project both a supported-only precision arm and a supported-plus-uncertain recall arm, then judge both independently with restricted ephemeral Sol-medium.
-3. Report useful-record recall, supported-proposal precision, critical-error rate, rescued-record recall, selected-noise rate, candidate-frontier coverage, and page completeness. Do not reinterpret model-judge support as human-gold accuracy.
-4. If the two projections bracket but do not jointly meet the target, add a second pairwise Luna verification pass only for uncertain clusters; do not narrow discovery or silently discard overflow candidates.
-5. Freeze the winning code, prompt, schema, and model configuration, then label a fresh thread- and sender-grouped human holdout. The existing formal promotion gate remains stricter than this exploratory personal-use target.
+1. With explicit informed approval, run the now-pinned verifier policy over the lossless 120-message private Gmail cohort. Preserve raw page verdicts and score one arm-blind union of proposals so identical proposals cannot receive different Sol judgments merely because they appeared in different arms.
+2. Report useful-record recall, supported-proposal precision, critical-error rate, rescued-record recall, selected-noise rate, candidate-frontier coverage, uncertainty-cluster review burden, and page completeness. Do not reinterpret model-judge support as human-gold accuracy.
+3. Add semantic-locator candidate gold for the synthetic suite, including default-negative cross-pairs, duplicate aliases, alternative-date groups, reschedule endpoint groups, and mixed authored/advertising/quoted messages. Sol should remain a disagreement diagnostic rather than the only source of truth.
+4. Integrate the verifier and uncertainty sidecars into the Gmail ingestion orchestration. The current frontier, policy, and evaluation harness are production-shaped but do not yet cause ingestion to persist or route a temporal fact.
+5. Label a fresh thread- and sender-grouped human holdout after the private development run. The existing formal promotion gate remains stricter than this exploratory personal-use target.
 
 ## Current Decision
 
-Keep expression discovery broad and deterministic; keep temporal references event-centered; put ambiguity into a review state; and make model judgment classify a complete, validator-backed, expression-local candidate frontier. Preserve subject bridges, cluster reducer-equivalent aliases, page overflow losslessly, and keep supported-only versus recall-biased uncertain policies measurable. Do not promote the whole-message endpoint selector, lead-only recall, heuristic auto-selection, silent candidate caps, or model-authored temporal semantics.
+Keep expression discovery broad and deterministic; keep temporal references event-centered; put ambiguity into a non-routable parent-cluster review state; and make model judgment classify a complete, validator-backed, expression-local candidate frontier. Separate evidential support from downstream normalization and identity deferral. Preserve subject bridges, cluster reducer-equivalent aliases, and page overflow losslessly. Keep supported-only precision measurable, but do not project uncertain alternatives as exact citations. Do not promote the whole-message endpoint selector, lead-only recall, heuristic auto-selection, silent candidate caps, model-authored temporal semantics, or independent per-arm judging of identical proposals.
