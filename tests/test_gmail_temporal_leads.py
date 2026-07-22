@@ -15,11 +15,12 @@ from pkm_brain.gmail_temporal_leads import (
 ANCHOR = "2026-12-29T10:00:00-08:00"
 
 
-def analyze(text: str, *, admitted: bool = True):
+def analyze(text: str, *, admitted: bool = True, rescue: bool = False):
     return analyze_gmail_temporal_leads(
         text=text,
         message_internal_at=ANCHOR,
         fact_admitted=admitted,
+        temporal_review_rescue=rescue,
         chunk_id="synthetic-message",
     )
 
@@ -62,6 +63,19 @@ def test_fact_admission_gates_only_association_leads() -> None:
     assert admitted.leads
     assert held.fact_admitted is False
     assert admitted.fact_admitted is True
+
+
+def test_temporal_rescue_adds_review_leads_without_changing_evidence() -> None:
+    text = "Orchid Interview is scheduled for May 14, 2027."
+    held = analyze(text, admitted=False)
+    rescued = analyze(text, admitted=False, rescue=True)
+
+    assert held.expressions == rescued.expressions
+    assert held.mentions == rescued.mentions
+    assert held.association_admission_basis == "none"
+    assert rescued.association_admission_basis == "temporal_rescue"
+    assert rescued.fact_admitted is False
+    assert rescued.leads
 
 
 def test_snapshot_fingerprint_and_endpoint_ids_bind_exact_analysis_content() -> None:
@@ -120,8 +134,15 @@ def test_subject_and_message_singleton_fallbacks_are_explicit() -> None:
         "Orchid Interview " + ("background context " * 20) + "July 22, 2027"
     )
 
-    assert [item.association_mode for item in subject.leads] == ["subject_singleton"]
-    assert subject.leads[0].confidence_tier == "review_fallback"
+    assert [item.association_mode for item in subject.leads] == [
+        "subject_body_bridge",
+        "subject_body_bridge",
+    ]
+    subject_mentions = {item.mention_id: item.mention_type for item in subject.mentions}
+    assert {
+        subject_mentions[item.mention_id] for item in subject.leads
+    } == {"event", "event_title_candidate"}
+    assert all(item.confidence_tier == "review_ambiguous" for item in subject.leads)
     assert [item.association_mode for item in message.leads] == ["message_singleton"]
     assert message.leads[0].gap_chars > 60
 
@@ -136,7 +157,13 @@ def test_subject_body_bridge_keeps_multiple_date_alternatives_review_only() -> N
     assert [item.association_mode for item in result.leads] == [
         "subject_body_bridge",
         "subject_body_bridge",
+        "subject_body_bridge",
+        "subject_body_bridge",
     ]
+    mention_types = {item.mention_id: item.mention_type for item in result.mentions}
+    assert {
+        mention_types[item.mention_id] for item in result.leads
+    } == {"event", "event_title_candidate"}
     assert all(
         "subject_body_bridge_review_only" in item.blockers for item in result.leads
     )
@@ -258,6 +285,103 @@ def test_structural_labels_and_common_predicates_expand_the_mention_inventory() 
     assert (action_lead.relation, action_lead.kind) == ("deadline", "planned")
 
 
+def test_structured_when_label_creates_deferred_subject_event_title_candidate() -> None:
+    text = "Subject: Q3 Leadership Forum\n\nWhen: May 14, 2027"
+    result = analyze(text)
+
+    title = next(
+        item
+        for item in result.mentions
+        if item.mention_type == "event_title_candidate"
+    )
+    assert text[title.start : title.end] == "Q3 Leadership Forum"
+    assert title.field == "subject"
+    assert title.segment_id.startswith("subject:")
+    assert title.blockers == ("event_title_review_only",)
+    assert any(
+        lead.mention_id == title.mention_id
+        and lead.association_mode == "subject_body_bridge"
+        for lead in result.leads
+    )
+
+
+def test_specific_event_title_coexists_with_its_generic_event_noun() -> None:
+    text = "Subject: Orchid Interview\n\nWhen: May 14, 2027"
+    result = analyze(text)
+
+    title = next(
+        item
+        for item in result.mentions
+        if item.mention_type == "event_title_candidate"
+    )
+    generic = next(
+        item
+        for item in result.mentions
+        if item.mention_type == "event" and text[item.start : item.end] == "Interview"
+    )
+
+    assert text[title.start : title.end] == "Orchid Interview"
+    assert title.start < generic.start < generic.end <= title.end
+
+
+def test_specific_subject_event_title_can_use_an_unlabeled_body_time() -> None:
+    text = "Subject: Orchid Interview\n\nPlease join us on May 14, 2027."
+    result = analyze(text)
+
+    title = next(
+        item
+        for item in result.mentions
+        if item.mention_type == "event_title_candidate"
+    )
+
+    assert text[title.start : title.end] == "Orchid Interview"
+    assert "event_title_review_only" in title.blockers
+
+
+def test_date_only_or_unstructured_subject_does_not_become_event_title() -> None:
+    date_only = analyze("Subject: May 14, 2027\n\nWhen: May 15, 2027")
+    no_title = analyze("When: May 14, 2027")
+
+    assert not any(
+        item.mention_type == "event_title_candidate"
+        for item in (*date_only.mentions, *no_title.mentions)
+    )
+
+
+@pytest.mark.parametrize(
+    "subject",
+    (
+        "Save 20% on summer travel",
+        "Your order update",
+    ),
+)
+def test_structured_time_label_does_not_turn_non_event_subject_into_event_title(
+    subject: str,
+) -> None:
+    result = analyze(f"Subject: {subject}\n\nWhen: May 14, 2027")
+
+    assert not any(
+        item.mention_type == "event_title_candidate"
+        for item in result.mentions
+    )
+
+
+def test_sentence_segments_are_preserved_on_expression_and_mention_endpoints() -> None:
+    text = (
+        "Alpha meeting was cancelled May 14, 2027. "
+        "Beta workshop is May 15, 2027."
+    )
+    result = analyze(text)
+
+    assert len({item.segment_id for item in result.expressions}) == 2
+    event_segments = {
+        text[item.start : item.end].casefold(): item.segment_id
+        for item in result.mentions
+        if item.mention_type == "event"
+    }
+    assert event_segments["meeting"] != event_segments["workshop"]
+
+
 @pytest.mark.parametrize(
     ("text", "expected_form", "expected_options", "expected_status"),
     (
@@ -313,6 +437,72 @@ def test_high_recall_expression_inventory(
     assert expression.normalized_options == expected_options
     assert expression.resolution_status == expected_status
     assert text[expression.start : expression.end] in expression_texts(text)
+
+
+@pytest.mark.parametrize(
+    ("text", "surface", "form", "blocker"),
+    (
+        (
+            "The workshop is next week.",
+            "next week",
+            "coarse_relative",
+            "coarse_relative_unresolved",
+        ),
+        (
+            "Please reply within three days.",
+            "within three days",
+            "coarse_relative",
+            "coarse_relative_unresolved",
+        ),
+        (
+            "The sync happens every Tuesday.",
+            "every Tuesday",
+            "recurrence",
+            "recurrence_not_expanded",
+        ),
+        (
+            "A monthly review is planned.",
+            "monthly",
+            "recurrence",
+            "recurrence_not_expanded",
+        ),
+    ),
+)
+def test_coarse_and_recurring_expressions_are_inventoried_but_not_normalized(
+    text: str,
+    surface: str,
+    form: str,
+    blocker: str,
+) -> None:
+    result = analyze(text, admitted=False)
+    expression = next(item for item in result.expressions if item.form == form)
+
+    assert text[expression.start : expression.end] == surface
+    assert expression.normalized_options == ()
+    assert expression.resolution_status == "unresolved"
+    assert blocker in expression.blockers
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_day"),
+    (
+        ("The interview is tomorrow morning.", "2026-12-30"),
+        ("The interview is this morning.", "2026-12-29"),
+        ("The interview is today evening.", "2026-12-29"),
+    ),
+)
+def test_coarse_time_of_day_preserves_its_anchored_calendar_day(
+    text: str,
+    expected_day: str,
+) -> None:
+    expression = analyze(text, admitted=False).expressions[0]
+
+    assert expression.form == "coarse_relative"
+    assert expression.normalized_options == (expected_day,)
+    assert expression.calendar_date_options == (expected_day,)
+    assert expression.resolution_status == "resolved"
+    assert "relative_to_message_time" in expression.blockers
+    assert "time_of_day_unresolved" in expression.blockers
 
 
 def test_weekday_conventions_are_preserved_as_options_not_guessed() -> None:
@@ -387,6 +577,86 @@ def test_marker_backed_footer_is_blocked_but_generic_tail_is_not_invented() -> N
     assert not any(mention.mention_type == "artifact" for mention in generic.mentions)
 
 
+def test_quoted_line_temporal_evidence_is_inventoried_and_blocked() -> None:
+    text = (
+        "Subject: Status update\n\n"
+        "> Meeting is scheduled for May 14, 2027."
+    )
+    result = analyze(text)
+
+    assert result.expressions
+    assert result.mentions
+    assert result.leads
+    assert all(
+        "quoted_or_forwarded_context" in item.blockers
+        for item in (*result.expressions, *result.mentions, *result.leads)
+    )
+    assert all(item.confidence_tier == "review_ambiguous" for item in result.leads)
+
+
+@pytest.mark.parametrize(
+    "marker",
+    (
+        "-----Original Message-----",
+        "---------- Forwarded message ---------",
+        "Begin forwarded message:",
+        "On Tuesday, May 4, 2027 Pat wrote:",
+    ),
+)
+def test_forwarded_or_original_tail_temporal_evidence_is_blocked(
+    marker: str,
+) -> None:
+    text = (
+        f"Subject: Status update\n\n{marker}\n"
+        "Meeting is scheduled for May 14, 2027."
+    )
+    result = analyze(text)
+
+    assert result.expressions
+    assert result.mentions
+    assert result.leads
+    assert all(
+        "quoted_or_forwarded_context" in item.blockers
+        for item in (*result.expressions, *result.mentions, *result.leads)
+    )
+
+
+def test_authored_temporal_evidence_before_quote_remains_unblocked() -> None:
+    text = (
+        "Subject: Status update\n\n"
+        "Authored meeting is scheduled for May 13, 2027.\n\n"
+        "> Quoted meeting is scheduled for May 14, 2027."
+    )
+    result = analyze(text)
+    authored_expression = next(
+        item
+        for item in result.expressions
+        if text[item.start : item.end] == "May 13, 2027"
+    )
+    quoted_expression = next(
+        item
+        for item in result.expressions
+        if text[item.start : item.end] == "May 14, 2027"
+    )
+    authored_mention = next(
+        item
+        for item in result.mentions
+        if item.mention_type == "event"
+        and text[item.start : item.end].casefold() == "meeting"
+        and item.start < text.index(">")
+    )
+
+    assert "quoted_or_forwarded_context" not in authored_expression.blockers
+    assert "quoted_or_forwarded_context" not in authored_mention.blockers
+    assert "quoted_or_forwarded_context" in quoted_expression.blockers
+    assert any(
+        lead.expression_id == authored_expression.expression_id
+        and lead.mention_id == authored_mention.mention_id
+        and "quoted_or_forwarded_context" not in lead.blockers
+        for lead in result.leads
+    )
+
+
 def test_nearest_edge_selection_caps_dense_cartesian_pairing() -> None:
     text = (
         "Meeting call session July 20, 2027 July 21, 2027 July 22, 2027 "
@@ -444,6 +714,7 @@ def test_public_expression_dataclass_has_no_source_content_field() -> None:
         "start",
         "end",
         "field",
+        "segment_id",
         "form",
         "normalized_options",
         "calendar_date_options",

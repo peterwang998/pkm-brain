@@ -20,12 +20,14 @@ def analysis(
     text: str,
     *,
     admitted: bool = True,
+    rescue: bool = False,
     chunk_id: str = "synthetic-selection-message",
 ):
     return analyze_gmail_temporal_leads(
         text=text,
         message_internal_at=ANCHOR,
         fact_admitted=admitted,
+        temporal_review_rescue=rescue,
         chunk_id=chunk_id,
     )
 
@@ -98,7 +100,7 @@ def test_valid_selection_derives_all_semantics_without_model_authorship() -> Non
     result = validate_gmail_temporal_selection(value, selection_payload(value, payload))
 
     association = result.associations[0]
-    assert result.version == "gmail_temporal_selection_v2"
+    assert result.version == "gmail_temporal_selection_v3"
     assert result.analysis_fingerprint == value.snapshot_fingerprint
     assert result.requested_decision == result.decision == "select_for_review"
     assert result.confidence == "medium"
@@ -304,6 +306,44 @@ def test_lifecycle_cue_is_not_bound_to_a_farther_competing_event() -> None:
     assert "competing_lifecycle_subject" in association.blockers
 
 
+def test_lifecycle_binding_ignores_competing_event_in_a_different_segment() -> None:
+    text = (
+        "Alpha meeting was cancelled May 14, 2027. "
+        "Beta workshop is May 15, 2027."
+    )
+    value = analysis(text)
+    expression = value.expressions[0]
+    subject = next(
+        item
+        for item in value.mentions
+        if item.mention_type == "event"
+        and text[item.start : item.end].casefold() == "meeting"
+    )
+    lifecycle = next(
+        item for item in value.mentions if item.lifecycle_role == "cancelled"
+    )
+    lead = matching_lead(value, expression.expression_id, subject.mention_id)
+
+    result = validate_gmail_temporal_selection(
+        value,
+        selection_payload(
+            value,
+            association_payload(
+                value,
+                expression_id=expression.expression_id,
+                subject_mention_id=subject.mention_id,
+                lifecycle_mention_id=lifecycle.mention_id,
+                selected_lead_id=lead.lead_id,
+            ),
+        ),
+    )
+
+    association = result.associations[0]
+    assert result.decision == "select_for_review"
+    assert association.lifecycle == "cancelled"
+    assert "competing_lifecycle_subject" not in association.blockers
+
+
 def test_lifecycle_cue_with_multiple_events_is_deferred_at_any_distance() -> None:
     text = (
         "The meeting "
@@ -346,17 +386,24 @@ def test_terminal_boundary_subject_is_never_promoted_as_occurrence_start() -> No
     subject = next(
         item for item in value.mentions if item.boundary_role == "terminal_boundary"
     )
-    with pytest.raises(GmailTemporalSelectionError, match="supported temporal subject"):
-        validate_gmail_temporal_selection(
+    result = validate_gmail_temporal_selection(
+        value,
+        selection_payload(
             value,
-            selection_payload(
+            association_payload(
                 value,
-                association_payload(
-                    value,
-                    subject_mention_id=subject.mention_id,
-                ),
+                subject_mention_id=subject.mention_id,
             ),
-        )
+        ),
+    )
+
+    association = result.associations[0]
+    assert result.decision == "defer_ambiguous"
+    assert (association.relation, association.kind) == (
+        "unspecified",
+        "unspecified",
+    )
+    assert "terminal_boundary_subject_not_occurrence" in association.blockers
 
 
 def test_broad_reschedule_role_is_not_guessed_as_old_or_replacement() -> None:
@@ -454,6 +501,57 @@ def test_non_admitted_evidence_and_negative_decisions_cannot_select() -> None:
     )
     assert result.associations == ()
     assert result.confidence == "medium"
+
+
+def test_temporal_rescue_selection_is_always_low_confidence_and_deferred() -> None:
+    value = analysis(
+        "The meeting is scheduled for May 14, 2027.",
+        admitted=False,
+        rescue=True,
+    )
+    expression = value.expressions[0]
+    subject = subject_mention(value)
+    lead = matching_lead(value, expression.expression_id, subject.mention_id)
+
+    result = validate_gmail_temporal_selection(
+        value,
+        selection_payload(
+            value,
+            association_payload(value, selected_lead_id=lead.lead_id),
+        ),
+    )
+
+    assert result.requested_decision == "select_for_review"
+    assert result.decision == "defer_ambiguous"
+    assert result.confidence == "low"
+    assert result.routable is False
+    assert "temporal_review_rescue_only" in result.blockers
+    assert "temporal_review_rescue_only" in result.associations[0].blockers
+
+
+def test_quoted_temporal_association_is_forced_to_low_confidence_deferral() -> None:
+    value = analysis(
+        "Subject: Status update\n\n"
+        "> Meeting is scheduled for May 14, 2027."
+    )
+    expression = value.expressions[0]
+    subject = subject_mention(value)
+    lead = matching_lead(value, expression.expression_id, subject.mention_id)
+
+    result = validate_gmail_temporal_selection(
+        value,
+        selection_payload(
+            value,
+            association_payload(value, selected_lead_id=lead.lead_id),
+        ),
+    )
+
+    assert result.requested_decision == "select_for_review"
+    assert result.decision == "defer_ambiguous"
+    assert result.confidence == "low"
+    assert result.routable is False
+    assert "quoted_or_forwarded_context" in result.blockers
+    assert "quoted_or_forwarded_context" in result.associations[0].blockers
 
 
 def test_anonymous_content_addressed_analysis_cannot_create_associations() -> None:

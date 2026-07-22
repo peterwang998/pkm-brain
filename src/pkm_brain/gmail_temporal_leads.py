@@ -14,6 +14,7 @@ from .gmail_temporal_discovery import discover_gmail_temporal_candidates
 TemporalRelation = Literal["occurrence", "deadline"]
 TemporalKind = Literal["planned", "actual"]
 TemporalField = Literal["subject", "body", "message"]
+AssociationAdmissionBasis = Literal["none", "fact", "temporal_rescue"]
 ResolutionStatus = Literal["resolved", "ambiguous", "unresolved"]
 AssociationMode = Literal[
     "direct_grammar",
@@ -57,6 +58,7 @@ class TemporalExpression:
     start: int
     end: int
     field: TemporalField
+    segment_id: str
     form: str
     normalized_options: tuple[str, ...]
     calendar_date_options: tuple[str, ...]
@@ -75,6 +77,7 @@ class TemporalMention:
     start: int
     end: int
     field: TemporalField
+    segment_id: str
     mention_type: str
     relation: TemporalRelation | None
     kind: TemporalKind | None
@@ -104,10 +107,12 @@ class TemporalLead:
 class TemporalLeadAnalysis:
     """Immutable, content-free result for one trusted Gmail message."""
 
-    version: Literal["gmail_temporal_leads_v1"]
+    version: Literal["gmail_temporal_leads_v2"]
     snapshot_fingerprint: str
+    source_sha256: str
     scope_bound: bool
     fact_admitted: bool
+    association_admission_basis: AssociationAdmissionBasis
     expressions: tuple[TemporalExpression, ...]
     mentions: tuple[TemporalMention, ...]
     leads: tuple[TemporalLead, ...]
@@ -122,6 +127,14 @@ class TemporalLeadAnalysis:
 @dataclass(frozen=True)
 class _FieldRange:
     name: TemporalField
+    start: int
+    end: int
+
+
+@dataclass(frozen=True)
+class _SegmentRange:
+    segment_id: str
+    field: TemporalField
     start: int
     end: int
 
@@ -253,6 +266,18 @@ _RELATIVE_RE = re.compile(
     r"in\s+\d{1,3}\s+(?:hours?|days?|weeks?))\b",
     re.IGNORECASE,
 )
+_COARSE_RELATIVE_RE = re.compile(
+    r"\b(?:(?:today|tomorrow|this)\s+(?:morning|afternoon|evening)|"
+    r"(?:this|next|last)\s+(?:week|month|quarter|weekend)|"
+    r"within\s+(?:\d{1,3}|a|one|two|three|few)\s+(?:business\s+)?days?|"
+    r"in\s+(?:a\s+)?few\s+days?)\b",
+    re.IGNORECASE,
+)
+_RECURRENCE_RE = re.compile(
+    rf"\b(?:every\s+(?:day|weekday|week|month|quarter|year|{_WEEKDAY_PATTERN})|"
+    r"daily|weekly|biweekly|monthly|quarterly|yearly|annually)\b",
+    re.IGNORECASE,
+)
 
 _ZONE_PATTERN = (
     r"(?:Z|UTC|GMT|(?:UTC|GMT)\s*[+-]\d{1,2}(?::?\d{2})?|"
@@ -272,7 +297,7 @@ _CLOCK_LINK_RE = re.compile(r"^\s*(?:(?:,?\s*(?:at|@)\s+)|T|,\s*|\s+)$", re.IGNO
 
 _EVENT_NOUN_RE = re.compile(
     r"\b(?:appointment|booking|call|ceremony|class|conference|concert|demo|"
-    r"delivery|dinner|event|exam|flight|hearing|interview|launch|meeting|"
+    r"delivery|dinner|event|exam|flight|forum|hearing|interview|launch|meeting|"
     r"offsite|orientation|party|pickup|presentation|reservation|review|"
     r"screening|session|stay|summit|tour|training|trip|visit|webinar|workshop)\b",
     re.IGNORECASE,
@@ -293,6 +318,17 @@ _EVENT_PREDICATE_RE = re.compile(
     r"talk)\b",
     re.IGNORECASE,
 )
+_EVENT_TITLE_LABEL_RE = re.compile(
+    r"(?im)^[ \t]*(?:event|title|what|summary)\s*:[ \t]*"
+    r"(?P<title>[^\r\n]{3,160})"
+)
+_SUBJECT_REPLY_PREFIX_RE = re.compile(r"(?i)^(?:(?:re|fw|fwd)\s*:\s*)+")
+_GENERIC_EVENT_TITLE_RE = re.compile(
+    r"(?i)^(?:calendar\s+)?(?:invite|invitation|reminder|notification|update|"
+    r"newsletter|digest|receipt|order|reservation|confirmation|confirmed|"
+    r"schedule|scheduled|event|meeting|appointment|webinar|promotion|sale|"
+    r"offer|welcome|thank\s+you|no\s+subject)$"
+)
 _ARTIFACT_RE = re.compile(
     r"\b(?:agenda|attachment|brief|deck|details|dial-in|invite|invitation|"
     r"link|notes|preparation|prep|recording|reminder|room|summary|transcript)\b",
@@ -302,6 +338,14 @@ _FOOTER_MARKER_RE = re.compile(
     r"\b(?:manage\s+(?:email\s+)?preferences|privacy\s+policy|unsubscribe|"
     r"view\s+(?:this\s+email\s+)?in\s+(?:a\s+)?browser)\b|©",
     re.IGNORECASE,
+)
+_QUOTED_LINE_RE = re.compile(r"(?m)^[ \t]*>[^\n]*(?:\n|\Z)")
+_FORWARDED_ORIGINAL_MARKER_RE = re.compile(
+    r"(?im)^[ \t]*(?:"
+    r"-{2,}[ \t]*(?:original|forwarded)[ \t]+message[ \t]*-{2,}|"
+    r"begin[ \t]+forwarded[ \t]+message:?|"
+    r"on[ \t]+[^\r\n]{1,500}[ \t]+wrote:"
+    r")[ \t]*\r?$"
 )
 _BOUNDARY_RE = re.compile(
     r"\b(?:arrival|arrives?|check[ -]?out|completion|ends?|returns?)\b",
@@ -403,7 +447,18 @@ _MAX_RETAINED_NEAR_EDGES = 20
 _MAX_RETAINED_BRIDGE_EDGES = 12
 _MAX_BROAD_ASSOCIATION_EXPRESSIONS = 64
 _MAX_BROAD_ASSOCIATION_MENTIONS = 128
-_CORE_ASSOCIATION_MENTION_TYPES = frozenset({"event", "deadline", "action", "boundary"})
+_STRICT_ASSOCIATION_MENTION_TYPES = frozenset(
+    {"event", "deadline", "action", "boundary"}
+)
+_CORE_ASSOCIATION_MENTION_TYPES = frozenset(
+    {
+        "event",
+        "event_title_candidate",
+        "deadline",
+        "action",
+        "boundary",
+    }
+)
 _T = TypeVar("_T")
 
 
@@ -412,23 +467,48 @@ def analyze_gmail_temporal_leads(
     text: str,
     message_internal_at: str | datetime | None,
     fact_admitted: bool,
+    temporal_review_rescue: bool = False,
     chunk_id: str | None = None,
 ) -> TemporalLeadAnalysis:
-    """Inventory temporal evidence and, only when admitted, create review leads.
+    """Inventory temporal evidence and optionally create review-only leads.
 
-    This function performs no writes, routing, extraction, or persistence.  Calling
-    it with ``fact_admitted=False`` returns the exact same inventories as an admitted
-    call but an empty lead tuple.  Admission therefore cannot manufacture evidence.
+    This function performs no writes, routing, extraction, or persistence.
+    ``fact_admitted`` and the explicit temporal-rescue gate affect association
+    hints only; neither can manufacture or remove expression/mention evidence.
+    Rescue output remains distinguishable so validation can force deferral.
     """
 
     source = text if isinstance(text, str) else ""
     scope_bound = isinstance(chunk_id, str) and bool(chunk_id.strip())
     anchor = _aware_internal_time(message_internal_at)
     fields = _field_ranges(source)
+    segments = _segment_ranges(source, fields)
+    quoted_or_forwarded_ranges = _quoted_or_forwarded_ranges(source)
     scope_prefix = _opaque_scope_prefix(chunk_id, source)
-    expressions = _expressions(source, anchor, fields, scope_prefix)
-    mentions = _mentions(source, fields, scope_prefix)
-    if fact_admitted is True:
+    expressions = _expressions(
+        source,
+        anchor,
+        fields,
+        segments,
+        quoted_or_forwarded_ranges,
+        scope_prefix,
+    )
+    mentions = _mentions(
+        source,
+        fields,
+        segments,
+        expressions,
+        quoted_or_forwarded_ranges,
+        scope_prefix,
+    )
+    admission_basis: AssociationAdmissionBasis = (
+        "fact"
+        if fact_admitted is True
+        else "temporal_rescue"
+        if temporal_review_rescue is True
+        else "none"
+    )
+    if admission_basis != "none":
         (
             leads,
             candidate_edge_count,
@@ -449,7 +529,7 @@ def analyze_gmail_temporal_leads(
         graph_truncated = False
         omitted_expression_count = 0
         omitted_mention_count = 0
-    version = "gmail_temporal_leads_v1"
+    version = "gmail_temporal_leads_v2"
     snapshot_fingerprint = _analysis_snapshot_fingerprint(
         version=version,
         source=source,
@@ -457,6 +537,7 @@ def analyze_gmail_temporal_leads(
         chunk_id=chunk_id,
         scope_bound=scope_bound,
         fact_admitted=fact_admitted is True,
+        association_admission_basis=admission_basis,
         expressions=expressions,
         mentions=mentions,
         leads=leads,
@@ -471,8 +552,10 @@ def analyze_gmail_temporal_leads(
     return TemporalLeadAnalysis(
         version=version,
         snapshot_fingerprint=snapshot_fingerprint,
+        source_sha256=hashlib.sha256(source.encode("utf-8")).hexdigest(),
         scope_bound=scope_bound,
         fact_admitted=fact_admitted is True,
+        association_admission_basis=admission_basis,
         expressions=expressions,
         mentions=mentions,
         leads=leads,
@@ -491,6 +574,8 @@ def _expressions(
     text: str,
     anchor: datetime | None,
     fields: tuple[_FieldRange, ...],
+    segments: tuple[_SegmentRange, ...],
+    quoted_or_forwarded_ranges: tuple[tuple[int, int], ...],
     scope_prefix: str,
 ) -> tuple[TemporalExpression, ...]:
     anchor_day = anchor.date() if anchor else None
@@ -505,6 +590,10 @@ def _expressions(
         attached = _attach_clock(text, atom)
         drafts.append(attached)
         occupied.append((attached.start, attached.end))
+    for unresolved in _unresolved_temporal_drafts(text, anchor):
+        if not _overlaps(unresolved.start, unresolved.end, occupied):
+            drafts.append(unresolved)
+            occupied.append((unresolved.start, unresolved.end))
     for relative in _relative_drafts(text, anchor):
         attached = _attach_clock(text, relative)
         if not _overlaps(attached.start, attached.end, occupied):
@@ -537,6 +626,7 @@ def _expressions(
             start=item.start,
             end=item.end,
             field=_field_for_span(fields, item.start, item.end),
+            segment_id=_segment_id_for_span(segments, item.start, item.end),
             form=item.form,
             normalized_options=item.normalized_options,
             calendar_date_options=(
@@ -550,6 +640,11 @@ def _expressions(
             blockers=_ordered_unique(
                 (
                     *item.blockers,
+                    *_quoted_or_forwarded_blocker(
+                        item.start,
+                        item.end,
+                        quoted_or_forwarded_ranges,
+                    ),
                     *(
                         ("multiple_normalization_options",)
                         if len(item.normalized_options) > 1
@@ -879,6 +974,70 @@ def _relative_drafts(text: str, anchor: datetime | None) -> list[_ExpressionDraf
     return output
 
 
+def _unresolved_temporal_drafts(
+    text: str,
+    anchor: datetime | None,
+) -> list[_ExpressionDraft]:
+    output: list[_ExpressionDraft] = []
+    for match in _COARSE_RELATIVE_RE.finditer(text):
+        raw = re.sub(r"\s+", " ", match.group(0).strip().casefold())
+        day_prefix = raw.split(" ", 1)[0]
+        if day_prefix in {"today", "tomorrow", "this"}:
+            options: tuple[str, ...] = ()
+            blockers: tuple[str, ...]
+            basis = "coarse_relative_expression"
+            if anchor is None:
+                blockers = ("missing_relative_anchor", "time_of_day_unresolved")
+            else:
+                offset = 1 if day_prefix == "tomorrow" else 0
+                options = ((anchor.date() + timedelta(days=offset)).isoformat(),)
+                basis = (
+                    "relative_tomorrow_from_message_internal_at"
+                    if offset
+                    else "relative_today_from_message_internal_at"
+                )
+                blockers = (
+                    "relative_to_message_time",
+                    "time_of_day_unresolved",
+                )
+            output.append(
+                _ExpressionDraft(
+                    match.start(),
+                    match.end(),
+                    "coarse_relative",
+                    options,
+                    "day",
+                    (basis, "coarse_time_of_day_expression"),
+                    blockers,
+                )
+            )
+            continue
+        output.append(
+            _ExpressionDraft(
+                match.start(),
+                match.end(),
+                "coarse_relative",
+                (),
+                "coarse",
+                ("coarse_relative_expression",),
+                ("coarse_relative_unresolved",),
+            )
+        )
+    for match in _RECURRENCE_RE.finditer(text):
+        output.append(
+            _ExpressionDraft(
+                match.start(),
+                match.end(),
+                "recurrence",
+                (),
+                "recurrence",
+                ("recurrence_expression",),
+                ("recurrence_not_expanded",),
+            )
+        )
+    return output
+
+
 def _attach_clock(text: str, atom: _ExpressionDraft) -> _ExpressionDraft:
     tail = text[atom.end : atom.end + 100]
     clock = _CLOCK_RE.search(tail)
@@ -1039,6 +1198,9 @@ def _clock_options(
 def _mentions(
     text: str,
     fields: tuple[_FieldRange, ...],
+    segments: tuple[_SegmentRange, ...],
+    expressions: tuple[TemporalExpression, ...],
+    quoted_or_forwarded_ranges: tuple[tuple[int, int], ...],
     scope_prefix: str,
 ) -> tuple[TemporalMention, ...]:
     drafts: list[_MentionDraft] = []
@@ -1187,6 +1349,15 @@ def _mentions(
                 )
             )
 
+    drafts.extend(
+        _event_title_drafts(
+            text,
+            fields=fields,
+            segments=segments,
+            expressions=expressions,
+        )
+    )
+
     unique: list[_MentionDraft] = []
     seen: set[tuple[object, ...]] = set()
     for item in sorted(
@@ -1204,14 +1375,157 @@ def _mentions(
             start=item.start,
             end=item.end,
             field=_field_for_span(fields, item.start, item.end),
+            segment_id=_segment_id_for_span(segments, item.start, item.end),
             mention_type=item.mention_type,
             relation=item.relation,
             kind=item.kind,
             boundary_role=item.boundary_role,
             lifecycle_role=item.lifecycle_role,
-            blockers=item.blockers,
+            blockers=_ordered_unique(
+                (
+                    *item.blockers,
+                    *_quoted_or_forwarded_blocker(
+                        item.start,
+                        item.end,
+                        quoted_or_forwarded_ranges,
+                    ),
+                )
+            ),
         )
         for index, item in enumerate(unique, start=1)
+    )
+
+
+def _event_title_drafts(
+    text: str,
+    *,
+    fields: tuple[_FieldRange, ...],
+    segments: tuple[_SegmentRange, ...],
+    expressions: tuple[TemporalExpression, ...],
+) -> list[_MentionDraft]:
+    """Return conservative proper-title endpoints for deferred review.
+
+    Event titles expand the subject inventory without turning arbitrary noun
+    phrases into trusted entities.  A subject title requires both a recognized
+    event cue in the subject and temporal evidence in the body.  A labeled body
+    title requires a recognized temporal expression in the same segment or
+    within a bounded local window.
+    """
+
+    output: list[_MentionDraft] = []
+    subject = next((item for item in fields if item.name == "subject"), None)
+    body_expressions = tuple(item for item in expressions if item.field == "body")
+    subject_has_event_cue = bool(
+        subject is not None
+        and (
+            _EVENT_NOUN_RE.search(text, subject.start, subject.end)
+            or _EVENT_PREDICATE_RE.search(text, subject.start, subject.end)
+        )
+    )
+    if subject is not None and body_expressions and subject_has_event_cue:
+        span = _trim_event_title_span(text, subject.start, subject.end)
+        if (
+            span is not None
+            and not _span_overlaps_expressions(span, expressions)
+            and _event_title_span_is_eligible(text, span)
+        ):
+            output.append(
+                _MentionDraft(
+                    span[0],
+                    span[1],
+                    "event_title_candidate",
+                    "occurrence",
+                    None,
+                    None,
+                    None,
+                    ("event_title_review_only",),
+                )
+            )
+
+    for match in _EVENT_TITLE_LABEL_RE.finditer(text):
+        span = _trim_event_title_span(
+            text,
+            match.start("title"),
+            match.end("title"),
+        )
+        if (
+            span is None
+            or _span_overlaps_expressions(span, expressions)
+            or not _event_title_span_is_eligible(text, span)
+        ):
+            continue
+        segment_id = _segment_id_for_span(segments, span[0], span[1])
+        if not any(
+            expression.segment_id == segment_id
+            or _span_distance(
+                span[0], span[1], expression.start, expression.end
+            )
+            <= 600
+            for expression in expressions
+        ):
+            continue
+        output.append(
+            _MentionDraft(
+                span[0],
+                span[1],
+                "event_title_candidate",
+                "occurrence",
+                None,
+                None,
+                None,
+                ("event_title_review_only",),
+            )
+        )
+    return output
+
+
+def _trim_event_title_span(
+    text: str,
+    start: int,
+    end: int,
+) -> tuple[int, int] | None:
+    while start < end and text[start] in " \t\"'([{<-–—|":
+        start += 1
+    while end > start and text[end - 1] in " \t\"')]}>,–—|:;":
+        end -= 1
+    if start >= end:
+        return None
+    prefix = _SUBJECT_REPLY_PREFIX_RE.match(text[start:end])
+    if prefix is not None:
+        start += prefix.end()
+        while start < end and text[start].isspace():
+            start += 1
+    return (start, end) if start < end else None
+
+
+def _event_title_span_is_eligible(
+    text: str,
+    span: tuple[int, int],
+) -> bool:
+    start, end = span
+    value = text[start:end].strip()
+    if not 3 <= len(value) <= 160:
+        return False
+    if _GENERIC_EVENT_TITLE_RE.fullmatch(value):
+        return False
+    if not re.search(r"[A-Za-z][A-Za-z]", value):
+        return False
+    if not re.search(r"[A-Za-z]", re.sub(r"\b(?:am|pm|utc|gmt)\b", "", value, flags=re.IGNORECASE)):
+        return False
+    # A structured proper title is a more useful event-identity candidate than
+    # the generic event noun it may contain (for example, "Orchid Interview"
+    # versus "Interview").  Preserve both endpoints for review instead of
+    # deleting the specific title merely because their spans overlap.
+    return True
+
+
+def _span_overlaps_expressions(
+    span: tuple[int, int],
+    expressions: tuple[TemporalExpression, ...],
+) -> bool:
+    return any(
+        expression.start < span[1] and span[0] < expression.end
+        for expression in expressions
     )
 
 
@@ -1235,6 +1549,7 @@ def _associate(
             "boundary",
             "lifecycle",
             "structural_label",
+            "event_title_candidate",
         }
     )
     # Keep the proven strict grammar on the exact mention vocabulary it already
@@ -1243,7 +1558,7 @@ def _associate(
     strict_mentions = tuple(
         item
         for item in edge_mentions
-        if item.mention_type in _CORE_ASSOCIATION_MENTION_TYPES
+        if item.mention_type in _STRICT_ASSOCIATION_MENTION_TYPES
     )
     raw: list[
         tuple[
@@ -1863,6 +2178,108 @@ def _field_ranges(text: str) -> tuple[_FieldRange, ...]:
     return tuple(fields)
 
 
+def _quoted_or_forwarded_ranges(text: str) -> tuple[tuple[int, int], ...]:
+    """Return exact ranges whose temporal evidence is not newly authored.
+
+    Individually quoted lines stay individually bounded.  A forwarded/original
+    message marker changes the provenance of the marker and all content after
+    it, so the first such marker starts one tail range.  Merging keeps overlap
+    checks deterministic without discarding any endpoint inventory.
+    """
+
+    ranges = [
+        (match.start(), match.end()) for match in _QUOTED_LINE_RE.finditer(text)
+    ]
+    marker = _FORWARDED_ORIGINAL_MARKER_RE.search(text)
+    if marker is not None:
+        ranges.append((marker.start(), len(text)))
+    if not ranges:
+        return ()
+
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(ranges):
+        if merged and start <= merged[-1][1]:
+            previous_start, previous_end = merged[-1]
+            merged[-1] = (previous_start, max(previous_end, end))
+        else:
+            merged.append((start, end))
+    return tuple(merged)
+
+
+def _quoted_or_forwarded_blocker(
+    start: int,
+    end: int,
+    ranges: tuple[tuple[int, int], ...],
+) -> tuple[str, ...]:
+    if any(range_start < end and start < range_end for range_start, range_end in ranges):
+        return ("quoted_or_forwarded_context",)
+    return ()
+
+
+_SEGMENT_BREAK_RE = re.compile(
+    r"\n[ \t]*\n+|;[ \t]*|[.!?](?:[ \t]+(?=[A-Z])|\n+)"
+    r"|\n(?=[ \t]*(?:>|[-*\u2022][ \t]+|(?:begin[ \t]+)?forwarded[ \t]+message|"
+    r"-{2,}[ \t]*original[ \t]+message[ \t]*-{2,}))",
+    re.IGNORECASE,
+)
+
+
+def _segment_ranges(
+    text: str,
+    fields: tuple[_FieldRange, ...],
+) -> tuple[_SegmentRange, ...]:
+    """Partition fields into stable local clauses without dropping source text."""
+
+    output: list[_SegmentRange] = []
+    for field in fields:
+        cursor = field.start
+        index = 1
+        for match in _SEGMENT_BREAK_RE.finditer(text, field.start, field.end):
+            boundary = match.end()
+            if boundary > cursor:
+                output.append(
+                    _SegmentRange(
+                        segment_id=f"{field.name}:s{index}",
+                        field=field.name,
+                        start=cursor,
+                        end=boundary,
+                    )
+                )
+                index += 1
+            cursor = boundary
+        if cursor < field.end or not output:
+            output.append(
+                _SegmentRange(
+                    segment_id=f"{field.name}:s{index}",
+                    field=field.name,
+                    start=cursor,
+                    end=field.end,
+                )
+            )
+    return tuple(output)
+
+
+def _segment_id_for_span(
+    segments: tuple[_SegmentRange, ...],
+    start: int,
+    end: int,
+) -> str:
+    for segment in segments:
+        if segment.start <= start and end <= segment.end:
+            return segment.segment_id
+    midpoint = start + max(0, end - start) // 2
+    nearest = min(
+        segments,
+        key=lambda item: (
+            0 if item.start <= midpoint <= item.end else 1,
+            min(abs(midpoint - item.start), abs(midpoint - item.end)),
+            item.segment_id,
+        ),
+        default=None,
+    )
+    return nearest.segment_id if nearest is not None else "message:s1"
+
+
 def _field_for_span(
     fields: tuple[_FieldRange, ...], start: int, end: int
 ) -> TemporalField:
@@ -2228,7 +2645,7 @@ def _opaque_scope_prefix(chunk_id: str | None, text: str) -> str:
     )
     material = f"{normalized_scope}\0{content_digest}"
     digest = hashlib.sha256(
-        f"pkm-brain/gmail-temporal-leads/v1\0{material}".encode("utf-8")
+        f"pkm-brain/gmail-temporal-leads/v2\0{material}".encode("utf-8")
     ).hexdigest()
     return f"gtl_{digest[:16]}"
 
@@ -2241,6 +2658,7 @@ def _analysis_snapshot_fingerprint(
     chunk_id: str | None,
     scope_bound: bool,
     fact_admitted: bool,
+    association_admission_basis: AssociationAdmissionBasis,
     expressions: tuple[TemporalExpression, ...],
     mentions: tuple[TemporalMention, ...],
     leads: tuple[TemporalLead, ...],
@@ -2253,7 +2671,7 @@ def _analysis_snapshot_fingerprint(
     """Bind a selector response to one exact, versioned evidence inventory."""
 
     payload = {
-        "schema": "gmail_temporal_analysis_snapshot_v1",
+        "schema": "gmail_temporal_analysis_snapshot_v2",
         "analysis_version": version,
         "source_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
         "anchor": anchor.isoformat() if anchor is not None else None,
@@ -2264,6 +2682,7 @@ def _analysis_snapshot_fingerprint(
         ),
         "scope_bound": scope_bound,
         "fact_admitted": fact_admitted,
+        "association_admission_basis": association_admission_basis,
         "expressions": [asdict(item) for item in expressions],
         "mentions": [asdict(item) for item in mentions],
         "leads": [asdict(item) for item in leads],
