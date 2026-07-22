@@ -6,6 +6,7 @@ from dataclasses import FrozenInstanceError, replace
 import pytest
 
 from pkm_brain.gmail_temporal_batching import (
+    GMAIL_TEMPORAL_SINGLETON_EVENT_FALLBACK_DIAGNOSTIC,
     GmailTemporalBatchAuthorityError,
     GmailTemporalBatchCaps,
     GmailTemporalBatchingError,
@@ -146,13 +147,170 @@ def test_structured_event_title_is_repeated_as_a_citable_subject_bridge() -> Non
     assert len(plan.batches) == 1
     batch = plan.batches[0]
     title = next(
-        item
-        for item in batch.mentions
-        if item.mention_type == "event_title_candidate"
+        item for item in batch.mentions if item.mention_type == "event_title_candidate"
     )
     assert title.candidate_role == "subject_bridge"
     assert title.surface == "Q3 Leadership Forum"
     assert title.mention_id in batch.manifest.mention_ids
+
+
+@pytest.mark.parametrize(
+    ("admitted", "rescue", "expected_basis"),
+    (
+        (True, False, "fact"),
+        (False, True, "temporal_rescue"),
+    ),
+)
+def test_singleton_cross_segment_event_fallback_packetizes_only_linked_event(
+    admitted: bool,
+    rescue: bool,
+    expected_basis: str,
+) -> None:
+    text = "The workshop update is ready. May 14, 2027."
+    value = analyze(text, admitted=admitted, rescue=rescue)
+    assert value.association_admission_basis == expected_basis
+    assert len(value.expressions) == 1
+    assert len(value.leads) == 1
+    lead = value.leads[0]
+    event = next(item for item in value.mentions if item.mention_type == "event")
+    expression = value.expressions[0]
+    assert lead.association_mode == "field_near"
+    assert lead.mention_id == event.mention_id
+    assert expression.field == event.field
+    assert expression.segment_id != event.segment_id
+
+    plan = plan_gmail_temporal_selector_batches(text=text, analysis=value)
+
+    assert plan.omissions == ()
+    assert len(plan.batches) == 1
+    batch = plan.batches[0]
+    assert (
+        batch.diagnostics.count(GMAIL_TEMPORAL_SINGLETON_EVENT_FALLBACK_DIAGNOSTIC) == 1
+    )
+    assert tuple(item.mention_id for item in batch.mentions) == (event.mention_id,)
+    assert tuple(item.lead_id for item in batch.lead_hints) == (lead.lead_id,)
+    assert batch.segment_start <= expression.start < batch.segment_end
+    assert not (batch.segment_start <= event.start < batch.segment_end)
+    local = next(item for item in batch.contexts if item.role == "local")
+    assert local.start <= min(expression.start, event.start)
+    assert local.end >= max(expression.end, event.end)
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "Please submit the form. May 14, 2027.",
+        "Workshop and meeting updates are ready. May 14, 2027.",
+        "The workshop update is ready. May 14, 2027. May 15, 2027.",
+    ),
+)
+def test_singleton_cross_segment_fallback_does_not_broaden_non_singletons(
+    text: str,
+) -> None:
+    value = analyze(text)
+
+    plan = plan_gmail_temporal_selector_batches(text=text, analysis=value)
+
+    assert all(
+        GMAIL_TEMPORAL_SINGLETON_EVENT_FALLBACK_DIAGNOSTIC not in batch.diagnostics
+        for batch in plan.batches
+    )
+
+
+def test_singleton_cross_segment_fallback_requires_admission() -> None:
+    text = "The workshop update is ready. May 14, 2027."
+    value = analyze(text, admitted=False, rescue=False)
+
+    plan = plan_gmail_temporal_selector_batches(text=text, analysis=value)
+
+    assert plan.batches == ()
+    assert {item.reason for item in plan.omissions} == {"fact_not_admitted"}
+
+
+def test_singleton_cross_segment_fallback_fails_closed_at_payload_cap() -> None:
+    text = "The workshop update is ready. May 14, 2027."
+    value = analyze(text)
+
+    plan = plan_gmail_temporal_selector_batches(
+        text=text,
+        analysis=value,
+        caps=GmailTemporalBatchCaps(max_payload_bytes=128),
+    )
+
+    assert plan.batches == ()
+    assert plan.covered_expression_ids == ()
+    assert len(plan.omissions) == 1
+    assert plan.omissions[0].reason == "payload_byte_cap"
+
+
+def test_citable_subject_bridges_precede_local_artifacts_at_mention_cap() -> None:
+    text = (
+        "Subject: Cancelled Planning Meeting\n\n"
+        "Email calendar invitation attachment document link agenda "
+        "Meeting May 14, 2027."
+    )
+    value = analyze(text)
+    citable_types = {
+        "event",
+        "event_title_candidate",
+        "event_predicate",
+        "deadline",
+        "action",
+        "boundary",
+        "lifecycle",
+    }
+    expected = {
+        item.mention_id for item in value.mentions if item.mention_type in citable_types
+    }
+    assert len(expected) == 4
+
+    plan = plan_gmail_temporal_selector_batches(
+        text=text,
+        analysis=value,
+        caps=GmailTemporalBatchCaps(max_mentions_per_batch=4),
+    )
+
+    assert len(plan.batches) == 1
+    assert expected == set(plan.batches[0].manifest.mention_ids)
+
+
+def test_default_batch_cap_covers_dense_but_bounded_message() -> None:
+    text = " ".join(f"Meeting July {(index % 28) + 1}, 2027." for index in range(66))
+    value = analyze(text)
+    assert len(value.expressions) == 66
+
+    plan = plan_gmail_temporal_selector_batches(text=text, analysis=value)
+
+    assert len(plan.batches) == 66
+    assert plan.omissions == ()
+
+
+def test_default_mention_cap_covers_dense_citable_segment() -> None:
+    text = (
+        "Subject: Cancelled Planning Meeting\n\n"
+        "Meeting interview workshop conference appointment session event call "
+        "visit tour presentation demo review training screening discussion "
+        "webinar lecture summit briefing May 14, 2027."
+    )
+    value = analyze(text)
+    citable_types = {
+        "event",
+        "event_title_candidate",
+        "event_predicate",
+        "deadline",
+        "action",
+        "boundary",
+        "lifecycle",
+    }
+    expected = {
+        item.mention_id for item in value.mentions if item.mention_type in citable_types
+    }
+    assert len(expected) == 20
+
+    plan = plan_gmail_temporal_selector_batches(text=text, analysis=value)
+
+    assert len(plan.batches) == 1
+    assert expected <= set(plan.batches[0].manifest.mention_ids)
 
 
 def test_hard_caps_and_expression_omission_accounting() -> None:

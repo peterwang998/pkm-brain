@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 from typing import Literal
 
 from .gmail_temporal_batching import (
+    GMAIL_TEMPORAL_SINGLETON_EVENT_FALLBACK_DIAGNOSTIC,
     GmailTemporalBatchAuthorityError,
     GmailTemporalSelectorBatch,
     VerifiedGmailTemporalBatchCitation,
@@ -29,12 +30,25 @@ _PAGE_PLAN_VERSION = "gmail_temporal_candidate_page_plan_v1"
 _PAGE_VERSION = "gmail_temporal_candidate_page_v1"
 _CLUSTER_UNCERTAINTY_VERSION = "gmail_temporal_candidate_cluster_uncertainty_v1"
 _VERDICT_SET_VERSION = "gmail_temporal_candidate_verdict_set_v2"
+_ENSEMBLE_CLUSTER_REVIEW_VERSION = "gmail_temporal_candidate_ensemble_cluster_review_v1"
+_ENSEMBLE_VERSION = "gmail_temporal_candidate_three_run_ensemble_v3"
+_ENSEMBLE_POLICY_VERSION = "gmail_temporal_candidate_three_run_consensus_v3"
+_ENSEMBLE_RUN_COUNT = 3
 _VERDICTS = {"supported", "unsupported", "uncertain"}
 _SUBSUMING_EXPLICIT_LIFECYCLES = frozenset({"cancelled", "completed", "scheduled"})
+_LIFECYCLE_SCOPE_CONFLICT_BLOCKERS = frozenset(
+    {
+        "lifecycle_expression_scope_conflict",
+        "lifecycle_subject_binding_unverified",
+    }
+)
 ClusterUncertaintyReason = Literal[
     "model_uncertain",
     "conflicting_supported_candidates",
+    "lifecycle_refinement_unresolved",
+    "scope_conflicted_lifecycle_review_canonicalized",
 ]
+EnsembleClusterReviewReason = Literal["split_semantics_unresolved"]
 
 
 class GmailTemporalFrontierError(ValueError):
@@ -167,6 +181,75 @@ class GmailTemporalCandidateVerdictSet:
     routable: Literal[False] = False
 
 
+@dataclass(frozen=True)
+class GmailTemporalCandidateEnsembleClusterReview:
+    """A parent cluster needing review without authorizing any candidate."""
+
+    version: Literal["gmail_temporal_candidate_ensemble_cluster_review_v1"]
+    cluster_id: str
+    reason: EnsembleClusterReviewReason
+    requires_defer: Literal[True] = True
+    routable: Literal[False] = False
+
+
+@dataclass(frozen=True)
+class GmailTemporalCandidateEnsembleVerdictSet:
+    """Three complete raw runs reduced and calibrated as one review result."""
+
+    version: Literal["gmail_temporal_candidate_three_run_ensemble_v3"]
+    policy_version: Literal["gmail_temporal_candidate_three_run_consensus_v3"]
+    policy_fingerprint: str
+    plan_fingerprint: str
+    frontier_fingerprint: str
+    run_count: Literal[3]
+    consensus_rows: tuple[GmailTemporalCandidatePageVerdicts, ...]
+    cluster_reviews: tuple[GmailTemporalCandidateEnsembleClusterReview, ...]
+    verdict_set: GmailTemporalCandidateVerdictSet
+    routable: Literal[False] = False
+
+
+def gmail_temporal_candidate_ensemble_policy_fingerprint() -> str:
+    """Bind the exact three-run vote policy independently of model prompts."""
+
+    material = {
+        "version": _ENSEMBLE_POLICY_VERSION,
+        "run_count": _ENSEMBLE_RUN_COUNT,
+        "accepted_verdicts": ["supported", "uncertain"],
+        "supported_rule": "all_three_supported",
+        "uncertain_rule": "at_least_two_accepted_unless_all_three_supported",
+        "unsupported_rule": "fewer_than_two_accepted",
+        "candidate_consensus_precedence": "blocks_one_vote_siblings",
+        "parent_cluster_fallback": "semantic_signature_quorum_then_canonical_alias",
+        "semantic_signature": [
+            "expression_id",
+            "relation",
+            "kind",
+            "lifecycle",
+            "normalized_value",
+        ],
+        "semantic_quorum": (
+            "exactly_one_signature_accepted_by_at_least_two_distinct_runs"
+        ),
+        "canonical_candidate_order": [
+            "accepted_vote_count_desc",
+            "supported_vote_count_desc",
+            "plan_order_asc",
+        ],
+        "parent_cluster_fallback_candidate_count": 1,
+        "parent_cluster_fallback_supported": False,
+        "split_semantics": (
+            "emit_non_routable_cluster_review_without_candidate_authorization"
+        ),
+        "cluster_review_version": _ENSEMBLE_CLUSTER_REVIEW_VERSION,
+        "post_consensus": "validate_gmail_temporal_candidate_verdict_set",
+        "post_consensus_review_canonicalization": (
+            "sole_scope_conflicted_unknown_to_unique_strict_direct_actual_"
+            "occurrence_as_uncertain"
+        ),
+    }
+    return "gtfep_" + hashlib.sha256(_canonical_bytes(material)).hexdigest()
+
+
 def build_gmail_temporal_candidate_frontier(
     *,
     analysis: TemporalLeadAnalysis,
@@ -214,6 +297,7 @@ def build_gmail_temporal_candidate_frontier(
 
     simplified = _omit_subsumed_lifecycle_free_bases(
         analysis=analysis,
+        batch=batch,
         candidates=tuple(candidates),
     )
     ordered = tuple(
@@ -267,6 +351,7 @@ def build_gmail_temporal_candidate_frontier(
 def _omit_subsumed_lifecycle_free_bases(
     *,
     analysis: TemporalLeadAnalysis,
+    batch: GmailTemporalSelectorBatch,
     candidates: tuple[GmailTemporalVerificationCandidate, ...],
 ) -> tuple[GmailTemporalVerificationCandidate, ...]:
     """Remove only a base binding fully represented by an exact lifecycle.
@@ -274,6 +359,8 @@ def _omit_subsumed_lifecycle_free_bases(
     Unknown, deferred, and reschedule lifecycle variants never subsume their
     lifecycle-free base. A directly grounded actual occurrence is also retained
     beside a terminal lifecycle because it can represent a distinct endpoint.
+    Source-verified aliases share this rule across bindings so a weaker title or
+    compound-noun base cannot destabilize one exact local lifecycle assertion.
     """
 
     by_binding: dict[str, list[GmailTemporalVerificationCandidate]] = {}
@@ -281,13 +368,24 @@ def _omit_subsumed_lifecycle_free_bases(
         by_binding.setdefault(candidate.binding_id, []).append(candidate)
     leads = {item.lead_id: item for item in analysis.leads}
     omitted: set[str] = set()
-    for values in by_binding.values():
+    components = _source_verified_alias_binding_components(
+        analysis=analysis,
+        batch=batch,
+        candidates=candidates,
+    )
+    for component in components:
+        values = tuple(
+            candidate
+            for binding_id in component
+            for candidate in by_binding[binding_id]
+        )
         explicit = tuple(
             candidate
             for candidate in values
             if candidate.lifecycle_mention_id is not None
             and candidate.lifecycle in _SUBSUMING_EXPLICIT_LIFECYCLES
             and not candidate.requires_defer
+            and candidate.normalized_value is not None
         )
         if not explicit:
             continue
@@ -325,13 +423,25 @@ def _explicit_lifecycle_subsumes_base(
         return False
     lead = leads.get(base.selected_lead_id or "")
     distinct_actual_endpoint = (
+        _is_direct_actual_endpoint(base=base, leads=leads)
+        and lead is not None
+        and lead.confidence_tier == "strict_direct"
+    )
+    return not distinct_actual_endpoint
+
+
+def _is_direct_actual_endpoint(
+    *,
+    base: GmailTemporalVerificationCandidate,
+    leads: dict[str, TemporalLead],
+) -> bool:
+    lead = leads.get(base.selected_lead_id or "")
+    return (
         base.relation == "occurrence"
         and base.kind == "actual"
         and lead is not None
         and lead.association_mode == "direct_grammar"
-        and lead.confidence_tier == "strict_direct"
     )
-    return not distinct_actual_endpoint
 
 
 def gmail_temporal_candidate_frontier_payload(
@@ -615,7 +725,6 @@ def validate_gmail_temporal_candidate_verdict_set(
         sorted(rows, key=lambda item: pages[item.page_fingerprint].sequence)
     )
     seen_pages: set[str] = set()
-    unsupported_count = 0
     frontier = build_gmail_temporal_candidate_frontier(
         analysis=analysis,
         batch=batch,
@@ -685,8 +794,6 @@ def validate_gmail_temporal_candidate_verdict_set(
                 raise GmailTemporalFrontierError(
                     "candidate verdict is unsupported or routable"
                 )
-            if verdict.verdict == "unsupported":
-                unsupported_count += 1
             verdict_by_candidate[candidate_id] = verdict.verdict
 
     if seen_pages != set(pages):
@@ -701,30 +808,49 @@ def validate_gmail_temporal_candidate_verdict_set(
     supported_ids: list[str] = []
     supported_citations: list[VerifiedGmailTemporalBatchCitation] = []
     uncertain_clusters: list[GmailTemporalCandidateClusterUncertainty] = []
+    leads_by_id = {item.lead_id: item for item in analysis.leads}
+    effective_verdict_by_candidate = dict(verdict_by_candidate)
+    canonicalized_uncertainty_by_cluster: dict[str, str] = {}
     for cluster_id in cluster_order:
         cluster_candidate_ids = candidate_ids_by_cluster[cluster_id]
+        canonicalization = _canonicalize_scope_conflicted_lifecycle_review(
+            cluster_candidate_ids=tuple(cluster_candidate_ids),
+            candidates=candidates,
+            leads=leads_by_id,
+            verdicts=effective_verdict_by_candidate,
+        )
+        if canonicalization is not None:
+            source_candidate_id, occurrence_candidate_id = canonicalization
+            effective_verdict_by_candidate[source_candidate_id] = "unsupported"
+            effective_verdict_by_candidate[occurrence_candidate_id] = "uncertain"
+            canonicalized_uncertainty_by_cluster[cluster_id] = occurrence_candidate_id
         supported = tuple(
             candidate_id
             for candidate_id in cluster_candidate_ids
-            if verdict_by_candidate[candidate_id] == "supported"
+            if effective_verdict_by_candidate[candidate_id] == "supported"
         )
         uncertain = tuple(
             candidate_id
             for candidate_id in cluster_candidate_ids
-            if verdict_by_candidate[candidate_id] == "uncertain"
+            if effective_verdict_by_candidate[candidate_id] == "uncertain"
         )
         if uncertain:
             plausible = tuple(
                 candidate_id
                 for candidate_id in cluster_candidate_ids
-                if verdict_by_candidate[candidate_id] != "unsupported"
+                if effective_verdict_by_candidate[candidate_id] != "unsupported"
             )
             uncertain_clusters.append(
                 GmailTemporalCandidateClusterUncertainty(
                     version="gmail_temporal_candidate_cluster_uncertainty_v1",
                     cluster_id=cluster_id,
                     plausible_candidate_ids=plausible,
-                    reason="model_uncertain",
+                    reason=(
+                        "scope_conflicted_lifecycle_review_canonicalized"
+                        if canonicalized_uncertainty_by_cluster.get(cluster_id)
+                        in plausible
+                        else "model_uncertain"
+                    ),
                 )
             )
             continue
@@ -740,6 +866,22 @@ def validate_gmail_temporal_candidate_verdict_set(
             continue
         if len(supported) == 1:
             candidate_id = supported[0]
+            candidate = candidates[candidate_id]
+            if _supported_base_requires_lifecycle_uncertainty(
+                base=candidate,
+                cluster_candidate_ids=tuple(cluster_candidate_ids),
+                candidates=candidates,
+                leads=leads_by_id,
+            ):
+                uncertain_clusters.append(
+                    GmailTemporalCandidateClusterUncertainty(
+                        version="gmail_temporal_candidate_cluster_uncertainty_v1",
+                        cluster_id=cluster_id,
+                        plausible_candidate_ids=(candidate_id,),
+                        reason="lifecycle_refinement_unresolved",
+                    )
+                )
+                continue
             page = page_by_candidate[candidate_id]
             citation = validate_gmail_temporal_candidate_page_choice(
                 analysis=analysis,
@@ -752,9 +894,12 @@ def validate_gmail_temporal_candidate_verdict_set(
             supported_ids.append(candidate_id)
             supported_citations.append(citation)
 
+    unsupported_count = sum(
+        verdict == "unsupported" for verdict in effective_verdict_by_candidate.values()
+    )
     accounted_candidate_ids = [
         candidate_id
-        for candidate_id, verdict in verdict_by_candidate.items()
+        for candidate_id, verdict in effective_verdict_by_candidate.items()
         if verdict == "unsupported"
     ]
     accounted_candidate_ids.extend(supported_ids)
@@ -767,7 +912,9 @@ def validate_gmail_temporal_candidate_verdict_set(
         len(accounted_candidate_ids) != len(set(accounted_candidate_ids))
         or set(accounted_candidate_ids) != set(plan.covered_candidate_ids)
         or unsupported_count
-        != sum(value == "unsupported" for value in verdict_by_candidate.values())
+        != sum(
+            value == "unsupported" for value in effective_verdict_by_candidate.values()
+        )
     ):
         raise GmailTemporalFrontierError(
             "candidate verdict aggregation does not account for the plan exactly"
@@ -789,6 +936,301 @@ def validate_gmail_temporal_candidate_verdict_set(
             or any(candidates[value].requires_defer for value in supported_ids)
         ),
     )
+
+
+def validate_gmail_temporal_candidate_ensemble_verdict_set(
+    *,
+    analysis: TemporalLeadAnalysis,
+    batch: GmailTemporalSelectorBatch,
+    plan: GmailTemporalCandidatePagePlan,
+    runs: tuple[tuple[GmailTemporalCandidatePageVerdicts, ...], ...],
+) -> GmailTemporalCandidateEnsembleVerdictSet:
+    """Reduce exactly three complete raw runs, then apply normal calibration.
+
+    A candidate survives directly only when at least two runs call it supported
+    or uncertain. Only three unanimous supported votes remain supported; every
+    other surviving candidate consensus is uncertain. If a parent cluster has
+    no candidate consensus, accepted candidates are grouped by exact temporal
+    semantics. One semantic signature accepted by at least two distinct runs
+    retains exactly one deterministic alias as uncertain. Split semantic votes
+    instead produce a non-routable cluster review without authorizing a candidate.
+    Candidate consensus always takes precedence, and fallback never emits support.
+    The resulting consensus rows pass through the same cluster-aware production
+    verdict validator used for a single run, so lifecycle and alias safety rules
+    remain authoritative.
+    """
+
+    if (
+        not isinstance(runs, tuple)
+        or len(runs) != _ENSEMBLE_RUN_COUNT
+        or any(not isinstance(run, tuple) for run in runs)
+    ):
+        raise GmailTemporalFrontierError(
+            "candidate ensemble requires exactly three tuple-backed runs"
+        )
+
+    run_verdicts: list[dict[str, str]] = []
+    for run in runs:
+        validate_gmail_temporal_candidate_verdict_set(
+            analysis=analysis,
+            batch=batch,
+            plan=plan,
+            rows=run,
+        )
+        verdicts: dict[str, str] = {}
+        rows_by_page = {row.page_fingerprint: row for row in run}
+        for page in plan.pages:
+            row = rows_by_page[page.page_fingerprint]
+            verdicts.update({item.candidate_id: item.verdict for item in row.verdicts})
+        if set(verdicts) != set(plan.covered_candidate_ids):
+            raise GmailTemporalFrontierError(
+                "candidate ensemble run does not cover the plan exactly"
+            )
+        run_verdicts.append(verdicts)
+
+    consensus_by_candidate: dict[str, str] = {}
+    for page in plan.pages:
+        candidate_ids = tuple(
+            candidate_id
+            for cluster in page.clusters
+            for candidate_id in cluster.candidate_ids
+        )
+        for candidate_id in candidate_ids:
+            votes = tuple(run[candidate_id] for run in run_verdicts)
+            accepted_votes = sum(value != "unsupported" for value in votes)
+            consensus_by_candidate[candidate_id] = (
+                "supported"
+                if all(value == "supported" for value in votes)
+                else "uncertain"
+                if accepted_votes >= 2
+                else "unsupported"
+            )
+
+    frontier = build_gmail_temporal_candidate_frontier(
+        analysis=analysis,
+        batch=batch,
+    )
+    candidates = {item.candidate_id: item for item in frontier.candidates}
+    parent_clusters: dict[str, list[str]] = {}
+    plan_order: dict[str, int] = {}
+    for page in plan.pages:
+        for cluster in page.clusters:
+            parent_clusters.setdefault(cluster.cluster_id, []).extend(
+                cluster.candidate_ids
+            )
+            for candidate_id in cluster.candidate_ids:
+                plan_order[candidate_id] = len(plan_order)
+    cluster_reviews: list[GmailTemporalCandidateEnsembleClusterReview] = []
+    for cluster_id, candidate_ids in parent_clusters.items():
+        if any(
+            consensus_by_candidate[candidate_id] != "unsupported"
+            for candidate_id in candidate_ids
+        ):
+            continue
+        accepting_runs = {
+            run_index
+            for run_index, run in enumerate(run_verdicts)
+            if any(run[candidate_id] != "unsupported" for candidate_id in candidate_ids)
+        }
+        if len(accepting_runs) < 2:
+            continue
+
+        signature_runs: dict[tuple[str, str, str, str, str | None], set[int]] = {}
+        for candidate_id in candidate_ids:
+            candidate = candidates[candidate_id]
+            signature = (
+                candidate.expression_id,
+                candidate.relation,
+                candidate.kind,
+                candidate.lifecycle,
+                candidate.normalized_value,
+            )
+            signature_runs.setdefault(signature, set()).update(
+                run_index
+                for run_index, run in enumerate(run_verdicts)
+                if run[candidate_id] != "unsupported"
+            )
+        quorum_signatures = tuple(
+            signature
+            for signature, accepting_signature_runs in signature_runs.items()
+            if len(accepting_signature_runs) >= 2
+        )
+        if len(quorum_signatures) != 1:
+            cluster_reviews.append(
+                GmailTemporalCandidateEnsembleClusterReview(
+                    version="gmail_temporal_candidate_ensemble_cluster_review_v1",
+                    cluster_id=cluster_id,
+                    reason="split_semantics_unresolved",
+                )
+            )
+            continue
+
+        winning_signature = quorum_signatures[0]
+        signature_candidates = tuple(
+            candidate_id
+            for candidate_id in candidate_ids
+            if (
+                candidates[candidate_id].expression_id,
+                candidates[candidate_id].relation,
+                candidates[candidate_id].kind,
+                candidates[candidate_id].lifecycle,
+                candidates[candidate_id].normalized_value,
+            )
+            == winning_signature
+            and any(run[candidate_id] != "unsupported" for run in run_verdicts)
+        )
+        canonical_candidate_id = min(
+            signature_candidates,
+            key=lambda candidate_id: (
+                -sum(run[candidate_id] != "unsupported" for run in run_verdicts),
+                -sum(run[candidate_id] == "supported" for run in run_verdicts),
+                plan_order[candidate_id],
+            ),
+        )
+        consensus_by_candidate[canonical_candidate_id] = "uncertain"
+
+    consensus_rows: list[GmailTemporalCandidatePageVerdicts] = []
+    for page in plan.pages:
+        verdicts = tuple(
+            GmailTemporalCandidateVerdict(
+                candidate_id=candidate_id,
+                verdict=consensus_by_candidate[candidate_id],  # type: ignore[arg-type]
+            )
+            for cluster in page.clusters
+            for candidate_id in cluster.candidate_ids
+        )
+        consensus_rows.append(
+            GmailTemporalCandidatePageVerdicts(
+                frontier_fingerprint=plan.frontier_fingerprint,
+                page_fingerprint=page.page_fingerprint,
+                verdicts=verdicts,
+            )
+        )
+
+    rows = tuple(consensus_rows)
+    verdict_set = validate_gmail_temporal_candidate_verdict_set(
+        analysis=analysis,
+        batch=batch,
+        plan=plan,
+        rows=rows,
+    )
+    return GmailTemporalCandidateEnsembleVerdictSet(
+        version="gmail_temporal_candidate_three_run_ensemble_v3",
+        policy_version="gmail_temporal_candidate_three_run_consensus_v3",
+        policy_fingerprint=gmail_temporal_candidate_ensemble_policy_fingerprint(),
+        plan_fingerprint=plan.plan_fingerprint,
+        frontier_fingerprint=plan.frontier_fingerprint,
+        run_count=3,
+        consensus_rows=rows,
+        cluster_reviews=tuple(cluster_reviews),
+        verdict_set=verdict_set,
+    )
+
+
+def _supported_base_requires_lifecycle_uncertainty(
+    *,
+    base: GmailTemporalVerificationCandidate,
+    cluster_candidate_ids: tuple[str, ...],
+    candidates: dict[str, GmailTemporalVerificationCandidate],
+    leads: dict[str, TemporalLead],
+) -> bool:
+    """Keep a lifecycle-free fallback reviewable, never authoritative.
+
+    A deferred explicit lifecycle candidate is retained beside its base to
+    protect recall when normalization is incomplete. If the verifier chooses
+    only that less-specific base, however, the explicit cue cannot safely be
+    erased. The base therefore becomes cluster uncertainty. Directly grounded
+    actual occurrences remain independent of completion/cancellation, and an
+    unresolved reschedule is calibrated separately because neither endpoint is
+    yet known to be the replacement schedule.
+    """
+
+    if base.lifecycle_mention_id is not None or base.lifecycle != "none":
+        return False
+    direct_actual_endpoint = _is_direct_actual_endpoint(base=base, leads=leads)
+    for candidate_id in cluster_candidate_ids:
+        explicit = candidates[candidate_id]
+        if explicit.lifecycle_mention_id is None:
+            continue
+        unresolved_reschedule = (
+            explicit.lifecycle == "unknown"
+            and "rescheduled_endpoint_role_unresolved" in explicit.blockers
+        )
+        deferred_refinement = (
+            explicit.lifecycle in _SUBSUMING_EXPLICIT_LIFECYCLES
+            and (explicit.requires_defer or explicit.normalized_value is None)
+            and not (
+                explicit.lifecycle in {"cancelled", "completed"}
+                and direct_actual_endpoint
+            )
+            and _explicit_lifecycle_subsumes_base(
+                lifecycle=explicit,
+                base=base,
+                leads=leads,
+            )
+        )
+        if unresolved_reschedule or deferred_refinement:
+            return True
+    return False
+
+
+def _canonicalize_scope_conflicted_lifecycle_review(
+    *,
+    cluster_candidate_ids: tuple[str, ...],
+    candidates: dict[str, GmailTemporalVerificationCandidate],
+    leads: dict[str, TemporalLead],
+    verdicts: dict[str, str],
+) -> tuple[str, str] | None:
+    """Retarget one unsafe lifecycle uncertainty to its direct occurrence.
+
+    Review-only policy: a sole accepted unknown-lifecycle refinement carrying
+    both expression-scope and subject-binding conflicts cannot displace its
+    unique blocker-free, strict-direct actual-occurrence sibling. The accepted
+    identity moves to that sibling as uncertainty; this policy never creates a
+    supported candidate. Every condition is deliberately exact so ambiguous,
+    non-actual, non-direct, multi-candidate, or explicit-lifecycle cases retain
+    the verifier's original cluster uncertainty.
+    """
+
+    accepted_candidate_ids = tuple(
+        candidate_id
+        for candidate_id in cluster_candidate_ids
+        if verdicts[candidate_id] != "unsupported"
+    )
+    if len(accepted_candidate_ids) != 1:
+        return None
+    source_candidate_id = accepted_candidate_ids[0]
+    source = candidates[source_candidate_id]
+    if source.lifecycle != "unknown" or not (
+        _LIFECYCLE_SCOPE_CONFLICT_BLOCKERS <= set(source.blockers)
+    ):
+        return None
+
+    occurrence_candidates: list[str] = []
+    for candidate_id in cluster_candidate_ids:
+        occurrence = candidates[candidate_id]
+        lead = leads.get(occurrence.selected_lead_id or "")
+        if (
+            occurrence.binding_id == source.binding_id
+            and occurrence.expression_id == source.expression_id
+            and occurrence.normalized_value == source.normalized_value
+            and occurrence.lifecycle_mention_id is None
+            and occurrence.lifecycle == "none"
+            and occurrence.relation == "occurrence"
+            and occurrence.kind == "actual"
+            and not occurrence.blockers
+            and occurrence.supporting_lead_present
+            and lead is not None
+            and lead.expression_id == occurrence.expression_id
+            and lead.mention_id == occurrence.subject_mention_id
+            and lead.association_mode == "direct_grammar"
+            and lead.confidence_tier == "strict_direct"
+            and not lead.blockers
+        ):
+            occurrence_candidates.append(candidate_id)
+    if len(occurrence_candidates) != 1:
+        return None
+    return source_candidate_id, occurrence_candidates[0]
 
 
 def _candidate(
@@ -858,7 +1300,10 @@ def _candidate(
         blockers=derived.blockers,
         risk_features=derived.risk_features,
         repair_flags=derived.repair_flags,
-        requires_defer=selection.decision == "defer_ambiguous",
+        requires_defer=(
+            selection.decision == "defer_ambiguous"
+            or GMAIL_TEMPORAL_SINGLETON_EVENT_FALLBACK_DIAGNOSTIC in batch.diagnostics
+        ),
         supporting_lead_present=derived.selected_lead_id is not None,
     )
 
@@ -1072,13 +1517,15 @@ def _validate_page_bounds(
         raise GmailTemporalFrontierError("candidate page exceeds its hard bounds")
 
 
-def _alias_clusters(
+def _source_verified_alias_binding_components(
     analysis: TemporalLeadAnalysis,
     batch: GmailTemporalSelectorBatch,
-    frontier: GmailTemporalCandidateFrontier,
-) -> tuple[GmailTemporalCandidateCluster, ...]:
+    candidates: tuple[GmailTemporalVerificationCandidate, ...],
+) -> tuple[tuple[str, ...], ...]:
+    """Return expression-local binding components joined by source-proof aliases."""
+
     candidates_by_binding: dict[str, list[GmailTemporalVerificationCandidate]] = {}
-    for candidate in frontier.candidates:
+    for candidate in candidates:
         candidates_by_binding.setdefault(candidate.binding_id, []).append(candidate)
     if not candidates_by_binding:
         return ()
@@ -1126,9 +1573,35 @@ def _alias_clusters(
     components: dict[str, list[str]] = {}
     for binding_id in binding_ids:
         components.setdefault(find(binding_id), []).append(binding_id)
+    return tuple(tuple(component) for component in components.values())
+
+
+def _alias_clusters(
+    analysis: TemporalLeadAnalysis,
+    batch: GmailTemporalSelectorBatch,
+    frontier: GmailTemporalCandidateFrontier,
+) -> tuple[GmailTemporalCandidateCluster, ...]:
+    candidates_by_binding: dict[str, list[GmailTemporalVerificationCandidate]] = {}
+    for candidate in frontier.candidates:
+        candidates_by_binding.setdefault(candidate.binding_id, []).append(candidate)
+    if not candidates_by_binding:
+        return ()
+    subject_by_binding = {
+        binding_id: values[0].subject_mention_id
+        for binding_id, values in candidates_by_binding.items()
+    }
+    expression_by_binding = {
+        binding_id: values[0].expression_id
+        for binding_id, values in candidates_by_binding.items()
+    }
+    components = _source_verified_alias_binding_components(
+        analysis=analysis,
+        batch=batch,
+        candidates=frontier.candidates,
+    )
     mention_rank = {item.mention_id: index for index, item in enumerate(batch.mentions)}
     output: list[GmailTemporalCandidateCluster] = []
-    for component in components.values():
+    for component in components:
         ordered_bindings = tuple(
             sorted(
                 component,

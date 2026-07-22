@@ -36,7 +36,10 @@ MIN_END_TO_END_REQUIRED_MEMBER_RECALL = 0.95
 MIN_END_TO_END_COMPLETE_UNIT_RECALL = 0.90
 MIN_END_TO_END_EXACT_UNIT_RECALL = 0.90
 MIN_USEFUL_RECORD_RECALL = 0.95
-MIN_SUPPORTED_REQUIRED_MEMBER_RECALL = 0.80
+# Personal-production release bar: at least 90% of members expected to be
+# directly supported must stay out of the uncertainty lane.  The separate
+# review-recall gate preserves the recall-biased escape hatch.
+MIN_SUPPORTED_REQUIRED_MEMBER_RECALL = 0.90
 MIN_STRICT_SUPPORTED_PRECISION = 0.95
 MIN_RECALL_ARM_PRECISION = 0.90
 MAX_SUPPORTED_TO_UNCERTAIN_RATE = 0.20
@@ -179,6 +182,27 @@ class RunManifest:
     sample_record_count: int
     checkpoint_sha256: str
     checkpoint_row_count: int
+
+
+ArtifactHypothesis = tuple[str, str, str, str, str | None]
+
+
+@dataclass(frozen=True)
+class ProductionArtifact:
+    """One production-visible citation or non-routable uncertainty sidecar."""
+
+    artifact_id: str
+    kind: str
+    candidate_ids: tuple[str, ...]
+    hypotheses: tuple[ArtifactHypothesis, ...]
+
+
+@dataclass(frozen=True)
+class ArtifactMatchEdge:
+    artifact_id: str
+    member_key: tuple[str, str, str]
+    quality: float
+    priority: int
 
 
 def _validate_private_artifact(path: Path) -> None:
@@ -655,7 +679,7 @@ def _checkpoint_verdicts(
     runtime_batches: list[RuntimeBatch],
     pages: Mapping[str, tuple[RuntimeBatch, GmailTemporalCandidatePage]],
     manifest: RunManifest,
-) -> dict[str, str]:
+) -> tuple[dict[str, str], dict[str, str]]:
     rows_by_page: dict[str, dict[str, Any]] = {}
     for row in rows:
         if set(row) != _CHECKPOINT_KEYS:
@@ -723,7 +747,8 @@ def _checkpoint_verdicts(
     if set(rows_by_page) != set(pages):
         raise CandidateGoldError("checkpoint does not cover the page cohort exactly")
 
-    verdict_by_candidate: dict[str, str] = {}
+    raw_verdict_by_candidate: dict[str, str] = {}
+    effective_verdict_by_candidate: dict[str, str] = {}
     for runtime_batch in runtime_batches:
         if not runtime_batch.pages:
             continue
@@ -748,25 +773,43 @@ def _checkpoint_verdicts(
             max_candidates_per_page=12,
             max_payload_bytes=12_000,
         )
-        validate_gmail_temporal_candidate_verdict_set(
+        verdict_set = validate_gmail_temporal_candidate_verdict_set(
             analysis=runtime_batch.analysis,
             batch=runtime_batch.batch,
             plan=plan,
             rows=typed_rows,
         )
+        supported_ids = set(verdict_set.supported_candidate_ids)
+        uncertain_ids = {
+            candidate_id
+            for uncertainty in verdict_set.uncertain_clusters
+            for candidate_id in uncertainty.plausible_candidate_ids
+        }
+        if supported_ids & uncertain_ids:
+            raise CandidateGoldError("effective verdict sets overlap")
         for row in typed_rows:
             for verdict in row.verdicts:
-                if verdict.candidate_id in verdict_by_candidate:
+                if verdict.candidate_id in raw_verdict_by_candidate:
                     raise CandidateGoldError("checkpoint repeats a candidate")
-                verdict_by_candidate[verdict.candidate_id] = verdict.verdict
+                raw_verdict_by_candidate[verdict.candidate_id] = verdict.verdict
+                effective_verdict_by_candidate[verdict.candidate_id] = (
+                    "supported"
+                    if verdict.candidate_id in supported_ids
+                    else "uncertain"
+                    if verdict.candidate_id in uncertain_ids
+                    else "unsupported"
+                )
     expected_candidates = {
         item.candidate.candidate_id
         for batch in runtime_batches
         for item in batch.candidates
     }
-    if set(verdict_by_candidate) != expected_candidates:
+    if (
+        set(raw_verdict_by_candidate) != expected_candidates
+        or set(effective_verdict_by_candidate) != expected_candidates
+    ):
         raise CandidateGoldError("checkpoint omits one or more candidates")
-    return verdict_by_candidate
+    return raw_verdict_by_candidate, effective_verdict_by_candidate
 
 
 def _member_matches(member: GoldMember) -> dict[str, float]:
@@ -791,6 +834,287 @@ def _member_expected_verdicts(member: GoldMember) -> dict[str, str]:
                 )
             output[candidate_id] = alternative.expected_verdict
     return output
+
+
+def _artifact_hypothesis(runtime: RuntimeCandidate) -> ArtifactHypothesis:
+    candidate = runtime.candidate
+    return (
+        candidate.expression_id,
+        candidate.relation,
+        candidate.kind,
+        candidate.lifecycle,
+        candidate.normalized_value,
+    )
+
+
+def _hypothesis_sort_key(value: ArtifactHypothesis) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _production_artifacts(
+    runtime_batches: list[RuntimeBatch],
+    candidates: Mapping[str, RuntimeCandidate],
+    verdicts: Mapping[str, str],
+) -> tuple[ProductionArtifact, ...]:
+    """Project effective verdicts into the artifacts a consumer actually sees.
+
+    Every supported citation remains its own artifact.  All uncertain candidates
+    in one validated parent cluster form one sidecar, and aliases with the same
+    semantic signature collapse to one hypothesis inside that sidecar.
+    """
+
+    candidate_to_cluster: dict[str, str] = {}
+    for runtime_batch in runtime_batches:
+        for page in runtime_batch.pages:
+            for cluster in page.clusters:
+                for candidate_id in cluster.candidate_ids:
+                    previous = candidate_to_cluster.setdefault(
+                        candidate_id,
+                        cluster.cluster_id,
+                    )
+                    if previous != cluster.cluster_id:
+                        raise CandidateGoldError(
+                            "candidate belongs to multiple parent clusters"
+                        )
+    if set(candidate_to_cluster) != set(candidates):
+        raise CandidateGoldError("parent clusters do not cover candidate authority")
+
+    artifacts: list[ProductionArtifact] = []
+    for candidate_id in sorted(
+        candidate_id
+        for candidate_id, verdict in verdicts.items()
+        if verdict == "supported"
+    ):
+        hypothesis = _artifact_hypothesis(candidates[candidate_id])
+        artifacts.append(
+            ProductionArtifact(
+                artifact_id=f"supported:{candidate_id}",
+                kind="supported_citation",
+                candidate_ids=(candidate_id,),
+                hypotheses=(hypothesis,),
+            )
+        )
+
+    uncertain_by_cluster: dict[str, list[str]] = defaultdict(list)
+    for candidate_id, verdict in verdicts.items():
+        if verdict == "uncertain":
+            uncertain_by_cluster[candidate_to_cluster[candidate_id]].append(
+                candidate_id
+            )
+    for cluster_id in sorted(uncertain_by_cluster):
+        candidate_ids = tuple(sorted(uncertain_by_cluster[cluster_id]))
+        hypotheses = tuple(
+            sorted(
+                {
+                    _artifact_hypothesis(candidates[candidate_id])
+                    for candidate_id in candidate_ids
+                },
+                key=_hypothesis_sort_key,
+            )
+        )
+        artifacts.append(
+            ProductionArtifact(
+                artifact_id=f"uncertainty:{cluster_id}",
+                kind="uncertainty_sidecar",
+                candidate_ids=candidate_ids,
+                hypotheses=hypotheses,
+            )
+        )
+    return tuple(artifacts)
+
+
+def _artifact_match_edges(
+    artifacts: tuple[ProductionArtifact, ...],
+    units: tuple[GoldUnit, ...],
+    candidates: Mapping[str, RuntimeCandidate],
+) -> tuple[
+    dict[str, ArtifactMatchEdge],
+    set[str],
+    dict[str, int],
+]:
+    """Compile each artifact's sole permissible semantic edge.
+
+    An uncertainty sidecar is pure only when every distinct hypothesis maps to
+    exactly the same gold member.  Candidate aliases within one hypothesis are
+    deliberately collapsed before this check.
+    """
+
+    candidate_memberships: dict[
+        str,
+        list[tuple[tuple[str, str, str], float, str]],
+    ] = defaultdict(list)
+    for unit in units:
+        for member in unit.members:
+            expected = _member_expected_verdicts(member)
+            for candidate_id, quality in _member_matches(member).items():
+                candidate_memberships[candidate_id].append(
+                    (member.key, quality, expected[candidate_id])
+                )
+
+    edges: dict[str, ArtifactMatchEdge] = {}
+    pure_sidecars: set[str] = set()
+    sidecar_unmatched_hypotheses: dict[str, int] = {}
+    for artifact in artifacts:
+        if artifact.kind == "supported_citation":
+            memberships = candidate_memberships.get(artifact.candidate_ids[0], [])
+            valid = [
+                (member_key, quality)
+                for member_key, quality, expected_verdict in memberships
+                if quality == 1.0 and expected_verdict == "supported"
+            ]
+            if len(valid) > 1:
+                raise CandidateGoldError(
+                    "one supported citation satisfies multiple semantic members"
+                )
+            if valid:
+                member_key, quality = valid[0]
+                edges[artifact.artifact_id] = ArtifactMatchEdge(
+                    artifact_id=artifact.artifact_id,
+                    member_key=member_key,
+                    quality=quality,
+                    priority=0,
+                )
+            continue
+
+        candidates_by_hypothesis: dict[ArtifactHypothesis, list[str]] = defaultdict(
+            list
+        )
+        for candidate_id in artifact.candidate_ids:
+            candidates_by_hypothesis[
+                _artifact_hypothesis(candidates[candidate_id])
+            ].append(candidate_id)
+        if set(candidates_by_hypothesis) != set(artifact.hypotheses):
+            raise CandidateGoldError("uncertainty hypotheses are internally stale")
+
+        hypothesis_members: list[dict[tuple[str, str, str], float]] = []
+        unmatched_hypotheses = 0
+        for hypothesis in artifact.hypotheses:
+            quality_by_member: dict[tuple[str, str, str], list[float]] = defaultdict(
+                list
+            )
+            has_unmatched_alias = False
+            for candidate_id in candidates_by_hypothesis[hypothesis]:
+                memberships = candidate_memberships.get(candidate_id, [])
+                if not memberships:
+                    has_unmatched_alias = True
+                    continue
+                for member_key, quality, _ in memberships:
+                    quality_by_member[member_key].append(quality)
+            if has_unmatched_alias or not quality_by_member:
+                unmatched_hypotheses += 1
+                member_scores: dict[tuple[str, str, str], float] = {}
+            else:
+                # Candidate IDs sharing one semantic signature remain distinct
+                # grounding alternatives.  The collapsed hypothesis therefore
+                # inherits its least-specific alias rather than allowing an
+                # exact alias to conceal a partial one.
+                member_scores = {
+                    member_key: min(qualities)
+                    for member_key, qualities in quality_by_member.items()
+                }
+            hypothesis_members.append(member_scores)
+        sidecar_unmatched_hypotheses[artifact.artifact_id] = unmatched_hypotheses
+
+        # Every hypothesis must authorize one and only one common member.  A
+        # hypothesis that can mean two members is cross-member, not "close
+        # enough"; an unmatched hypothesis likewise contaminates the sidecar.
+        singleton_members = [
+            next(iter(member_scores))
+            for member_scores in hypothesis_members
+            if len(member_scores) == 1
+        ]
+        if (
+            len(singleton_members) != len(hypothesis_members)
+            or len(set(singleton_members)) != 1
+        ):
+            continue
+        member_key = singleton_members[0]
+        # A sidecar is only as specific as its least-specific live hypothesis:
+        # exact plus partial ambiguity must stay partial.
+        quality = min(member_scores[member_key] for member_scores in hypothesis_members)
+        pure_sidecars.add(artifact.artifact_id)
+        edges[artifact.artifact_id] = ArtifactMatchEdge(
+            artifact_id=artifact.artifact_id,
+            member_key=member_key,
+            quality=quality,
+            priority=1 if quality == 1.0 else 2,
+        )
+    return edges, pure_sidecars, sidecar_unmatched_hypotheses
+
+
+def _match_production_artifacts(
+    artifacts: tuple[ProductionArtifact, ...],
+    units: tuple[GoldUnit, ...],
+    candidates: Mapping[str, RuntimeCandidate],
+) -> dict[str, Any]:
+    """Deterministic maximum matching under the release preference order.
+
+    Gold compilation and the sidecar-purity rule leave each artifact with at
+    most one semantic edge.  Sorting those edges by exact-supported, then
+    exact-uncertainty, then partial-uncertainty therefore produces a
+    maximum-cardinality one-to-one matching while resolving competition for a
+    member in the required order.
+    """
+
+    edges, pure_sidecars, sidecar_unmatched_hypotheses = _artifact_match_edges(
+        artifacts,
+        units,
+        candidates,
+    )
+    matched_members: dict[tuple[str, str, str], ArtifactMatchEdge] = {}
+    matched_artifacts: set[str] = set()
+    redundant_artifacts: set[str] = set()
+    invalid_artifacts = {
+        artifact.artifact_id
+        for artifact in artifacts
+        if artifact.artifact_id not in edges
+    }
+    for edge in sorted(
+        edges.values(),
+        key=lambda item: (item.priority, item.artifact_id, item.member_key),
+    ):
+        if edge.member_key in matched_members:
+            redundant_artifacts.add(edge.artifact_id)
+            continue
+        matched_members[edge.member_key] = edge
+        matched_artifacts.add(edge.artifact_id)
+
+    scores_by_unit = [
+        [
+            (
+                matched_members[member.key].quality
+                if member.key in matched_members
+                else 0.0
+            )
+            for member in unit.members
+        ]
+        for unit in units
+    ]
+    all_member_keys = {member.key for unit in units for member in unit.members}
+    sidecars = tuple(
+        artifact for artifact in artifacts if artifact.kind == "uncertainty_sidecar"
+    )
+    supported_artifacts = tuple(
+        artifact for artifact in artifacts if artifact.kind == "supported_citation"
+    )
+    return {
+        "scores_by_unit": scores_by_unit,
+        "matched_member_keys": set(matched_members),
+        "matched_member_quality": {
+            member_key: edge.quality for member_key, edge in matched_members.items()
+        },
+        "missed_member_keys": all_member_keys - set(matched_members),
+        "matched_artifact_ids": matched_artifacts,
+        "redundant_artifact_ids": redundant_artifacts,
+        "invalid_artifact_ids": invalid_artifacts,
+        "artifact_count": len(artifacts),
+        "supported_artifact_count": len(supported_artifacts),
+        "sidecar_count": len(sidecars),
+        "hypothesis_count": sum(len(artifact.hypotheses) for artifact in sidecars),
+        "pure_sidecar_count": len(pure_sidecars),
+        "impure_sidecar_count": len(sidecars) - len(pure_sidecars),
+        "unmatched_hypothesis_count": sum(sidecar_unmatched_hypotheses.values()),
+    }
 
 
 def _selection_scores(
@@ -854,28 +1178,93 @@ def _recall_metrics(scores_by_unit: list[list[float]]) -> dict[str, float | int]
 
 def evaluate(
     sample_path: Path,
-    checkpoint_path: Path,
-    run_manifest_path: Path,
+    checkpoint_path: Path | None,
+    run_manifest_path: Path | None,
+    *,
+    prevalidated_verdict_maps: tuple[
+        Mapping[str, str],
+        Mapping[str, str],
+    ]
+    | None = None,
+    provenance_override: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     samples = _load_jsonl(sample_path)
-    checkpoint_rows = _load_jsonl(checkpoint_path)
-    manifest = _load_run_manifest(
-        run_manifest_path,
-        sample_path=sample_path,
-        sample_record_count=len(samples),
-        checkpoint_path=checkpoint_path,
-        checkpoint_row_count=len(checkpoint_rows),
-    )
+    if prevalidated_verdict_maps is None:
+        if checkpoint_path is None or run_manifest_path is None:
+            raise CandidateGoldError(
+                "checkpoint and manifest are required for a single-run evaluation"
+            )
+        checkpoint_rows = _load_jsonl(checkpoint_path)
+        manifest = _load_run_manifest(
+            run_manifest_path,
+            sample_path=sample_path,
+            sample_record_count=len(samples),
+            checkpoint_path=checkpoint_path,
+            checkpoint_row_count=len(checkpoint_rows),
+        )
+    else:
+        if checkpoint_path is not None or run_manifest_path is not None:
+            raise CandidateGoldError(
+                "prevalidated verdict maps cannot be mixed with single-run evidence"
+            )
+        if (
+            not isinstance(prevalidated_verdict_maps, tuple)
+            or len(prevalidated_verdict_maps) != 2
+            or not all(
+                isinstance(values, Mapping) for values in prevalidated_verdict_maps
+            )
+            or not isinstance(provenance_override, Mapping)
+            or provenance_override.get("single_run") is not False
+        ):
+            raise CandidateGoldError(
+                "prevalidated verdict maps require explicit non-single-run provenance"
+            )
+        checkpoint_rows = []
+        manifest = None
     runtime_batches, candidates, pages = _runtime_batches(samples)
     units = _compile_gold(samples, candidates)
     if not units:
         raise CandidateGoldError("benchmark contains no semantic units")
-    verdicts = _checkpoint_verdicts(
-        checkpoint_rows,
-        runtime_batches,
-        pages,
-        manifest,
-    )
+    if prevalidated_verdict_maps is None:
+        if manifest is None:
+            raise CandidateGoldError("single-run manifest is unavailable")
+        raw_verdicts, verdicts = _checkpoint_verdicts(
+            checkpoint_rows,
+            runtime_batches,
+            pages,
+            manifest,
+        )
+        run_provenance: dict[str, Any] = {
+            "manifest_version": RUN_MANIFEST_VERSION,
+            "checkpoint_version": manifest.checkpoint_version,
+            "protocol_fingerprint": manifest.protocol_fingerprint,
+            "model": manifest.model,
+            "reasoning_effort": manifest.reasoning_effort,
+            "source_module_sha256": dict(manifest.source_module_sha256),
+            "artifact_sha256": {
+                "evaluator": manifest.evaluator_sha256,
+                "semantic_gold": manifest.semantic_gold_sha256,
+                "benchmark_builder": manifest.benchmark_builder_sha256,
+                "sample": manifest.sample_sha256,
+                "checkpoint": manifest.checkpoint_sha256,
+            },
+            "sample_record_count": manifest.sample_record_count,
+            "checkpoint_row_count": manifest.checkpoint_row_count,
+        }
+    else:
+        raw_verdicts = dict(prevalidated_verdict_maps[0])
+        verdicts = dict(prevalidated_verdict_maps[1])
+        expected_candidate_ids = set(candidates)
+        if (
+            set(raw_verdicts) != expected_candidate_ids
+            or set(verdicts) != expected_candidate_ids
+            or any(value not in _VERDICTS for value in raw_verdicts.values())
+            or any(value not in _VERDICTS for value in verdicts.values())
+        ):
+            raise CandidateGoldError(
+                "prevalidated verdict maps do not cover the candidate authority"
+            )
+        run_provenance = dict(provenance_override)
     frontier_ids = set(candidates)
     supported_ids = {
         candidate_id
@@ -888,10 +1277,31 @@ def evaluate(
         if verdict == "uncertain"
     }
     accepted_ids = supported_ids | uncertain_ids
+    raw_supported_ids = {
+        candidate_id
+        for candidate_id, verdict in raw_verdicts.items()
+        if verdict == "supported"
+    }
+    raw_uncertain_ids = {
+        candidate_id
+        for candidate_id, verdict in raw_verdicts.items()
+        if verdict == "uncertain"
+    }
+
+    artifacts = _production_artifacts(runtime_batches, candidates, verdicts)
+    artifact_scores = _match_production_artifacts(artifacts, units, candidates)
+    supported_artifacts = tuple(
+        artifact for artifact in artifacts if artifact.kind == "supported_citation"
+    )
+    supported_artifact_scores = _match_production_artifacts(
+        supported_artifacts,
+        units,
+        candidates,
+    )
 
     frontier_scores = _selection_scores(units, frontier_ids)
-    supported_scores = _selection_scores(units, supported_ids)
-    review_scores = _selection_scores(units, accepted_ids)
+    supported_scores = supported_artifact_scores["scores_by_unit"]
+    review_scores = artifact_scores["scores_by_unit"]
     frontier_unit_scores = [sum(scores) / len(scores) for scores in frontier_scores]
     review_unit_scores = [sum(scores) / len(scores) for scores in review_scores]
     unit_ratchet_regressions = sum(
@@ -966,6 +1376,7 @@ def evaluate(
                     )
 
     correct_supported = 0
+    raw_correct_supported = 0
     correct_review = 0
     correct_uncertain = 0
     expected_supported_members = 0
@@ -982,6 +1393,13 @@ def evaluate(
                 for candidate_id in matches
             )
             correct_supported += int(member_supported)
+            raw_correct_supported += int(
+                any(
+                    candidate_id in raw_supported_ids
+                    and expected_by_candidate[candidate_id] == "supported"
+                    for candidate_id in matches
+                )
+            )
             if member.expected_verdict == "supported":
                 expected_supported_members += 1
                 if not member_supported and any(
@@ -1043,15 +1461,38 @@ def evaluate(
     frontier_metrics = _recall_metrics(frontier_scores)
     supported_metrics = _recall_metrics(supported_scores)
     review_metrics = _recall_metrics(review_scores)
-    strict_supported_precision = _ratio(correct_supported, len(supported_ids))
-    recall_arm_precision = _ratio(correct_review, len(accepted_ids))
+    matched_supported_artifacts = len(supported_artifact_scores["matched_artifact_ids"])
+    matched_effective_artifacts = len(artifact_scores["matched_artifact_ids"])
+    supported_artifact_count = int(artifact_scores["supported_artifact_count"])
+    effective_artifact_count = int(artifact_scores["artifact_count"])
+    supported_artifact_precision = (
+        matched_supported_artifacts / supported_artifact_count
+        if supported_artifact_count
+        else 1.0
+    )
+    effective_artifact_precision = (
+        matched_effective_artifacts / effective_artifact_count
+        if effective_artifact_count
+        else 1.0
+    )
+    supported_member_count = len(supported_artifact_scores["matched_member_keys"])
+    effective_member_count = len(artifact_scores["matched_member_keys"])
+    semantic_member_count = sum(len(unit.members) for unit in units)
+    supported_member_recall = _ratio(
+        supported_member_count,
+        expected_supported_members,
+    )
+    effective_member_recall = _ratio(
+        effective_member_count,
+        semantic_member_count,
+    )
+    # Backward-compatible names now deliberately expose artifact-level values.
+    strict_supported_precision = supported_artifact_precision
+    recall_arm_precision = effective_artifact_precision
     uncertain_truth_precision = (
         _ratio(correct_uncertain, len(uncertain_ids)) if uncertain_ids else None
     )
-    supported_required_member_recall = _ratio(
-        correct_supported,
-        expected_supported_members,
-    )
+    supported_required_member_recall = supported_member_recall
     supported_to_uncertain_rate = _ratio(
         len(supported_to_uncertain_members),
         expected_supported_members,
@@ -1061,7 +1502,22 @@ def evaluate(
         for candidate_id in supported_ids
         if expected_verdict_by_candidate.get(candidate_id) == "uncertain"
     )
-    supported_overclaim_count = len(supported_ids) - correct_supported
+    raw_critical_calibration_error_candidates = sorted(
+        candidate_id
+        for candidate_id in raw_supported_ids
+        if expected_verdict_by_candidate.get(candidate_id) == "uncertain"
+    )
+    supported_overclaim_count = len(supported_artifact_scores["invalid_artifact_ids"])
+    raw_supported_overclaim_count = len(raw_supported_ids) - raw_correct_supported
+    effective_verdict_changes = {
+        (raw_verdicts[candidate_id], verdicts[candidate_id])
+        for candidate_id in verdicts
+        if raw_verdicts[candidate_id] != verdicts[candidate_id]
+    }
+    effective_verdict_change_count = sum(
+        raw_verdicts[candidate_id] != verdicts[candidate_id]
+        for candidate_id in verdicts
+    )
     default_negative_count = len(candidates) - len(matches_by_candidate)
     useful_record_recall = _ratio(recalled_useful_records, useful_records)
     gates = {
@@ -1076,17 +1532,31 @@ def evaluate(
         "useful_record_recall": useful_record_recall >= MIN_USEFUL_RECORD_RECALL,
         "supported_required_member_recall": supported_required_member_recall
         >= MIN_SUPPORTED_REQUIRED_MEMBER_RECALL,
+        "supported_member_recall": supported_member_recall
+        >= MIN_SUPPORTED_REQUIRED_MEMBER_RECALL,
         "supported_to_uncertain_rate": supported_to_uncertain_rate
         <= MAX_SUPPORTED_TO_UNCERTAIN_RATE,
         "strict_supported_precision": strict_supported_precision
         >= MIN_STRICT_SUPPORTED_PRECISION,
+        "supported_artifact_precision": supported_artifact_precision
+        >= MIN_STRICT_SUPPORTED_PRECISION,
         "recall_arm_precision": recall_arm_precision >= MIN_RECALL_ARM_PRECISION,
+        "effective_member_recall": effective_member_recall
+        >= MIN_END_TO_END_REQUIRED_MEMBER_RECALL,
+        "effective_artifact_precision": effective_artifact_precision
+        >= MIN_RECALL_ARM_PRECISION,
+        "uncertainty_hypothesis_purity": int(artifact_scores["impure_sidecar_count"])
+        == 0,
         "no_selected_noise": selected_noise_records == 0,
-        "no_duplicate_aliases": duplicate_alias_count == 0,
+        "no_redundant_artifacts": not artifact_scores["redundant_artifact_ids"],
+        # Compatibility key: aliases inside one sidecar hypothesis are no
+        # longer duplicates, but a second production artifact for one member is.
+        "no_duplicate_aliases": not artifact_scores["redundant_artifact_ids"],
         "no_supported_overclaims": supported_overclaim_count == 0,
         "no_critical_calibration_errors": not critical_calibration_error_candidates,
         "no_default_negative_supported": default_negative_supported == 0,
-        "no_default_negative_accepted": default_negative_accepted == 0,
+        # Compatibility key, now evaluated at artifact/hypothesis granularity.
+        "no_default_negative_accepted": not artifact_scores["invalid_artifact_ids"],
         "frontier_ratchet": (
             unit_ratchet_regressions == 0 and not member_ratchet_regressions
         ),
@@ -1094,25 +1564,10 @@ def evaluate(
         "frontier_member_ratchet": not member_ratchet_regressions,
     }
     return {
-        "run_provenance": {
-            "manifest_version": RUN_MANIFEST_VERSION,
-            "checkpoint_version": manifest.checkpoint_version,
-            "protocol_fingerprint": manifest.protocol_fingerprint,
-            "model": manifest.model,
-            "reasoning_effort": manifest.reasoning_effort,
-            "source_module_sha256": dict(manifest.source_module_sha256),
-            "artifact_sha256": {
-                "evaluator": manifest.evaluator_sha256,
-                "semantic_gold": manifest.semantic_gold_sha256,
-                "benchmark_builder": manifest.benchmark_builder_sha256,
-                "sample": manifest.sample_sha256,
-                "checkpoint": manifest.checkpoint_sha256,
-            },
-            "sample_record_count": manifest.sample_record_count,
-            "checkpoint_row_count": manifest.checkpoint_row_count,
-        },
+        "run_provenance": run_provenance,
         "records": len(samples),
         "useful_records": useful_records,
+        "recalled_useful_records": recalled_useful_records,
         "semantic_units": len(units),
         "semantic_members": sum(len(unit.members) for unit in units),
         "frontier_candidates": len(candidates),
@@ -1120,6 +1575,53 @@ def evaluate(
         "supported_candidates": len(supported_ids),
         "uncertain_candidates": len(uncertain_ids),
         "accepted_candidates": len(accepted_ids),
+        "raw_supported_candidates": len(raw_supported_ids),
+        "raw_uncertain_candidates": len(raw_uncertain_ids),
+        "production_artifacts": effective_artifact_count,
+        "supported_artifacts": supported_artifact_count,
+        "uncertainty_sidecars": int(artifact_scores["sidecar_count"]),
+        "uncertainty_hypotheses": int(artifact_scores["hypothesis_count"]),
+        "pure_uncertainty_sidecars": int(artifact_scores["pure_sidecar_count"]),
+        "impure_uncertainty_sidecars": int(artifact_scores["impure_sidecar_count"]),
+        "unmatched_uncertainty_hypotheses": int(
+            artifact_scores["unmatched_hypothesis_count"]
+        ),
+        "uncertainty_hypothesis_purity": (
+            int(artifact_scores["pure_sidecar_count"])
+            / int(artifact_scores["sidecar_count"])
+            if int(artifact_scores["sidecar_count"])
+            else 1.0
+        ),
+        "matched_artifacts": matched_effective_artifacts,
+        "redundant_artifacts": len(artifact_scores["redundant_artifact_ids"]),
+        "unmatched_artifacts": len(artifact_scores["invalid_artifact_ids"]),
+        "supported_redundant_artifacts": len(
+            supported_artifact_scores["redundant_artifact_ids"]
+        ),
+        "supported_unmatched_artifacts": len(
+            supported_artifact_scores["invalid_artifact_ids"]
+        ),
+        "missed_members": len(artifact_scores["missed_member_keys"]),
+        "missed_member_keys": sorted(
+            ":".join(member_key) for member_key in artifact_scores["missed_member_keys"]
+        ),
+        "matched_effective_member_keys": sorted(
+            ":".join(member_key)
+            for member_key in artifact_scores["matched_member_keys"]
+        ),
+        "matched_effective_members": [
+            {
+                "member_key": list(member_key),
+                "quality": quality,
+            }
+            for member_key, quality in sorted(
+                artifact_scores["matched_member_quality"].items()
+            )
+        ],
+        "effective_verdict_change_count": effective_verdict_change_count,
+        "effective_verdict_change_kinds": sorted(
+            f"{before}_to_{after}" for before, after in effective_verdict_changes
+        ),
         "frontier": frontier_metrics,
         "supported": supported_metrics,
         "review": review_metrics,
@@ -1129,18 +1631,32 @@ def evaluate(
         ),
         "useful_record_review_recall": useful_record_recall,
         "strict_supported_precision": strict_supported_precision,
+        "supported_artifact_precision": supported_artifact_precision,
+        "supported_member_recall": supported_member_recall,
         "supported_required_member_recall": supported_required_member_recall,
         "supported_to_uncertain_members": len(supported_to_uncertain_members),
         "supported_to_uncertain_rate": supported_to_uncertain_rate,
         "supported_to_uncertain_member_keys": sorted(supported_to_uncertain_members),
         "recall_arm_precision": recall_arm_precision,
+        "effective_artifact_precision": effective_artifact_precision,
+        "effective_member_recall": effective_member_recall,
         "uncertain_truth_precision": uncertain_truth_precision,
         "supported_overclaim_count": supported_overclaim_count,
+        "raw_supported_overclaim_count": raw_supported_overclaim_count,
         "critical_calibration_error_count": len(critical_calibration_error_candidates),
         "critical_calibration_error_candidates": (
             critical_calibration_error_candidates
         ),
-        "accepted_semantic_error_count": len(accepted_ids) - correct_review,
+        "raw_critical_calibration_error_count": len(
+            raw_critical_calibration_error_candidates
+        ),
+        "raw_critical_calibration_error_candidates": (
+            raw_critical_calibration_error_candidates
+        ),
+        "accepted_semantic_error_count": (
+            len(artifact_scores["redundant_artifact_ids"])
+            + len(artifact_scores["invalid_artifact_ids"])
+        ),
         "duplicate_alias_count": duplicate_alias_count,
         "verdict_calibration_mismatches": calibration_mismatches,
         "verdict_calibration_mismatch_members": sorted(calibration_mismatch_members),
@@ -1167,8 +1683,94 @@ def evaluate(
         ),
         "gates": gates,
         "candidate_gate_passed": all(gates.values()),
-        "private_content_printed": False,
     }
+
+
+_CLI_OMIT = object()
+
+
+def _aggregate_cli_value(value: Any) -> Any:
+    """Keep scalar aggregate structure while dropping identity-bearing arrays."""
+
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Mapping):
+        output: dict[str, Any] = {}
+        for key, nested in value.items():
+            filtered = _aggregate_cli_value(nested)
+            if filtered is not _CLI_OMIT:
+                output[str(key)] = filtered
+        return output
+    return _CLI_OMIT
+
+
+def _aggregate_cli_output(result: Mapping[str, Any]) -> dict[str, Any]:
+    filtered = _aggregate_cli_value(result)
+    if not isinstance(filtered, dict):
+        raise CandidateGoldError("candidate evaluation aggregate is malformed")
+    filtered["private_content_printed"] = False
+    return filtered
+
+
+def _assert_cli_aggregate_only(
+    output: Mapping[str, Any],
+    *,
+    samples: list[dict[str, Any]],
+    candidate_ids: set[str],
+) -> None:
+    """Fail closed if CLI output retains runtime identity or source content."""
+
+    def contains_sequence(value: Any) -> bool:
+        if isinstance(value, Mapping):
+            return any(contains_sequence(item) for item in value.values())
+        return isinstance(value, (list, tuple, set, frozenset))
+
+    if contains_sequence(output):
+        raise CandidateGoldError(
+            "candidate evaluation aggregate contains non-aggregate diagnostics"
+        )
+
+    sensitive_values = set(candidate_ids)
+    for sample in samples:
+        for key in ("sample_id", "text"):
+            value = sample.get(key)
+            if isinstance(value, str) and value:
+                sensitive_values.add(value)
+        gold = sample.get("gold")
+        if not isinstance(gold, Mapping):
+            continue
+        raw_units = gold.get("semantic_units")
+        if not isinstance(raw_units, list):
+            continue
+        for raw_unit in raw_units:
+            if not isinstance(raw_unit, Mapping):
+                continue
+            for key in ("unit_id", "truth"):
+                value = raw_unit.get(key)
+                if isinstance(value, str) and value:
+                    sensitive_values.add(value)
+            raw_members = raw_unit.get("members")
+            if not isinstance(raw_members, list):
+                continue
+            for raw_member in raw_members:
+                if not isinstance(raw_member, Mapping):
+                    continue
+                member_id = raw_member.get("member_id")
+                if isinstance(member_id, str) and member_id:
+                    sensitive_values.add(member_id)
+
+    serialized = json.dumps(
+        output,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    for value in sensitive_values:
+        encoded = json.dumps(value, ensure_ascii=False)[1:-1]
+        if encoded and encoded in serialized:
+            raise CandidateGoldError(
+                "candidate evaluation aggregate contains private runtime identity"
+            )
 
 
 def main() -> None:
@@ -1177,9 +1779,18 @@ def main() -> None:
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("run_manifest", type=Path)
     args = parser.parse_args()
+    result = evaluate(args.sample, args.checkpoint, args.run_manifest)
+    samples = _load_jsonl(args.sample)
+    _, candidates, _ = _runtime_batches(samples)
+    aggregate = _aggregate_cli_output(result)
+    _assert_cli_aggregate_only(
+        aggregate,
+        samples=samples,
+        candidate_ids=set(candidates),
+    )
     print(
         json.dumps(
-            evaluate(args.sample, args.checkpoint, args.run_manifest),
+            aggregate,
             sort_keys=True,
         )
     )

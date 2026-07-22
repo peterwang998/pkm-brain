@@ -4,7 +4,7 @@ import hashlib
 import json
 
 
-GMAIL_TEMPORAL_VERIFIER_POLICY_VERSION = "gmail_temporal_candidate_verifier_policy_v2"
+GMAIL_TEMPORAL_VERIFIER_POLICY_VERSION = "gmail_temporal_candidate_verifier_policy_v5"
 GMAIL_TEMPORAL_VERIFIER_MODEL = "gpt-5.6-luna"
 GMAIL_TEMPORAL_VERIFIER_REASONING_EFFORT = "medium"
 GMAIL_TEMPORAL_VERDICTS = ("supported", "uncertain", "unsupported")
@@ -56,6 +56,25 @@ closing predicates with their own adjacent dates are separate assertions, so do
 not keep only one of them. An explicit effective date for a consequential policy
 is a material state-change occurrence rather than publication metadata.
 
+Repeated direct schedules are also separate assertions. For each materially
+useful local clause of the form "[event] is scheduled for [date/time]", support
+the candidate that binds that clause's event, expression, and scheduled lifecycle.
+Do this independently for later clauses in the same dense sentence. A missing
+timezone, local-time wording, or null normalized value still requires downstream
+deferral but is not evidence against that directly stated schedule.
+
+Do not erase an explicit lifecycle by supporting its lifecycle-free base instead.
+Within one parent cluster, when the source directly states scheduled, cancelled,
+or completed, prefer the candidate carrying that exact lifecycle even when its
+normalization is deferred. If the lifecycle attachment itself is genuinely
+uncertain, the lifecycle-free base may be uncertain but must not be supported.
+This preference applies to lifecycle refinements of the same assertion, not to
+independently asserted actual-occurrence semantics. When the source directly says
+an event occurred, happened, or took place at a time, that lifecycle-free actual
+occurrence is a separate useful assertion from a later clause saying the event
+was completed or cancelled. Judge both direct assertions on their own evidence;
+the explicit lifecycle must not suppress the directly asserted actual occurrence.
+
 Material personal assertions include direct commitments, meetings, interviews,
 deadlines, active-project milestones, and consequential legal, financial,
 security, medical, or travel timing. Suppress promotions, newsletters,
@@ -75,7 +94,14 @@ binding ID are lifecycle variants of one expression and subject. Candidates
 sharing a parent cluster ID are aliases for one subject, including fragments on
 different pages. Across the complete plan, at most one candidate per binding ID
 and at most one candidate per parent cluster ID may be supported or uncertain.
-Prefer uncertain over guessing. Production validation requires
+Multiple alias candidates in one parent cluster must not be independently emitted
+as supported or uncertain. When no exact alias can be selected, deterministic
+aggregation may group the unresolved aliases into one cluster-level uncertainty;
+that grouping is not permission to accept every alias candidate.
+Those limits are per binding or parent cluster, never one candidate per page,
+message, or prompt. Do not suppress one independently supported clause because
+another cluster or page is supported. Prefer uncertain over guessing. Production
+validation requires
 complete page coverage, independently authorizes exact supported candidates,
 represents unresolved clusters without exact citations, propagates deterministic
 deferral, and keeps every result review-only and non-routable."""

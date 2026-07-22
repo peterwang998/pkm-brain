@@ -213,6 +213,19 @@ def _oracle_verdicts(
     return verdicts, selected_by_member
 
 
+def _prevalidated_result(
+    sample_path: Path,
+    verdicts: dict[str, str],
+) -> dict[str, Any]:
+    return candidate_evaluator.evaluate(
+        sample_path,
+        None,
+        None,
+        prevalidated_verdict_maps=(verdicts, verdicts),
+        provenance_override={"single_run": False, "test_fixture": True},
+    )
+
+
 def test_synthetic_gate_uses_embedded_record_gold_and_sol_proposal_labels(
     tmp_path: Path,
 ) -> None:
@@ -355,7 +368,7 @@ def test_candidate_gold_oracle_covers_units_without_alias_inflation(
     assert result["useful_records"] == 27
     assert result["semantic_units"] == 34
     assert result["semantic_members"] == 36
-    assert result["frontier_candidates"] == 98
+    assert result["frontier_candidates"] == 96
     assert result["frontier"]["any_unit_recall"] == 1.0
     assert result["frontier"]["required_member_recall"] == 1.0
     assert result["frontier"]["complete_unit_recall"] == 1.0
@@ -366,6 +379,487 @@ def test_candidate_gold_oracle_covers_units_without_alias_inflation(
     assert result["frontier_member_ratchet_regressions"] == 0
     assert result["frontier_upgraded_units"] == []
     assert result["candidate_gate_passed"] is True
+
+
+def test_artifact_scoring_collapses_same_signature_sidecar_aliases(
+    tmp_path: Path,
+) -> None:
+    (
+        sample_path,
+        _,
+        _,
+        _,
+        _,
+        candidates,
+        _,
+        units,
+        _,
+    ) = _candidate_fixture(tmp_path)
+    oracle, selected = _oracle_verdicts(candidates, units)
+    completion = next(
+        member
+        for unit in units
+        for member in unit.members
+        if member.key == ("syn_lifecycle_06", "review_meeting_completion", "completion")
+    )
+    partial_aliases = [
+        candidate_id
+        for candidate_id, quality in candidate_evaluator._member_matches(
+            completion
+        ).items()
+        if quality == 0.5
+    ]
+    assert len(partial_aliases) == 2
+    assert (
+        len(
+            {
+                candidate_evaluator._artifact_hypothesis(candidates[candidate_id])
+                for candidate_id in partial_aliases
+            }
+        )
+        == 1
+    )
+
+    one_alias = dict(oracle)
+    all_aliases = dict(oracle)
+    one_alias[selected[completion.key]] = "unsupported"
+    all_aliases[selected[completion.key]] = "unsupported"
+    one_alias[partial_aliases[0]] = "uncertain"
+    for candidate_id in partial_aliases:
+        all_aliases[candidate_id] = "uncertain"
+
+    one_result = _prevalidated_result(sample_path, one_alias)
+    all_result = _prevalidated_result(sample_path, all_aliases)
+
+    for key in (
+        "production_artifacts",
+        "uncertainty_sidecars",
+        "uncertainty_hypotheses",
+        "matched_artifacts",
+        "redundant_artifacts",
+        "unmatched_artifacts",
+        "effective_artifact_precision",
+        "effective_member_recall",
+    ):
+        assert all_result[key] == one_result[key]
+    assert all_result["uncertainty_hypotheses"] == 5
+    assert all_result["uncertainty_hypothesis_purity"] == 1.0
+
+
+def test_artifact_scoring_collapsed_alias_uses_least_specific_grounding(
+    tmp_path: Path,
+) -> None:
+    (
+        sample_path,
+        _,
+        _,
+        _,
+        _,
+        candidates,
+        _,
+        units,
+        _,
+    ) = _candidate_fixture(tmp_path)
+    oracle, selected = _oracle_verdicts(candidates, units)
+    member = next(
+        member
+        for unit in units
+        for member in unit.members
+        if member.key == ("syn_clear_05", "cedar_forum_schedule", "schedule")
+    )
+    matches = candidate_evaluator._member_matches(member)
+    aliases_by_hypothesis: dict[tuple[Any, ...], list[str]] = {}
+    for candidate_id in matches:
+        hypothesis = candidate_evaluator._artifact_hypothesis(candidates[candidate_id])
+        aliases_by_hypothesis.setdefault(hypothesis, []).append(candidate_id)
+    mixed_aliases = next(
+        candidate_ids
+        for candidate_ids in aliases_by_hypothesis.values()
+        if {matches[candidate_id] for candidate_id in candidate_ids} == {0.5, 1.0}
+    )
+    exact = next(
+        candidate_id for candidate_id in mixed_aliases if matches[candidate_id] == 1.0
+    )
+    partial = next(
+        candidate_id for candidate_id in mixed_aliases if matches[candidate_id] == 0.5
+    )
+
+    partial_only = dict(oracle)
+    partial_only[selected[member.key]] = "unsupported"
+    partial_only[partial] = "uncertain"
+    both_aliases = dict(partial_only)
+    both_aliases[exact] = "uncertain"
+
+    partial_result = _prevalidated_result(sample_path, partial_only)
+    both_result = _prevalidated_result(sample_path, both_aliases)
+    partial_quality = {
+        tuple(item["member_key"]): item["quality"]
+        for item in partial_result["matched_effective_members"]
+    }
+    both_quality = {
+        tuple(item["member_key"]): item["quality"]
+        for item in both_result["matched_effective_members"]
+    }
+
+    assert partial_quality[member.key] == 0.5
+    assert both_quality[member.key] == 0.5
+    assert (
+        both_result["review"]["exact_units"] == partial_result["review"]["exact_units"]
+    )
+    assert (
+        both_result["uncertainty_hypotheses"]
+        == partial_result["uncertainty_hypotheses"]
+    )
+
+
+def test_artifact_scoring_rejects_unmatched_alias_in_collapsed_hypothesis(
+    tmp_path: Path,
+) -> None:
+    (
+        _,
+        _,
+        _,
+        _,
+        _,
+        candidates,
+        _,
+        units,
+        _,
+    ) = _candidate_fixture(tmp_path)
+    member = next(
+        member
+        for unit in units
+        for member in unit.members
+        if member.key == ("syn_clear_05", "cedar_forum_schedule", "schedule")
+    )
+    matches = candidate_evaluator._member_matches(member)
+    aliases_by_hypothesis: dict[tuple[Any, ...], list[str]] = {}
+    for candidate_id in matches:
+        hypothesis = candidate_evaluator._artifact_hypothesis(candidates[candidate_id])
+        aliases_by_hypothesis.setdefault(hypothesis, []).append(candidate_id)
+    mixed_aliases = next(
+        candidate_ids
+        for candidate_ids in aliases_by_hypothesis.values()
+        if {matches[candidate_id] for candidate_id in candidate_ids} == {0.5, 1.0}
+    )
+    exact = next(
+        candidate_id for candidate_id in mixed_aliases if matches[candidate_id] == 1.0
+    )
+    partial = next(
+        candidate_id for candidate_id in mixed_aliases if matches[candidate_id] == 0.5
+    )
+    exact_only_member = candidate_evaluator.GoldMember(
+        key=member.key,
+        expected_verdict=member.expected_verdict,
+        baseline_grade=member.baseline_grade,
+        alternatives=(
+            candidate_evaluator.GoldAlternative(
+                quality="exact",
+                expected_verdict=member.expected_verdict,
+                candidate_ids=frozenset({exact}),
+            ),
+        ),
+    )
+    artifact = candidate_evaluator.ProductionArtifact(
+        artifact_id="uncertainty:test",
+        kind="uncertainty_sidecar",
+        candidate_ids=(exact, partial),
+        hypotheses=(candidate_evaluator._artifact_hypothesis(candidates[exact]),),
+    )
+
+    scores = candidate_evaluator._match_production_artifacts(
+        (artifact,),
+        (
+            candidate_evaluator.GoldUnit(
+                key=(member.key[0], member.key[1]),
+                baseline_grade="exact",
+                members=(exact_only_member,),
+            ),
+        ),
+        candidates,
+    )
+
+    assert scores["matched_artifact_ids"] == set()
+    assert scores["invalid_artifact_ids"] == {artifact.artifact_id}
+    assert scores["unmatched_hypothesis_count"] == 1
+
+
+def test_artifact_scoring_uses_least_specific_pure_sidecar_hypothesis(
+    tmp_path: Path,
+) -> None:
+    (
+        sample_path,
+        _,
+        _,
+        _,
+        _,
+        candidates,
+        _,
+        units,
+        _,
+    ) = _candidate_fixture(tmp_path)
+    oracle, selected = _oracle_verdicts(candidates, units)
+    member = next(
+        member
+        for unit in units
+        for member in unit.members
+        if member.key
+        == ("syn_mixed_01", "atlas_interview_current_schedule", "schedule")
+    )
+    matches = candidate_evaluator._member_matches(member)
+    expected = candidate_evaluator._member_expected_verdicts(member)
+    exact = next(
+        candidate_id
+        for candidate_id, quality in matches.items()
+        if quality == 1.0 and expected[candidate_id] == "supported"
+    )
+    partial = next(
+        candidate_id for candidate_id, quality in matches.items() if quality == 0.5
+    )
+    assert candidate_evaluator._artifact_hypothesis(
+        candidates[exact]
+    ) != candidate_evaluator._artifact_hypothesis(candidates[partial])
+    verdicts = dict(oracle)
+    verdicts[selected[member.key]] = "unsupported"
+    verdicts[exact] = "uncertain"
+    verdicts[partial] = "uncertain"
+
+    result = _prevalidated_result(sample_path, verdicts)
+    matched = {
+        tuple(item["member_key"]): item["quality"]
+        for item in result["matched_effective_members"]
+    }
+
+    assert matched[member.key] == 0.5
+    assert result["impure_uncertainty_sidecars"] == 0
+
+
+def test_artifact_scoring_rejects_cross_member_sidecar(
+    tmp_path: Path,
+) -> None:
+    (
+        sample_path,
+        _,
+        _,
+        _,
+        runtime_batches,
+        candidates,
+        _,
+        units,
+        _,
+    ) = _candidate_fixture(tmp_path)
+    oracle, selected = _oracle_verdicts(candidates, units)
+    occurrence = next(
+        member
+        for unit in units
+        for member in unit.members
+        if member.key == ("syn_lifecycle_06", "review_meeting_occurrence", "occurrence")
+    )
+    completion = next(
+        member
+        for unit in units
+        for member in unit.members
+        if member.key == ("syn_lifecycle_06", "review_meeting_completion", "completion")
+    )
+    candidate_to_cluster = {
+        candidate_id: cluster.cluster_id
+        for runtime_batch in runtime_batches
+        for page in runtime_batch.pages
+        for cluster in page.clusters
+        for candidate_id in cluster.candidate_ids
+    }
+    partial_completion = next(
+        candidate_id
+        for candidate_id, quality in candidate_evaluator._member_matches(
+            completion
+        ).items()
+        if quality == 0.5
+    )
+    occurrence_candidate = next(
+        candidate_id
+        for candidate_id in candidate_evaluator._member_matches(occurrence)
+        if candidate_to_cluster[candidate_id]
+        == candidate_to_cluster[partial_completion]
+    )
+    verdicts = dict(oracle)
+    verdicts[selected[occurrence.key]] = "unsupported"
+    verdicts[selected[completion.key]] = "unsupported"
+    verdicts[occurrence_candidate] = "uncertain"
+    verdicts[partial_completion] = "uncertain"
+
+    result = _prevalidated_result(sample_path, verdicts)
+
+    assert result["impure_uncertainty_sidecars"] == 1
+    assert result["unmatched_artifacts"] == 1
+    assert result["effective_member_recall"] == 34 / 36
+    assert result["missed_members"] == 2
+    assert result["gates"]["uncertainty_hypothesis_purity"] is False
+    assert result["candidate_gate_passed"] is False
+
+
+def test_artifact_scoring_rejects_unmatched_sidecar_hypothesis(
+    tmp_path: Path,
+) -> None:
+    (
+        sample_path,
+        _,
+        _,
+        _,
+        runtime_batches,
+        candidates,
+        _,
+        units,
+        _,
+    ) = _candidate_fixture(tmp_path)
+    oracle, selected = _oracle_verdicts(candidates, units)
+    member = next(
+        member
+        for unit in units
+        for member in unit.members
+        if member.key == ("syn_clear_01", "nimbus_interview_schedule", "schedule")
+    )
+    candidate_to_cluster = {
+        candidate_id: cluster.cluster_id
+        for runtime_batch in runtime_batches
+        for page in runtime_batch.pages
+        for cluster in page.clusters
+        for candidate_id in cluster.candidate_ids
+    }
+    gold_ids = set(candidate_evaluator._member_matches(member))
+    selected_id = selected[member.key]
+    unmatched = next(
+        candidate_id
+        for candidate_id in candidates
+        if candidate_id not in gold_ids
+        and candidate_to_cluster[candidate_id] == candidate_to_cluster[selected_id]
+    )
+    verdicts = dict(oracle)
+    verdicts[selected_id] = "uncertain"
+    verdicts[unmatched] = "uncertain"
+
+    result = _prevalidated_result(sample_path, verdicts)
+
+    assert result["impure_uncertainty_sidecars"] == 1
+    assert result["unmatched_uncertainty_hypotheses"] == 1
+    assert result["unmatched_artifacts"] == 1
+    assert ":".join(member.key) in result["missed_member_keys"]
+    assert result["gates"]["uncertainty_hypothesis_purity"] is False
+
+
+def test_artifact_scoring_counts_second_supported_citation_as_redundant(
+    tmp_path: Path,
+) -> None:
+    (
+        sample_path,
+        _,
+        _,
+        _,
+        _,
+        candidates,
+        _,
+        units,
+        _,
+    ) = _candidate_fixture(tmp_path)
+    oracle, _ = _oracle_verdicts(candidates, units)
+    member = next(
+        member
+        for unit in units
+        for member in unit.members
+        if member.key == ("syn_lifecycle_06", "review_meeting_occurrence", "occurrence")
+    )
+    exact_ids = [
+        candidate_id
+        for candidate_id, quality in candidate_evaluator._member_matches(member).items()
+        if quality == 1.0
+    ]
+    assert len(exact_ids) == 2
+    verdicts = dict(oracle)
+    for candidate_id in exact_ids:
+        verdicts[candidate_id] = "supported"
+
+    result = _prevalidated_result(sample_path, verdicts)
+
+    assert result["supported_redundant_artifacts"] == 1
+    assert result["redundant_artifacts"] == 1
+    assert result["supported_artifact_precision"] == 32 / 33
+    assert result["gates"]["no_redundant_artifacts"] is False
+    assert result["candidate_gate_passed"] is False
+
+
+def test_artifact_scoring_exact_supported_beats_partial_sidecar_once(
+    tmp_path: Path,
+) -> None:
+    (
+        sample_path,
+        _,
+        _,
+        _,
+        _,
+        candidates,
+        _,
+        units,
+        _,
+    ) = _candidate_fixture(tmp_path)
+    oracle, selected = _oracle_verdicts(candidates, units)
+    occurrence = next(
+        member
+        for unit in units
+        for member in unit.members
+        if member.key == ("syn_lifecycle_06", "review_meeting_occurrence", "occurrence")
+    )
+    completion = next(
+        member
+        for unit in units
+        for member in unit.members
+        if member.key == ("syn_lifecycle_06", "review_meeting_completion", "completion")
+    )
+    partial_aliases = [
+        candidate_id
+        for candidate_id, quality in candidate_evaluator._member_matches(
+            completion
+        ).items()
+        if quality == 0.5
+    ]
+    verdicts = dict(oracle)
+    verdicts[selected[occurrence.key]] = "unsupported"
+    for candidate_id in partial_aliases:
+        verdicts[candidate_id] = "uncertain"
+    # Mirror the v17 artifact mix exactly: 30 citations plus six singleton
+    # sidecars, while leaving the extra completion artifact and missing
+    # occurrence unchanged.
+    verdicts[selected[("syn_clear_01", "nimbus_interview_schedule", "schedule")]] = (
+        "uncertain"
+    )
+
+    result = _prevalidated_result(sample_path, verdicts)
+    reversed_result = _prevalidated_result(
+        sample_path,
+        dict(reversed(tuple(verdicts.items()))),
+    )
+
+    assert result["production_artifacts"] == 36
+    assert result["supported_artifacts"] == 30
+    assert result["uncertainty_sidecars"] == 6
+    assert result["uncertainty_hypotheses"] == 6
+    assert result["matched_artifacts"] == 35
+    assert result["redundant_artifacts"] == 1
+    assert result["unmatched_artifacts"] == 0
+    assert result["effective_artifact_precision"] == 35 / 36
+    assert result["effective_member_recall"] == 35 / 36
+    assert result["missed_member_keys"] == [
+        "syn_lifecycle_06:review_meeting_occurrence:occurrence"
+    ]
+    assert result["gates"]["no_redundant_artifacts"] is False
+    assert result["gates"]["no_duplicate_aliases"] is False
+    assert result["candidate_gate_passed"] is False
+    for key in (
+        "matched_artifacts",
+        "redundant_artifacts",
+        "effective_artifact_precision",
+        "effective_member_recall",
+        "missed_member_keys",
+    ):
+        assert reversed_result[key] == result[key]
 
 
 def test_candidate_gold_rejects_checkpoint_without_exact_provenance_schema(
@@ -622,7 +1116,7 @@ def test_candidate_gold_rejects_nearly_all_supported_truth_as_uncertain(
     assert result["candidate_gate_passed"] is False
 
 
-def test_candidate_gold_allows_bounded_supported_to_uncertain_underconfidence(
+def test_candidate_gold_rejects_underconfidence_below_personal_release_recall(
     tmp_path: Path,
 ) -> None:
     (
@@ -661,9 +1155,9 @@ def test_candidate_gold_allows_bounded_supported_to_uncertain_underconfidence(
     assert demoted == 6
     assert result["supported_required_member_recall"] == 26 / 32
     assert result["supported_to_uncertain_rate"] == 6 / 32
-    assert result["gates"]["supported_required_member_recall"] is True
+    assert result["gates"]["supported_required_member_recall"] is False
     assert result["gates"]["supported_to_uncertain_rate"] is True
-    assert result["candidate_gate_passed"] is True
+    assert result["candidate_gate_passed"] is False
 
 
 def test_candidate_gold_rejects_expected_uncertain_promoted_to_supported(
@@ -709,6 +1203,134 @@ def test_candidate_gold_rejects_expected_uncertain_promoted_to_supported(
     assert result["gates"]["no_supported_overclaims"] is False
     assert result["gates"]["no_critical_calibration_errors"] is False
     assert result["candidate_gate_passed"] is False
+
+
+def test_candidate_gold_scores_effective_lifecycle_calibration(
+    tmp_path: Path,
+) -> None:
+    (
+        sample_path,
+        checkpoint_path,
+        manifest_path,
+        _,
+        _,
+        candidates,
+        pages,
+        units,
+        provenance,
+    ) = _candidate_fixture(tmp_path)
+    verdicts, selected_by_member = _oracle_verdicts(candidates, units)
+    member = next(
+        member
+        for unit in units
+        for member in unit.members
+        if member.key == ("syn_dense_01", "dense_beta_workshop", "schedule")
+    )
+    exact_candidate_id = selected_by_member[member.key]
+    expected_by_candidate = candidate_evaluator._member_expected_verdicts(member)
+    base_candidate_id = next(
+        candidate_id
+        for candidate_id in candidate_evaluator._member_matches(member)
+        if expected_by_candidate[candidate_id] == "uncertain"
+        and candidates[candidate_id].candidate.lifecycle == "none"
+        and candidates[candidate_id].subject_surface.lower() == "workshop"
+    )
+    verdicts[exact_candidate_id] = "unsupported"
+    verdicts[base_candidate_id] = "supported"
+    _write_candidate_evidence(
+        sample_path=sample_path,
+        checkpoint_path=checkpoint_path,
+        manifest_path=manifest_path,
+        pages=pages,
+        verdicts=verdicts,
+        provenance=provenance,
+    )
+
+    result = candidate_evaluator.evaluate(
+        sample_path,
+        checkpoint_path,
+        manifest_path,
+    )
+
+    assert result["raw_supported_overclaim_count"] == 1
+    assert result["raw_critical_calibration_error_count"] == 1
+    assert result["effective_verdict_change_count"] == 1
+    assert result["effective_verdict_change_kinds"] == ["supported_to_uncertain"]
+    assert result["supported_overclaim_count"] == 0
+    assert result["critical_calibration_error_count"] == 0
+    assert result["raw_supported_candidates"] == result["supported_candidates"] + 1
+    assert result["review"]["required_member_recall"] == 1.0
+    assert result["candidate_gate_passed"] is True
+
+
+def test_candidate_gold_cli_prints_only_aggregate_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (
+        sample_path,
+        checkpoint_path,
+        manifest_path,
+        samples,
+        _,
+        candidates,
+        pages,
+        units,
+        provenance,
+    ) = _candidate_fixture(tmp_path)
+    verdicts, selected_by_member = _oracle_verdicts(candidates, units)
+    uncertain_member = next(
+        member
+        for unit in units
+        for member in unit.members
+        if member.expected_verdict == "uncertain"
+    )
+    critical_candidate_id = selected_by_member[uncertain_member.key]
+    verdicts[critical_candidate_id] = "supported"
+    _write_candidate_evidence(
+        sample_path=sample_path,
+        checkpoint_path=checkpoint_path,
+        manifest_path=manifest_path,
+        pages=pages,
+        verdicts=verdicts,
+        provenance=provenance,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "evaluate_gmail_temporal_candidate_gold.py",
+            str(sample_path),
+            str(checkpoint_path),
+            str(manifest_path),
+        ],
+    )
+
+    candidate_evaluator.main()
+
+    printed = json.loads(capsys.readouterr().out)
+    serialized = json.dumps(printed, ensure_ascii=False, sort_keys=True)
+
+    def contains_sequence(value: Any) -> bool:
+        if isinstance(value, dict):
+            return any(contains_sequence(item) for item in value.values())
+        return isinstance(value, list)
+
+    assert printed["private_content_printed"] is False
+    assert printed["critical_calibration_error_count"] == 1
+    assert "critical_calibration_error_candidates" not in printed
+    assert "matched_effective_member_keys" not in printed
+    assert "matched_effective_members" not in printed
+    assert contains_sequence(printed) is False
+    assert critical_candidate_id not in serialized
+    for sample in samples:
+        assert json.dumps(sample["sample_id"])[1:-1] not in serialized
+        assert json.dumps(sample["text"])[1:-1] not in serialized
+        for unit in sample["gold"]["semantic_units"]:
+            assert json.dumps(unit["unit_id"])[1:-1] not in serialized
+            for member in unit["members"]:
+                assert json.dumps(member["member_id"])[1:-1] not in serialized
 
 
 @pytest.mark.parametrize(

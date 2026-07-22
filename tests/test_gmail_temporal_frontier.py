@@ -6,21 +6,29 @@ from dataclasses import FrozenInstanceError, asdict, replace
 import pytest
 
 from pkm_brain.gmail_temporal_batching import (
+    GMAIL_TEMPORAL_SINGLETON_EVENT_FALLBACK_DIAGNOSTIC,
     GmailTemporalBatchCaps,
     plan_gmail_temporal_selector_batches,
 )
 from pkm_brain.gmail_temporal_frontier import (
     GmailTemporalCandidatePageVerdicts,
     GmailTemporalCandidateVerdict,
+    GmailTemporalCandidateEnsembleVerdictSet,
     GmailTemporalFrontierError,
+    _canonicalize_scope_conflicted_lifecycle_review,
+    _explicit_lifecycle_subsumes_base,
+    _is_direct_actual_endpoint,
     build_gmail_temporal_candidate_frontier,
     gmail_temporal_candidate_frontier_payload,
+    gmail_temporal_candidate_ensemble_policy_fingerprint,
     gmail_temporal_candidate_page_payload,
     plan_gmail_temporal_candidate_pages,
     validate_gmail_temporal_candidate_page_choice,
+    validate_gmail_temporal_candidate_ensemble_verdict_set,
     validate_gmail_temporal_candidate_verdict_set,
 )
 from pkm_brain.gmail_temporal_leads import analyze_gmail_temporal_leads
+from pkm_brain.gmail_temporal_selection import GMAIL_TEMPORAL_HARD_SCOPE_BLOCKERS
 
 
 ANCHOR = "2027-05-01T10:00:00-07:00"
@@ -133,6 +141,83 @@ def test_deferred_lifecycle_retains_base_for_recall() -> None:
 
     assert {item.lifecycle for item in frontier.candidates} == {"none", "scheduled"}
     assert all(item.requires_defer is True for item in frontier.candidates)
+
+
+@pytest.mark.parametrize(
+    ("admitted", "rescue", "expected_rescue_blocker"),
+    (
+        (True, False, False),
+        (False, True, True),
+    ),
+)
+def test_singleton_cross_segment_event_candidate_is_always_deferred(
+    admitted: bool,
+    rescue: bool,
+    expected_rescue_blocker: bool,
+) -> None:
+    text = "The workshop update is ready. May 14, 2027."
+    analysis = analyze_gmail_temporal_leads(
+        text=text,
+        message_internal_at=ANCHOR,
+        fact_admitted=admitted,
+        temporal_review_rescue=rescue,
+        chunk_id="synthetic-singleton-cross-segment",
+    )
+    plan = plan_gmail_temporal_selector_batches(text=text, analysis=analysis)
+    batch = plan.batches[0]
+
+    frontier = build_gmail_temporal_candidate_frontier(
+        analysis=analysis,
+        batch=batch,
+    )
+
+    assert GMAIL_TEMPORAL_SINGLETON_EVENT_FALLBACK_DIAGNOSTIC in batch.diagnostics
+    assert frontier.complete is True
+    assert len(frontier.candidates) == 1
+    candidate = frontier.candidates[0]
+    assert candidate.subject_mention_id == analysis.leads[0].mention_id
+    assert candidate.selected_lead_id == analysis.leads[0].lead_id
+    assert candidate.supporting_lead_present is True
+    assert candidate.relation == "occurrence"
+    assert candidate.lifecycle == "none"
+    assert candidate.requires_defer is True
+    assert candidate.routable is False
+    assert "field_near_review_only" in candidate.blockers
+    assert (
+        "temporal_review_rescue_only" in candidate.blockers
+    ) is expected_rescue_blocker
+    assert not GMAIL_TEMPORAL_HARD_SCOPE_BLOCKERS.intersection(candidate.blockers)
+
+    page_plan = plan_gmail_temporal_candidate_pages(
+        analysis=analysis,
+        batch=batch,
+    )
+    verdict_set = validate_gmail_temporal_candidate_verdict_set(
+        analysis=analysis,
+        batch=batch,
+        plan=page_plan,
+        rows=page_verdict_rows(
+            page_plan,
+            overrides={candidate.candidate_id: "supported"},
+        ),
+    )
+    assert verdict_set.supported_candidate_ids == (candidate.candidate_id,)
+    assert verdict_set.requires_defer is True
+    assert all(item.routable is False for item in verdict_set.supported_citations)
+
+
+def test_singleton_cross_segment_action_does_not_enter_frontier() -> None:
+    text = "Please submit the form. May 14, 2027."
+    analysis, plan = analyze_and_plan(text)
+    batch = plan.batches[0]
+
+    frontier = build_gmail_temporal_candidate_frontier(
+        analysis=analysis,
+        batch=batch,
+    )
+
+    assert GMAIL_TEMPORAL_SINGLETON_EVENT_FALLBACK_DIAGNOSTIC not in batch.diagnostics
+    assert frontier.candidates == ()
 
 
 def test_terminal_lifecycle_keeps_distinct_direct_actual_occurrence() -> None:
@@ -254,6 +339,27 @@ def test_frontier_reports_candidate_endpoint_truncation_without_silent_loss() ->
     assert frontier.omitted_candidate_mention_count > 0
     assert frontier.complete is False
     assert len(frontier.candidates) == 1
+
+
+def test_frontier_is_complete_when_artifacts_yield_to_citable_bridges() -> None:
+    text = (
+        "Subject: Cancelled Planning Meeting\n\n"
+        "Email calendar invitation attachment document link agenda "
+        "Meeting May 14, 2027."
+    )
+    analysis, plan = analyze_and_plan(
+        text,
+        caps=GmailTemporalBatchCaps(max_mentions_per_batch=4),
+    )
+
+    frontier = build_gmail_temporal_candidate_frontier(
+        analysis=analysis,
+        batch=plan.batches[0],
+    )
+
+    assert frontier.candidates
+    assert frontier.omitted_candidate_mention_count == 0
+    assert frontier.complete is True
 
 
 def test_frontier_reports_subject_bridge_hidden_by_context_cap() -> None:
@@ -732,6 +838,283 @@ def test_anaphoric_completion_has_an_independent_frontier_and_cluster() -> None:
     )
 
 
+@pytest.mark.parametrize("raw_verdict", ("uncertain", "supported"))
+def test_scope_conflicted_completion_review_canonicalizes_to_direct_occurrence(
+    raw_verdict: str,
+) -> None:
+    text = (
+        "The review meeting took place on August 9, 2027 and was completed "
+        "that afternoon."
+    )
+    analysis, plan = analyze_and_plan(text)
+    date_expression = next(
+        item for item in analysis.expressions if item.form == "explicit_date"
+    )
+    batch = next(
+        item
+        for item in plan.batches
+        if item.expressions[0].expression_id == date_expression.expression_id
+    )
+    frontier = build_gmail_temporal_candidate_frontier(
+        analysis=analysis,
+        batch=batch,
+    )
+    meeting = next(
+        item
+        for item in analysis.mentions
+        if item.mention_type == "event"
+        and text[item.start : item.end].casefold() == "meeting"
+    )
+    occurrence = next(
+        candidate
+        for candidate in frontier.candidates
+        if (
+            candidate.subject_mention_id == meeting.mention_id
+            and candidate.lifecycle == "none"
+            and candidate.relation == "occurrence"
+            and candidate.kind == "actual"
+        )
+    )
+    scope_conflicted = next(
+        candidate
+        for candidate in frontier.candidates
+        if candidate.binding_id == occurrence.binding_id
+        and candidate.lifecycle == "unknown"
+    )
+    direct_lead = next(
+        item for item in analysis.leads if item.lead_id == occurrence.selected_lead_id
+    )
+    page_plan = plan_gmail_temporal_candidate_pages(
+        analysis=analysis,
+        batch=batch,
+    )
+
+    assert occurrence.blockers == ()
+    assert occurrence.requires_defer is False
+    assert direct_lead.association_mode == "direct_grammar"
+    assert direct_lead.confidence_tier == "strict_direct"
+    assert direct_lead.blockers == ()
+    assert {
+        "lifecycle_expression_scope_conflict",
+        "lifecycle_subject_binding_unverified",
+    } <= set(scope_conflicted.blockers)
+
+    result = validate_gmail_temporal_candidate_verdict_set(
+        analysis=analysis,
+        batch=batch,
+        plan=page_plan,
+        rows=page_verdict_rows(
+            page_plan,
+            overrides={scope_conflicted.candidate_id: raw_verdict},
+        ),
+    )
+
+    assert result.supported_candidate_ids == ()
+    assert result.supported_citations == ()
+    assert result.unsupported_candidate_count == len(frontier.candidates) - 1
+    assert len(result.uncertain_clusters) == 1
+    uncertainty = result.uncertain_clusters[0]
+    assert uncertainty.plausible_candidate_ids == (occurrence.candidate_id,)
+    assert uncertainty.reason == "scope_conflicted_lifecycle_review_canonicalized"
+    assert result.requires_defer is True
+
+
+@pytest.mark.parametrize(
+    "near_miss",
+    (
+        "missing_expression_scope_blocker",
+        "missing_subject_binding_blocker",
+        "nonactual_kind",
+        "nonoccurrence_relation",
+        "nonstrict_lead",
+        "nondirect_lead",
+        "different_binding",
+        "different_expression",
+        "different_normalized_value",
+        "blocked_occurrence",
+        "multiple_accepted_candidates",
+        "scheduled",
+        "cancelled",
+        "completed",
+    ),
+)
+def test_scope_conflicted_lifecycle_review_canonicalization_refuses_near_misses(
+    near_miss: str,
+) -> None:
+    text = (
+        "The review meeting took place on August 9, 2027 and was completed "
+        "that afternoon."
+    )
+    analysis, plan = analyze_and_plan(text)
+    date_expression = next(
+        item for item in analysis.expressions if item.form == "explicit_date"
+    )
+    batch = next(
+        item
+        for item in plan.batches
+        if item.expressions[0].expression_id == date_expression.expression_id
+    )
+    frontier = build_gmail_temporal_candidate_frontier(
+        analysis=analysis,
+        batch=batch,
+    )
+    occurrence = next(
+        candidate
+        for candidate in frontier.candidates
+        if not candidate.blockers
+        and candidate.lifecycle == "none"
+        and candidate.relation == "occurrence"
+        and candidate.kind == "actual"
+    )
+    scope_conflicted = next(
+        candidate
+        for candidate in frontier.candidates
+        if candidate.binding_id == occurrence.binding_id
+        and candidate.lifecycle == "unknown"
+    )
+    page_plan = plan_gmail_temporal_candidate_pages(
+        analysis=analysis,
+        batch=batch,
+    )
+    ((_, cluster_candidate_ids),) = parent_cluster_candidate_ids(page_plan)
+    candidates = {
+        candidate.candidate_id: candidate for candidate in frontier.candidates
+    }
+    leads = {lead.lead_id: lead for lead in analysis.leads}
+    verdicts = {candidate_id: "unsupported" for candidate_id in candidates}
+    verdicts[scope_conflicted.candidate_id] = "uncertain"
+
+    if near_miss == "missing_expression_scope_blocker":
+        candidates[scope_conflicted.candidate_id] = replace(
+            scope_conflicted,
+            blockers=tuple(
+                blocker
+                for blocker in scope_conflicted.blockers
+                if blocker != "lifecycle_expression_scope_conflict"
+            ),
+        )
+    elif near_miss == "missing_subject_binding_blocker":
+        candidates[scope_conflicted.candidate_id] = replace(
+            scope_conflicted,
+            blockers=tuple(
+                blocker
+                for blocker in scope_conflicted.blockers
+                if blocker != "lifecycle_subject_binding_unverified"
+            ),
+        )
+    elif near_miss == "nonactual_kind":
+        candidates[occurrence.candidate_id] = replace(occurrence, kind="planned")
+    elif near_miss == "nonoccurrence_relation":
+        candidates[occurrence.candidate_id] = replace(
+            occurrence,
+            relation="deadline",
+        )
+    elif near_miss == "nonstrict_lead":
+        leads[occurrence.selected_lead_id] = replace(
+            leads[occurrence.selected_lead_id],
+            confidence_tier="review_ambiguous",
+        )
+    elif near_miss == "nondirect_lead":
+        leads[occurrence.selected_lead_id] = replace(
+            leads[occurrence.selected_lead_id],
+            association_mode="field_local",
+        )
+    elif near_miss == "different_binding":
+        candidates[occurrence.candidate_id] = replace(
+            occurrence,
+            binding_id=occurrence.binding_id + "-other",
+        )
+    elif near_miss == "different_expression":
+        candidates[occurrence.candidate_id] = replace(
+            occurrence,
+            expression_id=occurrence.expression_id + "-other",
+        )
+    elif near_miss == "different_normalized_value":
+        candidates[occurrence.candidate_id] = replace(
+            occurrence,
+            normalized_value="2027-08-10",
+        )
+    elif near_miss == "blocked_occurrence":
+        candidates[occurrence.candidate_id] = replace(
+            occurrence,
+            blockers=("multiple_association_expressions",),
+        )
+    elif near_miss == "multiple_accepted_candidates":
+        verdicts[occurrence.candidate_id] = "supported"
+    else:
+        candidates[scope_conflicted.candidate_id] = replace(
+            scope_conflicted,
+            lifecycle=near_miss,
+        )
+
+    assert (
+        _canonicalize_scope_conflicted_lifecycle_review(
+            cluster_candidate_ids=cluster_candidate_ids,
+            candidates=candidates,
+            leads=leads,
+            verdicts=verdicts,
+        )
+        is None
+    )
+
+
+def test_scope_conflicted_lifecycle_review_does_not_override_multiple_accepts() -> None:
+    text = (
+        "The review meeting took place on August 9, 2027 and was completed "
+        "that afternoon."
+    )
+    analysis, plan = analyze_and_plan(text)
+    date_expression = next(
+        item for item in analysis.expressions if item.form == "explicit_date"
+    )
+    batch = next(
+        item
+        for item in plan.batches
+        if item.expressions[0].expression_id == date_expression.expression_id
+    )
+    frontier = build_gmail_temporal_candidate_frontier(
+        analysis=analysis,
+        batch=batch,
+    )
+    occurrence = next(
+        candidate
+        for candidate in frontier.candidates
+        if not candidate.blockers
+        and candidate.lifecycle == "none"
+        and candidate.kind == "actual"
+    )
+    scope_conflicted = next(
+        candidate
+        for candidate in frontier.candidates
+        if candidate.binding_id == occurrence.binding_id
+        and candidate.lifecycle == "unknown"
+    )
+    page_plan = plan_gmail_temporal_candidate_pages(
+        analysis=analysis,
+        batch=batch,
+    )
+
+    result = validate_gmail_temporal_candidate_verdict_set(
+        analysis=analysis,
+        batch=batch,
+        plan=page_plan,
+        rows=page_verdict_rows(
+            page_plan,
+            overrides={
+                occurrence.candidate_id: "supported",
+                scope_conflicted.candidate_id: "uncertain",
+            },
+        ),
+    )
+
+    assert result.supported_candidate_ids == ()
+    assert result.uncertain_clusters[0].plausible_candidate_ids == (
+        occurrence.candidate_id,
+        scope_conflicted.candidate_id,
+    )
+    assert result.uncertain_clusters[0].reason == "model_uncertain"
+
+
 @pytest.mark.parametrize(
     "text",
     (
@@ -1076,7 +1459,14 @@ def test_supported_candidate_preserves_deterministic_defer_requirement() -> None
         analysis=analysis,
         batch=batch,
     )
-    candidate_id = page_plan.covered_candidate_ids[0]
+    candidate_id = next(
+        candidate.candidate_id
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+        if candidate.lifecycle == "scheduled"
+    )
 
     result = validate_gmail_temporal_candidate_verdict_set(
         analysis=analysis,
@@ -1153,6 +1543,629 @@ def test_verdict_set_all_unsupported_has_no_projection_or_uncertainty() -> None:
     assert result.uncertain_clusters == ()
     assert result.unsupported_candidate_count == len(page_plan.covered_candidate_ids)
     assert result.requires_defer is False
+
+
+def test_supported_deferred_schedule_base_becomes_lifecycle_uncertainty() -> None:
+    analysis, plan = analyze_and_plan(
+        "The workshop is scheduled for May 14, 2027 at 2:00 PM."
+    )
+    batch = plan.batches[0]
+    page_plan = plan_gmail_temporal_candidate_pages(
+        analysis=analysis,
+        batch=batch,
+    )
+    frontier = build_gmail_temporal_candidate_frontier(
+        analysis=analysis,
+        batch=batch,
+    )
+    base = next(
+        candidate
+        for candidate in frontier.candidates
+        if candidate.lifecycle_mention_id is None
+    )
+    scheduled = next(
+        candidate
+        for candidate in frontier.candidates
+        if candidate.lifecycle == "scheduled"
+    )
+    cluster_by_candidate = {
+        candidate_id: cluster_id
+        for cluster_id, candidate_ids in parent_cluster_candidate_ids(page_plan)
+        for candidate_id in candidate_ids
+    }
+    assert (
+        cluster_by_candidate[scheduled.candidate_id]
+        == cluster_by_candidate[base.candidate_id]
+    )
+
+    result = validate_gmail_temporal_candidate_verdict_set(
+        analysis=analysis,
+        batch=batch,
+        plan=page_plan,
+        rows=page_verdict_rows(
+            page_plan,
+            overrides={base.candidate_id: "supported"},
+        ),
+    )
+
+    assert scheduled.requires_defer is True
+    assert scheduled.normalized_value is None
+    assert result.supported_candidate_ids == ()
+    assert result.supported_citations == ()
+    assert result.unsupported_candidate_count == 1
+    assert len(result.uncertain_clusters) == 1
+    uncertainty = result.uncertain_clusters[0]
+    assert uncertainty.plausible_candidate_ids == (base.candidate_id,)
+    assert uncertainty.reason == "lifecycle_refinement_unresolved"
+    assert result.requires_defer is True
+
+
+def test_supported_deferred_schedule_lifecycle_remains_exactly_supported() -> None:
+    analysis, plan = analyze_and_plan(
+        "The workshop is scheduled for May 14, 2027 at 2:00 PM."
+    )
+    batch = plan.batches[0]
+    page_plan = plan_gmail_temporal_candidate_pages(
+        analysis=analysis,
+        batch=batch,
+    )
+    scheduled = next(
+        candidate
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+        if candidate.lifecycle == "scheduled"
+    )
+
+    result = validate_gmail_temporal_candidate_verdict_set(
+        analysis=analysis,
+        batch=batch,
+        plan=page_plan,
+        rows=page_verdict_rows(
+            page_plan,
+            overrides={scheduled.candidate_id: "supported"},
+        ),
+    )
+
+    assert result.supported_candidate_ids == (scheduled.candidate_id,)
+    assert len(result.supported_citations) == 1
+    assert result.uncertain_clusters == ()
+    assert result.requires_defer is True
+
+
+@pytest.mark.parametrize("lifecycle", ("cancelled", "completed"))
+def test_supported_deferred_terminal_base_becomes_lifecycle_uncertainty(
+    lifecycle: str,
+) -> None:
+    analysis, plan = analyze_and_plan(
+        f"The workshop was {lifecycle} on May 14, 2027 at 2:00 PM."
+    )
+    batch = plan.batches[0]
+    page_plan = plan_gmail_temporal_candidate_pages(
+        analysis=analysis,
+        batch=batch,
+    )
+    frontier = build_gmail_temporal_candidate_frontier(
+        analysis=analysis,
+        batch=batch,
+    )
+    base = next(
+        candidate
+        for candidate in frontier.candidates
+        if candidate.lifecycle_mention_id is None
+    )
+
+    result = validate_gmail_temporal_candidate_verdict_set(
+        analysis=analysis,
+        batch=batch,
+        plan=page_plan,
+        rows=page_verdict_rows(
+            page_plan,
+            overrides={base.candidate_id: "supported"},
+        ),
+    )
+
+    assert result.supported_candidate_ids == ()
+    assert result.uncertain_clusters[0].plausible_candidate_ids == (base.candidate_id,)
+    assert result.uncertain_clusters[0].reason == "lifecycle_refinement_unresolved"
+
+
+def test_supported_direct_actual_is_not_shadowed_by_deferred_completion() -> None:
+    analysis, plan = analyze_and_plan(
+        "The workshop occurred on May 14, 2027 at 2:00 PM and was completed."
+    )
+    batch = plan.batches[0]
+    page_plan = plan_gmail_temporal_candidate_pages(
+        analysis=analysis,
+        batch=batch,
+    )
+    frontier = build_gmail_temporal_candidate_frontier(
+        analysis=analysis,
+        batch=batch,
+    )
+    actual = next(
+        candidate
+        for candidate in frontier.candidates
+        if (candidate.relation, candidate.kind, candidate.lifecycle)
+        == ("occurrence", "actual", "none")
+    )
+    completed = next(
+        candidate
+        for candidate in frontier.candidates
+        if candidate.lifecycle == "completed"
+    )
+    direct_lead = next(
+        lead for lead in analysis.leads if lead.lead_id == actual.selected_lead_id
+    )
+
+    assert direct_lead.association_mode == "direct_grammar"
+    assert direct_lead.confidence_tier == "review_ambiguous"
+    assert _is_direct_actual_endpoint(
+        base=actual,
+        leads={direct_lead.lead_id: direct_lead},
+    )
+    assert _explicit_lifecycle_subsumes_base(
+        lifecycle=completed,
+        base=actual,
+        leads={direct_lead.lead_id: direct_lead},
+    )
+    assert not _is_direct_actual_endpoint(
+        base=actual,
+        leads={
+            direct_lead.lead_id: replace(
+                direct_lead,
+                association_mode="field_local",
+            )
+        },
+    )
+
+    result = validate_gmail_temporal_candidate_verdict_set(
+        analysis=analysis,
+        batch=batch,
+        plan=page_plan,
+        rows=page_verdict_rows(
+            page_plan,
+            overrides={actual.candidate_id: "supported"},
+        ),
+    )
+
+    assert result.supported_candidate_ids == (actual.candidate_id,)
+    assert result.uncertain_clusters == ()
+
+
+def test_supported_reschedule_base_becomes_lifecycle_uncertainty() -> None:
+    analysis, plan = analyze_and_plan(
+        "The workshop was rescheduled from May 14, 2027 at 2:00 PM "
+        "to May 16, 2027 at 3:00 PM."
+    )
+
+    for batch in plan.batches:
+        page_plan = plan_gmail_temporal_candidate_pages(
+            analysis=analysis,
+            batch=batch,
+        )
+        frontier = build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        )
+        base = next(
+            candidate
+            for candidate in frontier.candidates
+            if candidate.lifecycle_mention_id is None
+        )
+        unknown = next(
+            candidate
+            for candidate in frontier.candidates
+            if candidate.lifecycle == "unknown"
+        )
+
+        result = validate_gmail_temporal_candidate_verdict_set(
+            analysis=analysis,
+            batch=batch,
+            plan=page_plan,
+            rows=page_verdict_rows(
+                page_plan,
+                overrides={base.candidate_id: "supported"},
+            ),
+        )
+
+        assert "rescheduled_endpoint_role_unresolved" in unknown.blockers
+        assert result.supported_candidate_ids == ()
+        assert result.uncertain_clusters[0].plausible_candidate_ids == (
+            base.candidate_id,
+        )
+        assert result.uncertain_clusters[0].reason == "lifecycle_refinement_unresolved"
+
+
+def test_three_run_ensemble_preserves_only_consensus_candidates() -> None:
+    analysis, plan = analyze_and_plan(
+        "The workshop is scheduled for May 14, 2027 at 2:00 PM."
+    )
+    batch = plan.batches[0]
+    page_plan = plan_gmail_temporal_candidate_pages(
+        analysis=analysis,
+        batch=batch,
+    )
+    frontier = build_gmail_temporal_candidate_frontier(
+        analysis=analysis,
+        batch=batch,
+    )
+    base = next(
+        candidate
+        for candidate in frontier.candidates
+        if candidate.lifecycle_mention_id is None
+    )
+    scheduled = next(
+        candidate
+        for candidate in frontier.candidates
+        if candidate.lifecycle == "scheduled"
+    )
+    runs = (
+        page_verdict_rows(
+            page_plan,
+            overrides={scheduled.candidate_id: "supported"},
+        ),
+        page_verdict_rows(
+            page_plan,
+            overrides={scheduled.candidate_id: "supported"},
+        ),
+        page_verdict_rows(
+            page_plan,
+            overrides={base.candidate_id: "supported"},
+        ),
+    )
+
+    result = validate_gmail_temporal_candidate_ensemble_verdict_set(
+        analysis=analysis,
+        batch=batch,
+        plan=page_plan,
+        runs=runs,
+    )
+    consensus = {
+        verdict.candidate_id: verdict.verdict
+        for row in result.consensus_rows
+        for verdict in row.verdicts
+    }
+
+    assert isinstance(result, GmailTemporalCandidateEnsembleVerdictSet)
+    assert result.version == "gmail_temporal_candidate_three_run_ensemble_v3"
+    assert result.policy_version == "gmail_temporal_candidate_three_run_consensus_v3"
+    assert result.run_count == 3
+    assert result.policy_fingerprint == (
+        gmail_temporal_candidate_ensemble_policy_fingerprint()
+    )
+    assert result.policy_fingerprint.startswith("gtfep_")
+    assert consensus[scheduled.candidate_id] == "uncertain"
+    assert consensus[base.candidate_id] == "unsupported"
+    assert result.verdict_set.supported_candidate_ids == ()
+    assert result.verdict_set.uncertain_clusters[0].plausible_candidate_ids == (
+        scheduled.candidate_id,
+    )
+    assert result.cluster_reviews == ()
+
+
+def test_three_run_ensemble_retains_cross_run_alias_switching_as_uncertain() -> None:
+    analysis, plan = analyze_and_plan(
+        "The review meeting is scheduled for May 14, 2027 at 2:00 PM."
+    )
+    batch = plan.batches[0]
+    page_plan = plan_gmail_temporal_candidate_pages(
+        analysis=analysis,
+        batch=batch,
+    )
+    frontier = build_gmail_temporal_candidate_frontier(
+        analysis=analysis,
+        batch=batch,
+    )
+    aliases = tuple(
+        candidate
+        for candidate in frontier.candidates
+        if candidate.lifecycle_mention_id is None
+    )
+    assert len(aliases) == 2
+    assert len({candidate.subject_mention_id for candidate in aliases}) == 2
+    cluster_by_candidate = {
+        candidate_id: cluster_id
+        for cluster_id, candidate_ids in parent_cluster_candidate_ids(page_plan)
+        for candidate_id in candidate_ids
+    }
+    assert (
+        len({cluster_by_candidate[candidate.candidate_id] for candidate in aliases})
+        == 1
+    )
+
+    runs = (
+        page_verdict_rows(
+            page_plan,
+            overrides={aliases[0].candidate_id: "supported"},
+        ),
+        page_verdict_rows(
+            page_plan,
+            overrides={aliases[1].candidate_id: "supported"},
+        ),
+        page_verdict_rows(page_plan),
+    )
+    result = validate_gmail_temporal_candidate_ensemble_verdict_set(
+        analysis=analysis,
+        batch=batch,
+        plan=page_plan,
+        runs=runs,
+    )
+    consensus = {
+        verdict.candidate_id: verdict.verdict
+        for row in result.consensus_rows
+        for verdict in row.verdicts
+    }
+    alias_ids = tuple(candidate.candidate_id for candidate in aliases)
+    alias_id_set = set(alias_ids)
+    canonical_alias_ids = tuple(
+        candidate_id
+        for _cluster_id, candidate_ids in parent_cluster_candidate_ids(page_plan)
+        for candidate_id in candidate_ids
+        if candidate_id in alias_id_set
+    )
+
+    canonical_alias_id = canonical_alias_ids[0]
+    assert consensus[canonical_alias_id] == "uncertain"
+    assert all(
+        verdict == "unsupported"
+        for candidate_id, verdict in consensus.items()
+        if candidate_id != canonical_alias_id
+    )
+    assert result.verdict_set.supported_candidate_ids == ()
+    assert len(result.verdict_set.uncertain_clusters) == 1
+    uncertainty = result.verdict_set.uncertain_clusters[0]
+    assert uncertainty.plausible_candidate_ids == (canonical_alias_id,)
+    assert uncertainty.reason == "model_uncertain"
+    assert uncertainty.routable is False
+    assert result.cluster_reviews == ()
+
+
+def test_three_run_ensemble_does_not_admit_one_vote_different_lifecycle() -> None:
+    analysis, plan = analyze_and_plan(
+        "The review meeting is scheduled for May 14, 2027 at 2:00 PM."
+    )
+    batch = plan.batches[0]
+    page_plan = plan_gmail_temporal_candidate_pages(
+        analysis=analysis,
+        batch=batch,
+    )
+    frontier = build_gmail_temporal_candidate_frontier(
+        analysis=analysis,
+        batch=batch,
+    )
+    aliases = tuple(
+        candidate
+        for candidate in frontier.candidates
+        if candidate.lifecycle_mention_id is None
+    )
+    scheduled = next(
+        candidate
+        for candidate in frontier.candidates
+        if candidate.lifecycle == "scheduled"
+    )
+    alias_ids = {candidate.candidate_id for candidate in aliases}
+    canonical_alias_id = next(
+        candidate_id
+        for _cluster_id, candidate_ids in parent_cluster_candidate_ids(page_plan)
+        for candidate_id in candidate_ids
+        if candidate_id in alias_ids
+    )
+
+    result = validate_gmail_temporal_candidate_ensemble_verdict_set(
+        analysis=analysis,
+        batch=batch,
+        plan=page_plan,
+        runs=(
+            page_verdict_rows(
+                page_plan,
+                overrides={aliases[0].candidate_id: "supported"},
+            ),
+            page_verdict_rows(
+                page_plan,
+                overrides={aliases[1].candidate_id: "supported"},
+            ),
+            page_verdict_rows(
+                page_plan,
+                overrides={scheduled.candidate_id: "supported"},
+            ),
+        ),
+    )
+    consensus = {
+        verdict.candidate_id: verdict.verdict
+        for row in result.consensus_rows
+        for verdict in row.verdicts
+    }
+
+    assert consensus[canonical_alias_id] == "uncertain"
+    assert consensus[scheduled.candidate_id] == "unsupported"
+    assert all(
+        verdict == "unsupported"
+        for candidate_id, verdict in consensus.items()
+        if candidate_id != canonical_alias_id
+    )
+    assert result.verdict_set.uncertain_clusters[0].plausible_candidate_ids == (
+        canonical_alias_id,
+    )
+    assert result.cluster_reviews == ()
+
+
+def test_three_run_ensemble_routes_split_semantics_to_cluster_review_only() -> None:
+    analysis, plan = analyze_and_plan(
+        "The review meeting is scheduled, then cancelled, for May 14, 2027 at 2:00 PM."
+    )
+    batch = plan.batches[0]
+    page_plan = plan_gmail_temporal_candidate_pages(
+        analysis=analysis,
+        batch=batch,
+    )
+    frontier = build_gmail_temporal_candidate_frontier(
+        analysis=analysis,
+        batch=batch,
+    )
+    ((cluster_id, cluster_candidate_ids),) = parent_cluster_candidate_ids(page_plan)
+    candidates = {item.candidate_id: item for item in frontier.candidates}
+    signature_candidates: dict[tuple[object, ...], str] = {}
+    for candidate_id in cluster_candidate_ids:
+        candidate = candidates[candidate_id]
+        signature_candidates.setdefault(
+            (
+                candidate.expression_id,
+                candidate.relation,
+                candidate.kind,
+                candidate.lifecycle,
+                candidate.normalized_value,
+            ),
+            candidate_id,
+        )
+    assert len(signature_candidates) >= 3
+    three_semantics = tuple(signature_candidates.values())[:3]
+
+    result = validate_gmail_temporal_candidate_ensemble_verdict_set(
+        analysis=analysis,
+        batch=batch,
+        plan=page_plan,
+        runs=tuple(
+            page_verdict_rows(
+                page_plan,
+                overrides={candidate_id: "supported"},
+            )
+            for candidate_id in three_semantics
+        ),
+    )
+    consensus = {
+        verdict.candidate_id: verdict.verdict
+        for row in result.consensus_rows
+        for verdict in row.verdicts
+    }
+
+    assert set(consensus.values()) == {"unsupported"}
+    assert result.verdict_set.supported_candidate_ids == ()
+    assert result.verdict_set.uncertain_clusters == ()
+    assert result.verdict_set.unsupported_candidate_count == len(frontier.candidates)
+    assert len(result.cluster_reviews) == 1
+    review = result.cluster_reviews[0]
+    assert review.version == "gmail_temporal_candidate_ensemble_cluster_review_v1"
+    assert review.cluster_id == cluster_id
+    assert review.reason == "split_semantics_unresolved"
+    assert review.requires_defer is True
+    assert review.routable is False
+
+
+@pytest.mark.parametrize(
+    ("votes", "expected"),
+    (
+        (("supported", "supported", "supported"), "supported"),
+        (("supported", "supported", "unsupported"), "uncertain"),
+        (("supported", "uncertain", "unsupported"), "uncertain"),
+        (("uncertain", "uncertain", "uncertain"), "uncertain"),
+        (("supported", "unsupported", "unsupported"), "unsupported"),
+    ),
+)
+def test_three_run_ensemble_vote_policy(
+    votes: tuple[str, str, str],
+    expected: str,
+) -> None:
+    analysis, plan = analyze_and_plan("The meeting is May 14, 2027.")
+    batch = plan.batches[0]
+    page_plan = plan_gmail_temporal_candidate_pages(
+        analysis=analysis,
+        batch=batch,
+    )
+    candidate_id = page_plan.covered_candidate_ids[0]
+    runs = tuple(
+        page_verdict_rows(
+            page_plan,
+            overrides={candidate_id: vote},
+        )
+        for vote in votes
+    )
+
+    result = validate_gmail_temporal_candidate_ensemble_verdict_set(
+        analysis=analysis,
+        batch=batch,
+        plan=page_plan,
+        runs=runs,
+    )
+    consensus = result.consensus_rows[0].verdicts[0]
+
+    assert consensus.candidate_id == candidate_id
+    assert consensus.verdict == expected
+
+
+def test_three_run_ensemble_applies_lifecycle_calibration_after_voting() -> None:
+    analysis, plan = analyze_and_plan(
+        "The workshop is scheduled for May 14, 2027 at 2:00 PM."
+    )
+    batch = plan.batches[0]
+    page_plan = plan_gmail_temporal_candidate_pages(
+        analysis=analysis,
+        batch=batch,
+    )
+    base = next(
+        candidate
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+        if candidate.lifecycle_mention_id is None
+    )
+    run = page_verdict_rows(
+        page_plan,
+        overrides={base.candidate_id: "supported"},
+    )
+
+    result = validate_gmail_temporal_candidate_ensemble_verdict_set(
+        analysis=analysis,
+        batch=batch,
+        plan=page_plan,
+        runs=(run, run, run),
+    )
+
+    assert (
+        next(
+            verdict.verdict
+            for row in result.consensus_rows
+            for verdict in row.verdicts
+            if verdict.candidate_id == base.candidate_id
+        )
+        == "supported"
+    )
+    assert result.verdict_set.supported_candidate_ids == ()
+    assert result.verdict_set.uncertain_clusters[0].plausible_candidate_ids == (
+        base.candidate_id,
+    )
+    assert (
+        result.verdict_set.uncertain_clusters[0].reason
+        == "lifecycle_refinement_unresolved"
+    )
+
+
+def test_three_run_ensemble_rejects_wrong_count_and_incomplete_run() -> None:
+    analysis, plan = analyze_and_plan("The meeting is May 14, 2027.")
+    batch = plan.batches[0]
+    page_plan = plan_gmail_temporal_candidate_pages(
+        analysis=analysis,
+        batch=batch,
+    )
+    run = page_verdict_rows(page_plan)
+
+    with pytest.raises(GmailTemporalFrontierError, match="exactly three"):
+        validate_gmail_temporal_candidate_ensemble_verdict_set(
+            analysis=analysis,
+            batch=batch,
+            plan=page_plan,
+            runs=(run, run),
+        )
+
+    with pytest.raises(GmailTemporalFrontierError, match="cover the page plan"):
+        validate_gmail_temporal_candidate_ensemble_verdict_set(
+            analysis=analysis,
+            batch=batch,
+            plan=page_plan,
+            runs=(run, run, run[:-1]),
+        )
 
 
 def test_supported_plus_uncertain_cluster_becomes_model_uncertainty() -> None:
@@ -1434,6 +2447,167 @@ def test_terminal_lifecycle_candidates_preserve_terminal_semantics(
     assert (terminal.relation, terminal.kind) == ("unspecified", "unspecified")
     assert terminal.lifecycle_mention_id is not None
     assert terminal.requires_defer is False
+
+
+@pytest.mark.parametrize(
+    ("body", "expected_lifecycle", "expected_normalized"),
+    (
+        (
+            "Nimbus Interview is scheduled for May 14, 2027 at 16:30 -07:00.",
+            "scheduled",
+            "2027-05-14T16:30:00-07:00",
+        ),
+        (
+            "Nimbus Interview was cancelled on May 14, 2027.",
+            "cancelled",
+            "2027-05-14",
+        ),
+        (
+            "Nimbus Interview was completed on May 14, 2027.",
+            "completed",
+            "2027-05-14",
+        ),
+    ),
+)
+def test_exact_lifecycle_subsumes_source_verified_alias_bases(
+    body: str,
+    expected_lifecycle: str,
+    expected_normalized: str,
+) -> None:
+    analysis, plan = analyze_and_plan(f"Subject: Nimbus Interview\n\n{body}")
+    frontier = build_gmail_temporal_candidate_frontier(
+        analysis=analysis,
+        batch=plan.batches[0],
+    )
+
+    exact = tuple(
+        candidate
+        for candidate in frontier.candidates
+        if candidate.lifecycle == expected_lifecycle and not candidate.requires_defer
+    )
+    unknown = tuple(
+        candidate
+        for candidate in frontier.candidates
+        if candidate.lifecycle == "unknown"
+    )
+
+    assert len(exact) == 1
+    assert exact[0].normalized_value == expected_normalized
+    assert not any(
+        candidate.lifecycle_mention_id is None for candidate in frontier.candidates
+    )
+    assert len(unknown) == 2
+    assert all(candidate.requires_defer for candidate in unknown)
+
+
+def test_deferred_lifecycle_does_not_subsume_alias_bases() -> None:
+    analysis, plan = analyze_and_plan(
+        "The review meeting is scheduled for May 14, 2027 at 2:00 PM."
+    )
+    frontier = build_gmail_temporal_candidate_frontier(
+        analysis=analysis,
+        batch=plan.batches[0],
+    )
+
+    lifecycle_free = tuple(
+        candidate
+        for candidate in frontier.candidates
+        if candidate.lifecycle_mention_id is None
+    )
+    scheduled = tuple(
+        candidate
+        for candidate in frontier.candidates
+        if candidate.lifecycle == "scheduled"
+    )
+
+    assert len(lifecycle_free) == 2
+    assert len(scheduled) == 2
+    assert all(candidate.requires_defer for candidate in scheduled)
+    assert all(candidate.normalized_value is None for candidate in scheduled)
+
+
+def test_reschedule_aliases_keep_unknown_lifecycle_and_free_bases() -> None:
+    analysis, plan = analyze_and_plan(
+        "The review meeting was rescheduled from May 14, 2027 to May 16, 2027."
+    )
+
+    for batch in plan.batches:
+        frontier = build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        )
+        lifecycle_free = tuple(
+            candidate
+            for candidate in frontier.candidates
+            if candidate.lifecycle_mention_id is None
+        )
+        unknown = tuple(
+            candidate
+            for candidate in frontier.candidates
+            if candidate.lifecycle == "unknown"
+        )
+
+        assert len(lifecycle_free) == 2
+        assert len(unknown) == 2
+        assert all(candidate.requires_defer for candidate in unknown)
+
+
+def test_terminal_lifecycle_does_not_subsume_distinct_direct_actual() -> None:
+    analysis, plan = analyze_and_plan(
+        "The review meeting occurred on May 14, 2027 and was completed."
+    )
+    frontier = build_gmail_temporal_candidate_frontier(
+        analysis=analysis,
+        batch=plan.batches[0],
+    )
+
+    actual = tuple(
+        candidate
+        for candidate in frontier.candidates
+        if (
+            candidate.relation,
+            candidate.kind,
+            candidate.lifecycle,
+        )
+        == ("occurrence", "actual", "none")
+    )
+    completed = tuple(
+        candidate
+        for candidate in frontier.candidates
+        if candidate.lifecycle == "completed"
+    )
+
+    assert actual
+    assert all(not candidate.requires_defer for candidate in actual)
+    assert completed
+
+
+def test_exact_lifecycle_does_not_subsume_source_distinct_title_bases() -> None:
+    text = (
+        "Subject: Atlas Interview Update\n\n"
+        "The Beta interview is scheduled for May 14, 2027."
+    )
+    analysis, plan = analyze_and_plan(text)
+    frontier = build_gmail_temporal_candidate_frontier(
+        analysis=analysis,
+        batch=plan.batches[0],
+    )
+    title_ids = {
+        mention.mention_id
+        for mention in analysis.mentions
+        if mention.field == "subject"
+        and mention.mention_type in {"event", "event_title_candidate"}
+    }
+
+    assert any(
+        candidate.subject_mention_id in title_ids
+        and candidate.lifecycle_mention_id is None
+        for candidate in frontier.candidates
+    )
+    assert any(
+        candidate.lifecycle == "scheduled" and not candidate.requires_defer
+        for candidate in frontier.candidates
+    )
 
 
 def test_unresolved_reschedule_variants_never_become_precise() -> None:

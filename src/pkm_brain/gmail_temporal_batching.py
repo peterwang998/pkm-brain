@@ -46,6 +46,12 @@ _SUBJECT_BRIDGE_TYPES = frozenset(
         "action",
     }
 )
+_CITABLE_MENTION_TYPES = frozenset((*_SUBJECT_BRIDGE_TYPES, "boundary", "lifecycle"))
+_TEMPORAL_SUBJECT_TYPES = frozenset((*_SUBJECT_BRIDGE_TYPES, "boundary"))
+_SINGLETON_CROSS_SEGMENT_MAX_GAP_CHARS = 240
+GMAIL_TEMPORAL_SINGLETON_EVENT_FALLBACK_DIAGNOSTIC = (
+    "singleton_cross_segment_event_fallback"
+)
 _MENTION_TYPE_RANK = {
     "event_title_candidate": 0,
     "event": 1,
@@ -87,8 +93,8 @@ class GmailTemporalBatchCaps:
 
     max_payload_bytes: int = 12_000
     max_expressions_per_batch: int = 1
-    max_mentions_per_batch: int = 16
-    max_batches: int = 64
+    max_mentions_per_batch: int = 24
+    max_batches: int = 96
     max_lead_hints_per_batch: int = 4
     overlap_chars: int = 120
     max_local_context_chars: int = 2_400
@@ -527,12 +533,39 @@ def _build_batch(
         ranked_mentions,
         limit=caps.max_mentions_per_batch,
     )
+    singleton_fallback = _singleton_cross_segment_event_fallback(
+        analysis=analysis,
+        expressions=expressions,
+        selected_mentions=selected_mentions,
+        expression_segment=segment,
+        mention_segments=mention_segments,
+    )
+    if singleton_fallback is not None:
+        # This is an empty-frontier fallback, not a general bridge. Keep only
+        # the exact event endpoint already linked by the analysis's sole
+        # retained lead. The intervening same-field text remains visible in one
+        # bounded context, while no unrelated mention gains citation authority.
+        selected_mentions = [singleton_fallback]
+        field = next(item for item in fields if item.name == segment.field)
+        required = (
+            min(expression_hull[0], singleton_fallback.start),
+            max(expression_hull[1], singleton_fallback.end),
+        )
+        local_start, local_end = _bounded_span(
+            lower=field.start,
+            upper=field.end,
+            required=required,
+            limit=max(caps.max_local_context_chars, required[1] - required[0]),
+        )
+        subject_context = None
     relevant_mentions = {
         item.mention_id
         for item in analysis.mentions
         if mention_segments[item.mention_id].segment_id == segment.segment_id
     }
     relevant_mentions.update(item.mention_id for item in bridge_mentions)
+    if singleton_fallback is not None:
+        relevant_mentions.add(singleton_fallback.mention_id)
 
     expression_views = tuple(
         GmailTemporalBatchExpression(
@@ -551,6 +584,8 @@ def _build_batch(
         diagnostics.append("local_context_trimmed")
     if subject_trimmed:
         diagnostics.append("subject_bridge_context_trimmed")
+    if singleton_fallback is not None:
+        diagnostics.append(GMAIL_TEMPORAL_SINGLETON_EVENT_FALLBACK_DIAGNOSTIC)
 
     contexts = _contexts(
         text=text,
@@ -603,6 +638,12 @@ def _build_batch(
     batch = finalize()
     if batch.payload_bytes <= caps.max_payload_bytes:
         return batch
+
+    # Never degrade the fallback into an unlinked event, a context-free pair,
+    # or a packet that silently loses its sole lead. If its minimal bounded
+    # packet does not fit, normal payload-omission accounting must fail closed.
+    if singleton_fallback is not None:
+        return None
 
     if lead_hints:
         diagnostics.append("lead_hints_removed_for_byte_cap")
@@ -1027,14 +1068,27 @@ def _rank_mentions(
     local_mentions: tuple[TemporalMention, ...],
     bridge_mentions: tuple[TemporalMention, ...],
 ) -> tuple[TemporalMention, ...]:
-    def rank(item: TemporalMention) -> tuple[int, int, int, int, str]:
+    def rank(item: TemporalMention) -> tuple[int, int, int, int, int, str]:
+        # A packet's hard mention cap must preserve every endpoint that can
+        # become a subject or lifecycle citation before spending capacity on
+        # structural/artifact context.  Local non-citable mentions previously
+        # displaced subject-bridge endpoints even when the packet had enough
+        # total room for all citable evidence.
+        citable_rank = 0 if item.mention_type in _CITABLE_MENTION_TYPES else 1
         role_rank = 0 if item.field != "subject" else 1
         type_rank = _MENTION_TYPE_RANK.get(item.mention_type, 50)
         distance = min(
             _span_distance(item.start, item.end, value.start, value.end)
             for value in expressions
         )
-        return role_rank, type_rank, distance, item.start, item.mention_id
+        return (
+            citable_rank,
+            role_rank,
+            type_rank,
+            distance,
+            item.start,
+            item.mention_id,
+        )
 
     values = {item.mention_id: item for item in (*local_mentions, *bridge_mentions)}
     return tuple(sorted(values.values(), key=rank))
@@ -1066,6 +1120,61 @@ def _ensure_subject_bridge(
         {item.mention_id: item for item in selected}.values(),
         key=lambda item: (item.field == "subject", item.start, item.mention_id),
     )
+
+
+def _singleton_cross_segment_event_fallback(
+    *,
+    analysis: TemporalLeadAnalysis,
+    expressions: tuple[TemporalExpression, ...],
+    selected_mentions: Sequence[TemporalMention],
+    expression_segment: _Segment,
+    mention_segments: dict[str, _Segment],
+) -> TemporalMention | None:
+    """Return one uniquely linked event for an otherwise empty packet.
+
+    The broad field-near graph is deliberately not exposed. Eligibility
+    requires one global expression and one retained lead, and only the event
+    cited by that lead may cross a same-field segment boundary. Hard-scope
+    blockers remain under the downstream selection validator's authority; the
+    frontier also forces every emitted fallback candidate to defer.
+    """
+
+    if analysis.association_admission_basis not in {"fact", "temporal_rescue"}:
+        return None
+    if len(analysis.expressions) != 1 or len(expressions) != 1:
+        return None
+    if any(item.mention_type in _TEMPORAL_SUBJECT_TYPES for item in selected_mentions):
+        return None
+    if len(analysis.leads) != 1:
+        return None
+    lead = analysis.leads[0]
+    expression = expressions[0]
+    if (
+        lead.expression_id != expression.expression_id
+        or lead.association_mode != "field_near"
+        or lead.confidence_tier != "review_ambiguous"
+        or isinstance(lead.gap_chars, bool)
+        or not isinstance(lead.gap_chars, int)
+        or lead.gap_chars < 0
+        or lead.gap_chars > _SINGLETON_CROSS_SEGMENT_MAX_GAP_CHARS
+    ):
+        return None
+    mention = next(
+        (item for item in analysis.mentions if item.mention_id == lead.mention_id),
+        None,
+    )
+    if mention is None or mention.mention_type != "event":
+        return None
+    mention_segment = mention_segments.get(mention.mention_id)
+    if (
+        expression.field != mention.field
+        or expression_segment.field != mention.field
+        or mention_segment is None
+        or mention_segment.field != expression_segment.field
+        or mention_segment.segment_id == expression_segment.segment_id
+    ):
+        return None
+    return mention
 
 
 def _initial_local_context(

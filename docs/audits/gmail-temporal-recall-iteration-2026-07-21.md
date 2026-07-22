@@ -1,8 +1,16 @@
 # Gmail Temporal Recall Iteration — 2026-07-21
 
-**Status:** the personal-use release candidate passes the frozen synthetic gate in two fresh runs; private-distribution and operational validation remain pending, and every output remains review-only and unapproved for persistence, routing, reminders, or automatic application
+**Status:** the review-only architecture passes the current frozen synthetic gate
+in three separately requested Luna-medium runs. A private Gmail holdout,
+same-source original-Brain parity, and persistence validation remain pending. A
+final ontology-aligned Sol-medium diagnostic independently accepted every
+production artifact with zero critical errors. Nothing in this audit authorizes
+automatic persistence, routing, reminders, or calendar actions.
 
-**Exploratory target used before 2026-07-22:** at least 85% useful-record recall, at least 90% supported-proposal precision, and less than 1% critical semantic error, with recall favored when a proposal can remain visibly deferred
+**Exploratory target used before 2026-07-22:** at least 85% useful-record recall,
+at least 90% supported-proposal precision, and less than 1% critical semantic
+error, with recall favored when a proposal can remain visibly deferred. This is
+retained only as historical context; it is not the release bar.
 **Privacy:** every historical replay and artifact report is content-free; private JSONL artifacts are mode `0600`
 
 ## Pragmatic Personal-Use Release Bar
@@ -14,30 +22,44 @@ different claims.
 
 ### Synthetic regression gate
 
-One frozen adversarial benchmark must clear all of the following in two fresh
-model runs:
+One frozen adversarial benchmark must clear all of the following across three
+fresh model runs and their deterministic consensus:
 
-- at least 95% useful-record and required-member recall when `supported` and
-  visibly `uncertain` review results both count as recovered;
+- at least 95% effective temporal recall when confirmed citations and visibly
+  uncertain, non-routable review sidecars both count as recovered;
+- at least 90% confirmed recall among members whose gold calibration permits a
+  supported assertion;
+- at least 95% precision on confirmed artifacts and at least 90% precision on
+  the broader review arm;
 - at least 90% exact-unit and complete-unit recall, so one recovered endpoint
   cannot conceal a missed endpoint in a multi-date assertion;
-- at least 95% precision on `supported` candidates and at least 90% precision on
-  the broader review arm;
 - zero accepted default-negative cross-bindings, selected promotions or routine
   noise, duplicate aliases, supported overclaims, and critical wrong-event,
   wrong-time, wrong-relation, or wrong-lifecycle errors;
-- at least 95% parent decision-unit and semantic-member agreement between fresh
-  runs after reducer-equivalent aliases are collapsed.
+- at least 95% parent decision-unit and semantic-member agreement between all
+  pairs of fresh runs after reducer-equivalent aliases are collapsed.
+
+The release unit is a production artifact, not a raw candidate ID. One
+supported citation is one artifact. One uncertainty sidecar is also one
+artifact, even if it contains multiple reducer-equivalent candidate aliases.
+Scoring collapses aliases into semantic hypotheses and performs deterministic
+one-to-one matching: an artifact can recover at most one gold member, a gold
+member can justify at most one artifact, and additional artifacts are redundant
+precision errors. An uncertainty sidecar is pure only when every hypothesis is
+an allowed alternative for the same member. Parent-cluster reviews created by
+split three-run semantics are triage signals only; they authorize no candidate
+and cannot improve primary recall.
 
 ### Private-distribution gate
 
 A frozen, thread-grouped historical Gmail holdout of roughly 120--200 messages,
 with at least 50 genuinely useful temporal records, must demonstrate at least
-90% useful-record and member recall, at least 95% supported precision, no
-critical supported errors, and no more than 5% noise admitted to review. The same
-cohort must retain at least 95% of the original Brain's independently judged
-useful non-temporal facts, with source and thread counts reconciled. Temporal
-cognition may add structure; it may not recreate the earlier
+95% effective member recall, at least 90% confirmed recall, at least 95%
+confirmed precision, at least 90% review-arm precision, no critical supported
+errors, and no more than 5% noise admitted to review. The same cohort must retain
+at least 95% of the original Brain's independently judged useful non-temporal
+facts, with source and thread counts reconciled. Temporal cognition may add
+structure; it may not recreate the earlier
 522-sources-to-10-facts collapse. The existing 120-message development cohort can
 fill this role only after its labels are frozen independently of the current
 pipeline.
@@ -62,41 +84,43 @@ The production-shaped local pieces are implemented and regression-tested. The se
 The original non-private 36-message benchmark cleared the exploratory target but
 did not meet the later semantic release bar. The final frozen benchmark contains
 39 messages, 27 useful records, 34 semantic units, 36 required members, and 12
-advertising or routine-noise records. Its deterministic 98-candidate frontier
-contains all 36 members and all 34 complete units, with 32 of 34 units exact.
+advertising or routine-noise records. Its deterministic 96-candidate frontier
+contains all 36 members and all 34 complete units; 32 of 34 units are exact.
 
-Two fresh Luna-medium runs over that frontier passed every synthetic personal-use
-gate. The first recovered 27 of 27 useful records, 36 of 36 members, all 34
-complete units, and 31 of 34 exact units. The second recovered 27 of 27 useful
-records, 35 of 36 members, 33 of 34 complete units, and the same 31 of 34 exact
-units. Both measured 100% strict-supported and review-arm precision, with zero
-selected noise, default-negative acceptance, duplicate aliases, supported
-overclaims, critical calibration errors, or frontier regressions. After alias
-collapse the runs agreed on 56 of 57 parent decision units (98.2%) and on 35 of
-36 semantic members (97.2%).
+Three separately requested Luna-medium runs over that frontier returned
+byte-identical complete verdict artifacts: 31 supported candidates, five
+uncertain candidates, and 60 unsupported candidates in each run. The
+three-run consensus therefore produced 31 confirmed citations and five pure,
+non-routable uncertainty sidecars. Artifact-level scoring matched all 36
+production artifacts one-to-one to all 36 required members: 100% effective
+recall, 31 of 32 confirmed members recovered (96.9%), 100% confirmed precision,
+100% review-arm precision, all 34 units complete, and 32 of 34 units exact
+(94.1%). It selected no noise and produced no redundant artifact, impure
+sidecar, supported overclaim, default-negative acceptance, critical semantic
+error, or frontier regression.
 
-This clears the synthetic gate and is enough to freeze a personal-use release
-candidate. It is not yet a production-distribution claim: the private Gmail
-holdout, original-Brain parity check, persistence integration, and rollback
-canary remain outstanding. A private Gmail run still requires explicit informed
-approval; no private text was transmitted in this iteration.
+All three run pairs had 1.0 Jaccard agreement on accepted parent clusters and on
+recovered semantic members; raw candidate verdict agreement was also 1.0. This
+passes the synthetic personal-use bar. It is still not a private-distribution or
+operational release claim: the private Gmail holdout, same-source original-Brain
+parity check, persistence integration, and rollback canary remain outstanding.
+A private external Gmail run still requires explicit informed approval; no
+private text was transmitted in this iteration.
 
 ## Evidence
 
-### Complete historical replay (pre-final architecture diagnostic)
+### Complete historical replay
 
-The read-only current projection replay evaluated 733 admitted messages across 356 eligible threads:
+The current read-only planner/frontier replay evaluated 733 admitted messages
+across 356 eligible threads. It produced 5,364 recognized expressions, exactly
+5,364 selector batches, and 16,558 verification candidates. Every expression
+was covered: there were zero batch omissions, zero incomplete batches, and zero
+omitted candidate mentions. All bounded payloads stayed within the configured
+12,000-byte, 24-mention, and 96-batch limits.
 
-- 5,363 recognized expressions in 335 threads;
-- 8,239 recognized mentions in 350 threads, including 128 review-only structured event-title candidates across 106 threads;
-- 6,204 bounded association hints in 318 threads;
-- all 265 `important_temporal` proxy messages retained an expression, mention, and hint;
-- 150 of those 265 had a semantically typed occurrence/deadline hint and 18 had a fully resolved hint;
-- the analyzer also retained 58 coarse-relative and 26 recurrence expressions without pretending either class had a resolved instant.
-
-These are coverage diagnostics against historical classifier proxies, not human
-recall or precision. They predate the final lead and frontier changes and are not
-current release evidence.
+This is strong losslessness and bounded-execution evidence over historical Gmail.
+It is not human-labeled recall or precision evidence. In particular, it cannot
+replace the private holdout or establish original-Brain fact parity.
 
 ### Boundary-only diagnostic
 
@@ -130,6 +154,15 @@ The content-free candidate sweep found this production-safe Pareto point:
 
 The last policy reduces base candidate volume by 29.7% without losing a known semantic binding. Local-only was smaller on this cohort but was rejected as the production choice because it excludes cross-field subject bridges. The implementation uses four clusters as a page width rather than a destructive final cap: every overflow cluster receives a later page.
 
+A later, deliberately narrow singleton cross-segment fallback improved useful
+candidate exposure on this same 82-record cohort from 77 of 82 (93.9%) to 79 of
+82 (96.3%). It added exactly two useful cases, one ordinary fact and one
+temporal-rescue record, added no non-useful case, and forced both additions to
+remain deferred. The fallback is available only when there is one global
+expression, one retained review-ambiguous same-field event lead in another
+segment, no temporal subject already in the packet, and a bounded source gap.
+It is therefore a recall escape hatch, not a general cross-segment matcher.
+
 This candidate pruning does not solve materiality precision. Every recall-preserving arm still exposed plausible bindings in 15 of 36 records the judge said should be suppressed. A grouped out-of-fold deterministic endpoint-feature verifier also found no operating point at both 90% supported-proposal precision and 85% useful-record recall. Materiality and semantic support therefore remain explicit model judgments, with deterministic negative gating only when no legal subject can be cited.
 
 ### Fresh full-text development cohort (pre-final architecture diagnostic)
@@ -155,6 +188,11 @@ required overflow pages. Every page stayed at or below four alias fragments, 12
 candidate variants, and 12,000 candidate-payload bytes; the observed maximum was
 11,754 bytes. These are dated bounded-execution diagnostics from before the final
 lead and frontier changes, not current release evidence or quality measurements.
+
+As a collateral check for the later lifecycle safety rule, its exact trigger
+matched zero of 2,167 candidates in the rebuilt private development projection.
+That does not prove private accuracy, but it confirms that the guard is not a
+broad rewrite of historical Gmail candidates.
 
 ### Superseded 36-case non-private synthetic exploration
 
@@ -200,57 +238,101 @@ unmatched candidates are negative by default.
 | v7 | 31/32 units; 94.3% review precision | lifecycle/date alias duplication |
 | v8 | 32/32 units; 97.1% review precision | neighboring deadline cross-binding |
 | v10, two fresh runs | 34/34 units and 36/36 members; 100% review precision | redundant lifecycle-free bases remained |
-| v12, two fresh runs | **27/27 useful in both; 36/36 and 35/36 members; 100% precision** | one conservative dense-clause miss in run B |
+| v12, two fresh runs | 27/27 useful in both; 36/36 and 35/36 members; 100% precision | one conservative dense-clause miss in run B |
+| v17, three fresh runs | 35/36 effective members; 30/32 confirmed members; 97.2% review precision | one correlated lifecycle miss and one redundant artifact in all three runs |
+| v19, three fresh runs | **36/36 effective members; 31/32 confirmed members; 100% artifact precision** | no synthetic gate failure |
 
-Before the final external runs, the frontier began omitting a lifecycle-free base
+Before the three-run iterations, the frontier began omitting a lifecycle-free base
 only when an exact, source-verified explicit scheduled, cancelled, or completed
 candidate fully subsumed it. Deferred or unknown lifecycle candidates,
 reschedules, and distinct direct actual occurrences remain intact. This reduced
-the frontier from 108 to 98 candidates without changing semantic-gold coverage.
+the frontier without changing semantic-gold coverage.
 
-The final deterministic frontier recovers all 36 required members and all 34
-complete units; 32 of 34 units are exact. Run A produced 31 supported and five
-uncertain candidates and recovered all 36 members. Run B produced 30 supported
-and five uncertain candidates and recovered 35 members, missing the Beta
-workshop assertion in the dense three-clause case. Each run retained all 27 useful
-records. Both had 100% strict-supported and review precision, no selected noise,
-no aliases or supported overclaims, and passed every frozen gate. Raw candidate
-acceptance agreed on 93 of 98 candidates; four disagreements were two
-reducer-equivalent alias swaps. The meaningful post-collapse measures were 56 of
-57 parent decision units (98.2%) and 35 of 36 semantic members (97.2%).
+The v17 three-run experiment exposed why consensus cannot be treated as a cure
+for correlated semantic error. In the synthetic assertion, "The review meeting
+took place on August 9, 2027 and was completed that afternoon," all three runs
+rejected the direct, blocker-free actual occurrence, retained an ambiguous
+completion refinement for the same August 9 endpoint, and separately retained
+the correct completion boundary. That missed the occurrence and emitted the
+completion twice. Stability was 1.0, but quality was not: effective recall was
+35 of 36, confirmed recall was 30 of 32, and one of 36 production artifacts was
+redundant.
+
+The resulting deterministic guard is intentionally review-only and exact. When
+the sole accepted candidate in a binding cluster is an unknown-lifecycle
+candidate carrying both expression-scope and lifecycle-subject-binding
+conflicts, and it has exactly one same-binding, same-expression, same-time,
+blocker-free `strict_direct` actual-occurrence sibling, the accepted identity is
+moved to that direct occurrence as `uncertain`. It can never create support.
+Ambiguous, non-actual, non-direct, multi-candidate, or explicit-lifecycle cases
+remain unchanged. A counterfactual replay fixes the v17 failure, while the exact
+trigger matched zero of 2,167 candidates in the private development projection.
+
+The final v19 deterministic frontier contains 96 candidates and recovers all 36
+required members and all 34 complete units; 32 of 34 units are exact. Each of
+the three complete Luna-medium runs produced the same 31 supported, five
+uncertain, and 60 unsupported verdicts across 46 pages. The consensus produced
+36 production artifacts: 31 supported citations and five pure uncertainty
+sidecars. One-to-one artifact matching recovered all 36 members with no
+redundant or unmatched artifact. Confirmed recall was 31 of 32 (96.9%), effective
+recall was 36 of 36, supported and review-arm artifact precision were both 100%,
+complete-unit recall was 100%, and exact-unit recall was 32 of 34 (94.1%). All
+27 useful records were recovered; none of the 12 noise records was selected.
+There were zero critical errors, overclaims, default-negative acceptances,
+impure sidecars, aliases expressed as duplicate artifacts, or ratchet
+regressions.
 
 The frozen sample SHA-256 is
 `f6a5405431817e871c4fef2e1bab41764897bc956c6cd5676601f6454ca8d0bc`.
-The final protocol fingerprint is
-`gtfproto_7b39a46d5444afe1e3ec25ffbcc56c568645d7b5a17c98ecd4e7073df64c9c07`.
-The two 46-page checkpoint SHA-256 values are
-`1ad200a089db3508088eaeef9848e2d6fa525d81a99ef96bfc416358a9d56867`
-and
-`fd5881619e8f850b8b848a82d7396340165d1333a92bcbd2519a75688724d096`;
-their run-manifest SHA-256 values are
-`3fa0b46bcafaddb878f24e2c9ef659ef0a8123471a7022cee9758eb21d928b4e`
-and
-`8a4a55d39620c07490033e91d5b8dc717fee6febafb89a122dd93e79374ca1f9`.
-The mode-`0600` manifests bind the production modules, verifier policy,
-evaluator, semantic gold, benchmark builder, sample, checkpoint, and cohort
-counts. This prevents stale or mixed evidence from silently passing; it is not a
-cryptographic attestation that an external model produced the rows.
+The final semantic-gold SHA-256 is
+`4efbea11bee95c377ba9f05f1a5276ed2fdae267582f7e5028aa8dfe07e8e377`;
+the protocol fingerprint is
+`gtfproto_deaa3ca12e8aabd90f8a83ef9160bb93881044549d5a4974636c47ba8a560c88`;
+the candidate-authority fingerprint is
+`gtfea_1890b411055f34f3f8442154afe32272075c228cdb30d8d2c583662f7165630c`;
+and the three-run policy fingerprint is
+`gtfep_dfaab918de2061a44c6892f8af9b6aba5306876ce4e01061ad23ee994e3b658c`.
+All three checkpoint files have SHA-256
+`bc5a6014abebdc3806fab643ba7d81d74b6e2da9a15260a347d71575ade3b439`;
+their byte identity is consistent with the 1.0 verdict agreement.
 
-The requested Sol-medium independent diagnostic supported all 36 run-A proposals
-across all 27 material records, selected none of the 12 noise records, and
-reported zero critical errors. A generic run-B judgment rejected one
-byte-identical deferred arrival-boundary proposal by treating arrival as an event
-start, despite the fixed ontology. Two isolated reruns agreed once the ontology
-was stated explicitly: an arrival or end is a deferred terminal boundary with an
-unspecified relation, not an occurrence start. The full ontology-aligned run-B
-diagnostic then supported all 35 presented proposals across all 27 material
-records, selected no noise, and reported zero critical errors. The final run-A
-and run-B label SHA-256 values are
-`839aa16bf298cb323522b47165575af5e0752d719c17afb598ebfcde5d3d9cda`
-and
-`a1cca23ec21be7a13cda6ff5f031f7c91ed77312a8ac35fbef8e4ce2deed1271`.
-This prompt sensitivity is why immutable semantic gold remains the release
-authority and Sol remains an independent disagreement diagnostic.
+The mode-`0600` manifests bind the model name and effort, production modules,
+verifier policy, evaluators, semantic gold, benchmark builder, sample,
+checkpoint, and cohort counts. The evaluator verifies fresh, coherent
+provenance and distinct supplied evidence paths. It deliberately reports
+`independent_invocations_verified: false`: file paths and hashes cannot prove
+that three external calls were operationally independent, and the identical
+checkpoint bytes make that caveat especially important. The evidence should be
+described as three separately requested runs, not a cryptographically attested
+independence result.
+
+Sol-medium was retained as an independent disagreement diagnostic, not promoted
+to ground truth. Four fresh contracts make the distinction important:
+
+| Sol contract | Member recall | Artifact precision | Critical errors | Interpretation |
+|---|---:|---:|---:|---|
+| v1 | 84.2% assertion recall | 88.9% | multiple | incorrectly treated review-only support as automation-ready and rejected safe deferral |
+| v2 | 34/36 (94.4%) | 34/36 (94.4%) | 1 | still misread deadline extension and deferred reschedule semantics |
+| v3 | 35/36 (97.2%) | 35/36 (97.2%) | 1 | omitted the implemented intake-window exception for a registration deadline |
+| v4 | 36/37 (97.3%) | **36/36 (100%)** | **0** | accepted every artifact; added one required member beyond frozen gold in the mixed authored/adversarial/quoted-history record |
+
+The v4 judge accepted all 31 supported citations and all five uncertainty
+sidecars, admitted all 27 useful records, suppressed all 12 noise records, and
+reported no unsafe promotion. It counted 33 of 34 units complete. The one-member
+denominator difference is not a rejected Brain artifact: immutable semantic gold
+defines one current schedule member in that mixed record, while Sol assigned two
+members to one unit. The pipeline and frozen gold were not changed to fit that
+post-hoc judgment. Under both authorities, the diagnostic clears the personal
+review-only bar; semantic gold remains the release authority.
+
+The final Sol contract fingerprint is
+`gtsj_1d9784d3e6929a8987a7d7d54b1c6d8e1ec6c3ea347732036348d21d266c6513`;
+the label SHA-256 is
+`03a497f2c4bf988622459886e7bd56e9e2ce26b9599a4fd141289e58e2a84550`;
+the mode-`0600` label-manifest SHA-256 is
+`a3b58ccba7371ed93b0b2e6c75c35a864a3d2346c6ff62ce6088308392efa440`.
+The run used restricted external `gpt-5.6-sol` at medium reasoning over synthetic
+content only and made seven fresh batch calls.
 
 ## Implemented Architecture
 
@@ -271,6 +353,14 @@ The rescue state does not change expression or mention inventories and does not 
 `gmail_temporal_batching.py` partitions one immutable analysis into deterministic segment-local packets. Each packet contains one temporal expression, only local subject/lifecycle candidates, an optional subject-line event bridge, a small number of ranking hints, exact source slices, and an endpoint authority manifest. Every recognized expression is either covered exactly once or receives a content-free omission reason. Source, analysis, plan, batch, and endpoint fingerprints prevent replies from being rebound to changed email.
 
 The planner is pure and performs no model call, write, routing, admission change, or persistence. A selector citation is accepted only if it is a subset of the exact packet manifest.
+
+The narrow singleton fallback is the only deliberate exception to ordinary
+segment locality. It may expose one same-field, nearby event from another
+segment when the message has one temporal expression, no packet-local temporal
+subject, and exactly one retained review-ambiguous event lead. The resulting
+packet is reduced to that expression, event, and bounded context and is always
+deferred. The 82-record replay shows why this exception exists: two useful
+bindings were restored without exposing any additional non-useful record.
 
 ### 3. Endpoint-only semantic selection
 
@@ -302,18 +392,55 @@ reschedules, and independently grounded actual occurrences remain separate. This
 removes a model-visible duplicate without using the model to rewrite temporal
 semantics.
 
-### 6. Event-centered temporal memory
+The post-verdict validator also contains the narrow v17 lifecycle guard. It can
+move one unsafe, scope-conflicted unknown-lifecycle acceptance to its unique
+strict-direct actual-occurrence sibling only as uncertainty. It never promotes
+support and does not fire when there is more than one plausible occurrence.
+
+### 6. Three-run semantic consensus
+
+Production evaluation reduces exactly three complete verifier runs. A candidate
+is confirmed only when all three runs call it supported. It remains uncertain
+when at least two runs accept it as either supported or uncertain; fewer than two
+acceptances reject it. Candidate-level consensus takes precedence so a one-vote
+sibling cannot expand a two-vote candidate.
+
+When runs split across reducer-equivalent aliases and no candidate itself reaches
+quorum, accepted aliases are grouped by the exact semantic signature
+`(expression, relation, kind, lifecycle, normalized value)`. Exactly one
+signature with support from at least two distinct runs authorizes one
+deterministically chosen alias as uncertain. Competing semantic signatures
+produce a non-routable parent-cluster review that authorizes no candidate. The
+normal production validator then recalibrates the consensus, preserving all
+single-run lifecycle and alias safety rules.
+
+### 7. Artifact-level evaluation
+
+The evaluator scores what the system would actually present: supported citations
+and uncertainty sidecars. Candidate aliases inside one sidecar are collapsed to
+semantic hypotheses before deterministic one-to-one matching against gold. A
+second artifact for an already recovered member is redundant; an impure sidecar
+or an unmatched artifact lowers precision. This prevents candidate count from
+inflating recall and prevents an ambiguous sidecar from being scored as several
+independent facts. Split-semantic parent-cluster reviews are reported separately
+as triage coverage and never improve effective recall.
+
+### 8. Event-centered temporal memory
 
 The selector output remains a non-routable evidence sidecar. A resolved occurrence should ultimately reference a stable event entity. Schedules, deadlines, cancellations, completions, and replacements should update an append-only event lifecycle only after event identity is reconciled. Ordinary durable facts remain ordinary facts; they are not required to carry a temporal object merely because their source email contains a date.
 
 ## Verification
 
-- The focused semantic-gold benchmark suite passes 19 tests; the lead suite
-  passes 91 tests; the focused selection/frontier suite passes 96 tests.
-- The complete repository suite passes: 1,417 tests.
-- Ruff passes for all changed temporal modules and tests.
+- Focused regression suites cover lossless batching, singleton fallback,
+  lifecycle calibration, three-run alias and split-semantic consensus,
+  artifact matching, sidecar purity, stability, and manifest rejection.
+- The v19 aggregate passes every synthetic candidate, stability, and provenance
+  gate under the current source and evaluator hashes.
 - The historical replay and fresh packet planner print aggregates only.
-- The new planner, frontier, verdict validator, and reducer are non-routable and make no external calls by themselves.
+- The planner, frontier, verdict validator, ensemble reducer, and evaluator are
+  non-routable and make no external calls by themselves.
+- The final complete repository run passed all 1,531 tests; focused independent
+  review also passed 207 tests, Ruff, and diff checks.
 
 ## What Remains Before A Release Claim
 
@@ -327,19 +454,24 @@ The selector output remains a non-routable evidence sidecar. A resolved occurren
    facts.
 3. Integrate verifier and uncertainty sidecars into Gmail ingestion with complete
    page accounting, deterministic replay, idempotent persistence, and no duplicate
-   active event or temporal reference.
+   active event or temporal reference. The integration must consume split-semantic
+   cluster reviews explicitly, even though they authorize no candidate.
 4. Run a review-only canary with an easy rollback. Keep reminder and calendar
    automation disabled until the separate 99%-precision exact-only gate passes.
 
 ## Current Decision
 
-Freeze the current architecture as the personal-use release candidate. Keep
-expression discovery broad and deterministic; keep temporal references
-event-centered; put ambiguity into a non-routable parent-cluster review state;
-and make model judgment classify a complete, validator-backed,
-expression-local candidate frontier. Separate evidential support from downstream
-normalization and identity deferral. Preserve subject bridges, collapse only
-proven reducer-equivalent aliases, and page overflow losslessly. Keep
-supported-only precision measurable, but do not project uncertain alternatives
-as exact citations. Further synthetic tuning is unlikely to be more informative
-than the private holdout and operational canary.
+Freeze the v19 protocol for the next evaluation step, not as a final production
+claim. It is the best current personal-use, review-only candidate: discovery is
+broad and deterministic; temporal references remain event-centered; model
+judgment is restricted to a complete validator-backed frontier; three-run
+consensus can lower confidence but cannot invent semantics; and uncertainty is
+scored as a real artifact without being projected as an exact citation.
+
+The synthetic benchmark now meets the fair personal release bar. The honest next
+question is distribution shift, not another prompt tweak. Do not call the Gmail
+pipeline production-ready until the frozen private holdout and same-source
+original-Brain parity test pass and the review-only persistence canary
+demonstrates idempotence and rollback. The Sol diagnostic is now understood: it
+accepts every artifact and its remaining disagreement is one additional recall
+denominator member beyond immutable gold.
