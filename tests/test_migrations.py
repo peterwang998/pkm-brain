@@ -9,7 +9,7 @@ from pkm_brain.db import connection, init_db
 from pkm_brain.migrations import MIGRATIONS, run_migrations
 
 
-EXPECTED_MIGRATIONS = list(range(1, 26))
+EXPECTED_MIGRATIONS = list(range(1, 27))
 
 
 def test_fresh_db_applies_registered_migrations(tmp_path: Path) -> None:
@@ -83,9 +83,23 @@ def test_fresh_db_applies_registered_migrations(tmp_path: Path) -> None:
             row["name"]
             for row in conn.execute("PRAGMA table_info(gmail_temporal_review_heads)")
         }
+        temporal_execution_columns = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info(gmail_temporal_review_executions)"
+            )
+        }
+        temporal_component_columns = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info(gmail_temporal_review_components)"
+            )
+        }
         tables = {
             row["name"]
-            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
         }
 
     assert versions == EXPECTED_MIGRATIONS
@@ -144,9 +158,7 @@ def test_fresh_db_applies_registered_migrations(tmp_path: Path) -> None:
         "event_time_precision",
         "event_time_expression",
     }.issubset(fact_columns)
-    assert {"aliases", "status", "merged_into", "description"}.issubset(
-        entity_columns
-    )
+    assert {"aliases", "status", "merged_into", "description"}.issubset(entity_columns)
     assert {
         "fact_id",
         "entity_id",
@@ -184,9 +196,14 @@ def test_fresh_db_applies_registered_migrations(tmp_path: Path) -> None:
         synthesis_columns
     )
     assert {"kind", "target_id", "title", "text"}.issubset(retrieval_fts_columns)
-    assert {"stage", "document_id", "content_hash", "model", "prompt_version", "status"}.issubset(
-        watermark_columns
-    )
+    assert {
+        "stage",
+        "document_id",
+        "content_hash",
+        "model",
+        "prompt_version",
+        "status",
+    }.issubset(watermark_columns)
     assert {
         "input_key",
         "message_scope_key",
@@ -225,6 +242,32 @@ def test_fresh_db_applies_registered_migrations(tmp_path: Path) -> None:
         "generation",
         "updated_at",
     }.issubset(temporal_head_columns)
+    assert {
+        "input_key",
+        "message_scope_key",
+        "pipeline_scope",
+        "document_id",
+        "source_sha256",
+        "runner_policy_fingerprint",
+        "admission_policy_fingerprint",
+        "verifier_policy_fingerprint",
+        "disposition",
+        "target_fingerprint",
+        "request_set_sha256",
+        "component_set_sha256",
+        "invocation_attestation",
+        "review_run_id",
+        "complete",
+        "routable",
+    }.issubset(temporal_execution_columns)
+    assert {
+        "execution_id",
+        "run_ordinal",
+        "invocation_id",
+        "artifact_sha256",
+        "payload_json",
+        "routable",
+    }.issubset(temporal_component_columns)
 
 
 def test_migrations_rerun_is_noop(tmp_path: Path) -> None:
@@ -537,8 +580,18 @@ def test_cos_migrations_backfill_legacy_facts_questions_and_shared_fts() -> None
     assert fact["truth_confidence"] == 0.7
     assert question["action_id"] is None
     assert question["recommended_action"] == "{}"
-    assert {"kind": "chunk", "target_id": "chunk_legacy", "title": "Legacy Chunk", "text": "legacy chunk text"} in retrieval_rows
-    assert {"kind": "fact", "target_id": "fact_legacy", "title": "concepts/test.md", "text": "Legacy fact statement"} in retrieval_rows
+    assert {
+        "kind": "chunk",
+        "target_id": "chunk_legacy",
+        "title": "Legacy Chunk",
+        "text": "legacy chunk text",
+    } in retrieval_rows
+    assert {
+        "kind": "fact",
+        "target_id": "fact_legacy",
+        "title": "concepts/test.md",
+        "text": "Legacy fact statement",
+    } in retrieval_rows
 
 
 def test_wiki_change_item_status_migration_defaults_existing_items_to_pending() -> None:
@@ -826,9 +879,7 @@ def test_migration_adds_mention_kind_to_existing_fact_entities_table() -> None:
 
     run_migrations(conn)
 
-    columns = {
-        row["name"] for row in conn.execute("PRAGMA table_info(fact_entities)")
-    }
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(fact_entities)")}
     versions = [
         row["version"] for row in conn.execute("SELECT version FROM schema_migrations")
     ]
@@ -879,7 +930,9 @@ def test_temporal_fact_migration_is_additive_and_does_not_guess_valid_time() -> 
     }
 
 
-def test_fact_revision_migration_backfills_lineage_and_enforces_one_open_revision() -> None:
+def test_fact_revision_migration_backfills_lineage_and_enforces_one_open_revision() -> (
+    None
+):
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     conn.execute(
@@ -956,13 +1009,16 @@ def test_fact_revision_migration_backfills_lineage_and_enforces_one_open_revisio
         )
         """
     )
-    assert conn.execute(
-        """
+    assert (
+        conn.execute(
+            """
         SELECT id
         FROM facts
         WHERE assertion_lineage_id = 'fact_legacy' AND knowledge_to IS NULL
         """
-    ).fetchone()["id"] == "fact_2"
+        ).fetchone()["id"]
+        == "fact_2"
+    )
 
 
 def test_event_time_migration_is_additive_nullable_and_idempotent() -> None:
@@ -1006,6 +1062,142 @@ def test_event_time_migration_is_additive_nullable_and_idempotent() -> None:
     assert "idx_facts_event_time" in {
         index["name"] for index in conn.execute("PRAGMA index_list(facts)")
     }
+
+
+def test_runner_evidence_migration_retires_unattested_production_head_only() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("CREATE TABLE documents(id TEXT PRIMARY KEY)")
+    conn.execute("INSERT INTO documents(id) VALUES ('doc-gmail-legacy')")
+    persistence_migration = next(row for row in MIGRATIONS if row[0] == 25)
+    runner_migration = next(row for row in MIGRATIONS if row[0] == 26)
+    run_migrations(conn, [persistence_migration])
+
+    run_columns = (
+        "id",
+        "input_key",
+        "message_scope_key",
+        "pipeline_scope",
+        "document_id",
+        "document_content_hash",
+        "gmail_account_key",
+        "gmail_thread_id",
+        "gmail_source_revision",
+        "gmail_message_id",
+        "message_internal_at",
+        "message_start_offset",
+        "message_end_offset",
+        "source_sha256",
+        "source_locator_hash",
+        "source_locator_json",
+        "projection_version",
+        "analysis_fingerprint",
+        "batch_plan_fingerprint",
+        "ensemble_policy_fingerprint",
+        "grouping_policy_fingerprint",
+        "projection_fingerprint",
+        "projection_sha256",
+        "artifact_set_sha256",
+        "projection_json",
+        "complete",
+        "routable",
+        "created_at",
+    )
+    common = (
+        "doc-gmail-legacy",
+        "a" * 64,
+        "personal@example.test",
+        "thread-legacy",
+        "b" * 64,
+        "message-legacy",
+        "2026-07-22T12:00:00+00:00",
+        0,
+        10,
+        "c" * 64,
+        "d" * 64,
+        "{}",
+        "gmail_temporal_review_projection_v1",
+        "analysis-v1",
+        "batch-v1",
+        "ensemble-v1",
+        "grouping-v1",
+        "projection-v1",
+        "e" * 64,
+        "f" * 64,
+        "{}",
+        1,
+        0,
+        "2026-07-22T19:00:00+00:00",
+    )
+    fixtures = (
+        (
+            "run-production-legacy",
+            "input-production-legacy",
+            "scope-production-legacy",
+            "gmail_temporal_review_v1",
+            *common,
+        ),
+        (
+            "run-review-legacy",
+            "input-review-legacy",
+            "scope-review-legacy",
+            "gmail-temporal-review/test",
+            *common,
+        ),
+    )
+    conn.executemany(
+        f"INSERT INTO gmail_temporal_review_runs({', '.join(run_columns)}) "
+        f"VALUES ({', '.join('?' for _ in run_columns)})",
+        fixtures,
+    )
+    conn.executemany(
+        """
+        INSERT INTO gmail_temporal_review_heads(
+          message_scope_key, pipeline_scope, run_id, generation, updated_at
+        ) VALUES (?, ?, ?, 1, '2026-07-22T19:00:00+00:00')
+        """,
+        (
+            (
+                "scope-production-legacy",
+                "gmail_temporal_review_v1",
+                "run-production-legacy",
+            ),
+            (
+                "scope-review-legacy",
+                "gmail-temporal-review/test",
+                "run-review-legacy",
+            ),
+        ),
+    )
+
+    run_migrations(conn, [runner_migration])
+    runner_migration[2](conn)
+
+    heads = [
+        tuple(row)
+        for row in conn.execute(
+            """
+            SELECT message_scope_key, pipeline_scope, run_id
+            FROM gmail_temporal_review_heads
+            ORDER BY message_scope_key
+            """
+        )
+    ]
+    assert heads == [
+        (
+            "scope-review-legacy",
+            "gmail-temporal-review/test",
+            "run-review-legacy",
+        )
+    ]
+    assert (
+        conn.execute("SELECT COUNT(*) FROM gmail_temporal_review_runs").fetchone()[0]
+        == 2
+    )
+    assert [
+        row["version"] for row in conn.execute("SELECT version FROM schema_migrations")
+    ] == [25, 26]
 
 
 def test_failed_migration_rolls_back_that_migration() -> None:

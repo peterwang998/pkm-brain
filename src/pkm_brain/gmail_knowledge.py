@@ -6,7 +6,7 @@ import os
 import re
 import shutil
 import tempfile
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
@@ -27,6 +27,7 @@ from .gmail_archive import (
 from .gmail_projection import (
     GMAIL_KNOWLEDGE_CLASSIFIER_VERSION,
     GMAIL_KNOWLEDGE_PROJECTION_VERSION,
+    GMAIL_MESSAGE_POLICY_VERSION,
     gmail_projection_session_id,
     require_gmail_projection_version,
 )
@@ -42,6 +43,7 @@ from .source_dates import (
     read_frontmatter,
     source_frontmatter_with_path,
     strict_int,
+    trusted_gmail_message_policies,
     trusted_gmail_message_timestamps,
 )
 from .util import file_sha256, slugify
@@ -128,6 +130,18 @@ class GmailImportanceAssessment:
 
 
 @dataclass(frozen=True)
+class GmailMessagePolicy:
+    message_id: str
+    delivery_kind: str
+    advertising_bases: tuple[str, ...]
+    fact_admission_basis: str
+    provider_important: bool
+    provider_starred: bool
+    human_signal_basis: str
+    operator_message_after: bool
+
+
+@dataclass(frozen=True)
 class NormalizedGmailThread:
     account_key: str
     thread_id: str
@@ -146,6 +160,7 @@ class NormalizedGmailThread:
     importance_confidence: float
     fact_admission_basis: str
     fact_eligible: bool
+    message_policies: tuple[GmailMessagePolicy, ...]
     created_at: str | None
     updated_at: str | None
     total_message_count: int
@@ -246,7 +261,9 @@ class GmailKnowledgeCapture:
             ),
             reverse=True,
         )
-        selected = changed[: self.batch_size] if self.batch_size is not None else changed
+        selected = (
+            changed[: self.batch_size] if self.batch_size is not None else changed
+        )
         deferred = max(0, len(changed) - len(selected))
         output = CaptureResult(
             discovered=len(snapshots),
@@ -298,7 +315,9 @@ class GmailKnowledgeCapture:
                 output.errors.extend(captured.errors)
                 output.warnings.extend(captured.warnings)
                 output.artifacts.extend(captured.artifacts)
-            except Exception as exc:  # isolate one malformed or concurrently changed thread
+            except (
+                Exception
+            ) as exc:  # isolate one malformed or concurrently changed thread
                 output.errors.append(_safe_gmail_thread_error(snapshot, exc))
         return output
 
@@ -413,18 +432,14 @@ class GmailKnowledgeCapture:
                     continue
                 captured_path = Path(captured_path_value)
                 frontmatter = read_frontmatter(captured_path)
-                if (
-                    trusted_gmail_message_timestamps(
-                        document,
-                        frontmatter,
-                        captured_path,
-                    )
-                    is not None
-                    and self._repair_ingested_raw_artifact(
-                        captured_path,
-                        document,
-                        expected_hash,
-                    )
+                if trusted_gmail_message_timestamps(
+                    document,
+                    frontmatter,
+                    captured_path,
+                ) is not None and self._repair_ingested_raw_artifact(
+                    captured_path,
+                    document,
+                    expected_hash,
                 ):
                     raw_artifacts_repaired += 1
         for row in captured_rows:
@@ -479,14 +494,11 @@ class GmailKnowledgeCapture:
         frontmatter = read_frontmatter(captured_path)
         account_key = str(frontmatter.get("gmail_account_key") or "").strip()
         thread_id = str(frontmatter.get("gmail_thread_id") or "").strip()
-        source_revision = str(
-            frontmatter.get("gmail_source_revision") or ""
-        ).strip()
+        source_revision = str(frontmatter.get("gmail_source_revision") or "").strip()
         projection_version = strict_int(frontmatter.get("gmail_projection_version"))
         classifier_version = strict_int(frontmatter.get("gmail_classifier_version"))
         if (
-            str(frontmatter.get("source_type") or "")
-            != GMAIL_KNOWLEDGE_SOURCE_TYPE
+            str(frontmatter.get("source_type") or "") != GMAIL_KNOWLEDGE_SOURCE_TYPE
             or not account_key
             or not thread_id
             or not GMAIL_SOURCE_REVISION.fullmatch(source_revision)
@@ -519,6 +531,19 @@ class GmailKnowledgeCapture:
             captured_path,
         )
         if trusted_timestamps is None:
+            return False, False
+        if self.projection_version == GMAIL_KNOWLEDGE_PROJECTION_VERSION and (
+            trusted_gmail_message_policies(
+                {
+                    "source_type": GMAIL_KNOWLEDGE_SOURCE_TYPE,
+                    "source_path": str(captured_path),
+                    "content_hash": content_hash,
+                },
+                frontmatter,
+                captured_path,
+            )
+            is None
+        ):
             return False, False
         if not isinstance(ingested_document, dict):
             return True, False
@@ -657,7 +682,9 @@ def normalize_gmail_thread(
         body, removed = strip_quoted_history(message.body_text)
         quoted_removed += removed
         if len(body) > GMAIL_MESSAGE_BODY_CAP:
-            body = body[:GMAIL_MESSAGE_BODY_CAP].rstrip() + "\n\n[Message body truncated]"
+            body = (
+                body[:GMAIL_MESSAGE_BODY_CAP].rstrip() + "\n\n[Message body truncated]"
+            )
             truncated_indexes.add(index)
         normalized_bodies.append(body)
     normalized_bodies, thread_truncated_indexes = _cap_newest_bodies(
@@ -693,9 +720,7 @@ def normalize_gmail_thread(
         or (
             kind == "unknown"
             and has_human_message
-            and not _message_is_advertising(
-                message, operator_email=operator_email
-            )
+            and not _message_is_advertising(message, operator_email=operator_email)
         )
     ]
     human_candidate = has_human_message
@@ -719,16 +744,14 @@ def normalize_gmail_thread(
         human_candidate_body_chars >= GMAIL_KNOWLEDGE_MIN_HUMAN_FACT_BODY_CHARS
     )
     temporal_body_sufficient = (
-        temporal_candidate_body_chars
-        >= GMAIL_KNOWLEDGE_MIN_TEMPORAL_FACT_BODY_CHARS
+        temporal_candidate_body_chars >= GMAIL_KNOWLEDGE_MIN_TEMPORAL_FACT_BODY_CHARS
     )
     human_lane_eligible = human_candidate and human_body_sufficient
     temporal_lane_eligible = (
         transactional_temporal_candidate and temporal_body_sufficient
     )
     fact_eligible = bool(
-        not deleted
-        and (human_lane_eligible or temporal_lane_eligible)
+        not deleted and (human_lane_eligible or temporal_lane_eligible)
     )
     human_admitted_ids = (
         {message.message_id for message in human_candidate_messages}
@@ -739,6 +762,42 @@ def normalize_gmail_thread(
         {message.message_id for message in temporal_candidate_messages}
         if temporal_lane_eligible and not deleted
         else set()
+    )
+    message_human_signal_bases = [
+        gmail_human_signal_basis((message,), operator_email=operator_email)
+        for message in retained_messages
+    ]
+    message_policies = tuple(
+        GmailMessagePolicy(
+            message_id=message.message_id,
+            delivery_kind=delivery_kind,
+            advertising_bases=_message_advertising_bases(
+                message, operator_email=operator_email
+            ),
+            fact_admission_basis=(
+                "durable_human_candidate"
+                if message.message_id in human_admitted_ids
+                else "high_confidence_important_transactional_temporal"
+                if message.message_id in temporal_admitted_ids
+                else "none"
+            ),
+            provider_important="IMPORTANT"
+            in {str(value).upper() for value in message.label_ids},
+            provider_starred="STARRED"
+            in {str(value).upper() for value in message.label_ids},
+            human_signal_basis=message_human_signal_bases[index],
+            operator_message_after=any(
+                {
+                    "provider_sent",
+                    "operator_authored",
+                }
+                & set(basis.split("+"))
+                for basis in message_human_signal_bases[index + 1 :]
+            ),
+        )
+        for index, (message, delivery_kind) in enumerate(
+            zip(retained_messages, message_delivery_kinds)
+        )
     )
     admitted_message_ids = [
         message.message_id
@@ -851,6 +910,8 @@ def normalize_gmail_thread(
         f"gmail_message_ids: {_yaml_list([message.message_id for message in messages])}",
         "gmail_message_timestamps_version: 1",
         f"gmail_message_timestamps: {_yaml_json(message_timestamps)}",
+        f"gmail_message_policy_version: {GMAIL_MESSAGE_POLICY_VERSION}",
+        f"gmail_message_policies: {_yaml_json([asdict(item) for item in message_policies])}",
         f"delivery_kind: {delivery_kind}",
         f"delivery_kind_basis: {delivery_basis}",
         # Compatibility aliases for existing reports and extraction metadata.
@@ -894,6 +955,7 @@ def normalize_gmail_thread(
         importance_confidence=importance.importance_confidence,
         fact_admission_basis=fact_admission_basis,
         fact_eligible=fact_eligible,
+        message_policies=message_policies,
         created_at=created_at,
         updated_at=updated_at,
         total_message_count=snapshot.total_message_count,
@@ -946,9 +1008,10 @@ def assess_gmail_importance(
 ) -> GmailImportanceAssessment:
     """Assess fact importance and actionability independently of delivery kind."""
 
-    effective_delivery = delivery_kind or classify_gmail_thread(
-        messages, operator_email=operator_email
-    )[0]
+    effective_delivery = (
+        delivery_kind
+        or classify_gmail_thread(messages, operator_email=operator_email)[0]
+    )
     classified_messages = [
         (
             message,
@@ -1031,17 +1094,22 @@ def assess_gmail_importance(
 def _message_is_advertising(
     message: ArchiveOpenedMessage, *, operator_email: str = ""
 ) -> bool:
+    return bool(_message_advertising_bases(message, operator_email=operator_email))
+
+
+def _message_advertising_bases(
+    message: ArchiveOpenedMessage, *, operator_email: str = ""
+) -> tuple[str, ...]:
     if _message_delivery_kind(message, operator_email=operator_email) == "human":
-        return False
-    labels = {
-        str(label).upper()
-        for label in message.label_ids
-        if str(label).strip()
-    }
+        return ()
+    labels = {str(label).upper() for label in message.label_ids if str(label).strip()}
     content = "\n".join((message.subject or "", message.body_text))
-    return bool(labels & _PROMOTIONAL_LABELS) or bool(
-        _ADVERTISING_PATTERN.search(content)
-    )
+    bases: list[str] = []
+    if labels & _PROMOTIONAL_LABELS:
+        bases.append("provider_category_promotions")
+    if _ADVERTISING_PATTERN.search(content):
+        bases.append("content_pattern")
+    return tuple(sorted(bases))
 
 
 def _message_is_transactional_temporal_candidate(
@@ -1091,7 +1159,9 @@ def gmail_human_signal_basis(
         bases.append("operator_authored")
         if any(
             normalized_operator
-            not in {str(address).strip().casefold() for address in message.from_addresses}
+            not in {
+                str(address).strip().casefold() for address in message.from_addresses
+            }
             for message in messages
         ):
             bases.append("reciprocal_thread")
@@ -1101,11 +1171,7 @@ def gmail_human_signal_basis(
 def _message_delivery_kind(
     message: ArchiveOpenedMessage, *, operator_email: str = ""
 ) -> str:
-    labels = {
-        str(label).upper()
-        for label in message.label_ids
-        if str(label).strip()
-    }
+    labels = {str(label).upper() for label in message.label_ids if str(label).strip()}
     precedence = str(message.precedence or "").strip().casefold()
     if (
         labels & _BULK_LABELS
@@ -1160,9 +1226,7 @@ def reconcile_gmail_document_revisions(
                 (GMAIL_KNOWLEDGE_SOURCE_TYPE,),
             )
         ]
-        grouped: dict[
-            tuple[str, str], list[tuple[dict[str, Any], dict[str, Any]]]
-        ] = {}
+        grouped: dict[tuple[str, str], list[tuple[dict[str, Any], dict[str, Any]]]] = {}
         desired_status: dict[str, str] = {}
         for document in documents:
             frontmatter, frontmatter_path = source_frontmatter_with_path(document)
@@ -1336,9 +1400,7 @@ def reconcile_gmail_document_revisions(
         from .service import BrainService
 
         try:
-            vector_repair = BrainService(paths).rebuild_vector_index(
-                missing_only=True
-            )
+            vector_repair = BrainService(paths).rebuild_vector_index(missing_only=True)
         except Exception:
             vector_inventory_ok = False
             reconciliation_errors.append("Gmail reactivated-vector repair failed")
@@ -1382,7 +1444,9 @@ def reconcile_gmail_document_revisions(
         superseded_documents=sum(
             status == "superseded" for status in desired_status.values()
         ),
-        deleted_documents=sum(status == "deleted" for status in desired_status.values()),
+        deleted_documents=sum(
+            status == "deleted" for status in desired_status.values()
+        ),
         retrieval_chunks_removed=len(purged_chunk_ids),
         vectors_removed=int(vectors_removed),
         reactivated_documents=len(reactivated_ids),
@@ -1455,8 +1519,13 @@ def _valid_gmail_revision_lineage(
         frontmatter.get("fact_eligible"), bool
     ):
         return False
-    return (
-        trusted_gmail_message_timestamps(
+    trusted_timestamps = trusted_gmail_message_timestamps(
+        document,
+        frontmatter,
+        frontmatter_path,
+    )
+    return trusted_timestamps is not None and (
+        trusted_gmail_message_policies(
             document,
             frontmatter,
             frontmatter_path,
@@ -1578,8 +1647,7 @@ def _message_direction(
     }:
         return "outgoing", "from_header_fallback"
     if operator_email and operator_email in {
-        value.casefold()
-        for value in (*message.to_addresses, *message.cc_addresses)
+        value.casefold() for value in (*message.to_addresses, *message.cc_addresses)
     }:
         return "incoming", "recipient_header_fallback"
     return "unknown", "insufficient_provider_metadata"

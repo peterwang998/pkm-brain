@@ -15,6 +15,7 @@ from pkm_brain.gmail_temporal_persistence import (
     GmailTemporalPersistenceConflict,
     GmailTemporalPersistenceError,
     GmailTemporalSourceLocator,
+    clear_gmail_temporal_review_head_for_source,
     get_gmail_temporal_review_head,
     persist_gmail_temporal_review_projection,
     rollback_gmail_temporal_review_head,
@@ -470,6 +471,81 @@ def test_complete_projection_persists_once_and_groups_are_not_artifacts(
     assert question_count == 0
 
 
+def test_production_scope_rejects_direct_sink_without_runner_evidence(
+    tmp_path: Path,
+) -> None:
+    paths = _workspace(tmp_path)
+
+    with pytest.raises(
+        GmailTemporalPersistenceError, match="requires runner execution evidence"
+    ):
+        persist_gmail_temporal_review_projection(
+            paths,
+            source=_source(),
+            pipeline_scope="gmail_temporal_review_v1",
+            projection=_projection(),
+            expected_head_run_id=None,
+            expected_head_generation=None,
+        )
+
+    assert _counts(paths) == (0, 0, 0)
+
+
+def test_production_head_without_matching_execution_receipt_is_stale(
+    tmp_path: Path,
+) -> None:
+    paths = _workspace(tmp_path)
+    result = persist_gmail_temporal_review_projection(
+        paths,
+        source=_source(),
+        pipeline_scope=PIPELINE_SCOPE,
+        projection=_projection(),
+        expected_head_run_id=None,
+        expected_head_generation=None,
+    )
+    with connection(paths.sqlite_path) as conn:
+        stored = dict(
+            conn.execute(
+                "SELECT * FROM gmail_temporal_review_runs WHERE id = ?",
+                (result.run_id,),
+            ).fetchone()
+        )
+        stored.update(
+            id="legacy-production-run",
+            input_key="legacy-production-input",
+            pipeline_scope="gmail_temporal_review_v1",
+        )
+        columns = tuple(stored)
+        conn.execute(
+            f"INSERT INTO gmail_temporal_review_runs({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' for _ in columns)})",
+            tuple(stored[column] for column in columns),
+        )
+        conn.execute(
+            """
+            INSERT INTO gmail_temporal_review_heads(
+              message_scope_key, pipeline_scope, run_id, generation, updated_at
+            ) VALUES (?, 'gmail_temporal_review_v1', ?, 1, ?)
+            """,
+            (
+                result.message_scope_key,
+                "legacy-production-run",
+                "2026-07-22T20:00:00+00:00",
+            ),
+        )
+
+    head = get_gmail_temporal_review_head(
+        paths,
+        message_scope_key=result.message_scope_key,
+        pipeline_scope="gmail_temporal_review_v1",
+    )
+
+    assert head is not None
+    assert head.run_id == "legacy-production-run"
+    assert head.source_status == "stale"
+    assert head.stale_reason == "runner_execution_missing"
+
+
 def test_same_input_key_with_different_projection_bytes_fails_closed(
     tmp_path: Path,
 ) -> None:
@@ -719,6 +795,87 @@ def test_source_authority_and_append_only_triggers_fail_closed(tmp_path: Path) -
                 (result.run_id,),
             )
     assert _counts(paths) == (1, 3, 1)
+
+
+def test_source_bound_clear_requires_current_source_and_exact_head(
+    tmp_path: Path,
+) -> None:
+    paths = _workspace(tmp_path)
+    first = persist_gmail_temporal_review_projection(
+        paths,
+        source=_source(),
+        pipeline_scope=PIPELINE_SCOPE,
+        projection=_projection(suffix="a"),
+        expected_head_run_id=None,
+        expected_head_generation=None,
+    )
+    second = persist_gmail_temporal_review_projection(
+        paths,
+        source=_source(),
+        pipeline_scope=PIPELINE_SCOPE,
+        projection=_projection(suffix="b"),
+        expected_head_run_id=first.run_id,
+        expected_head_generation=first.head_generation,
+    )
+
+    with pytest.raises(GmailTemporalHeadConflict, match="changed"):
+        clear_gmail_temporal_review_head_for_source(
+            paths,
+            source=_source(),
+            pipeline_scope=PIPELINE_SCOPE,
+            expected_run_id=first.run_id,
+            expected_generation=first.head_generation,
+        )
+
+    with connection(paths.sqlite_path) as conn:
+        conn.execute("UPDATE documents SET status='superseded' WHERE id='doc-gmail-1'")
+    with pytest.raises(GmailTemporalHeadConflict, match="no longer the active"):
+        clear_gmail_temporal_review_head_for_source(
+            paths,
+            source=_source(),
+            pipeline_scope=PIPELINE_SCOPE,
+            expected_run_id=second.run_id,
+            expected_generation=second.head_generation,
+        )
+
+    with connection(paths.sqlite_path) as conn:
+        stored = conn.execute(
+            "SELECT run_id, generation FROM gmail_temporal_review_heads"
+        ).fetchone()
+    assert tuple(stored) == (second.run_id, second.head_generation)
+
+
+def test_source_bound_clear_atomically_clears_current_review_head(
+    tmp_path: Path,
+) -> None:
+    paths = _workspace(tmp_path)
+    result = persist_gmail_temporal_review_projection(
+        paths,
+        source=_source(),
+        pipeline_scope=PIPELINE_SCOPE,
+        projection=_projection(),
+        expected_head_run_id=None,
+        expected_head_generation=None,
+    )
+
+    cleared = clear_gmail_temporal_review_head_for_source(
+        paths,
+        source=_source(),
+        pipeline_scope=PIPELINE_SCOPE,
+        expected_run_id=result.run_id,
+        expected_generation=result.head_generation,
+    )
+
+    assert cleared.current_run_id is None
+    assert cleared.head_generation == result.head_generation + 1
+    head = get_gmail_temporal_review_head(
+        paths,
+        message_scope_key=result.message_scope_key,
+        pipeline_scope=PIPELINE_SCOPE,
+    )
+    assert head is not None
+    assert head.run_id is None
+    assert head.source_status == "cleared"
 
 
 @pytest.mark.parametrize(

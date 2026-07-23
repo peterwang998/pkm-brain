@@ -10,10 +10,13 @@ import json
 # and makes artifact bytes deterministic. V5 scopes advertising and body-sufficiency
 # decisions to the individual message ranges that fact extraction can actually see.
 # V6 keeps those message scopes independent when one thread contains both a bulk
-# promotion and a separate qualifying transactional event.
+# promotion and a separate qualifying transactional event. V7 adds a trusted
+# per-message delivery/advertising/relevance index so temporal review never uses
+# one thread-level label as the recall boundary for a different message.
 # Each semantic renderer change gets a new version.
-GMAIL_KNOWLEDGE_PROJECTION_VERSION = 6
+GMAIL_KNOWLEDGE_PROJECTION_VERSION = 7
 GMAIL_KNOWLEDGE_CLASSIFIER_VERSION = 5
+GMAIL_MESSAGE_POLICY_VERSION = 1
 
 
 def require_gmail_projection_version(value: int) -> int:

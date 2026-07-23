@@ -341,6 +341,38 @@ def test_frontier_reports_candidate_endpoint_truncation_without_silent_loss() ->
     assert len(frontier.candidates) == 1
 
 
+def test_frontier_recovers_same_segment_event_outside_trimmed_context() -> None:
+    text = (
+        "Subject: FYI\n\nMeeting "
+        + ("context " * 700)
+        + "is scheduled for May 14, 2027."
+    )
+    analysis, plan = analyze_and_plan(text)
+    batch = plan.batches[0]
+
+    frontier = build_gmail_temporal_candidate_frontier(
+        analysis=analysis,
+        batch=batch,
+    )
+
+    assert "local_context_trimmed" in batch.diagnostics
+    event = next(
+        item
+        for item in batch.mentions
+        if item.mention_type == "event" and item.start == text.index("Meeting")
+    )
+    assert batch.omitted_mention_count == 0
+    recovered = tuple(
+        item
+        for item in frontier.candidates
+        if item.subject_mention_id == event.mention_id
+    )
+    assert recovered
+    assert all(item.requires_defer is True for item in recovered)
+    assert frontier.omitted_candidate_mention_count == 0
+    assert frontier.complete is True
+
+
 def test_frontier_is_complete_when_artifacts_yield_to_citable_bridges() -> None:
     text = (
         "Subject: Cancelled Planning Meeting\n\n"

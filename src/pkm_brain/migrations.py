@@ -1014,6 +1014,144 @@ def _migration_025_gmail_temporal_review_persistence(
     )
 
 
+def _migration_026_gmail_temporal_runner_evidence(
+    conn: sqlite3.Connection,
+) -> None:
+    """Bind review outcomes to the authoritative runner and component evidence."""
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS gmail_temporal_review_executions (
+          id TEXT PRIMARY KEY,
+          input_key TEXT NOT NULL UNIQUE,
+          message_scope_key TEXT NOT NULL,
+          pipeline_scope TEXT NOT NULL,
+          document_id TEXT NOT NULL REFERENCES documents(id),
+          document_content_hash TEXT NOT NULL,
+          source_sha256 TEXT NOT NULL,
+          source_locator_hash TEXT NOT NULL,
+          runner_policy_fingerprint TEXT NOT NULL,
+          admission_policy_fingerprint TEXT NOT NULL,
+          verifier_policy_fingerprint TEXT NOT NULL,
+          sanitizer_version INTEGER NOT NULL CHECK(sanitizer_version >= 1),
+          provider TEXT NOT NULL,
+          model TEXT NOT NULL,
+          reasoning_effort TEXT NOT NULL,
+          admission_basis TEXT NOT NULL CHECK(
+            admission_basis IN ('fact', 'temporal_rescue', 'not_admitted')
+          ),
+          disposition TEXT NOT NULL CHECK(
+            disposition IN (
+              'complete_review_projection', 'no_recognized_expression',
+              'no_verification_candidate', 'not_admitted'
+            )
+          ),
+          target_fingerprint TEXT NOT NULL,
+          analysis_fingerprint TEXT NOT NULL,
+          batch_plan_fingerprint TEXT NOT NULL,
+          expression_count INTEGER NOT NULL CHECK(expression_count >= 0),
+          batch_count INTEGER NOT NULL CHECK(batch_count >= 0),
+          candidate_count INTEGER NOT NULL CHECK(candidate_count >= 0),
+          page_count INTEGER NOT NULL CHECK(page_count >= 0),
+          request_count INTEGER NOT NULL CHECK(request_count >= 0),
+          component_count INTEGER NOT NULL CHECK(component_count IN (0, 3)),
+          request_set_sha256 TEXT NOT NULL,
+          component_set_sha256 TEXT NOT NULL,
+          invocation_attestation TEXT NOT NULL CHECK(
+            invocation_attestation = 'self_reported_external_invocation'
+          ),
+          independent_invocations_verified INTEGER NOT NULL CHECK(
+            independent_invocations_verified = 0
+          ),
+          review_run_id TEXT UNIQUE REFERENCES gmail_temporal_review_runs(id),
+          complete INTEGER NOT NULL CHECK(complete = 1),
+          routable INTEGER NOT NULL CHECK(routable = 0),
+          created_at TEXT NOT NULL,
+          CHECK(
+            (disposition = 'complete_review_projection'
+             AND component_count = 3 AND review_run_id IS NOT NULL)
+            OR
+            (disposition != 'complete_review_projection'
+             AND component_count = 0 AND review_run_id IS NULL)
+          ),
+          UNIQUE(message_scope_key, pipeline_scope, input_key)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_gmail_temporal_review_executions_scope
+        ON gmail_temporal_review_executions(
+          message_scope_key, pipeline_scope, created_at
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS gmail_temporal_review_components (
+          execution_id TEXT NOT NULL
+            REFERENCES gmail_temporal_review_executions(id),
+          run_ordinal INTEGER NOT NULL CHECK(run_ordinal BETWEEN 1 AND 3),
+          invocation_id TEXT NOT NULL,
+          started_at TEXT NOT NULL,
+          completed_at TEXT NOT NULL,
+          artifact_sha256 TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          routable INTEGER NOT NULL CHECK(routable = 0),
+          created_at TEXT NOT NULL,
+          PRIMARY KEY(execution_id, run_ordinal),
+          UNIQUE(execution_id, invocation_id),
+          UNIQUE(execution_id, artifact_sha256)
+        )
+        """
+    )
+    # Migration 25 could make a production review run current before the
+    # authoritative runner receipt existed.  Keep that immutable evidence in
+    # the ledger, but never carry its mutable head authority across the v26
+    # trust-boundary upgrade.  The NOT EXISTS form also makes a direct,
+    # idempotent invocation of this migration preserve already-attested heads.
+    conn.execute(
+        """
+        DELETE FROM gmail_temporal_review_heads
+        WHERE pipeline_scope = 'gmail_temporal_review_v1'
+          AND run_id IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1
+            FROM gmail_temporal_review_executions
+            WHERE review_run_id = gmail_temporal_review_heads.run_id
+              AND message_scope_key =
+                    gmail_temporal_review_heads.message_scope_key
+              AND pipeline_scope = gmail_temporal_review_heads.pipeline_scope
+              AND disposition = 'complete_review_projection'
+              AND complete = 1
+              AND routable = 0
+          )
+        """
+    )
+    for table in (
+        "gmail_temporal_review_executions",
+        "gmail_temporal_review_components",
+    ):
+        conn.execute(
+            f"""
+            CREATE TRIGGER IF NOT EXISTS trg_{table}_no_update
+            BEFORE UPDATE ON {table}
+            BEGIN
+              SELECT RAISE(ABORT, 'gmail temporal runner evidence is immutable');
+            END
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE TRIGGER IF NOT EXISTS trg_{table}_no_delete
+            BEFORE DELETE ON {table}
+            BEGIN
+              SELECT RAISE(ABORT, 'gmail temporal runner evidence is immutable');
+            END
+            """
+        )
+
+
 MIGRATIONS: list[Migration] = [
     (1, "add_origin_identity", _migration_001_add_origin_identity),
     (2, "create_sync_runs", _migration_002_create_sync_runs),
@@ -1047,6 +1185,11 @@ MIGRATIONS: list[Migration] = [
         25,
         "gmail_temporal_review_persistence",
         _migration_025_gmail_temporal_review_persistence,
+    ),
+    (
+        26,
+        "gmail_temporal_runner_evidence",
+        _migration_026_gmail_temporal_runner_evidence,
     ),
 ]
 

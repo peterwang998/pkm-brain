@@ -5,7 +5,7 @@ import json
 import re
 import sqlite3
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Iterator, Mapping, Sequence
 
@@ -32,6 +32,16 @@ _PIPELINE_SCOPE = re.compile(r"^[a-z0-9][a-z0-9._:/-]{0,127}$")
 _RUN_VERSION = "gmail_temporal_review_persistence_v1"
 _LOCATOR_VERSION = "gmail_temporal_source_locator_v1"
 _ARTIFACT_KINDS = {"supported_citation", "uncertainty_sidecar"}
+_RUNNER_EXECUTION_VERSION = "gmail_temporal_runner_execution_v1"
+_PRODUCTION_PIPELINE_SCOPE = "gmail_temporal_review_v1"
+_INVOCATION_ATTESTATION = "self_reported_external_invocation"
+_EXECUTION_DISPOSITIONS = {
+    "complete_review_projection",
+    "no_recognized_expression",
+    "no_verification_candidate",
+    "not_admitted",
+}
+_ADMISSION_BASES = {"fact", "temporal_rescue", "not_admitted"}
 
 
 class GmailTemporalPersistenceError(ValueError):
@@ -127,6 +137,8 @@ class GmailTemporalPersistenceResult:
     head_generation: int
     replayed: bool
     head_changed: bool
+    execution_id: str | None = None
+    execution_replayed: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -137,6 +149,57 @@ class GmailTemporalRollbackResult:
     current_run_id: str | None
     head_generation: int
     changed: bool
+
+
+@dataclass(frozen=True)
+class GmailTemporalReviewComponentEvidence:
+    """Content-free component checkpoint retained with one runner execution."""
+
+    run_ordinal: int
+    invocation_id: str
+    started_at: str
+    completed_at: str
+    artifact_sha256: str
+    payload_json: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class GmailTemporalReviewExecutionEvidence:
+    """Authoritative-runner evidence required by the production pipeline scope."""
+
+    runner_policy_fingerprint: str
+    admission_policy_fingerprint: str
+    verifier_policy_fingerprint: str
+    sanitizer_version: int
+    provider: str
+    model: str
+    reasoning_effort: str
+    admission_basis: str
+    disposition: str
+    target_fingerprint: str
+    analysis_fingerprint: str
+    batch_plan_fingerprint: str
+    expression_count: int
+    batch_count: int
+    candidate_count: int
+    page_count: int
+    request_fingerprints: tuple[str, ...]
+    components: tuple[GmailTemporalReviewComponentEvidence, ...]
+    version: str = _RUNNER_EXECUTION_VERSION
+    invocation_attestation: str = _INVOCATION_ATTESTATION
+    independent_invocations_verified: bool = False
+
+
+@dataclass(frozen=True)
+class GmailTemporalExecutionPersistenceResult:
+    execution_id: str
+    input_key: str
+    message_scope_key: str
+    pipeline_scope: str
+    disposition: str
+    replayed: bool
+    head_changed: bool
+    head_generation: int | None
 
 
 @dataclass(frozen=True)
@@ -170,6 +233,47 @@ class _PreparedProjection:
     artifacts: tuple[_PreparedArtifact, ...]
 
 
+@dataclass(frozen=True)
+class _PreparedExecutionComponent:
+    run_ordinal: int
+    invocation_id: str
+    started_at: str
+    completed_at: str
+    artifact_sha256: str
+    payload_json: str
+
+
+@dataclass(frozen=True)
+class _PreparedExecution:
+    execution_id: str
+    input_key: str
+    message_scope_key: str
+    pipeline_scope: str
+    locator: GmailTemporalSourceLocator
+    locator_hash: str
+    runner_policy_fingerprint: str
+    admission_policy_fingerprint: str
+    verifier_policy_fingerprint: str
+    sanitizer_version: int
+    provider: str
+    model: str
+    reasoning_effort: str
+    admission_basis: str
+    disposition: str
+    target_fingerprint: str
+    analysis_fingerprint: str
+    batch_plan_fingerprint: str
+    expression_count: int
+    batch_count: int
+    candidate_count: int
+    page_count: int
+    request_count: int
+    request_set_sha256: str
+    component_set_sha256: str
+    review_run_id: str | None
+    components: tuple[_PreparedExecutionComponent, ...]
+
+
 def gmail_temporal_message_scope_key(
     *, gmail_account_key: str, gmail_thread_id: str, gmail_message_id: str
 ) -> str:
@@ -197,6 +301,7 @@ def persist_gmail_temporal_review_projection(
     projection: GmailTemporalReviewProjection,
     expected_head_run_id: str | None,
     expected_head_generation: int | None,
+    execution: GmailTemporalReviewExecutionEvidence | None = None,
 ) -> GmailTemporalPersistenceResult:
     """Atomically append one complete projection and CAS its current head.
 
@@ -210,8 +315,24 @@ def persist_gmail_temporal_review_projection(
         pipeline_scope=pipeline_scope,
         projection=projection,
     )
+    prepared_execution = _prepare_execution(
+        source=prepared.locator,
+        pipeline_scope=prepared.pipeline_scope,
+        execution=execution,
+        review_run_id=prepared.run_id,
+        expected_component_fingerprints=_projection_component_fingerprints(projection),
+        expected_analysis_fingerprint=prepared.analysis_fingerprint,
+        expected_batch_plan_fingerprint=prepared.batch_plan_fingerprint,
+    )
+    if prepared.pipeline_scope == _PRODUCTION_PIPELINE_SCOPE and (
+        prepared_execution is None
+    ):
+        raise GmailTemporalPersistenceError(
+            "production Gmail temporal persistence requires runner execution evidence"
+        )
     _validate_expected_head(expected_head_run_id, expected_head_generation)
     created_at = now_iso()
+    execution_replayed: bool | None = None
     with connection(paths.sqlite_path) as conn:
         with _savepoint(conn, "gmail_temporal_review_persist"):
             _validate_document_authority(conn, prepared.locator)
@@ -228,6 +349,10 @@ def persist_gmail_temporal_review_projection(
                 _insert_artifacts(conn, prepared, created_at=created_at)
             else:
                 _validate_existing_run(conn, existing, prepared)
+            if prepared_execution is not None:
+                execution_replayed = _persist_execution(
+                    conn, prepared_execution, created_at=created_at
+                )
             head, head_changed = _advance_head(
                 conn,
                 message_scope_key=prepared.message_scope_key,
@@ -248,6 +373,108 @@ def persist_gmail_temporal_review_projection(
         head_generation=head.generation,
         replayed=replayed,
         head_changed=head_changed,
+        execution_id=(
+            prepared_execution.execution_id if prepared_execution is not None else None
+        ),
+        execution_replayed=execution_replayed,
+    )
+
+
+def persist_gmail_temporal_zero_work_outcome(
+    paths: BrainPaths,
+    *,
+    source: GmailTemporalSourceLocator,
+    pipeline_scope: str,
+    execution: GmailTemporalReviewExecutionEvidence,
+    expected_head_run_id: str | None,
+    expected_head_generation: int | None,
+) -> GmailTemporalExecutionPersistenceResult:
+    """Append one zero-work decision and source-bound CAS-clear its review head."""
+
+    locator = source.validated()
+    pipeline = _pipeline_scope(pipeline_scope)
+    prepared = _prepare_execution(
+        source=locator,
+        pipeline_scope=pipeline,
+        execution=execution,
+        review_run_id=None,
+        expected_component_fingerprints=(),
+        expected_analysis_fingerprint=None,
+        expected_batch_plan_fingerprint=None,
+    )
+    if prepared is None:
+        raise GmailTemporalPersistenceError("zero-work execution evidence is required")
+    if prepared.disposition == "complete_review_projection":
+        raise GmailTemporalPersistenceError(
+            "zero-work persistence cannot accept a review projection"
+        )
+    _validate_expected_head(expected_head_run_id, expected_head_generation)
+    created_at = now_iso()
+    with connection(paths.sqlite_path) as conn:
+        with _savepoint(conn, "gmail_temporal_zero_work_persist"):
+            _validate_document_authority(conn, locator)
+            replayed = _persist_execution(conn, prepared, created_at=created_at)
+            row = conn.execute(
+                """
+                SELECT message_scope_key, pipeline_scope, run_id, generation, updated_at
+                FROM gmail_temporal_review_heads
+                WHERE message_scope_key = ? AND pipeline_scope = ?
+                """,
+                (prepared.message_scope_key, pipeline),
+            ).fetchone()
+            if row is None:
+                if (
+                    expected_head_run_id is not None
+                    or expected_head_generation is not None
+                ):
+                    raise GmailTemporalHeadConflict(
+                        "Gmail temporal review head disappeared before zero-work persistence"
+                    )
+                head_changed = False
+                head_generation = None
+            else:
+                current = _head_from_row(row)
+                if (
+                    current.run_id != expected_head_run_id
+                    or current.generation != expected_head_generation
+                ):
+                    raise GmailTemporalHeadConflict(
+                        "Gmail temporal review head changed before zero-work persistence"
+                    )
+                if current.run_id is None:
+                    head_changed = False
+                    head_generation = current.generation
+                else:
+                    cursor = conn.execute(
+                        """
+                        UPDATE gmail_temporal_review_heads
+                        SET run_id = NULL, generation = generation + 1, updated_at = ?
+                        WHERE message_scope_key = ? AND pipeline_scope = ?
+                          AND generation = ? AND run_id = ?
+                        """,
+                        (
+                            created_at,
+                            prepared.message_scope_key,
+                            pipeline,
+                            current.generation,
+                            current.run_id,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise GmailTemporalHeadConflict(
+                            "Gmail temporal review head changed concurrently"
+                        )
+                    head_changed = True
+                    head_generation = current.generation + 1
+    return GmailTemporalExecutionPersistenceResult(
+        execution_id=prepared.execution_id,
+        input_key=prepared.input_key,
+        message_scope_key=prepared.message_scope_key,
+        pipeline_scope=pipeline,
+        disposition=prepared.disposition,
+        replayed=replayed,
+        head_changed=head_changed,
+        head_generation=head_generation,
     )
 
 
@@ -273,6 +500,26 @@ def get_gmail_temporal_review_head(
         head = _head_from_row(row)
         if head.run_id is None:
             return replace(head, source_status="cleared")
+        if pipeline == _PRODUCTION_PIPELINE_SCOPE:
+            execution = conn.execute(
+                """
+                SELECT 1
+                FROM gmail_temporal_review_executions
+                WHERE review_run_id = ?
+                  AND message_scope_key = ?
+                  AND pipeline_scope = ?
+                  AND disposition = 'complete_review_projection'
+                  AND complete = 1
+                  AND routable = 0
+                """,
+                (head.run_id, message_scope, pipeline),
+            ).fetchone()
+            if execution is None:
+                return replace(
+                    head,
+                    source_status="stale",
+                    stale_reason="runner_execution_missing",
+                )
         try:
             run = _run_row(conn, head.run_id)
             _validate_document_authority(conn, _locator_from_run(run))
@@ -417,6 +664,545 @@ def rollback_gmail_temporal_review_head(
         head_generation=next_head.generation,
         changed=True,
     )
+
+
+def clear_gmail_temporal_review_head_for_source(
+    paths: BrainPaths,
+    *,
+    source: GmailTemporalSourceLocator,
+    pipeline_scope: str,
+    expected_run_id: str,
+    expected_generation: int,
+) -> GmailTemporalRollbackResult:
+    """CAS-clear a head only while the zero-work source remains authoritative.
+
+    Unlike a manual rollback, this transition binds the clear decision to the
+    active Gmail document that produced it.  A superseding source revision or a
+    concurrent head advance therefore aborts the clear atomically.
+    """
+
+    locator = source.validated()
+    pipeline = _pipeline_scope(pipeline_scope)
+    expected = _bounded_text(expected_run_id, "expected_run_id", 128)
+    _validate_expected_head(expected, expected_generation)
+    message_scope = gmail_temporal_message_scope_key(
+        gmail_account_key=locator.gmail_account_key,
+        gmail_thread_id=locator.gmail_thread_id,
+        gmail_message_id=locator.gmail_message_id,
+    )
+    updated_at = now_iso()
+    with connection(paths.sqlite_path) as conn:
+        with _savepoint(conn, "gmail_temporal_review_source_clear"):
+            _validate_document_authority(conn, locator)
+            row = conn.execute(
+                """
+                SELECT message_scope_key, pipeline_scope, run_id, generation, updated_at
+                FROM gmail_temporal_review_heads
+                WHERE message_scope_key = ? AND pipeline_scope = ?
+                """,
+                (message_scope, pipeline),
+            ).fetchone()
+            if row is None:
+                raise GmailTemporalHeadConflict(
+                    "Gmail temporal review head disappeared before source-bound clear"
+                )
+            current = _head_from_row(row)
+            if current.run_id != expected or current.generation != expected_generation:
+                raise GmailTemporalHeadConflict(
+                    "Gmail temporal review head changed before source-bound clear"
+                )
+            cursor = conn.execute(
+                """
+                UPDATE gmail_temporal_review_heads
+                SET run_id = NULL, generation = generation + 1, updated_at = ?
+                WHERE message_scope_key = ? AND pipeline_scope = ?
+                  AND generation = ? AND run_id = ?
+                """,
+                (
+                    updated_at,
+                    message_scope,
+                    pipeline,
+                    expected_generation,
+                    expected,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise GmailTemporalHeadConflict(
+                    "Gmail temporal review head changed concurrently"
+                )
+    return GmailTemporalRollbackResult(
+        message_scope_key=message_scope,
+        pipeline_scope=pipeline,
+        previous_run_id=expected,
+        current_run_id=None,
+        head_generation=expected_generation + 1,
+        changed=True,
+    )
+
+
+def _projection_component_fingerprints(
+    projection: GmailTemporalReviewProjection,
+) -> tuple[str, ...]:
+    values = projection.component_evidence_fingerprints
+    if not isinstance(values, tuple):
+        raise GmailTemporalPersistenceError(
+            "projection component evidence fingerprints are malformed"
+        )
+    return tuple(_sha256(value, "component_evidence_fingerprint") for value in values)
+
+
+def _prepare_execution(
+    *,
+    source: GmailTemporalSourceLocator,
+    pipeline_scope: str,
+    execution: GmailTemporalReviewExecutionEvidence | None,
+    review_run_id: str | None,
+    expected_component_fingerprints: tuple[str, ...],
+    expected_analysis_fingerprint: str | None,
+    expected_batch_plan_fingerprint: str | None,
+) -> _PreparedExecution | None:
+    if execution is None:
+        return None
+    if not isinstance(execution, GmailTemporalReviewExecutionEvidence):
+        raise GmailTemporalPersistenceError("runner execution evidence is malformed")
+    if (
+        execution.version != _RUNNER_EXECUTION_VERSION
+        or execution.invocation_attestation != _INVOCATION_ATTESTATION
+        or execution.independent_invocations_verified is not False
+        or execution.disposition not in _EXECUTION_DISPOSITIONS
+        or execution.admission_basis not in _ADMISSION_BASES
+    ):
+        raise GmailTemporalPersistenceError("runner execution authority is invalid")
+    locator = source.validated()
+    pipeline = _pipeline_scope(pipeline_scope)
+    runner_policy = _bounded_text(
+        execution.runner_policy_fingerprint, "runner_policy_fingerprint", 256
+    )
+    admission_policy = _bounded_text(
+        execution.admission_policy_fingerprint, "admission_policy_fingerprint", 256
+    )
+    verifier_policy = _bounded_text(
+        execution.verifier_policy_fingerprint, "verifier_policy_fingerprint", 256
+    )
+    target = _bounded_text(execution.target_fingerprint, "target_fingerprint", 256)
+    analysis = _bounded_text(
+        execution.analysis_fingerprint, "analysis_fingerprint", 256
+    )
+    batch_plan = _bounded_text(
+        execution.batch_plan_fingerprint, "batch_plan_fingerprint", 256
+    )
+    if (
+        expected_analysis_fingerprint is not None
+        and analysis != expected_analysis_fingerprint
+    ) or (
+        expected_batch_plan_fingerprint is not None
+        and batch_plan != expected_batch_plan_fingerprint
+    ):
+        raise GmailTemporalPersistenceError(
+            "runner execution does not match the review projection authority"
+        )
+    provider = _bounded_text(execution.provider, "provider", 128)
+    model = _bounded_text(execution.model, "model", 128)
+    effort = _bounded_text(execution.reasoning_effort, "reasoning_effort", 64)
+    sanitizer_version = _nonnegative_int(
+        execution.sanitizer_version, "sanitizer_version", positive=True
+    )
+    counts = {
+        "expression_count": _nonnegative_int(
+            execution.expression_count, "expression_count"
+        ),
+        "batch_count": _nonnegative_int(execution.batch_count, "batch_count"),
+        "candidate_count": _nonnegative_int(
+            execution.candidate_count, "candidate_count"
+        ),
+        "page_count": _nonnegative_int(execution.page_count, "page_count"),
+    }
+    if not isinstance(execution.request_fingerprints, tuple):
+        raise GmailTemporalPersistenceError(
+            "runner request fingerprint authority is malformed"
+        )
+    requests = tuple(
+        _bounded_text(item, "request_fingerprint", 256)
+        for item in execution.request_fingerprints
+    )
+    if len(requests) != len(set(requests)):
+        raise GmailTemporalPersistenceError(
+            "runner request fingerprint authority is duplicated"
+        )
+    components = _prepare_execution_components(
+        execution.components,
+        source=locator,
+        runner_policy=runner_policy,
+        admission_policy=admission_policy,
+        verifier_policy=verifier_policy,
+        provider=provider,
+        model=model,
+        reasoning_effort=effort,
+        target_fingerprint=target,
+        analysis_fingerprint=analysis,
+        batch_plan_fingerprint=batch_plan,
+    )
+    complete_projection = execution.disposition == "complete_review_projection"
+    if complete_projection:
+        if (
+            review_run_id is None
+            or len(components) != 3
+            or counts["candidate_count"] < 1
+            or counts["page_count"] < 1
+            or len(requests) != counts["page_count"]
+        ):
+            raise GmailTemporalPersistenceError(
+                "complete runner execution coverage is invalid"
+            )
+    elif review_run_id is not None or components or requests:
+        raise GmailTemporalPersistenceError(
+            "zero-work runner execution fabricated verifier evidence"
+        )
+    component_fingerprints = tuple(item.artifact_sha256 for item in components)
+    if component_fingerprints != expected_component_fingerprints:
+        raise GmailTemporalPersistenceError(
+            "runner components do not match the review projection"
+        )
+    locator_payload = _source_locator_payload(locator)
+    locator_hash = (
+        "gtloc_" + hashlib.sha256(_canonical_bytes(locator_payload)).hexdigest()
+    )
+    request_set_sha256 = hashlib.sha256(_canonical_bytes(requests)).hexdigest()
+    component_material = [
+        {
+            "run_ordinal": item.run_ordinal,
+            "invocation_id": item.invocation_id,
+            "started_at": item.started_at,
+            "completed_at": item.completed_at,
+            "artifact_sha256": item.artifact_sha256,
+        }
+        for item in components
+    ]
+    component_set_sha256 = hashlib.sha256(
+        _canonical_bytes(component_material)
+    ).hexdigest()
+    normalized_review_run_id = (
+        _bounded_text(review_run_id, "review_run_id", 128)
+        if review_run_id is not None
+        else None
+    )
+    input_material = {
+        "version": _RUNNER_EXECUTION_VERSION,
+        "pipeline_scope": pipeline,
+        "source_locator_hash": locator_hash,
+        "runner_policy_fingerprint": runner_policy,
+        "admission_policy_fingerprint": admission_policy,
+        "verifier_policy_fingerprint": verifier_policy,
+        "sanitizer_version": sanitizer_version,
+        "provider": provider,
+        "model": model,
+        "reasoning_effort": effort,
+        "admission_basis": execution.admission_basis,
+        "disposition": execution.disposition,
+        "target_fingerprint": target,
+        "analysis_fingerprint": analysis,
+        "batch_plan_fingerprint": batch_plan,
+        **counts,
+        "request_set_sha256": request_set_sha256,
+        "component_set_sha256": component_set_sha256,
+        "invocation_attestation": _INVOCATION_ATTESTATION,
+        "independent_invocations_verified": False,
+        "review_run_id": normalized_review_run_id,
+    }
+    input_key = "gtrei_" + hashlib.sha256(_canonical_bytes(input_material)).hexdigest()
+    execution_id = "gtre_" + hashlib.sha256(input_key.encode("ascii")).hexdigest()
+    message_scope = gmail_temporal_message_scope_key(
+        gmail_account_key=locator.gmail_account_key,
+        gmail_thread_id=locator.gmail_thread_id,
+        gmail_message_id=locator.gmail_message_id,
+    )
+    return _PreparedExecution(
+        execution_id=execution_id,
+        input_key=input_key,
+        message_scope_key=message_scope,
+        pipeline_scope=pipeline,
+        locator=locator,
+        locator_hash=locator_hash,
+        runner_policy_fingerprint=runner_policy,
+        admission_policy_fingerprint=admission_policy,
+        verifier_policy_fingerprint=verifier_policy,
+        sanitizer_version=sanitizer_version,
+        provider=provider,
+        model=model,
+        reasoning_effort=effort,
+        admission_basis=execution.admission_basis,
+        disposition=execution.disposition,
+        target_fingerprint=target,
+        analysis_fingerprint=analysis,
+        batch_plan_fingerprint=batch_plan,
+        expression_count=counts["expression_count"],
+        batch_count=counts["batch_count"],
+        candidate_count=counts["candidate_count"],
+        page_count=counts["page_count"],
+        request_count=len(requests),
+        request_set_sha256=request_set_sha256,
+        component_set_sha256=component_set_sha256,
+        review_run_id=normalized_review_run_id,
+        components=components,
+    )
+
+
+def _prepare_execution_components(
+    values: tuple[GmailTemporalReviewComponentEvidence, ...],
+    *,
+    source: GmailTemporalSourceLocator,
+    runner_policy: str,
+    admission_policy: str,
+    verifier_policy: str,
+    provider: str,
+    model: str,
+    reasoning_effort: str,
+    target_fingerprint: str,
+    analysis_fingerprint: str,
+    batch_plan_fingerprint: str,
+) -> tuple[_PreparedExecutionComponent, ...]:
+    if not isinstance(values, tuple):
+        raise GmailTemporalPersistenceError("runner component evidence is malformed")
+    output: list[_PreparedExecutionComponent] = []
+    for expected_ordinal, item in enumerate(values, start=1):
+        if not isinstance(item, GmailTemporalReviewComponentEvidence):
+            raise GmailTemporalPersistenceError(
+                "runner component evidence is malformed"
+            )
+        ordinal = _nonnegative_int(item.run_ordinal, "run_ordinal", positive=True)
+        invocation = _bounded_text(item.invocation_id, "invocation_id", 128)
+        started = _aware_timestamp(item.started_at, "started_at")
+        completed = _aware_timestamp(item.completed_at, "completed_at")
+        artifact_sha256 = _sha256(item.artifact_sha256, "artifact_sha256")
+        if ordinal != expected_ordinal or completed < started:
+            raise GmailTemporalPersistenceError(
+                "runner component chronology or ordinal is invalid"
+            )
+        if not isinstance(item.payload_json, str):
+            raise GmailTemporalPersistenceError("runner component payload is invalid")
+        raw = item.payload_json.encode("utf-8")
+        if len(raw) > 16 * 1024 * 1024 or hashlib.sha256(raw).hexdigest() != (
+            artifact_sha256
+        ):
+            raise GmailTemporalPersistenceError(
+                "runner component payload hash is invalid"
+            )
+        payload = _strict_json(raw, label="runner component payload")
+        if not isinstance(payload, Mapping) or raw != _canonical_bytes(payload) + b"\n":
+            raise GmailTemporalPersistenceError(
+                "runner component payload is not canonical"
+            )
+        if (
+            payload.get("run_ordinal") != ordinal
+            or isinstance(payload.get("run_ordinal"), bool)
+            or payload.get("invocation_id") != invocation
+            or payload.get("started_at") != item.started_at
+            or payload.get("completed_at") != item.completed_at
+            or payload.get("provider") != provider
+            or payload.get("model") != model
+            or payload.get("reasoning_effort") != reasoning_effort
+            or payload.get("runner_policy_fingerprint") != runner_policy
+            or payload.get("admission_policy_fingerprint") != admission_policy
+            or payload.get("verifier_policy_fingerprint") != verifier_policy
+            or payload.get("source_sha256") != source.source_sha256
+            or payload.get("analysis_fingerprint") != analysis_fingerprint
+            or payload.get("batch_plan_fingerprint") != batch_plan_fingerprint
+            or payload.get("target_fingerprint") != target_fingerprint
+            or payload.get("complete") is not True
+            or payload.get("routable") is not False
+        ):
+            raise GmailTemporalPersistenceError(
+                "runner component payload authority is invalid"
+            )
+        output.append(
+            _PreparedExecutionComponent(
+                run_ordinal=ordinal,
+                invocation_id=invocation,
+                started_at=started,
+                completed_at=completed,
+                artifact_sha256=artifact_sha256,
+                payload_json=item.payload_json,
+            )
+        )
+    if len({item.invocation_id for item in output}) != len(output) or len(
+        {item.artifact_sha256 for item in output}
+    ) != len(output):
+        raise GmailTemporalPersistenceError("runner component evidence is duplicated")
+    return tuple(output)
+
+
+def _persist_execution(
+    conn: sqlite3.Connection,
+    prepared: _PreparedExecution,
+    *,
+    created_at: str,
+) -> bool:
+    existing = conn.execute(
+        "SELECT * FROM gmail_temporal_review_executions WHERE input_key = ?",
+        (prepared.input_key,),
+    ).fetchone()
+    if existing is None:
+        conflict = conn.execute(
+            """
+            SELECT id FROM gmail_temporal_review_executions
+            WHERE id = ? OR (review_run_id IS NOT NULL AND review_run_id = ?)
+            """,
+            (prepared.execution_id, prepared.review_run_id),
+        ).fetchone()
+        if conflict is not None:
+            raise GmailTemporalPersistenceConflict(
+                "runner execution identity already has different evidence"
+            )
+        locator = prepared.locator
+        conn.execute(
+            """
+            INSERT INTO gmail_temporal_review_executions(
+              id, input_key, message_scope_key, pipeline_scope, document_id,
+              document_content_hash, source_sha256, source_locator_hash,
+              runner_policy_fingerprint, admission_policy_fingerprint,
+              verifier_policy_fingerprint, sanitizer_version, provider, model,
+              reasoning_effort, admission_basis, disposition, target_fingerprint,
+              analysis_fingerprint, batch_plan_fingerprint, expression_count,
+              batch_count, candidate_count, page_count, request_count,
+              component_count, request_set_sha256, component_set_sha256,
+              invocation_attestation, independent_invocations_verified,
+              review_run_id, complete, routable, created_at
+            ) VALUES (
+              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+              ?, ?, ?, ?, ?, ?, ?, 0, ?, 1, 0, ?
+            )
+            """,
+            (
+                prepared.execution_id,
+                prepared.input_key,
+                prepared.message_scope_key,
+                prepared.pipeline_scope,
+                locator.document_id,
+                locator.document_content_hash,
+                locator.source_sha256,
+                prepared.locator_hash,
+                prepared.runner_policy_fingerprint,
+                prepared.admission_policy_fingerprint,
+                prepared.verifier_policy_fingerprint,
+                prepared.sanitizer_version,
+                prepared.provider,
+                prepared.model,
+                prepared.reasoning_effort,
+                prepared.admission_basis,
+                prepared.disposition,
+                prepared.target_fingerprint,
+                prepared.analysis_fingerprint,
+                prepared.batch_plan_fingerprint,
+                prepared.expression_count,
+                prepared.batch_count,
+                prepared.candidate_count,
+                prepared.page_count,
+                prepared.request_count,
+                len(prepared.components),
+                prepared.request_set_sha256,
+                prepared.component_set_sha256,
+                _INVOCATION_ATTESTATION,
+                prepared.review_run_id,
+                created_at,
+            ),
+        )
+        conn.executemany(
+            """
+            INSERT INTO gmail_temporal_review_components(
+              execution_id, run_ordinal, invocation_id, started_at, completed_at,
+              artifact_sha256, payload_json, routable, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+            """,
+            (
+                (
+                    prepared.execution_id,
+                    item.run_ordinal,
+                    item.invocation_id,
+                    item.started_at,
+                    item.completed_at,
+                    item.artifact_sha256,
+                    item.payload_json,
+                    created_at,
+                )
+                for item in prepared.components
+            ),
+        )
+        return False
+    _validate_existing_execution(conn, existing, prepared)
+    return True
+
+
+def _validate_existing_execution(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    prepared: _PreparedExecution,
+) -> None:
+    locator = prepared.locator
+    expected: dict[str, Any] = {
+        "id": prepared.execution_id,
+        "input_key": prepared.input_key,
+        "message_scope_key": prepared.message_scope_key,
+        "pipeline_scope": prepared.pipeline_scope,
+        "document_id": locator.document_id,
+        "document_content_hash": locator.document_content_hash,
+        "source_sha256": locator.source_sha256,
+        "source_locator_hash": prepared.locator_hash,
+        "runner_policy_fingerprint": prepared.runner_policy_fingerprint,
+        "admission_policy_fingerprint": prepared.admission_policy_fingerprint,
+        "verifier_policy_fingerprint": prepared.verifier_policy_fingerprint,
+        "sanitizer_version": prepared.sanitizer_version,
+        "provider": prepared.provider,
+        "model": prepared.model,
+        "reasoning_effort": prepared.reasoning_effort,
+        "admission_basis": prepared.admission_basis,
+        "disposition": prepared.disposition,
+        "target_fingerprint": prepared.target_fingerprint,
+        "analysis_fingerprint": prepared.analysis_fingerprint,
+        "batch_plan_fingerprint": prepared.batch_plan_fingerprint,
+        "expression_count": prepared.expression_count,
+        "batch_count": prepared.batch_count,
+        "candidate_count": prepared.candidate_count,
+        "page_count": prepared.page_count,
+        "request_count": prepared.request_count,
+        "component_count": len(prepared.components),
+        "request_set_sha256": prepared.request_set_sha256,
+        "component_set_sha256": prepared.component_set_sha256,
+        "invocation_attestation": _INVOCATION_ATTESTATION,
+        "independent_invocations_verified": 0,
+        "review_run_id": prepared.review_run_id,
+        "complete": 1,
+        "routable": 0,
+    }
+    if any(row[key] != value for key, value in expected.items()):
+        raise GmailTemporalPersistenceConflict(
+            "stored Gmail temporal runner execution does not match exact replay"
+        )
+    rows = conn.execute(
+        """
+        SELECT run_ordinal, invocation_id, started_at, completed_at,
+               artifact_sha256, payload_json, routable
+        FROM gmail_temporal_review_components
+        WHERE execution_id = ? ORDER BY run_ordinal
+        """,
+        (prepared.execution_id,),
+    ).fetchall()
+    actual = [tuple(item) for item in rows]
+    expected_components = [
+        (
+            item.run_ordinal,
+            item.invocation_id,
+            item.started_at,
+            item.completed_at,
+            item.artifact_sha256,
+            item.payload_json,
+            0,
+        )
+        for item in prepared.components
+    ]
+    if actual != expected_components:
+        raise GmailTemporalPersistenceConflict(
+            "stored Gmail temporal runner components do not match exact replay"
+        )
 
 
 def _prepare_projection(
@@ -1124,6 +1910,29 @@ def _validate_expected_head(run_id: str | None, generation: int | None) -> None:
         raise GmailTemporalPersistenceError(
             "expected head generation must be a positive integer"
         )
+
+
+def _nonnegative_int(value: Any, name: str, *, positive: bool = False) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise GmailTemporalPersistenceError(f"{name} must be an integer")
+    if value < (1 if positive else 0):
+        raise GmailTemporalPersistenceError(f"invalid {name}")
+    return value
+
+
+def _strict_json(raw: bytes, *, label: str) -> Any:
+    def object_pairs(values: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in values:
+            if key in result:
+                raise GmailTemporalPersistenceError(f"{label} has duplicate keys")
+            result[key] = value
+        return result
+
+    try:
+        return json.loads(raw, object_pairs_hook=object_pairs)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise GmailTemporalPersistenceError(f"{label} is not valid JSON") from exc
 
 
 def _canonical_bytes(value: object) -> bytes:

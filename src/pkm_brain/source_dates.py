@@ -9,7 +9,12 @@ from typing import Any
 import yaml
 
 from .chunking import strip_frontmatter
-from .gmail_projection import gmail_projection_session_id
+from .gmail_projection import (
+    GMAIL_KNOWLEDGE_CLASSIFIER_VERSION,
+    GMAIL_KNOWLEDGE_PROJECTION_VERSION,
+    GMAIL_MESSAGE_POLICY_VERSION,
+    gmail_projection_session_id,
+)
 from .util import file_sha256, slugify
 
 SOURCE_DATE_FIELDS = (
@@ -23,6 +28,31 @@ GMAIL_MESSAGE_TIMESTAMPS_VERSION = 1
 GMAIL_SOURCE_REVISION = re.compile(r"^[0-9a-f]{64}$")
 GMAIL_PROVIDER_MESSAGE_ID = re.compile(r"^[A-Za-z0-9_.-]+$")
 SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+GMAIL_MESSAGE_POLICY_KEYS = {
+    "message_id",
+    "delivery_kind",
+    "advertising_bases",
+    "fact_admission_basis",
+    "provider_important",
+    "provider_starred",
+    "human_signal_basis",
+    "operator_message_after",
+}
+GMAIL_MESSAGE_DELIVERY_KINDS = {"human", "transactional", "bulk", "unknown"}
+GMAIL_MESSAGE_ADVERTISING_BASES = {
+    "content_pattern",
+    "provider_category_promotions",
+}
+GMAIL_MESSAGE_FACT_ADMISSION_BASES = {
+    "none",
+    "durable_human_candidate",
+    "high_confidence_important_transactional_temporal",
+}
+GMAIL_MESSAGE_HUMAN_SIGNAL_ORDER = (
+    "provider_category_personal",
+    "provider_sent",
+    "operator_authored",
+)
 
 
 @dataclass(frozen=True)
@@ -313,9 +343,7 @@ def trusted_gmail_message_timestamps(
     if raw_projection_version is None:
         # Preserve trust for immutable evidence emitted before explicit projection
         # versioning. New renderers always use the collision-resistant identity.
-        expected_stem = slugify(
-            f"{account_key}--{thread_id}--{source_revision[:20]}"
-        )
+        expected_stem = slugify(f"{account_key}--{thread_id}--{source_revision[:20]}")
     else:
         projection_version = strict_int(raw_projection_version)
         if projection_version is None or projection_version < 1:
@@ -364,9 +392,7 @@ def trusted_gmail_message_timestamps(
     normalized: list[dict[str, Any]] = []
     previous_end = -1
     expected_keys = {"message_id", "internal_date", "start_offset", "end_offset"}
-    for index, (message_id, raw_entry) in enumerate(
-        zip(message_ids, entries), start=1
-    ):
+    for index, (message_id, raw_entry) in enumerate(zip(message_ids, entries), start=1):
         if not isinstance(raw_entry, dict) or set(raw_entry) != expected_keys:
             return None
         if raw_entry.get("message_id") != message_id:
@@ -388,17 +414,15 @@ def trusted_gmail_message_timestamps(
         ):
             return None
         if index == 1:
-            if not body.startswith("# Email thread:") or not body[:start_offset].endswith(
-                "\n\n"
-            ):
+            if not body.startswith("# Email thread:") or not body[
+                :start_offset
+            ].endswith("\n\n"):
                 return None
         elif body[previous_end:start_offset] != "\n\n":
             return None
         first_line = body[start_offset:end_offset].split("\n", 1)[0]
         if internal_date:
-            expected_heading = (
-                f"## Message {index} — {internal_date} — {message_id}"
-            )
+            expected_heading = f"## Message {index} — {internal_date} — {message_id}"
             if first_line != expected_heading:
                 return None
         elif not (
@@ -418,6 +442,196 @@ def trusted_gmail_message_timestamps(
     if normalized and previous_end != len(body):
         return None
     return normalized
+
+
+def trusted_gmail_message_policies(
+    document: dict[str, Any],
+    frontmatter: dict[str, Any],
+    frontmatter_path: Path | None,
+) -> list[dict[str, Any]] | None:
+    """Validate the current connector-authored per-message policy index.
+
+    Aggregate thread labels are useful summaries, but they cannot suppress or
+    admit a different message in a mixed thread.  This index is trusted only
+    after the same immutable file/lineage checks as the provider timestamp
+    index and after exact reconciliation with fact-admitted message ids.
+    """
+
+    if str(document.get("source_type") or "") != "gmail_thread":
+        return None
+    if text_value(frontmatter.get("source_type")) != "gmail_thread":
+        return None
+    if (
+        strict_int(frontmatter.get("gmail_projection_version"))
+        != GMAIL_KNOWLEDGE_PROJECTION_VERSION
+        or strict_int(frontmatter.get("gmail_classifier_version"))
+        != GMAIL_KNOWLEDGE_CLASSIFIER_VERSION
+        or strict_int(frontmatter.get("gmail_message_policy_version"))
+        != GMAIL_MESSAGE_POLICY_VERSION
+    ):
+        return None
+    timestamps = trusted_gmail_message_timestamps(
+        document,
+        frontmatter,
+        frontmatter_path,
+    )
+    if timestamps is None:
+        return None
+    message_ids = frontmatter.get("gmail_message_ids")
+    entries = frontmatter.get("gmail_message_policies")
+    admitted_ids = frontmatter.get("gmail_fact_admitted_message_ids")
+    if not all(
+        isinstance(value, list) for value in (message_ids, entries, admitted_ids)
+    ):
+        return None
+    if [item.get("message_id") for item in timestamps] != message_ids:
+        return None
+    if len(entries) != len(message_ids):
+        return None
+    if any(
+        not isinstance(message_id, str)
+        or GMAIL_PROVIDER_MESSAGE_ID.fullmatch(message_id) is None
+        for message_id in admitted_ids
+    ):
+        return None
+    if len(admitted_ids) != len(set(admitted_ids)):
+        return None
+
+    normalized: list[dict[str, Any]] = []
+    policy_admitted_ids: list[str] = []
+    for message_id, raw_entry in zip(message_ids, entries):
+        if (
+            not isinstance(raw_entry, dict)
+            or set(raw_entry) != GMAIL_MESSAGE_POLICY_KEYS
+        ):
+            return None
+        if raw_entry.get("message_id") != message_id:
+            return None
+        delivery_kind = raw_entry.get("delivery_kind")
+        advertising_bases = raw_entry.get("advertising_bases")
+        fact_admission_basis = raw_entry.get("fact_admission_basis")
+        provider_important = raw_entry.get("provider_important")
+        provider_starred = raw_entry.get("provider_starred")
+        human_signal_basis = raw_entry.get("human_signal_basis")
+        operator_message_after = raw_entry.get("operator_message_after")
+        if delivery_kind not in GMAIL_MESSAGE_DELIVERY_KINDS:
+            return None
+        if (
+            not isinstance(advertising_bases, list)
+            or any(
+                not isinstance(value, str)
+                or value not in GMAIL_MESSAGE_ADVERTISING_BASES
+                for value in advertising_bases
+            )
+            or advertising_bases != sorted(set(advertising_bases))
+        ):
+            return None
+        if fact_admission_basis not in GMAIL_MESSAGE_FACT_ADMISSION_BASES:
+            return None
+        if not isinstance(provider_important, bool) or not isinstance(
+            provider_starred, bool
+        ):
+            return None
+        if not isinstance(operator_message_after, bool):
+            return None
+        if not _canonical_gmail_message_human_signal(human_signal_basis):
+            return None
+        if delivery_kind == "human" and (
+            human_signal_basis == "none" or advertising_bases
+        ):
+            return None
+        if delivery_kind in {"transactional", "unknown"} and (
+            human_signal_basis != "none"
+        ):
+            return None
+        if fact_admission_basis != "none":
+            if advertising_bases or delivery_kind == "bulk":
+                return None
+            if (
+                fact_admission_basis == "durable_human_candidate"
+                and delivery_kind not in {"human", "unknown"}
+            ):
+                return None
+            if (
+                fact_admission_basis
+                == "high_confidence_important_transactional_temporal"
+                and delivery_kind != "transactional"
+            ):
+                return None
+            policy_admitted_ids.append(message_id)
+        normalized.append(
+            {
+                "message_id": message_id,
+                "delivery_kind": delivery_kind,
+                "advertising_bases": list(advertising_bases),
+                "fact_admission_basis": fact_admission_basis,
+                "provider_important": provider_important,
+                "provider_starred": provider_starred,
+                "human_signal_basis": human_signal_basis,
+                "operator_message_after": operator_message_after,
+            }
+        )
+
+    if admitted_ids != policy_admitted_ids:
+        return None
+    has_human_durable = any(
+        item["delivery_kind"] == "human"
+        and item["fact_admission_basis"] == "durable_human_candidate"
+        for item in normalized
+    )
+    if (
+        any(
+            item["delivery_kind"] == "unknown"
+            and item["fact_admission_basis"] == "durable_human_candidate"
+            for item in normalized
+        )
+        and not has_human_durable
+    ):
+        return None
+    for index, item in enumerate(normalized):
+        expected_operator_message_after = any(
+            {"provider_sent", "operator_authored"}
+            & set(str(later["human_signal_basis"]).split("+"))
+            for later in normalized[index + 1 :]
+        )
+        if item["operator_message_after"] is not expected_operator_message_after:
+            return None
+    fact_eligible = frontmatter.get("fact_eligible")
+    deleted = frontmatter.get("deleted")
+    if not isinstance(fact_eligible, bool) or not isinstance(deleted, bool):
+        return None
+    if fact_eligible != bool(policy_admitted_ids):
+        return None
+    if not deleted and not message_ids:
+        return None
+    if deleted and (message_ids or policy_admitted_ids or fact_eligible):
+        return None
+    kinds = {item["delivery_kind"] for item in normalized}
+    expected_delivery = (
+        next(iter(kinds)) if len(kinds) == 1 else "mixed" if kinds else "unknown"
+    )
+    if text_value(frontmatter.get("delivery_kind")) != expected_delivery:
+        return None
+    if text_value(frontmatter.get("classification")) != expected_delivery:
+        return None
+    return normalized
+
+
+def _canonical_gmail_message_human_signal(value: Any) -> bool:
+    if value == "none":
+        return True
+    if not isinstance(value, str) or not value:
+        return False
+    tokens = value.split("+")
+    if len(tokens) != len(set(tokens)):
+        return False
+    if any(token not in GMAIL_MESSAGE_HUMAN_SIGNAL_ORDER for token in tokens):
+        return False
+    expected = sorted(
+        tokens,
+        key=GMAIL_MESSAGE_HUMAN_SIGNAL_ORDER.index,
+    )
+    return tokens == expected
 
 
 def trusted_gmail_document_paths(

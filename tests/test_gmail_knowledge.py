@@ -30,6 +30,7 @@ from pkm_brain.gmail_knowledge import (
     normalize_gmail_thread,
     reconcile_gmail_document_revisions,
 )
+from pkm_brain.gmail_projection import GMAIL_MESSAGE_POLICY_VERSION
 from pkm_brain.extraction_source_policy import (
     filter_source_extraction_chunks,
     source_extraction_admission,
@@ -80,9 +81,7 @@ def opened_message(**changes: object) -> ArchiveOpenedMessage:
             "the customer note before then. This is durable project context.\n\n"
             "On Tue, someone wrote:\n> old quoted history"
         ),
-        attachments=(
-            ArchiveAttachment("plan.pdf", "application/pdf", 4_096),
-        ),
+        attachments=(ArchiveAttachment("plan.pdf", "application/pdf", 4_096),),
         account_key="gmail.primary",
     )
     return replace(value, **changes)
@@ -117,25 +116,30 @@ def test_normalization_filters_quotes_and_keeps_attachment_descriptors_only() ->
     timestamp_entry = frontmatter["gmail_message_timestamps"][0]
     body = strip_frontmatter(normalized.markdown)
     assert frontmatter["gmail_message_timestamps_version"] == 1
-    assert (
-        frontmatter["gmail_projection_version"]
-        == GMAIL_KNOWLEDGE_PROJECTION_VERSION
-    )
+    assert frontmatter["gmail_message_policy_version"] == GMAIL_MESSAGE_POLICY_VERSION
+    assert frontmatter["gmail_message_policies"] == [
+        {
+            "message_id": "message-1",
+            "delivery_kind": "human",
+            "advertising_bases": [],
+            "fact_admission_basis": "durable_human_candidate",
+            "provider_important": False,
+            "provider_starred": False,
+            "human_signal_basis": "provider_sent",
+            "operator_message_after": False,
+        }
+    ]
+    assert frontmatter["gmail_projection_version"] == GMAIL_KNOWLEDGE_PROJECTION_VERSION
     assert normalized.projection_version == GMAIL_KNOWLEDGE_PROJECTION_VERSION
     assert normalized.classifier_version == GMAIL_KNOWLEDGE_CLASSIFIER_VERSION
     assert normalized.provider_labels_available is True
     assert normalized.human_signal_basis == "provider_sent"
-    assert (
-        frontmatter["gmail_classifier_version"]
-        == GMAIL_KNOWLEDGE_CLASSIFIER_VERSION
-    )
+    assert frontmatter["gmail_classifier_version"] == GMAIL_KNOWLEDGE_CLASSIFIER_VERSION
     assert timestamp_entry["message_id"] == "message-1"
     assert timestamp_entry["internal_date"] == "2026-07-01T16:00:00.000+00:00"
     assert body[
         timestamp_entry["start_offset"] : timestamp_entry["end_offset"]
-    ].startswith(
-        "## Message 1 — 2026-07-01T16:00:00.000+00:00 — message-1"
-    )
+    ].startswith("## Message 1 — 2026-07-01T16:00:00.000+00:00 — message-1")
 
 
 def test_missing_automation_markers_are_not_positive_human_evidence() -> None:
@@ -170,9 +174,10 @@ def test_operator_authored_legacy_message_is_positive_human_evidence() -> None:
         operator_email="owner@example.com",
     )
 
-    assert classify_gmail_thread(
-        [message], operator_email="owner@example.com"
-    ) == ("human", "headers_only")
+    assert classify_gmail_thread([message], operator_email="owner@example.com") == (
+        "human",
+        "headers_only",
+    )
     assert normalized.delivery_kind == "human"
     assert normalized.fact_eligible is True
     assert normalized.human_signal_basis == "operator_authored"
@@ -215,9 +220,7 @@ def test_bulk_delivery_is_not_automatically_labeled_advertising() -> None:
         body_text="The working group discussed its ongoing project and decisions. " * 4,
     )
 
-    assessment = assess_gmail_importance(
-        [community_digest], delivery_kind="bulk"
-    )
+    assessment = assess_gmail_importance([community_digest], delivery_kind="bulk")
     normalized = normalize_gmail_thread(
         snapshot(),
         ArchiveThreadResult(
@@ -234,6 +237,31 @@ def test_bulk_delivery_is_not_automatically_labeled_advertising() -> None:
     assert normalized.fact_importance == "routine"
     assert normalized.fact_eligible is False
     assert normalized.fact_admission_basis == "delivery_not_fact_eligible"
+    frontmatter = yaml.safe_load(normalized.markdown.split("---", 2)[1])
+    assert frontmatter["gmail_message_policies"][0]["advertising_bases"] == []
+
+
+def test_human_message_promotional_words_do_not_become_advertising_authority() -> None:
+    message = opened_message(
+        label_ids=("SENT",),
+        subject="Re: Registration",
+        body_text=(
+            "I decided we should register now for the working session on July 22. "
+            "Please invite the project group and keep the existing agenda."
+        ),
+    )
+
+    normalized = normalize_gmail_thread(
+        snapshot(),
+        ArchiveThreadResult(
+            "thread-1", 1, (message,), False, account_key="gmail.primary"
+        ),
+        operator_email="owner@example.com",
+    )
+
+    frontmatter = yaml.safe_load(normalized.markdown.split("---", 2)[1])
+    assert frontmatter["gmail_message_policies"][0]["delivery_kind"] == "human"
+    assert frontmatter["gmail_message_policies"][0]["advertising_bases"] == []
 
 
 def test_mixed_promotional_thread_admits_only_the_durable_human_range() -> None:
@@ -275,6 +303,28 @@ def test_mixed_promotional_thread_admits_only_the_durable_human_range() -> None:
     frontmatter = yaml.safe_load(normalized.markdown.split("---", 2)[1])
     assert frontmatter["gmail_fact_admitted_message_ids"] == ["message-reply"]
     assert frontmatter["gmail_fact_admitted_body_chars"] == len(reply.body_text)
+    assert frontmatter["gmail_message_policies"] == [
+        {
+            "message_id": "message-bulk",
+            "delivery_kind": "bulk",
+            "advertising_bases": ["provider_category_promotions"],
+            "fact_admission_basis": "none",
+            "provider_important": False,
+            "provider_starred": False,
+            "human_signal_basis": "none",
+            "operator_message_after": True,
+        },
+        {
+            "message_id": "message-reply",
+            "delivery_kind": "human",
+            "advertising_bases": [],
+            "fact_admission_basis": "durable_human_candidate",
+            "provider_important": False,
+            "provider_starred": False,
+            "human_signal_basis": "provider_sent",
+            "operator_message_after": False,
+        },
+    ]
 
 
 def test_human_body_sufficiency_ignores_nonadmitted_automated_body() -> None:
@@ -354,7 +404,8 @@ def test_mixed_human_and_transactional_thread_preserves_human_fact_capability() 
         label_ids=("CATEGORY_UPDATES",),
         from_addresses=("no-reply@project.example",),
         subject="Project workspace notification",
-        body_text="A routine project workspace notification with enough retained context. " * 3,
+        body_text="A routine project workspace notification with enough retained context. "
+        * 3,
     )
     human_reply = opened_message(
         message_id="message-human",
@@ -437,6 +488,33 @@ def test_important_transactional_time_is_fact_eligible_but_ad_is_not() -> None:
     assert ad_thread.fact_admission_basis == "advertising_excluded"
 
 
+def test_lexical_advertising_pattern_remains_auditable_weak_evidence() -> None:
+    registration = opened_message(
+        label_ids=("CATEGORY_UPDATES", "IMPORTANT"),
+        from_addresses=("no-reply@events.example",),
+        subject="Interview registration closes August 14, 2027",
+        body_text=(
+            "Registration for the hiring interview closes August 14, 2027. "
+            "Register now to keep the scheduled interview place and receive the "
+            "participant instructions."
+        ),
+    )
+
+    normalized = normalize_gmail_thread(
+        snapshot(),
+        ArchiveThreadResult(
+            "thread-1", 1, (registration,), False, account_key="gmail.primary"
+        ),
+    )
+    policy = yaml.safe_load(normalized.markdown.split("---", 2)[1])[
+        "gmail_message_policies"
+    ][0]
+
+    assert policy["advertising_bases"] == ["content_pattern"]
+    assert policy["provider_important"] is True
+    assert policy["fact_admission_basis"] == "none"
+
+
 def test_bulk_promotion_does_not_poison_separate_transactional_event() -> None:
     promotion = opened_message(
         message_id="message-promotion",
@@ -459,9 +537,7 @@ def test_bulk_promotion_does_not_poison_separate_transactional_event() -> None:
         ),
     )
 
-    assessment = assess_gmail_importance(
-        [promotion, interview], delivery_kind="mixed"
-    )
+    assessment = assess_gmail_importance([promotion, interview], delivery_kind="mixed")
     normalized = normalize_gmail_thread(
         snapshot(total_message_count=2, visible_message_count=2),
         ArchiveThreadResult(
@@ -479,6 +555,15 @@ def test_bulk_promotion_does_not_poison_separate_transactional_event() -> None:
     assert normalized.fact_eligible is True
     frontmatter = yaml.safe_load(normalized.markdown.split("---", 2)[1])
     assert frontmatter["gmail_fact_admitted_message_ids"] == ["message-interview"]
+    policies = {
+        item["message_id"]: item for item in frontmatter["gmail_message_policies"]
+    }
+    assert policies["message-promotion"]["advertising_bases"]
+    assert policies["message-promotion"]["fact_admission_basis"] == "none"
+    assert policies["message-interview"]["advertising_bases"] == []
+    assert policies["message-interview"]["fact_admission_basis"] == (
+        "high_confidence_important_transactional_temporal"
+    )
 
 
 def test_routine_delivery_date_and_passive_bill_date_do_not_enter_facts() -> None:
@@ -573,7 +658,9 @@ def test_quoted_or_human_promotional_language_does_not_change_admission() -> Non
 
 
 def test_projection_bytes_are_deterministic_and_concise_human_reply_is_kept() -> None:
-    message = opened_message(body_text="Yes, I agree. I will send the final note tomorrow morning.")
+    message = opened_message(
+        body_text="Yes, I agree. I will send the final note tomorrow morning."
+    )
     thread = ArchiveThreadResult(
         "thread-1", 1, (message,), False, account_key="gmail.primary"
     )
@@ -788,9 +875,7 @@ def test_deleted_thread_becomes_non_extractable_tombstone() -> None:
             deleted_message_count=1,
             source_revision="d" * 64,
         ),
-        ArchiveThreadResult(
-            "thread-1", 0, (), False, account_key="gmail.primary"
-        ),
+        ArchiveThreadResult("thread-1", 0, (), False, account_key="gmail.primary"),
     )
 
     assert normalized.deleted is True
@@ -960,9 +1045,12 @@ def test_capture_keeps_immutable_revisions_and_retires_old_retrieval(
     assert restored.retrieval_chunks_restored == len(second_chunk_ids)
     assert restored.errors == ()
     with sqlite3.connect(paths.sqlite_path) as conn:
-        assert conn.execute(
-            "SELECT status FROM documents WHERE id=?", (second_document[0],)
-        ).fetchone()[0] == "active"
+        assert (
+            conn.execute(
+                "SELECT status FROM documents WHERE id=?", (second_document[0],)
+            ).fetchone()[0]
+            == "active"
+        )
         assert conn.execute(
             f"SELECT COUNT(*) FROM chunk_fts WHERE chunk_id IN ({placeholders})",
             list(second_chunk_ids),
@@ -1081,13 +1169,19 @@ def test_projection_version_forces_one_time_immutable_recapture(
     assert Path(repaired_corruption.artifacts[0]) == second_path
     assert second_path.read_text(encoding="utf-8") == second_markdown
     with sqlite3.connect(paths.sqlite_path) as conn:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM capture_sources WHERE agent = 'gmail'"
-        ).fetchone()[0] == 2
-        assert conn.execute(
-            "SELECT status FROM capture_sources WHERE captured_path = ?",
-            (str(second_path),),
-        ).fetchone()[0] == "captured"
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM capture_sources WHERE agent = 'gmail'"
+            ).fetchone()[0]
+            == 2
+        )
+        assert (
+            conn.execute(
+                "SELECT status FROM capture_sources WHERE captured_path = ?",
+                (str(second_path),),
+            ).fetchone()[0]
+            == "captured"
+        )
 
 
 def test_capture_errors_replace_provider_thread_id_with_opaque_reference(

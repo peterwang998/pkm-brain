@@ -498,12 +498,10 @@ def _build_batch(
         fields=fields,
         caps=caps,
     )
-    local_mentions = tuple(
+    same_segment_mentions = tuple(
         item
         for item in analysis.mentions
         if mention_segments[item.mention_id].segment_id == segment.segment_id
-        and local_start <= item.start
-        and item.end <= local_end
     )
     subject_field = next((item for item in fields if item.name == "subject"), None)
     subject_context: tuple[int, int] | None = None
@@ -524,7 +522,7 @@ def _build_batch(
 
     ranked_mentions = _rank_mentions(
         expressions=expressions,
-        local_mentions=local_mentions,
+        local_mentions=same_segment_mentions,
         bridge_mentions=bridge_mentions,
     )
     selected_mentions = list(ranked_mentions[: caps.max_mentions_per_batch])
@@ -558,11 +556,12 @@ def _build_batch(
             limit=max(caps.max_local_context_chars, required[1] - required[0]),
         )
         subject_context = None
-    relevant_mentions = {
-        item.mention_id
-        for item in analysis.mentions
-        if mention_segments[item.mention_id].segment_id == segment.segment_id
-    }
+    # The bounded prose context is not an endpoint-recall boundary.  Preserve
+    # every mention in the expression's deterministic segment as an explicit
+    # endpoint candidate even when a very long sentence trims its surrounding
+    # prose.  Adjacent-segment mentions visible only through context padding do
+    # not gain authority here.
+    relevant_mentions = {item.mention_id for item in same_segment_mentions}
     relevant_mentions.update(item.mention_id for item in bridge_mentions)
     if singleton_fallback is not None:
         relevant_mentions.add(singleton_fallback.mention_id)

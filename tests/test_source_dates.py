@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, Callable
+
+import pytest
+import yaml
 
 from pkm_brain.chunking import chunk_text
 from pkm_brain.db import connection
@@ -19,7 +23,9 @@ from pkm_brain.service import BrainService
 from pkm_brain.source_dates import (
     derive_fact_source_date,
     document_source_date_metadata,
+    read_frontmatter,
     stamp_candidate_source_context,
+    trusted_gmail_message_policies,
 )
 from pkm_brain.ui_server import enrich_fact_like
 from pkm_brain.util import slugify, text_sha256
@@ -180,6 +186,111 @@ def gmail_candidate_for_text(
         ],
         "metadata": {},
     }
+
+
+def rewrite_gmail_frontmatter(
+    source_path: Path,
+    mutate: Callable[[dict[str, Any]], None],
+) -> tuple[dict[str, object], dict[str, Any]]:
+    markdown = source_path.read_text(encoding="utf-8")
+    _opening, separator, remainder = markdown.partition("---\n")
+    assert separator
+    raw_frontmatter, closing, body = remainder.partition("---\n")
+    assert closing
+    frontmatter = yaml.safe_load(raw_frontmatter)
+    assert isinstance(frontmatter, dict)
+    mutate(frontmatter)
+    rewritten = (
+        "---\n"
+        + yaml.safe_dump(frontmatter, sort_keys=False, allow_unicode=True)
+        + "---\n"
+        + body
+    )
+    source_path.write_text(rewritten, encoding="utf-8")
+    return gmail_document_card(source_path, rewritten), frontmatter
+
+
+def test_current_gmail_message_policy_is_bound_to_trusted_message_order(
+    tmp_path: Path,
+) -> None:
+    document, source_path = normalized_gmail_document(
+        tmp_path,
+        body="The owner decided to keep the project launch on July 15.",
+    )
+    frontmatter = read_frontmatter(source_path)
+
+    policies = trusted_gmail_message_policies(document, frontmatter, source_path)
+
+    assert policies is not None
+    assert policies[0]["message_id"] == "message-1"
+    assert policies[0]["fact_admission_basis"] == "durable_human_candidate"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("provider_important", 1),
+        ("delivery_kind", "bulk"),
+        ("advertising_bases", ["content_pattern"]),
+        ("fact_admission_basis", "none"),
+        ("operator_message_after", True),
+        ("unknown", False),
+    ],
+)
+def test_current_gmail_message_policy_rejects_malformed_or_inconsistent_rows(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    _document, source_path = normalized_gmail_document(
+        tmp_path,
+        body="The owner decided to keep the project launch on July 15.",
+    )
+
+    document, frontmatter = rewrite_gmail_frontmatter(
+        source_path,
+        lambda item: item["gmail_message_policies"][0].__setitem__(field, value),
+    )
+
+    assert trusted_gmail_message_policies(document, frontmatter, source_path) is None
+
+
+def test_current_gmail_message_policy_rejects_missing_policy_version(
+    tmp_path: Path,
+) -> None:
+    _document, source_path = normalized_gmail_document(
+        tmp_path,
+        body="The owner decided to keep the project launch on July 15.",
+    )
+    document, frontmatter = rewrite_gmail_frontmatter(
+        source_path,
+        lambda item: item.pop("gmail_message_policy_version"),
+    )
+
+    assert trusted_gmail_message_policies(document, frontmatter, source_path) is None
+
+
+def test_unknown_message_cannot_fabricate_human_context_fact_admission(
+    tmp_path: Path,
+) -> None:
+    _document, source_path = normalized_gmail_document(
+        tmp_path,
+        body="The owner decided to keep the project launch on July 15.",
+    )
+
+    def remove_human_authority(item: dict[str, Any]) -> None:
+        policy = item["gmail_message_policies"][0]
+        policy["delivery_kind"] = "unknown"
+        policy["human_signal_basis"] = "none"
+        item["delivery_kind"] = "unknown"
+        item["classification"] = "unknown"
+
+    document, frontmatter = rewrite_gmail_frontmatter(
+        source_path,
+        remove_human_authority,
+    )
+
+    assert trusted_gmail_message_policies(document, frontmatter, source_path) is None
 
 
 def test_queue_fact_source_date_prefers_source_event_over_processing_time(

@@ -11,6 +11,7 @@ from .gmail_projection import (
 from .source_dates import (
     source_frontmatter_with_path,
     strict_int,
+    trusted_gmail_message_policies,
     trusted_gmail_message_timestamps,
 )
 
@@ -60,24 +61,33 @@ def source_extraction_admission(
 ) -> tuple[bool, dict[str, str]]:
     frontmatter, frontmatter_path = source_frontmatter_with_path(document)
     eligible = _truthy(frontmatter.get("fact_eligible"))
-    delivery_kind = str(
-        frontmatter.get("delivery_kind") or frontmatter.get("classification") or ""
-    ).strip().casefold()
+    delivery_kind = (
+        str(frontmatter.get("delivery_kind") or frontmatter.get("classification") or "")
+        .strip()
+        .casefold()
+    )
     fact_importance = str(frontmatter.get("fact_importance") or "").strip().casefold()
     actionability = str(frontmatter.get("actionability") or "").strip().casefold()
     importance_confidence = _float(frontmatter.get("importance_confidence"))
-    human_signal_basis = str(
-        frontmatter.get("gmail_human_signal_basis") or ""
-    ).strip().casefold()
+    human_signal_basis = (
+        str(frontmatter.get("gmail_human_signal_basis") or "").strip().casefold()
+    )
     source_type = str(document.get("source_type") or "")
     trusted_gmail_source = True
     admitted_message_ranges: list[dict[str, int]] = []
     if source_type == "gmail_thread":
         trusted_timestamps = (
-            trusted_gmail_message_timestamps(
-                document, frontmatter, frontmatter_path
-            )
+            trusted_gmail_message_timestamps(document, frontmatter, frontmatter_path)
             if frontmatter_path is not None
+            else None
+        )
+        trusted_policies = (
+            trusted_gmail_message_policies(
+                document,
+                frontmatter,
+                frontmatter_path,
+            )
+            if trusted_timestamps is not None
             else None
         )
         trusted_gmail_source = bool(
@@ -86,14 +96,14 @@ def source_extraction_admission(
             and strict_int(frontmatter.get("gmail_classifier_version"))
             == GMAIL_KNOWLEDGE_CLASSIFIER_VERSION
             and trusted_timestamps is not None
+            and trusted_policies is not None
         )
         eligible = eligible and trusted_gmail_source
-        admitted_ids = frontmatter.get("gmail_fact_admitted_message_ids")
-        if eligible and isinstance(admitted_ids, list) and trusted_timestamps:
+        if eligible and trusted_timestamps and trusted_policies:
             wanted = {
-                str(message_id)
-                for message_id in admitted_ids
-                if isinstance(message_id, str) and message_id
+                str(item["message_id"])
+                for item in trusted_policies
+                if item["fact_admission_basis"] != "none"
             }
             admitted_message_ranges = [
                 {
@@ -106,35 +116,36 @@ def source_extraction_admission(
             eligible = bool(wanted) and len(admitted_message_ranges) == len(wanted)
         elif eligible:
             eligible = False
-    if fact_importance == "advertising" or actionability == "promotional":
-        eligible = False
-    if delivery_kind == "transactional" and eligible:
-        eligible = bool(
-            fact_importance == "important_temporal"
-            and actionability in {"action_required", "time_sensitive"}
-            and importance_confidence >= 0.95
-        )
-    if delivery_kind == "mixed" and eligible:
-        temporal_candidate = bool(
-            fact_importance == "important_temporal"
-            and actionability in {"action_required", "time_sensitive"}
-            and importance_confidence >= 0.95
-        )
-        human_candidate = bool(
-            fact_importance == "durable_candidate"
-            and human_signal_basis not in {"", "none"}
-        )
-        eligible = temporal_candidate or human_candidate
-    if delivery_kind == "human" and eligible:
-        eligible = bool(
-            fact_importance == "durable_candidate"
-            and human_signal_basis not in {"", "none"}
-        )
-    if delivery_kind in {"bulk", "unknown"}:
-        eligible = False
-    requires_eligibility = bool(policy.get("require_fact_eligible")) or str(
-        source_type
-    ) == "gmail_thread"
+    else:
+        if fact_importance == "advertising" or actionability == "promotional":
+            eligible = False
+        if delivery_kind == "transactional" and eligible:
+            eligible = bool(
+                fact_importance == "important_temporal"
+                and actionability in {"action_required", "time_sensitive"}
+                and importance_confidence >= 0.95
+            )
+        if delivery_kind == "mixed" and eligible:
+            temporal_candidate = bool(
+                fact_importance == "important_temporal"
+                and actionability in {"action_required", "time_sensitive"}
+                and importance_confidence >= 0.95
+            )
+            human_candidate = bool(
+                fact_importance == "durable_candidate"
+                and human_signal_basis not in {"", "none"}
+            )
+            eligible = temporal_candidate or human_candidate
+        if delivery_kind == "human" and eligible:
+            eligible = bool(
+                fact_importance == "durable_candidate"
+                and human_signal_basis not in {"", "none"}
+            )
+        if delivery_kind in {"bulk", "unknown"}:
+            eligible = False
+    requires_eligibility = (
+        bool(policy.get("require_fact_eligible")) or str(source_type) == "gmail_thread"
+    )
     admitted = not requires_eligibility or eligible
     return admitted, {
         "source_trust": str(frontmatter.get("source_trust") or ""),
@@ -163,7 +174,9 @@ def filter_source_extraction_chunks(
     if source_type != "gmail_thread":
         return chunks
     try:
-        ranges = json.loads(source_metadata.get("gmail_admitted_message_ranges") or "[]")
+        ranges = json.loads(
+            source_metadata.get("gmail_admitted_message_ranges") or "[]"
+        )
     except json.JSONDecodeError:
         return []
     if not isinstance(ranges, list) or not ranges:
@@ -185,9 +198,7 @@ def filter_source_extraction_chunks(
 
 
 def source_prompt_safety_rule(source_window: dict[str, Any]) -> str:
-    source_type = str(
-        (source_window.get("document") or {}).get("source_type") or ""
-    )
+    source_type = str((source_window.get("document") or {}).get("source_type") or "")
     if source_type != "gmail_thread":
         return ""
     return (

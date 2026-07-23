@@ -4,10 +4,12 @@
 in three separately requested Luna-medium runs. Its source-bound append ledger,
 idempotent replay, stale-head handling, and rollback primitives are implemented
 and tested. A private Gmail holdout, actual same-source original-Brain parity
-run, authoritative post-ingest runner, and review-only canary remain pending. A
-final ontology-aligned Sol-medium diagnostic independently accepted every
-production artifact with zero critical errors. Nothing in this audit authorizes
-automatic fact promotion, routing, reminders, or calendar actions.
+run, and review-only canary remain pending. The authoritative post-ingest runner,
+per-message projection-v7 policy, durable zero-work/execution ledger, and
+content-free full-corpus audit are implemented. A final ontology-aligned
+Sol-medium diagnostic independently accepted every synthetic production artifact
+with zero critical errors. Nothing in this audit authorizes automatic fact
+promotion, routing, reminders, or calendar actions.
 
 **Exploratory target used before 2026-07-22:** at least 85% useful-record recall,
 at least 90% supported-proposal precision, and less than 1% critical semantic
@@ -54,14 +56,17 @@ and cannot improve primary recall.
 
 ### Private-distribution gate
 
-A frozen, thread-grouped historical Gmail holdout of roughly 120--200 messages,
-with at least 50 genuinely useful temporal records, must demonstrate at least
+A frozen, thread-grouped historical Gmail holdout of roughly 150 messages,
+with at least 50 genuinely useful temporal records, at least 60 required
+temporal members, and at least 40 hard negatives, must demonstrate at least
 95% effective member recall, at least 90% confirmed recall, at least 95%
 confirmed precision, at least 90% review-arm precision, no critical supported
 errors, and no more than 5% noise admitted to review. The same cohort must retain
 at least 95% of every supported, scope-correct original-Brain non-temporal fact
-unit at candidate, review, and persistence stages, with source and thread counts
-reconciled. A separate source-only usefulness slice may be reported as a
+unit at candidate, review, and persistence stages, with at least 50 units across
+30 threads and reconciled source/thread counts. On 40 frozen temporal-recall
+queries, top-five retrieval must reach at least 90% and top-ten at least 95%.
+A separate source-only usefulness slice may be reported as a
 diagnostic, but it cannot shrink the release denominator. Temporal cognition
 may add
 structure; it may not recreate the earlier
@@ -79,6 +84,17 @@ reminders or calendar actions. Those require a separate exact-only path: one
 unambiguous normalized endpoint, a supported event binding, no deterministic
 deferral, at least 99% measured precision, and user confirmation until enough
 real operating evidence exists.
+
+For this personal-use release, structural preparation must cover 100% of
+fact-admitted/high-value messages and at least 99.5% overall, with every bounded
+failure visible as quarantine rather than silent omission. Provider change to
+the local mirror should be p95 within 15 minutes and end-to-end review p95 within
+30 minutes. Historical backfill may average at most two verifier pages per
+incoming message and use a candidate-bearing p95 ceiling of 24 pages. The
+steady-state canary must run for at least 72 hours or 200 messages, whichever is
+longer, and should target p95 at most 12 because routine daily mail should not
+resemble dense historical digests. No backlog may remain older
+than 24 hours, and user-visible review noise is capped at ten items per day.
 
 ## Outcome So Far
 
@@ -108,7 +124,7 @@ All three run pairs had 1.0 Jaccard agreement on accepted parent clusters and on
 recovered semantic members; raw candidate verdict agreement was also 1.0. This
 passes the synthetic personal-use bar. It is still not a private-distribution or
 operational release claim: the private Gmail holdout, same-source original-Brain
-parity check, persistence integration, and rollback canary remain outstanding.
+parity check, and live execution/persistence rollback canary remain outstanding.
 A private external Gmail run still requires explicit informed approval; no
 private text was transmitted in this iteration.
 
@@ -359,6 +375,16 @@ The rescue state does not change expression or mention inventories and does not 
 
 The planner is pure and performs no model call, write, routing, admission change, or persistence. A selector citation is accepted only if it is a subset of the exact packet manifest.
 
+The prose window is a byte bound, not a recall boundary. If one unusually long
+sentence forces that window to trim around the temporal expression, exact event,
+action, deadline, boundary, and lifecycle endpoints elsewhere in the same
+deterministic sentence segment remain eligible as manifest endpoints. They are
+shown by exact surface and unsafe distant bindings defer. Context padding from
+an adjacent sentence never grants endpoint authority, and endpoint or payload
+overflow remains an explicit incomplete frontier. A 5,600-character regression
+that previously returned a falsely complete empty frontier now recovers its
+distant event and scheduled lifecycle as two deferred candidates.
+
 The narrow singleton fallback is the only deliberate exception to ordinary
 segment locality. It may expose one same-field, nearby event from another
 segment when the message has one temporal expression, no packet-local temporal
@@ -497,14 +523,32 @@ and hash-bound, while
 `independent_invocations_verified=false` remains explicit because file hashes
 cannot prove independent model execution.
 
-This is intentionally a low-level, non-routable ledger sink, not yet the
-production runner. Canonical projection validation proves internal consistency;
-it does not prove that a caller actually ran the analyzer, batcher, complete
-frontier, three raw verifier invocations, and ensemble reducer. Before runtime
-integration, one authoritative runner must derive the trusted message text,
-construct those stages itself, accept exactly three raw checkpoint/verdict
-inputs, compute their hashes, and call the sink privately. Runtime code must not
-be able to submit an arbitrary prebuilt projection.
+Migration 26 closes that runtime gap with append-only execution and component
+receipts. The authoritative runner accepts only a Brain home, active document
+identity, provider message identity, and exactly three protected component
+files. It reloads the immutable projection, validates the target message range
+and per-message policy, recomputes analysis, batching, complete frontier, pages,
+sanitized requests, ensemble, and review projection, then persists projection
+and execution evidence in one transaction. Production-scope direct sink calls
+without runner evidence fail. Zero-work outcomes are also durable, idempotent,
+and source-bound, so `not_admitted`, no-expression, and no-candidate messages
+cannot be confused with unprocessed mail or repeatedly recomputed forever.
+
+The v26 upgrade also retires a mutable production head created before execution
+receipts existed while preserving its immutable review run. Production head
+reads require a matching complete, scope-bound execution receipt and otherwise
+return stale. This is an integrity boundary, not a hostile-process security
+boundary: execution evidence is a validated in-process capability, so code that
+already runs inside the Brain process could fabricate self-consistent evidence.
+
+Component files must be three distinct owner-only, single-link regular files
+with canonical schemas, distinct invocation identities, exact request/page/
+candidate coverage, pinned external-Codex Luna-medium configuration, and valid
+chronology. Provider execution is still self-reported rather than
+cryptographically attested. The same in-process trust limitation applies to a
+caller that bypasses the intended runner entry point. Crash-resumable pending component execution plus
+an explicit append-only head-transition sequence remain follow-up hardening.
+The runner is still non-routable and has no enabled daemon/external-launch path.
 
 ### 11. Local historical structural audit
 
@@ -540,6 +584,53 @@ fail structurally or exit nonzero. It reports only aggregate/opaque results and
 explicitly does not claim cryptographic proof of independent invocation. The
 actual private parity extraction and labeling run remains outstanding.
 
+### 12. Projection-v7 full-corpus structural replay
+
+On 2026-07-22 the current encrypted archive was rebuilt into a separate
+temporary Brain home using projection v7/classifier v5. The local-only capture
+created 7,125 immutable revisions, indexed 16,118 chunks, reconciled exactly
+6,960 active and 165 deleted documents, and reported zero capture, ingest,
+vector, or reconciliation errors. Projection v7 adds an ordered, trusted
+per-message policy index. Thread-level advertising or delivery summaries can no
+longer suppress a different message. Each target row records message delivery,
+strong and weak advertising bases, exact fact-admission basis, provider
+importance/star state, positive human evidence, and whether a later
+operator-authored message exists in that thread.
+
+The authoritative content-free audit then prepared 7,857 of 7,859 active
+messages. The two failures were explicit bounded batch omissions, yielding
+99.97% overall structural completeness and no silent loss. Both were
+non-advertising, non-fact-admitted, relevance-free rescue messages--one
+transactional and one unknown--so all 733 fact-admitted messages prepared
+successfully. It found 45,306
+temporal expressions, 34,584 legal verification candidates, 2,123
+candidate-bearing messages, and 13,548 lossless verifier pages. Admission was
+733 fact, 2,338 temporal rescue, and 4,786 not admitted. The fact-lane
+population remained exactly 733 across the v6-to-v7 change, while target-message
+authority removed thread-level poisoning. Relative to the last pre-v7
+diagnostic, candidate-bearing coverage increased from 1,982 to 2,123
+messages while preparation failures fell from 88 to two. Pages increased from
+12,044 to 13,548, so the gain is real recall coverage rather than a free cost
+reduction.
+
+Overall page volume is 1.72 pages per mailbox message and 6.38 per
+candidate-bearing message. The candidate-bearing p95 is 22 pages and p99 is 44;
+that passes the bounded historical-backfill budget adopted above but not the
+tighter steady-state target. The maximum remains bounded at 75 pages. Only
+seven bulk messages entered temporal rescue, six of which had candidates, after
+requiring target-specific provider, human, star, or later-operator relevance.
+Lexical advertising cues are now weak evidence rather than an unconditional
+negative: 69 such messages entered rescue and 59 had candidates, while provider
+promotion categorization remains a strong negative unless the owner starred the
+message. Semantic precision for those 59 messages is deliberately not claimed
+until the private holdout is labeled and the pinned external verifier is run
+with explicit informed approval.
+
+The audit script emits only aggregates, static error buckets, bounded policy
+strata, and volume percentiles. It prints no path, provider/document/message
+identity, source hash, request fingerprint, request payload, exception detail,
+or message text, and makes zero model or persistence calls.
+
 ## Verification
 
 - Focused regression suites cover lossless batching, singleton fallback,
@@ -550,10 +641,11 @@ actual private parity extraction and labeling run remains outstanding.
 - The historical replay and fresh packet planner print aggregates only.
 - The planner, frontier, verdict validator, ensemble reducer, and evaluator are
   non-routable and make no external calls by themselves.
-- The final complete repository run passed all 1,579 tests. The expanded
-  temporal integration suite passed 473 tests; the final parity/cohort suite
-  passed 43 tests under independent review. Ruff, formatting, compilation, and
-  diff checks also passed.
+- The final complete repository run passed all 1,625 tests, including the 20
+  connector tests that require a temporary localhost OAuth callback. The focused
+  current Gmail policy/runner/batching/frontier/persistence/migration suite
+  passed 353 tests, including the aggregate audit's privacy tests.
+  Ruff, formatting, compilation, and diff checks also passed.
 
 ## What Remains Before A Release Claim
 
@@ -566,13 +658,11 @@ actual private parity extraction and labeling run remains outstanding.
    counts and require at least 95% retention and precision over every supported,
    scope-correct original non-temporal unit at candidate, review, and persistence
    stages. Do not condition the release denominator on a `useful` label.
-3. Add the authoritative post-ingest runner described above. It must reconstruct
-   trusted message evidence, recompute the analyzer/batcher/frontier/three-run
-   ensemble and projection, then use the implemented idempotent ledger without
-   exposing its prebuilt-projection sink to runtime callers. It must consume
-   split-semantic cluster reviews explicitly, even though they authorize no
-   candidate, and prevent duplicate active event or temporal references.
-4. Run a review-only canary with an easy rollback. Keep reminder and calendar
+3. Run a review-only canary with an easy rollback. Exercise one content-changing
+   source revision, exact replay, restart, stale-head clearing, rollback, and
+   bounded failure quarantine. Measure the tighter steady-state page and
+   freshness budgets rather than extrapolating from the historical backfill.
+4. Keep reminder and calendar
    automation disabled until the separate 99%-precision exact-only gate passes.
 
 ## Current Decision

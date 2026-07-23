@@ -60,6 +60,7 @@ from pkm_brain.llm import LLMProviderError, role_env
 from pkm_brain.gmail_projection import (
     GMAIL_KNOWLEDGE_CLASSIFIER_VERSION,
     GMAIL_KNOWLEDGE_PROJECTION_VERSION,
+    GMAIL_MESSAGE_POLICY_VERSION,
     gmail_projection_session_id,
 )
 from pkm_brain.numeric_faithfulness import extract_numeric_mentions
@@ -158,7 +159,7 @@ delivery_kind: {"human" if eligible else "bulk"}
 fact_importance: {"durable_candidate" if eligible else "routine"}
 actionability: informational
 importance_confidence: 1.0
-gmail_human_signal_basis: {"operator-authored" if eligible else "none"}
+gmail_human_signal_basis: {"operator_authored" if eligible else "none"}
 fact_eligible: {"true" if eligible else "false"}
 gmail_message_timestamps_version: 1
 gmail_message_ids: ["{message_id}"]
@@ -168,7 +169,17 @@ gmail_message_timestamps:
     internal_date: "{internal_date}"
     start_offset: {message_start}
     end_offset: {len(body)}
-gmail_fact_admitted_message_ids: {f'["{message_id}"]' if eligible else '[]'}
+gmail_message_policy_version: {GMAIL_MESSAGE_POLICY_VERSION}
+gmail_message_policies:
+  - message_id: "{message_id}"
+    delivery_kind: {"human" if eligible else "bulk"}
+    advertising_bases: []
+    fact_admission_basis: {"durable_human_candidate" if eligible else "none"}
+    provider_important: false
+    provider_starred: false
+    human_signal_basis: {"operator_authored" if eligible else "none"}
+    operator_message_after: false
+gmail_fact_admitted_message_ids: {f'["{message_id}"]' if eligible else "[]"}
 deleted: false
 ---
 
@@ -387,9 +398,7 @@ def test_document_route_coherence_does_not_override_routable_named_topic() -> No
     route_targets = {
         page_hint: {
             "page_hint": page_hint,
-            "canonical_entity": page_hint.removeprefix("projects/").removesuffix(
-                ".md"
-            ),
+            "canonical_entity": page_hint.removeprefix("projects/").removesuffix(".md"),
             "page_scope": page_hint,
             "retrieval_purpose": page_hint,
         }
@@ -1138,7 +1147,10 @@ def test_fact_merge_rejects_planned_and_actual_event_identity(tmp_path: Path) ->
             mention_kind="named",
         )
         assert event is not None
-    for fact_id, kind in (("fact_launch_planned", "planned"), ("fact_launch_actual", "actual")):
+    for fact_id, kind in (
+        ("fact_launch_planned", "planned"),
+        ("fact_launch_actual", "actual"),
+    ):
         action = propose_action(
             svc.paths,
             "fact_upsert",
@@ -1686,9 +1698,7 @@ def test_extraction_accepts_empty_short_window_without_coverage_retry(
 
     assert provider.calls == 1
     assert result["candidates"] == []
-    assert result["document_validations"][0]["windows"][0][
-        "coverage_retry_count"
-    ] == 0
+    assert result["document_validations"][0]["windows"][0]["coverage_retry_count"] == 0
 
 
 def test_extraction_records_only_the_retry_that_actually_ran(
@@ -4799,9 +4809,7 @@ def test_decide_policy_actions_persists_lock_failure_and_continues(
             raise sqlite3.OperationalError("database is locked")
         return real_decide_action(paths, action_id, **kwargs)
 
-    monkeypatch.setattr(
-        policy_action_batch, "decide_action", locked_first_action
-    )
+    monkeypatch.setattr(policy_action_batch, "decide_action", locked_first_action)
 
     decided = decide_policy_actions(
         svc.paths,
