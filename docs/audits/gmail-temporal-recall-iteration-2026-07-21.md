@@ -676,6 +676,22 @@ All eleven safety invariants pass with zero private Gmail records and zero exter
 model calls. This establishes structural addressability only. It does not
 measure semantic recall or precision on personal mail.
 
+### 9B. Public v20 deterministic structural contrast
+
+The checked-in public v20 contrast benchmark now contains 90 synthetic cases.
+It reports 71 of 71 expected-positive cases with at least one candidate, 15 of
+15 matched non-advertising controls candidate-free, 48 of 48 ambiguity cases
+fail-closed, and 20 of 20 abbreviated shared-month-day expectations satisfied.
+The raw-source safety layer passes 5 of 5 direct guard cases and 2 of 2 simulated
+parser-lag fallbacks. The report contains zero critical structural errors.
+
+These are deterministic structural fixture results over public synthetic text.
+Candidate-bearing recall means only that a fixture expected to expose a review
+candidate did so; it is not measured semantic recall. This benchmark makes no
+claim about semantic precision or recall on private Gmail, retrieval quality,
+original-Brain parity, or production readiness. It performs no private-data,
+external-model, network, retrieval, or persistence evaluation.
+
 ### 10. Review-only persistence boundary
 
 Migration 25 adds an append-only ledger in the main Brain database for complete
@@ -817,10 +833,12 @@ or message text, and makes zero model or persistence calls.
   artifact matching, sidecar purity, stability, and manifest rejection.
 - The v19 aggregate passes every synthetic candidate, stability, and provenance
   gate under the current source and evaluator hashes.
+- The public v20 structural contrast report passes all 90 cases with zero
+  critical structural errors; it is not a semantic or retrieval benchmark.
 - The historical replay and fresh packet planner print aggregates only.
 - The planner, frontier, verdict validator, ensemble reducer, and evaluator are
   non-routable and make no external calls by themselves.
-- The final complete repository run passed all 1,836 tests, including the 20
+- The final complete repository run passed all 2,072 tests, including the 20
   connector tests that require a temporary localhost OAuth callback. The focused
   current Gmail policy/runner/batching/frontier/persistence/migration suite
   passed 353 tests, including the aggregate audit's privacy tests.
