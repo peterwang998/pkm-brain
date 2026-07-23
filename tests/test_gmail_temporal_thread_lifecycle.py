@@ -176,6 +176,17 @@ def _select_lifecycle(lifecycle: str) -> CandidateSelector:
     return select
 
 
+def _select_exact_reschedule_endpoint(
+    candidates: tuple[GmailTemporalVerificationCandidate, ...],
+) -> dict[str, str]:
+    candidate = next(
+        item
+        for item in candidates
+        if item.lifecycle in {"rescheduled_old", "rescheduled_replacement"}
+    )
+    return {candidate.candidate_id: "supported"}
+
+
 def _select_first_supported(
     candidates: tuple[GmailTemporalVerificationCandidate, ...],
 ) -> dict[str, str]:
@@ -469,7 +480,7 @@ def test_schedule_reschedule_terminal_retains_every_occurrence_and_artifact(
     )
     reschedule = _projection(
         "The Apollo interview was rescheduled from August 14, 2027 to August 16, 2027.",
-        _select_lifecycle("unknown"),
+        _select_exact_reschedule_endpoint,
         internal_at="2027-08-02T09:00:00-07:00",
         chunk_id="message-2",
     )
@@ -621,7 +632,7 @@ def test_conflicted_reschedule_guard_never_changes_the_current_occurrence(
 def test_trusted_receipt_rejects_fully_refingerprinted_reschedule_role_flip() -> None:
     projection = _projection(
         "The Apollo interview was rescheduled from August 14, 2027 to August 16, 2027.",
-        _select_lifecycle("unknown"),
+        _select_exact_reschedule_endpoint,
         internal_at="2027-08-02T09:00:00-07:00",
         chunk_id="message-1",
     )

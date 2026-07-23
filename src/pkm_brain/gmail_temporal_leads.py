@@ -14,6 +14,7 @@ from .gmail_temporal_discovery import discover_gmail_temporal_candidates
 TemporalRelation = Literal["occurrence", "deadline"]
 TemporalKind = Literal["planned", "actual"]
 TemporalField = Literal["subject", "body", "message"]
+GMAIL_TEMPORAL_LEAD_POLICY_VERSION = "gmail_temporal_lead_policy_v3"
 AssociationAdmissionBasis = Literal["none", "fact", "temporal_rescue"]
 ResolutionStatus = Literal["resolved", "ambiguous", "unresolved"]
 AssociationMode = Literal[
@@ -460,6 +461,91 @@ _EVENT_TITLE_LABEL_RE = re.compile(
     r"(?im)^[ \t]*(?:event|title|what|summary)\s*:[ \t]*"
     r"(?P<title>[^\r\n]{3,160})"
 )
+# Some authored updates carry the durable event identity in the body rather than
+# in the message subject.  Keep this rescue deliberately narrower than a noun-
+# phrase parser: a capitalized name plus a recognized event head must begin a
+# clause and participate in one of a few explicit temporal grammars.  Horizontal
+# whitespace in every token prevents a title from crossing a source line or
+# sentence boundary.
+_SOURCE_BOUND_EVENT_HEAD_PATTERN = (
+    r"appointment|booking|call|ceremony|class|conference|concert|debrief|demo|"
+    r"dinner|event|exam|flight|forum|hearing|interview|launch|meeting|offsite|"
+    r"orientation|party|presentation|reservation|review|screening|session|stay|"
+    r"summit|tour|training|trip|visit|webinar|workshop"
+)
+_SOURCE_BOUND_EVENT_TOKEN_PATTERN = (
+    r"[A-Za-z][A-Za-z0-9]*(?:[-'\N{RIGHT SINGLE QUOTATION MARK}][A-Za-z0-9]+)*"
+)
+_SOURCE_BOUND_EVENT_NAME_PATTERN = (
+    r"(?:[A-Z]|[a-z](?=[A-Za-z0-9]*[A-Z]))"
+    r"[A-Za-z0-9]*(?:[-'\N{RIGHT SINGLE QUOTATION MARK}][A-Za-z0-9]+)*"
+)
+_SOURCE_BOUND_EVENT_TITLE_RE = re.compile(
+    rf"(?:\A|(?<=[.!?;\r\n]))[ \t]*"
+    rf"(?i:The)[ \t]+"
+    rf"(?P<title>{_SOURCE_BOUND_EVENT_NAME_PATTERN}"
+    rf"(?:[ \t]+{_SOURCE_BOUND_EVENT_TOKEN_PATTERN}){{0,5}}[ \t]+"
+    rf"(?i:{_SOURCE_BOUND_EVENT_HEAD_PATTERN}))"
+    rf"[ \t]+(?P<predicate>"
+    rf"(?i:may[ \t]+(?:happen|occur|take[ \t]+place)[ \t]+on)|"
+    rf"(?i:has[ \t]+been[ \t]+rescheduled[ \t]+(?:to|from))|"
+    rf"(?i:(?:(?:is|was|has[ \t]+been)[ \t]+)?scheduled[ \t]+(?:for|on))"
+    rf")\b"
+)
+_SOURCE_BOUND_EVENT_ROUTINE_MODIFIER_RE = re.compile(
+    r"\b(?:account|billing|invoice|order|package|parcel|receipt|shipment|"
+    r"subscription|tracking)\b",
+    re.IGNORECASE,
+)
+_SOURCE_BOUND_EVENT_INTERNAL_CLAUSE_RE = re.compile(
+    r"\b(?:i|we|you|he|she|they|it|"
+    r"announce(?:d|s)?|confirm(?:ed|s)?|expect(?:ed|s)?|note(?:d|s)?|"
+    r"report(?:ed|s)?|say|says|said|share(?:d|s)?|update(?:d|s)?)\b",
+    re.IGNORECASE,
+)
+_SOURCE_BOUND_EVENT_ARTICLES = frozenset({"a", "an", "the"})
+_SOURCE_BOUND_EVENT_ARTICLE_PREPOSITIONS = frozenset({"of"})
+_SOURCE_BOUND_EVENT_MODIFIERS = frozenset(
+    {
+        "annual",
+        "architecture",
+        "birthday",
+        "board",
+        "budget",
+        "client",
+        "customer",
+        "design",
+        "executive",
+        "final",
+        "finance",
+        "kickoff",
+        "leadership",
+        "monthly",
+        "partner",
+        "performance",
+        "planning",
+        "product",
+        "project",
+        "quarterly",
+        "roadmap",
+        "sales",
+        "strategy",
+        "team",
+        "technical",
+        "weekly",
+        "yearly",
+    }
+)
+_SOURCE_BOUND_FIRST_EXPRESSION_LINK_RE = re.compile(r"[ \t]*(?:(?i:either)[ \t]+)?")
+_SOURCE_BOUND_RESCHEDULE_NEXT_LINK_RE = re.compile(
+    r"[ \t]*(?:,[ \t]*)?(?P<role>from|to)[ \t]*",
+    re.IGNORECASE,
+)
+_SOURCE_BOUND_OPTION_NEXT_LINK_RE = re.compile(
+    r"[ \t]*(?:,[ \t]*)?(?:and|or)(?:[ \t]+(?:at|on))?[ \t]*",
+    re.IGNORECASE,
+)
+GMAIL_TEMPORAL_CLAUSE_BOUND_EVENT_TITLE_BLOCKER = "clause_bound_event_title_review_only"
 _SUBJECT_REPLY_PREFIX_RE = re.compile(r"(?i)^(?:(?:re|fw|fwd)\s*:\s*)+")
 _GENERIC_EVENT_TITLE_RE = re.compile(
     r"(?i)^(?:calendar\s+)?(?:invite|invitation|reminder|notification|update|"
@@ -1970,6 +2056,7 @@ def _mentions(
             fields=fields,
             segments=segments,
             expressions=expressions,
+            quoted_or_forwarded_ranges=quoted_or_forwarded_ranges,
         )
     )
 
@@ -2017,6 +2104,7 @@ def _event_title_drafts(
     fields: tuple[_FieldRange, ...],
     segments: tuple[_SegmentRange, ...],
     expressions: tuple[TemporalExpression, ...],
+    quoted_or_forwarded_ranges: tuple[tuple[int, int], ...],
 ) -> list[_MentionDraft]:
     """Return conservative proper-title endpoints for deferred review.
 
@@ -2088,7 +2176,117 @@ def _event_title_drafts(
                 ("event_title_review_only",),
             )
         )
+
+    output.extend(
+        _source_bound_clause_event_title_drafts(
+            text,
+            fields=fields,
+            segments=segments,
+            expressions=expressions,
+            quoted_or_forwarded_ranges=quoted_or_forwarded_ranges,
+        )
+    )
     return output
+
+
+def _source_bound_clause_event_title_drafts(
+    text: str,
+    *,
+    fields: tuple[_FieldRange, ...],
+    segments: tuple[_SegmentRange, ...],
+    expressions: tuple[TemporalExpression, ...],
+    quoted_or_forwarded_ranges: tuple[tuple[int, int], ...],
+) -> list[_MentionDraft]:
+    """Recover a full event identity from a small, source-bound grammar.
+
+    These candidates are review-only and may associate only with expressions in
+    their own source segment.  The immediate right-hand expression check avoids
+    turning a merely topical event phrase into a temporal subject, while the
+    provenance check prevents quoted or forwarded history from gaining a fresh
+    event identity.
+    """
+
+    output: list[_MentionDraft] = []
+    for match in _SOURCE_BOUND_EVENT_TITLE_RE.finditer(text):
+        span = match.span("title")
+        if any(
+            range_start < match.end() and match.start() < range_end
+            for range_start, range_end in quoted_or_forwarded_ranges
+        ):
+            continue
+        if _SOURCE_BOUND_EVENT_ROUTINE_MODIFIER_RE.search(text[span[0] : span[1]]):
+            continue
+        if _source_bound_event_title_has_internal_clause(text[span[0] : span[1]]):
+            continue
+        if not _event_title_span_is_eligible(text, span):
+            continue
+
+        field = _field_for_span(fields, span[0], span[1])
+        segment_id = _segment_id_for_span(segments, span[0], span[1])
+        right_hand_expressions = tuple(
+            expression
+            for expression in expressions
+            if expression.field == field
+            and expression.segment_id == segment_id
+            and expression.start >= match.end("predicate")
+        )
+        if not right_hand_expressions:
+            continue
+        first_expression = min(right_hand_expressions, key=lambda item: item.start)
+        if (
+            re.fullmatch(
+                r"[ \t]*(?:(?i:either)[ \t]+)?",
+                text[match.end("predicate") : first_expression.start],
+            )
+            is None
+        ):
+            continue
+
+        output.append(
+            _MentionDraft(
+                span[0],
+                span[1],
+                "event_title_candidate",
+                "occurrence",
+                None,
+                None,
+                None,
+                (
+                    "event_title_review_only",
+                    GMAIL_TEMPORAL_CLAUSE_BOUND_EVENT_TITLE_BLOCKER,
+                ),
+            )
+        )
+    return output
+
+
+def _source_bound_event_title_has_internal_clause(value: str) -> bool:
+    """Reject prose-shaped titles with a closed proper-name/title grammar."""
+
+    if _SOURCE_BOUND_EVENT_INTERNAL_CLAUSE_RE.search(value):
+        return True
+    tokens = tuple(re.findall(r"[A-Za-z0-9]+", value))
+    if len(tokens) < 2:
+        return True
+    for index, token in enumerate(tokens[1:-1], start=1):
+        normalized = token.casefold()
+        if normalized in _SOURCE_BOUND_EVENT_ARTICLES:
+            if (
+                tokens[index - 1].casefold()
+                not in _SOURCE_BOUND_EVENT_ARTICLE_PREPOSITIONS
+            ):
+                return True
+            continue
+        if (
+            normalized in _SOURCE_BOUND_EVENT_ARTICLE_PREPOSITIONS
+            or normalized in _SOURCE_BOUND_EVENT_MODIFIERS
+            or token[0].isupper()
+            or any(character.isupper() for character in token[1:])
+            or token[0].isdigit()
+        ):
+            continue
+        return True
+    return False
 
 
 def _bounded_event_predicate_drafts(
@@ -2558,7 +2756,16 @@ def _associate(
     for expression in broad_expressions:
         for mention in broad_edge_mentions:
             pair = (expression.expression_id, mention.mention_id)
-            if pair in paired or expression.field != mention.field:
+            if (
+                pair in paired
+                or expression.field != mention.field
+                or not _source_bound_title_pair_is_authorized(
+                    text,
+                    expressions,
+                    expression,
+                    mention,
+                )
+            ):
                 continue
             gap, between = _association_gap(text, expression, mention)
             if gap > _MAX_LOCAL_ASSOCIATION_GAP:
@@ -2634,7 +2841,16 @@ def _associate(
     for expression in broad_expressions:
         for mention in broad_edge_mentions:
             pair = (expression.expression_id, mention.mention_id)
-            if pair in paired or expression.field != mention.field:
+            if (
+                pair in paired
+                or expression.field != mention.field
+                or not _source_bound_title_pair_is_authorized(
+                    text,
+                    expressions,
+                    expression,
+                    mention,
+                )
+            ):
                 continue
             gap, between = _association_gap(text, expression, mention)
             if gap > _MAX_NEAR_ASSOCIATION_GAP:
@@ -2736,7 +2952,12 @@ def _associate(
             continue
         for mention in subject_mentions:
             pair = (expression.expression_id, mention.mention_id)
-            if pair in paired:
+            if pair in paired or not _source_bound_title_pair_is_authorized(
+                text,
+                expressions,
+                expression,
+                mention,
+            ):
                 continue
             gap, _between = _association_gap(text, expression, mention)
             bridge_edges.append((gap, expression, mention))
@@ -2807,7 +3028,12 @@ def _associate(
         expression = expressions[0]
         mention = edge_mentions[0]
         pair = (expression.expression_id, mention.mention_id)
-        if pair not in paired:
+        if pair not in paired and _source_bound_title_pair_is_authorized(
+            text,
+            expressions,
+            expression,
+            mention,
+        ):
             relation, kind = _relation_and_kind(text, expression, mention)
             blockers = _association_blockers(
                 expression, mention, mentions, mode="message_singleton"
@@ -2887,7 +3113,7 @@ def _retain_mutual_nearest_edges(
     *,
     limit: int,
 ) -> tuple[list[tuple[int, TemporalExpression, TemporalMention]], bool]:
-    """Keep at most two mutually near alternatives at each endpoint."""
+    """Keep bounded mutually near alternatives at each endpoint."""
 
     by_expression: dict[str, list[tuple[int, TemporalExpression, TemporalMention]]] = {}
     by_mention: dict[str, list[tuple[int, TemporalExpression, TemporalMention]]] = {}
@@ -2900,16 +3126,28 @@ def _retain_mutual_nearest_edges(
     for values in by_expression.values():
         ranked = sorted(
             values,
-            key=lambda edge: (edge[0], edge[2].start, edge[2].mention_id),
+            key=lambda edge: (
+                0
+                if GMAIL_TEMPORAL_CLAUSE_BOUND_EVENT_TITLE_BLOCKER in edge[2].blockers
+                else 1,
+                edge[0],
+                edge[2].start,
+                edge[2].mention_id,
+            ),
         )[:2]
         top_for_expression.update(
             (edge[1].expression_id, edge[2].mention_id) for edge in ranked
         )
     for values in by_mention.values():
+        mention_limit = (
+            4
+            if GMAIL_TEMPORAL_CLAUSE_BOUND_EVENT_TITLE_BLOCKER in values[0][2].blockers
+            else 2
+        )
         ranked = sorted(
             values,
             key=lambda edge: (edge[0], edge[1].start, edge[1].expression_id),
-        )[:2]
+        )[:mention_limit]
         top_for_mention.update(
             (edge[1].expression_id, edge[2].mention_id) for edge in ranked
         )
@@ -3090,6 +3328,75 @@ def _association_gap(
     if mention.end <= expression.start:
         return expression.start - mention.end, text[mention.end : expression.start]
     return 0, ""
+
+
+def _source_bound_title_pair_is_authorized(
+    text: str,
+    expressions: tuple[TemporalExpression, ...],
+    expression: TemporalExpression,
+    mention: TemporalMention,
+) -> bool:
+    """Keep a rescued title on only the expressions its source frame names."""
+
+    if GMAIL_TEMPORAL_CLAUSE_BOUND_EVENT_TITLE_BLOCKER not in mention.blockers:
+        return True
+    matches = tuple(
+        match
+        for match in _SOURCE_BOUND_EVENT_TITLE_RE.finditer(text)
+        if match.span("title") == (mention.start, mention.end)
+    )
+    if len(matches) != 1:
+        return False
+    match = matches[0]
+    frame_expressions = tuple(
+        sorted(
+            (
+                candidate
+                for candidate in expressions
+                if candidate.field == mention.field
+                and candidate.segment_id == mention.segment_id
+                and candidate.start >= match.end("predicate")
+            ),
+            key=lambda candidate: (candidate.start, candidate.end),
+        )
+    )
+    if not frame_expressions:
+        return False
+    first = frame_expressions[0]
+    if (
+        _SOURCE_BOUND_FIRST_EXPRESSION_LINK_RE.fullmatch(
+            text[match.end("predicate") : first.start]
+        )
+        is None
+    ):
+        return False
+
+    authorized = {first.expression_id}
+    predicate = match.group("predicate").casefold()
+    if "rescheduled" in predicate and len(frame_expressions) > 1:
+        first_role = predicate.rsplit(maxsplit=1)[-1]
+        second = frame_expressions[1]
+        second_link = _SOURCE_BOUND_RESCHEDULE_NEXT_LINK_RE.fullmatch(
+            text[first.end : second.start]
+        )
+        if (
+            second_link is not None
+            and second_link.group("role").casefold() != first_role
+        ):
+            authorized.add(second.expression_id)
+    elif predicate.startswith("may "):
+        previous = first
+        for candidate in frame_expressions[1:4]:
+            if (
+                _SOURCE_BOUND_OPTION_NEXT_LINK_RE.fullmatch(
+                    text[previous.end : candidate.start]
+                )
+                is None
+            ):
+                break
+            authorized.add(candidate.expression_id)
+            previous = candidate
+    return expression.expression_id in authorized
 
 
 def _confidence_tier(

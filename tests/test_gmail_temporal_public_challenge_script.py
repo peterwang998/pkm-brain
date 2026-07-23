@@ -329,6 +329,23 @@ def test_bounded_units_use_shared_item_and_byte_ceiling() -> None:
         )
 
 
+def test_bounded_units_pack_multi_page_cases_atomically() -> None:
+    rows = (
+        _row("case-one", 1, 100),
+        _row("case-one", 2, 100),
+        _row("case-two", 3, 100),
+        _row("case-two", 4, 100),
+        _row("case-two", 5, 100),
+    )
+
+    units = challenge.bounded_public_call_units(rows)
+
+    assert [[row.case_id for row in unit.rows] for unit in units] == [
+        ["case-one", "case-one"],
+        ["case-two", "case-two", "case-two"],
+    ]
+
+
 @pytest.mark.parametrize("variant", ["missing", "tampered"])
 def test_public_root_authority_fails_before_invoker_creation(
     tmp_path: Path, variant: str
@@ -443,8 +460,11 @@ def test_success_seals_all_three_runs_before_results_and_keeps_files_private(
         fixture["gold"],
         fixture["key"],
         output,
+        evaluation_mode="blind_first_use",
     )
-    assert score["gold_opened_after_prediction_seal"] is True
+    assert score["gold_opened_after_this_prediction_seal"] is True
+    assert score["operator_asserted_evaluation_mode"] == "blind_first_use"
+    assert score["first_use_blindness_claimed"] is True
     assert score["selected_negative_cases"] == 0
     assert score["smoke_gate_passed"] is False
     assert score["test_invoker_used"] is True
@@ -493,6 +513,7 @@ def test_all_zero_work_challenge_scores_as_zero_recall_without_calls(
         fixture["gold"],
         fixture["key"],
         output,
+        evaluation_mode="development_replay",
     )
 
     assert score["gold_members"] == 1
@@ -503,6 +524,8 @@ def test_all_zero_work_challenge_scores_as_zero_recall_without_calls(
     assert score["review_output_precision"] == 0.0
     assert score["selected_negative_cases"] == 0
     assert score["smoke_gate_passed"] is False
+    assert score["operator_asserted_evaluation_mode"] == "development_replay"
+    assert score["first_use_blindness_claimed"] is False
 
 
 def test_zero_work_does_not_claim_an_unused_injected_invoker(tmp_path: Path) -> None:
@@ -559,7 +582,7 @@ def test_injected_invoker_is_rejected_without_explicit_test_mode(
 def test_case_atomic_ceiling_fails_before_any_invocation() -> None:
     rows = tuple(_row("one-dense-case", index, 14_000) for index in range(1, 6))
 
-    with pytest.raises(challenge.PublicChallengeError, match="cannot span"):
+    with pytest.raises(challenge.PublicChallengeError, match="cannot fit"):
         challenge.bounded_public_call_units(rows)
 
 
@@ -604,6 +627,7 @@ def test_score_rejects_missing_evidence_or_stale_source(
             fixture["gold"],
             fixture["key"],
             output,
+            evaluation_mode="blind_first_use",
         )
 
 
@@ -640,7 +664,7 @@ def test_artifact_match_requires_exact_subject_and_no_extra_value() -> None:
     )
 
 
-def test_gold_v2_rejects_opaque_forbidden_values() -> None:
+def test_gold_rejects_opaque_forbidden_values() -> None:
     with pytest.raises(challenge.PublicChallengeError, match="forbidden"):
         challenge._validate_gold(  # noqa: SLF001
             {
@@ -663,3 +687,37 @@ def test_gold_v2_rejects_opaque_forbidden_values() -> None:
                 ],
             }
         )
+
+
+def test_legacy_v2_gold_keeps_bare_forbidden_values_and_rejects_bindings() -> None:
+    legacy = {
+        "version": challenge.LEGACY_GOLD_VERSION,
+        "created_before_predictions": True,
+        "cases": [
+            {
+                "case_id": "positive",
+                "members": [
+                    {
+                        "subject": "Public event",
+                        "relation": "occurrence",
+                        "lifecycle": "scheduled",
+                        "value": "2027-09-20",
+                    }
+                ],
+                "forbidden": ["2027-09-19"],
+            },
+            {"case_id": "negative", "members": [], "forbidden": []},
+        ],
+    }
+    challenge._validate_gold(legacy)  # noqa: SLF001
+
+    legacy["cases"][0]["forbidden"] = [
+        {
+            "subject": "Public event",
+            "relation": "occurrence",
+            "lifecycle": "scheduled",
+            "value": "2027-09-19",
+        }
+    ]
+    with pytest.raises(challenge.PublicChallengeError, match="forbidden"):
+        challenge._validate_gold(legacy)  # noqa: SLF001

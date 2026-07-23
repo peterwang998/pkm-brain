@@ -26,6 +26,7 @@ SelectionDecision = Literal[
     "reject_nonmaterial",
 ]
 SelectionConfidence = Literal["high", "medium", "low"]
+GMAIL_TEMPORAL_SELECTION_POLICY_VERSION = "gmail_temporal_selection_policy_v3"
 TemporalSubjectPairRelation = Literal["alias", "coordinated", "distinct"]
 SelectionRelation = Literal["occurrence", "deadline", "unspecified"]
 SelectionKind = Literal["planned", "actual", "unspecified"]
@@ -59,7 +60,11 @@ _MENTION_ID_RE = re.compile(r"gtl_[0-9a-f]{16}:m[1-9][0-9]*\Z")
 _LEAD_ID_RE = re.compile(r"gtl_[0-9a-f]{16}:l[1-9][0-9]*\Z")
 _TERMINAL_LIFECYCLES = {"cancelled", "completed"}
 _HANDLED_TERMINAL_BLOCKERS = {"lifecycle_cancelled", "lifecycle_completed"}
-_NON_DEFER_REPAIRS = {"terminal_semantics_derived_as_unspecified"}
+_NON_DEFER_REPAIRS = {
+    "cancelled_scheduled_slot_derived_as_planned_occurrence",
+    "reschedule_endpoint_role_derived_from_exact_frame",
+    "terminal_semantics_derived_as_unspecified",
+}
 _HARD_RISK_FEATURES = {
     "cross_field_subject_body",
     "field_near_review_only",
@@ -109,6 +114,42 @@ _LIFECYCLE_EXPRESSION_FORWARD_LINK_RE = re.compile(
 _EXPRESSION_LIFECYCLE_FORWARD_LINK_RE = re.compile(
     r"\s*(?:(?:is|was|were|has\s+been|had\s+been|will\s+be)\s*)?",
     re.IGNORECASE,
+)
+_RESCHEDULE_ENDPOINT_LINK_RE = re.compile(
+    r"\s*(?:,\s*)?(?P<role>from|to)\s*",
+    re.IGNORECASE,
+)
+_RESCHEDULE_SUBJECT_LINK_RE = re.compile(
+    r"\s*(?:(?:has\s+been|was)\s*)?",
+    re.IGNORECASE,
+)
+_RESCHEDULE_INDEPENDENT_TEMPORAL_CLAUSE_RE = re.compile(
+    r"\s*(?:,\s*and|;)\s+(?:please\s+)?"
+    r"(?:confirm|complete|decide|reply|respond|rsvp|send|submit)\b"
+    r"[^.!?;\n]{0,64}\b(?:after|before|by|on)\s*",
+    re.IGNORECASE,
+)
+_RESCHEDULE_TRAILING_ORDINAL_OPTION_RE = re.compile(
+    r"\s*(?:\(\s*)?(?:(?:,\s*)?(?:and|or|alternatively)"
+    r"(?:\s+(?:conceivably|maybe|perhaps|possibly))?|"
+    r",\s*(?:conceivably|maybe|perhaps|possibly))"
+    r"\s+(?:the\s+)?\d{1,2}(?:st|nd|rd|th)\b",
+    re.IGNORECASE,
+)
+_SCHEDULED_SLOT_SUBJECT_LINK_RE = re.compile(
+    r"\s*(?:(?:is|was|has\s+been|had\s+been)\s*)?",
+    re.IGNORECASE,
+)
+_SCHEDULED_SLOT_EXPRESSION_LINK_RE = re.compile(
+    r"\s*for\s*",
+    re.IGNORECASE,
+)
+_SCHEDULED_SLOT_TERMINAL_LINK_RE = re.compile(
+    r"\s*(?:,\s*)?(?:(?:and|but)\s+)?(?:has\s+been|was)\s*",
+    re.IGNORECASE,
+)
+_SCHEDULED_SLOT_CLEAN_TERMINAL_RE = re.compile(
+    r"\s*(?:[.!?]+[\"')\]]*)?\s*\Z",
 )
 _LIFECYCLE_CONTEXT_BLOCKERS = frozenset(
     {"lifecycle_cancelled", "lifecycle_completed", "lifecycle_rescheduled"}
@@ -192,6 +233,17 @@ GMAIL_TEMPORAL_SELECTION_SCHEMA: dict[str, Any] = {
 
 class GmailTemporalSelectionError(ValueError):
     """Raised when a semantic selector exceeds its evidence-bound authority."""
+
+
+@dataclass(frozen=True)
+class _ExactLifecycleFrame:
+    """Source-verified lifecycle semantics unavailable in one broad mention."""
+
+    lifecycle: SelectionLifecycle
+    relation: SelectionRelation
+    kind: SelectionKind
+    repair_flag: str
+    complementary_lifecycle_mention_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -366,6 +418,14 @@ def validate_gmail_temporal_selection(
         normalized_value, normalization_blockers = _deterministic_normalization(
             expression
         )
+        exact_lifecycle_frame = _exact_lifecycle_frame(
+            expression=expression,
+            expressions=expressions,
+            subject=subject,
+            lifecycle=lifecycle,
+            mentions=mentions,
+            batch=batch,
+        )
         grammatical_scope_blockers = _expression_subject_binding_blockers(
             expression=expression,
             expressions=expressions,
@@ -384,6 +444,7 @@ def validate_gmail_temporal_selection(
             coordinated_supporting_lead=coordinated_supporting_lead,
             lifecycle_subject_grammar_supported=lifecycle_subject_grammar_supported,
             lifecycle_lead=lifecycle_lead,
+            exact_lifecycle_frame=exact_lifecycle_frame,
             batch=batch,
         )
         relation, kind, lifecycle_value, semantic_blockers, semantic_repairs = (
@@ -392,6 +453,7 @@ def validate_gmail_temporal_selection(
                 lifecycle,
                 supporting_lead,
                 lifecycle_binding_supported=not lifecycle_binding_blockers,
+                exact_lifecycle_frame=exact_lifecycle_frame,
             )
         )
         if relation == "deadline" and expression.form == "date_range":
@@ -420,6 +482,16 @@ def validate_gmail_temporal_selection(
                             lifecycle is not None
                             and blocker in _LIFECYCLE_CONTEXT_BLOCKERS
                             and blocker not in lifecycle.blockers
+                        )
+                        and not (
+                            exact_lifecycle_frame is not None
+                            and exact_lifecycle_frame.lifecycle
+                            in {"rescheduled_old", "rescheduled_replacement"}
+                            and blocker
+                            in {
+                                "multiple_association_expressions",
+                                "multiple_association_mentions",
+                            }
                         )
                     )
                     if supporting_lead is not None
@@ -766,6 +838,7 @@ def _lifecycle_subject_binding_blockers(
     coordinated_supporting_lead: TemporalLead | None,
     lifecycle_subject_grammar_supported: bool,
     lifecycle_lead: TemporalLead | None,
+    exact_lifecycle_frame: _ExactLifecycleFrame | None,
     batch: GmailTemporalSelectorBatch | None,
 ) -> tuple[str, ...]:
     """Require lifecycle evidence to bind both time and the selected subject."""
@@ -779,7 +852,7 @@ def _lifecycle_subject_binding_blockers(
         and not lifecycle_subject_grammar_supported
     ):
         blockers.append("lifecycle_subject_pair_unlinked")
-    if lifecycle_lead is None:
+    if lifecycle_lead is None and exact_lifecycle_frame is None:
         blockers.append("lifecycle_expression_unlinked")
     if lifecycle.field != subject.field:
         blockers.append("lifecycle_subject_cross_field")
@@ -807,6 +880,12 @@ def _lifecycle_subject_binding_blockers(
             candidate,
             expression,
             batch=batch,
+        )
+        and not (
+            exact_lifecycle_frame is not None
+            and exact_lifecycle_frame.lifecycle == "cancelled"
+            and candidate.mention_id
+            == exact_lifecycle_frame.complementary_lifecycle_mention_id
         )
         for candidate in mentions.values()
     ):
@@ -901,6 +980,254 @@ def _lifecycle_expression_has_local_grammar(
             and _EXPRESSION_LIFECYCLE_FORWARD_LINK_RE.fullmatch(separator) is not None
         )
     return False
+
+
+def _exact_lifecycle_frame(
+    *,
+    expression: TemporalExpression,
+    expressions: dict[str, TemporalExpression],
+    subject: TemporalMention,
+    lifecycle: TemporalMention | None,
+    mentions: dict[str, TemporalMention],
+    batch: GmailTemporalSelectorBatch | None,
+) -> _ExactLifecycleFrame | None:
+    """Derive only endpoint roles made explicit by a closed source frame.
+
+    Lifecycle inventory mentions deliberately remain broad.  These two frames
+    are narrow enough to recover semantics deterministically without asking a
+    model to author them: complementary ``from``/``to`` reschedule endpoints,
+    and a scheduled slot immediately followed by its cancellation.  Everything
+    else retains the existing unknown or terminal-unspecified behavior.
+    """
+
+    if (
+        lifecycle is None
+        or batch is None
+        or subject.mention_type
+        not in {"event", "event_predicate", "event_title_candidate"}
+        or subject.boundary_role == "terminal_boundary"
+        or subject.field != expression.field
+        or subject.segment_id != expression.segment_id
+        or lifecycle.field != expression.field
+        or lifecycle.segment_id != expression.segment_id
+    ):
+        return None
+    if lifecycle.lifecycle_role == "rescheduled":
+        return _exact_reschedule_endpoint_frame(
+            expression=expression,
+            expressions=expressions,
+            subject=subject,
+            lifecycle=lifecycle,
+            batch=batch,
+        )
+    if lifecycle.lifecycle_role == "cancelled":
+        return _exact_scheduled_slot_cancellation_frame(
+            expression=expression,
+            subject=subject,
+            lifecycle=lifecycle,
+            mentions=mentions,
+            batch=batch,
+        )
+    return None
+
+
+def _exact_reschedule_endpoint_frame(
+    *,
+    expression: TemporalExpression,
+    expressions: dict[str, TemporalExpression],
+    subject: TemporalMention,
+    lifecycle: TemporalMention,
+    batch: GmailTemporalSelectorBatch,
+) -> _ExactLifecycleFrame | None:
+    if not _source_link_matches(
+        batch,
+        subject.end,
+        lifecycle.start,
+        field=subject.field,
+        pattern=_RESCHEDULE_SUBJECT_LINK_RE,
+    ):
+        return None
+    post_lifecycle = tuple(
+        sorted(
+            (
+                candidate
+                for candidate in expressions.values()
+                if candidate.field == lifecycle.field
+                and candidate.segment_id == lifecycle.segment_id
+                and candidate.start >= lifecycle.end
+            ),
+            key=lambda candidate: (candidate.start, candidate.end),
+        )
+    )
+    if len(post_lifecycle) < 2:
+        return None
+    first, second = post_lifecycle[:2]
+    endpoints = (first, second)
+    if expression.expression_id not in {
+        candidate.expression_id for candidate in endpoints
+    } or any(
+        candidate.resolution_status != "resolved"
+        or len(candidate.normalized_options) != 1
+        or not _complete_normalization_is_valid(candidate.normalized_options[0])
+        or candidate.blockers
+        for candidate in endpoints
+    ):
+        return None
+    first_link = _source_slice(
+        batch,
+        lifecycle.end,
+        first.start,
+        field=lifecycle.field,
+    )
+    second_link = _source_slice(
+        batch,
+        first.end,
+        second.start,
+        field=lifecycle.field,
+    )
+    first_match = (
+        _RESCHEDULE_ENDPOINT_LINK_RE.fullmatch(first_link)
+        if first_link is not None
+        else None
+    )
+    second_match = (
+        _RESCHEDULE_ENDPOINT_LINK_RE.fullmatch(second_link)
+        if second_link is not None
+        else None
+    )
+    if (
+        first_match is None
+        or second_match is None
+        or first_match.group("role").casefold() == second_match.group("role").casefold()
+    ):
+        return None
+    if len(post_lifecycle) > 2:
+        third_link = _source_slice(
+            batch,
+            second.end,
+            post_lifecycle[2].start,
+            field=lifecycle.field,
+        )
+        # A third temporal expression makes the replacement endpoint ambiguous
+        # unless the source opens a small, closed grammar for an independent
+        # action deadline.  This fails closed for lexical, parenthesized, slash,
+        # and punctuation-only alternatives without enumerating every hedge.
+        if third_link is None or (
+            _RESCHEDULE_INDEPENDENT_TEMPORAL_CLAUSE_RE.fullmatch(third_link) is None
+        ):
+            return None
+    trailing = _source_slice(
+        batch,
+        second.end,
+        min(batch.segment_end, second.end + 96),
+        field=lifecycle.field,
+    )
+    if (
+        trailing is not None
+        and _RESCHEDULE_TRAILING_ORDINAL_OPTION_RE.match(trailing) is not None
+    ):
+        return None
+    selected_link = (
+        first_match.group("role").casefold()
+        if expression.expression_id == first.expression_id
+        else second_match.group("role").casefold()
+    )
+    return _ExactLifecycleFrame(
+        lifecycle=(
+            "rescheduled_old" if selected_link == "from" else "rescheduled_replacement"
+        ),
+        relation="occurrence",
+        kind="planned",
+        repair_flag="reschedule_endpoint_role_derived_from_exact_frame",
+    )
+
+
+def _exact_scheduled_slot_cancellation_frame(
+    *,
+    expression: TemporalExpression,
+    subject: TemporalMention,
+    lifecycle: TemporalMention,
+    mentions: dict[str, TemporalMention],
+    batch: GmailTemporalSelectorBatch,
+) -> _ExactLifecycleFrame | None:
+    if (
+        expression.resolution_status != "resolved"
+        or len(expression.normalized_options) != 1
+        or not _complete_normalization_is_valid(expression.normalized_options[0])
+        or expression.blockers
+    ):
+        return None
+    scheduled = tuple(
+        candidate
+        for candidate in mentions.values()
+        if candidate.mention_type == "lifecycle"
+        and candidate.lifecycle_role == "scheduled"
+        and candidate.field == expression.field
+        and candidate.segment_id == expression.segment_id
+        and subject.end <= candidate.start
+        and candidate.end <= expression.start
+        and expression.end <= lifecycle.start
+        and _source_link_matches(
+            batch,
+            subject.end,
+            candidate.start,
+            field=subject.field,
+            pattern=_SCHEDULED_SLOT_SUBJECT_LINK_RE,
+        )
+        and _source_link_matches(
+            batch,
+            candidate.end,
+            expression.start,
+            field=expression.field,
+            pattern=_SCHEDULED_SLOT_EXPRESSION_LINK_RE,
+        )
+        and _source_link_matches(
+            batch,
+            expression.end,
+            lifecycle.start,
+            field=expression.field,
+            pattern=_SCHEDULED_SLOT_TERMINAL_LINK_RE,
+        )
+    )
+    if len(scheduled) != 1:
+        return None
+    trailing = _source_slice(
+        batch,
+        lifecycle.end,
+        batch.segment_end,
+        field=lifecycle.field,
+    )
+    # Exact cancellation is a closed terminal grammar: after ``cancelled`` only
+    # sentence-ending punctuation may remain.  Any lexical continuation could
+    # qualify, condition, contrast, or replace the cancellation, so retain the
+    # cancellation hypothesis but require review instead of trying to enumerate
+    # every possible hedge (``unless``, ``subject to``, ``provided``, etc.).
+    qualified = trailing is None or (
+        _SCHEDULED_SLOT_CLEAN_TERMINAL_RE.fullmatch(trailing) is None
+    )
+    return _ExactLifecycleFrame(
+        lifecycle="cancelled",
+        relation="occurrence",
+        kind="planned",
+        repair_flag=(
+            "cancelled_scheduled_slot_has_ambiguous_trailing_qualification"
+            if qualified
+            else "cancelled_scheduled_slot_derived_as_planned_occurrence"
+        ),
+        complementary_lifecycle_mention_id=scheduled[0].mention_id,
+    )
+
+
+def _source_link_matches(
+    batch: GmailTemporalSelectorBatch,
+    start: int,
+    end: int,
+    *,
+    field: str,
+    pattern: re.Pattern[str],
+) -> bool:
+    link = _source_slice(batch, start, end, field=field)
+    return link is not None and pattern.fullmatch(link) is not None
 
 
 def classify_gmail_temporal_subject_pair(
@@ -1153,6 +1480,7 @@ def _deterministic_semantics(
     supporting_lead: TemporalLead | None,
     *,
     lifecycle_binding_supported: bool,
+    exact_lifecycle_frame: _ExactLifecycleFrame | None,
 ) -> tuple[
     SelectionRelation,
     SelectionKind,
@@ -1210,7 +1538,12 @@ def _deterministic_semantics(
         )
 
     role = lifecycle_mention.lifecycle_role
-    if role == "scheduled":
+    if exact_lifecycle_frame is not None:
+        lifecycle = exact_lifecycle_frame.lifecycle
+        relation = exact_lifecycle_frame.relation
+        kind = exact_lifecycle_frame.kind
+        repairs.append(exact_lifecycle_frame.repair_flag)
+    elif role == "scheduled":
         lifecycle = "scheduled"
         if relation not in {"occurrence", "unspecified"}:
             relation = "unspecified"
@@ -1269,7 +1602,13 @@ def _association_requires_defer(
         return True
     if lifecycle == "unknown":
         return True
-    ignored = _HANDLED_TERMINAL_BLOCKERS if lifecycle in _TERMINAL_LIFECYCLES else set()
+    ignored = (
+        _HANDLED_TERMINAL_BLOCKERS
+        if lifecycle in _TERMINAL_LIFECYCLES
+        else {"lifecycle_rescheduled"}
+        if lifecycle in {"rescheduled_old", "rescheduled_replacement"}
+        else set()
+    )
     if any(blocker not in ignored for blocker in blockers):
         return True
     return any(feature in _HARD_RISK_FEATURES for feature in risk_features)

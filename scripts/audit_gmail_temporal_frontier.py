@@ -36,7 +36,7 @@ from pkm_brain.gmail_temporal_selection import (
 )
 
 
-AUDIT_VERSION = "gmail_temporal_frontier_audit_v2"
+AUDIT_VERSION = "gmail_temporal_frontier_audit_v3"
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SOURCE_PATHS = {
     name: _REPO_ROOT / "src" / "pkm_brain" / f"{name}.py"
@@ -256,6 +256,7 @@ def audit_gmail_temporal_frontier(path: Path) -> dict[str, Any]:
         record_incomplete_frontiers = 0
         record_singleton_fallback_batches = 0
         record_singleton_fallback_candidates = 0
+        record_candidate_expression_ids: set[str] = set()
         for batch in plan.batches:
             singleton_fallback = (
                 GMAIL_TEMPORAL_SINGLETON_EVENT_FALLBACK_DIAGNOSTIC in batch.diagnostics
@@ -275,6 +276,19 @@ def audit_gmail_temporal_frontier(path: Path) -> dict[str, Any]:
                 batch=batch,
             )
             candidate_count = len(frontier.candidates)
+            candidate_expression_ids = {
+                item.expression_id for item in frontier.candidates
+            }
+            batch_expression_ids = {item.expression_id for item in batch.expressions}
+            record_candidate_expression_ids.update(candidate_expression_ids)
+            counts["expressions_with_candidates"] += len(candidate_expression_ids)
+            counts["expressions_without_candidates"] += len(
+                batch_expression_ids - candidate_expression_ids
+            )
+            coverage["expressions_with_candidates"] += len(candidate_expression_ids)
+            coverage["expressions_without_candidates"] += len(
+                batch_expression_ids - candidate_expression_ids
+            )
             page_count = len(page_plan.pages)
             record_candidates += candidate_count
             if singleton_fallback:
@@ -348,6 +362,20 @@ def audit_gmail_temporal_frontier(path: Path) -> dict[str, Any]:
 
         counts["records_with_candidates"] += int(record_candidates > 0)
         counts["records_with_pages"] += int(record_pages > 0)
+        expression_ids = {item.expression_id for item in analysis.expressions}
+        uncovered_expression_ids = expression_ids - record_candidate_expression_ids
+        counts["records_with_partial_expression_coverage"] += int(
+            bool(record_candidate_expression_ids) and bool(uncovered_expression_ids)
+        )
+        counts["records_with_no_expression_candidates"] += int(
+            bool(expression_ids) and not record_candidate_expression_ids
+        )
+        coverage["with_partial_expression_coverage"] += int(
+            bool(record_candidate_expression_ids) and bool(uncovered_expression_ids)
+        )
+        coverage["with_no_expression_candidates"] += int(
+            bool(expression_ids) and not record_candidate_expression_ids
+        )
         coverage["with_candidates"] += int(record_candidates > 0)
         coverage["with_pages"] += int(record_pages > 0)
         counts["records_with_singleton_fallback"] += int(
@@ -360,7 +388,7 @@ def audit_gmail_temporal_frontier(path: Path) -> dict[str, Any]:
         if admitted:
             counts["admitted_with_candidates"] += int(record_candidates > 0)
             counts["admitted_with_pages"] += int(record_pages > 0)
-            if analysis.expressions and record_candidates == 0:
+            if uncovered_expression_ids:
                 record_material = (
                     "gmail-temporal-frontier-gap-v1\0"
                     + cohort_sha256
@@ -374,6 +402,7 @@ def audit_gmail_temporal_frontier(path: Path) -> dict[str, Any]:
                         ).hexdigest()[:20],
                         "stratum": stratum,
                         "expressions": len(analysis.expressions),
+                        "expressions_without_candidates": len(uncovered_expression_ids),
                         "expression_forms": dict(
                             sorted(
                                 Counter(

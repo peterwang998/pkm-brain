@@ -7,6 +7,7 @@ from typing import Callable
 
 import pytest
 
+import pkm_brain.gmail_temporal_review as review_module
 from pkm_brain.gmail_temporal_batching import (
     GmailTemporalBatchPlan,
     GmailTemporalSelectorBatch,
@@ -36,6 +37,7 @@ from pkm_brain.gmail_temporal_review import (
     GmailTemporalReviewProjection,
     canonical_gmail_temporal_review_projection_bytes,
     gmail_temporal_review_projection_payload,
+    gmail_temporal_review_grouping_policy_fingerprint,
     project_gmail_temporal_review,
     _structural_frames,
 )
@@ -45,6 +47,19 @@ VerdictSelector = Callable[
     [str, TemporalLeadAnalysis, tuple[GmailTemporalVerificationCandidate, ...]],
     dict[str, str],
 ]
+
+
+def test_grouping_policy_binds_deterministic_candidate_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    before = gmail_temporal_review_grouping_policy_fingerprint()
+    monkeypatch.setattr(
+        review_module,
+        "gmail_temporal_candidate_policy_fingerprint",
+        lambda: "gtcp_" + "0" * 64,
+    )
+
+    assert gmail_temporal_review_grouping_policy_fingerprint() != before
 
 
 def _rows(
@@ -157,6 +172,22 @@ def _select_lifecycle(value: str, verdict: str) -> VerdictSelector:
     return select
 
 
+def _select_exact_reschedule(verdict: str) -> VerdictSelector:
+    def select(
+        _expression_id: str,
+        _analysis: TemporalLeadAnalysis,
+        candidates: tuple[GmailTemporalVerificationCandidate, ...],
+    ) -> dict[str, str]:
+        candidate = next(
+            item
+            for item in candidates
+            if item.lifecycle in {"rescheduled_old", "rescheduled_replacement"}
+        )
+        return {candidate.candidate_id: verdict}
+
+    return select
+
+
 def _select_first_uncertain(
     _expression_id: str,
     _analysis: TemporalLeadAnalysis,
@@ -242,9 +273,22 @@ def _with_subject_type_references(
 
 def test_single_projection_is_canonical_content_free_and_always_deferred() -> None:
     text = "The Super Secret Meeting is scheduled for August 14, 2027."
+
+    def select_non_deferred_scheduled(
+        _expression_id: str,
+        _analysis: TemporalLeadAnalysis,
+        candidates: tuple[GmailTemporalVerificationCandidate, ...],
+    ) -> dict[str, str]:
+        candidate = next(
+            item
+            for item in candidates
+            if item.lifecycle == "scheduled" and not item.requires_defer
+        )
+        return {candidate.candidate_id: "supported"}
+
     analysis, _, _, projection = _fixture(
         text,
-        _select_lifecycle("scheduled", "supported"),
+        select_non_deferred_scheduled,
     )
 
     assert len(projection.artifacts) == 1
@@ -366,11 +410,11 @@ def test_v19_syn_ambiguous_04_preserves_alternatives_and_alias_collapse() -> Non
     assert group.candidate_authorization is False
 
 
-def test_v19_syn_lifecycle_03_orders_roles_without_rewriting_candidates() -> None:
+def test_exact_reschedule_candidates_preserve_structural_endpoint_roles() -> None:
     text = (
         "The hiring interview was rescheduled from August 20, 2027 to August 16, 2027."
     )
-    _, _, _, projection = _fixture(text, _select_lifecycle("unknown", "uncertain"))
+    _, _, _, projection = _fixture(text, _select_exact_reschedule("uncertain"))
 
     assert len(projection.artifacts) == 2
     group = next(item for item in projection.groups if item.kind == "reschedule")
@@ -385,11 +429,13 @@ def test_v19_syn_lifecycle_03_orders_roles_without_rewriting_candidates() -> Non
         "2027-08-20",
         "2027-08-16",
     ]
-    assert all(item.lifecycle == "unknown" for item in hypotheses)
-    assert all(item.candidate_requires_defer is True for item in hypotheses)
+    assert [item.lifecycle for item in hypotheses] == [
+        "rescheduled_old",
+        "rescheduled_replacement",
+    ]
+    assert all(item.candidate_requires_defer is False for item in hypotheses)
     assert all(
-        (item.relation, item.kind) == ("unspecified", "unspecified")
-        for item in hypotheses
+        (item.relation, item.kind) == ("occurrence", "planned") for item in hypotheses
     )
 
 
@@ -405,7 +451,9 @@ def test_missing_reschedule_endpoint_is_explicitly_incomplete() -> None:
     ) -> dict[str, str]:
         if expression_id != analysis.expressions[0].expression_id:
             return {}
-        candidate = next(item for item in candidates if item.lifecycle == "unknown")
+        candidate = next(
+            item for item in candidates if item.lifecycle == "rescheduled_old"
+        )
         return {candidate.candidate_id: "uncertain"}
 
     _, _, _, projection = _fixture(text, select)
@@ -1360,7 +1408,8 @@ def test_split_semantics_is_triage_only_and_gets_an_unresolved_group() -> None:
 
 def test_structural_group_exposes_split_endpoint_without_duplicate_authority() -> None:
     text = (
-        "The hiring interview was rescheduled from August 14, 2027 to August 16, 2027."
+        "The hiring interview was rescheduled from August 14, 2027 "
+        "until August 16, 2027."
     )
     analysis = analyze_gmail_temporal_leads(
         text=text,
@@ -1539,7 +1588,8 @@ def test_split_group_cannot_duplicate_an_artifact_reference() -> None:
 
 def test_complete_member_cannot_hide_a_split_semantic_review() -> None:
     text = (
-        "The hiring interview was rescheduled from August 14, 2027 to August 16, 2027."
+        "The hiring interview was rescheduled from August 14, 2027 "
+        "until August 16, 2027."
     )
     analysis = analyze_gmail_temporal_leads(
         text=text,

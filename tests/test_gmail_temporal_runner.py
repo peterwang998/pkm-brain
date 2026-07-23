@@ -36,6 +36,19 @@ INTERNAL_AT = "2027-07-01T09:00:00-07:00"
 DOCUMENT = "doc-runner"
 
 
+def test_runner_policy_binds_deterministic_candidate_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    before = runner.gmail_temporal_runner_policy_fingerprint()
+    monkeypatch.setattr(
+        runner,
+        "gmail_temporal_candidate_policy_fingerprint",
+        lambda: "gtcp_" + "0" * 64,
+    )
+
+    assert runner.gmail_temporal_runner_policy_fingerprint() != before
+
+
 def _workspace(
     tmp_path: Path,
     *,

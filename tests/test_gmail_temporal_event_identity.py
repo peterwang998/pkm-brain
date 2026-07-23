@@ -175,6 +175,17 @@ def _select_lifecycle(lifecycle: str) -> CandidateSelector:
     return select
 
 
+def _select_exact_reschedule_endpoint(
+    candidates: tuple[GmailTemporalVerificationCandidate, ...],
+) -> dict[str, str]:
+    candidate = next(
+        item
+        for item in candidates
+        if item.lifecycle in {"rescheduled_old", "rescheduled_replacement"}
+    )
+    return {candidate.candidate_id: "supported"}
+
+
 def _select_relation(relation: str) -> CandidateSelector:
     def select(
         candidates: tuple[GmailTemporalVerificationCandidate, ...],
@@ -491,7 +502,7 @@ def test_schedule_reschedule_cancel_projects_one_verified_lifecycle() -> None:
     )
     reschedule = _projection(
         "The Apollo interview was rescheduled from August 14, 2027 to August 16, 2027.",
-        _select_lifecycle("unknown"),
+        _select_exact_reschedule_endpoint,
         internal_at="2027-08-02T09:00:00-07:00",
         chunk_id="message-2",
     )
@@ -608,9 +619,19 @@ def test_non_event_temporal_artifacts_are_retained_but_not_identity_units(
 
 
 def test_normal_interview_event_remains_an_identity_unit() -> None:
+    def select_non_deferred_scheduled_event(
+        candidates: tuple[GmailTemporalVerificationCandidate, ...],
+    ) -> dict[str, str]:
+        candidate = next(
+            item
+            for item in candidates
+            if item.lifecycle == "scheduled" and not item.requires_defer
+        )
+        return {candidate.candidate_id: "supported"}
+
     projection = _projection(
         "The Apollo interview is scheduled for August 14, 2027.",
-        _select_lifecycle("scheduled"),
+        select_non_deferred_scheduled_event,
         internal_at="2027-08-01T09:00:00-07:00",
         chunk_id="eventhood-interview",
     )

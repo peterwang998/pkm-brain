@@ -16,6 +16,7 @@ from .gmail_temporal_frontier import (
     GmailTemporalCandidatePagePlan,
     GmailTemporalVerificationCandidate,
     build_gmail_temporal_candidate_frontier,
+    gmail_temporal_candidate_policy_fingerprint,
     gmail_temporal_candidate_ensemble_policy_fingerprint,
     plan_gmail_temporal_candidate_pages,
     validate_gmail_temporal_candidate_verdict_set,
@@ -34,7 +35,7 @@ _HYPOTHESIS_VERSION = "gmail_temporal_review_hypothesis_v2"
 _CLUSTER_REVIEW_VERSION = "gmail_temporal_review_cluster_review_v1"
 _GROUP_VERSION = "gmail_temporal_review_group_v1"
 _GROUP_MEMBER_VERSION = "gmail_temporal_review_group_member_v1"
-_GROUPING_POLICY_VERSION = "gmail_temporal_review_grouping_policy_v6"
+_GROUPING_POLICY_VERSION = "gmail_temporal_review_grouping_policy_v7"
 
 ReviewArtifactKind = Literal["supported_citation", "uncertainty_sidecar"]
 ReviewEvidenceStatus = Literal["supported", "uncertain"]
@@ -298,6 +299,7 @@ def gmail_temporal_review_grouping_policy_fingerprint() -> str:
 
     material = {
         "version": _GROUPING_POLICY_VERSION,
+        "candidate_policy_fingerprint": (gmail_temporal_candidate_policy_fingerprint()),
         "artifact_hypothesis_signature": [
             "expression_id",
             "subject_type_references",

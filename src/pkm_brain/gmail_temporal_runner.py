@@ -36,6 +36,7 @@ from .gmail_temporal_frontier import (
     GmailTemporalCandidateVerdict,
     GmailTemporalVerificationCandidate,
     build_gmail_temporal_candidate_frontier,
+    gmail_temporal_candidate_policy_fingerprint,
     gmail_temporal_candidate_ensemble_policy_fingerprint,
     gmail_temporal_candidate_page_payload,
     plan_gmail_temporal_candidate_pages,
@@ -79,7 +80,7 @@ from .source_dates import (
 )
 
 
-GMAIL_TEMPORAL_RUNNER_VERSION = "gmail_temporal_review_runner_v2"
+GMAIL_TEMPORAL_RUNNER_VERSION = "gmail_temporal_review_runner_v3"
 GMAIL_TEMPORAL_ADMISSION_POLICY_VERSION = "gmail_temporal_admission_policy_v2"
 GMAIL_TEMPORAL_REQUEST_VERSION = "gmail_temporal_verifier_request_v1"
 GMAIL_TEMPORAL_COMPONENT_VERSION = "gmail_temporal_verifier_component_v1"
@@ -147,7 +148,7 @@ class GmailTemporalVerifierRequest:
 class GmailTemporalReviewPreparation:
     """Source-derived verifier work; payloads are private and must not be logged."""
 
-    version: Literal["gmail_temporal_review_runner_v2"]
+    version: Literal["gmail_temporal_review_runner_v3"]
     disposition: str
     message_scope_key: str
     admission_basis: str
@@ -171,7 +172,7 @@ class GmailTemporalReviewPreparation:
 class GmailTemporalRunnerResult:
     """Aggregate-only finalizer result safe for operational status output."""
 
-    version: Literal["gmail_temporal_review_runner_v2"]
+    version: Literal["gmail_temporal_review_runner_v3"]
     disposition: str
     message_scope_key: str
     admission_basis: str
@@ -275,6 +276,7 @@ def gmail_temporal_runner_policy_fingerprint() -> str:
         "model": GMAIL_TEMPORAL_VERIFIER_MODEL,
         "reasoning_effort": GMAIL_TEMPORAL_VERIFIER_REASONING_EFFORT,
         "verifier_policy": gmail_temporal_verifier_policy_fingerprint(),
+        "candidate_policy": gmail_temporal_candidate_policy_fingerprint(),
         "ensemble_policy": gmail_temporal_candidate_ensemble_policy_fingerprint(),
         "grouping_policy": gmail_temporal_review_grouping_policy_fingerprint(),
         "component_count": _RUN_COUNT,

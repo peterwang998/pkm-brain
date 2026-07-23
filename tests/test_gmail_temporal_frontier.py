@@ -19,6 +19,7 @@ from pkm_brain.gmail_temporal_frontier import (
     _explicit_lifecycle_subsumes_base,
     _is_direct_actual_endpoint,
     build_gmail_temporal_candidate_frontier,
+    gmail_temporal_candidate_policy_fingerprint,
     gmail_temporal_candidate_frontier_payload,
     gmail_temporal_candidate_ensemble_policy_fingerprint,
     gmail_temporal_candidate_page_payload,
@@ -32,6 +33,13 @@ from pkm_brain.gmail_temporal_selection import GMAIL_TEMPORAL_HARD_SCOPE_BLOCKER
 
 
 ANCHOR = "2027-05-01T10:00:00-07:00"
+
+
+def test_candidate_policy_fingerprint_is_explicit_and_stable_shape() -> None:
+    fingerprint = gmail_temporal_candidate_policy_fingerprint()
+
+    assert fingerprint.startswith("gtcp_")
+    assert len(fingerprint) == 69
 
 
 def analyze_and_plan(
@@ -2509,8 +2517,7 @@ def test_multiple_supported_candidates_become_conflict_uncertainty() -> None:
 
 def test_alias_cluster_uncertainty_aggregates_across_page_fragments() -> None:
     analysis, plan = analyze_and_plan(
-        "Subject: Q3 Leadership Forum\n\n"
-        "The Q3 Leadership Forum is scheduled for May 14, 2027."
+        "Subject: Q3 Leadership Forum\n\nJoin the Q3 Leadership Forum on May 14, 2027."
     )
     batch = plan.batches[0]
     page_plan = plan_gmail_temporal_candidate_pages(
@@ -2693,15 +2700,24 @@ def test_verdict_set_v2_serialization_separates_raw_rows_from_sidecars() -> None
 
 
 @pytest.mark.parametrize(
-    ("text", "expected_lifecycle"),
+    ("text", "expected_lifecycle", "expected_semantics"),
     (
-        ("The meeting scheduled for May 14, 2027 was cancelled.", "cancelled"),
-        ("The meeting on May 14, 2027 was completed.", "completed"),
+        (
+            "The meeting scheduled for May 14, 2027 was cancelled.",
+            "cancelled",
+            ("occurrence", "planned"),
+        ),
+        (
+            "The meeting on May 14, 2027 was completed.",
+            "completed",
+            ("unspecified", "unspecified"),
+        ),
     ),
 )
 def test_terminal_lifecycle_candidates_preserve_terminal_semantics(
     text: str,
     expected_lifecycle: str,
+    expected_semantics: tuple[str, str],
 ) -> None:
     analysis, plan = analyze_and_plan(text)
     frontier = build_gmail_temporal_candidate_frontier(
@@ -2712,7 +2728,7 @@ def test_terminal_lifecycle_candidates_preserve_terminal_semantics(
     terminal = next(
         item for item in frontier.candidates if item.lifecycle == expected_lifecycle
     )
-    assert (terminal.relation, terminal.kind) == ("unspecified", "unspecified")
+    assert (terminal.relation, terminal.kind) == expected_semantics
     assert terminal.lifecycle_mention_id is not None
     assert terminal.requires_defer is False
 
@@ -2794,7 +2810,7 @@ def test_deferred_lifecycle_does_not_subsume_alias_bases() -> None:
     assert all(candidate.normalized_value is None for candidate in scheduled)
 
 
-def test_reschedule_aliases_keep_unknown_lifecycle_and_free_bases() -> None:
+def test_exact_reschedule_compound_aliases_collapse_to_one_precise_variant() -> None:
     analysis, plan = analyze_and_plan(
         "The review meeting was rescheduled from May 14, 2027 to May 16, 2027."
     )
@@ -2804,20 +2820,20 @@ def test_reschedule_aliases_keep_unknown_lifecycle_and_free_bases() -> None:
             analysis=analysis,
             batch=batch,
         )
-        lifecycle_free = tuple(
+        exact = tuple(
             candidate
             for candidate in frontier.candidates
-            if candidate.lifecycle_mention_id is None
-        )
-        unknown = tuple(
-            candidate
-            for candidate in frontier.candidates
-            if candidate.lifecycle == "unknown"
+            if candidate.lifecycle in {"rescheduled_old", "rescheduled_replacement"}
         )
 
-        assert len(lifecycle_free) == 2
-        assert len(unknown) == 2
-        assert all(candidate.requires_defer for candidate in unknown)
+        assert len(exact) == 1
+        assert len(frontier.candidates) == 1
+        assert exact[0].requires_defer is False
+        assert exact[0].lifecycle == (
+            "rescheduled_old"
+            if exact[0].normalized_value == "2027-05-14"
+            else "rescheduled_replacement"
+        )
 
 
 def test_terminal_lifecycle_does_not_subsume_distinct_direct_actual() -> None:
@@ -2850,7 +2866,7 @@ def test_terminal_lifecycle_does_not_subsume_distinct_direct_actual() -> None:
     assert completed
 
 
-def test_exact_lifecycle_does_not_subsume_source_distinct_title_bases() -> None:
+def test_clause_bound_local_identity_supersedes_source_distinct_title_bridge() -> None:
     text = (
         "Subject: Atlas Interview Update\n\n"
         "The Beta interview is scheduled for May 14, 2027."
@@ -2867,10 +2883,8 @@ def test_exact_lifecycle_does_not_subsume_source_distinct_title_bases() -> None:
         and mention.mention_type in {"event", "event_title_candidate"}
     }
 
-    assert any(
-        candidate.subject_mention_id in title_ids
-        and candidate.lifecycle_mention_id is None
-        for candidate in frontier.candidates
+    assert not any(
+        candidate.subject_mention_id in title_ids for candidate in frontier.candidates
     )
     assert any(
         candidate.lifecycle == "scheduled" and not candidate.requires_defer
@@ -2878,7 +2892,7 @@ def test_exact_lifecycle_does_not_subsume_source_distinct_title_bases() -> None:
     )
 
 
-def test_unresolved_reschedule_variants_never_become_precise() -> None:
+def test_exact_reschedule_variants_become_precise_before_verification() -> None:
     analysis, plan = analyze_and_plan(
         "The meeting was rescheduled from May 14, 2027 to May 16, 2027."
     )
@@ -2897,20 +2911,21 @@ def test_unresolved_reschedule_variants_never_become_precise() -> None:
         if candidate.lifecycle_mention_id is not None
     ]
     assert len(rescheduled) == 2
-    assert all(item.lifecycle == "unknown" for item in rescheduled)
+    assert {item.normalized_value: item.lifecycle for item in rescheduled} == {
+        "2027-05-14": "rescheduled_old",
+        "2027-05-16": "rescheduled_replacement",
+    }
     assert all(
-        (item.relation, item.kind) == ("unspecified", "unspecified")
-        for item in rescheduled
+        (item.relation, item.kind) == ("occurrence", "planned") for item in rescheduled
     )
-    assert all(item.requires_defer is True for item in rescheduled)
+    assert all(item.requires_defer is False for item in rescheduled)
     lifecycle_free = [
         candidate
         for frontier in frontiers
         for candidate in frontier.candidates
         if candidate.lifecycle_mention_id is None
     ]
-    assert len(lifecycle_free) == 2
-    assert all(item.lifecycle == "none" for item in lifecycle_free)
+    assert lifecycle_free == []
 
 
 def test_unrelated_lifecycle_cue_is_not_crossed_into_other_segment() -> None:

@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, replace
 from typing import Literal, Sequence
 
 from .gmail_temporal_leads import (
+    GMAIL_TEMPORAL_CLAUSE_BOUND_EVENT_TITLE_BLOCKER,
     TemporalExpression,
     TemporalLead,
     TemporalLeadAnalysis,
@@ -17,6 +18,7 @@ from .gmail_temporal_leads import (
 BatchField = Literal["subject", "body", "message"]
 BatchContextRole = Literal["local", "subject_bridge"]
 BatchMentionRole = Literal["local", "subject_bridge"]
+GMAIL_TEMPORAL_BATCHING_POLICY_VERSION = "gmail_temporal_batching_policy_v2"
 BatchOmissionReason = Literal[
     "fact_not_admitted",
     "scope_not_bound",
@@ -51,6 +53,9 @@ _TEMPORAL_SUBJECT_TYPES = frozenset((*_SUBJECT_BRIDGE_TYPES, "boundary"))
 _SINGLETON_CROSS_SEGMENT_MAX_GAP_CHARS = 240
 GMAIL_TEMPORAL_SINGLETON_EVENT_FALLBACK_DIAGNOSTIC = (
     "singleton_cross_segment_event_fallback"
+)
+GMAIL_TEMPORAL_CLAUSE_BOUND_SUBJECT_SUPERSESSION_DIAGNOSTIC = (
+    "subject_bridge_superseded_by_clause_bound_event_title"
 )
 _MENTION_TYPE_RANK = {
     "event_title_candidate": 0,
@@ -498,15 +503,25 @@ def _build_batch(
         fields=fields,
         caps=caps,
     )
+    expression_ids = {item.expression_id for item in expressions}
     same_segment_mentions = tuple(
         item
         for item in analysis.mentions
         if mention_segments[item.mention_id].segment_id == segment.segment_id
+        and (
+            GMAIL_TEMPORAL_CLAUSE_BOUND_EVENT_TITLE_BLOCKER not in item.blockers
+            or any(
+                lead.mention_id == item.mention_id
+                and lead.expression_id in expression_ids
+                for lead in analysis.leads
+            )
+        )
     )
     subject_field = next((item for item in fields if item.name == "subject"), None)
     subject_context: tuple[int, int] | None = None
     subject_trimmed = False
     bridge_mentions: tuple[TemporalMention, ...] = ()
+    clause_bound_local_identity = False
     if segment.field == "body" and subject_field is not None:
         subject_context, subject_trimmed = _subject_context(
             subject_field,
@@ -519,6 +534,22 @@ def _build_batch(
             and subject_context[0] <= item.start
             and item.end <= subject_context[1]
         )
+        clause_bound_local_identity = any(
+            GMAIL_TEMPORAL_CLAUSE_BOUND_EVENT_TITLE_BLOCKER in mention.blockers
+            and any(
+                lead.mention_id == mention.mention_id
+                and lead.expression_id in expression_ids
+                for lead in analysis.leads
+            )
+            for mention in same_segment_mentions
+        )
+        if clause_bound_local_identity:
+            # A source-local grammatical identity is stronger than a topical
+            # subject-line bridge. Keeping both creates duplicate event families
+            # and destabilizes grouped lifecycle review without adding evidence.
+            bridge_mentions = ()
+            subject_context = None
+            subject_trimmed = False
 
     ranked_mentions = _rank_mentions(
         expressions=expressions,
@@ -583,6 +614,8 @@ def _build_batch(
         diagnostics.append("local_context_trimmed")
     if subject_trimmed:
         diagnostics.append("subject_bridge_context_trimmed")
+    if clause_bound_local_identity:
+        diagnostics.append(GMAIL_TEMPORAL_CLAUSE_BOUND_SUBJECT_SUPERSESSION_DIAGNOSTIC)
     if singleton_fallback is not None:
         diagnostics.append(GMAIL_TEMPORAL_SINGLETON_EVENT_FALLBACK_DIAGNOSTIC)
 

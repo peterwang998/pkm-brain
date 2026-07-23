@@ -22,6 +22,7 @@ import re
 import secrets
 import stat
 import sys
+from collections import Counter, defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -48,15 +49,16 @@ from pkm_brain.gmail_temporal_runner import (
 from pkm_brain.paths import BrainPaths
 
 
-VERSION = "gmail_temporal_public_challenge_launcher_v2"
+VERSION = "gmail_temporal_public_challenge_launcher_v3"
 CHALLENGE_VERSION = "gmail_temporal_public_challenge_v2"
-PLAN_VERSION = "gmail_temporal_public_challenge_plan_v2"
-CALL_START_VERSION = "gmail_temporal_public_challenge_call_start_v2"
-CALL_RECEIPT_VERSION = "gmail_temporal_public_challenge_call_receipt_v2"
-PREDICTION_SEAL_VERSION = "gmail_temporal_public_challenge_prediction_seal_v2"
-RESULT_VERSION = "gmail_temporal_public_challenge_result_v2"
-SCORE_VERSION = "gmail_temporal_public_challenge_score_v2"
-GOLD_VERSION = "public_blind_gmail_temporal_gold_v2"
+PLAN_VERSION = "gmail_temporal_public_challenge_plan_v3"
+CALL_START_VERSION = "gmail_temporal_public_challenge_call_start_v3"
+CALL_RECEIPT_VERSION = "gmail_temporal_public_challenge_call_receipt_v3"
+PREDICTION_SEAL_VERSION = "gmail_temporal_public_challenge_prediction_seal_v3"
+RESULT_VERSION = "gmail_temporal_public_challenge_result_v3"
+SCORE_VERSION = "gmail_temporal_public_challenge_score_v6"
+GOLD_VERSION = "public_blind_gmail_temporal_gold_v3"
+LEGACY_GOLD_VERSION = "public_blind_gmail_temporal_gold_v2"
 PUBLIC_ROOT_AUTHORITY_VERSION = "gmail_temporal_public_root_authority_v2"
 PUBLIC_ROOT_AUTHORITY_FILENAME = "public_temporal_challenge_authority.json"
 PUBLIC_TEST_PROVIDER = "injected-test-double"
@@ -69,12 +71,12 @@ PRIVATE_DIRECTORY_MODE = 0o700
 DEFAULT_TIMEOUT_SECONDS = 900
 MAX_TIMEOUT_SECONDS = 1800
 
-PLAN_DOMAIN = b"gmail_temporal_public_challenge_plan_v2\0"
-CALL_START_DOMAIN = b"gmail_temporal_public_challenge_call_start_v2\0"
-CALL_RECEIPT_DOMAIN = b"gmail_temporal_public_challenge_call_receipt_v2\0"
-PREDICTION_SEAL_DOMAIN = b"gmail_temporal_public_challenge_prediction_seal_v2\0"
-RESULT_DOMAIN = b"gmail_temporal_public_challenge_result_v2\0"
-SCORE_DOMAIN = b"gmail_temporal_public_challenge_score_v2\0"
+PLAN_DOMAIN = b"gmail_temporal_public_challenge_plan_v3\0"
+CALL_START_DOMAIN = b"gmail_temporal_public_challenge_call_start_v3\0"
+CALL_RECEIPT_DOMAIN = b"gmail_temporal_public_challenge_call_receipt_v3\0"
+PREDICTION_SEAL_DOMAIN = b"gmail_temporal_public_challenge_prediction_seal_v3\0"
+RESULT_DOMAIN = b"gmail_temporal_public_challenge_result_v3\0"
+SCORE_DOMAIN = b"gmail_temporal_public_challenge_score_v6\0"
 PUBLIC_ROOT_AUTHORITY_DOMAIN = b"gmail_temporal_public_root_authority_v2\0"
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -591,17 +593,42 @@ def bounded_public_call_units(rows: Sequence[_RequestRow]) -> tuple[_CallUnit, .
         }
         for row in rows
     ]
-    try:
-        batches = external._bounded_batches(  # noqa: SLF001
-            shared_rows,
-            max_items=external.MAX_VERIFIER_BATCH_SIZE,
-            max_request_bytes=external.MAX_VERIFIER_REQUEST_BYTES,
-            request_factory=external._verifier_request,  # noqa: SLF001
-        )
-    except Exception as exc:
-        raise PublicChallengeError(
-            "public verifier request exceeds safe bounds"
-        ) from exc
+    case_groups: list[list[Mapping[str, Any]]] = []
+    seen_cases: set[str] = set()
+    for row in shared_rows:
+        case_id = str(row["case_id"])
+        if not case_groups or str(case_groups[-1][0]["case_id"]) != case_id:
+            if case_id in seen_cases:
+                raise PublicChallengeError("public case request order is noncontiguous")
+            seen_cases.add(case_id)
+            case_groups.append([])
+        case_groups[-1].append(row)
+
+    batches: list[list[Mapping[str, Any]]] = []
+    current: list[Mapping[str, Any]] = []
+    for group in case_groups:
+        group_request = external._verifier_request(group)  # noqa: SLF001
+        if (
+            len(group) > external.MAX_VERIFIER_BATCH_SIZE
+            or len(_canonical_json(group_request) + b"\n")
+            > external.MAX_VERIFIER_REQUEST_BYTES
+        ):
+            raise PublicChallengeError(
+                "one public case cannot fit one safe external invocation"
+            )
+        proposed = [*current, *group]
+        proposed_request = external._verifier_request(proposed)  # noqa: SLF001
+        if current and (
+            len(proposed) > external.MAX_VERIFIER_BATCH_SIZE
+            or len(_canonical_json(proposed_request) + b"\n")
+            > external.MAX_VERIFIER_REQUEST_BYTES
+        ):
+            batches.append(current)
+            current = list(group)
+        else:
+            current = proposed
+    if current:
+        batches.append(current)
     by_fingerprint = {row.request_fingerprint: row for row in rows}
     if len(by_fingerprint) != len(rows):
         raise PublicChallengeError("verifier request identity is duplicated")
@@ -1995,43 +2022,152 @@ def _normalized_subject(value: Any) -> str | None:
     return normalized or None
 
 
-_SUBJECT_IDENTITY_STOPWORDS = {
-    "appointment",
-    "cancelled",
-    "completed",
-    "confirm",
-    "confirmed",
+_SUBJECT_IDENTITY_WRAPPERS = frozenset(
+    {
+        "cancellation",
+        "cancelled",
+        "completed",
+        "confirm",
+        "confirmation",
+        "confirmed",
+        "moved",
+        "reminder",
+        "rescheduled",
+        "scheduled",
+        "update",
+    }
+)
+_SUBJECT_EVENT_HEADS = frozenset(
+    {
+        "appointment",
+        "booking",
+        "call",
+        "ceremony",
+        "class",
+        "conference",
+        "concert",
+        "debrief",
+        "demo",
+        "delivery",
+        "dinner",
+        "event",
+        "exam",
+        "flight",
+        "forum",
+        "hearing",
+        "interview",
+        "launch",
+        "meeting",
+        "offsite",
+        "orientation",
+        "party",
+        "pickup",
+        "presentation",
+        "reservation",
+        "review",
+        "screening",
+        "session",
+        "stay",
+        "summit",
+        "tour",
+        "training",
+        "trip",
+        "visit",
+        "webinar",
+        "workshop",
+    }
+)
+_SUBJECT_EVENT_DESCRIPTORS = _SUBJECT_EVENT_HEADS | {
     "design",
-    "event",
-    "interview",
-    "meeting",
-    "moved",
+    "hiring",
     "planning",
     "project",
-    "rescheduled",
-    "review",
-    "scheduled",
-    "session",
 }
 
 
-def _subject_identity_tokens(value: Any) -> set[str]:
+@dataclass(frozen=True)
+class _SubjectIdentity:
+    tokens: tuple[str, ...]
+    prefix: tuple[str, ...]
+    event_head: str | None
+
+
+def _subject_identity(value: Any) -> _SubjectIdentity | None:
     normalized = _normalized_subject(value)
     if normalized is None:
-        return set()
-    return {
-        token
-        for token in re.findall(r"[a-z0-9]+", normalized)
-        if token not in _SUBJECT_IDENTITY_STOPWORDS
-    }
+        return None
+    tokens = list(re.findall(r"[a-z0-9]+", normalized))
+    while tokens and tokens[0] in _SUBJECT_IDENTITY_WRAPPERS:
+        tokens.pop(0)
+    while tokens and tokens[-1] in _SUBJECT_IDENTITY_WRAPPERS:
+        tokens.pop()
+    if not tokens:
+        return None
+    event_head = tokens[-1] if tokens[-1] in _SUBJECT_EVENT_HEADS else None
+    prefix = tuple(tokens[:-1] if event_head is not None else tokens)
+    return _SubjectIdentity(
+        tokens=tuple(tokens),
+        prefix=prefix,
+        event_head=event_head,
+    )
+
+
+def _subject_prefix_expands_only_by_event_descriptors(
+    shorter: tuple[str, ...],
+    longer: tuple[str, ...],
+) -> bool:
+    return bool(
+        shorter
+        and len(shorter) <= len(longer)
+        and longer[: len(shorter)] == shorter
+        and all(token in _SUBJECT_EVENT_DESCRIPTORS for token in longer[len(shorter) :])
+    )
+
+
+def _subject_prefixes_are_compatible(
+    first: tuple[str, ...],
+    second: tuple[str, ...],
+) -> bool:
+    return _subject_prefix_expands_only_by_event_descriptors(
+        first,
+        second,
+    ) or _subject_prefix_expands_only_by_event_descriptors(second, first)
+
+
+def _subject_identity_tokens(value: Any) -> set[str]:
+    identity = _subject_identity(value)
+    return set(identity.tokens) if identity is not None else set()
 
 
 def _subject_matches(expected: str, actual: str) -> bool:
     if _normalized_subject(expected) == _normalized_subject(actual):
         return True
-    expected_tokens = _subject_identity_tokens(expected)
-    actual_tokens = _subject_identity_tokens(actual)
-    return bool(expected_tokens and expected_tokens <= actual_tokens)
+    expected_identity = _subject_identity(expected)
+    actual_identity = _subject_identity(actual)
+    if expected_identity is None or actual_identity is None:
+        return False
+    if (
+        expected_identity.event_head is not None
+        and actual_identity.event_head is not None
+        and expected_identity.event_head != actual_identity.event_head
+    ):
+        return False
+    if expected_identity.event_head is None and actual_identity.event_head is None:
+        return expected_identity.tokens == actual_identity.tokens
+    if expected_identity.event_head == actual_identity.event_head:
+        return _subject_prefixes_are_compatible(
+            expected_identity.prefix,
+            actual_identity.prefix,
+        )
+    headed, base = (
+        (expected_identity, actual_identity)
+        if expected_identity.event_head is not None
+        else (actual_identity, expected_identity)
+    )
+    return _subject_prefix_expands_only_by_event_descriptors(
+        base.tokens,
+        headed.prefix,
+    )
 
 
 def _authority_subject_surfaces(authority: Any) -> dict[str, str]:
@@ -2098,6 +2234,98 @@ def _exact_artifact_match(
     return actual_values == {member.get("value")}
 
 
+def _alternatives_artifacts(
+    projection: Mapping[str, Any],
+    member: Mapping[str, Any],
+    *,
+    subject_surfaces: Mapping[str, str],
+) -> tuple[tuple[str, ...], str] | None:
+    """Match one option-set gold member to production's per-expression artifacts.
+
+    Review projection intentionally forbids one artifact from spanning temporal
+    expressions.  An explicit ``X or Y`` option set is therefore represented as
+    one complete alternatives group containing one uncertainty artifact per
+    expression, not as one multi-value artifact.  Score that exact production
+    shape without weakening subject, relation, lifecycle, or status matching.
+    """
+
+    expected_values = member.get("values")
+    if (
+        member.get("expected_verdict") != "uncertain"
+        or not isinstance(expected_values, list)
+        or not expected_values
+    ):
+        return None
+    artifacts = {
+        str(item.get("artifact_id")): item
+        for item in projection.get("artifacts", [])
+        if isinstance(item, Mapping) and isinstance(item.get("artifact_id"), str)
+    }
+    for group in projection.get("groups", []):
+        if (
+            not isinstance(group, Mapping)
+            or group.get("kind") != "alternatives"
+            or group.get("coverage") != "complete"
+            or not isinstance(group.get("subject_family_id"), str)
+            or not group.get("subject_family_id")
+        ):
+            continue
+        group_members = group.get("members")
+        if not isinstance(group_members, list) or len(group_members) != len(
+            expected_values
+        ):
+            continue
+        matched: list[str] = []
+        actual_values: set[str] = set()
+        valid = True
+        for group_member in group_members:
+            if (
+                not isinstance(group_member, Mapping)
+                or group_member.get("role") != "alternative"
+                or group_member.get("state") != "present"
+                or group_member.get("cluster_review_ids") not in ([], ())
+                or not isinstance(group_member.get("artifact_ids"), list)
+                or len(group_member["artifact_ids"]) != 1
+            ):
+                valid = False
+                break
+            artifact_id = str(group_member["artifact_ids"][0])
+            artifact = artifacts.get(artifact_id)
+            hypotheses = _artifact_hypotheses(artifact) if artifact is not None else []
+            if (
+                artifact is None
+                or artifact.get("evidence_status") != "uncertain"
+                or not hypotheses
+                or not all(
+                    _hypothesis_matches_member(
+                        hypothesis,
+                        member,
+                        subject_surfaces=subject_surfaces,
+                    )
+                    for hypothesis in hypotheses
+                )
+            ):
+                valid = False
+                break
+            artifact_values = {
+                hypothesis.get("normalized_value") for hypothesis in hypotheses
+            }
+            if (
+                len(artifact_values) != 1
+                or None in artifact_values
+                or actual_values.intersection(artifact_values)
+            ):
+                valid = False
+                break
+            actual_values.update(str(value) for value in artifact_values)
+            matched.append(artifact_id)
+        if valid and actual_values == set(expected_values):
+            group_id = group.get("group_id")
+            if isinstance(group_id, str) and group_id:
+                return tuple(matched), group_id
+    return None
+
+
 def _reschedule_artifact(
     projection: Mapping[str, Any],
     member: Mapping[str, Any],
@@ -2141,10 +2369,59 @@ def _reschedule_artifact(
     return None
 
 
+def _forbidden_hypothesis_matches(
+    hypothesis: Mapping[str, Any],
+    forbidden: Any,
+    *,
+    subject_surfaces: Mapping[str, str],
+) -> bool:
+    """Apply a forbidden value without weakening an already frozen benchmark.
+
+    A bare value is case-wide in legacy V2 gold and remains case-wide in V3.
+    Changing its meaning after predictions exist would silently improve an old
+    score.  Newly frozen V3 gold can instead spell out a scoped binding with
+    subject, relation, lifecycle, and value.
+    """
+
+    if isinstance(forbidden, str):
+        return hypothesis.get("normalized_value") == forbidden
+    if not isinstance(forbidden, Mapping):
+        return False
+    value = forbidden.get("value")
+    if hypothesis.get("normalized_value") != value:
+        return False
+    return _hypothesis_matches_member(
+        hypothesis,
+        forbidden,
+        subject_surfaces=subject_surfaces,
+    )
+
+
+def _structural_component_key(
+    member: Mapping[str, Any],
+    member_ordinal: int,
+) -> str | None:
+    """Return the gold component whose completeness this member participates in."""
+
+    if "values" in member:
+        return f"alternatives:{member_ordinal}"
+    if member.get("lifecycle") not in {
+        "rescheduled_old",
+        "rescheduled_replacement",
+    }:
+        return None
+    identity_tokens = sorted(_subject_identity_tokens(member.get("subject")))
+    subject_key = " ".join(identity_tokens) or str(
+        _normalized_subject(member.get("subject"))
+    )
+    return f"reschedule:{subject_key}"
+
+
 def _validate_gold(gold: Mapping[str, Any]) -> None:
+    gold_version = gold.get("version")
     if (
         set(gold) != {"version", "created_before_predictions", "cases"}
-        or gold.get("version") != GOLD_VERSION
+        or gold_version not in {GOLD_VERSION, LEGACY_GOLD_VERSION}
         or gold.get("created_before_predictions") is not True
         or not isinstance(gold.get("cases"), list)
         or not gold["cases"]
@@ -2174,18 +2451,43 @@ def _validate_gold(gold: Mapping[str, Any]) -> None:
         positive_cases += int(bool(members))
         negative_cases += int(not members)
         forbidden = row.get("forbidden", [])
-        if (
-            not isinstance(forbidden, list)
-            or len(forbidden) != len(set(forbidden))
-            or any(
-                not isinstance(value, str)
-                or _NORMALIZED_TEMPORAL_VALUE_RE.fullmatch(value) is None
-                for value in forbidden
-            )
-        ):
+        if not isinstance(forbidden, list):
             raise PublicChallengeError(
                 "public semantic gold forbidden values are invalid"
             )
+        seen_forbidden: set[bytes] = set()
+        for value in forbidden:
+            if isinstance(value, str):
+                valid_forbidden = (
+                    _NORMALIZED_TEMPORAL_VALUE_RE.fullmatch(value) is not None
+                )
+            else:
+                valid_forbidden = (
+                    gold_version == GOLD_VERSION
+                    and isinstance(value, Mapping)
+                    and set(value) == {"subject", "relation", "lifecycle", "value"}
+                    and _normalized_subject(value.get("subject")) is not None
+                    and value.get("relation") in {"occurrence", "deadline"}
+                    and value.get("lifecycle")
+                    in {
+                        "none",
+                        "unknown",
+                        "scheduled",
+                        "cancelled",
+                        "completed",
+                        "rescheduled_old",
+                        "rescheduled_replacement",
+                    }
+                    and isinstance(value.get("value"), str)
+                    and _NORMALIZED_TEMPORAL_VALUE_RE.fullmatch(value["value"])
+                    is not None
+                )
+            identity = _canonical_json(value)
+            if not valid_forbidden or identity in seen_forbidden:
+                raise PublicChallengeError(
+                    "public semantic gold forbidden values are invalid"
+                )
+            seen_forbidden.add(identity)
         seen_members: set[bytes] = set()
         expected_values: set[str] = set()
         for member in members:
@@ -2244,8 +2546,45 @@ def _validate_gold(gold: Mapping[str, Any]) -> None:
             if identity in seen_members:
                 raise PublicChallengeError("public semantic gold member is duplicated")
             seen_members.add(identity)
-        if expected_values & set(forbidden):
+        legacy_forbidden_values = {
+            value for value in forbidden if isinstance(value, str)
+        }
+        structured_contradiction = any(
+            isinstance(value, Mapping)
+            and any(
+                (
+                    _subject_matches(
+                        str(value.get("subject")),
+                        str(member.get("subject")),
+                    )
+                    or _subject_matches(
+                        str(member.get("subject")),
+                        str(value.get("subject")),
+                    )
+                )
+                and value.get("relation") == member.get("relation")
+                and value.get("lifecycle") == member.get("lifecycle")
+                and value.get("value")
+                in (
+                    member.get("values")
+                    if isinstance(member.get("values"), list)
+                    else [member.get("value")]
+                )
+                for member in members
+                if isinstance(member, Mapping)
+            )
+            for value in forbidden
+        )
+        if expected_values & legacy_forbidden_values or structured_contradiction:
             raise PublicChallengeError("public semantic gold contradicts itself")
+        if row.get("complete_group_required") is True and not any(
+            isinstance(member, Mapping)
+            and _structural_component_key(member, ordinal) is not None
+            for ordinal, member in enumerate(members)
+        ):
+            raise PublicChallengeError(
+                "public semantic gold requires a missing structural group"
+            )
     if positive_cases == 0 or negative_cases == 0:
         raise PublicChallengeError("public semantic gold denominators are vacuous")
 
@@ -2255,8 +2594,18 @@ def score_public_challenge(
     gold_path: Path,
     hmac_key_path: Path,
     output_root: Path,
+    *,
+    evaluation_mode: str,
 ) -> dict[str, Any]:
-    """Open gold only after a complete authenticated prediction result exists."""
+    """Open gold only after a complete authenticated prediction result exists.
+
+    ``evaluation_mode`` is an explicit operator assertion.  The signed evidence
+    proves only that this invocation opened gold after this prediction seal; it
+    cannot prove that the cohort's gold was never opened in an earlier run.
+    """
+
+    if evaluation_mode not in {"blind_first_use", "development_replay"}:
+        raise PublicChallengeError("public challenge evaluation mode is invalid")
 
     key = _key(hmac_key_path)
     _private_directory(output_root)
@@ -2374,8 +2723,8 @@ def score_public_challenge(
     cluster_reviews = 0
     negative_cases = 0
     selected_negative_cases = 0
-    complete_group_cases = 0
-    complete_group_cases_recovered = 0
+    complete_group_components = 0
+    complete_group_components_recovered = 0
     forbidden_hypotheses = 0
     per_case: list[dict[str, Any]] = []
     for case_id in selected_ids:
@@ -2409,9 +2758,18 @@ def score_public_challenge(
         if not members:
             negative_cases += 1
             selected_negative_cases += int(bool(artifacts or reviews))
-        forbidden_values = set(gold_row.get("forbidden", []))
+        forbidden_bindings = gold_row.get("forbidden", [])
+        if not isinstance(forbidden_bindings, list):
+            raise PublicChallengeError("semantic gold forbidden schema is invalid")
         case_forbidden = sum(
-            hypothesis.get("normalized_value") in forbidden_values
+            any(
+                _forbidden_hypothesis_matches(
+                    hypothesis,
+                    forbidden,
+                    subject_surfaces=subject_surfaces,
+                )
+                for forbidden in forbidden_bindings
+            )
             for artifact in artifacts
             for hypothesis in _artifact_hypotheses(artifact)
         )
@@ -2423,19 +2781,33 @@ def score_public_challenge(
         }
         case_matches = 0
         case_confirmed = 0
-        complete_required = gold_row.get("complete_group_required") is True
-        if complete_required:
-            complete_group_cases += 1
-        reschedule_matches = 0
-        reschedule_group_ids: set[str] = set()
-        for member in members:
+        component_members: Counter[str] = Counter()
+        for member_ordinal, member in enumerate(members):
+            if isinstance(member, Mapping):
+                component_key = _structural_component_key(member, member_ordinal)
+                if component_key is not None:
+                    component_members[component_key] += 1
+        complete_group_components += len(component_members)
+        matched_component_members: Counter[str] = Counter()
+        component_group_ids: defaultdict[str, set[str]] = defaultdict(set)
+        for member_ordinal, member in enumerate(members):
             if not isinstance(member, Mapping):
                 raise PublicChallengeError("semantic gold member is invalid")
+            component_key = _structural_component_key(member, member_ordinal)
             gold_members += 1
             expected_verdict = member.get("expected_verdict", "supported")
             supported_gold_members += int(expected_verdict != "uncertain")
-            matched_id: str | None = None
-            if (
+            matched_ids: tuple[str, ...] = ()
+            structural_group_id: str | None = None
+            if "values" in member and projection is not None:
+                alternatives_match = _alternatives_artifacts(
+                    projection,
+                    member,
+                    subject_surfaces=subject_surfaces,
+                )
+                if alternatives_match is not None:
+                    matched_ids, structural_group_id = alternatives_match
+            elif (
                 member.get("lifecycle")
                 in {
                     "rescheduled_old",
@@ -2449,9 +2821,8 @@ def score_public_challenge(
                     subject_surfaces=subject_surfaces,
                 )
                 if reschedule_match is not None:
-                    matched_id, group_id = reschedule_match
-                    reschedule_group_ids.add(group_id)
-                    reschedule_matches += 1
+                    matched_id, structural_group_id = reschedule_match
+                    matched_ids = (matched_id,)
             else:
                 for artifact_id, artifact in available.items():
                     if (case_id, artifact_id) in matched_artifact_ids:
@@ -2461,26 +2832,33 @@ def score_public_challenge(
                         member,
                         subject_surfaces=subject_surfaces,
                     ):
-                        matched_id = artifact_id
+                        matched_ids = (artifact_id,)
                         break
-            if matched_id is None or (case_id, matched_id) in matched_artifact_ids:
+            if not matched_ids or any(
+                (case_id, artifact_id) in matched_artifact_ids
+                for artifact_id in matched_ids
+            ):
                 continue
-            matched_artifact_ids.add((case_id, matched_id))
+            matched_artifact_ids.update(
+                (case_id, artifact_id) for artifact_id in matched_ids
+            )
             matched_members += 1
             case_matches += 1
-            artifact = available[matched_id]
-            if (
-                expected_verdict != "uncertain"
-                and artifact.get("evidence_status") == "supported"
+            if component_key is not None and structural_group_id is not None:
+                matched_component_members[component_key] += 1
+                component_group_ids[component_key].add(structural_group_id)
+            if expected_verdict != "uncertain" and all(
+                available[artifact_id].get("evidence_status") == "supported"
+                for artifact_id in matched_ids
             ):
                 confirmed_members += 1
                 case_confirmed += 1
-        if (
-            complete_required
-            and reschedule_matches == len(members)
-            and len(reschedule_group_ids) == 1
-        ):
-            complete_group_cases_recovered += 1
+        case_complete_components = sum(
+            matched_component_members[component_key] == expected_members
+            and len(component_group_ids[component_key]) == 1
+            for component_key, expected_members in component_members.items()
+        )
+        complete_group_components_recovered += case_complete_components
         per_case.append(
             {
                 "case_id": case_id,
@@ -2489,6 +2867,8 @@ def score_public_challenge(
                 "confirmed_members": case_confirmed,
                 "artifacts": len(artifacts),
                 "cluster_reviews": len(reviews),
+                "complete_group_components": len(component_members),
+                "complete_group_components_recovered": case_complete_components,
                 "negative_selected": bool(not members and (artifacts or reviews)),
                 "forbidden_hypotheses": case_forbidden,
             }
@@ -2514,13 +2894,13 @@ def score_public_challenge(
     )
     review_outputs = total_artifacts + cluster_reviews
     review_precision = (
-        matched_members / review_outputs
+        len(matched_artifact_ids) / review_outputs
         if review_outputs
         else (1.0 if gold_members == 0 else 0.0)
     )
     complete_group_recall = (
-        complete_group_cases_recovered / complete_group_cases
-        if complete_group_cases
+        complete_group_components_recovered / complete_group_components
+        if complete_group_components
         else 1.0
     )
     gate = {
@@ -2531,7 +2911,7 @@ def score_public_challenge(
         "perfect_supported_precision": supported_precision == 1.0,
         "perfect_review_precision": review_precision == 1.0,
         "complete_structural_groups": (
-            complete_group_cases_recovered == complete_group_cases
+            complete_group_components_recovered == complete_group_components
         ),
         "no_selected_hard_negatives": selected_negative_cases == 0,
         "no_forbidden_hypotheses": forbidden_hypotheses == 0,
@@ -2550,7 +2930,9 @@ def score_public_challenge(
             "gold_sha256": _sha256(gold_raw),
             "prediction_seal_sha256": _sha256(seal_raw),
             "result_sha256": _sha256(result_raw),
-            "gold_opened_after_prediction_seal": True,
+            "gold_opened_after_this_prediction_seal": True,
+            "operator_asserted_evaluation_mode": evaluation_mode,
+            "first_use_blindness_claimed": evaluation_mode == "blind_first_use",
             "gold_members": gold_members,
             "supported_gold_members": supported_gold_members,
             "matched_members": matched_members,
@@ -2562,8 +2944,10 @@ def score_public_challenge(
             "negative_cases": negative_cases,
             "selected_negative_cases": selected_negative_cases,
             "forbidden_hypotheses": forbidden_hypotheses,
-            "complete_group_cases": complete_group_cases,
-            "complete_group_cases_recovered": complete_group_cases_recovered,
+            "complete_group_components": complete_group_components,
+            "complete_group_components_recovered": (
+                complete_group_components_recovered
+            ),
             "effective_member_recall": effective_recall,
             "confirmed_member_recall": confirmed_recall,
             "supported_artifact_precision": supported_precision,
@@ -2573,6 +2957,7 @@ def score_public_challenge(
             "gates": gate,
             "smoke_gate_passed": all(gate.values()),
             "public_synthetic": True,
+            "gold_version": gold.get("version"),
             "release_eligible": False,
             "scored_at": _now(),
         },
@@ -2599,9 +2984,14 @@ def score_public_challenge(
         "supported_artifact_precision": supported_precision,
         "review_output_precision": review_precision,
         "complete_group_recall": complete_group_recall,
+        "complete_group_components": complete_group_components,
+        "complete_group_components_recovered": complete_group_components_recovered,
         "smoke_gate_passed": all(gate.values()),
-        "gold_opened_after_prediction_seal": True,
+        "gold_opened_after_this_prediction_seal": True,
+        "operator_asserted_evaluation_mode": evaluation_mode,
+        "first_use_blindness_claimed": evaluation_mode == "blind_first_use",
         "public_synthetic": True,
+        "gold_version": gold.get("version"),
         "release_eligible": False,
         "test_invoker_used": claims.test_invoker_used,
         "private_content_printed": False,
@@ -2634,6 +3024,11 @@ def main() -> None:
     score.add_argument("--gold", type=Path, required=True)
     score.add_argument("--hmac-key", type=Path, required=True)
     score.add_argument("--output-root", type=Path, required=True)
+    score.add_argument(
+        "--evaluation-mode",
+        choices=("blind_first_use", "development_replay"),
+        required=True,
+    )
     args = parser.parse_args()
     try:
         if args.phase == "run":
@@ -2650,6 +3045,7 @@ def main() -> None:
                 args.gold,
                 args.hmac_key,
                 args.output_root,
+                evaluation_mode=args.evaluation_mode,
             )
     except (PublicChallengeError, OSError, ValueError):
         print(json.dumps(_safe_failure(str(args.phase)), sort_keys=True))

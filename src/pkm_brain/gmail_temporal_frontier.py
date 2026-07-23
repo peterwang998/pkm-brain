@@ -6,6 +6,8 @@ from dataclasses import asdict, dataclass
 from typing import Literal
 
 from .gmail_temporal_batching import (
+    GMAIL_TEMPORAL_BATCHING_POLICY_VERSION,
+    GMAIL_TEMPORAL_CLAUSE_BOUND_SUBJECT_SUPERSESSION_DIAGNOSTIC,
     GMAIL_TEMPORAL_SINGLETON_EVENT_FALLBACK_DIAGNOSTIC,
     GmailTemporalBatchAuthorityError,
     GmailTemporalSelectorBatch,
@@ -13,9 +15,15 @@ from .gmail_temporal_batching import (
     validate_gmail_temporal_batch_citation,
     validate_gmail_temporal_batch_manifest,
 )
-from .gmail_temporal_leads import TemporalLead, TemporalLeadAnalysis
+from .gmail_temporal_leads import (
+    GMAIL_TEMPORAL_CLAUSE_BOUND_EVENT_TITLE_BLOCKER,
+    GMAIL_TEMPORAL_LEAD_POLICY_VERSION,
+    TemporalLead,
+    TemporalLeadAnalysis,
+)
 from .gmail_temporal_selection import (
     GMAIL_TEMPORAL_HARD_SCOPE_BLOCKERS,
+    GMAIL_TEMPORAL_SELECTION_POLICY_VERSION,
     GMAIL_TEMPORAL_SUBJECT_TYPES,
     GmailTemporalSelectionError,
     SelectedTemporalAssociation,
@@ -34,8 +42,18 @@ _ENSEMBLE_CLUSTER_REVIEW_VERSION = "gmail_temporal_candidate_ensemble_cluster_re
 _ENSEMBLE_VERSION = "gmail_temporal_candidate_three_run_ensemble_v3"
 _ENSEMBLE_POLICY_VERSION = "gmail_temporal_candidate_three_run_consensus_v3"
 _ENSEMBLE_RUN_COUNT = 3
+GMAIL_TEMPORAL_CANDIDATE_POLICY_VERSION = "gmail_temporal_candidate_policy_v3"
+GMAIL_TEMPORAL_FRONTIER_POLICY_VERSION = "gmail_temporal_frontier_policy_v2"
 _VERDICTS = {"supported", "unsupported", "uncertain"}
-_SUBSUMING_EXPLICIT_LIFECYCLES = frozenset({"cancelled", "completed", "scheduled"})
+_SUBSUMING_EXPLICIT_LIFECYCLES = frozenset(
+    {
+        "cancelled",
+        "completed",
+        "scheduled",
+        "rescheduled_old",
+        "rescheduled_replacement",
+    }
+)
 _LIFECYCLE_SCOPE_CONFLICT_BLOCKERS = frozenset(
     {
         "lifecycle_expression_scope_conflict",
@@ -208,6 +226,40 @@ class GmailTemporalCandidateEnsembleVerdictSet:
     routable: Literal[False] = False
 
 
+def gmail_temporal_candidate_policy_fingerprint() -> str:
+    """Bind deterministic extraction, batching, selection, and frontier policy."""
+
+    material = {
+        "version": GMAIL_TEMPORAL_CANDIDATE_POLICY_VERSION,
+        "constituent_versions": {
+            "leads": GMAIL_TEMPORAL_LEAD_POLICY_VERSION,
+            "batching": GMAIL_TEMPORAL_BATCHING_POLICY_VERSION,
+            "selection": GMAIL_TEMPORAL_SELECTION_POLICY_VERSION,
+            "frontier": GMAIL_TEMPORAL_FRONTIER_POLICY_VERSION,
+        },
+        "clause_bound_event_identity": {
+            "review_only": True,
+            "expression_authority": "closed_source_frame",
+            "title_tokens": "proper_names_bounded_connectors_and_closed_modifiers",
+            "subject_bridge": "superseded_only_for_authorized_expression",
+        },
+        "exact_lifecycle_frames": {
+            "reschedule": "immediate_complementary_from_to_pair",
+            "scheduled_terminal": (
+                "same_subject_scheduled_slot_cancellation_at_clean_clause_end"
+            ),
+            "qualified_terminal": "retain_cancelled_hypothesis_but_defer",
+            "ambiguous_options": "fail_closed",
+        },
+        "frontier_subsumption": {
+            "exact_reschedule_subsumes_unknown_alias": True,
+            "cancelled_scheduled_slot_subsumes_stale_schedule": True,
+            "terminal_timestamp_does_not_subsume_schedule": True,
+        },
+    }
+    return "gtcp_" + hashlib.sha256(_canonical_bytes(material)).hexdigest()
+
+
 def gmail_temporal_candidate_ensemble_policy_fingerprint() -> str:
     """Bind the exact three-run vote policy independently of model prompts."""
 
@@ -356,11 +408,13 @@ def _omit_subsumed_lifecycle_free_bases(
 ) -> tuple[GmailTemporalVerificationCandidate, ...]:
     """Remove only a base binding fully represented by an exact lifecycle.
 
-    Unknown, deferred, and reschedule lifecycle variants never subsume their
-    lifecycle-free base. A directly grounded actual occurrence is also retained
-    beside a terminal lifecycle because it can represent a distinct endpoint.
-    Source-verified aliases share this rule across bindings so a weaker title or
-    compound-noun base cannot destabilize one exact local lifecycle assertion.
+    Unknown and deferred lifecycle variants never subsume their lifecycle-free
+    base. An exact source-derived reschedule endpoint does, because its occurrence
+    semantics and direction are already represented. A directly grounded actual
+    occurrence is retained beside a terminal lifecycle because it can represent a
+    distinct endpoint. Source-verified aliases share these rules across bindings
+    so a weaker title or compound-noun base cannot destabilize one exact local
+    lifecycle assertion.
     """
 
     by_binding: dict[str, list[GmailTemporalVerificationCandidate]] = {}
@@ -389,7 +443,31 @@ def _omit_subsumed_lifecycle_free_bases(
         )
         if not explicit:
             continue
+        exact_reschedules = tuple(
+            candidate
+            for candidate in explicit
+            if candidate.lifecycle in {"rescheduled_old", "rescheduled_replacement"}
+        )
+        terminal_occurrence_slots = tuple(
+            candidate
+            for candidate in explicit
+            if candidate.lifecycle in {"cancelled", "completed"}
+            and candidate.relation == "occurrence"
+            and candidate.kind == "planned"
+        )
         for base in values:
+            if base.lifecycle == "unknown" and any(
+                candidate.normalized_value == base.normalized_value
+                for candidate in exact_reschedules
+            ):
+                omitted.add(base.candidate_id)
+                continue
+            if base.lifecycle == "scheduled" and any(
+                candidate.normalized_value == base.normalized_value
+                for candidate in terminal_occurrence_slots
+            ):
+                omitted.add(base.candidate_id)
+                continue
             if base.lifecycle_mention_id is not None or base.lifecycle != "none":
                 continue
             if any(
@@ -415,6 +493,11 @@ def _explicit_lifecycle_subsumes_base(
     if lifecycle.normalized_value != base.normalized_value:
         return False
     if lifecycle.lifecycle == "scheduled":
+        return (
+            lifecycle.relation == base.relation == "occurrence"
+            and lifecycle.kind == base.kind == "planned"
+        )
+    if lifecycle.lifecycle in {"rescheduled_old", "rescheduled_replacement"}:
         return (
             lifecycle.relation == base.relation == "occurrence"
             and lifecycle.kind == base.kind == "planned"
@@ -1657,6 +1740,7 @@ def _omitted_candidate_mention_count(
     batch: GmailTemporalSelectorBatch,
 ) -> int:
     selected = set(batch.manifest.mention_ids)
+    expression_ids = set(batch.manifest.expression_ids)
     relevant: set[str] = set()
     for mention in analysis.mentions:
         candidate_endpoint = (
@@ -1669,8 +1753,21 @@ def _omitted_candidate_mention_count(
             mention.field == batch.field
             and batch.segment_start <= mention.start
             and mention.end <= batch.segment_end
+            and (
+                GMAIL_TEMPORAL_CLAUSE_BOUND_EVENT_TITLE_BLOCKER not in mention.blockers
+                or any(
+                    lead.mention_id == mention.mention_id
+                    and lead.expression_id in expression_ids
+                    for lead in analysis.leads
+                )
+            )
         )
-        subject_bridge = batch.field == "body" and mention.field == "subject"
+        subject_bridge = (
+            batch.field == "body"
+            and mention.field == "subject"
+            and GMAIL_TEMPORAL_CLAUSE_BOUND_SUBJECT_SUPERSESSION_DIAGNOSTIC
+            not in batch.diagnostics
+        )
         if local or subject_bridge:
             relevant.add(mention.mention_id)
     return len(relevant - selected)

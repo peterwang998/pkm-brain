@@ -381,7 +381,7 @@ SEMANTIC_GOLD: dict[str, list[dict[str, Any]]] = {
     "syn_lifecycle_01": [
         _unit(
             "dentist_appointment_cancelled",
-            "The 2027-08-14 dentist appointment was cancelled.",
+            "The dentist appointment scheduled for 2027-08-14 was cancelled.",
             _member(
                 "cancelled",
                 "supported",
@@ -390,8 +390,8 @@ SEMANTIC_GOLD: dict[str, list[dict[str, Any]]] = {
                     "appointment",
                     lifecycle_surface="cancelled",
                     lifecycle_role="cancelled",
-                    relation="unspecified",
-                    kind="unspecified",
+                    relation="occurrence",
+                    kind="planned",
                     lifecycle="cancelled",
                     normalized_value="2027-08-14",
                     requires_defer=False,
@@ -423,7 +423,7 @@ SEMANTIC_GOLD: dict[str, list[dict[str, Any]]] = {
     "syn_lifecycle_03": [
         _unit(
             "hiring_interview_reschedule",
-            "The hiring interview moved from 2027-08-14 to 2027-08-16.",
+            "The hiring interview was rescheduled from 2027-08-14 to 2027-08-16.",
             _member(
                 "old_endpoint",
                 "uncertain",
@@ -431,7 +431,7 @@ SEMANTIC_GOLD: dict[str, list[dict[str, Any]]] = {
                     "August 14, 2027",
                     "interview",
                     lifecycle_surface="rescheduled",
-                    lifecycle_role="rescheduled_old",
+                    lifecycle_role="rescheduled",
                     relation="occurrence",
                     kind="planned",
                     lifecycle="rescheduled_old",
@@ -450,7 +450,7 @@ SEMANTIC_GOLD: dict[str, list[dict[str, Any]]] = {
                     requires_defer=True,
                     quality="partial",
                 ),
-                baseline_frontier_grade="partial",
+                baseline_frontier_grade="exact",
             ),
             _member(
                 "replacement_endpoint",
@@ -459,7 +459,7 @@ SEMANTIC_GOLD: dict[str, list[dict[str, Any]]] = {
                     "August 16, 2027",
                     "interview",
                     lifecycle_surface="rescheduled",
-                    lifecycle_role="rescheduled_replacement",
+                    lifecycle_role="rescheduled",
                     relation="occurrence",
                     kind="planned",
                     lifecycle="rescheduled_replacement",
@@ -478,9 +478,9 @@ SEMANTIC_GOLD: dict[str, list[dict[str, Any]]] = {
                     requires_defer=True,
                     quality="partial",
                 ),
-                baseline_frontier_grade="partial",
+                baseline_frontier_grade="exact",
             ),
-            baseline_frontier_grade="partial",
+            baseline_frontier_grade="exact",
         )
     ],
     "syn_lifecycle_04": [
