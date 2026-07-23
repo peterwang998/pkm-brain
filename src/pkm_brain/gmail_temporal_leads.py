@@ -255,6 +255,54 @@ _SHARED_DAY_FIRST_RANGE_RE = re.compile(
     r"(?:\s+(?P<year>\d{4})\b)?(?!\s*,?\s*\d+\b)",
     re.IGNORECASE,
 )
+# These source-grammar patterns intentionally mirror the strict reschedule
+# shapes in gmail_temporal_review.  They are repeated here instead of importing
+# the review layer (which depends on this module), and are narrowed to horizontal
+# whitespace so abbreviated alternatives can never cross a clause boundary.
+_ABBREVIATED_RESCHEDULE_DAY_TAIL_RE = re.compile(
+    r"[ \t]*(?:(?:,[ \t]*)?\bor[ \t]+|/[ \t]*)"
+    r"(?P<token>(?P<day>\d{1,2})(?:st|nd|rd|th)?)"
+    r"(?![\w/:])"
+    r"(?![ \t]*,?[ \t]*\d{4}\b)"
+    r"(?![ \t]*(?:a\.?m\.?|p\.?m\.?)\b)",
+    re.IGNORECASE,
+)
+_ABBREVIATED_RESCHEDULE_FROM_PREFIX_RE = re.compile(
+    r"\b(?:changed|moved|postponed|rescheduled|pushed[ \t]+back)\b"
+    r"(?:[ \t]+(?:again|once[ \t]+more))?[ \t]+from[ \t]*$",
+    re.IGNORECASE,
+)
+_ABBREVIATED_RESCHEDULE_REPLACEMENT_PREFIX_RE = re.compile(
+    r"(?:"
+    r"\b(?:moved|postponed|rescheduled|pushed[ \t]+back)\b"
+    r"(?:[ \t]+(?:again|once[ \t]+more))?[ \t]+(?:for|to|until)|"
+    r"\bnew[ \t]+(?:date|time)[ \t]*:"
+    r")[ \t]*$",
+    re.IGNORECASE,
+)
+_ABBREVIATED_RESCHEDULE_CUE_PREFIX_RE = re.compile(
+    r"\b(?:moved|postponed|rescheduled|pushed[ \t]+back)\b"
+    r"[ \t]*:?[ \t]*$",
+    re.IGNORECASE,
+)
+_ABBREVIATED_RESCHEDULE_NOW_PREFIX_RE = re.compile(r"\bnow[ \t]*$", re.IGNORECASE)
+_ABBREVIATED_RESCHEDULE_DIRECT_CONNECTOR_RE = re.compile(
+    r"[ \t]+(?:to|until)[ \t]+", re.IGNORECASE
+)
+_ABBREVIATED_RESCHEDULE_FROM_CONNECTOR_RE = re.compile(
+    r"[ \t]+from[ \t]+", re.IGNORECASE
+)
+_ABBREVIATED_RESCHEDULE_INSTEAD_CONNECTOR_RE = re.compile(
+    r"[ \t]+(?:instead[ \t]+of|rather[ \t]+than)[ \t]+", re.IGNORECASE
+)
+_ABBREVIATED_RESCHEDULE_WAS_CONNECTOR_RE = re.compile(
+    r"[ \t]*\([ \t]*(?:previously|was)[ \t]+", re.IGNORECASE
+)
+_ABBREVIATED_RESCHEDULE_ARROW_RE = re.compile(
+    r"[ \t]*(?:<->|->|=>|<-|<=|↔|⇄|→|←)[ \t]*"
+)
+_ABBREVIATED_RESCHEDULE_CLOSING_TAIL_RE = re.compile(r"[ \t]*(?:[)\]}\"'”’][ \t]*)*")
+_HARD_CLAUSE_BOUNDARY_RE = re.compile(r"[.!?;\r\n]")
 _RANGE_CONNECTOR_RE = re.compile(
     rf"^\s*(?:-|–|—|\bto\b|\bthrough\b|\buntil\b)\s*"
     rf"(?:(?:{_WEEKDAY_PATTERN})\s*,?\s*)?$",
@@ -339,6 +387,51 @@ _CLOSING_PREDICATE_RE = re.compile(r"(?:closed|closes|will\s+close)\Z", re.IGNOR
 _ACTUAL_CLOSING_PREDICATE_RE = re.compile(r"closed\Z", re.IGNORECASE)
 _OPENING_PREDICATE_SCAN_RE = re.compile(
     r"\b(?:opened|opens|will\s+open)\b", re.IGNORECASE
+)
+_INTAKE_BOUNDARY_PREDICATE_RE = re.compile(
+    r"(?P<state>\b(?:(?:is|are|will[ \t]+be|remains?)[ \t]+open))"
+    r"(?:[ \t]+from\b)|"
+    r"(?P<transition>\b(?:open|begins?|starts?)\b)",
+    re.IGNORECASE,
+)
+_EFFECTIVE_BOUNDARY_PREDICATE_RES = (
+    re.compile(
+        r"\b(?P<predicate>effective[ \t]+date[ \t]+"
+        r"(?:is|will[ \t]+be))\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?P<predicate>(?:is|was|will[ \t]+be)[ \t]+in[ \t]+force[ \t]+"
+        r"(?:beginning|starting))\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?P<predicate>appl(?:y|ies)[ \t]+as[ \t]+of)\b",
+        re.IGNORECASE,
+    ),
+)
+_EFFECTIVE_BOUNDARY_SUBJECT_RE = re.compile(
+    # Allow one domain modifier (benefit/benefits or coverage) before a
+    # plan/policy head. Arbitrary adjectives and prepositional tails do not
+    # gain authority merely because they contain an accepted noun later.
+    r"\A(?:(?:benefits?|coverage)[ \t]+(?:plan|policy|policies)|"
+    r"agreement|benefits?|contract|coverage|law|plan|policy|policies|"
+    r"program|regulation|rule|terms?)(?:['\N{RIGHT SINGLE QUOTATION MARK}]s)?"
+    r"(?:[ \t]+(?:change|changes|update))?[ \t]*\Z",
+    re.IGNORECASE,
+)
+_PREDICATE_EXPRESSION_LINK_RE = re.compile(
+    r"[ \t]*(?:[:,@-][ \t]*)?(?:(?:at|from|on)[ \t]+)?\Z",
+    re.IGNORECASE,
+)
+_INTAKE_POST_EXPRESSION_BOUNDARY_RE = re.compile(r"[ \t]*(?:[.!?;)\]}\"'”’][ \t]*)*")
+_OPENING_RESOURCE_SUBJECT_RE = re.compile(
+    r"(?:online[ \t]+)?portal(?:[ \t]+(?:window|period|cycle|intake))?",
+    re.IGNORECASE,
+)
+_OPENING_TO_CLOSING_COORDINATION_RE = re.compile(
+    r"[ \t]*(?:,[ \t]*)?(?:and|but|then)[ \t]+",
+    re.IGNORECASE,
 )
 _TRAILING_COORDINATION_RE = re.compile(r"(?:,\s*)?(?:and|but|then)\s*\Z", re.IGNORECASE)
 _CLOSURE_SUBJECT_SEPARATOR_RE = re.compile(
@@ -746,6 +839,11 @@ def _expressions(
     anchor_day = anchor.date() if anchor else None
     ranges = _shared_range_drafts(text, anchor_day)
     atoms = _date_drafts(text, anchor_day)
+    abbreviated_reschedule_days = _abbreviated_reschedule_day_drafts(
+        text,
+        atoms=atoms,
+        segments=segments,
+    )
     ranges.extend(_paired_range_drafts(text, atoms, ranges))
     occupied = [(item.start, item.end) for item in ranges]
     drafts: list[_ExpressionDraft] = list(ranges)
@@ -755,6 +853,12 @@ def _expressions(
         attached = _attach_clock(text, atom)
         drafts.append(attached)
         occupied.append((attached.start, attached.end))
+    for abbreviated in abbreviated_reschedule_days:
+        if not _overlaps(abbreviated.start, abbreviated.end, occupied):
+            # Preserve the exact abbreviated-day span.  In particular, do not
+            # let the ordinary clock attachment pass absorb adjacent source.
+            drafts.append(abbreviated)
+            occupied.append((abbreviated.start, abbreviated.end))
     for unresolved in _unresolved_temporal_drafts(text, anchor):
         if not _overlaps(unresolved.start, unresolved.end, occupied):
             drafts.append(unresolved)
@@ -958,6 +1062,243 @@ def _date_drafts(text: str, anchor: date | None) -> list[_ExpressionDraft]:
         output.append(item)
         occupied.append((item.start, item.end))
     return output
+
+
+def _abbreviated_reschedule_day_drafts(
+    text: str,
+    *,
+    atoms: list[_ExpressionDraft],
+    segments: tuple[_SegmentRange, ...],
+) -> list[_ExpressionDraft]:
+    """Inventory a shared-month day only inside strict reschedule grammar.
+
+    A source such as ``August 15, 2027 or 16`` contains a real second endpoint,
+    but the generic date parser must not treat arbitrary bare numbers as dates.
+    This bounded pass starts only from a fully qualified textual date, requires
+    an immediately adjacent ``or`` or slash tail in the same clause, and checks
+    that the date occupies an explicit reschedule endpoint slot.  The inherited
+    date is still blocked for review because source alternatives are unresolved.
+    """
+
+    output: list[_ExpressionDraft] = []
+    ordered_atoms = sorted(atoms, key=lambda item: (item.start, item.end))
+    for anchor in ordered_atoms:
+        anchor_day = _explicit_textual_anchor_day(anchor)
+        if anchor_day is None:
+            continue
+        segment = next(
+            (
+                item
+                for item in segments
+                if item.start <= anchor.start and anchor.end <= item.end
+            ),
+            None,
+        )
+        if segment is None:
+            continue
+        match = _ABBREVIATED_RESCHEDULE_DAY_TAIL_RE.match(
+            text,
+            anchor.end,
+            segment.end,
+        )
+        if match is None:
+            continue
+        token_start, token_end = match.span("token")
+        clause_start, clause_end = _hard_clause_bounds(
+            text,
+            span_start=anchor.start,
+            span_end=anchor.end,
+            lower_bound=segment.start,
+            upper_bound=segment.end,
+            protected_spans=tuple((item.start, item.end) for item in ordered_atoms),
+        )
+        if token_end > clause_end:
+            continue
+        local_atoms = tuple(
+            item
+            for item in ordered_atoms
+            if clause_start <= item.start and item.end <= clause_end
+        )
+        if not _abbreviated_reschedule_tail_is_bounded(
+            text,
+            anchor=anchor,
+            shorthand_end=token_end,
+            clause_end=clause_end,
+            atoms=local_atoms,
+        ):
+            continue
+        if not _is_governed_reschedule_endpoint(
+            text,
+            anchor=anchor,
+            shorthand_end=token_end,
+            clause_start=clause_start,
+            atoms=local_atoms,
+        ):
+            continue
+
+        value = _safe_date(
+            anchor_day.year,
+            anchor_day.month,
+            int(match.group("day")),
+        )
+        options = (value.isoformat(),) if value is not None else ()
+        output.append(
+            _ExpressionDraft(
+                token_start,
+                token_end,
+                "abbreviated_shared_month_day",
+                options,
+                "day",
+                (
+                    "month_and_year_inherited_from_preceding_explicit_"
+                    "reschedule_endpoint",
+                ),
+                _ordered_unique(
+                    (
+                        "reschedule_endpoint_alternatives_unresolved",
+                        *(("invalid_calendar_date",) if value is None else ()),
+                    )
+                ),
+                options,
+            )
+        )
+    return output
+
+
+def _explicit_textual_anchor_day(item: _ExpressionDraft) -> date | None:
+    if (
+        item.form != "explicit_date"
+        or len(item.normalized_options) != 1
+        or not {
+            "explicit_month_day_year",
+            "explicit_day_month_year",
+        }.intersection(item.resolution_basis)
+    ):
+        return None
+    try:
+        return date.fromisoformat(item.normalized_options[0])
+    except ValueError:
+        return None
+
+
+def _hard_clause_bounds(
+    text: str,
+    *,
+    span_start: int,
+    span_end: int,
+    lower_bound: int,
+    upper_bound: int,
+    protected_spans: tuple[tuple[int, int], ...],
+) -> tuple[int, int]:
+    boundaries = tuple(
+        match.start()
+        for match in _HARD_CLAUSE_BOUNDARY_RE.finditer(
+            text,
+            lower_bound,
+            upper_bound,
+        )
+        if not any(
+            protected_start <= match.start() < protected_end
+            for protected_start, protected_end in protected_spans
+        )
+    )
+    preceding = max((index for index in boundaries if index < span_start), default=-1)
+    clause_start = max(lower_bound, preceding + 1)
+    following = tuple(index for index in boundaries if index >= span_end)
+    clause_end = min(following, default=upper_bound)
+    return clause_start, clause_end
+
+
+def _is_governed_reschedule_endpoint(
+    text: str,
+    *,
+    anchor: _ExpressionDraft,
+    shorthand_end: int,
+    clause_start: int,
+    atoms: tuple[_ExpressionDraft, ...],
+) -> bool:
+    """Match only endpoint slots accepted by the strict review grammar."""
+
+    prefix = text[clause_start : anchor.start]
+    if (
+        _ABBREVIATED_RESCHEDULE_FROM_PREFIX_RE.search(prefix) is not None
+        or _ABBREVIATED_RESCHEDULE_REPLACEMENT_PREFIX_RE.search(prefix) is not None
+    ):
+        return True
+
+    try:
+        anchor_index = next(index for index, item in enumerate(atoms) if item is anchor)
+    except StopIteration:
+        return False
+
+    if anchor_index > 0:
+        previous = atoms[anchor_index - 1]
+        previous_prefix = text[clause_start : previous.start]
+        connector = text[previous.end : anchor.start]
+        if (
+            _ABBREVIATED_RESCHEDULE_FROM_PREFIX_RE.search(previous_prefix) is not None
+            and _ABBREVIATED_RESCHEDULE_DIRECT_CONNECTOR_RE.fullmatch(connector)
+            is not None
+        ):
+            return True
+        if (
+            _ABBREVIATED_RESCHEDULE_CUE_PREFIX_RE.search(previous_prefix) is not None
+            and _ABBREVIATED_RESCHEDULE_ARROW_RE.fullmatch(connector) is not None
+        ):
+            return True
+
+    if anchor_index + 1 < len(atoms):
+        following = atoms[anchor_index + 1]
+        if shorthand_end <= following.start:
+            connector = text[shorthand_end : following.start]
+            if (
+                _ABBREVIATED_RESCHEDULE_CUE_PREFIX_RE.search(prefix) is not None
+                and _ABBREVIATED_RESCHEDULE_ARROW_RE.fullmatch(connector) is not None
+            ):
+                return True
+            if (
+                _ABBREVIATED_RESCHEDULE_NOW_PREFIX_RE.search(prefix) is not None
+                and _ABBREVIATED_RESCHEDULE_INSTEAD_CONNECTOR_RE.fullmatch(connector)
+                is not None
+            ):
+                return True
+    return False
+
+
+def _abbreviated_reschedule_tail_is_bounded(
+    text: str,
+    *,
+    anchor: _ExpressionDraft,
+    shorthand_end: int,
+    clause_end: int,
+    atoms: tuple[_ExpressionDraft, ...],
+) -> bool:
+    """Reject a bare count followed by prose while retaining endpoint grammar."""
+
+    following = next(
+        (item for item in atoms if item is not anchor and shorthand_end <= item.start),
+        None,
+    )
+    if following is not None:
+        connector = text[shorthand_end : following.start]
+        return any(
+            pattern.fullmatch(connector) is not None
+            for pattern in (
+                _ABBREVIATED_RESCHEDULE_DIRECT_CONNECTOR_RE,
+                _ABBREVIATED_RESCHEDULE_FROM_CONNECTOR_RE,
+                _ABBREVIATED_RESCHEDULE_INSTEAD_CONNECTOR_RE,
+                _ABBREVIATED_RESCHEDULE_WAS_CONNECTOR_RE,
+                _ABBREVIATED_RESCHEDULE_ARROW_RE,
+            )
+        )
+    if clause_end < len(text) and text[clause_end] in "\r\n":
+        return False
+    return (
+        _ABBREVIATED_RESCHEDULE_CLOSING_TAIL_RE.fullmatch(
+            text[shorthand_end:clause_end]
+        )
+        is not None
+    )
 
 
 def _shared_range_drafts(text: str, anchor: date | None) -> list[_ExpressionDraft]:
@@ -1425,8 +1766,18 @@ def _mentions(
     for match in _EVENT_PREDICATE_RE.finditer(text):
         field = _field_for_span(fields, match.start(), match.end())
         surface = match.group(0)
+        opening_predicate = _OPENING_PREDICATE_RE.fullmatch(surface) is not None
+        if opening_predicate and not _opening_predicate_context_supported(
+            text,
+            fields=fields,
+            segments=segments,
+            expressions=expressions,
+            predicate_start=match.start(),
+            predicate_end=match.end(),
+        ):
+            continue
         predicate_blockers = ["predicate_mention_review_only"]
-        if _OPENING_PREDICATE_RE.fullmatch(surface):
+        if opening_predicate:
             relation: TemporalRelation = "occurrence"
             kind: TemporalKind | None = (
                 "actual"
@@ -1489,6 +1840,14 @@ def _mentions(
                 tuple(predicate_blockers),
             )
         )
+    drafts.extend(
+        _bounded_event_predicate_drafts(
+            text,
+            fields=fields,
+            segments=segments,
+            expressions=expressions,
+        )
+    )
     for match in _DEADLINE_MENTION_RE.finditer(text):
         drafts.append(
             _MentionDraft(
@@ -1730,6 +2089,322 @@ def _event_title_drafts(
             )
         )
     return output
+
+
+def _bounded_event_predicate_drafts(
+    text: str,
+    *,
+    fields: tuple[_FieldRange, ...],
+    segments: tuple[_SegmentRange, ...],
+    expressions: tuple[TemporalExpression, ...],
+) -> list[_MentionDraft]:
+    """Return source-bound transition cues omitted by the broad vocabulary.
+
+    Bare ``open``/``begin`` and state-like effective language are too generic
+    to inventory globally. Admit them only when a recognized source subject is
+    followed locally by an already parsed temporal expression. They remain
+    predicate review hints, so the existing defer policy continues to apply.
+    """
+
+    output: list[_MentionDraft] = []
+    for match in _INTAKE_BOUNDARY_PREDICATE_RE.finditer(text):
+        group = "state" if match.group("state") is not None else "transition"
+        start, end = match.span(group)
+        field = _field_for_span(fields, start, end)
+        if not _intake_boundary_subject_context(
+            text,
+            fields=fields,
+            field_name=field,
+            predicate_start=start,
+        ):
+            continue
+        if not _predicate_has_forward_expression(
+            text,
+            fields=fields,
+            segments=segments,
+            expressions=expressions,
+            predicate_start=start,
+            link_end=match.end(),
+            require_terminal_expression=True,
+        ):
+            continue
+        output.append(
+            _MentionDraft(
+                start,
+                end,
+                "event_predicate",
+                "occurrence",
+                "planned",
+                "occurrence_start",
+                None,
+                ("predicate_mention_review_only",),
+            )
+        )
+
+    for pattern in _EFFECTIVE_BOUNDARY_PREDICATE_RES:
+        for match in pattern.finditer(text):
+            start, end = match.span("predicate")
+            field = _field_for_span(fields, start, end)
+            if not _effective_boundary_subject_context(
+                text,
+                fields=fields,
+                field_name=field,
+                predicate_start=start,
+            ):
+                continue
+            if not _predicate_has_forward_expression(
+                text,
+                fields=fields,
+                segments=segments,
+                expressions=expressions,
+                predicate_start=start,
+                link_end=match.end(),
+                require_terminal_expression=True,
+            ):
+                continue
+            output.append(
+                _MentionDraft(
+                    start,
+                    end,
+                    "event_predicate",
+                    "occurrence",
+                    None,
+                    "occurrence_start",
+                    None,
+                    ("predicate_mention_review_only",),
+                )
+            )
+    return output
+
+
+def _opening_predicate_context_supported(
+    text: str,
+    *,
+    fields: tuple[_FieldRange, ...],
+    segments: tuple[_SegmentRange, ...],
+    expressions: tuple[TemporalExpression, ...],
+    predicate_start: int,
+    predicate_end: int,
+) -> bool:
+    """Bound inflected opening verbs to a subject and right-hand boundary."""
+
+    field = _field_for_span(fields, predicate_start, predicate_end)
+    if not _opening_boundary_subject_context(
+        text,
+        fields=fields,
+        field_name=field,
+        predicate_start=predicate_start,
+    ):
+        return False
+    segment = next(
+        (
+            item
+            for item in segments
+            if item.start <= predicate_start and predicate_end <= item.end
+        ),
+        None,
+    )
+    if segment is None or segment.field != field:
+        return False
+    for expression in expressions:
+        gap = expression.start - predicate_end
+        if (
+            expression.field == field
+            and expression.segment_id == segment.segment_id
+            and segment.start <= expression.start
+            and expression.end <= segment.end
+            and 0 <= gap <= 24
+            and _PREDICATE_EXPRESSION_LINK_RE.fullmatch(
+                text[predicate_end : expression.start]
+            )
+            is not None
+            and _opening_expression_tail_is_supported(
+                text,
+                expression=expression,
+                segment=segment,
+                expressions=expressions,
+            )
+        ):
+            return True
+    return False
+
+
+def _opening_boundary_subject_context(
+    text: str,
+    *,
+    fields: tuple[_FieldRange, ...],
+    field_name: TemporalField,
+    predicate_start: int,
+) -> bool:
+    if _intake_boundary_subject_context(
+        text,
+        fields=fields,
+        field_name=field_name,
+        predicate_start=predicate_start,
+    ):
+        return True
+    field = next((item for item in fields if item.name == field_name), None)
+    lower, _upper = _clause_window(
+        text,
+        predicate_start,
+        predicate_start,
+        padding=100,
+        lower_bound=field.start if field else 0,
+        upper_bound=field.end if field else len(text),
+    )
+    subject = _CLOSURE_SUBJECT_SEPARATOR_RE.split(text[lower:predicate_start])[-1]
+    subject = re.sub(
+        r"\A(?:our|the|your)[ \t]+",
+        "",
+        subject.strip(),
+        flags=re.IGNORECASE,
+    )
+    return _OPENING_RESOURCE_SUBJECT_RE.fullmatch(subject) is not None
+
+
+def _opening_expression_tail_is_supported(
+    text: str,
+    *,
+    expression: TemporalExpression,
+    segment: _SegmentRange,
+    expressions: tuple[TemporalExpression, ...],
+) -> bool:
+    if (
+        _INTAKE_POST_EXPRESSION_BOUNDARY_RE.fullmatch(
+            text[expression.end : segment.end]
+        )
+        is not None
+    ):
+        return True
+    for closing in _EVENT_PREDICATE_RE.finditer(
+        text,
+        expression.end,
+        segment.end,
+    ):
+        if _CLOSING_PREDICATE_RE.fullmatch(closing.group(0)) is None:
+            continue
+        if (
+            _OPENING_TO_CLOSING_COORDINATION_RE.fullmatch(
+                text[expression.end : closing.start()]
+            )
+            is None
+        ):
+            continue
+        for closing_expression in expressions:
+            gap = closing_expression.start - closing.end()
+            if (
+                closing_expression.field == expression.field
+                and closing_expression.segment_id == expression.segment_id
+                and closing_expression.end <= segment.end
+                and 0 <= gap <= 24
+                and _PREDICATE_EXPRESSION_LINK_RE.fullmatch(
+                    text[closing.end() : closing_expression.start]
+                )
+                is not None
+                and _INTAKE_POST_EXPRESSION_BOUNDARY_RE.fullmatch(
+                    text[closing_expression.end : segment.end]
+                )
+                is not None
+            ):
+                return True
+    return False
+
+
+def _predicate_has_forward_expression(
+    text: str,
+    *,
+    fields: tuple[_FieldRange, ...],
+    segments: tuple[_SegmentRange, ...],
+    expressions: tuple[TemporalExpression, ...],
+    predicate_start: int,
+    link_end: int,
+    require_terminal_expression: bool = False,
+) -> bool:
+    field = _field_for_span(fields, predicate_start, link_end)
+    segment = next(
+        (
+            item
+            for item in segments
+            if item.start <= predicate_start and link_end <= item.end
+        ),
+        None,
+    )
+    if segment is None or segment.field != field:
+        return False
+    for expression in expressions:
+        gap = expression.start - link_end
+        if (
+            expression.field == field
+            and expression.segment_id == segment.segment_id
+            and segment.start <= expression.start
+            and expression.end <= segment.end
+            and 0 <= gap <= 24
+            and _PREDICATE_EXPRESSION_LINK_RE.fullmatch(
+                text[link_end : expression.start]
+            )
+            is not None
+            and (
+                not require_terminal_expression
+                or _INTAKE_POST_EXPRESSION_BOUNDARY_RE.fullmatch(
+                    text[expression.end : segment.end]
+                )
+                is not None
+            )
+        ):
+            return True
+    return False
+
+
+def _intake_boundary_subject_context(
+    text: str,
+    *,
+    fields: tuple[_FieldRange, ...],
+    field_name: TemporalField,
+    predicate_start: int,
+) -> bool:
+    field = next((item for item in fields if item.name == field_name), None)
+    lower, _upper = _clause_window(
+        text,
+        predicate_start,
+        predicate_start,
+        padding=100,
+        lower_bound=field.start if field else 0,
+        upper_bound=field.end if field else len(text),
+    )
+    subject = _CLOSURE_SUBJECT_SEPARATOR_RE.split(text[lower:predicate_start])[-1]
+    subject = re.sub(
+        r"\A(?:our|the|your)[ \t]+",
+        "",
+        subject.strip(),
+        flags=re.IGNORECASE,
+    )
+    return _DEADLINE_CLOSURE_SUBJECT_RE.fullmatch(subject) is not None
+
+
+def _effective_boundary_subject_context(
+    text: str,
+    *,
+    fields: tuple[_FieldRange, ...],
+    field_name: TemporalField,
+    predicate_start: int,
+) -> bool:
+    field = next((item for item in fields if item.name == field_name), None)
+    lower, _upper = _clause_window(
+        text,
+        predicate_start,
+        predicate_start,
+        padding=100,
+        lower_bound=field.start if field else 0,
+        upper_bound=field.end if field else len(text),
+    )
+    subject = _CLOSURE_SUBJECT_SEPARATOR_RE.split(text[lower:predicate_start])[-1]
+    subject = re.sub(
+        r"\A(?:our|the|your)[ \t]+",
+        "",
+        subject.strip(),
+        flags=re.IGNORECASE,
+    )
+    return _EFFECTIVE_BOUNDARY_SUBJECT_RE.fullmatch(subject) is not None
 
 
 def _trim_event_title_span(
@@ -2873,7 +3548,7 @@ def _complete_normalization_is_valid(value: str) -> bool:
 def _is_lifecycle_reassignment(
     text: str, first_expression_start: int, connector: str
 ) -> bool:
-    if connector.strip().casefold() != "to":
+    if connector.strip().casefold() not in {"to", "until"}:
         return False
     clause_start = (
         max(
@@ -2889,7 +3564,8 @@ def _is_lifecycle_reassignment(
     ]
     return bool(
         re.search(
-            r"\b(?:changed|moved|rescheduled)\b[^.!?;]{0,90}\bfrom\s*$",
+            r"\b(?:changed|moved|postponed|rescheduled|pushed\s+back)\b"
+            r"(?:\s+(?:again|once\s+more))?\s+from\s*$",
             prefix,
             re.IGNORECASE,
         )

@@ -16,6 +16,7 @@ from .gmail_temporal_review import (
     GmailTemporalReviewError,
     GmailTemporalReviewProjection,
     canonical_gmail_temporal_review_projection_bytes,
+    gmail_temporal_review_grouping_policy_fingerprint,
     gmail_temporal_review_projection_payload,
 )
 from .paths import BrainPaths
@@ -515,6 +516,14 @@ def get_gmail_temporal_review_head(
                 source_status="stale",
                 stale_reason="projection_schema_retired",
             )
+        if str(run["grouping_policy_fingerprint"]) != (
+            gmail_temporal_review_grouping_policy_fingerprint()
+        ):
+            return replace(
+                head,
+                source_status="stale",
+                stale_reason="grouping_policy_retired",
+            )
         if pipeline == _PRODUCTION_PIPELINE_SCOPE:
             execution = conn.execute(
                 """
@@ -609,6 +618,12 @@ def rollback_gmail_temporal_review_head(
                 ):
                     raise GmailTemporalPersistenceError(
                         "rollback target review projection schema is retired"
+                    )
+                if str(target["grouping_policy_fingerprint"]) != (
+                    gmail_temporal_review_grouping_policy_fingerprint()
+                ):
+                    raise GmailTemporalPersistenceError(
+                        "rollback target review grouping policy is retired"
                     )
                 try:
                     _validate_document_authority(conn, _locator_from_run(target))

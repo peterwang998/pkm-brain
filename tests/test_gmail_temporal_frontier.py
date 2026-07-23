@@ -481,8 +481,18 @@ def test_missing_benchmark_predicates_produce_nonempty_frontiers() -> None:
     texts = (
         "The new benefits policy becomes effective August 1, 2027.",
         "Registration opens August 12, 2027 and closes August 20, 2027.",
+        "The policy effective date is August 1, 2027.",
+        "Applications open August 12, 2027.",
+        "The policy is in force beginning August 1, 2027.",
+        "Enrollment begins August 12, 2027.",
+        "Registration is open from August 12, 2027.",
+        "Applications are open from August 12, 2027.",
+        "Applications will be open from August 12, 2027.",
+        "Applications remain open from August 12, 2027.",
+        "Enrollment starts August 12, 2027.",
+        "The rule applies as of August 1, 2027.",
     )
-    expected_frontier_counts = (1, 2)
+    expected_frontier_counts = (1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1)
 
     for text, expected_count in zip(texts, expected_frontier_counts, strict=True):
         analysis, plan = analyze_and_plan(text)
@@ -496,6 +506,202 @@ def test_missing_benchmark_predicates_produce_nonempty_frontiers() -> None:
 
         assert len(frontiers) == expected_count
         assert all(frontier.candidates for frontier in frontiers)
+        assert all(
+            candidate.requires_defer
+            for frontier in frontiers
+            for candidate in frontier.candidates
+        )
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "The benefits policy effective date is August 1, 2027.",
+        "The coverage plan effective date is August 1, 2027.",
+        "Our benefits plan applies as of August 1, 2027.",
+        "Your coverage policy is in force beginning August 1, 2027.",
+    ),
+)
+def test_effective_boundary_allowlisted_compounds_produce_frontiers(
+    text: str,
+) -> None:
+    analysis, plan = analyze_and_plan(text)
+    frontiers = tuple(
+        build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        )
+        for batch in plan.batches
+    )
+
+    assert any(item.mention_type == "event_predicate" for item in analysis.mentions)
+    assert analysis.leads
+    assert frontiers
+    assert all(frontier.candidates for frontier in frontiers)
+    assert all(
+        candidate.requires_defer
+        for frontier in frontiers
+        for candidate in frontier.candidates
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "Registration is open\n\n          from August 12, 2027.",
+        "The store is open from August 12, 2027.",
+        "Keep applications open on August 12, 2027.",
+        "Keep applications open from August 12, 2027.",
+        "We reviewed applications open on August 12, 2027.",
+        "I use applications open on August 12, 2027 for QA.",
+        "Applications are open for QA on August 12, 2027.",
+        "The report will be open from August 12, 2027.",
+        "The application form starts August 12, 2027.",
+        "The application starts with questionnaire on August 12, 2027.",
+        "Applications are open\n\n          from August 12, 2027.",
+        "Applications for QA open August 12, 2027 reports",
+        "Applications are open from August 12, 2027 reports.",
+        "Applications will be open from August 12, 2027 reports.",
+        "Applications remain open from August 12, 2027 reports.",
+        "Enrollment starts August 12, 2027 questionnaire.",
+    ),
+)
+def test_bounded_intake_predicates_do_not_create_unsafe_frontiers(
+    text: str,
+) -> None:
+    analysis, plan = analyze_and_plan(text)
+
+    assert not any(item.mention_type == "event_predicate" for item in analysis.mentions)
+    assert analysis.leads == ()
+    frontiers = tuple(
+        build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        )
+        for batch in plan.batches
+    )
+    assert frontiers
+    assert all(frontier.candidates == () for frontier in frontiers)
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "The discount for the policy applies as of August 1, 2027.",
+        "The report about the contract is in force beginning August 1, 2027.",
+        "The summary of the policy changes applies as of August 1, 2027.",
+        "The memo about our terms applies as of August 1, 2027.",
+        "The benefits policy report applies as of August 1, 2027.",
+        "The coverage plan summary is in force beginning August 1, 2027.",
+        "The discount for the benefits policy applies as of August 1, 2027.",
+        ("The report about the coverage plan is in force beginning August 1, 2027."),
+        "The policy applies as of August 1, 2027 reports indicate otherwise.",
+        "The benefits plan effective date is August 1, 2027 reports show.",
+        ("The coverage policy is in force beginning August 1, 2027 reports show."),
+    ),
+)
+def test_effective_boundary_modifier_heads_do_not_create_unsafe_frontiers(
+    text: str,
+) -> None:
+    analysis, plan = analyze_and_plan(text)
+
+    assert not any(item.mention_type == "event_predicate" for item in analysis.mentions)
+    assert analysis.leads == ()
+    frontiers = tuple(
+        build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        )
+        for batch in plan.batches
+    )
+    assert frontiers
+    assert all(frontier.candidates == () for frontier in frontiers)
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "The clerk opens the report on August 12, 2027.",
+        "We opened the application on August 12, 2027.",
+        "The application report opens August 12, 2027.",
+        "Registration opens August 12, 2027 reports show.",
+    ),
+)
+def test_opening_inflection_lookalikes_have_no_frontier_candidates(
+    text: str,
+) -> None:
+    analysis, plan = analyze_and_plan(text)
+    frontiers = tuple(
+        build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        )
+        for batch in plan.batches
+    )
+
+    assert not any(item.mention_type == "event_predicate" for item in analysis.mentions)
+    assert analysis.leads == ()
+    assert frontiers
+    assert all(frontier.candidates == () for frontier in frontiers)
+
+
+@pytest.mark.parametrize(
+    ("text", "surface", "expected_kind", "expected_date"),
+    (
+        (
+            "The portal opens August 12, 2027.",
+            "opens",
+            "planned",
+            "2027-08-12",
+        ),
+        (
+            "The portal will open August 12, 2027.",
+            "will open",
+            "planned",
+            "2027-08-12",
+        ),
+        (
+            "The portal opened August 12, 2027.",
+            "opened",
+            "actual",
+            "2027-08-12",
+        ),
+        (
+            "Registration opens August 12, 2027 and closes August 20, 2027.",
+            "opens",
+            "planned",
+            "2027-08-12",
+        ),
+    ),
+)
+def test_bounded_opening_inflections_reach_forced_defer_frontier(
+    text: str,
+    surface: str,
+    expected_kind: str,
+    expected_date: str,
+) -> None:
+    analysis, plan = analyze_and_plan(text)
+    predicate = next(
+        item
+        for item in analysis.mentions
+        if item.mention_type == "event_predicate"
+        and text[item.start : item.end] == surface
+    )
+    candidates = tuple(
+        candidate
+        for batch in plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+        if candidate.subject_mention_id == predicate.mention_id
+        and candidate.normalized_value == expected_date
+    )
+
+    assert candidates
+    assert {item.relation for item in candidates} == {"occurrence"}
+    assert {item.kind for item in candidates} == {expected_kind}
+    assert all(item.requires_defer is True for item in candidates)
 
 
 def test_page_plan_clusters_adjacent_compound_event_nouns() -> None:
@@ -1808,6 +2014,36 @@ def test_supported_reschedule_base_becomes_lifecycle_uncertainty() -> None:
             base.candidate_id,
         )
         assert result.uncertain_clusters[0].reason == "lifecycle_refinement_unresolved"
+
+
+@pytest.mark.parametrize("tail", (" or 17", "/17"))
+def test_abbreviated_reschedule_day_candidates_are_forced_to_defer(
+    tail: str,
+) -> None:
+    text = f"The workshop was rescheduled from May 14, 2027 to May 16, 2027{tail}."
+    analysis, plan = analyze_and_plan(text)
+    shorthand = next(
+        item
+        for item in analysis.expressions
+        if item.form == "abbreviated_shared_month_day"
+    )
+    candidates = tuple(
+        candidate
+        for batch in plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+        if candidate.expression_id == shorthand.expression_id
+    )
+
+    assert candidates
+    assert {item.normalized_value for item in candidates} == {"2027-05-17"}
+    assert all(item.requires_defer is True for item in candidates)
+    assert all(
+        "reschedule_endpoint_alternatives_unresolved" in item.blockers
+        for item in candidates
+    )
 
 
 def test_three_run_ensemble_preserves_only_consensus_candidates() -> None:

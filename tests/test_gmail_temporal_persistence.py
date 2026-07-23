@@ -651,6 +651,101 @@ def test_v1_projection_head_is_stale_replaceable_and_not_restorable(
     )
 
 
+def test_retired_grouping_policy_head_is_stale_replaceable_and_not_restorable(
+    tmp_path: Path,
+) -> None:
+    paths = _workspace(tmp_path)
+    target_scope = "gmail-temporal-review/grouping-retirement"
+    seed = persist_gmail_temporal_review_projection(
+        paths,
+        source=_source(),
+        pipeline_scope="gmail-temporal-review/grouping-retirement-seed",
+        projection=_projection(suffix="retired-grouping"),
+        expected_head_run_id=None,
+        expected_head_generation=None,
+    )
+    with connection(paths.sqlite_path) as conn:
+        stored = dict(
+            conn.execute(
+                "SELECT * FROM gmail_temporal_review_runs WHERE id = ?",
+                (seed.run_id,),
+            ).fetchone()
+        )
+        legacy_payload = json.loads(stored["projection_json"])
+        legacy_payload["grouping_policy_fingerprint"] = "gtrgp_retired"
+        fingerprint_material = dict(legacy_payload)
+        fingerprint_material.pop("projection_fingerprint")
+        legacy_payload["projection_fingerprint"] = (
+            "gtrp_" + hashlib.sha256(_canonical_bytes(fingerprint_material)).hexdigest()
+        )
+        legacy_json = _canonical_bytes(legacy_payload).decode("utf-8")
+        stored.update(
+            id="legacy-grouping-run",
+            input_key="legacy-grouping-input",
+            pipeline_scope=target_scope,
+            grouping_policy_fingerprint="gtrgp_retired",
+            projection_fingerprint=legacy_payload["projection_fingerprint"],
+            projection_json=legacy_json,
+            projection_sha256=hashlib.sha256(legacy_json.encode("utf-8")).hexdigest(),
+        )
+        columns = tuple(stored)
+        conn.execute(
+            f"INSERT INTO gmail_temporal_review_runs({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' for _ in columns)})",
+            tuple(stored[column] for column in columns),
+        )
+        conn.execute(
+            """
+            INSERT INTO gmail_temporal_review_heads(
+              message_scope_key, pipeline_scope, run_id, generation, updated_at
+            ) VALUES (?, ?, 'legacy-grouping-run', 1, ?)
+            """,
+            (seed.message_scope_key, target_scope, "2026-07-22T20:00:00+00:00"),
+        )
+
+    stale = get_gmail_temporal_review_head(
+        paths,
+        message_scope_key=seed.message_scope_key,
+        pipeline_scope=target_scope,
+    )
+
+    assert stale is not None
+    assert stale.run_id == "legacy-grouping-run"
+    assert stale.source_status == "stale"
+    assert stale.stale_reason == "grouping_policy_retired"
+
+    replacement = persist_gmail_temporal_review_projection(
+        paths,
+        source=_source(),
+        pipeline_scope=target_scope,
+        projection=_projection(suffix="replacement-grouping"),
+        expected_head_run_id="legacy-grouping-run",
+        expected_head_generation=1,
+    )
+    current = get_gmail_temporal_review_head(
+        paths,
+        message_scope_key=seed.message_scope_key,
+        pipeline_scope=target_scope,
+    )
+
+    assert current is not None
+    assert current.run_id == replacement.run_id
+    assert current.generation == 2
+    assert current.source_status == "current"
+    with pytest.raises(
+        GmailTemporalPersistenceError,
+        match="rollback target review grouping policy is retired",
+    ):
+        rollback_gmail_temporal_review_head(
+            paths,
+            message_scope_key=seed.message_scope_key,
+            pipeline_scope=target_scope,
+            expected_run_id=replacement.run_id,
+            expected_generation=2,
+            restore_run_id="legacy-grouping-run",
+        )
+
+
 def test_same_input_key_with_different_projection_bytes_fails_closed(
     tmp_path: Path,
 ) -> None:

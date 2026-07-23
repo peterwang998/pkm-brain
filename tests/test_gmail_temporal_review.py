@@ -37,6 +37,7 @@ from pkm_brain.gmail_temporal_review import (
     canonical_gmail_temporal_review_projection_bytes,
     gmail_temporal_review_projection_payload,
     project_gmail_temporal_review,
+    _structural_frames,
 )
 
 
@@ -417,6 +418,815 @@ def test_missing_reschedule_endpoint_is_explicitly_incomplete() -> None:
     assert group.members[1].reasons == ("no_review_artifact",)
     assert group.subject_family_id is None
     assert sum(len(item.artifact_ids) for item in group.members) == 1
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_roles", "expected_values"),
+    (
+        (
+            "The meeting was pushed back from Aug 12 until Aug 15.",
+            ("rescheduled_old", "rescheduled_replacement"),
+            ("2027-08-12", "2027-08-15"),
+        ),
+        (
+            "The meeting changed from Aug 12 until Aug 15.",
+            ("rescheduled_old", "rescheduled_replacement"),
+            ("2027-08-12", "2027-08-15"),
+        ),
+        (
+            "Meeting update — New date: Aug 15 (was Aug 12).",
+            ("rescheduled_replacement", "rescheduled_old"),
+            ("2027-08-15", "2027-08-12"),
+        ),
+        (
+            "The meeting is now Aug 15 instead of Aug 12.",
+            ("rescheduled_replacement", "rescheduled_old"),
+            ("2027-08-15", "2027-08-12"),
+        ),
+        (
+            "The meeting moved Aug 12 -> Aug 15.",
+            ("rescheduled_old", "rescheduled_replacement"),
+            ("2027-08-12", "2027-08-15"),
+        ),
+        (
+            "The meeting moved Aug 15 <- Aug 12.",
+            ("rescheduled_replacement", "rescheduled_old"),
+            ("2027-08-15", "2027-08-12"),
+        ),
+        (
+            "The meeting moved to Aug 15 from Aug 12.",
+            ("rescheduled_replacement", "rescheduled_old"),
+            ("2027-08-15", "2027-08-12"),
+        ),
+        (
+            "The meeting was rescheduled to Aug 15 from Aug 12.",
+            ("rescheduled_replacement", "rescheduled_old"),
+            ("2027-08-15", "2027-08-12"),
+        ),
+    ),
+)
+def test_directional_reschedule_grammar_preserves_exact_endpoint_roles(
+    text: str,
+    expected_roles: tuple[str, str],
+    expected_values: tuple[str, str],
+) -> None:
+    analysis, _, _, projection = _fixture(text, _select_first_uncertain)
+
+    assert [
+        expression.normalized_options[0] for expression in analysis.expressions
+    ] == list(expected_values)
+    assert len(projection.groups) == 1
+    group = projection.groups[0]
+    assert (group.kind, group.coverage) == ("reschedule", "complete")
+    assert tuple(item.role for item in group.members) == expected_roles
+    assert tuple(item.source_order for item in group.members) == (1, 2)
+    assert group.reasons == ()
+    assert group.candidate_authorization is False
+    assert group.requires_defer is True
+    assert group.routable is False
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_roles"),
+    (
+        (
+            "Meeting update — New date: Aug 15 (was Aug 12 or Aug 13).",
+            ("rescheduled_replacement", "unresolved", "unresolved"),
+        ),
+        (
+            "The meeting is now Aug 15 instead of Aug 12 or Aug 13.",
+            ("rescheduled_replacement", "unresolved", "unresolved"),
+        ),
+        (
+            "The meeting moved Aug 12 -> Aug 15 or Aug 16.",
+            ("rescheduled_old", "unresolved", "unresolved"),
+        ),
+        (
+            "The meeting was rescheduled from Aug 12 to Aug 15 or Aug 16.",
+            ("rescheduled_old", "unresolved", "unresolved"),
+        ),
+        (
+            "The meeting was rescheduled from Aug 12 to Aug 15 or on Aug 16.",
+            ("rescheduled_old", "unresolved", "unresolved"),
+        ),
+        (
+            "The meeting was rescheduled from Aug 12 to Aug 15, or perhaps Aug 16.",
+            ("rescheduled_old", "unresolved", "unresolved"),
+        ),
+        (
+            "The meeting was rescheduled from Aug 12 to Aug 15 or maybe at Aug 16.",
+            ("rescheduled_old", "unresolved", "unresolved"),
+        ),
+        (
+            "The meeting moved to Aug 15 from Aug 12 or Aug 13.",
+            ("rescheduled_replacement", "unresolved", "unresolved"),
+        ),
+        (
+            "The meeting was rescheduled from Aug 12 to Aug 15, Aug 16, or Aug 17.",
+            (
+                "rescheduled_old",
+                "unresolved",
+                "unresolved",
+                "unresolved",
+            ),
+        ),
+    ),
+)
+def test_endpoint_alternatives_form_one_conflicted_reschedule_group(
+    text: str,
+    expected_roles: tuple[str, ...],
+) -> None:
+    analysis, _, _, projection = _fixture(text, _select_first_uncertain)
+
+    assert len(analysis.expressions) == len(expected_roles)
+    assert len(projection.groups) == 1
+    group = projection.groups[0]
+    assert (group.kind, group.coverage) == ("reschedule", "conflicted")
+    assert tuple(member.role for member in group.members) == expected_roles
+    assert tuple(member.source_order for member in group.members) == tuple(
+        range(1, len(expected_roles) + 1)
+    )
+    assert group.reasons == ("reschedule_endpoint_alternatives_unresolved",)
+    assert {member.expression_id for member in group.members} == {
+        expression.expression_id for expression in analysis.expressions
+    }
+    assert sum(len(member.artifact_ids) for member in group.members) == len(
+        projection.artifacts
+    )
+
+
+@pytest.mark.parametrize("hedge", ("possibly", "potentially", "conceivably"))
+def test_unrecognized_bounded_or_connector_quarantines_the_reschedule(
+    hedge: str,
+) -> None:
+    text = f"The meeting was rescheduled from Aug 12 to Aug 15 or {hedge} Aug 16."
+    analysis, _, _, projection = _fixture(text, _select_first_uncertain)
+
+    assert len(analysis.expressions) == 3
+    assert len(projection.groups) == 1
+    group = projection.groups[0]
+    assert (group.kind, group.coverage) == ("reschedule", "conflicted")
+    assert tuple(member.role for member in group.members) == (
+        "unresolved",
+        "unresolved",
+        "unresolved",
+    )
+    assert tuple(member.source_order for member in group.members) == (1, 2, 3)
+    assert group.reasons == ("reschedule_endpoint_connector_unresolved",)
+    assert {member.expression_id for member in group.members} == {
+        expression.expression_id for expression in analysis.expressions
+    }
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        (
+            "The meeting was rescheduled from Aug 12 to Aug 15 or the hotel "
+            "was booked for Aug 16."
+        ),
+        (
+            "The meeting was rescheduled from Aug 12 to Aug 15 or we could "
+            "meet on Aug 16."
+        ),
+        ("The meeting was rescheduled from Aug 12 to Aug 15 or dinner is on Aug 16."),
+        (
+            "The meeting was rescheduled from Aug 12 to Aug 15 or Project "
+            "Phoenix is on Aug 16."
+        ),
+    ),
+)
+def test_ordinary_or_clause_does_not_expand_the_reschedule_span(text: str) -> None:
+    analysis, _, _, projection = _fixture(text, _select_first_uncertain)
+
+    assert len(analysis.expressions) == 3
+    assert len(projection.groups) == 2
+    reschedule = next(
+        group for group in projection.groups if group.kind == "reschedule"
+    )
+    assert reschedule.coverage == "complete"
+    assert tuple(member.role for member in reschedule.members) == (
+        "rescheduled_old",
+        "rescheduled_replacement",
+    )
+    independent = next(group for group in projection.groups if group.kind == "single")
+    assert tuple(member.role for member in independent.members) == ("independent",)
+    assert {
+        member.expression_id for group in projection.groups for member in group.members
+    } == {expression.expression_id for expression in analysis.expressions}
+
+
+@pytest.mark.parametrize("tail", (" or 16", "/16"))
+def test_abbreviated_shared_month_day_is_consumed_by_the_reschedule(tail: str) -> None:
+    text = f"The meeting was rescheduled from August 12, 2027 to August 15, 2027{tail}."
+    analysis, _, _, projection = _fixture(text, _select_first_uncertain)
+
+    assert len(analysis.expressions) == 3
+    assert analysis.expressions[-1].form == "abbreviated_shared_month_day"
+    assert analysis.expressions[-1].blockers == (
+        "reschedule_endpoint_alternatives_unresolved",
+    )
+    assert len(projection.groups) == 1
+    group = projection.groups[0]
+    assert (group.kind, group.coverage) == ("reschedule", "conflicted")
+    assert tuple(member.role for member in group.members) == (
+        "rescheduled_old",
+        "unresolved",
+        "unresolved",
+    )
+    assert tuple(member.source_order for member in group.members) == (1, 2, 3)
+    assert group.reasons == ("reschedule_endpoint_alternatives_unresolved",)
+    assert group.source_end == analysis.expressions[-1].end
+    assert not any("missing_from_source" in reason for reason in group.reasons)
+
+
+@pytest.mark.parametrize(
+    ("text", "retained_count", "expected_missing_roles"),
+    (
+        (
+            (
+                "The meeting was rescheduled from August 12, 2027 to "
+                "August 15, 2027 or 16."
+            ),
+            2,
+            (),
+        ),
+        (
+            "The meeting was postponed until August 15, 2027/16.",
+            1,
+            ("rescheduled_old",),
+        ),
+    ),
+)
+def test_raw_tail_guard_survives_an_absent_abbreviated_day_lead(
+    text: str,
+    retained_count: int,
+    expected_missing_roles: tuple[str, ...],
+) -> None:
+    analysis = analyze_gmail_temporal_leads(
+        text=text,
+        message_internal_at="2027-08-10T09:00:00-07:00",
+        fact_admitted=True,
+        chunk_id="review-raw-tail-fallback",
+    )
+    assert analysis.expressions[-1].form == "abbreviated_shared_month_day"
+    retained = analysis.expressions[:retained_count]
+    lagging_analysis = replace(analysis, expressions=retained)
+
+    frames = _structural_frames(text=text, analysis=lagging_analysis)
+
+    assert len(frames) == 1
+    frame = frames[0]
+    assert frame.kind == "reschedule"
+    assert (
+        tuple(member.role for member in frame.members)
+        == ("unresolved",) * retained_count
+    )
+    assert frame.missing_roles == expected_missing_roles
+    assert frame.conflict_reasons == (
+        "reschedule_endpoint_abbreviated_alternative_unresolved",
+    )
+    assert frame.source_end > retained[-1].end
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        (
+            "The meeting was rescheduled from August 12, 2027 to "
+            "August 15, 2027 or the 16th."
+        ),
+        ("The meeting was rescheduled from August 12, 2027 to August 15 or 16, 2027."),
+    ),
+)
+def test_unparsed_ordinal_or_shared_year_tail_quarantines_the_pair(text: str) -> None:
+    analysis, _, _, projection = _fixture(text, _select_first_uncertain)
+
+    assert len(analysis.expressions) == 2
+    assert len(projection.groups) == 1
+    group = projection.groups[0]
+    assert (group.kind, group.coverage) == ("reschedule", "conflicted")
+    assert tuple(member.role for member in group.members) == (
+        "unresolved",
+        "unresolved",
+    )
+    assert tuple(member.source_order for member in group.members) == (1, 2)
+    assert group.reasons == ("reschedule_endpoint_abbreviated_alternative_unresolved",)
+    assert group.source_end > analysis.expressions[-1].end
+    assert not any("missing_from_source" in reason for reason in group.reasons)
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "The meeting was postponed until August 15, 2027 or the 16th.",
+        "The meeting was postponed until August 15 or 16, 2027.",
+    ),
+)
+def test_unparsed_ordinal_or_shared_year_replacement_only_is_conflicted(
+    text: str,
+) -> None:
+    analysis, _, _, projection = _fixture(text, _select_first_uncertain)
+
+    assert len(analysis.expressions) == 1
+    assert len(projection.groups) == 1
+    group = projection.groups[0]
+    assert (group.kind, group.coverage) == ("reschedule", "conflicted")
+    assert tuple(member.role for member in group.members) == ("unresolved",)
+    assert tuple(member.source_order for member in group.members) == (1,)
+    assert group.reasons == (
+        "reschedule_endpoint_abbreviated_alternative_unresolved",
+        "rescheduled_old_missing_from_source",
+    )
+    assert group.source_end > analysis.expressions[-1].end
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        ("The meeting was moved to August 15, 2027 or the 16th from August 12, 2027."),
+        (
+            "The meeting was rescheduled from August 12, 2027 or the 13th to "
+            "August 15, 2027."
+        ),
+        ("The meeting was moved to August 15 or 16, 2027 from August 12, 2027."),
+        ("The meeting was rescheduled from August 12 or 13, 2027 to August 15, 2027."),
+    ),
+)
+def test_unparsed_interior_alternative_never_assigns_endpoint_roles(text: str) -> None:
+    analysis, _, _, projection = _fixture(text, _select_first_uncertain)
+
+    assert len(analysis.expressions) == 2
+    assert len(projection.groups) == 1
+    group = projection.groups[0]
+    assert (group.kind, group.coverage) == ("reschedule", "conflicted")
+    assert tuple(member.role for member in group.members) == (
+        "unresolved",
+        "unresolved",
+    )
+    assert tuple(member.source_order for member in group.members) == (1, 2)
+    assert group.reasons == ("reschedule_endpoint_abbreviated_alternative_unresolved",)
+    assert not any("missing_from_source" in reason for reason in group.reasons)
+
+
+@pytest.mark.parametrize(
+    ("text", "missing_reason"),
+    (
+        (
+            "The meeting was postponed until August 15, 2027 or 16.",
+            "rescheduled_old_missing_from_source",
+        ),
+        (
+            "The meeting was rescheduled from August 12, 2027 or 13.",
+            "rescheduled_replacement_missing_from_source",
+        ),
+        (
+            "Meeting update — New date: August 15, 2027 / 16.",
+            "rescheduled_old_missing_from_source",
+        ),
+    ),
+)
+def test_single_endpoint_abbreviated_day_is_never_incomplete_or_known_role(
+    text: str,
+    missing_reason: str,
+) -> None:
+    analysis, _, _, projection = _fixture(text, _select_first_uncertain)
+
+    assert len(analysis.expressions) == 2
+    assert analysis.expressions[-1].form == "abbreviated_shared_month_day"
+    assert analysis.expressions[-1].blockers == (
+        "reschedule_endpoint_alternatives_unresolved",
+    )
+    assert len(projection.groups) == 1
+    group = projection.groups[0]
+    assert (group.kind, group.coverage) == ("reschedule", "conflicted")
+    assert tuple(member.role for member in group.members) == (
+        "unresolved",
+        "unresolved",
+    )
+    assert tuple(member.source_order for member in group.members) == (1, 2)
+    assert group.reasons == (
+        "reschedule_endpoint_alternatives_unresolved",
+        missing_reason,
+    )
+    assert group.source_end == analysis.expressions[-1].end
+
+
+def test_full_date_slash_quarantines_the_complete_reschedule_span() -> None:
+    text = (
+        "The meeting was rescheduled from August 12, 2027 to August 15, 2027 "
+        "/ August 16, 2027."
+    )
+    analysis, _, _, projection = _fixture(text, _select_first_uncertain)
+
+    assert len(analysis.expressions) == 3
+    assert analysis.expressions[-1].form != "abbreviated_shared_month_day"
+    assert len(projection.groups) == 1
+    group = projection.groups[0]
+    assert (group.kind, group.coverage) == ("reschedule", "conflicted")
+    assert tuple(member.role for member in group.members) == (
+        "unresolved",
+        "unresolved",
+        "unresolved",
+    )
+    assert tuple(member.source_order for member in group.members) == (1, 2, 3)
+    assert group.reasons == ("reschedule_endpoint_connector_unresolved",)
+    assert {member.expression_id for member in group.members} == {
+        expression.expression_id for expression in analysis.expressions
+    }
+
+
+def test_non_reschedule_full_date_slash_remains_independent() -> None:
+    text = "Hotel check-in is August 15, 2027 / Dinner is August 16, 2027."
+    analysis, _, _, projection = _fixture(text, _select_first_uncertain)
+
+    assert len(analysis.expressions) == 2
+    assert len(projection.groups) == 2
+    assert all(
+        (group.kind, group.coverage) == ("single", "complete")
+        for group in projection.groups
+    )
+
+
+@pytest.mark.parametrize(
+    "tail",
+    (
+        " / 2.0 release.",
+        " / 16 attendees joined.",
+        " or the 16th attendees joined.",
+    ),
+)
+def test_numeric_version_or_count_tail_does_not_quarantine_reschedule(
+    tail: str,
+) -> None:
+    text = f"The meeting was rescheduled from August 12, 2027 to August 15, 2027{tail}"
+    _, _, _, projection = _fixture(text, _select_first_uncertain)
+
+    reschedule = next(
+        group for group in projection.groups if group.kind == "reschedule"
+    )
+    assert (reschedule.kind, reschedule.coverage) == ("reschedule", "complete")
+    assert tuple(member.role for member in reschedule.members) == (
+        "rescheduled_old",
+        "rescheduled_replacement",
+    )
+    assert "reschedule_endpoint_connector_unresolved" not in reschedule.reasons
+    assert (
+        "reschedule_endpoint_abbreviated_alternative_unresolved"
+        not in reschedule.reasons
+    )
+
+
+def test_day_like_count_tail_is_not_inventoried_as_a_date_alternative() -> None:
+    text = (
+        "The meeting was rescheduled from August 12, 2027 to August 15, 2027 "
+        "or 16 people joined the waitlist."
+    )
+    analysis, _, _, projection = _fixture(text, _select_first_uncertain)
+
+    assert len(analysis.expressions) == 2
+    assert len(projection.groups) == 1
+    group = projection.groups[0]
+    assert (group.kind, group.coverage) == ("reschedule", "complete")
+    assert tuple(member.role for member in group.members) == (
+        "rescheduled_old",
+        "rescheduled_replacement",
+    )
+
+
+def test_invalid_abbreviated_day_never_gains_slash_connector_authority() -> None:
+    text = "The meeting was rescheduled from August 12, 2027 to August 15, 2027/32."
+    analysis, _, _, projection = _fixture(text, _select_first_uncertain)
+
+    assert len(analysis.expressions) == 3
+    assert analysis.expressions[-1].form == "abbreviated_shared_month_day"
+    assert "invalid_calendar_date" in analysis.expressions[-1].blockers
+    reschedule = next(
+        group for group in projection.groups if group.kind == "reschedule"
+    )
+    assert reschedule.coverage == "conflicted"
+    assert tuple(member.role for member in reschedule.members) == (
+        "unresolved",
+        "unresolved",
+        "unresolved",
+    )
+    assert reschedule.reasons == ("reschedule_endpoint_connector_unresolved",)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_roles"),
+    (
+        (
+            "The meeting was moved to August 15, 2027/16 from August 12, 2027.",
+            ("unresolved", "unresolved", "rescheduled_old"),
+        ),
+        (
+            "The meeting was rescheduled from August 12, 2027/13 to August 15, 2027.",
+            ("unresolved", "unresolved", "rescheduled_replacement"),
+        ),
+    ),
+)
+def test_slash_shorthand_preserves_only_the_unambiguous_opposite_role(
+    text: str,
+    expected_roles: tuple[str, ...],
+) -> None:
+    analysis, _, _, projection = _fixture(text, _select_first_uncertain)
+
+    assert len(analysis.expressions) == 3
+    assert analysis.expressions[1].form == "abbreviated_shared_month_day"
+    assert analysis.expressions[1].blockers == (
+        "reschedule_endpoint_alternatives_unresolved",
+    )
+    assert len(projection.groups) == 1
+    group = projection.groups[0]
+    assert (group.kind, group.coverage) == ("reschedule", "conflicted")
+    assert tuple(member.role for member in group.members) == expected_roles
+    assert tuple(member.source_order for member in group.members) == (1, 2, 3)
+    assert group.reasons == ("reschedule_endpoint_alternatives_unresolved",)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_count", "missing_reason"),
+    (
+        (
+            "The meeting was postponed until Aug 15 or Aug 16.",
+            2,
+            "rescheduled_old_missing_from_source",
+        ),
+        (
+            "Meeting update — New date: Aug 15 or Aug 16.",
+            2,
+            "rescheduled_old_missing_from_source",
+        ),
+        (
+            "The meeting was rescheduled for Aug 15, Aug 16, or Aug 17.",
+            3,
+            "rescheduled_old_missing_from_source",
+        ),
+        (
+            "The meeting was rescheduled from Aug 12 or Aug 13.",
+            2,
+            "rescheduled_replacement_missing_from_source",
+        ),
+    ),
+)
+def test_single_endpoint_alternatives_form_one_all_unresolved_group(
+    text: str,
+    expected_count: int,
+    missing_reason: str,
+) -> None:
+    analysis, _, _, projection = _fixture(text, _select_first_uncertain)
+
+    assert len(analysis.expressions) == expected_count
+    assert len(projection.groups) == 1
+    group = projection.groups[0]
+    assert (group.kind, group.coverage) == ("reschedule", "conflicted")
+    assert (
+        tuple(member.role for member in group.members)
+        == ("unresolved",) * expected_count
+    )
+    assert tuple(member.source_order for member in group.members) == tuple(
+        range(1, expected_count + 1)
+    )
+    assert group.reasons == (
+        "reschedule_endpoint_alternatives_unresolved",
+        missing_reason,
+    )
+    assert {member.expression_id for member in group.members} == {
+        expression.expression_id for expression in analysis.expressions
+    }
+    assert sum(len(member.artifact_ids) for member in group.members) == len(
+        projection.artifacts
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_singleton_role"),
+    (
+        (
+            "The meeting was rescheduled to Aug 15 or Aug 16 from Aug 12.",
+            "rescheduled_old",
+        ),
+        (
+            "The meeting is now Aug 15 or Aug 16 instead of Aug 12.",
+            "rescheduled_old",
+        ),
+        (
+            "The meeting moved Aug 12 or Aug 13 -> Aug 15.",
+            "rescheduled_replacement",
+        ),
+        (
+            "Meeting update — New date: Aug 15 or Aug 16 (was Aug 12).",
+            "rescheduled_old",
+        ),
+    ),
+)
+def test_leading_endpoint_alternatives_preserve_only_opposite_role(
+    text: str,
+    expected_singleton_role: str,
+) -> None:
+    analysis, _, _, projection = _fixture(text, _select_first_uncertain)
+
+    assert len(analysis.expressions) == 3
+    assert len(projection.groups) == 1
+    group = projection.groups[0]
+    assert (group.kind, group.coverage) == ("reschedule", "conflicted")
+    assert tuple(member.role for member in group.members) == (
+        "unresolved",
+        "unresolved",
+        expected_singleton_role,
+    )
+    assert tuple(member.source_order for member in group.members) == (1, 2, 3)
+    assert group.reasons == ("reschedule_endpoint_alternatives_unresolved",)
+    assert {member.expression_id for member in group.members} == {
+        expression.expression_id for expression in analysis.expressions
+    }
+    assert sum(len(member.artifact_ids) for member in group.members) == len(
+        projection.artifacts
+    )
+
+
+def test_collapsed_old_slot_alternatives_form_one_all_unresolved_group() -> None:
+    text = "The meeting was rescheduled from Aug 12 or Aug 13 to Aug 15."
+    analysis, _, _, projection = _fixture(text, _select_first_uncertain)
+
+    assert [expression.form for expression in analysis.expressions] == [
+        "inferred_date",
+        "date_range",
+    ]
+    assert len(projection.groups) == 1
+    group = projection.groups[0]
+    assert (group.kind, group.coverage) == ("reschedule", "conflicted")
+    assert tuple(member.role for member in group.members) == (
+        "unresolved",
+        "unresolved",
+    )
+    assert tuple(member.source_order for member in group.members) == (1, 2)
+    assert group.reasons == (
+        "reschedule_endpoint_alternatives_unresolved",
+        "reschedule_endpoint_representation_unresolved",
+    )
+    assert {member.expression_id for member in group.members} == {
+        expression.expression_id for expression in analysis.expressions
+    }
+    assert sum(len(member.artifact_ids) for member in group.members) == len(
+        projection.artifacts
+    )
+
+
+def test_both_endpoint_alternative_chains_form_one_all_unresolved_group() -> None:
+    text = "The meeting was moved to Aug 15 or Aug 16 from Aug 12 or Aug 13."
+    analysis, _, _, projection = _fixture(text, _select_first_uncertain)
+
+    assert len(analysis.expressions) == 4
+    assert len(projection.groups) == 1
+    group = projection.groups[0]
+    assert (group.kind, group.coverage) == ("reschedule", "conflicted")
+    assert tuple(member.role for member in group.members) == (
+        "unresolved",
+        "unresolved",
+        "unresolved",
+        "unresolved",
+    )
+    assert tuple(member.source_order for member in group.members) == (1, 2, 3, 4)
+    assert group.reasons == ("reschedule_endpoint_alternatives_unresolved",)
+    assert {member.expression_id for member in group.members} == {
+        expression.expression_id for expression in analysis.expressions
+    }
+    assert sum(len(member.artifact_ids) for member in group.members) == len(
+        projection.artifacts
+    )
+
+
+def test_collapsed_both_slot_alternatives_never_invent_a_missing_role() -> None:
+    text = "The meeting was rescheduled from Aug 12 or Aug 13 to Aug 15 or Aug 16."
+    analysis, _, _, projection = _fixture(text, _select_first_uncertain)
+
+    assert [expression.form for expression in analysis.expressions] == [
+        "inferred_date",
+        "date_range",
+        "inferred_date",
+    ]
+    assert len(projection.groups) == 1
+    group = projection.groups[0]
+    assert (group.kind, group.coverage) == ("reschedule", "conflicted")
+    assert tuple(member.role for member in group.members) == (
+        "unresolved",
+        "unresolved",
+        "unresolved",
+    )
+    assert tuple(member.source_order for member in group.members) == (1, 2, 3)
+    assert group.reasons == (
+        "reschedule_endpoint_alternatives_unresolved",
+        "reschedule_endpoint_representation_unresolved",
+    )
+    assert not any("missing_from_source" in reason for reason in group.reasons)
+    assert {member.expression_id for member in group.members} == {
+        expression.expression_id for expression in analysis.expressions
+    }
+    assert sum(len(member.artifact_ids) for member in group.members) == len(
+        projection.artifacts
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "The meeting was postponed until Aug 15.",
+        "The meeting moved to Aug 15.",
+    ),
+)
+def test_replacement_only_reschedule_is_explicitly_incomplete(text: str) -> None:
+    _, _, _, projection = _fixture(text, _select_first_uncertain)
+
+    assert len(projection.groups) == 1
+    group = projection.groups[0]
+    assert (group.kind, group.coverage) == ("reschedule", "incomplete")
+    assert tuple(item.role for item in group.members) == ("rescheduled_replacement",)
+    assert tuple(item.source_order for item in group.members) == (1,)
+    assert group.members[0].state == "present"
+    assert group.reasons == ("rescheduled_old_missing_from_source",)
+    assert group.subject_family_id is None
+    assert group.candidate_authorization is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "The meeting was postponed and the hotel was booked for Aug 15.",
+        "The meeting was rescheduled because we booked the room for Aug 15.",
+        "The meeting moved to Zoom and the hotel was booked for Aug 15.",
+    ),
+)
+def test_replacement_only_cue_does_not_capture_an_unrelated_later_date(
+    text: str,
+) -> None:
+    _, _, _, projection = _fixture(text, _select_first_uncertain)
+
+    assert len(projection.groups) == 1
+    group = projection.groups[0]
+    assert (group.kind, group.coverage) == ("single", "complete")
+    assert tuple(member.role for member in group.members) == ("independent",)
+
+
+def test_bare_changed_to_date_does_not_invent_reschedule_roles() -> None:
+    text = "The meeting changed to Aug 15."
+    _, _, _, projection = _fixture(text, _select_first_uncertain)
+
+    assert len(projection.groups) == 1
+    group = projection.groups[0]
+    assert (group.kind, group.coverage) == ("single", "complete")
+    assert tuple(item.role for item in group.members) == ("independent",)
+
+
+def test_bidirectional_reschedule_arrow_stays_explicitly_unresolved() -> None:
+    text = "The meeting moved Aug 12 <-> Aug 15."
+    _, _, _, projection = _fixture(text, _select_first_uncertain)
+
+    assert len(projection.groups) == 1
+    group = projection.groups[0]
+    assert (group.kind, group.coverage) == ("reschedule", "conflicted")
+    assert tuple(item.role for item in group.members) == ("unresolved", "unresolved")
+    assert tuple(item.source_order for item in group.members) == (1, 2)
+    assert group.reasons == ("reschedule_endpoint_direction_unresolved",)
+    assert group.subject_family_id is None
+    assert group.candidate_authorization is False
+
+
+def test_collapsed_reschedule_range_never_guesses_endpoint_roles() -> None:
+    text = "The meeting was pushed back from Aug 12 until 15."
+    analysis, _, _, projection = _fixture(text, _select_first_uncertain)
+
+    assert len(analysis.expressions) == 1
+    assert analysis.expressions[0].form == "date_range"
+    assert len(projection.groups) == 1
+    group = projection.groups[0]
+    assert (group.kind, group.coverage) == ("reschedule", "conflicted")
+    assert tuple(item.role for item in group.members) == ("unresolved",)
+    assert tuple(item.source_order for item in group.members) == (1,)
+    assert group.reasons == ("reschedule_endpoint_representation_unresolved",)
+    assert group.subject_family_id is None
+    assert group.candidate_authorization is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "The meeting moved to Zoom and runs from Aug 12 until Aug 15.",
+        "The meeting was postponed and vacation runs from Aug 12 until Aug 15.",
+    ),
+)
+def test_earlier_lifecycle_cue_does_not_relabel_unrelated_interval(
+    text: str,
+) -> None:
+    analysis, _, _, projection = _fixture(text, _select_first_uncertain)
+
+    assert len(analysis.expressions) == 1
+    assert analysis.expressions[0].form == "date_range"
+    assert len(projection.groups) == 1
+    group = projection.groups[0]
+    assert (group.kind, group.coverage) == ("single", "complete")
+    assert tuple(item.role for item in group.members) == ("independent",)
 
 
 def test_independent_subject_clauses_do_not_form_an_alternative_group() -> None:

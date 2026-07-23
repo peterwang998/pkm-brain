@@ -34,7 +34,7 @@ _HYPOTHESIS_VERSION = "gmail_temporal_review_hypothesis_v2"
 _CLUSTER_REVIEW_VERSION = "gmail_temporal_review_cluster_review_v1"
 _GROUP_VERSION = "gmail_temporal_review_group_v1"
 _GROUP_MEMBER_VERSION = "gmail_temporal_review_group_member_v1"
-_GROUPING_POLICY_VERSION = "gmail_temporal_review_grouping_policy_v2"
+_GROUPING_POLICY_VERSION = "gmail_temporal_review_grouping_policy_v6"
 
 ReviewArtifactKind = Literal["supported_citation", "uncertainty_sidecar"]
 ReviewEvidenceStatus = Literal["supported", "uncertain"]
@@ -65,12 +65,76 @@ _ALTERNATIVE_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 _ALTERNATIVE_COMMA_RE = re.compile(r"\s*,\s*")
-_ALTERNATIVE_OR_RE = re.compile(r"\s*(?:,\s*)?\bor\b\s*", re.IGNORECASE)
-_RESCHEDULE_PREFIX_RE = re.compile(
-    r"\b(?:changed|moved|rescheduled)\b[^.!?;\r\n]{0,90}\bfrom\s*$",
+_ALTERNATIVE_OR_RE = re.compile(
+    r"\s*(?:,\s*)?\bor\b"
+    r"(?:\s+(?:perhaps|maybe))?"
+    r"(?:\s+(?:on|at))?\s*",
     re.IGNORECASE,
 )
-_RESCHEDULE_CONNECTOR_RE = re.compile(r"\s+to\s+", re.IGNORECASE)
+_RESCHEDULE_UNRESOLVED_OR_CONNECTOR_RE = re.compile(
+    r"\s*(?:,\s*)?\bor\b"
+    r"(?!\s+(?:a|an|another|he|her|his|it|its|our|she|the|their|they|we|you|your)\b)"
+    r"(?:\s+[A-Za-z][A-Za-z'-]*){1,3}\s*,?\s*",
+    re.IGNORECASE,
+)
+_RESCHEDULE_ABBREVIATED_SLASH_CONNECTOR_RE = re.compile(r"[ \t]*/[ \t]*")
+_RESCHEDULE_ABBREVIATED_INTERIOR_PREFIX_RE = re.compile(
+    r"[ \t]*(?:(?:,[ \t]*)?\bor\b[ \t]+|/[ \t]*)"
+    r"(?:the[ \t]+)?"
+    r"(?:[12]\d|3[01]|0?[1-9])(?:st|nd|rd|th)?"
+    r"(?:[ \t]*,[ \t]*[12]\d{3})?"
+    r"(?![A-Za-z0-9/])(?!\.\d)",
+    re.IGNORECASE,
+)
+_RESCHEDULE_ABBREVIATED_ALTERNATIVE_TAIL_RE = re.compile(
+    r"[ \t]*(?:(?:,[ \t]*)?\bor\b[ \t]+|/[ \t]*)"
+    r"(?:the[ \t]+)?"
+    r"(?:[12]\d|3[01]|0?[1-9])(?:st|nd|rd|th)?"
+    r"(?:[ \t]*,[ \t]*[12]\d{3})?"
+    r"(?![A-Za-z0-9/])(?!\.\d)"
+    r"(?=[ \t]*(?:[.!?;\)\]\r\n]|$))",
+    re.IGNORECASE,
+)
+_RESCHEDULE_PREFIX_RE = re.compile(
+    r"\b(?:changed|moved|postponed|rescheduled|pushed\s+back)\b"
+    r"(?:\s+(?:again|once\s+more))?\s+from\s*$",
+    re.IGNORECASE,
+)
+_RESCHEDULE_CONNECTOR_RE = re.compile(r"\s+(?:to|until)\s+", re.IGNORECASE)
+_RESCHEDULE_TO_PREFIX_RE = re.compile(
+    r"\b(?:moved|rescheduled)\b"
+    r"(?:\s+(?:again|once\s+more))?\s+to\s*$",
+    re.IGNORECASE,
+)
+_RESCHEDULE_FROM_CONNECTOR_RE = re.compile(r"\s+from\s+", re.IGNORECASE)
+_RESCHEDULE_CUE_PREFIX_RE = re.compile(
+    r"\b(?:moved|postponed|rescheduled|pushed\s+back)\s*:?[ \t]*$",
+    re.IGNORECASE,
+)
+_RESCHEDULE_REPLACEMENT_ONLY_PREFIX_RE = re.compile(
+    r"(?:"
+    r"\b(?:moved|postponed|rescheduled|pushed\s+back)\b"
+    r"(?:\s+(?:again|once\s+more))?\s+(?:for|to|until)|"
+    r"\bnew\s+(?:date|time)\s*:"
+    r")[ \t]*$",
+    re.IGNORECASE,
+)
+_RESCHEDULE_NEW_DATE_PREFIX_RE = re.compile(
+    r"\bnew\s+(?:date|time)\s*:[ \t]*$",
+    re.IGNORECASE,
+)
+_RESCHEDULE_WAS_CONNECTOR_RE = re.compile(
+    r"\s*\(\s*(?:previously|was)\s+",
+    re.IGNORECASE,
+)
+_RESCHEDULE_NOW_PREFIX_RE = re.compile(r"\bnow[ \t]*$", re.IGNORECASE)
+_RESCHEDULE_INSTEAD_CONNECTOR_RE = re.compile(
+    r"\s+(?:instead\s+of|rather\s+than)\s+",
+    re.IGNORECASE,
+)
+_RESCHEDULE_FORWARD_ARROW_RE = re.compile(r"\s*(?:->|=>|→)\s*")
+_RESCHEDULE_REVERSE_ARROW_RE = re.compile(r"\s*(?:<-|<=|←)\s*")
+_RESCHEDULE_AMBIGUOUS_ARROW_RE = re.compile(r"\s*(?:<->|↔|⇄)\s*")
 
 
 class GmailTemporalReviewError(ValueError):
@@ -214,6 +278,8 @@ class _StructuralFrame:
     source_start: int
     source_end: int
     members: tuple[_StructuralMember, ...]
+    missing_roles: tuple[ReviewGroupRole, ...] = ()
+    conflict_reasons: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -252,10 +318,51 @@ def gmail_temporal_review_grouping_policy_fingerprint() -> str:
         },
         "reschedule_grammar": {
             "same_field_and_segment": True,
-            "requires_one_rescheduled_lifecycle_mention": True,
+            "strong_source_cue_required": True,
             "prefix_pattern": _RESCHEDULE_PREFIX_RE.pattern,
             "connector_pattern": _RESCHEDULE_CONNECTOR_RE.pattern,
-            "roles_follow_source_order_not_value_order": True,
+            "inverse_to_prefix_pattern": _RESCHEDULE_TO_PREFIX_RE.pattern,
+            "inverse_from_connector_pattern": (_RESCHEDULE_FROM_CONNECTOR_RE.pattern),
+            "replacement_only_prefix_pattern": (
+                _RESCHEDULE_REPLACEMENT_ONLY_PREFIX_RE.pattern
+            ),
+            "new_date_prefix_pattern": _RESCHEDULE_NEW_DATE_PREFIX_RE.pattern,
+            "was_connector_pattern": _RESCHEDULE_WAS_CONNECTOR_RE.pattern,
+            "now_prefix_pattern": _RESCHEDULE_NOW_PREFIX_RE.pattern,
+            "instead_connector_pattern": _RESCHEDULE_INSTEAD_CONNECTOR_RE.pattern,
+            "forward_arrow_pattern": _RESCHEDULE_FORWARD_ARROW_RE.pattern,
+            "reverse_arrow_pattern": _RESCHEDULE_REVERSE_ARROW_RE.pattern,
+            "ambiguous_arrow_pattern": _RESCHEDULE_AMBIGUOUS_ARROW_RE.pattern,
+            "members_follow_source_order": True,
+            "roles_follow_explicit_directional_grammar": True,
+            "missing_or_ambiguous_roles_remain_unresolved": True,
+            "endpoint_alternative_policy": (
+                "one_conflicted_reschedule_frame_without_fallthrough"
+            ),
+            "collapsed_endpoint_alternatives": (
+                "all_unresolved_with_representation_conflict"
+            ),
+            "unresolved_or_connector_pattern": (
+                _RESCHEDULE_UNRESOLVED_OR_CONNECTOR_RE.pattern
+            ),
+            "abbreviated_alternative_tail_pattern": (
+                _RESCHEDULE_ABBREVIATED_ALTERNATIVE_TAIL_RE.pattern
+            ),
+            "abbreviated_slash_connector_pattern": (
+                _RESCHEDULE_ABBREVIATED_SLASH_CONNECTOR_RE.pattern
+            ),
+            "abbreviated_interior_prefix_pattern": (
+                _RESCHEDULE_ABBREVIATED_INTERIOR_PREFIX_RE.pattern
+            ),
+            "abbreviated_slash_authority": {
+                "form": "abbreviated_shared_month_day",
+                "blocker": "reschedule_endpoint_alternatives_unresolved",
+                "requires_terminal_day_boundary": True,
+            },
+            "unrecognized_bounded_or_policy": "all_unresolved_conflict",
+            "unparsed_abbreviated_day_policy": (
+                "all_unresolved_without_role_or_normalization_authority"
+            ),
         },
         "groups_are_artifacts": False,
         "incomplete_or_conflicted_authorizes_candidates": False,
@@ -455,7 +562,12 @@ def project_gmail_temporal_review(
 def gmail_temporal_review_projection_payload(
     projection: GmailTemporalReviewProjection,
 ) -> dict[str, object]:
-    """Return the validated canonical JSON-safe projection payload."""
+    """Return the shape-validated canonical JSON-safe projection payload.
+
+    This content-free check proves internal hash and schema consistency only.
+    Source-derived semantics such as reschedule endpoint direction require a
+    downstream trusted ledger receipt over these exact canonical bytes.
+    """
 
     _validate_projection(projection)
     value = _jsonable(asdict(projection))
@@ -467,7 +579,7 @@ def gmail_temporal_review_projection_payload(
 def canonical_gmail_temporal_review_projection_bytes(
     projection: GmailTemporalReviewProjection,
 ) -> bytes:
-    """Return canonical compact UTF-8 bytes suitable for hash-bound storage."""
+    """Return shape-validated bytes suitable for a trusted receipt boundary."""
 
     return _canonical_bytes(gmail_temporal_review_projection_payload(projection))
 
@@ -856,48 +968,338 @@ def _structural_frames(
 
     frames: list[_StructuralFrame] = []
     consumed: set[str] = set()
-    lifecycle_mentions = tuple(
-        item
-        for item in analysis.mentions
-        if item.mention_type == "lifecycle" and item.lifecycle_role == "rescheduled"
-    )
+
     for expressions in expressions_by_segment.values():
         for first, second in zip(expressions, expressions[1:]):
-            connector = text[first.end : second.start]
-            if _RESCHEDULE_CONNECTOR_RE.fullmatch(connector) is None:
+            if first.expression_id in consumed or second.expression_id in consumed:
                 continue
-            clause_start = _clause_start(text, first.start)
-            prefix = text[clause_start : first.start]
-            match = _RESCHEDULE_PREFIX_RE.search(prefix)
-            if match is None:
-                continue
-            cue_start = clause_start + match.start()
-            governed_lifecycles = tuple(
-                item
-                for item in lifecycle_mentions
-                if item.field == first.field
-                and item.segment_id == first.segment_id
-                and cue_start <= item.start
-                and item.end <= first.start
+            interior_shape = _abbreviated_interior_reschedule_shape(
+                text=text,
+                first=first,
+                second=second,
             )
-            if len(governed_lifecycles) != 1:
+            if interior_shape is None:
+                continue
+            cue_start, conflict_reasons = interior_shape
+            frames.append(
+                _make_structural_frame(
+                    analysis_fingerprint=analysis.snapshot_fingerprint,
+                    kind="reschedule",
+                    source_start=cue_start,
+                    source_end=second.end,
+                    members=(
+                        _StructuralMember(first.expression_id, "unresolved", 1),
+                        _StructuralMember(second.expression_id, "unresolved", 2),
+                    ),
+                    conflict_reasons=conflict_reasons,
+                )
+            )
+            consumed.update((first.expression_id, second.expression_id))
+
+    for expressions in expressions_by_segment.values():
+        for index, first in enumerate(expressions):
+            if first.expression_id in consumed:
+                continue
+            (
+                endpoint_alternatives,
+                endpoint_connector_unresolved,
+            ) = _following_reschedule_alternative_chain(
+                text=text,
+                analysis=analysis,
+                expressions=expressions,
+                anchor_index=index,
+            )
+            if not endpoint_alternatives:
+                continue
+
+            opposite_index = index + len(endpoint_alternatives) + 1
+            if opposite_index < len(expressions):
+                opposite = expressions[opposite_index]
+                leading_shape = _leading_alternative_reschedule_shape(
+                    text=text,
+                    first=first,
+                    last_alternative=endpoint_alternatives[-1],
+                    opposite=opposite,
+                )
+                if leading_shape is not None:
+                    cue_start, opposite_role, conflict_reasons = leading_shape
+                    (
+                        opposite_alternatives,
+                        opposite_connector_unresolved,
+                    ) = _following_reschedule_alternative_chain(
+                        text=text,
+                        analysis=analysis,
+                        expressions=expressions,
+                        anchor_index=opposite_index,
+                    )
+                    connector_unresolved = (
+                        endpoint_connector_unresolved or opposite_connector_unresolved
+                    )
+                    source_expressions = (
+                        first,
+                        *endpoint_alternatives,
+                        opposite,
+                        *opposite_alternatives,
+                    )
+                    frames.append(
+                        _make_structural_frame(
+                            analysis_fingerprint=analysis.snapshot_fingerprint,
+                            kind="reschedule",
+                            source_start=cue_start,
+                            source_end=source_expressions[-1].end,
+                            members=tuple(
+                                _StructuralMember(
+                                    expression.expression_id,
+                                    (
+                                        opposite_role
+                                        if not connector_unresolved
+                                        and not opposite_alternatives
+                                        and source_order == len(source_expressions)
+                                        else "unresolved"
+                                    ),
+                                    source_order,
+                                )
+                                for source_order, expression in enumerate(
+                                    source_expressions,
+                                    start=1,
+                                )
+                            ),
+                            conflict_reasons=tuple(
+                                (
+                                    *conflict_reasons,
+                                    (
+                                        "reschedule_endpoint_connector_unresolved"
+                                        if connector_unresolved
+                                        else "reschedule_endpoint_alternatives_unresolved"
+                                    ),
+                                )
+                            ),
+                        )
+                    )
+                    consumed.update(
+                        expression.expression_id for expression in source_expressions
+                    )
+                    continue
+
+            single_shape = _reschedule_single_shape(text=text, expression=first)
+            if single_shape is None:
+                continue
+            cue_start, role, missing_role = single_shape
+            source_expressions = (first, *endpoint_alternatives)
+            if role == "rescheduled_old" and any(
+                item.form == "date_range" for item in source_expressions
+            ):
+                missing_roles: tuple[ReviewGroupRole, ...] = ()
+                conflict_reasons = (
+                    "reschedule_endpoint_representation_unresolved",
+                    (
+                        "reschedule_endpoint_connector_unresolved"
+                        if endpoint_connector_unresolved
+                        else "reschedule_endpoint_alternatives_unresolved"
+                    ),
+                )
+            else:
+                missing_roles = (missing_role,)
+                conflict_reasons = (
+                    "reschedule_endpoint_connector_unresolved"
+                    if endpoint_connector_unresolved
+                    else "reschedule_endpoint_alternatives_unresolved",
+                )
+            frames.append(
+                _make_structural_frame(
+                    analysis_fingerprint=analysis.snapshot_fingerprint,
+                    kind="reschedule",
+                    source_start=cue_start,
+                    source_end=source_expressions[-1].end,
+                    members=tuple(
+                        _StructuralMember(
+                            expression.expression_id,
+                            "unresolved",
+                            source_order,
+                        )
+                        for source_order, expression in enumerate(
+                            source_expressions,
+                            start=1,
+                        )
+                    ),
+                    missing_roles=missing_roles,
+                    conflict_reasons=conflict_reasons,
+                )
+            )
+            consumed.update(
+                expression.expression_id for expression in source_expressions
+            )
+
+    for expressions in expressions_by_segment.values():
+        for index, (first, second) in enumerate(zip(expressions, expressions[1:])):
+            if first.expression_id in consumed or second.expression_id in consumed:
+                continue
+            shape = _reschedule_pair_shape(
+                text=text,
+                first=first,
+                second=second,
+            )
+            if shape is None:
+                continue
+            cue_start, roles, conflict_reasons = shape
+            (
+                endpoint_alternatives,
+                endpoint_connector_unresolved,
+            ) = _following_reschedule_alternative_chain(
+                text=text,
+                analysis=analysis,
+                expressions=expressions,
+                anchor_index=index + 1,
+            )
+            if endpoint_alternatives:
+                source_expressions = (first, second, *endpoint_alternatives)
+                retained_role: ReviewGroupRole = (
+                    roles[0]
+                    if not conflict_reasons and not endpoint_connector_unresolved
+                    else "unresolved"
+                )
+                frame = _make_structural_frame(
+                    analysis_fingerprint=analysis.snapshot_fingerprint,
+                    kind="reschedule",
+                    source_start=cue_start,
+                    source_end=source_expressions[-1].end,
+                    members=tuple(
+                        _StructuralMember(
+                            expression.expression_id,
+                            retained_role if source_order == 1 else "unresolved",
+                            source_order,
+                        )
+                        for source_order, expression in enumerate(
+                            source_expressions,
+                            start=1,
+                        )
+                    ),
+                    conflict_reasons=tuple(
+                        (
+                            *conflict_reasons,
+                            (
+                                "reschedule_endpoint_connector_unresolved"
+                                if endpoint_connector_unresolved
+                                else "reschedule_endpoint_alternatives_unresolved"
+                            ),
+                        )
+                    ),
+                )
+                frames.append(frame)
+                consumed.update(
+                    expression.expression_id for expression in source_expressions
+                )
+                continue
+            abbreviated_tail_end = (
+                None
+                if conflict_reasons
+                else _abbreviated_reschedule_tail_end(
+                    text=text,
+                    expression=second,
+                )
+            )
+            if abbreviated_tail_end is not None:
+                frame = _make_structural_frame(
+                    analysis_fingerprint=analysis.snapshot_fingerprint,
+                    kind="reschedule",
+                    source_start=cue_start,
+                    source_end=abbreviated_tail_end,
+                    members=(
+                        _StructuralMember(first.expression_id, "unresolved", 1),
+                        _StructuralMember(second.expression_id, "unresolved", 2),
+                    ),
+                    conflict_reasons=(
+                        "reschedule_endpoint_abbreviated_alternative_unresolved",
+                    ),
+                )
+                frames.append(frame)
+                consumed.update((first.expression_id, second.expression_id))
                 continue
             frame = _make_structural_frame(
                 analysis_fingerprint=analysis.snapshot_fingerprint,
                 kind="reschedule",
                 source_start=cue_start,
                 source_end=second.end,
-                members=(
-                    _StructuralMember(first.expression_id, "rescheduled_old", 1),
-                    _StructuralMember(
-                        second.expression_id,
-                        "rescheduled_replacement",
-                        2,
-                    ),
+                members=tuple(
+                    _StructuralMember(expression.expression_id, role, source_order)
+                    for source_order, (expression, role) in enumerate(
+                        zip((first, second), roles),
+                        start=1,
+                    )
                 ),
+                conflict_reasons=conflict_reasons,
             )
             frames.append(frame)
             consumed.update((first.expression_id, second.expression_id))
+
+    for expressions in expressions_by_segment.values():
+        for expression in expressions:
+            if expression.expression_id in consumed:
+                continue
+            collapsed_range_cue = _collapsed_reschedule_range_cue(
+                text=text,
+                expression=expression,
+            )
+            if collapsed_range_cue is not None:
+                frames.append(
+                    _make_structural_frame(
+                        analysis_fingerprint=analysis.snapshot_fingerprint,
+                        kind="reschedule",
+                        source_start=collapsed_range_cue,
+                        source_end=expression.end,
+                        members=(
+                            _StructuralMember(
+                                expression.expression_id, "unresolved", 1
+                            ),
+                        ),
+                        conflict_reasons=(
+                            "reschedule_endpoint_representation_unresolved",
+                        ),
+                    )
+                )
+                consumed.add(expression.expression_id)
+                continue
+            shape = _reschedule_single_shape(text=text, expression=expression)
+            if shape is None:
+                continue
+            cue_start, role, missing_role = shape
+            abbreviated_tail_end = _abbreviated_reschedule_tail_end(
+                text=text,
+                expression=expression,
+            )
+            if abbreviated_tail_end is not None:
+                frames.append(
+                    _make_structural_frame(
+                        analysis_fingerprint=analysis.snapshot_fingerprint,
+                        kind="reschedule",
+                        source_start=cue_start,
+                        source_end=abbreviated_tail_end,
+                        members=(
+                            _StructuralMember(
+                                expression.expression_id,
+                                "unresolved",
+                                1,
+                            ),
+                        ),
+                        missing_roles=(missing_role,),
+                        conflict_reasons=(
+                            "reschedule_endpoint_abbreviated_alternative_unresolved",
+                        ),
+                    )
+                )
+                consumed.add(expression.expression_id)
+                continue
+            frames.append(
+                _make_structural_frame(
+                    analysis_fingerprint=analysis.snapshot_fingerprint,
+                    kind="reschedule",
+                    source_start=cue_start,
+                    source_end=expression.end,
+                    members=(_StructuralMember(expression.expression_id, role, 1),),
+                    missing_roles=(missing_role,),
+                )
+            )
+            consumed.add(expression.expression_id)
 
     for expressions in expressions_by_segment.values():
         index = 0
@@ -958,6 +1360,281 @@ def _structural_frames(
     )
 
 
+def _reschedule_pair_shape(
+    *,
+    text: str,
+    first: TemporalExpression,
+    second: TemporalExpression,
+) -> (
+    tuple[
+        int,
+        tuple[ReviewGroupRole, ReviewGroupRole],
+        tuple[str, ...],
+    ]
+    | None
+):
+    clause_start = _clause_start(text, first.start)
+    prefix = text[clause_start : first.start]
+    connector = text[first.end : second.start]
+
+    match = _RESCHEDULE_PREFIX_RE.search(prefix)
+    if match is not None and _RESCHEDULE_CONNECTOR_RE.fullmatch(connector):
+        return (
+            clause_start + match.start(),
+            ("rescheduled_old", "rescheduled_replacement"),
+            (),
+        )
+
+    match = _RESCHEDULE_TO_PREFIX_RE.search(prefix)
+    if match is not None and _RESCHEDULE_FROM_CONNECTOR_RE.fullmatch(connector):
+        return (
+            clause_start + match.start(),
+            ("rescheduled_replacement", "rescheduled_old"),
+            (),
+        )
+
+    match = _RESCHEDULE_NEW_DATE_PREFIX_RE.search(prefix)
+    if match is not None and _RESCHEDULE_WAS_CONNECTOR_RE.fullmatch(connector):
+        return (
+            clause_start + match.start(),
+            ("rescheduled_replacement", "rescheduled_old"),
+            (),
+        )
+
+    match = _RESCHEDULE_NOW_PREFIX_RE.search(prefix)
+    if match is not None and _RESCHEDULE_INSTEAD_CONNECTOR_RE.fullmatch(connector):
+        return (
+            clause_start + match.start(),
+            ("rescheduled_replacement", "rescheduled_old"),
+            (),
+        )
+
+    match = _RESCHEDULE_CUE_PREFIX_RE.search(prefix)
+    if match is None:
+        return None
+    cue_start = clause_start + match.start()
+    if _RESCHEDULE_FORWARD_ARROW_RE.fullmatch(connector):
+        return (
+            cue_start,
+            ("rescheduled_old", "rescheduled_replacement"),
+            (),
+        )
+    if _RESCHEDULE_REVERSE_ARROW_RE.fullmatch(connector):
+        return (
+            cue_start,
+            ("rescheduled_replacement", "rescheduled_old"),
+            (),
+        )
+    if _RESCHEDULE_AMBIGUOUS_ARROW_RE.fullmatch(connector):
+        return (
+            cue_start,
+            ("unresolved", "unresolved"),
+            ("reschedule_endpoint_direction_unresolved",),
+        )
+    return None
+
+
+def _leading_alternative_reschedule_shape(
+    *,
+    text: str,
+    first: TemporalExpression,
+    last_alternative: TemporalExpression,
+    opposite: TemporalExpression,
+) -> tuple[int, ReviewGroupRole, tuple[str, ...]] | None:
+    """Resolve only the unambiguous endpoint after an explicit alternative slot."""
+
+    clause_start = _clause_start(text, first.start)
+    prefix = text[clause_start : first.start]
+    connector = text[last_alternative.end : opposite.start]
+
+    match = _RESCHEDULE_PREFIX_RE.search(prefix)
+    if match is not None and _RESCHEDULE_CONNECTOR_RE.fullmatch(connector):
+        return clause_start + match.start(), "rescheduled_replacement", ()
+
+    match = _RESCHEDULE_TO_PREFIX_RE.search(prefix)
+    if match is not None and _RESCHEDULE_FROM_CONNECTOR_RE.fullmatch(connector):
+        return clause_start + match.start(), "rescheduled_old", ()
+
+    match = _RESCHEDULE_NEW_DATE_PREFIX_RE.search(prefix)
+    if match is not None and _RESCHEDULE_WAS_CONNECTOR_RE.fullmatch(connector):
+        return clause_start + match.start(), "rescheduled_old", ()
+
+    match = _RESCHEDULE_NOW_PREFIX_RE.search(prefix)
+    if match is not None and _RESCHEDULE_INSTEAD_CONNECTOR_RE.fullmatch(connector):
+        return clause_start + match.start(), "rescheduled_old", ()
+
+    match = _RESCHEDULE_CUE_PREFIX_RE.search(prefix)
+    if match is None:
+        return None
+    cue_start = clause_start + match.start()
+    if _RESCHEDULE_FORWARD_ARROW_RE.fullmatch(connector):
+        return cue_start, "rescheduled_replacement", ()
+    if _RESCHEDULE_REVERSE_ARROW_RE.fullmatch(connector):
+        return cue_start, "rescheduled_old", ()
+    if _RESCHEDULE_AMBIGUOUS_ARROW_RE.fullmatch(connector):
+        return cue_start, "unresolved", ("reschedule_endpoint_direction_unresolved",)
+    return None
+
+
+def _abbreviated_interior_reschedule_shape(
+    *,
+    text: str,
+    first: TemporalExpression,
+    second: TemporalExpression,
+) -> tuple[int, tuple[str, ...]] | None:
+    """Quarantine an unparsed shorthand alternative inside a proven reschedule.
+
+    The raw connector contributes no date value and no endpoint role. It only
+    prevents the two parsed expressions around it from being mistaken for a
+    complete reschedule pair.
+    """
+
+    clause_start = _clause_start(text, first.start)
+    prefix = text[clause_start : first.start]
+    connector = text[first.end : second.start]
+    abbreviated = _RESCHEDULE_ABBREVIATED_INTERIOR_PREFIX_RE.match(connector)
+    if abbreviated is None:
+        return None
+    remainder = connector[abbreviated.end() :]
+
+    grammar = (
+        (_RESCHEDULE_PREFIX_RE, _RESCHEDULE_CONNECTOR_RE),
+        (_RESCHEDULE_TO_PREFIX_RE, _RESCHEDULE_FROM_CONNECTOR_RE),
+        (_RESCHEDULE_NEW_DATE_PREFIX_RE, _RESCHEDULE_WAS_CONNECTOR_RE),
+        (_RESCHEDULE_NOW_PREFIX_RE, _RESCHEDULE_INSTEAD_CONNECTOR_RE),
+    )
+    for prefix_pattern, connector_pattern in grammar:
+        match = prefix_pattern.search(prefix)
+        if match is not None and connector_pattern.fullmatch(remainder):
+            return (
+                clause_start + match.start(),
+                ("reschedule_endpoint_abbreviated_alternative_unresolved",),
+            )
+
+    match = _RESCHEDULE_CUE_PREFIX_RE.search(prefix)
+    if match is not None and any(
+        pattern.fullmatch(remainder) is not None
+        for pattern in (
+            _RESCHEDULE_FORWARD_ARROW_RE,
+            _RESCHEDULE_REVERSE_ARROW_RE,
+            _RESCHEDULE_AMBIGUOUS_ARROW_RE,
+        )
+    ):
+        return (
+            clause_start + match.start(),
+            ("reschedule_endpoint_abbreviated_alternative_unresolved",),
+        )
+    return None
+
+
+def _following_reschedule_alternative_chain(
+    *,
+    text: str,
+    analysis: TemporalLeadAnalysis,
+    expressions: list[TemporalExpression],
+    anchor_index: int,
+) -> tuple[tuple[TemporalExpression, ...], bool]:
+    """Return one bounded ``or`` chain and whether its connector was unresolved."""
+
+    alternatives: list[TemporalExpression] = []
+    saw_or = False
+    connector_unresolved = False
+    cursor = anchor_index + 1
+    while cursor < len(expressions):
+        previous = expressions[cursor - 1]
+        current = expressions[cursor]
+        connector = text[previous.end : current.start]
+        if _ALTERNATIVE_OR_RE.fullmatch(connector) is not None:
+            saw_or = True
+        elif (
+            _RESCHEDULE_ABBREVIATED_SLASH_CONNECTOR_RE.fullmatch(connector) is not None
+        ):
+            if current.form == "abbreviated_shared_month_day" and not (
+                _has_terminal_abbreviated_day_boundary(text=text, expression=current)
+            ):
+                break
+            saw_or = True
+            if not (
+                current.form == "abbreviated_shared_month_day"
+                and current.blockers == ("reschedule_endpoint_alternatives_unresolved",)
+            ):
+                connector_unresolved = True
+        elif _RESCHEDULE_UNRESOLVED_OR_CONNECTOR_RE.fullmatch(
+            connector
+        ) is not None and not any(
+            mention.field == previous.field
+            and mention.segment_id == previous.segment_id
+            and previous.end <= mention.start
+            and mention.end <= current.start
+            for mention in analysis.mentions
+        ):
+            saw_or = True
+            connector_unresolved = True
+        elif _ALTERNATIVE_COMMA_RE.fullmatch(connector) is None:
+            break
+        alternatives.append(current)
+        cursor += 1
+    return (tuple(alternatives), connector_unresolved) if saw_or else ((), False)
+
+
+def _has_terminal_abbreviated_day_boundary(
+    *,
+    text: str,
+    expression: TemporalExpression,
+) -> bool:
+    tail = text[expression.end :]
+    return re.match(r"(?![A-Za-z0-9/])(?!\.\d)", tail) is not None
+
+
+def _abbreviated_reschedule_tail_end(
+    *,
+    text: str,
+    expression: TemporalExpression,
+) -> int | None:
+    match = _RESCHEDULE_ABBREVIATED_ALTERNATIVE_TAIL_RE.match(
+        text,
+        expression.end,
+    )
+    return None if match is None else match.end()
+
+
+def _collapsed_reschedule_range_cue(
+    *,
+    text: str,
+    expression: TemporalExpression,
+) -> int | None:
+    if expression.form != "date_range":
+        return None
+    clause_start = _clause_start(text, expression.start)
+    prefix = text[clause_start : expression.start]
+    match = _RESCHEDULE_PREFIX_RE.search(prefix)
+    return None if match is None else clause_start + match.start()
+
+
+def _reschedule_single_shape(
+    *,
+    text: str,
+    expression: TemporalExpression,
+) -> tuple[int, ReviewGroupRole, ReviewGroupRole] | None:
+    clause_start = _clause_start(text, expression.start)
+    prefix = text[clause_start : expression.start]
+    match = _RESCHEDULE_REPLACEMENT_ONLY_PREFIX_RE.search(prefix)
+    if match is not None:
+        return (
+            clause_start + match.start(),
+            "rescheduled_replacement",
+            "rescheduled_old",
+        )
+    match = _RESCHEDULE_PREFIX_RE.search(prefix)
+    if match is not None:
+        return (
+            clause_start + match.start(),
+            "rescheduled_old",
+            "rescheduled_replacement",
+        )
+    return None
+
+
 def _make_structural_frame(
     *,
     analysis_fingerprint: str,
@@ -965,6 +1642,8 @@ def _make_structural_frame(
     source_start: int,
     source_end: int,
     members: tuple[_StructuralMember, ...],
+    missing_roles: tuple[ReviewGroupRole, ...] = (),
+    conflict_reasons: tuple[str, ...] = (),
 ) -> _StructuralFrame:
     material = {
         "version": _GROUP_VERSION,
@@ -973,6 +1652,8 @@ def _make_structural_frame(
         "source_start": source_start,
         "source_end": source_end,
         "members": [asdict(item) for item in members],
+        "missing_roles": missing_roles,
+        "conflict_reasons": conflict_reasons,
     }
     return _StructuralFrame(
         frame_id="gtrg_" + hashlib.sha256(_canonical_bytes(material)).hexdigest(),
@@ -980,6 +1661,8 @@ def _make_structural_frame(
         source_start=source_start,
         source_end=source_end,
         members=members,
+        missing_roles=missing_roles,
+        conflict_reasons=conflict_reasons,
     )
 
 
@@ -1008,10 +1691,13 @@ def _review_groups(
     structurally_grouped_artifacts: set[str] = set()
     for frame in frames:
         projected_members: list[GmailTemporalReviewGroupMember] = []
-        reasons: list[str] = []
+        reasons: list[str] = [
+            *(f"{role}_missing_from_source" for role in frame.missing_roles),
+            *frame.conflict_reasons,
+        ]
         family_sets: list[set[str]] = []
-        missing = False
-        conflicted = False
+        missing = bool(frame.missing_roles)
+        conflicted = bool(frame.conflict_reasons)
         for structural_member in frame.members:
             expression_id = structural_member.expression_id
             member_artifacts = tuple(artifacts_by_expression.get(expression_id, ()))
@@ -1329,7 +2015,11 @@ def _validate_projection(projection: GmailTemporalReviewProjection) -> None:
     artifact_group_counts = {artifact_id: 0 for artifact_id in artifacts}
     split_review_counts = {review_id: 0 for review_id in reviews}
     for group in projection.groups:
-        if not _group_is_valid(group, artifacts=artifacts, reviews=reviews):
+        if not _group_is_valid(
+            group,
+            artifacts=artifacts,
+            reviews=reviews,
+        ):
             raise GmailTemporalReviewError("review group structure is invalid")
         for member in group.members:
             for artifact_id in member.artifact_ids:
@@ -1446,6 +2136,164 @@ def _cluster_review_is_valid(item: GmailTemporalReviewClusterReview) -> bool:
     )
 
 
+def _structural_group_shape(
+    group: GmailTemporalReviewGroup,
+) -> tuple[bool, bool] | None:
+    """Validate self-consistent structural metadata without claiming source proof."""
+
+    missing_roles: tuple[ReviewGroupRole, ...] = ()
+    conflict_reasons: tuple[str, ...] = ()
+    roles = tuple(member.role for member in group.members)
+    orders = tuple(member.source_order for member in group.members)
+    if group.kind == "alternatives":
+        if not (
+            len(group.members) >= 2
+            and set(roles) == {"alternative"}
+            and orders == tuple(range(1, len(group.members) + 1))
+        ):
+            return None
+    elif group.kind == "reschedule":
+        if len(group.members) == 2 and set(roles) == {
+            "rescheduled_old",
+            "rescheduled_replacement",
+        }:
+            if orders != (1, 2):
+                return None
+        elif len(group.members) == 1 and roles[0] in {
+            "rescheduled_old",
+            "rescheduled_replacement",
+        }:
+            if orders != (1,):
+                return None
+            missing_roles = (
+                "rescheduled_replacement"
+                if roles[0] == "rescheduled_old"
+                else "rescheduled_old",
+            )
+        elif (
+            len(group.members) >= 2
+            and set(roles) == {"unresolved"}
+            and orders == tuple(range(1, len(group.members) + 1))
+            and "reschedule_endpoint_connector_unresolved" in group.reasons
+        ):
+            qualifiers = tuple(
+                reason
+                for reason in (
+                    "reschedule_endpoint_direction_unresolved",
+                    "reschedule_endpoint_representation_unresolved",
+                )
+                if reason in group.reasons
+            )
+            source_missing = tuple(
+                role
+                for role in (
+                    "rescheduled_old",
+                    "rescheduled_replacement",
+                )
+                if f"{role}_missing_from_source" in group.reasons
+            )
+            if (
+                len(qualifiers) > 1
+                or len(source_missing) > 1
+                or (qualifiers and source_missing)
+            ):
+                return None
+            missing_roles = source_missing
+            conflict_reasons = (
+                *qualifiers,
+                "reschedule_endpoint_connector_unresolved",
+            )
+        elif (
+            set(roles) == {"unresolved"}
+            and orders == tuple(range(1, len(group.members) + 1))
+            and "reschedule_endpoint_abbreviated_alternative_unresolved"
+            in group.reasons
+        ):
+            source_missing = tuple(
+                role
+                for role in (
+                    "rescheduled_old",
+                    "rescheduled_replacement",
+                )
+                if f"{role}_missing_from_source" in group.reasons
+            )
+            if len(source_missing) > 1 or (len(group.members) == 1) != (
+                len(source_missing) == 1
+            ):
+                return None
+            missing_roles = source_missing
+            conflict_reasons = (
+                "reschedule_endpoint_abbreviated_alternative_unresolved",
+            )
+        elif (
+            len(group.members) >= 2
+            and roles[0] in {"rescheduled_old", "rescheduled_replacement"}
+            and set(roles[1:]) == {"unresolved"}
+            and orders == tuple(range(1, len(group.members) + 1))
+        ):
+            conflict_reasons = ("reschedule_endpoint_alternatives_unresolved",)
+        elif (
+            len(group.members) >= 3
+            and roles[-1] in {"rescheduled_old", "rescheduled_replacement"}
+            and set(roles[:-1]) == {"unresolved"}
+            and orders == tuple(range(1, len(group.members) + 1))
+        ):
+            conflict_reasons = ("reschedule_endpoint_alternatives_unresolved",)
+        elif (
+            len(group.members) >= 2
+            and set(roles) == {"unresolved"}
+            and orders == tuple(range(1, len(group.members) + 1))
+            and "reschedule_endpoint_alternatives_unresolved" in group.reasons
+        ):
+            if "reschedule_endpoint_representation_unresolved" in group.reasons:
+                conflict_reasons = (
+                    "reschedule_endpoint_representation_unresolved",
+                    "reschedule_endpoint_alternatives_unresolved",
+                )
+            elif "reschedule_endpoint_direction_unresolved" in group.reasons:
+                conflict_reasons = (
+                    "reschedule_endpoint_direction_unresolved",
+                    "reschedule_endpoint_alternatives_unresolved",
+                )
+            elif "rescheduled_old_missing_from_source" in group.reasons:
+                missing_roles = ("rescheduled_old",)
+                conflict_reasons = ("reschedule_endpoint_alternatives_unresolved",)
+            elif "rescheduled_replacement_missing_from_source" in group.reasons:
+                missing_roles = ("rescheduled_replacement",)
+                conflict_reasons = ("reschedule_endpoint_alternatives_unresolved",)
+            else:
+                conflict_reasons = ("reschedule_endpoint_alternatives_unresolved",)
+        elif roles == ("unresolved", "unresolved") and orders == (1, 2):
+            conflict_reasons = ("reschedule_endpoint_direction_unresolved",)
+        elif roles == ("unresolved",) and orders == (1,):
+            conflict_reasons = ("reschedule_endpoint_representation_unresolved",)
+        else:
+            return None
+    else:
+        return None
+
+    expected_source_reasons = {
+        *(f"{role}_missing_from_source" for role in missing_roles),
+        *conflict_reasons,
+    }
+    known_source_reasons = {
+        "rescheduled_old_missing_from_source",
+        "rescheduled_replacement_missing_from_source",
+        "reschedule_endpoint_direction_unresolved",
+        "reschedule_endpoint_representation_unresolved",
+        "reschedule_endpoint_alternatives_unresolved",
+        "reschedule_endpoint_connector_unresolved",
+        "reschedule_endpoint_abbreviated_alternative_unresolved",
+    }
+    actual_source_reasons = set(group.reasons) & known_source_reasons
+    if actual_source_reasons != expected_source_reasons or not (
+        set(group.reasons) - actual_source_reasons
+    ) <= {"incompatible_subject_alias_families"}:
+        return None
+
+    return bool(missing_roles), bool(conflict_reasons)
+
+
 def _group_is_valid(
     group: GmailTemporalReviewGroup,
     *,
@@ -1477,6 +2325,13 @@ def _group_is_valid(
         return False
     roles = tuple(member.role for member in group.members)
     orders = tuple(member.source_order for member in group.members)
+    source_missing_role = False
+    source_conflict = False
+    if group.kind in {"alternatives", "reschedule"}:
+        shape = _structural_group_shape(group)
+        if shape is None:
+            return False
+        source_missing_role, source_conflict = shape
     if group.kind == "single" and not (
         len(group.members) == 1 and roles == ("independent",) and orders == (None,)
     ):
@@ -1487,10 +2342,79 @@ def _group_is_valid(
         and orders == tuple(range(1, len(group.members) + 1))
     ):
         return False
-    if group.kind == "reschedule" and not (
-        roles == ("rescheduled_old", "rescheduled_replacement") and orders == (1, 2)
-    ):
-        return False
+    if group.kind == "reschedule":
+        if {
+            "reschedule_endpoint_connector_unresolved",
+            "reschedule_endpoint_abbreviated_alternative_unresolved",
+        } & set(group.reasons):
+            minimum_members = (
+                1
+                if "reschedule_endpoint_abbreviated_alternative_unresolved"
+                in group.reasons
+                else 2
+            )
+            if (
+                len(group.members) < minimum_members
+                or set(roles) != {"unresolved"}
+                or orders != tuple(range(1, len(group.members) + 1))
+                or group.coverage != "conflicted"
+            ):
+                return False
+        elif "reschedule_endpoint_alternatives_unresolved" in group.reasons:
+            ordered = orders == tuple(range(1, len(group.members) + 1))
+            roles_are_conservative = (
+                set(roles) == {"unresolved"}
+                or (
+                    roles[0] in {"rescheduled_old", "rescheduled_replacement"}
+                    and set(roles[1:]) == {"unresolved"}
+                )
+                or (
+                    roles[-1] in {"rescheduled_old", "rescheduled_replacement"}
+                    and set(roles[:-1]) == {"unresolved"}
+                )
+            )
+            if (
+                len(group.members) < 2
+                or not ordered
+                or not roles_are_conservative
+                or group.coverage != "conflicted"
+            ):
+                return False
+        elif len(group.members) == 2 and set(roles) == {
+            "rescheduled_old",
+            "rescheduled_replacement",
+        }:
+            if orders != (1, 2):
+                return False
+        elif len(group.members) == 1 and roles[0] in {
+            "rescheduled_old",
+            "rescheduled_replacement",
+        }:
+            missing_role = (
+                "rescheduled_replacement"
+                if roles[0] == "rescheduled_old"
+                else "rescheduled_old"
+            )
+            if (
+                orders != (1,)
+                or not source_missing_role
+                or f"{missing_role}_missing_from_source" not in group.reasons
+            ):
+                return False
+        elif roles == ("unresolved", "unresolved") and orders == (1, 2):
+            if (
+                group.coverage != "conflicted"
+                or "reschedule_endpoint_direction_unresolved" not in group.reasons
+            ):
+                return False
+        elif roles == ("unresolved",) and orders == (1,):
+            if (
+                group.coverage != "conflicted"
+                or "reschedule_endpoint_representation_unresolved" not in group.reasons
+            ):
+                return False
+        else:
+            return False
     if group.kind == "split_semantics" and not (
         len(group.members) == 1
         and roles == ("unresolved",)
@@ -1516,11 +2440,17 @@ def _group_is_valid(
         )
     if group.coverage == "incomplete":
         return (
-            "missing" in states
+            ("missing" in states or source_missing_role)
             and "conflicted" not in states
+            and not source_conflict
+            and "incompatible_subject_alias_families" not in group.reasons
             and group.subject_family_id is None
         )
-    return "conflicted" in states or bool(group.reasons)
+    return (
+        "conflicted" in states
+        or source_conflict
+        or "incompatible_subject_alias_families" in group.reasons
+    )
 
 
 def _group_member_is_valid(

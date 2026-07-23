@@ -705,6 +705,139 @@ def test_effective_opening_and_closing_predicates_are_inventoried() -> None:
 
 
 @pytest.mark.parametrize(
+    ("text", "surface", "expected_kind"),
+    (
+        (
+            "The policy effective date is August 1, 2027.",
+            "effective date is",
+            None,
+        ),
+        ("Applications open August 12, 2027.", "open", "planned"),
+        (
+            "The policy is in force beginning August 1, 2027.",
+            "is in force beginning",
+            None,
+        ),
+        ("Enrollment begins August 12, 2027.", "begins", "planned"),
+        (
+            "Registration is open from August 12, 2027.",
+            "is open",
+            "planned",
+        ),
+        (
+            "Applications are open from August 12, 2027.",
+            "are open",
+            "planned",
+        ),
+        (
+            "Applications will be open from August 12, 2027.",
+            "will be open",
+            "planned",
+        ),
+        (
+            "Applications remain open from August 12, 2027.",
+            "remain open",
+            "planned",
+        ),
+        ("Enrollment starts August 12, 2027.", "starts", "planned"),
+        ("The rule applies as of August 1, 2027.", "applies as of", None),
+        ("Our contract applies as of August 1, 2027.", "applies as of", None),
+        (
+            "Your policy update is in force beginning August 1, 2027.",
+            "is in force beginning",
+            None,
+        ),
+        (
+            "The benefits policy effective date is August 1, 2027.",
+            "effective date is",
+            None,
+        ),
+        (
+            "The coverage plan effective date is August 1, 2027.",
+            "effective date is",
+            None,
+        ),
+        (
+            "Our benefits plan applies as of August 1, 2027.",
+            "applies as of",
+            None,
+        ),
+        (
+            "Your coverage policy is in force beginning August 1, 2027.",
+            "is in force beginning",
+            None,
+        ),
+    ),
+)
+def test_source_bound_transition_predicates_restore_review_recall(
+    text: str,
+    surface: str,
+    expected_kind: str | None,
+) -> None:
+    result = analyze(text, admitted=False, rescue=True)
+    predicate = next(
+        item
+        for item in result.mentions
+        if item.mention_type == "event_predicate"
+        and text[item.start : item.end] == surface
+    )
+
+    assert (
+        predicate.relation,
+        predicate.kind,
+        predicate.boundary_role,
+    ) == ("occurrence", expected_kind, "occurrence_start")
+    assert "predicate_mention_review_only" in predicate.blockers
+    assert any(item.mention_id == predicate.mention_id for item in result.leads)
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "Please open the August 12, 2027 report.",
+        "The application begins with an August 12, 2027 questionnaire.",
+        "The store is open from August 12, 2027.",
+        "The discount applies as of August 1, 2027.",
+        "The report is in force beginning August 1, 2027.",
+        "The effective date is August 1, 2027.",
+        "The discount for the policy applies as of August 1, 2027.",
+        "The report about the contract is in force beginning August 1, 2027.",
+        "The summary of the policy changes applies as of August 1, 2027.",
+        "The memo about our terms applies as of August 1, 2027.",
+        "The benefits policy report applies as of August 1, 2027.",
+        "The coverage plan summary is in force beginning August 1, 2027.",
+        "The discount for the benefits policy applies as of August 1, 2027.",
+        ("The report about the coverage plan is in force beginning August 1, 2027."),
+        "The policy applies as of August 1, 2027 reports indicate otherwise.",
+        "The benefits plan effective date is August 1, 2027 reports show.",
+        ("The coverage policy is in force beginning August 1, 2027 reports show."),
+        "Registration is open\n\n          from August 12, 2027.",
+        "Keep applications open on August 12, 2027.",
+        "Keep applications open from August 12, 2027.",
+        "We reviewed applications open on August 12, 2027.",
+        "I use applications open on August 12, 2027 for QA.",
+        "Applications are open for QA on August 12, 2027.",
+        "The report will be open from August 12, 2027.",
+        "The application form starts August 12, 2027.",
+        "The application starts with questionnaire on August 12, 2027.",
+        "Applications are open\n\n          from August 12, 2027.",
+        "Applications for QA open August 12, 2027 reports",
+        "Applications are open from August 12, 2027 reports.",
+        "Applications will be open from August 12, 2027 reports.",
+        "Applications remain open from August 12, 2027 reports.",
+        "Enrollment starts August 12, 2027 questionnaire.",
+    ),
+)
+def test_source_bound_transition_predicates_reject_generic_lookalikes(
+    text: str,
+) -> None:
+    result = analyze(text, admitted=False, rescue=True)
+
+    assert not any(item.mention_type == "event_predicate" for item in result.mentions)
+    assert result.leads == ()
+
+
+@pytest.mark.parametrize(
     ("surface", "expected_kind", "expected_boundary", "expected_blocker"),
     (
         ("became effective", "actual", "occurrence_start", None),
@@ -788,6 +921,52 @@ def test_opened_and_closed_predicates_are_actual_transitions() -> None:
         closing_predicate.kind,
         closing_predicate.boundary_role,
     ) == ("closed", "deadline", "actual", "deadline")
+
+
+@pytest.mark.parametrize(
+    ("surface", "expected_kind"),
+    (
+        ("opens", "planned"),
+        ("will open", "planned"),
+        ("opened", "actual"),
+    ),
+)
+def test_portal_opening_inflections_preserve_transition_kind(
+    surface: str,
+    expected_kind: str,
+) -> None:
+    text = f"The portal {surface} August 12, 2027."
+    result = analyze(text, admitted=False, rescue=True)
+    predicate = next(
+        item for item in result.mentions if item.mention_type == "event_predicate"
+    )
+
+    assert text[predicate.start : predicate.end] == surface
+    assert (
+        predicate.relation,
+        predicate.kind,
+        predicate.boundary_role,
+    ) == ("occurrence", expected_kind, "occurrence_start")
+    assert "predicate_mention_review_only" in predicate.blockers
+    assert any(item.mention_id == predicate.mention_id for item in result.leads)
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "The clerk opens the report on August 12, 2027.",
+        "We opened the application on August 12, 2027.",
+        "The application report opens August 12, 2027.",
+        "Registration opens August 12, 2027 reports show.",
+    ),
+)
+def test_opening_inflections_reject_transitive_or_unbounded_lookalikes(
+    text: str,
+) -> None:
+    result = analyze(text, admitted=False, rescue=True)
+
+    assert not any(item.mention_type == "event_predicate" for item in result.mentions)
+    assert result.leads == ()
 
 
 @pytest.mark.parametrize(
@@ -1159,6 +1338,148 @@ def test_reschedule_from_to_retains_endpoints_instead_of_inventing_interval() ->
     ]
     assert all("lifecycle_rescheduled" in item.blockers for item in result.leads)
     assert all(item.confidence_tier == "review_ambiguous" for item in result.leads)
+
+
+@pytest.mark.parametrize(
+    ("text", "token", "normalized"),
+    (
+        (
+            "The meeting was rescheduled from August 12, 2027 "
+            "to August 15, 2027 or 16.",
+            "16",
+            "2027-08-16",
+        ),
+        (
+            "The meeting was rescheduled from August 12, 2027 to August 15, 2027/16.",
+            "16",
+            "2027-08-16",
+        ),
+        (
+            "The meeting was postponed until August 15, 2027 or 16th.",
+            "16th",
+            "2027-08-16",
+        ),
+        (
+            "The meeting was moved to August 15, 2027 or 16 from August 12, 2027.",
+            "16",
+            "2027-08-16",
+        ),
+        (
+            "The meeting was rescheduled from August 12, 2027 or 13 "
+            "to August 15, 2027.",
+            "13",
+            "2027-08-13",
+        ),
+        (
+            "The meeting was rescheduled from 12 August 2027 to 15 August 2027 or 16.",
+            "16",
+            "2027-08-16",
+        ),
+        (
+            "The meeting was rescheduled from Aug. 12, 2027 to Aug. 15, 2027 or 16.",
+            "16",
+            "2027-08-16",
+        ),
+        (
+            "Meeting update — New date: August 15, 2027 or 16 (was August 12, 2027).",
+            "16",
+            "2027-08-16",
+        ),
+        (
+            "The meeting is now August 15, 2027 or 16 instead of August 12, 2027.",
+            "16",
+            "2027-08-16",
+        ),
+    ),
+)
+def test_reschedule_abbreviated_shared_month_day_is_exact_and_deferred(
+    text: str,
+    token: str,
+    normalized: str,
+) -> None:
+    result = analyze(text)
+    shorthand = tuple(
+        item
+        for item in result.expressions
+        if item.form == "abbreviated_shared_month_day"
+    )
+
+    assert len(shorthand) == 1
+    expression = shorthand[0]
+    assert text[expression.start : expression.end] == token
+    assert expression.normalized_options == (normalized,)
+    assert expression.calendar_date_options == (normalized,)
+    assert expression.resolution_status == "resolved"
+    assert expression.local_time is None
+    assert expression.resolution_basis == (
+        "month_and_year_inherited_from_preceding_explicit_reschedule_endpoint",
+    )
+    assert "reschedule_endpoint_alternatives_unresolved" in expression.blockers
+    preceding = max(
+        (
+            item
+            for item in result.expressions
+            if item.end <= expression.start and item.form == "explicit_date"
+        ),
+        key=lambda item: item.end,
+    )
+    assert expression.field == preceding.field
+    assert expression.segment_id == preceding.segment_id
+
+
+def test_invalid_abbreviated_shared_month_day_is_retained_unresolved() -> None:
+    text = "The meeting was rescheduled from April 29, 2027 to April 30, 2027 or 31."
+    result = analyze(text)
+    expression = next(
+        item
+        for item in result.expressions
+        if item.form == "abbreviated_shared_month_day"
+    )
+
+    assert text[expression.start : expression.end] == "31"
+    assert expression.normalized_options == ()
+    assert expression.calendar_date_options == ()
+    assert expression.resolution_status == "unresolved"
+    assert "invalid_calendar_date" in expression.blockers
+    assert "reschedule_endpoint_alternatives_unresolved" in expression.blockers
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "Vacation is August 15, 2027 or 16.",
+        (
+            "The meeting was rescheduled because we booked the room for "
+            "August 15, 2027 or 16."
+        ),
+        "The meeting was rescheduled to August 15, 2027. Or 16.",
+        "The meeting was rescheduled to August 15, 2027\nor 16.",
+        ("The meeting was rescheduled to August 15, 2027 or 16\nfrom August 12, 2027."),
+        "The meeting was rescheduled to August 15, 2027 or maybe 16.",
+        "The meeting was rescheduled to August 15, 2027 or on 16.",
+        "The meeting was rescheduled to 2027-08-15 or 16.",
+        "The meeting was rescheduled to 8/15/2027 or 16.",
+        "The meeting was rescheduled to August 15, 2027 or 16, 2028.",
+        "The meeting was rescheduled to August 15, 2027 or 4 PM.",
+        (
+            "The meeting was rescheduled from August 12, 2027 "
+            "to August 15, 2027 or 16 people joined."
+        ),
+        (
+            "The meeting was rescheduled from August 12, 2027 "
+            "to August 15, 2027 or 16 attendees replied."
+        ),
+        "Version notes: August 15, 2027/16.",
+    ),
+)
+def test_abbreviated_shared_month_day_rejects_ungoverned_or_ambiguous_tails(
+    text: str,
+) -> None:
+    result = analyze(text, admitted=False)
+
+    assert all(
+        item.form != "abbreviated_shared_month_day" for item in result.expressions
+    )
 
 
 def test_missing_year_keeps_adjacent_year_suggestions_ambiguous() -> None:

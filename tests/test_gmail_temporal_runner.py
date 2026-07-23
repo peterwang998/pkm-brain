@@ -445,6 +445,8 @@ def test_runner_uses_recall_rescue_but_hard_suppresses_advertising(
 
     advertising_paths = _workspace(
         tmp_path / "advertising",
+        body="Applications will be open from August 14, 2027.",
+        subject="Applications",
         admitted=False,
         importance="advertising",
         actionability="promotional",
@@ -511,6 +513,27 @@ def test_mixed_thread_aggregate_cannot_poison_target_message_policy(
         ("The policy takes effect August 14, 2027.", "Policy update"),
         ("Registration closes August 14, 2027.", "Registration"),
         ("The portal opens August 14, 2027.", "Portal update"),
+        ("The portal will open August 14, 2027.", "Portal update"),
+        ("The portal opened August 14, 2027.", "Portal update"),
+        ("The policy effective date is August 14, 2027.", "Policy update"),
+        ("Applications open August 14, 2027.", "Applications"),
+        (
+            "The policy is in force beginning August 14, 2027.",
+            "Policy update",
+        ),
+        ("Enrollment begins August 14, 2027.", "Enrollment"),
+        ("Registration is open from August 14, 2027.", "Registration"),
+        ("Applications are open from August 14, 2027.", "Applications"),
+        (
+            "Applications will be open from August 14, 2027.",
+            "Applications",
+        ),
+        (
+            "Applications remain open from August 14, 2027.",
+            "Applications",
+        ),
+        ("Enrollment starts August 14, 2027.", "Enrollment"),
+        ("The rule applies as of August 14, 2027.", "Rule update"),
     ],
 )
 def test_temporal_rescue_includes_shared_event_predicate_subjects(
@@ -532,6 +555,76 @@ def test_temporal_rescue_includes_shared_event_predicate_subjects(
     assert preparation.admission_basis == "temporal_rescue"
     assert preparation.disposition == "complete_review_projection"
     assert preparation.candidate_count > 0
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        "The store is open from August 14, 2027.",
+        "The report will be open from August 14, 2027.",
+        "The application form starts August 14, 2027.",
+        "The application starts with questionnaire on August 14, 2027.",
+        "Keep applications open from August 14, 2027.",
+        "Applications are open for QA on August 14, 2027.",
+        "Applications are open\n\n          from August 14, 2027.",
+        "Applications for QA open August 14, 2027 reports",
+        "The policy applies as of August 14, 2027 reports indicate otherwise.",
+        "The benefits plan effective date is August 14, 2027 reports show.",
+    ),
+)
+def test_intake_lookalikes_do_not_trigger_temporal_rescue(
+    tmp_path: Path,
+    body: str,
+) -> None:
+    paths = _workspace(
+        tmp_path,
+        body=body,
+        subject="FYI",
+        admitted=False,
+    )
+
+    preparation = runner.prepare_gmail_temporal_review(
+        paths,
+        document_id=DOCUMENT,
+        gmail_message_id=MESSAGE,
+    )
+
+    assert preparation.admission_basis == "not_admitted"
+    assert preparation.disposition == "not_admitted"
+    assert preparation.candidate_count == 0
+    assert preparation.requests == ()
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        "The clerk opens the report on August 14, 2027.",
+        "We opened the application on August 14, 2027.",
+        "The application report opens August 14, 2027.",
+        "Registration opens August 14, 2027 reports show.",
+    ),
+)
+def test_opening_inflection_lookalikes_do_not_trigger_temporal_rescue(
+    tmp_path: Path,
+    body: str,
+) -> None:
+    paths = _workspace(
+        tmp_path,
+        body=body,
+        subject="FYI",
+        admitted=False,
+    )
+
+    preparation = runner.prepare_gmail_temporal_review(
+        paths,
+        document_id=DOCUMENT,
+        gmail_message_id=MESSAGE,
+    )
+
+    assert preparation.admission_basis == "not_admitted"
+    assert preparation.disposition == "not_admitted"
+    assert preparation.candidate_count == 0
+    assert preparation.requests == ()
 
 
 def test_inconsistent_advertising_fact_membership_fails_policy_validation(

@@ -176,6 +176,12 @@ def _select_lifecycle(lifecycle: str) -> CandidateSelector:
     return select
 
 
+def _select_first_supported(
+    candidates: tuple[GmailTemporalVerificationCandidate, ...],
+) -> dict[str, str]:
+    return {candidates[0].candidate_id: "supported"}
+
+
 def _message(
     *,
     index: int,
@@ -256,6 +262,100 @@ def _message(
             projection=projection,
             identity_assertions=tuple(assertions),
         ),
+    )
+
+
+def _refingerprinted_projection(
+    projection: GmailTemporalReviewProjection,
+) -> GmailTemporalReviewProjection:
+    material = asdict(projection)
+    material.pop("projection_fingerprint")
+    return replace(
+        projection,
+        projection_fingerprint="gtrp_"
+        + hashlib.sha256(
+            json.dumps(
+                material,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest(),
+    )
+
+
+def _forge_reschedule_roles(
+    projection: GmailTemporalReviewProjection,
+    *,
+    roles: tuple[str, ...],
+    missing_roles: tuple[str, ...] = (),
+    reasons: tuple[str, ...] = (),
+) -> GmailTemporalReviewProjection:
+    group = next(item for item in projection.groups if item.kind == "reschedule")
+    group_material = {
+        "version": "gmail_temporal_review_group_v1",
+        "analysis_fingerprint": projection.analysis_fingerprint,
+        "kind": group.kind,
+        "source_start": group.source_start,
+        "source_end": group.source_end,
+        "members": [
+            {
+                "expression_id": member.expression_id,
+                "role": role,
+                "source_order": member.source_order,
+            }
+            for member, role in zip(group.members, roles, strict=True)
+        ],
+        "missing_roles": missing_roles,
+        "conflict_reasons": (),
+    }
+    group_id = (
+        "gtrg_"
+        + hashlib.sha256(
+            json.dumps(
+                group_material,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+    )
+    members = tuple(
+        replace(
+            member,
+            member_id="gtrgm_"
+            + hashlib.sha256(
+                json.dumps(
+                    {
+                        "version": "gmail_temporal_review_group_member_v1",
+                        "group_id": group_id,
+                        "expression_id": member.expression_id,
+                        "role": role,
+                        "source_order": member.source_order,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest(),
+            role=role,  # type: ignore[arg-type]
+        )
+        for member, role in zip(group.members, roles, strict=True)
+    )
+    forged_group = replace(
+        group,
+        group_id=group_id,
+        members=members,
+        reasons=reasons,
+    )
+    return _refingerprinted_projection(
+        replace(
+            projection,
+            groups=tuple(
+                forged_group if item.group_id == group.group_id else item
+                for item in projection.groups
+            ),
+        )
     )
 
 
@@ -436,6 +536,160 @@ def test_schedule_reschedule_terminal_retains_every_occurrence_and_artifact(
         ]
         == result.projection_fingerprint
     )
+
+
+@pytest.mark.parametrize(
+    "guarded_text",
+    (
+        (
+            "The Apollo interview was rescheduled from August 14, 2027 to "
+            "August 16, 2027 or conceivably August 18, 2027."
+        ),
+        (
+            "The Apollo interview was rescheduled from August 14, 2027 to "
+            "August 16, 2027 or 18."
+        ),
+        (
+            "The Apollo interview was rescheduled from August 14, 2027 to "
+            "August 16, 2027 or the 18th."
+        ),
+        (
+            "The Apollo interview was rescheduled from August 14, 2027 to "
+            "August 16 or 18, 2027."
+        ),
+        (
+            "The Apollo interview was rescheduled from August 14, 2027 to "
+            "August 16, 2027 / August 18, 2027."
+        ),
+        (
+            "The Apollo interview was moved to August 16, 2027 or the 18th "
+            "from August 14, 2027."
+        ),
+    ),
+)
+def test_conflicted_reschedule_guard_never_changes_the_current_occurrence(
+    guarded_text: str,
+) -> None:
+    schedule = _projection(
+        "The Apollo interview is scheduled for August 14, 2027.",
+        _select_lifecycle("scheduled"),
+        internal_at="2027-08-01T09:00:00-07:00",
+        chunk_id="message-1",
+    )
+    guarded = _projection(
+        guarded_text,
+        _select_lifecycle("unknown"),
+        internal_at="2027-08-02T09:00:00-07:00",
+        chunk_id="message-2",
+    )
+    guarded_group = next(
+        group for group in guarded.groups if group.kind == "reschedule"
+    )
+    assert guarded_group.coverage == "conflicted"
+    guarded_roles = {member.role for member in guarded_group.members}
+    assert "unresolved" in guarded_roles
+    assert "rescheduled_replacement" not in guarded_roles
+
+    result = _project(
+        (
+            _message(
+                index=1,
+                projection=schedule,
+                internal_at="2027-08-01T09:00:00-07:00",
+            ),
+            _message(
+                index=2,
+                projection=guarded,
+                internal_at="2027-08-02T09:00:00-07:00",
+            ),
+        )
+    )
+
+    assert len(result.events) == 1
+    event = result.events[0]
+    assert event.current_status == "scheduled"
+    assert event.last_unambiguous_status == "scheduled"
+    assert len(event.occurrences) == 1
+    assert event.occurrences[0].normalized_value == "2027-08-14"
+    assert event.occurrences[0].state == "scheduled"
+    assert event.occurrences[0].superseded_by_occurrence_id is None
+    assert result.unresolved_alternatives[-1].reason == (
+        "incomplete_or_conflicted_message_group"
+    )
+
+
+def test_trusted_receipt_rejects_fully_refingerprinted_reschedule_role_flip() -> None:
+    projection = _projection(
+        "The Apollo interview was rescheduled from August 14, 2027 to August 16, 2027.",
+        _select_lifecycle("unknown"),
+        internal_at="2027-08-02T09:00:00-07:00",
+        chunk_id="message-1",
+    )
+    authority, message = _message(
+        index=1,
+        projection=projection,
+        internal_at="2027-08-02T09:00:00-07:00",
+    )
+    forged = _forge_reschedule_roles(
+        projection,
+        roles=("rescheduled_replacement", "rescheduled_old"),
+    )
+    forged_bytes = canonical_gmail_temporal_review_projection_bytes(forged)
+    assert forged_bytes != canonical_gmail_temporal_review_projection_bytes(projection)
+
+    receipt = replace(
+        authority,
+        current_projection_fingerprint=forged.projection_fingerprint,
+    )
+    with pytest.raises(
+        GmailTemporalThreadLifecycleError,
+        match="does not match the current ledger receipt",
+    ):
+        validate_gmail_temporal_thread_review_inputs(
+            snapshot_authority=GmailTemporalThreadSnapshotAuthority(
+                version="gmail_temporal_thread_snapshot_authority_v2",
+                messages=(receipt,),
+            ),
+            messages=(replace(message, projection=forged),),
+        )
+
+
+def test_trusted_receipt_rejects_refingerprinted_missing_reschedule_role_flip() -> None:
+    projection = _projection(
+        "The Apollo interview was postponed until August 16, 2027.",
+        _select_first_supported,
+        internal_at="2027-08-02T09:00:00-07:00",
+        chunk_id="message-1",
+    )
+    authority, message = _message(
+        index=1,
+        projection=projection,
+        internal_at="2027-08-02T09:00:00-07:00",
+    )
+    forged = _forge_reschedule_roles(
+        projection,
+        roles=("rescheduled_old",),
+        missing_roles=("rescheduled_replacement",),
+        reasons=("rescheduled_replacement_missing_from_source",),
+    )
+    forged_bytes = canonical_gmail_temporal_review_projection_bytes(forged)
+    assert forged_bytes != canonical_gmail_temporal_review_projection_bytes(projection)
+
+    receipt = replace(
+        authority,
+        current_projection_fingerprint=forged.projection_fingerprint,
+    )
+    with pytest.raises(
+        GmailTemporalThreadLifecycleError,
+        match="does not match the current ledger receipt",
+    ):
+        validate_gmail_temporal_thread_review_inputs(
+            snapshot_authority=GmailTemporalThreadSnapshotAuthority(
+                version="gmail_temporal_thread_snapshot_authority_v2",
+                messages=(receipt,),
+            ),
+            messages=(replace(message, projection=forged),),
+        )
 
 
 def test_refingerprinted_caller_mutation_cannot_replace_derived_lifecycle() -> None:
