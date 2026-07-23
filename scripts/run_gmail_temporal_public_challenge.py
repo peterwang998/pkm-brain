@@ -342,7 +342,22 @@ def _key(path: Path) -> bytes:
     return raw
 
 
-def _execution_claims(*, test_invoker_used: bool) -> _ExecutionClaims:
+def _execution_claims(
+    *, test_invoker_used: bool, external_calls_required: bool
+) -> _ExecutionClaims:
+    if not external_calls_required:
+        return _ExecutionClaims(
+            provider=(
+                PUBLIC_TEST_PROVIDER
+                if test_invoker_used
+                else GMAIL_TEMPORAL_EXTERNAL_PROVIDER
+            ),
+            external_call_started=False,
+            restricted_execution=False,
+            ephemeral_execution=False,
+            local_model_used=False,
+            test_invoker_used=test_invoker_used,
+        )
     if test_invoker_used:
         # An injected callable has no external-execution attestation. Mark it
         # conservatively as local so test output cannot masquerade as the
@@ -1090,7 +1105,6 @@ def run_public_challenge(
         raise PublicChallengeError("timeout is outside the safe bound")
     if (invoke is not None) != test_only_allow_injected_invoker:
         raise PublicChallengeError("injected invoker requires explicit test-only mode")
-    claims = _execution_claims(test_invoker_used=invoke is not None)
     key = _key(hmac_key_path)
     challenge, challenge_raw = _load_challenge(challenge_path, key=key)
     cases = _prepare_cases(challenge)
@@ -1098,6 +1112,10 @@ def run_public_challenge(
     units = bounded_public_call_units(rows)
     if rows and not units:
         raise PublicChallengeError("candidate-bearing challenge has no call units")
+    claims = _execution_claims(
+        test_invoker_used=invoke is not None,
+        external_calls_required=bool(units),
+    )
     _fresh_private_directory(output_root)
     plan = _signed(
         _plan_value(
@@ -1113,10 +1131,14 @@ def run_public_challenge(
     )
     plan_raw = _canonical_json(plan) + b"\n"
     _write_private_new(output_root / "plan.json", plan_raw)
-    active_invoke = invoke or external.RestrictedCodexInvoker(codex_binary)
+    active_invoke = (
+        invoke or external.RestrictedCodexInvoker(codex_binary) if units else None
+    )
     completed: list[_CompletedCall] = []
     for run_ordinal in range(1, RUN_COUNT + 1):
         for unit in units:
+            if active_invoke is None:
+                raise PublicChallengeError("public verifier invoker is unavailable")
             completed.append(
                 _execute_call(
                     output_root=output_root,
@@ -1293,11 +1315,16 @@ def _plan_case_rows(cases: Sequence[_Case]) -> list[dict[str, Any]]:
     ]
 
 
-def _claims_from_plan(plan: Mapping[str, Any]) -> _ExecutionClaims:
+def _claims_from_plan(
+    plan: Mapping[str, Any], *, external_calls_required: bool
+) -> _ExecutionClaims:
     test_value = plan.get("test_invoker_used")
     if not isinstance(test_value, bool):
         raise PublicChallengeError("public challenge execution mode is invalid")
-    claims = _execution_claims(test_invoker_used=test_value)
+    claims = _execution_claims(
+        test_invoker_used=test_value,
+        external_calls_required=external_calls_required,
+    )
     if (
         plan.get("provider") != claims.provider
         or plan.get("restricted_execution") is not claims.restricted_execution
@@ -1350,7 +1377,7 @@ def _validate_plan_authority(
     }
     if set(plan) != expected_keys:
         raise PublicChallengeError("public challenge plan schema is invalid")
-    claims = _claims_from_plan(plan)
+    claims = _claims_from_plan(plan, external_calls_required=bool(units))
     rows = _request_rows(cases)
     stable = {
         "version": PLAN_VERSION,

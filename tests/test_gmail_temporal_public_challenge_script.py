@@ -453,25 +453,40 @@ def test_success_seals_all_three_runs_before_results_and_keeps_files_private(
 
 def test_all_zero_work_challenge_scores_as_zero_recall_without_calls(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = _fixture(tmp_path, all_zero_work=True)
     output = tmp_path / "zero-work-run"
-    fake = FakeCodex()
+
+    def reject_invoker_construction(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("zero-work run must not construct an external invoker")
+
+    monkeypatch.setattr(
+        challenge.external,
+        "RestrictedCodexInvoker",
+        reject_invoker_construction,
+    )
 
     result = challenge.run_public_challenge(
         fixture["manifest"],
         fixture["key"],
         output,
-        invoke=fake,
-        test_only_allow_injected_invoker=True,
     )
 
     assert result["candidate_cases"] == 0
     assert result["zero_work_cases"] == 2
     assert result["invocations"] == 0
-    assert fake.calls == []
+    assert result["external_calls"] == 0
+    assert result["test_invoker_used"] is False
     assert not (output / "calls").exists()
     assert not (output / "components").exists()
+    plan = json.loads((output / "plan.json").read_text(encoding="utf-8"))
+    seal = json.loads((output / "prediction-seal.json").read_text(encoding="utf-8"))
+    for evidence in (plan, seal):
+        assert evidence["restricted_execution"] is False
+        assert evidence["ephemeral_execution"] is False
+        assert evidence["local_model_used"] is False
+    assert seal["external_call_count"] == 0
 
     score = challenge.score_public_challenge(
         fixture["manifest"],
