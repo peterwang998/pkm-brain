@@ -25,6 +25,13 @@ from pkm_brain.gmail_temporal_event_identity import (
     resolve_gmail_temporal_event_identity,
     validate_gmail_temporal_event_identity_resolution,
 )
+from pkm_brain.gmail_temporal_event_identity_consumers import (
+    GmailTemporalEventIdentityConsumerError,
+    GmailTemporalEventIdentitySourceText,
+    bind_gmail_temporal_event_identity_unit_surfaces,
+    build_gmail_temporal_event_identity_pair_requests,
+    build_gmail_temporal_verified_event_bindings,
+)
 from pkm_brain.gmail_temporal_frontier import (
     GmailTemporalCandidateEnsembleVerdictSet,
     GmailTemporalCandidatePagePlan,
@@ -56,6 +63,10 @@ from pkm_brain.gmail_temporal_thread_lifecycle import (
     GmailTemporalThreadMessageReview,
     GmailTemporalThreadSnapshotAuthority,
     project_gmail_temporal_thread_lifecycle,
+)
+from pkm_brain.gmail_temporal_thread_retrieval_experiment import (
+    GmailTemporalThreadEvidence,
+    plan_gmail_temporal_thread_retrieval_experiment,
 )
 
 
@@ -297,6 +308,24 @@ def _analysis_authorities(
     )
 
 
+def _source_text_authorities(
+    messages: tuple[GmailTemporalThreadMessageReview, ...],
+    texts: tuple[str, ...],
+) -> tuple[GmailTemporalEventIdentitySourceText, ...]:
+    assert len(messages) == len(texts)
+    return tuple(
+        GmailTemporalEventIdentitySourceText(
+            version="gmail_temporal_event_identity_source_text_v1",
+            gmail_account_key=message.source.gmail_account_key,
+            gmail_thread_id=message.source.gmail_thread_id,
+            gmail_message_id=message.source.gmail_message_id,
+            source_sha256=message.source.source_sha256,
+            text=text,
+        )
+        for message, text in zip(messages, texts, strict=True)
+    )
+
+
 def _resolve(
     plan: GmailTemporalEventIdentityPlan,
     verdicts: Mapping[str, str],
@@ -383,6 +412,11 @@ def _with_subject_type_references(
     hypothesis: GmailTemporalReviewHypothesis,
     references: tuple[tuple[str, str], ...],
 ) -> GmailTemporalReviewHypothesis:
+    replacement_types = dict(references)
+    alias_references = tuple(
+        (mention_id, replacement_types.get(mention_id, mention_type))
+        for mention_id, mention_type in hypothesis.subject_alias_type_references
+    )
     signature = (
         hypothesis.expression_id,
         hypothesis.relation,
@@ -391,9 +425,11 @@ def _with_subject_type_references(
         hypothesis.normalized_value,
     )
     material = {
-        "version": "gmail_temporal_review_hypothesis_v2",
+        "version": "gmail_temporal_review_hypothesis_v3",
         "signature": signature,
         "subject_type_references": references,
+        "subject_alias_type_references": alias_references,
+        "canonical_subject_mention_id": hypothesis.canonical_subject_mention_id,
     }
     return replace(
         hypothesis,
@@ -407,6 +443,7 @@ def _with_subject_type_references(
             ).encode("utf-8")
         ).hexdigest(),
         subject_type_references=references,
+        subject_alias_type_references=alias_references,
     )
 
 
@@ -655,6 +692,62 @@ def test_normal_interview_event_remains_an_identity_unit() -> None:
         plan.units[0].hypothesis_id
         == projection.artifacts[0].hypotheses[0].hypothesis_id
     )
+
+
+def test_event_identity_unit_consumes_canonical_aliases_without_losing_evidence() -> (
+    None
+):
+    text = "The Northstar design review is scheduled for October 2, 2027."
+
+    def select_generic_event(
+        candidates: tuple[GmailTemporalVerificationCandidate, ...],
+    ) -> dict[str, str]:
+        candidate = next(item for item in candidates if not item.requires_defer)
+        return {candidate.candidate_id: "supported"}
+
+    projection = _projection(
+        text,
+        select_generic_event,
+        internal_at="2027-08-01T09:00:00-07:00",
+        chunk_id="eventhood-canonical-title",
+    )
+    plan = _plan(
+        (
+            _message(
+                order=1,
+                provider_message_id="eventhood-canonical-title",
+                projection=projection,
+                internal_at="2027-08-01T09:00:00-07:00",
+                start_offset=0,
+            ),
+        )
+    )
+    analysis = _ANALYSIS_AUTHORITIES[projection.analysis_fingerprint]
+    surfaces = {
+        mention.mention_id: text[mention.start : mention.end]
+        for mention in analysis.mentions
+    }
+    hypothesis = projection.artifacts[0].hypotheses[0]
+
+    assert len(plan.units) == 1
+    unit = plan.units[0]
+    assert unit.version == "gmail_temporal_event_identity_unit_v3"
+    assert plan.version == "gmail_temporal_event_identity_plan_v3"
+    assert unit.subject_mention_ids == hypothesis.subject_mention_ids
+    assert unit.subject_type_references == hypothesis.subject_type_references
+    assert {surfaces[value] for value in unit.subject_mention_ids} == {"review"}
+    assert unit.subject_alias_mention_ids == hypothesis.subject_alias_mention_ids
+    assert unit.subject_alias_type_references == (
+        hypothesis.subject_alias_type_references
+    )
+    assert {surfaces[value] for value in unit.subject_alias_mention_ids} == {
+        "review",
+        "Northstar design review",
+    }
+    assert unit.canonical_subject_mention_id == (
+        hypothesis.canonical_subject_mention_id
+    )
+    assert surfaces[unit.canonical_subject_mention_id] == "Northstar design review"
 
 
 def test_event_predicate_transition_remains_an_identity_unit() -> None:
@@ -1760,3 +1853,387 @@ def test_incomplete_stale_and_conflicting_external_sets_fail_closed() -> None:
             plan=plan,
             verdict_sets=sets[:2],
         )
+
+
+def test_c2_pair_request_uses_full_title_without_rewriting_selected_evidence() -> None:
+    text = (
+        "The Lumen Quay planning session has been rescheduled to "
+        "September 22, 2027 from September 19, 2027. "
+        "The room is unchanged."
+    )
+
+    def select_generic_reschedule_endpoint(
+        candidates: tuple[GmailTemporalVerificationCandidate, ...],
+    ) -> dict[str, str]:
+        candidate = next(
+            item
+            for item in candidates
+            if item.lifecycle in {"rescheduled_old", "rescheduled_replacement"}
+            and not item.requires_defer
+        )
+        return {candidate.candidate_id: "supported"}
+
+    projection = _projection(
+        text,
+        select_generic_reschedule_endpoint,
+        internal_at="2027-09-01T09:00:00-07:00",
+        chunk_id="consumer-c2",
+    )
+    pairs = (
+        _message(
+            order=1,
+            provider_message_id="consumer-c2",
+            projection=projection,
+            internal_at="2027-09-01T09:00:00-07:00",
+            start_offset=0,
+        ),
+    )
+    snapshot, messages = _snapshot(pairs)
+    analyses = _analysis_authorities(messages)
+    plan = plan_gmail_temporal_event_identity(
+        snapshot_authority=snapshot,
+        messages=messages,
+        analysis_authorities=analyses,
+    )
+    source_texts = _source_text_authorities(messages, (text,))
+
+    surfaces = bind_gmail_temporal_event_identity_unit_surfaces(
+        snapshot_authority=snapshot,
+        messages=messages,
+        analysis_authorities=analyses,
+        plan=plan,
+        source_texts=source_texts,
+    )
+
+    assert len(surfaces.units) == 2
+    for unit in surfaces.units:
+        assert {item.surface for item in unit.verifier_selected_evidence} == {"session"}
+        assert {item.surface for item in unit.deterministic_identity_aliases} == {
+            "session",
+            "Lumen Quay planning session",
+        }
+        assert unit.canonical_identity is not None
+        assert unit.canonical_identity.surface == "Lumen Quay planning session"
+
+    requests = build_gmail_temporal_event_identity_pair_requests(
+        snapshot_authority=snapshot,
+        messages=messages,
+        analysis_authorities=analyses,
+        plan=plan,
+        source_texts=source_texts,
+    )
+
+    assert len(requests) == 1
+    payload = json.loads(requests[0].payload)
+    assert payload["version"] == "gmail_temporal_event_identity_pair_request_v1"
+    assert payload["request_fingerprint"] == requests[0].request_fingerprint
+    assert len(payload["pairs"]) == 1
+    assert len(payload["units"]) == 2
+    for unit in payload["units"]:
+        assert {item["surface"] for item in unit["verifier_selected_evidence"]} == {
+            "session"
+        }
+        metadata = unit["deterministic_identity_metadata"]
+        assert metadata["authority"] == ("source_verified_non_authorizing_alias_family")
+        assert metadata["canonical_full_title"]["surface"] == (
+            "Lumen Quay planning session"
+        )
+
+
+def test_surface_adapter_rejects_source_hash_span_and_plan_tampering() -> None:
+    text = "The Northstar design review is scheduled for October 2, 2027."
+
+    def select_generic_event(
+        candidates: tuple[GmailTemporalVerificationCandidate, ...],
+    ) -> dict[str, str]:
+        candidate = next(item for item in candidates if not item.requires_defer)
+        return {candidate.candidate_id: "supported"}
+
+    projection = _projection(
+        text,
+        select_generic_event,
+        internal_at="2027-09-01T09:00:00-07:00",
+        chunk_id="consumer-tamper",
+    )
+    pairs = (
+        _message(
+            order=1,
+            provider_message_id="consumer-tamper",
+            projection=projection,
+            internal_at="2027-09-01T09:00:00-07:00",
+            start_offset=0,
+        ),
+    )
+    snapshot, messages = _snapshot(pairs)
+    analyses = _analysis_authorities(messages)
+    plan = plan_gmail_temporal_event_identity(
+        snapshot_authority=snapshot,
+        messages=messages,
+        analysis_authorities=analyses,
+    )
+    source_texts = _source_text_authorities(messages, (text,))
+
+    with pytest.raises(
+        GmailTemporalEventIdentityConsumerError,
+        match="source text",
+    ):
+        bind_gmail_temporal_event_identity_unit_surfaces(
+            snapshot_authority=snapshot,
+            messages=messages,
+            analysis_authorities=analyses,
+            plan=plan,
+            source_texts=(replace(source_texts[0], text=text + " altered"),),
+        )
+
+    with pytest.raises(
+        GmailTemporalEventIdentityConsumerError,
+        match="source text",
+    ):
+        bind_gmail_temporal_event_identity_unit_surfaces(
+            snapshot_authority=snapshot,
+            messages=messages,
+            analysis_authorities=analyses,
+            plan=plan,
+            source_texts=(replace(source_texts[0], source_sha256="0" * 64),),
+        )
+
+    canonical_id = plan.units[0].canonical_subject_mention_id
+    assert canonical_id is not None
+    mention_index = next(
+        index
+        for index, mention in enumerate(analyses[0].mentions)
+        if mention.mention_id == canonical_id
+    )
+    changed_mentions = list(analyses[0].mentions)
+    changed_mentions[mention_index] = replace(
+        changed_mentions[mention_index],
+        start=changed_mentions[mention_index].start + 1,
+    )
+    with pytest.raises(
+        GmailTemporalEventIdentityConsumerError,
+        match="source authority",
+    ):
+        bind_gmail_temporal_event_identity_unit_surfaces(
+            snapshot_authority=snapshot,
+            messages=messages,
+            analysis_authorities=(
+                replace(analyses[0], mentions=tuple(changed_mentions)),
+            ),
+            plan=plan,
+            source_texts=source_texts,
+        )
+
+    with pytest.raises(
+        GmailTemporalEventIdentityConsumerError,
+        match="current thread inputs",
+    ):
+        bind_gmail_temporal_event_identity_unit_surfaces(
+            snapshot_authority=snapshot,
+            messages=messages,
+            analysis_authorities=analyses,
+            plan=replace(plan, plan_fingerprint="gteip_stale"),
+            source_texts=source_texts,
+        )
+
+
+def test_missing_canonical_exports_no_generic_retrieval_alias() -> None:
+    text = "The meeting is scheduled for October 2, 2027."
+
+    def select_generic_event(
+        candidates: tuple[GmailTemporalVerificationCandidate, ...],
+    ) -> dict[str, str]:
+        candidate = next(item for item in candidates if not item.requires_defer)
+        return {candidate.candidate_id: "supported"}
+
+    projection = _projection(
+        text,
+        select_generic_event,
+        internal_at="2027-09-01T09:00:00-07:00",
+        chunk_id="consumer-no-canonical",
+    )
+    pairs = (
+        _message(
+            order=1,
+            provider_message_id="consumer-no-canonical",
+            projection=projection,
+            internal_at="2027-09-01T09:00:00-07:00",
+            start_offset=0,
+        ),
+    )
+    snapshot, messages = _snapshot(pairs)
+    analyses = _analysis_authorities(messages)
+    plan = plan_gmail_temporal_event_identity(
+        snapshot_authority=snapshot,
+        messages=messages,
+        analysis_authorities=analyses,
+    )
+    source_texts = _source_text_authorities(messages, (text,))
+    surfaces = bind_gmail_temporal_event_identity_unit_surfaces(
+        snapshot_authority=snapshot,
+        messages=messages,
+        analysis_authorities=analyses,
+        plan=plan,
+        source_texts=source_texts,
+    )
+    resolution = _resolve(plan, {})
+
+    assert len(surfaces.units) == 1
+    assert surfaces.units[0].canonical_identity is None
+    assert (
+        build_gmail_temporal_verified_event_bindings(
+            snapshot_authority=snapshot,
+            messages=messages,
+            analysis_authorities=analyses,
+            plan=plan,
+            resolution=resolution,
+            source_texts=source_texts,
+        )
+        == ()
+    )
+
+
+def test_distinct_named_events_remain_isolated_in_retrieval_bindings() -> None:
+    texts = (
+        "The Northstar design review is scheduled for October 2, 2027.",
+        "The Lumen Quay planning session is scheduled for October 3, 2027.",
+    )
+
+    def select_generic_event(
+        candidates: tuple[GmailTemporalVerificationCandidate, ...],
+    ) -> dict[str, str]:
+        candidate = next(item for item in candidates if not item.requires_defer)
+        return {candidate.candidate_id: "supported"}
+
+    projections = tuple(
+        _projection(
+            text,
+            select_generic_event,
+            internal_at=f"2027-09-0{index}T09:00:00-07:00",
+            chunk_id=f"consumer-distinct-{index}",
+        )
+        for index, text in enumerate(texts, start=1)
+    )
+    pairs = tuple(
+        _message(
+            order=index,
+            provider_message_id=f"consumer-distinct-{index}",
+            projection=projection,
+            internal_at=f"2027-09-0{index}T09:00:00-07:00",
+            start_offset=(index - 1) * 1_000,
+        )
+        for index, projection in enumerate(projections, start=1)
+    )
+    snapshot, messages = _snapshot(pairs)
+    analyses = _analysis_authorities(messages)
+    plan = plan_gmail_temporal_event_identity(
+        snapshot_authority=snapshot,
+        messages=messages,
+        analysis_authorities=analyses,
+    )
+    resolution = _resolve(plan, _uniform_verdicts(plan, "different_event"))
+    bindings = build_gmail_temporal_verified_event_bindings(
+        snapshot_authority=snapshot,
+        messages=messages,
+        analysis_authorities=analyses,
+        plan=plan,
+        resolution=resolution,
+        source_texts=_source_text_authorities(messages, texts),
+    )
+
+    assert len(bindings) == 2
+    assert {item.aliases for item in bindings} == {
+        ("Northstar design review",),
+        ("Lumen Quay planning session",),
+    }
+    assert all("review" not in item.aliases for item in bindings)
+    assert all("session" not in item.aliases for item in bindings)
+    assert len({item.event_identity_key for item in bindings}) == 2
+
+
+def test_c4_canonical_binding_matches_retrieval_query_and_attaches_context() -> None:
+    text = "The Northstar design review is scheduled for October 2, 2027."
+
+    def select_generic_event(
+        candidates: tuple[GmailTemporalVerificationCandidate, ...],
+    ) -> dict[str, str]:
+        candidate = next(item for item in candidates if not item.requires_defer)
+        return {candidate.candidate_id: "supported"}
+
+    projection = _projection(
+        text,
+        select_generic_event,
+        internal_at="2027-09-01T09:00:00-07:00",
+        chunk_id="consumer-c4",
+    )
+    pairs = (
+        _message(
+            order=1,
+            provider_message_id="consumer-c4",
+            projection=projection,
+            internal_at="2027-09-01T09:00:00-07:00",
+            start_offset=0,
+        ),
+    )
+    snapshot, messages = _snapshot(pairs)
+    analyses = _analysis_authorities(messages)
+    plan = plan_gmail_temporal_event_identity(
+        snapshot_authority=snapshot,
+        messages=messages,
+        analysis_authorities=analyses,
+    )
+    resolution = _resolve(plan, {})
+    bindings = build_gmail_temporal_verified_event_bindings(
+        snapshot_authority=snapshot,
+        messages=messages,
+        analysis_authorities=analyses,
+        plan=plan,
+        resolution=resolution,
+        source_texts=_source_text_authorities(messages, (text,)),
+    )
+
+    assert len(bindings) == 1
+    assert bindings[0].aliases == ("Northstar design review",)
+    evidence = (
+        GmailTemporalThreadEvidence(
+            evidence_id="northstar-anchor",
+            gmail_account_scope_id="account-a",
+            gmail_provider_thread_id="northstar-thread",
+            available_at="2027-09-01T12:00:00Z",
+            message_ordinal=1,
+            text=(
+                "Subject: Northstar design review\n\n"
+                "Northstar design review was booked for October 2, 2027."
+            ),
+            verified_event_bindings=bindings,
+        ),
+        GmailTemporalThreadEvidence(
+            evidence_id="northstar-update",
+            gmail_account_scope_id="account-a",
+            gmail_provider_thread_id="northstar-thread",
+            available_at="2027-09-02T12:00:00Z",
+            message_ordinal=2,
+            text=(
+                "Subject: Northstar design review\n\n"
+                "Northstar design review was cancelled."
+            ),
+            verified_event_bindings=bindings,
+        ),
+        GmailTemporalThreadEvidence(
+            evidence_id="noise",
+            gmail_account_scope_id="account-a",
+            gmail_provider_thread_id="noise-thread",
+            available_at="2027-09-02T12:00:00Z",
+            message_ordinal=1,
+            text="Subject: Routine note\n\nGeneral information.",
+        ),
+    )
+    retrieval = plan_gmail_temporal_thread_retrieval_experiment(
+        query="What is the latest status of the Northstar design review?",
+        temporal_intent="lifecycle",
+        source_available_as_of="2027-10-31T00:00:00Z",
+        baseline_ranked_evidence_ids=("northstar-anchor", "noise"),
+        evidence_sources=evidence,
+    )
+
+    assert retrieval.target_event_identity_key == bindings[0].event_identity_key
+    assert retrieval.verified_context_evidence_ids == ("northstar-update",)

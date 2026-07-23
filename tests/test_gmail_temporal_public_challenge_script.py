@@ -209,6 +209,8 @@ def _fixture(tmp_path: Path, *, all_zero_work: bool = False) -> dict[str, Path]:
                         "relation": "occurrence",
                         "lifecycle": "scheduled",
                         "value": "2027-09-20",
+                        "expected_verdict": "supported",
+                        "canonical_subject_required": True,
                     }
                 ],
             },
@@ -466,9 +468,142 @@ def test_success_seals_all_three_runs_before_results_and_keeps_files_private(
     assert score["operator_asserted_evaluation_mode"] == "blind_first_use"
     assert score["first_use_blindness_claimed"] is True
     assert score["selected_negative_cases"] == 0
+    assert score["canonical_subject_members"] == 1
+    assert score["canonical_subject_members_recovered"] == 0
+    assert score["canonical_subject_recall"] == 0.0
+    assert score["cases"][0]["canonical_subject_members"] == 1
+    assert score["cases"][0]["canonical_subject_members_recovered"] == 0
+    assert score["gates"]["all_canonical_subjects_recovered"] is False
     assert score["smoke_gate_passed"] is False
     assert score["test_invoker_used"] is True
     assert (output / "score.json").is_file()
+    signed_score = json.loads((output / "score.json").read_text(encoding="utf-8"))
+    assert signed_score["canonical_subject_members"] == 1
+    assert signed_score["canonical_subject_members_recovered"] == 0
+    assert signed_score["canonical_subject_recall"] == 0.0
+    assert signed_score["cases"][0]["canonical_subject_members"] == 1
+    assert signed_score["cases"][0]["canonical_subject_members_recovered"] == 0
+    assert signed_score["gates"]["all_canonical_subjects_recovered"] is False
+
+
+def test_scorer_upgrade_accepts_authenticated_prior_prediction_launcher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(tmp_path)
+    output = tmp_path / "prior-launcher-run"
+    current_hashes = challenge._source_hashes()  # noqa: SLF001
+    prior_artifact = tmp_path / "reviewed-prior-launcher.py"
+    prior_artifact.write_bytes(b"# exact reviewed prior launcher artifact\n")
+    prior_artifact.chmod(0o600)
+    prior_sha256 = hashlib.sha256(prior_artifact.read_bytes()).hexdigest()
+    prior_hashes = {**current_hashes, "launcher": prior_sha256}
+
+    with monkeypatch.context() as run_patch:
+        run_patch.setattr(challenge, "_source_hashes", lambda: prior_hashes)
+        challenge.run_public_challenge(
+            fixture["manifest"],
+            fixture["key"],
+            output,
+            invoke=FakeCodex(),
+            test_only_allow_injected_invoker=True,
+        )
+
+    score = challenge.score_public_challenge(
+        fixture["manifest"],
+        fixture["gold"],
+        fixture["key"],
+        output,
+        evaluation_mode="development_replay",
+        prediction_launcher_artifact=prior_artifact,
+    )
+    signed_score = json.loads((output / "score.json").read_text(encoding="utf-8"))
+
+    for value in (score, signed_score):
+        assert value["prediction_launcher_sha256"] == prior_sha256
+        assert value["prediction_launcher_trust_basis"] == (
+            "exact_prior_launcher_artifact"
+        )
+        assert value["prediction_launcher_exact_artifact_verified"] is True
+        assert value["scorer_sha256"] == current_hashes["launcher"]
+
+
+@pytest.mark.parametrize(
+    "source_name",
+    ("launcher", "production_runner", "shared_external_runner"),
+)
+def test_scorer_upgrade_rejects_authenticated_unknown_prediction_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_name: str,
+) -> None:
+    fixture = _fixture(tmp_path)
+    output = tmp_path / f"unknown-{source_name}-run"
+    simulated_hashes = {
+        **challenge._source_hashes(),  # noqa: SLF001
+        source_name: "1" * 64,
+    }
+
+    with monkeypatch.context() as run_patch:
+        run_patch.setattr(challenge, "_source_hashes", lambda: simulated_hashes)
+        challenge.run_public_challenge(
+            fixture["manifest"],
+            fixture["key"],
+            output,
+            invoke=FakeCodex(),
+            test_only_allow_injected_invoker=True,
+        )
+
+    with pytest.raises(challenge.PublicChallengeError, match="provenance"):
+        challenge.score_public_challenge(
+            fixture["manifest"],
+            fixture["gold"],
+            fixture["key"],
+            output,
+            evaluation_mode="development_replay",
+        )
+
+    assert not (output / "score.json").exists()
+
+
+def test_scorer_upgrade_rejects_wrong_prior_launcher_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(tmp_path)
+    output = tmp_path / "wrong-prior-launcher-run"
+    expected = tmp_path / "expected-prior-launcher.py"
+    expected.write_bytes(b"# expected prior launcher\n")
+    expected.chmod(0o600)
+    wrong = tmp_path / "wrong-prior-launcher.py"
+    wrong.write_bytes(b"# tampered prior launcher\n")
+    wrong.chmod(0o600)
+    simulated_hashes = {
+        **challenge._source_hashes(),  # noqa: SLF001
+        "launcher": hashlib.sha256(expected.read_bytes()).hexdigest(),
+    }
+
+    with monkeypatch.context() as run_patch:
+        run_patch.setattr(challenge, "_source_hashes", lambda: simulated_hashes)
+        challenge.run_public_challenge(
+            fixture["manifest"],
+            fixture["key"],
+            output,
+            invoke=FakeCodex(),
+            test_only_allow_injected_invoker=True,
+        )
+
+    with pytest.raises(challenge.PublicChallengeError, match="provenance"):
+        challenge.score_public_challenge(
+            fixture["manifest"],
+            fixture["gold"],
+            fixture["key"],
+            output,
+            evaluation_mode="development_replay",
+            prediction_launcher_artifact=wrong,
+        )
+
+    assert not (output / "score.json").exists()
 
 
 def test_all_zero_work_challenge_scores_as_zero_recall_without_calls(
@@ -520,6 +655,9 @@ def test_all_zero_work_challenge_scores_as_zero_recall_without_calls(
     assert score["matched_members"] == 0
     assert score["effective_member_recall"] == 0.0
     assert score["confirmed_member_recall"] == 0.0
+    assert score["canonical_subject_members"] == 1
+    assert score["canonical_subject_members_recovered"] == 0
+    assert score["canonical_subject_recall"] == 0.0
     assert score["supported_artifact_precision"] == 0.0
     assert score["review_output_precision"] == 0.0
     assert score["selected_negative_cases"] == 0

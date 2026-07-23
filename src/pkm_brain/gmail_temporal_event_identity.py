@@ -28,11 +28,11 @@ from .gmail_temporal_thread_lifecycle import (
 )
 
 
-_UNIT_VERSION = "gmail_temporal_event_identity_unit_v2"
-_UNIT_AUTHORITY_VERSION = "gmail_temporal_event_identity_unit_authority_v2"
+_UNIT_VERSION = "gmail_temporal_event_identity_unit_v3"
+_UNIT_AUTHORITY_VERSION = "gmail_temporal_event_identity_unit_authority_v3"
 _PAIR_VERSION = "gmail_temporal_event_identity_pair_v2"
 _PAGE_VERSION = "gmail_temporal_event_identity_page_v2"
-_PLAN_VERSION = "gmail_temporal_event_identity_plan_v2"
+_PLAN_VERSION = "gmail_temporal_event_identity_plan_v3"
 _VERDICT_SET_VERSION = "gmail_temporal_event_identity_verdict_set_v2"
 _PAIR_CONSENSUS_VERSION = "gmail_temporal_event_identity_pair_consensus_v2"
 _CLUSTER_VERSION = "gmail_temporal_event_identity_cluster_v2"
@@ -63,7 +63,7 @@ class GmailTemporalEventIdentityError(ValueError):
 class GmailTemporalEventIdentityUnit:
     """One exact artifact/hypothesis bound to immutable message authority."""
 
-    version: Literal["gmail_temporal_event_identity_unit_v2"]
+    version: Literal["gmail_temporal_event_identity_unit_v3"]
     unit_id: str
     message_order: int
     message_authority_fingerprint: str
@@ -75,6 +75,9 @@ class GmailTemporalEventIdentityUnit:
     hypothesis_id: str
     subject_mention_ids: tuple[str, ...]
     subject_type_references: tuple[tuple[str, str], ...]
+    subject_alias_mention_ids: tuple[str, ...]
+    subject_alias_type_references: tuple[tuple[str, str], ...]
+    canonical_subject_mention_id: str | None
     relation: str
     kind: str
     lifecycle: str
@@ -111,7 +114,7 @@ class GmailTemporalEventIdentityPage:
 class GmailTemporalEventIdentityPlan:
     """Complete bounded cross-unit comparison authority."""
 
-    version: Literal["gmail_temporal_event_identity_plan_v2"]
+    version: Literal["gmail_temporal_event_identity_plan_v3"]
     plan_fingerprint: str
     thread_authority_fingerprint: str
     authorized_prior_resolution_fingerprint: str | None
@@ -283,6 +286,9 @@ def _bind_analysis_authorities(
                     hypothesis.expression_id not in expression_ids
                     or not set(hypothesis.lifecycle_mention_ids).issubset(mention_ids)
                     or not set(hypothesis.subject_mention_ids).issubset(mention_ids)
+                    or not set(hypothesis.subject_alias_mention_ids).issubset(
+                        mention_ids
+                    )
                 ):
                     raise GmailTemporalEventIdentityError(
                         "identity projection exceeds its analysis authority"
@@ -291,12 +297,30 @@ def _bind_analysis_authorities(
                     (mention_id, subject_types[mention_id])
                     for mention_id in hypothesis.subject_mention_ids
                 )
+                expected_alias_references = tuple(
+                    (mention_id, subject_types[mention_id])
+                    for mention_id in hypothesis.subject_alias_mention_ids
+                )
                 if (
                     any(
                         mention_type not in GMAIL_TEMPORAL_SUBJECT_TYPES
                         for _, mention_type in expected_references
                     )
                     or hypothesis.subject_type_references != expected_references
+                    or hypothesis.subject_alias_type_references
+                    != expected_alias_references
+                    or not set(hypothesis.subject_mention_ids).issubset(
+                        hypothesis.subject_alias_mention_ids
+                    )
+                    or (
+                        hypothesis.canonical_subject_mention_id is not None
+                        and (
+                            hypothesis.canonical_subject_mention_id
+                            not in hypothesis.subject_alias_mention_ids
+                            or subject_types[hypothesis.canonical_subject_mention_id]
+                            != "event_title_candidate"
+                        )
+                    )
                 ):
                     raise GmailTemporalEventIdentityError(
                         "identity projection subject types do not match analysis authority"
@@ -376,10 +400,15 @@ def plan_gmail_temporal_event_identity(
                     (mention_id, authoritative_subject_types[mention_id])
                     for mention_id in hypothesis.subject_mention_ids
                 )
+                subject_alias_type_references = tuple(
+                    (mention_id, authoritative_subject_types[mention_id])
+                    for mention_id in hypothesis.subject_alias_mention_ids
+                )
                 if not _is_event_identity_hypothesis(
                     artifact_id=artifact.artifact_id,
                     hypothesis=hypothesis,
                     subject_type_references=subject_type_references,
+                    subject_alias_type_references=subject_alias_type_references,
                     structural_event_artifact_ids=structural_event_artifact_ids,
                 ):
                     continue
@@ -396,6 +425,7 @@ def plan_gmail_temporal_event_identity(
                     artifact=artifact,
                     hypothesis=hypothesis,
                     subject_type_references=subject_type_references,
+                    subject_alias_type_references=subject_alias_type_references,
                 )
                 units.append(unit)
     if len(units) > MAX_EVENT_IDENTITY_UNITS:
@@ -434,7 +464,7 @@ def plan_gmail_temporal_event_identity(
         "routable": False,
     }
     plan = GmailTemporalEventIdentityPlan(
-        version="gmail_temporal_event_identity_plan_v2",
+        version="gmail_temporal_event_identity_plan_v3",
         plan_fingerprint="gteip_"
         + hashlib.sha256(_canonical_bytes(material)).hexdigest(),
         thread_authority_fingerprint=authority_fingerprint,
@@ -834,14 +864,23 @@ def _is_event_identity_hypothesis(
     artifact_id: str,
     hypothesis: GmailTemporalReviewHypothesis,
     subject_type_references: tuple[tuple[str, str], ...],
+    subject_alias_type_references: tuple[tuple[str, str], ...],
     structural_event_artifact_ids: set[str],
 ) -> bool:
     subject_types = {mention_type for _, mention_type in subject_type_references}
+    alias_types = {mention_type for _, mention_type in subject_alias_type_references}
     if (
         not subject_types
         or not subject_types.issubset(_EVENT_CENTERED_SUBJECT_TYPES)
+        or not alias_types
+        or not alias_types.issubset(_EVENT_CENTERED_SUBJECT_TYPES)
         or {mention_id for mention_id, _ in subject_type_references}
         != set(hypothesis.subject_mention_ids)
+        or {mention_id for mention_id, _ in subject_alias_type_references}
+        != set(hypothesis.subject_alias_mention_ids)
+        or not set(hypothesis.subject_mention_ids).issubset(
+            hypothesis.subject_alias_mention_ids
+        )
     ):
         return False
     if hypothesis.relation == "deadline":
@@ -869,6 +908,7 @@ def _event_unit(
     artifact: GmailTemporalReviewArtifact,
     hypothesis: GmailTemporalReviewHypothesis,
     subject_type_references: tuple[tuple[str, str], ...],
+    subject_alias_type_references: tuple[tuple[str, str], ...],
 ) -> GmailTemporalEventIdentityUnit:
     unit_id = gmail_temporal_event_identity_unit_id(
         source_anchor=source_anchor,
@@ -884,7 +924,7 @@ def _event_unit(
         "hypothesis": asdict(hypothesis),
     }
     return GmailTemporalEventIdentityUnit(
-        version="gmail_temporal_event_identity_unit_v2",
+        version="gmail_temporal_event_identity_unit_v3",
         unit_id=unit_id,
         message_order=message_order,
         message_authority_fingerprint=message_authority_fingerprint,
@@ -898,6 +938,9 @@ def _event_unit(
         hypothesis_id=hypothesis.hypothesis_id,
         subject_mention_ids=hypothesis.subject_mention_ids,
         subject_type_references=subject_type_references,
+        subject_alias_mention_ids=hypothesis.subject_alias_mention_ids,
+        subject_alias_type_references=subject_alias_type_references,
+        canonical_subject_mention_id=hypothesis.canonical_subject_mention_id,
         relation=hypothesis.relation,
         kind=hypothesis.kind,
         lifecycle=hypothesis.lifecycle,
@@ -947,6 +990,52 @@ def _event_page(
         ),
         pair_ids=pair_ids,
     )
+
+
+def _identity_unit_subjects_are_valid(
+    item: GmailTemporalEventIdentityUnit,
+) -> bool:
+    references = item.subject_alias_type_references
+    if (
+        not isinstance(item.subject_alias_mention_ids, tuple)
+        or not item.subject_alias_mention_ids
+        or item.subject_alias_mention_ids
+        != tuple(sorted(item.subject_alias_mention_ids))
+        or len(item.subject_alias_mention_ids)
+        != len(set(item.subject_alias_mention_ids))
+        or not set(item.subject_mention_ids).issubset(item.subject_alias_mention_ids)
+        or not isinstance(references, tuple)
+        or not references
+        or any(
+            not isinstance(reference, tuple)
+            or len(reference) != 2
+            or not isinstance(reference[0], str)
+            or not reference[0]
+            or not isinstance(reference[1], str)
+            or reference[1] not in _EVENT_CENTERED_SUBJECT_TYPES
+            for reference in references
+        )
+    ):
+        return False
+    if (
+        references != tuple(sorted(references))
+        or tuple(reference[0] for reference in references)
+        != item.subject_alias_mention_ids
+    ):
+        return False
+    alias_types = dict(references)
+    if any(
+        alias_types.get(mention_id) != mention_type
+        for mention_id, mention_type in item.subject_type_references
+    ):
+        return False
+    title_ids = tuple(
+        mention_id
+        for mention_id in item.subject_alias_mention_ids
+        if alias_types[mention_id] == "event_title_candidate"
+    )
+    expected_canonical = title_ids[0] if len(title_ids) == 1 else None
+    return item.canonical_subject_mention_id == expected_canonical
 
 
 def _validate_plan(plan: GmailTemporalEventIdentityPlan) -> None:
@@ -1001,6 +1090,7 @@ def _validate_plan(plan: GmailTemporalEventIdentityPlan) -> None:
         )
         or tuple(reference[0] for reference in item.subject_type_references)
         != item.subject_mention_ids
+        or not _identity_unit_subjects_are_valid(item)
         or item.candidate_authorization is not False
         or item.requires_defer is not True
         or item.routable is not False

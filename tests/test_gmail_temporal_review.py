@@ -223,6 +223,20 @@ def _select_all_same_signature_aliases(
     }
 
 
+def _select_generic_event_supported(
+    _expression_id: str,
+    analysis: TemporalLeadAnalysis,
+    candidates: tuple[GmailTemporalVerificationCandidate, ...],
+) -> dict[str, str]:
+    mention_types = {
+        mention.mention_id: mention.mention_type for mention in analysis.mentions
+    }
+    candidate = next(
+        item for item in candidates if mention_types[item.subject_mention_id] == "event"
+    )
+    return {candidate.candidate_id: "supported"}
+
+
 def _refingerprinted(
     projection: GmailTemporalReviewProjection,
 ) -> GmailTemporalReviewProjection:
@@ -252,9 +266,11 @@ def _with_subject_type_references(
         hypothesis.normalized_value,
     )
     material = {
-        "version": "gmail_temporal_review_hypothesis_v2",
+        "version": "gmail_temporal_review_hypothesis_v3",
         "signature": signature,
         "subject_type_references": references,
+        "subject_alias_type_references": (hypothesis.subject_alias_type_references),
+        "canonical_subject_mention_id": hypothesis.canonical_subject_mention_id,
     }
     return replace(
         hypothesis,
@@ -327,6 +343,198 @@ def test_single_projection_is_canonical_content_free_and_always_deferred() -> No
         gmail_temporal_review_projection_payload(projection)["projection_fingerprint"]
         == projection.projection_fingerprint
     )
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_bare", "expected_title", "expected_artifacts"),
+    (
+        (
+            (
+                "The Lumen Quay planning session has been rescheduled to "
+                "September 22, 2027 from September 19, 2027. "
+                "The room is unchanged."
+            ),
+            "session",
+            "Lumen Quay planning session",
+            2,
+        ),
+        (
+            "The Northstar design review is scheduled for October 2, 2027.",
+            "review",
+            "Northstar design review",
+            1,
+        ),
+    ),
+)
+def test_supported_generic_event_preserves_evidence_and_promotes_unique_title_identity(
+    text: str,
+    expected_bare: str,
+    expected_title: str,
+    expected_artifacts: int,
+) -> None:
+    analysis, _, _, projection = _fixture(
+        text,
+        _select_generic_event_supported,
+        chunk_id=f"review-canonical-title-{expected_bare}",
+    )
+    surfaces = {
+        mention.mention_id: text[mention.start : mention.end]
+        for mention in analysis.mentions
+    }
+
+    assert projection.version == "gmail_temporal_review_projection_v3"
+    assert len(projection.artifacts) == expected_artifacts
+    for artifact in projection.artifacts:
+        hypothesis = artifact.hypotheses[0]
+        assert hypothesis.version == "gmail_temporal_review_hypothesis_v3"
+        assert {surfaces[value] for value in hypothesis.subject_mention_ids} == {
+            expected_bare
+        }
+        assert {surfaces[value] for value in hypothesis.subject_alias_mention_ids} == {
+            expected_bare,
+            expected_title,
+        }
+        assert hypothesis.canonical_subject_mention_id not in (
+            *hypothesis.subject_mention_ids,
+            None,
+        )
+        assert surfaces[hypothesis.canonical_subject_mention_id] == expected_title
+        assert (
+            tuple(mention_id for mention_id, _ in hypothesis.subject_type_references)
+            == hypothesis.subject_mention_ids
+        )
+        assert (
+            tuple(
+                mention_id for mention_id, _ in hypothesis.subject_alias_type_references
+            )
+            == hypothesis.subject_alias_mention_ids
+        )
+
+        signature = (
+            hypothesis.expression_id,
+            hypothesis.relation,
+            hypothesis.kind,
+            hypothesis.lifecycle,
+            hypothesis.normalized_value,
+        )
+        legacy_id = (
+            "gtrh_"
+            + hashlib.sha256(
+                json.dumps(
+                    {
+                        "version": "gmail_temporal_review_hypothesis_v2",
+                        "signature": signature,
+                        "subject_type_references": hypothesis.subject_type_references,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+        )
+        assert hypothesis.hypothesis_id != legacy_id
+
+    payload = gmail_temporal_review_projection_payload(projection)
+    serialized = payload["artifacts"][0]["hypotheses"][0]
+    assert serialized["subject_alias_mention_ids"]
+    assert serialized["subject_alias_type_references"]
+    assert serialized["canonical_subject_mention_id"]
+    assert b"subject_alias_mention_ids" in (
+        canonical_gmail_temporal_review_projection_bytes(projection)
+    )
+
+
+def test_subject_identity_canonicalization_fails_closed_for_two_named_titles() -> None:
+    aliases, references, canonical = review_module._subject_identity_metadata(  # noqa: SLF001
+        subject_mention_ids=("bare",),
+        subject_types_by_id={
+            "bare": "event",
+            "title-a": "event_title_candidate",
+            "title-b": "event_title_candidate",
+        },
+        subject_families={
+            "bare": "family-a",
+            "title-a": "family-a",
+            "title-b": "family-a",
+        },
+        subject_family_members={
+            "family-a": ("bare", "title-a", "title-b"),
+        },
+    )
+
+    assert aliases == ("bare", "title-a", "title-b")
+    assert references == (
+        ("bare", "event"),
+        ("title-a", "event_title_candidate"),
+        ("title-b", "event_title_candidate"),
+    )
+    assert canonical is None
+    assert review_module._subject_identity_references_are_valid(  # noqa: SLF001
+        subject_mention_ids=("bare",),
+        subject_type_references=(("bare", "event"),),
+        subject_alias_mention_ids=aliases,
+        subject_alias_type_references=references,
+        canonical_subject_mention_id=None,
+    )
+    assert not review_module._subject_identity_references_are_valid(  # noqa: SLF001
+        subject_mention_ids=("bare",),
+        subject_type_references=(("bare", "event"),),
+        subject_alias_mention_ids=aliases,
+        subject_alias_type_references=references,
+        canonical_subject_mention_id="title-a",
+    )
+
+
+def test_subject_identity_never_collapses_a_distinct_named_event() -> None:
+    aliases, _, canonical = review_module._subject_identity_metadata(  # noqa: SLF001
+        subject_mention_ids=("bare",),
+        subject_types_by_id={
+            "bare": "event",
+            "same-title": "event_title_candidate",
+            "different-title": "event_title_candidate",
+        },
+        subject_families={
+            "bare": "family-a",
+            "same-title": "family-a",
+            "different-title": "family-b",
+        },
+        subject_family_members={
+            "family-a": ("bare", "same-title"),
+            "family-b": ("different-title",),
+        },
+    )
+
+    assert aliases == ("bare", "same-title")
+    assert canonical == "same-title"
+
+
+def test_projection_keeps_distinct_named_event_families_separate() -> None:
+    text = (
+        "The Northstar design review is scheduled for October 2, 2027. "
+        "The Lumen Quay planning session is scheduled for October 3, 2027."
+    )
+    analysis, _, _, projection = _fixture(
+        text,
+        _select_generic_event_supported,
+        chunk_id="review-distinct-named-events",
+    )
+    surfaces = {
+        mention.mention_id: text[mention.start : mention.end]
+        for mention in analysis.mentions
+    }
+    aliases_by_value = {
+        hypothesis.normalized_value: {
+            surfaces[value] for value in hypothesis.subject_alias_mention_ids
+        }
+        for artifact in projection.artifacts
+        for hypothesis in artifact.hypotheses
+    }
+
+    assert aliases_by_value == {
+        "2027-10-02": {"review", "Northstar design review"},
+        "2027-10-03": {"session", "Lumen Quay planning session"},
+    }
+    assert len({group.subject_family_id for group in projection.groups}) == 2
 
 
 @pytest.mark.parametrize(

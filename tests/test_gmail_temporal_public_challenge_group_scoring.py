@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import sys
 from pathlib import Path
@@ -181,6 +182,7 @@ def test_gold_accepts_structured_forbidden_distinct_binding() -> None:
                             "relation": "occurrence",
                             "lifecycle": "none",
                             "value": "2027-09-25",
+                            "expected_verdict": "supported",
                         }
                     ],
                     "forbidden": [
@@ -213,6 +215,7 @@ def test_gold_rejects_alias_equivalent_structured_forbidden_binding() -> None:
                                 "relation": "occurrence",
                                 "lifecycle": "scheduled",
                                 "value": "2027-09-20",
+                                "expected_verdict": "supported",
                             }
                         ],
                         "forbidden": [
@@ -266,6 +269,276 @@ def test_subject_alias_matching_does_not_collapse_distinct_named_events(
         "Lumen Quay planning session",
         actual,
     )
+
+
+def test_supported_gold_counts_pure_uncertainty_as_effective_not_confirmed() -> None:
+    artifact = _artifact("a1", "m1", "2027-09-25")
+    member = {
+        "subject": "Marigold project debrief",
+        "relation": "occurrence",
+        "lifecycle": "none",
+        "value": "2027-09-25",
+    }
+
+    assert challenge._exact_artifact_match(  # noqa: SLF001
+        artifact,
+        member,
+        subject_surfaces={"m1": "Marigold project debrief"},
+    )
+    assert not challenge._artifacts_confirm_supported_member(  # noqa: SLF001
+        (artifact,),
+        member,
+    )
+
+    supported = {**artifact, "evidence_status": "supported"}
+    assert challenge._artifacts_confirm_supported_member(  # noqa: SLF001
+        (supported,),
+        member,
+    )
+
+
+def test_complete_production_subject_family_expands_only_its_artifact() -> None:
+    artifact = {
+        **_artifact("a1", "bare", "2027-09-22"),
+        "evidence_status": "supported",
+        "parent_cluster_id": "cluster-1",
+    }
+    analysis_fingerprint = "analysis-1"
+    family_id = (
+        "gtrsf_"
+        + hashlib.sha256(
+            challenge._canonical_json(  # noqa: SLF001
+                {
+                    "analysis_fingerprint": analysis_fingerprint,
+                    "subject_mention_ids": ["bare", "full"],
+                }
+            )
+        ).hexdigest()
+    )
+    projection = {
+        "version": challenge._LEGACY_PROJECTION_VERSION,  # noqa: SLF001
+        "analysis_fingerprint": analysis_fingerprint,
+        "artifacts": [artifact],
+        "groups": [
+            {
+                "group_id": "g1",
+                "kind": "single",
+                "coverage": "complete",
+                "subject_family_id": family_id,
+                "members": [
+                    {
+                        "role": "independent",
+                        "state": "present",
+                        "artifact_ids": ["a1"],
+                        "cluster_review_ids": [],
+                        "subject_family_ids": [family_id],
+                        "reasons": [],
+                    }
+                ],
+            }
+        ],
+    }
+    surfaces = {
+        "bare": "session",
+        "full": "Lumen Quay planning session",
+        "different": "Lumen Quay design review",
+    }
+    aliases = challenge._artifact_subject_aliases(  # noqa: SLF001
+        projection,
+        subject_surfaces=surfaces,
+        parent_cluster_subject_ids={
+            "cluster-1": frozenset({"bare", "full"}),
+        },
+    )
+    planning_member = {
+        "subject": "Lumen Quay planning session",
+        "relation": "occurrence",
+        "lifecycle": "none",
+        "value": "2027-09-22",
+    }
+
+    assert aliases == {"a1": frozenset({"session", "Lumen Quay planning session"})}
+    assert not challenge._exact_artifact_match(  # noqa: SLF001
+        artifact,
+        planning_member,
+        subject_surfaces=surfaces,
+    )
+    assert challenge._exact_artifact_match(  # noqa: SLF001
+        artifact,
+        planning_member,
+        subject_surfaces=surfaces,
+        subject_alias_surfaces=aliases["a1"],
+    )
+    assert not challenge._exact_artifact_match(  # noqa: SLF001
+        artifact,
+        {**planning_member, "subject": "Lumen Quay design review"},
+        subject_surfaces=surfaces,
+        subject_alias_surfaces=aliases["a1"],
+    )
+
+    projection["groups"][0]["coverage"] = "incomplete"
+    assert (
+        challenge._artifact_subject_aliases(  # noqa: SLF001
+            projection,
+            subject_surfaces=surfaces,
+            parent_cluster_subject_ids={
+                "cluster-1": frozenset({"bare", "full"}),
+            },
+        )
+        == {}
+    )
+
+
+def test_v3_projection_scores_only_its_exported_subject_alias_family() -> None:
+    artifact = {
+        **_artifact("a1", "bare", "2027-09-22"),
+        "evidence_status": "supported",
+    }
+    hypothesis = artifact["hypotheses"][0]
+    assert isinstance(hypothesis, dict)
+    hypothesis.update(
+        {
+            "subject_alias_mention_ids": ["bare", "full"],
+            "subject_alias_type_references": [
+                ["bare", "event_reference"],
+                ["full", "event_title_candidate"],
+            ],
+            "canonical_subject_mention_id": "full",
+        }
+    )
+    surfaces = {
+        "bare": "session",
+        "full": "Lumen Quay planning session",
+        "different": "Lumen Quay design review",
+    }
+    aliases = challenge._artifact_subject_aliases(  # noqa: SLF001
+        {
+            "version": challenge._PROJECTION_VERSION,  # noqa: SLF001
+            "artifacts": [artifact],
+        },
+        subject_surfaces=surfaces,
+        parent_cluster_subject_ids={
+            "untrusted-cluster": frozenset({"bare", "full", "different"})
+        },
+    )
+    planning_member = {
+        "subject": "Lumen Quay planning session",
+        "relation": "occurrence",
+        "lifecycle": "none",
+        "value": "2027-09-22",
+    }
+
+    assert aliases == {"a1": frozenset({"session", "Lumen Quay planning session"})}
+    assert challenge._exact_artifact_match(  # noqa: SLF001
+        artifact,
+        planning_member,
+        subject_surfaces=surfaces,
+        subject_alias_surfaces=aliases["a1"],
+    )
+    assert not challenge._exact_artifact_match(  # noqa: SLF001
+        artifact,
+        {**planning_member, "subject": "Lumen Quay design review"},
+        subject_surfaces=surfaces,
+        subject_alias_surfaces=aliases["a1"],
+    )
+
+
+def test_canonical_subject_recovery_requires_every_exact_named_title() -> None:
+    member = {
+        "subject": "Lumen Quay planning session",
+        "relation": "occurrence",
+        "lifecycle": "scheduled",
+        "value": "2027-09-22",
+        "expected_verdict": "supported",
+        "canonical_subject_required": True,
+    }
+    hypothesis = {
+        "subject_mention_ids": ["bare"],
+        "subject_alias_mention_ids": ["bare", "full"],
+        "canonical_subject_mention_id": "full",
+        "relation": "occurrence",
+        "lifecycle": "scheduled",
+        "normalized_value": "2027-09-22",
+    }
+    artifact = {"evidence_status": "supported", "hypotheses": [hypothesis]}
+    surfaces = {
+        "bare": "session",
+        "full": "Lumen Quay planning session",
+        "short": "Lumen Quay session",
+    }
+
+    assert challenge._artifacts_recover_canonical_subject(  # noqa: SLF001
+        (artifact,),
+        member,
+        subject_surfaces=surfaces,
+    )
+
+    for canonical_id in (None, "short", "missing"):
+        changed = {
+            **artifact,
+            "hypotheses": [
+                {**hypothesis, "canonical_subject_mention_id": canonical_id}
+            ],
+        }
+        assert not challenge._artifacts_recover_canonical_subject(  # noqa: SLF001
+            (changed,),
+            member,
+            subject_surfaces=surfaces,
+        )
+
+    mixed = {
+        **artifact,
+        "hypotheses": [
+            hypothesis,
+            {**hypothesis, "canonical_subject_mention_id": None},
+        ],
+    }
+    assert not challenge._artifacts_recover_canonical_subject(  # noqa: SLF001
+        (mixed,),
+        member,
+        subject_surfaces=surfaces,
+    )
+
+
+def test_canonical_subject_flag_is_current_v4_only_and_must_be_boolean() -> None:
+    member = {
+        "subject": "Lumen Quay planning session",
+        "relation": "occurrence",
+        "lifecycle": "scheduled",
+        "value": "2027-09-22",
+        "expected_verdict": "supported",
+        "canonical_subject_required": True,
+    }
+    current = {
+        "version": challenge.GOLD_VERSION,
+        "created_before_predictions": True,
+        "cases": [
+            {"case_id": "positive", "members": [member]},
+            {"case_id": "negative", "members": []},
+        ],
+    }
+
+    challenge._validate_gold(current)  # noqa: SLF001
+
+    malformed = {
+        **current,
+        "cases": [
+            {
+                "case_id": "positive",
+                "members": [{**member, "canonical_subject_required": 1}],
+            },
+            {"case_id": "negative", "members": []},
+        ],
+    }
+    with pytest.raises(challenge.PublicChallengeError, match="member schema"):
+        challenge._validate_gold(malformed)  # noqa: SLF001
+
+    legacy = {
+        **current,
+        "version": challenge.LEGACY_STRUCTURED_GOLD_VERSION,
+    }
+    with pytest.raises(challenge.PublicChallengeError, match="member schema"):
+        challenge._validate_gold(legacy)  # noqa: SLF001
 
 
 def test_structural_component_keys_keep_independent_groups_separate() -> None:

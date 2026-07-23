@@ -19,6 +19,9 @@ EXPERIMENT_MAX_TOTAL_CONTEXT_RESULTS = (
 )
 EXPERIMENT_MAX_EVIDENCE_SOURCES = 20_000
 EXPERIMENT_MAX_SOURCE_TEXT_CHARS = 100_000
+GMAIL_TEMPORAL_VERIFIED_EVENT_ALIAS_POLICY_VERSION = (
+    "gmail_temporal_verified_event_alias_policy_v1"
+)
 
 TemporalThreadIntent = Literal["lifecycle", "timeline"]
 TemporalThreadIntentOverride = Literal["lifecycle", "timeline", "none"]
@@ -500,22 +503,15 @@ def _verified_event_bindings(
                 "verified event bindings are invalid"
             )
         aliases: list[str] = []
+        normalized_aliases: list[str] = []
         for alias in item.aliases:
-            if (
-                not isinstance(alias, str)
-                or not alias.strip()
-                or alias != alias.strip()
-                or len(alias) > 256
-                or any(character in alias for character in "\x00\r\n")
-                or not _topic_tokens(alias)
-            ):
+            alias_key = gmail_temporal_verified_event_alias_key(alias)
+            if alias_key is None:
                 raise GmailTemporalThreadRetrievalExperimentError(
                     "verified event bindings are invalid"
                 )
             aliases.append(alias)
-        normalized_aliases = tuple(
-            " ".join(sorted(_topic_tokens(alias))) for alias in aliases
-        )
+            normalized_aliases.append(alias_key)
         if len(normalized_aliases) != len(set(normalized_aliases)):
             raise GmailTemporalThreadRetrievalExperimentError(
                 "verified event bindings are invalid"
@@ -605,6 +601,21 @@ def _timestamp(value: object, *, label: str) -> datetime:
 
 def _normalized_token(value: str) -> str:
     return unicodedata.normalize("NFKC", value).casefold()
+
+
+def gmail_temporal_verified_event_alias_key(value: object) -> str | None:
+    """Return retrieval's normalized alias key, or ``None`` when inadmissible."""
+
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or value != value.strip()
+        or len(value) > 256
+        or any(character in value for character in "\x00\r\n")
+        or not (topics := _topic_tokens(value))
+    ):
+        return None
+    return " ".join(sorted(topics))
 
 
 def _topic_tokens(text: str) -> frozenset[str]:

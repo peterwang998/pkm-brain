@@ -353,7 +353,7 @@ def _hypothesis_id(
     subject_type_references: tuple[tuple[str, str], ...],
 ) -> str:
     material = {
-        "version": "gmail_temporal_review_hypothesis_v2",
+        "version": "gmail_temporal_review_hypothesis_v3",
         "signature": (
             expression_id,
             "scheduled_for",
@@ -362,6 +362,8 @@ def _hypothesis_id(
             normalized_value,
         ),
         "subject_type_references": subject_type_references,
+        "subject_alias_type_references": subject_type_references,
+        "canonical_subject_mention_id": None,
     }
     return "gtrh_" + hashlib.sha256(_canonical_bytes(material)).hexdigest()
 
@@ -375,7 +377,7 @@ def _artifact_and_group(
     subject_types = ((subject_id, "event"),)
     normalized_value = "2027-08-14T09:00:00-07:00"
     hypothesis = GmailTemporalReviewHypothesis(
-        version="gmail_temporal_review_hypothesis_v2",
+        version="gmail_temporal_review_hypothesis_v3",
         hypothesis_id=_hypothesis_id(
             expression_id=expression_id,
             normalized_value=normalized_value,
@@ -384,6 +386,9 @@ def _artifact_and_group(
         expression_id=expression_id,
         subject_mention_ids=(subject_id,),
         subject_type_references=subject_types,
+        subject_alias_mention_ids=(subject_id,),
+        subject_alias_type_references=subject_types,
+        canonical_subject_mention_id=None,
         lifecycle_mention_ids=(f"public-lifecycle-{suffix}",),
         relation="scheduled_for",
         kind="planned",
@@ -393,7 +398,7 @@ def _artifact_and_group(
         candidate_requires_defer=False,
     )
     artifact = GmailTemporalReviewArtifact(
-        version="gmail_temporal_review_artifact_v2",
+        version="gmail_temporal_review_artifact_v3",
         artifact_id=f"supported:{candidate_id}",
         kind="supported_citation",
         evidence_status="supported",
@@ -448,7 +453,7 @@ def _projection(suffix: str) -> GmailTemporalReviewProjection:
     )
     artifact, group = _artifact_and_group(suffix)
     provisional = GmailTemporalReviewProjection(
-        version="gmail_temporal_review_projection_v2",
+        version="gmail_temporal_review_projection_v3",
         projection_fingerprint="",
         analysis_fingerprint=f"public-analysis-{suffix}",
         source_sha256=SOURCE_HASH,

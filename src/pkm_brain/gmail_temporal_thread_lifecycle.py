@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     )
 
 
-_PROJECTION_VERSION = "gmail_temporal_thread_lifecycle_projection_v2"
+_PROJECTION_VERSION = "gmail_temporal_thread_lifecycle_projection_v3"
 _AUTHORITY_VERSION = "gmail_temporal_thread_snapshot_authority_v2"
 _MESSAGE_AUTHORITY_VERSION = "gmail_temporal_thread_message_authority_v2"
 _MESSAGE_REVIEW_VERSION = "gmail_temporal_thread_message_review_v1"
@@ -33,7 +33,7 @@ _IDENTITY_ASSERTION_VERSION = "gmail_temporal_event_identity_assertion_v2"
 _SOURCE_REF_VERSION = "gmail_temporal_lifecycle_source_ref_v1"
 _OCCURRENCE_VERSION = "gmail_temporal_lifecycle_occurrence_v1"
 _UNRESOLVED_VERSION = "gmail_temporal_lifecycle_unresolved_alternative_v1"
-_EVENT_IDENTITY_UNIT_VERSION = "gmail_temporal_event_identity_unit_v2"
+_EVENT_IDENTITY_UNIT_VERSION = "gmail_temporal_event_identity_unit_v3"
 _EVENT_IDENTITY_KEY_VERSION = "gmail_temporal_stable_event_key_v1"
 
 _OPAQUE_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,511}$")
@@ -187,7 +187,7 @@ class GmailTemporalLifecycleUnresolvedAlternative:
 class GmailTemporalThreadLifecycleProjection:
     """Pure, deterministic lifecycle view over one current Gmail thread."""
 
-    version: Literal["gmail_temporal_thread_lifecycle_projection_v2"]
+    version: Literal["gmail_temporal_thread_lifecycle_projection_v3"]
     projection_fingerprint: str
     snapshot_authority: GmailTemporalThreadSnapshotAuthority
     source_messages: tuple[GmailTemporalThreadMessageReview, ...]
@@ -350,7 +350,7 @@ def project_gmail_temporal_thread_lifecycle(
     }
     fingerprint = "gtlp_" + hashlib.sha256(_canonical_bytes(material)).hexdigest()
     return GmailTemporalThreadLifecycleProjection(
-        version="gmail_temporal_thread_lifecycle_projection_v2",
+        version="gmail_temporal_thread_lifecycle_projection_v3",
         projection_fingerprint=fingerprint,
         snapshot_authority=normalized_authority,
         source_messages=normalized_messages,
@@ -475,6 +475,9 @@ def gmail_temporal_event_identity_unit_id(
             "expression_id": hypothesis.expression_id,
             "subject_mention_ids": hypothesis.subject_mention_ids,
             "subject_type_references": hypothesis.subject_type_references,
+            "subject_alias_mention_ids": hypothesis.subject_alias_mention_ids,
+            "subject_alias_type_references": (hypothesis.subject_alias_type_references),
+            "canonical_subject_mention_id": (hypothesis.canonical_subject_mention_id),
             "lifecycle_mention_ids": hypothesis.lifecycle_mention_ids,
             "relation": hypothesis.relation,
             "kind": hypothesis.kind,

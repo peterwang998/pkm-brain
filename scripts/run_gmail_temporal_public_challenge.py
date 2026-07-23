@@ -50,14 +50,16 @@ from pkm_brain.paths import BrainPaths
 
 
 VERSION = "gmail_temporal_public_challenge_launcher_v3"
-CHALLENGE_VERSION = "gmail_temporal_public_challenge_v2"
+CHALLENGE_VERSION = "gmail_temporal_public_challenge_v3"
+LEGACY_CHALLENGE_VERSION = "gmail_temporal_public_challenge_v2"
 PLAN_VERSION = "gmail_temporal_public_challenge_plan_v3"
 CALL_START_VERSION = "gmail_temporal_public_challenge_call_start_v3"
 CALL_RECEIPT_VERSION = "gmail_temporal_public_challenge_call_receipt_v3"
 PREDICTION_SEAL_VERSION = "gmail_temporal_public_challenge_prediction_seal_v3"
 RESULT_VERSION = "gmail_temporal_public_challenge_result_v3"
-SCORE_VERSION = "gmail_temporal_public_challenge_score_v6"
-GOLD_VERSION = "public_blind_gmail_temporal_gold_v3"
+SCORE_VERSION = "gmail_temporal_public_challenge_score_v9"
+GOLD_VERSION = "public_blind_gmail_temporal_gold_v4"
+LEGACY_STRUCTURED_GOLD_VERSION = "public_blind_gmail_temporal_gold_v3"
 LEGACY_GOLD_VERSION = "public_blind_gmail_temporal_gold_v2"
 PUBLIC_ROOT_AUTHORITY_VERSION = "gmail_temporal_public_root_authority_v2"
 PUBLIC_ROOT_AUTHORITY_FILENAME = "public_temporal_challenge_authority.json"
@@ -76,8 +78,9 @@ CALL_START_DOMAIN = b"gmail_temporal_public_challenge_call_start_v3\0"
 CALL_RECEIPT_DOMAIN = b"gmail_temporal_public_challenge_call_receipt_v3\0"
 PREDICTION_SEAL_DOMAIN = b"gmail_temporal_public_challenge_prediction_seal_v3\0"
 RESULT_DOMAIN = b"gmail_temporal_public_challenge_result_v3\0"
-SCORE_DOMAIN = b"gmail_temporal_public_challenge_score_v6\0"
+SCORE_DOMAIN = b"gmail_temporal_public_challenge_score_v9\0"
 PUBLIC_ROOT_AUTHORITY_DOMAIN = b"gmail_temporal_public_root_authority_v2\0"
+MAX_PREDICTION_LAUNCHER_ARTIFACT_BYTES = 4 * 1024 * 1024
 
 _ROOT = Path(__file__).resolve().parents[1]
 _HOLDOUT_RUNNER_PATH = _ROOT / "scripts" / "run_gmail_temporal_holdout_external.py"
@@ -88,6 +91,9 @@ _CASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$")
 _CHALLENGE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _CALL_ID_RE = re.compile(r"^gtpvc_(?:test_)?i_[0-9a-f]{64}$")
 _LOGICAL_RUN_ID_RE = re.compile(r"^gtpvc_(?:test_)?r_[0-9a-f]{64}$")
+_RUNNER_POLICY_RE = re.compile(r"^gtrun_[0-9a-f]{64}$")
+_TARGET_FINGERPRINT_RE = re.compile(r"^gtrt_[0-9a-f]{64}$")
+_REQUEST_FINGERPRINT_RE = re.compile(r"^gtrq_[0-9a-f]{64}$")
 
 _CHALLENGE_KEYS = {
     "version",
@@ -183,6 +189,14 @@ class _ExecutionClaims:
     ephemeral_execution: bool
     local_model_used: bool
     test_invoker_used: bool
+
+
+@dataclass(frozen=True)
+class _PredictionSourceProvenance:
+    launcher_sha256: str
+    trust_basis: str
+    exact_artifact_verified: bool
+    scorer_sha256: str
 
 
 def _load_script(name: str, path: Path) -> ModuleType:
@@ -418,7 +432,7 @@ def _load_challenge(path: Path, *, key: bytes) -> tuple[dict[str, Any], bytes]:
     if set(value) != _CHALLENGE_KEYS:
         raise PublicChallengeError("challenge manifest schema is invalid")
     if (
-        value.get("version") != CHALLENGE_VERSION
+        value.get("version") not in {CHALLENGE_VERSION, LEGACY_CHALLENGE_VERSION}
         or value.get("scope") != PUBLIC_SCOPE
         or value.get("public_synthetic") is not True
         or value.get("contains_private_gmail") is not False
@@ -582,6 +596,66 @@ def _request_rows(cases: Sequence[_Case]) -> tuple[_RequestRow, ...]:
     return tuple(rows)
 
 
+def _archived_request_rows(
+    cases: Sequence[_Case],
+    plan: Mapping[str, Any],
+) -> tuple[_RequestRow, ...]:
+    """Rebuild a prior launcher's requests with its authenticated policy ID."""
+
+    raw_cases = plan.get("cases")
+    if not isinstance(raw_cases, list) or len(raw_cases) != len(cases):
+        raise PublicChallengeError("archived request case coverage is invalid")
+    current_by_case: dict[str, list[_RequestRow]] = defaultdict(list)
+    for row in _request_rows(cases):
+        current_by_case[row.case_id].append(row)
+    output: list[_RequestRow] = []
+    for case, raw_case in zip(cases, raw_cases, strict=True):
+        if not isinstance(raw_case, Mapping) or raw_case.get("case_id") != case.case_id:
+            raise PublicChallengeError("archived request case order is invalid")
+        runner_policy = raw_case.get("runner_policy_fingerprint")
+        request_fingerprints = raw_case.get("request_fingerprints")
+        current_rows = current_by_case.get(case.case_id, [])
+        if (
+            not isinstance(runner_policy, str)
+            or _RUNNER_POLICY_RE.fullmatch(runner_policy) is None
+            or not isinstance(request_fingerprints, list)
+            or len(request_fingerprints) != len(current_rows)
+            or any(
+                not isinstance(value, str)
+                or _REQUEST_FINGERPRINT_RE.fullmatch(value) is None
+                for value in request_fingerprints
+            )
+        ):
+            raise PublicChallengeError("archived request identity is invalid")
+        for current_row, request_fingerprint in zip(
+            current_rows,
+            request_fingerprints,
+            strict=True,
+        ):
+            payload = dict(current_row.payload)
+            payload["runner_policy_fingerprint"] = runner_policy
+            payload.pop("request_fingerprint", None)
+            expected_fingerprint = (
+                "gtrq_" + hashlib.sha256(_canonical_json(payload)).hexdigest()
+            )
+            if expected_fingerprint != request_fingerprint:
+                raise PublicChallengeError("archived verifier request is stale")
+            payload["request_fingerprint"] = request_fingerprint
+            output.append(
+                _RequestRow(
+                    case_id=current_row.case_id,
+                    request_fingerprint=request_fingerprint,
+                    payload=payload,
+                    batch_fingerprint=current_row.batch_fingerprint,
+                    frontier_fingerprint=current_row.frontier_fingerprint,
+                    page_plan_fingerprint=current_row.page_plan_fingerprint,
+                    page_fingerprint=current_row.page_fingerprint,
+                    candidate_ids=current_row.candidate_ids,
+                )
+            )
+    return tuple(output)
+
+
 def bounded_public_call_units(rows: Sequence[_RequestRow]) -> tuple[_CallUnit, ...]:
     """Apply the private holdout's exact item and serialized-byte ceilings."""
 
@@ -677,6 +751,90 @@ def _source_hashes() -> dict[str, str]:
         "production_runner": _sha256(_RUNNER_PATH.read_bytes()),
         "shared_external_runner": _sha256(_HOLDOUT_RUNNER_PATH.read_bytes()),
     }
+
+
+def _prediction_launcher_artifact_sha256(path: Path) -> str:
+    try:
+        info = os.lstat(path)
+    except OSError as exc:
+        raise PublicChallengeError(
+            "prior prediction launcher artifact is unavailable"
+        ) from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) & 0o022
+        or info.st_size <= 0
+        or info.st_size > MAX_PREDICTION_LAUNCHER_ARTIFACT_BYTES
+    ):
+        raise PublicChallengeError("prior prediction launcher artifact is unsafe")
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise PublicChallengeError(
+            "prior prediction launcher artifact is unavailable"
+        ) from exc
+    if len(raw) != info.st_size:
+        raise PublicChallengeError("prior prediction launcher artifact is stale")
+    return _sha256(raw)
+
+
+def _validate_prediction_source_provenance(
+    source_hashes: Any,
+    *,
+    launcher_version: Any,
+    plan_version: Any,
+    prediction_launcher_artifact: Path | None,
+) -> _PredictionSourceProvenance:
+    """Authenticate prediction code independently from the current scorer."""
+
+    if (
+        not isinstance(source_hashes, Mapping)
+        or set(source_hashes)
+        != {"launcher", "production_runner", "shared_external_runner"}
+        or any(
+            not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None
+            for value in source_hashes.values()
+        )
+    ):
+        raise PublicChallengeError("public prediction source provenance is invalid")
+    current = _source_hashes()
+    if (
+        source_hashes["production_runner"] != current["production_runner"]
+        or source_hashes["shared_external_runner"] != current["shared_external_runner"]
+    ):
+        raise PublicChallengeError("public prediction runner provenance is stale")
+
+    launcher_sha256 = str(source_hashes["launcher"])
+    if launcher_sha256 == current["launcher"]:
+        if (
+            prediction_launcher_artifact is not None
+            and _prediction_launcher_artifact_sha256(prediction_launcher_artifact)
+            != launcher_sha256
+        ):
+            raise PublicChallengeError(
+                "current prediction launcher artifact does not match its plan"
+            )
+        return _PredictionSourceProvenance(
+            launcher_sha256=launcher_sha256,
+            trust_basis="current_scorer_source",
+            exact_artifact_verified=prediction_launcher_artifact is not None,
+            scorer_sha256=current["launcher"],
+        )
+    if (
+        launcher_version != VERSION
+        or plan_version != PLAN_VERSION
+        or prediction_launcher_artifact is None
+        or _prediction_launcher_artifact_sha256(prediction_launcher_artifact)
+        != launcher_sha256
+    ):
+        raise PublicChallengeError("public prediction launcher provenance is stale")
+    return _PredictionSourceProvenance(
+        launcher_sha256=launcher_sha256,
+        trust_basis="exact_prior_launcher_artifact",
+        exact_artifact_verified=True,
+        scorer_sha256=current["launcher"],
+    )
 
 
 def _plan_value(
@@ -981,7 +1139,12 @@ def _execute_call(
     )
 
 
-def _component_value(case: _Case, call: _CompletedCall) -> dict[str, Any]:
+def _component_value(
+    case: _Case,
+    call: _CompletedCall,
+    *,
+    archived_plan_case: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     preparation = case.preparation
     pages = call.case_pages.get(case.case_id)
     if pages is None or len(pages) != len(preparation.requests):
@@ -995,13 +1158,21 @@ def _component_value(case: _Case, call: _CompletedCall) -> dict[str, Any]:
         "reasoning_effort": GMAIL_TEMPORAL_VERIFIER_REASONING_EFFORT,
         "started_at": call.started_at,
         "completed_at": call.completed_at,
-        "runner_policy_fingerprint": gmail_temporal_runner_policy_fingerprint(),
+        "runner_policy_fingerprint": (
+            archived_plan_case["runner_policy_fingerprint"]
+            if archived_plan_case is not None
+            else gmail_temporal_runner_policy_fingerprint()
+        ),
         "admission_policy_fingerprint": (gmail_temporal_admission_policy_fingerprint()),
         "verifier_policy_fingerprint": gmail_temporal_verifier_policy_fingerprint(),
         "source_sha256": preparation.source_sha256,
         "analysis_fingerprint": preparation.analysis_fingerprint,
         "batch_plan_fingerprint": preparation.batch_plan_fingerprint,
-        "target_fingerprint": preparation.target_fingerprint,
+        "target_fingerprint": (
+            archived_plan_case["target_fingerprint"]
+            if archived_plan_case is not None
+            else preparation.target_fingerprint
+        ),
         "pages": [dict(item) for item in pages],
         "complete": True,
         "routable": False,
@@ -1339,6 +1510,42 @@ def _plan_case_rows(cases: Sequence[_Case]) -> list[dict[str, Any]]:
     ]
 
 
+def _expected_plan_case_rows(
+    cases: Sequence[_Case],
+    plan: Mapping[str, Any],
+    provenance: _PredictionSourceProvenance,
+) -> list[dict[str, Any]]:
+    expected = _plan_case_rows(cases)
+    if provenance.trust_basis == "current_scorer_source":
+        return expected
+    raw_cases = plan.get("cases")
+    if not isinstance(raw_cases, list) or len(raw_cases) != len(expected):
+        raise PublicChallengeError("archived plan case coverage is invalid")
+    for current, archived in zip(expected, raw_cases, strict=True):
+        if not isinstance(archived, Mapping):
+            raise PublicChallengeError("archived plan case is invalid")
+        runner_policy = archived.get("runner_policy_fingerprint")
+        target_fingerprint = archived.get("target_fingerprint")
+        request_fingerprints = archived.get("request_fingerprints")
+        if (
+            not isinstance(runner_policy, str)
+            or _RUNNER_POLICY_RE.fullmatch(runner_policy) is None
+            or not isinstance(target_fingerprint, str)
+            or _TARGET_FINGERPRINT_RE.fullmatch(target_fingerprint) is None
+            or not isinstance(request_fingerprints, list)
+            or any(
+                not isinstance(value, str)
+                or _REQUEST_FINGERPRINT_RE.fullmatch(value) is None
+                for value in request_fingerprints
+            )
+        ):
+            raise PublicChallengeError("archived plan case identity is invalid")
+        current["runner_policy_fingerprint"] = runner_policy
+        current["target_fingerprint"] = target_fingerprint
+        current["request_fingerprints"] = list(request_fingerprints)
+    return expected
+
+
 def _claims_from_plan(
     plan: Mapping[str, Any], *, external_calls_required: bool
 ) -> _ExecutionClaims:
@@ -1367,7 +1574,11 @@ def _validate_plan_authority(
     challenge_raw: bytes,
     cases: Sequence[_Case],
     units: Sequence[_CallUnit],
-) -> tuple[_ExecutionClaims, dict[tuple[int, int], Mapping[str, Any]]]:
+    source_provenance: _PredictionSourceProvenance,
+) -> tuple[
+    _ExecutionClaims,
+    dict[tuple[int, int], Mapping[str, Any]],
+]:
     expected_keys = {
         "version",
         "launcher_version",
@@ -1403,7 +1614,7 @@ def _validate_plan_authority(
     if set(plan) != expected_keys:
         raise PublicChallengeError("public challenge plan schema is invalid")
     claims = _claims_from_plan(plan, external_calls_required=bool(units))
-    rows = _request_rows(cases)
+    rows = tuple(row for unit in units for row in unit.rows)
     stable = {
         "version": PLAN_VERSION,
         "launcher_version": VERSION,
@@ -1421,8 +1632,7 @@ def _validate_plan_authority(
         "call_count_per_run": len(units),
         "max_items_per_call": external.MAX_VERIFIER_BATCH_SIZE,
         "max_request_bytes": external.MAX_VERIFIER_REQUEST_BYTES,
-        "cases": _plan_case_rows(cases),
-        "source_module_sha256": _source_hashes(),
+        "cases": _expected_plan_case_rows(cases, plan, source_provenance),
         "gold_sha256_committed_but_not_opened": challenge["gold_sha256"],
         "gold_accessed": False,
         "public_synthetic": True,
@@ -1681,6 +1891,8 @@ def _validate_component_evidence(
     challenge: Mapping[str, Any],
     cases: Sequence[_Case],
     calls: Sequence[_CompletedCall],
+    plan: Mapping[str, Any],
+    source_provenance: _PredictionSourceProvenance,
 ) -> tuple[dict[str, tuple[Path, ...]], dict[str, Any]]:
     import pkm_brain.gmail_temporal_runner as production_runner
 
@@ -1712,7 +1924,12 @@ def _validate_component_evidence(
     }:
         raise PublicChallengeError("public component case coverage is invalid")
     output: dict[str, tuple[Path, ...]] = {}
-    for case in cases:
+    raw_plan_cases = plan.get("cases")
+    if not isinstance(raw_plan_cases, list) or len(raw_plan_cases) != len(cases):
+        raise PublicChallengeError("public component plan coverage is invalid")
+    for case, raw_plan_case in zip(cases, raw_plan_cases, strict=True):
+        if not isinstance(raw_plan_case, Mapping):
+            raise PublicChallengeError("public component plan case is invalid")
         authority = authorities[case.case_id]
         if not case.preparation.requests:
             output[case.case_id] = ()
@@ -1730,12 +1947,21 @@ def _validate_component_evidence(
             path = case_root / f"run-{run_ordinal}.json"
             raw = _private_file(path)
             value = _strict_json(raw, label="public verifier component")
-            if value != _component_value(case, call):
+            if value != _component_value(
+                case,
+                call,
+                archived_plan_case=(
+                    raw_plan_case
+                    if source_provenance.trust_basis != "current_scorer_source"
+                    else None
+                ),
+            ):
                 raise PublicChallengeError("public verifier component is stale")
             case_paths.append(path)
-        production_runner._load_components(  # noqa: SLF001
-            tuple(case_paths), authority=authority
-        )
+        if source_provenance.trust_basis == "current_scorer_source":
+            production_runner._load_components(  # noqa: SLF001
+                tuple(case_paths), authority=authority
+            )
         output[case.case_id] = tuple(case_paths)
     return output, authorities
 
@@ -1779,6 +2005,7 @@ def _validate_persisted_results(
     *,
     challenge: Mapping[str, Any],
     challenge_raw: bytes,
+    plan: Mapping[str, Any],
     plan_raw: bytes,
     seal_raw: bytes,
     cases: Sequence[_Case],
@@ -1846,13 +2073,22 @@ def _validate_persisted_results(
         raise PublicChallengeError("prediction result case coverage is invalid")
     by_case: dict[str, Mapping[str, Any]] = {}
     paths = BrainPaths.from_value(str(challenge["brain_home"]))
+    raw_plan_cases = plan.get("cases")
+    if not isinstance(raw_plan_cases, list) or len(raw_plan_cases) != len(cases):
+        raise PublicChallengeError("prediction result plan coverage is invalid")
     with connection(paths.sqlite_path) as conn:
-        for case, raw_row in zip(cases, raw_rows, strict=True):
+        for case, raw_row, raw_plan_case in zip(
+            cases,
+            raw_rows,
+            raw_plan_cases,
+            strict=True,
+        ):
             if (
                 not isinstance(raw_row, Mapping)
                 or set(raw_row) != {"case_id", "runner_result", "projection"}
                 or raw_row.get("case_id") != case.case_id
                 or not isinstance(raw_row.get("runner_result"), Mapping)
+                or not isinstance(raw_plan_case, Mapping)
             ):
                 raise PublicChallengeError("prediction result case schema is invalid")
             runner = raw_row["runner_result"]
@@ -1937,6 +2173,18 @@ def _validate_persisted_results(
                 or execution["pipeline_scope"] != GMAIL_TEMPORAL_PIPELINE_SCOPE
                 or execution["document_id"] != case.document_id
                 or execution["source_sha256"] != preparation.source_sha256
+                or execution["runner_policy_fingerprint"]
+                != raw_plan_case.get("runner_policy_fingerprint")
+                or execution["admission_policy_fingerprint"]
+                != raw_plan_case.get("admission_policy_fingerprint")
+                or execution["verifier_policy_fingerprint"]
+                != raw_plan_case.get("verifier_policy_fingerprint")
+                or execution["target_fingerprint"]
+                != raw_plan_case.get("target_fingerprint")
+                or execution["analysis_fingerprint"]
+                != raw_plan_case.get("analysis_fingerprint")
+                or execution["batch_plan_fingerprint"]
+                != raw_plan_case.get("batch_plan_fingerprint")
                 or execution["provider"] != GMAIL_TEMPORAL_EXTERNAL_PROVIDER
                 or execution["model"] != GMAIL_TEMPORAL_VERIFIER_MODEL
                 or execution["reasoning_effort"]
@@ -2180,11 +2428,258 @@ def _authority_subject_surfaces(authority: Any) -> dict[str, str]:
     return output
 
 
+_PROJECTION_VERSION = "gmail_temporal_review_projection_v3"
+_LEGACY_PROJECTION_VERSION = "gmail_temporal_review_projection_v2"
+
+
+def _authority_parent_cluster_subject_ids(
+    authority: Any,
+) -> dict[str, frozenset[str]]:
+    """Expose the authenticated parent-cluster aliases used by legacy V2."""
+
+    output: dict[str, frozenset[str]] = {}
+    for batch in authority.batches:
+        for page in batch.page_plan.pages:
+            for cluster in page.clusters:
+                subject_ids = frozenset(cluster.subject_mention_ids)
+                if not subject_ids:
+                    raise PublicChallengeError(
+                        "production parent subject cluster is invalid"
+                    )
+                previous = output.setdefault(cluster.cluster_id, subject_ids)
+                if previous != subject_ids:
+                    raise PublicChallengeError(
+                        "production parent subject cluster is unstable"
+                    )
+    return output
+
+
+def _v3_artifact_subject_aliases(
+    projection: Mapping[str, Any],
+    *,
+    subject_surfaces: Mapping[str, str],
+) -> dict[str, frozenset[str]]:
+    """Use only alias identity metadata exported by the authenticated V3 run."""
+
+    artifacts = projection.get("artifacts")
+    if not isinstance(artifacts, list):
+        raise PublicChallengeError("public projection artifacts are invalid")
+    output: dict[str, frozenset[str]] = {}
+    for artifact in artifacts:
+        if not isinstance(artifact, Mapping):
+            raise PublicChallengeError("public projection artifact is invalid")
+        artifact_id = artifact.get("artifact_id")
+        hypotheses = _artifact_hypotheses(artifact)
+        if not isinstance(artifact_id, str) or not artifact_id or not hypotheses:
+            raise PublicChallengeError("public projection artifact is invalid")
+        family_ids: tuple[str, ...] | None = None
+        for hypothesis in hypotheses:
+            selected_ids = hypothesis.get("subject_mention_ids")
+            alias_ids = hypothesis.get("subject_alias_mention_ids")
+            type_references = hypothesis.get("subject_alias_type_references")
+            canonical_id = hypothesis.get("canonical_subject_mention_id")
+            if (
+                not isinstance(selected_ids, list)
+                or not selected_ids
+                or any(
+                    not isinstance(value, str) or not value for value in selected_ids
+                )
+                or len(selected_ids) != len(set(selected_ids))
+                or not isinstance(alias_ids, list)
+                or not alias_ids
+                or any(not isinstance(value, str) or not value for value in alias_ids)
+                or alias_ids != sorted(alias_ids)
+                or len(alias_ids) != len(set(alias_ids))
+                or not set(selected_ids).issubset(alias_ids)
+                or not isinstance(type_references, list)
+                or len(type_references) != len(alias_ids)
+                or canonical_id is not None
+                and (not isinstance(canonical_id, str) or canonical_id not in alias_ids)
+            ):
+                raise PublicChallengeError(
+                    "public projection subject alias metadata is invalid"
+                )
+            alias_types: dict[str, str] = {}
+            for reference in type_references:
+                if (
+                    not isinstance(reference, list)
+                    or len(reference) != 2
+                    or not isinstance(reference[0], str)
+                    or not reference[0]
+                    or not isinstance(reference[1], str)
+                    or not reference[1]
+                    or reference[0] in alias_types
+                ):
+                    raise PublicChallengeError(
+                        "public projection subject alias metadata is invalid"
+                    )
+                alias_types[reference[0]] = reference[1]
+            if list(alias_types) != alias_ids or (
+                canonical_id is not None
+                and alias_types.get(canonical_id) != "event_title_candidate"
+            ):
+                raise PublicChallengeError(
+                    "public projection subject alias metadata is invalid"
+                )
+            current_ids = tuple(alias_ids)
+            if family_ids is None:
+                family_ids = current_ids
+            elif family_ids != current_ids:
+                raise PublicChallengeError(
+                    "public artifact spans incompatible subject alias families"
+                )
+        assert family_ids is not None
+        if any(
+            not isinstance(subject_surfaces.get(mention_id), str)
+            or not subject_surfaces[mention_id]
+            for mention_id in family_ids
+        ):
+            raise PublicChallengeError(
+                "public projection subject alias authority is incomplete"
+            )
+        aliases = frozenset(subject_surfaces[mention_id] for mention_id in family_ids)
+        output[artifact_id] = aliases
+    return output
+
+
+def _legacy_artifact_subject_aliases(
+    projection: Mapping[str, Any],
+    *,
+    subject_surfaces: Mapping[str, str],
+    parent_cluster_subject_ids: Mapping[str, frozenset[str]],
+) -> dict[str, frozenset[str]]:
+    """Reconstruct V2 aliases from exact authenticated parent clusters only."""
+
+    artifacts = {
+        str(item.get("artifact_id")): item
+        for item in projection.get("artifacts", [])
+        if isinstance(item, Mapping) and isinstance(item.get("artifact_id"), str)
+    }
+    analysis_fingerprint = projection.get("analysis_fingerprint")
+    if not isinstance(analysis_fingerprint, str) or not analysis_fingerprint:
+        return {}
+    output: dict[str, frozenset[str]] = {}
+    for group in projection.get("groups", []):
+        if not isinstance(group, Mapping) or group.get("coverage") != "complete":
+            continue
+        family_id = group.get("subject_family_id")
+        members = group.get("members")
+        if (
+            not isinstance(family_id, str)
+            or re.fullmatch(r"gtrsf_[0-9a-f]{64}", family_id) is None
+            or not isinstance(members, list)
+            or not members
+        ):
+            continue
+        artifact_ids: list[str] = []
+        group_is_exact = True
+        for member in members:
+            if (
+                not isinstance(member, Mapping)
+                or member.get("state") != "present"
+                or member.get("subject_family_ids") != [family_id]
+                or member.get("cluster_review_ids") not in ([], ())
+                or member.get("reasons") not in ([], ())
+                or not isinstance(member.get("artifact_ids"), list)
+                or not member["artifact_ids"]
+                or any(
+                    not isinstance(artifact_id, str) or artifact_id not in artifacts
+                    for artifact_id in member["artifact_ids"]
+                )
+            ):
+                group_is_exact = False
+                break
+            artifact_ids.extend(member["artifact_ids"])
+        if not group_is_exact or len(artifact_ids) != len(set(artifact_ids)):
+            continue
+        family_mention_ids: set[str] = set()
+        for artifact_id in artifact_ids:
+            artifact = artifacts[artifact_id]
+            parent_cluster_id = artifact.get("parent_cluster_id")
+            cluster_ids = (
+                parent_cluster_subject_ids.get(parent_cluster_id, frozenset())
+                if isinstance(parent_cluster_id, str)
+                else frozenset()
+            )
+            hypotheses = _artifact_hypotheses(artifact)
+            selected_ids = {
+                mention_id
+                for hypothesis in hypotheses
+                for mention_id in hypothesis.get("subject_mention_ids", [])
+                if isinstance(mention_id, str)
+            }
+            if (
+                not cluster_ids
+                or not hypotheses
+                or not selected_ids
+                or not selected_ids.issubset(cluster_ids)
+            ):
+                group_is_exact = False
+                break
+            family_mention_ids.update(cluster_ids)
+        expected_family_id = (
+            "gtrsf_"
+            + hashlib.sha256(
+                _canonical_json(
+                    {
+                        "analysis_fingerprint": analysis_fingerprint,
+                        "subject_mention_ids": sorted(family_mention_ids),
+                    }
+                )
+            ).hexdigest()
+        )
+        surfaces_are_complete = all(
+            isinstance(subject_surfaces.get(mention_id), str)
+            and bool(subject_surfaces[mention_id])
+            for mention_id in family_mention_ids
+        )
+        aliases = frozenset(
+            subject_surfaces[mention_id]
+            for mention_id in family_mention_ids
+            if mention_id in subject_surfaces
+        )
+        if (
+            not group_is_exact
+            or family_id != expected_family_id
+            or not surfaces_are_complete
+        ):
+            continue
+        for artifact_id in artifact_ids:
+            previous = output.setdefault(artifact_id, aliases)
+            if previous != aliases:
+                raise PublicChallengeError(
+                    "public artifact spans incompatible subject alias families"
+                )
+    return output
+
+
+def _artifact_subject_aliases(
+    projection: Mapping[str, Any],
+    *,
+    subject_surfaces: Mapping[str, str],
+    parent_cluster_subject_ids: Mapping[str, frozenset[str]],
+) -> dict[str, frozenset[str]]:
+    version = projection.get("version")
+    if version == _PROJECTION_VERSION:
+        return _v3_artifact_subject_aliases(
+            projection,
+            subject_surfaces=subject_surfaces,
+        )
+    if version == _LEGACY_PROJECTION_VERSION:
+        return _legacy_artifact_subject_aliases(
+            projection,
+            subject_surfaces=subject_surfaces,
+            parent_cluster_subject_ids=parent_cluster_subject_ids,
+        )
+    raise PublicChallengeError("prediction projection version is unsupported")
+
+
 def _hypothesis_matches_member(
     hypothesis: Mapping[str, Any],
     member: Mapping[str, Any],
     *,
     subject_surfaces: Mapping[str, str],
+    subject_alias_surfaces: Sequence[str] = (),
 ) -> bool:
     expected_subject = _normalized_subject(member.get("subject"))
     mention_ids = hypothesis.get("subject_mention_ids")
@@ -2196,6 +2691,7 @@ def _hypothesis_matches_member(
         if isinstance(mention_id, str)
         and isinstance((surface := subject_surfaces.get(mention_id)), str)
     }
+    actual_subjects.update(subject_alias_surfaces)
     return (
         any(_subject_matches(expected_subject, actual) for actual in actual_subjects)
         and hypothesis.get("relation") == member.get("relation")
@@ -2208,10 +2704,14 @@ def _exact_artifact_match(
     member: Mapping[str, Any],
     *,
     subject_surfaces: Mapping[str, str],
+    subject_alias_surfaces: Sequence[str] = (),
 ) -> bool:
     expected_verdict = member.get("expected_verdict", "supported")
-    expected_status = "uncertain" if expected_verdict == "uncertain" else "supported"
-    if artifact.get("evidence_status") != expected_status:
+    evidence_status = artifact.get("evidence_status")
+    if expected_verdict == "uncertain":
+        if evidence_status != "uncertain":
+            return False
+    elif evidence_status not in {"supported", "uncertain"}:
         return False
     hypotheses = _artifact_hypotheses(artifact)
     if not hypotheses or not all(
@@ -2219,6 +2719,7 @@ def _exact_artifact_match(
             hypothesis,
             member,
             subject_surfaces=subject_surfaces,
+            subject_alias_surfaces=subject_alias_surfaces,
         )
         for hypothesis in hypotheses
     ):
@@ -2234,11 +2735,48 @@ def _exact_artifact_match(
     return actual_values == {member.get("value")}
 
 
+def _artifacts_confirm_supported_member(
+    artifacts: Sequence[Mapping[str, Any]],
+    member: Mapping[str, Any],
+) -> bool:
+    return bool(
+        member.get("expected_verdict", "supported") != "uncertain"
+        and artifacts
+        and all(item.get("evidence_status") == "supported" for item in artifacts)
+    )
+
+
+def _artifacts_recover_canonical_subject(
+    artifacts: Sequence[Mapping[str, Any]],
+    member: Mapping[str, Any],
+    *,
+    subject_surfaces: Mapping[str, str],
+) -> bool:
+    """Require every matched hypothesis to name the exact trusted event title."""
+
+    expected_subject = _normalized_subject(member.get("subject"))
+    if expected_subject is None or not artifacts:
+        return False
+    for artifact in artifacts:
+        hypotheses = _artifact_hypotheses(artifact)
+        if not hypotheses:
+            return False
+        for hypothesis in hypotheses:
+            canonical_id = hypothesis.get("canonical_subject_mention_id")
+            if not isinstance(canonical_id, str) or not canonical_id:
+                return False
+            canonical_surface = subject_surfaces.get(canonical_id)
+            if _normalized_subject(canonical_surface) != expected_subject:
+                return False
+    return True
+
+
 def _alternatives_artifacts(
     projection: Mapping[str, Any],
     member: Mapping[str, Any],
     *,
     subject_surfaces: Mapping[str, str],
+    artifact_subject_aliases: Mapping[str, Sequence[str]] | None = None,
 ) -> tuple[tuple[str, ...], str] | None:
     """Match one option-set gold member to production's per-expression artifacts.
 
@@ -2301,6 +2839,11 @@ def _alternatives_artifacts(
                         hypothesis,
                         member,
                         subject_surfaces=subject_surfaces,
+                        subject_alias_surfaces=(
+                            artifact_subject_aliases.get(artifact_id, ())
+                            if artifact_subject_aliases is not None
+                            else ()
+                        ),
                     )
                     for hypothesis in hypotheses
                 )
@@ -2331,6 +2874,7 @@ def _reschedule_artifact(
     member: Mapping[str, Any],
     *,
     subject_surfaces: Mapping[str, str],
+    artifact_subject_aliases: Mapping[str, Sequence[str]] | None = None,
 ) -> tuple[str, str] | None:
     artifacts = {
         str(item.get("artifact_id")): item
@@ -2362,6 +2906,11 @@ def _reschedule_artifact(
                 artifact,
                 member,
                 subject_surfaces=subject_surfaces,
+                subject_alias_surfaces=(
+                    artifact_subject_aliases.get(artifact_id, ())
+                    if artifact_subject_aliases is not None
+                    else ()
+                ),
             ):
                 group_id = group.get("group_id")
                 if isinstance(group_id, str) and group_id:
@@ -2374,13 +2923,13 @@ def _forbidden_hypothesis_matches(
     forbidden: Any,
     *,
     subject_surfaces: Mapping[str, str],
+    subject_alias_surfaces: Sequence[str] = (),
 ) -> bool:
     """Apply a forbidden value without weakening an already frozen benchmark.
 
-    A bare value is case-wide in legacy V2 gold and remains case-wide in V3.
-    Changing its meaning after predictions exist would silently improve an old
-    score.  Newly frozen V3 gold can instead spell out a scoped binding with
-    subject, relation, lifecycle, and value.
+    A bare value is case-wide in legacy V2/V3 gold. Changing its meaning after
+    predictions exist would silently improve an old score. Newly frozen V4 gold
+    requires a scoped binding with subject, relation, lifecycle, and value.
     """
 
     if isinstance(forbidden, str):
@@ -2394,6 +2943,7 @@ def _forbidden_hypothesis_matches(
         hypothesis,
         forbidden,
         subject_surfaces=subject_surfaces,
+        subject_alias_surfaces=subject_alias_surfaces,
     )
 
 
@@ -2419,9 +2969,15 @@ def _structural_component_key(
 
 def _validate_gold(gold: Mapping[str, Any]) -> None:
     gold_version = gold.get("version")
+    supported_gold_versions = {
+        GOLD_VERSION,
+        LEGACY_STRUCTURED_GOLD_VERSION,
+        LEGACY_GOLD_VERSION,
+    }
+    current_gold = gold_version == GOLD_VERSION
     if (
         set(gold) != {"version", "created_before_predictions", "cases"}
-        or gold_version not in {GOLD_VERSION, LEGACY_GOLD_VERSION}
+        or gold_version not in supported_gold_versions
         or gold.get("created_before_predictions") is not True
         or not isinstance(gold.get("cases"), list)
         or not gold["cases"]
@@ -2459,15 +3015,22 @@ def _validate_gold(gold: Mapping[str, Any]) -> None:
         for value in forbidden:
             if isinstance(value, str):
                 valid_forbidden = (
-                    _NORMALIZED_TEMPORAL_VALUE_RE.fullmatch(value) is not None
+                    not current_gold
+                    and gold_version
+                    in {LEGACY_STRUCTURED_GOLD_VERSION, LEGACY_GOLD_VERSION}
+                    and _NORMALIZED_TEMPORAL_VALUE_RE.fullmatch(value) is not None
                 )
             else:
+                relation = value.get("relation") if isinstance(value, Mapping) else None
                 valid_forbidden = (
-                    gold_version == GOLD_VERSION
+                    gold_version in {GOLD_VERSION, LEGACY_STRUCTURED_GOLD_VERSION}
                     and isinstance(value, Mapping)
                     and set(value) == {"subject", "relation", "lifecycle", "value"}
                     and _normalized_subject(value.get("subject")) is not None
-                    and value.get("relation") in {"occurrence", "deadline"}
+                    and (
+                        relation in {"occurrence", "deadline"}
+                        or (current_gold and relation == "unspecified")
+                    )
                     and value.get("lifecycle")
                     in {
                         "none",
@@ -2496,6 +3059,8 @@ def _validate_gold(gold: Mapping[str, Any]) -> None:
             keys = set(member)
             has_value = "value" in member
             has_values = "values" in member
+            expected_verdict = member.get("expected_verdict", "supported")
+            relation = member.get("relation")
             if (
                 not {"subject", "relation", "lifecycle"} <= keys
                 or not keys
@@ -2506,10 +3071,14 @@ def _validate_gold(gold: Mapping[str, Any]) -> None:
                     "value",
                     "values",
                     "expected_verdict",
+                    *({"canonical_subject_required"} if current_gold else set()),
                 }
                 or has_value == has_values
                 or _normalized_subject(member.get("subject")) is None
-                or member.get("relation") not in {"occurrence", "deadline"}
+                or (
+                    relation not in {"occurrence", "deadline"}
+                    and not (current_gold and relation == "unspecified")
+                )
                 or member.get("lifecycle")
                 not in {
                     "none",
@@ -2520,8 +3089,12 @@ def _validate_gold(gold: Mapping[str, Any]) -> None:
                     "rescheduled_old",
                     "rescheduled_replacement",
                 }
-                or member.get("expected_verdict", "supported")
-                not in {"supported", "uncertain"}
+                or expected_verdict not in {"supported", "uncertain"}
+                or (current_gold and "expected_verdict" not in member)
+                or (
+                    "canonical_subject_required" in member
+                    and not isinstance(member["canonical_subject_required"], bool)
+                )
             ):
                 raise PublicChallengeError(
                     "public semantic gold member schema is invalid"
@@ -2596,6 +3169,7 @@ def score_public_challenge(
     output_root: Path,
     *,
     evaluation_mode: str,
+    prediction_launcher_artifact: Path | None = None,
 ) -> dict[str, Any]:
     """Open gold only after a complete authenticated prediction result exists.
 
@@ -2632,13 +3206,25 @@ def score_public_challenge(
         label="public challenge result",
     )
     cases = _prepare_cases(challenge)
-    units = bounded_public_call_units(_request_rows(cases))
+    prediction_provenance = _validate_prediction_source_provenance(
+        plan.get("source_module_sha256"),
+        launcher_version=plan.get("launcher_version"),
+        plan_version=plan.get("version"),
+        prediction_launcher_artifact=prediction_launcher_artifact,
+    )
+    rows = (
+        _request_rows(cases)
+        if prediction_provenance.trust_basis == "current_scorer_source"
+        else _archived_request_rows(cases, plan)
+    )
+    units = bounded_public_call_units(rows)
     claims, plan_calls = _validate_plan_authority(
         plan,
         challenge=challenge,
         challenge_raw=challenge_raw,
         cases=cases,
         units=units,
+        source_provenance=prediction_provenance,
     )
     calls = _validate_call_evidence(
         output_root=output_root,
@@ -2653,6 +3239,8 @@ def score_public_challenge(
         challenge=challenge,
         cases=cases,
         calls=calls,
+        plan=plan,
+        source_provenance=prediction_provenance,
     )
     _validate_seal_authority(
         seal,
@@ -2669,6 +3257,7 @@ def score_public_challenge(
         result,
         challenge=challenge,
         challenge_raw=challenge_raw,
+        plan=plan,
         plan_raw=plan_raw,
         seal_raw=seal_raw,
         cases=cases,
@@ -2717,6 +3306,8 @@ def score_public_challenge(
     supported_gold_members = 0
     matched_members = 0
     confirmed_members = 0
+    canonical_subject_members = 0
+    canonical_subject_members_recovered = 0
     total_artifacts = 0
     supported_artifacts = 0
     matched_artifact_ids: set[tuple[str, str]] = set()
@@ -2734,7 +3325,10 @@ def score_public_challenge(
             raise PublicChallengeError("semantic gold member schema is invalid")
         prediction = result_rows[case_id]
         projection = prediction.get("projection")
-        subject_surfaces = _authority_subject_surfaces(authorities[case_id])
+        authority = authorities[case_id]
+        subject_surfaces = _authority_subject_surfaces(authority)
+        parent_cluster_subject_ids = _authority_parent_cluster_subject_ids(authority)
+        artifact_subject_aliases: dict[str, frozenset[str]] = {}
         artifacts: list[Mapping[str, Any]] = []
         reviews: list[Mapping[str, Any]] = []
         if projection is not None:
@@ -2750,6 +3344,11 @@ def score_public_challenge(
                 for item in projection.get("cluster_reviews", [])
                 if isinstance(item, Mapping)
             ]
+            artifact_subject_aliases = _artifact_subject_aliases(
+                projection,
+                subject_surfaces=subject_surfaces,
+                parent_cluster_subject_ids=parent_cluster_subject_ids,
+            )
         total_artifacts += len(artifacts)
         supported_artifacts += sum(
             item.get("evidence_status") == "supported" for item in artifacts
@@ -2767,6 +3366,10 @@ def score_public_challenge(
                     hypothesis,
                     forbidden,
                     subject_surfaces=subject_surfaces,
+                    subject_alias_surfaces=artifact_subject_aliases.get(
+                        str(artifact.get("artifact_id")),
+                        (),
+                    ),
                 )
                 for forbidden in forbidden_bindings
             )
@@ -2781,6 +3384,8 @@ def score_public_challenge(
         }
         case_matches = 0
         case_confirmed = 0
+        case_canonical_subject_members = 0
+        case_canonical_subject_members_recovered = 0
         component_members: Counter[str] = Counter()
         for member_ordinal, member in enumerate(members):
             if isinstance(member, Mapping):
@@ -2797,6 +3402,11 @@ def score_public_challenge(
             gold_members += 1
             expected_verdict = member.get("expected_verdict", "supported")
             supported_gold_members += int(expected_verdict != "uncertain")
+            canonical_subject_required = (
+                member.get("canonical_subject_required") is True
+            )
+            canonical_subject_members += int(canonical_subject_required)
+            case_canonical_subject_members += int(canonical_subject_required)
             matched_ids: tuple[str, ...] = ()
             structural_group_id: str | None = None
             if "values" in member and projection is not None:
@@ -2804,6 +3414,7 @@ def score_public_challenge(
                     projection,
                     member,
                     subject_surfaces=subject_surfaces,
+                    artifact_subject_aliases=artifact_subject_aliases,
                 )
                 if alternatives_match is not None:
                     matched_ids, structural_group_id = alternatives_match
@@ -2819,6 +3430,7 @@ def score_public_challenge(
                     projection,
                     member,
                     subject_surfaces=subject_surfaces,
+                    artifact_subject_aliases=artifact_subject_aliases,
                 )
                 if reschedule_match is not None:
                     matched_id, structural_group_id = reschedule_match
@@ -2831,6 +3443,10 @@ def score_public_challenge(
                         artifact,
                         member,
                         subject_surfaces=subject_surfaces,
+                        subject_alias_surfaces=artifact_subject_aliases.get(
+                            artifact_id,
+                            (),
+                        ),
                     ):
                         matched_ids = (artifact_id,)
                         break
@@ -2847,12 +3463,19 @@ def score_public_challenge(
             if component_key is not None and structural_group_id is not None:
                 matched_component_members[component_key] += 1
                 component_group_ids[component_key].add(structural_group_id)
-            if expected_verdict != "uncertain" and all(
-                available[artifact_id].get("evidence_status") == "supported"
-                for artifact_id in matched_ids
+            if _artifacts_confirm_supported_member(
+                tuple(available[artifact_id] for artifact_id in matched_ids),
+                member,
             ):
                 confirmed_members += 1
                 case_confirmed += 1
+            if canonical_subject_required and _artifacts_recover_canonical_subject(
+                tuple(available[artifact_id] for artifact_id in matched_ids),
+                member,
+                subject_surfaces=subject_surfaces,
+            ):
+                canonical_subject_members_recovered += 1
+                case_canonical_subject_members_recovered += 1
         case_complete_components = sum(
             matched_component_members[component_key] == expected_members
             and len(component_group_ids[component_key]) == 1
@@ -2865,6 +3488,10 @@ def score_public_challenge(
                 "gold_members": len(members),
                 "matched_members": case_matches,
                 "confirmed_members": case_confirmed,
+                "canonical_subject_members": case_canonical_subject_members,
+                "canonical_subject_members_recovered": (
+                    case_canonical_subject_members_recovered
+                ),
                 "artifacts": len(artifacts),
                 "cluster_reviews": len(reviews),
                 "complete_group_components": len(component_members),
@@ -2887,6 +3514,11 @@ def score_public_challenge(
     confirmed_recall = (
         confirmed_members / supported_gold_members if supported_gold_members else 1.0
     )
+    canonical_subject_recall = (
+        canonical_subject_members_recovered / canonical_subject_members
+        if canonical_subject_members
+        else 1.0
+    )
     supported_precision = (
         matched_supported_artifacts / supported_artifacts
         if supported_artifacts
@@ -2907,6 +3539,9 @@ def score_public_challenge(
         "all_members_recovered": matched_members == gold_members,
         "all_supported_members_confirmed": (
             confirmed_members == supported_gold_members
+        ),
+        "all_canonical_subjects_recovered": (
+            canonical_subject_members_recovered == canonical_subject_members
         ),
         "perfect_supported_precision": supported_precision == 1.0,
         "perfect_review_precision": review_precision == 1.0,
@@ -2930,6 +3565,12 @@ def score_public_challenge(
             "gold_sha256": _sha256(gold_raw),
             "prediction_seal_sha256": _sha256(seal_raw),
             "result_sha256": _sha256(result_raw),
+            "prediction_launcher_sha256": (prediction_provenance.launcher_sha256),
+            "prediction_launcher_trust_basis": (prediction_provenance.trust_basis),
+            "prediction_launcher_exact_artifact_verified": (
+                prediction_provenance.exact_artifact_verified
+            ),
+            "scorer_sha256": prediction_provenance.scorer_sha256,
             "gold_opened_after_this_prediction_seal": True,
             "operator_asserted_evaluation_mode": evaluation_mode,
             "first_use_blindness_claimed": evaluation_mode == "blind_first_use",
@@ -2937,6 +3578,10 @@ def score_public_challenge(
             "supported_gold_members": supported_gold_members,
             "matched_members": matched_members,
             "confirmed_members": confirmed_members,
+            "canonical_subject_members": canonical_subject_members,
+            "canonical_subject_members_recovered": (
+                canonical_subject_members_recovered
+            ),
             "artifacts": total_artifacts,
             "supported_artifacts": supported_artifacts,
             "matched_artifacts": len(matched_artifact_ids),
@@ -2950,6 +3595,7 @@ def score_public_challenge(
             ),
             "effective_member_recall": effective_recall,
             "confirmed_member_recall": confirmed_recall,
+            "canonical_subject_recall": canonical_subject_recall,
             "supported_artifact_precision": supported_precision,
             "review_output_precision": review_precision,
             "complete_group_recall": complete_group_recall,
@@ -2973,6 +3619,8 @@ def score_public_challenge(
         "matched_members": matched_members,
         "supported_gold_members": supported_gold_members,
         "confirmed_members": confirmed_members,
+        "canonical_subject_members": canonical_subject_members,
+        "canonical_subject_members_recovered": canonical_subject_members_recovered,
         "artifacts": total_artifacts,
         "supported_artifacts": supported_artifacts,
         "cluster_reviews": cluster_reviews,
@@ -2981,17 +3629,26 @@ def score_public_challenge(
         "forbidden_hypotheses": forbidden_hypotheses,
         "effective_member_recall": effective_recall,
         "confirmed_member_recall": confirmed_recall,
+        "canonical_subject_recall": canonical_subject_recall,
         "supported_artifact_precision": supported_precision,
         "review_output_precision": review_precision,
         "complete_group_recall": complete_group_recall,
         "complete_group_components": complete_group_components,
         "complete_group_components_recovered": complete_group_components_recovered,
+        "cases": per_case,
+        "gates": gate,
         "smoke_gate_passed": all(gate.values()),
         "gold_opened_after_this_prediction_seal": True,
         "operator_asserted_evaluation_mode": evaluation_mode,
         "first_use_blindness_claimed": evaluation_mode == "blind_first_use",
         "public_synthetic": True,
         "gold_version": gold.get("version"),
+        "prediction_launcher_sha256": prediction_provenance.launcher_sha256,
+        "prediction_launcher_trust_basis": prediction_provenance.trust_basis,
+        "prediction_launcher_exact_artifact_verified": (
+            prediction_provenance.exact_artifact_verified
+        ),
+        "scorer_sha256": prediction_provenance.scorer_sha256,
         "release_eligible": False,
         "test_invoker_used": claims.test_invoker_used,
         "private_content_printed": False,
@@ -3024,6 +3681,7 @@ def main() -> None:
     score.add_argument("--gold", type=Path, required=True)
     score.add_argument("--hmac-key", type=Path, required=True)
     score.add_argument("--output-root", type=Path, required=True)
+    score.add_argument("--prediction-launcher-artifact", type=Path)
     score.add_argument(
         "--evaluation-mode",
         choices=("blind_first_use", "development_replay"),
@@ -3046,6 +3704,7 @@ def main() -> None:
                 args.hmac_key,
                 args.output_root,
                 evaluation_mode=args.evaluation_mode,
+                prediction_launcher_artifact=args.prediction_launcher_artifact,
             )
     except (PublicChallengeError, OSError, ValueError):
         print(json.dumps(_safe_failure(str(args.phase)), sort_keys=True))

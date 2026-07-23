@@ -171,7 +171,7 @@ def _projection(
 ) -> GmailTemporalReviewProjection:
     supported_subject_types = ((f"subject-supported-{suffix}", "event"),)
     supported_hypothesis = GmailTemporalReviewHypothesis(
-        version="gmail_temporal_review_hypothesis_v2",
+        version="gmail_temporal_review_hypothesis_v3",
         hypothesis_id=_hypothesis_id(
             expression_id=f"expression-supported-{suffix}",
             relation="scheduled_for",
@@ -183,6 +183,9 @@ def _projection(
         expression_id=f"expression-supported-{suffix}",
         subject_mention_ids=(f"subject-supported-{suffix}",),
         subject_type_references=supported_subject_types,
+        subject_alias_mention_ids=(f"subject-supported-{suffix}",),
+        subject_alias_type_references=supported_subject_types,
+        canonical_subject_mention_id=None,
         lifecycle_mention_ids=(f"lifecycle-supported-{suffix}",),
         relation="scheduled_for",
         kind="planned",
@@ -193,7 +196,7 @@ def _projection(
     )
     uncertain_subject_types = ((f"subject-uncertain-{suffix}", "event_predicate"),)
     uncertain_hypothesis = GmailTemporalReviewHypothesis(
-        version="gmail_temporal_review_hypothesis_v2",
+        version="gmail_temporal_review_hypothesis_v3",
         hypothesis_id=_hypothesis_id(
             expression_id=f"expression-uncertain-{suffix}",
             relation="occurrence",
@@ -205,6 +208,9 @@ def _projection(
         expression_id=f"expression-uncertain-{suffix}",
         subject_mention_ids=(f"subject-uncertain-{suffix}",),
         subject_type_references=uncertain_subject_types,
+        subject_alias_mention_ids=(f"subject-uncertain-{suffix}",),
+        subject_alias_type_references=uncertain_subject_types,
+        canonical_subject_mention_id=None,
         lifecycle_mention_ids=(),
         relation="occurrence",
         kind="actual",
@@ -214,7 +220,7 @@ def _projection(
         candidate_requires_defer=True,
     )
     supported = GmailTemporalReviewArtifact(
-        version="gmail_temporal_review_artifact_v2",
+        version="gmail_temporal_review_artifact_v3",
         artifact_id=f"supported:candidate-supported-{suffix}",
         kind="supported_citation",
         evidence_status="supported",
@@ -225,7 +231,7 @@ def _projection(
         hypotheses=(supported_hypothesis,),
     )
     uncertain = GmailTemporalReviewArtifact(
-        version="gmail_temporal_review_artifact_v2",
+        version="gmail_temporal_review_artifact_v3",
         artifact_id=f"uncertainty:cluster-uncertain-{suffix}",
         kind="uncertainty_sidecar",
         evidence_status="uncertain",
@@ -268,7 +274,7 @@ def _projection(
         ),
     )
     projection = GmailTemporalReviewProjection(
-        version="gmail_temporal_review_projection_v2",
+        version="gmail_temporal_review_projection_v3",
         projection_fingerprint="",
         analysis_fingerprint=f"analysis-{suffix}",
         source_sha256=source_sha256,
@@ -356,9 +362,11 @@ def _hypothesis_id(
         normalized_value,
     )
     material = {
-        "version": "gmail_temporal_review_hypothesis_v2",
+        "version": "gmail_temporal_review_hypothesis_v3",
         "signature": signature,
         "subject_type_references": subject_type_references,
+        "subject_alias_type_references": subject_type_references,
+        "canonical_subject_mention_id": None,
     }
     return "gtrh_" + hashlib.sha256(_canonical_bytes(material)).hexdigest()
 
@@ -647,7 +655,7 @@ def test_v1_projection_head_is_stale_replaceable_and_not_restorable(
             restore_run_id="legacy-schema-run",
         )
     assert GMAIL_TEMPORAL_REVIEW_PROJECTION_VERSION == (
-        "gmail_temporal_review_projection_v2"
+        "gmail_temporal_review_projection_v3"
     )
 
 
