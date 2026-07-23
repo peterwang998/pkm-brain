@@ -271,7 +271,7 @@ def plan_gmail_temporal_thread_retrieval_experiment(
     )[:direct_limit]
     intent, intent_basis = _resolve_intent(query, temporal_intent)
     locked_ids = direct[: min(EXPERIMENT_LOCKED_ANCHOR_RESULTS, len(direct))]
-    if intent is None or verified_context_limit == 0:
+    if intent is None:
         return _plan(
             intent=intent,
             intent_basis=intent_basis,

@@ -89,6 +89,53 @@ def test_exact_alias_rescues_a_supported_review_observation() -> None:
     assert observation.routable is False
 
 
+@pytest.mark.parametrize(
+    ("alias", "body_alias", "key"),
+    [
+        ("東京会議", "東京会議", "event:tokyo-meeting"),
+        ("Café Review", "CAFÉ REVIEW", "event:cafe-review"),
+        ("Café Review", "Cafe\u0301 Review", "event:cafe-review"),
+    ],
+)
+def test_unicode_exact_alias_rescues_a_supported_review_observation(
+    alias: str,
+    body_alias: str,
+    key: str,
+) -> None:
+    plan = _plan(
+        f"Subject: Update\n\n{body_alias} was cancelled.",
+        _anchor(alias=alias, key=key),
+    )
+
+    assert plan.omissions == ()
+    observation = plan.observations[0]
+    assert observation.resolution == "supported"
+    assert observation.selected_event_identity_key == key
+    assert observation.possible_event_identity_keys == (key,)
+    assert observation.reasons == ("exact_subject_alias_match",)
+
+
+@pytest.mark.parametrize(
+    ("alias", "body_alias"),
+    [
+        ("Café Review", "Caf Review"),
+        ("Café Review", "Cafe Review"),
+        ("東京会議", "京都会議"),
+    ],
+)
+def test_unicode_aliases_do_not_match_truncated_or_lookalike_identity(
+    alias: str,
+    body_alias: str,
+) -> None:
+    plan = _plan(
+        f"Subject: Update\n\n{body_alias} was cancelled.",
+        _anchor(alias=alias),
+    )
+
+    assert plan.observations == ()
+    assert plan.omissions[0].reason == "explicit_event_identity_mismatch"
+
+
 def test_unique_anaphora_is_retained_but_never_selects_an_identity() -> None:
     plan = _plan(
         "Subject: Update\n\nIt was completed.",

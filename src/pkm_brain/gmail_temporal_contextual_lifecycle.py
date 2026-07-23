@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Literal
@@ -60,7 +61,7 @@ _LIFECYCLE_TITLE_PREFIX = re.compile(
     r"[ \t]*:[ \t]*",
     re.IGNORECASE,
 )
-_TOKEN = re.compile(r"[A-Za-z0-9]+")
+_TOKEN = re.compile(r"[^\W_]+", re.UNICODE)
 _IDENTITY_STOPWORDS = frozenset(
     {
         "a",
@@ -521,9 +522,12 @@ def _recent_object_conflicts(
 
 
 def _identity_tokens(value: str) -> tuple[str, ...]:
+    normalized = unicodedata.normalize("NFKC", value)
     return tuple(
         token
-        for token in (item.lower() for item in _TOKEN.findall(value))
+        for token in (
+            match.group(0).casefold() for match in _TOKEN.finditer(normalized)
+        )
         if token not in _IDENTITY_STOPWORDS
     )
 

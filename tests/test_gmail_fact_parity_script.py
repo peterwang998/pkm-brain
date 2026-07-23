@@ -586,12 +586,18 @@ def test_complete_prepared_bundle_scores_three_runs_without_private_output(
     assert result["version"] == parity.VERSION
     assert result["metric_gate_passed"] is True
     assert result["gate_passed"] is False
+    canonical_authority = parity._expected_canonical_adapter_authority()
+    assert canonical_authority is not None
+    assert result["target_authority_gate"]["canonical_adapter_available"] is True
     assert result["target_authority_gate"]["canonical_adapter_exact"] is False
     assert (
-        result["target_authority_gate"]["canonical_adapter_tracked_at_git_head"]
-        is False
+        result["target_authority_gate"]["canonical_adapter_tracked_at_git_head"] is True
     )
-    assert result["target_authority_gate"]["canonical_adapter_git_head"] is None
+    assert (
+        result["target_authority_gate"]["canonical_adapter_git_head"]
+        == canonical_authority["git_head"]
+    )
+    assert result["target_authority_gate"]["passed"] is False
     assert result["cohort"] == {
         "threads": 100,
         "messages": 100,

@@ -308,6 +308,95 @@ def test_newer_review_only_lifecycle_update_follows_verified_update() -> None:
     assert plan.context_evidence_ids == ("atlas-m2", "atlas-review")
 
 
+def test_zero_verified_budget_preserves_separate_review_only_channel() -> None:
+    sources = (
+        _source(
+            "atlas-m1",
+            ordinal=1,
+            text="Subject: Atlas\n\nAtlas launch was booked for October 2, 2027.",
+        ),
+        _source(
+            "atlas-m2",
+            ordinal=2,
+            text="Subject: Atlas\n\nAtlas launch was rescheduled to October 4, 2027.",
+        ),
+        _source(
+            "atlas-review",
+            ordinal=3,
+            text="Subject: Atlas\n\nIt was cancelled.",
+            verified_key=None,
+            contextual_key="event:atlas",
+        ),
+    ) + _distractors()
+    baseline = _baseline()
+
+    plan = plan_gmail_temporal_thread_retrieval_experiment(
+        query="What is the current status of the Atlas launch?",
+        temporal_intent="lifecycle",
+        source_available_as_of=CUTOFF,
+        baseline_ranked_evidence_ids=baseline,
+        evidence_sources=sources,
+        verified_context_limit=0,
+    )
+
+    assert plan.target_event_identity_key == "event:atlas"
+    assert plan.direct_ranked_evidence_ids == baseline
+    assert plan.verified_context_evidence_ids == ()
+    assert plan.review_context_evidence_ids == ("atlas-review",)
+    assert plan.context_evidence_ids == ("atlas-review",)
+    assert plan.answer_evidence_ids == baseline + ("atlas-review",)
+
+
+def test_zero_verified_budget_does_not_weaken_review_context_safeguards() -> None:
+    sources = (
+        _source(
+            "atlas-m1",
+            ordinal=2,
+            text="Subject: Atlas\n\nAtlas launch was booked for October 2, 2027.",
+        ),
+        _source(
+            "stale-review",
+            ordinal=1,
+            text="Subject: Atlas\n\nIt was cancelled.",
+            verified_key=None,
+            contextual_key="event:atlas",
+        ),
+        _source(
+            "wrong-event-review",
+            ordinal=3,
+            text="Subject: Atlas\n\nIt was cancelled.",
+            verified_key=None,
+            contextual_key="event:other",
+        ),
+        _source(
+            "question-review",
+            ordinal=4,
+            text="Subject: Atlas\n\nWas it cancelled?",
+            verified_key=None,
+            contextual_key="event:atlas",
+        ),
+        _source(
+            "verified-update",
+            ordinal=5,
+            text="Subject: Atlas\n\nAtlas launch was cancelled.",
+        ),
+    ) + _distractors()
+
+    plan = plan_gmail_temporal_thread_retrieval_experiment(
+        query="What is the current status of the Atlas launch?",
+        temporal_intent="lifecycle",
+        source_available_as_of=CUTOFF,
+        baseline_ranked_evidence_ids=_baseline(),
+        evidence_sources=sources,
+        verified_context_limit=0,
+    )
+
+    assert plan.target_event_identity_key == "event:atlas"
+    assert plan.verified_context_evidence_ids == ()
+    assert plan.review_context_evidence_ids == ()
+    assert plan.context_evidence_ids == ()
+
+
 @pytest.mark.parametrize(
     "text",
     [
