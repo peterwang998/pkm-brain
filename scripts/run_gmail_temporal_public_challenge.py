@@ -60,6 +60,7 @@ GOLD_VERSION = "public_blind_gmail_temporal_gold_v2"
 PUBLIC_ROOT_AUTHORITY_VERSION = "gmail_temporal_public_root_authority_v2"
 PUBLIC_ROOT_AUTHORITY_FILENAME = "public_temporal_challenge_authority.json"
 PUBLIC_TEST_PROVIDER = "injected-test-double"
+PUBLIC_NO_CALL_PROVIDER = "none"
 
 PUBLIC_SCOPE = "public_synthetic_non_release"
 RUN_COUNT = 3
@@ -347,16 +348,12 @@ def _execution_claims(
 ) -> _ExecutionClaims:
     if not external_calls_required:
         return _ExecutionClaims(
-            provider=(
-                PUBLIC_TEST_PROVIDER
-                if test_invoker_used
-                else GMAIL_TEMPORAL_EXTERNAL_PROVIDER
-            ),
+            provider=PUBLIC_NO_CALL_PROVIDER,
             external_call_started=False,
             restricted_execution=False,
             ephemeral_execution=False,
             local_model_used=False,
-            test_invoker_used=test_invoker_used,
+            test_invoker_used=False,
         )
     if test_invoker_used:
         # An injected callable has no external-execution attestation. Mark it
@@ -1330,6 +1327,7 @@ def _claims_from_plan(
         or plan.get("restricted_execution") is not claims.restricted_execution
         or plan.get("ephemeral_execution") is not claims.ephemeral_execution
         or plan.get("local_model_used") is not claims.local_model_used
+        or plan.get("test_invoker_used") is not claims.test_invoker_used
     ):
         raise PublicChallengeError("public challenge execution claims are invalid")
     return claims

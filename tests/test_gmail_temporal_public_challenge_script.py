@@ -505,6 +505,32 @@ def test_all_zero_work_challenge_scores_as_zero_recall_without_calls(
     assert score["smoke_gate_passed"] is False
 
 
+def test_zero_work_does_not_claim_an_unused_injected_invoker(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path, all_zero_work=True)
+    output = tmp_path / "zero-work-with-unused-invoker"
+    fake = FakeCodex()
+
+    result = challenge.run_public_challenge(
+        fixture["manifest"],
+        fixture["key"],
+        output,
+        invoke=fake,
+        test_only_allow_injected_invoker=True,
+    )
+
+    assert fake.calls == []
+    assert result["invocations"] == 0
+    assert result["external_calls"] == 0
+    assert result["test_invoker_used"] is False
+    plan = json.loads((output / "plan.json").read_text(encoding="utf-8"))
+    seal = json.loads((output / "prediction-seal.json").read_text(encoding="utf-8"))
+    for evidence in (plan, seal):
+        assert evidence["provider"] == challenge.PUBLIC_NO_CALL_PROVIDER
+        assert evidence["test_invoker_used"] is False
+        assert evidence["restricted_execution"] is False
+        assert evidence["local_model_used"] is False
+
+
 def datetime_from_iso(value: str) -> Any:
     from datetime import datetime
 
