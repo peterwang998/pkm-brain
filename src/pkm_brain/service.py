@@ -49,6 +49,12 @@ from .indexes import (
     vector_chunk_ids,
 )
 from .paths import BrainPaths, local_node_id
+from .retrospective_retrieval import (
+    RETROSPECTIVE_RETRIEVAL_VERSION as RETROSPECTIVE_RETRIEVAL_VERSION,
+    ReadOnlyModeError,
+    RetrospectiveEvidenceSource as RetrospectiveEvidenceSource,
+    RetrospectiveRetrievalMixin,
+)
 from .temporal import TemporalRetrievalRequest
 from .title_utils import bounded_document_title
 from .util import file_sha256, new_id, now_iso, slugify, token_count as estimate_tokens
@@ -300,7 +306,6 @@ RECENCY_INTENT_TERMS = {
     "yesterday",
 }
 
-
 @dataclass(frozen=True)
 class RetrievalPolicy:
     mode: str
@@ -313,16 +318,15 @@ class RetrievalPolicy:
     include_full_text: bool = False
 
 
-class ReadOnlyModeError(RuntimeError):
-    pass
-
-
-class BrainService:
+class BrainService(RetrospectiveRetrievalMixin):
     def __init__(self, paths: BrainPaths, *, read_only: bool = False) -> None:
         self.paths = paths
         self.read_only = read_only
         self.embedding_config = load_embedding_config(paths)
         self.embedding_provider = resolve_embedding_provider(self.embedding_config)
+
+    def _retrospective_ranking_dependencies(self) -> tuple[Any, Any]:
+        return rerank_chunks, select_search_results
 
     def _ensure_workspace(self) -> None:
         if self.read_only:
@@ -878,9 +882,7 @@ class BrainService:
                 "DELETE FROM context_lineage_events WHERE retrieval_event_id IS NOT NULL"
             ).rowcount
             delete_all_chunk_fts(conn)
-            active_document_ids = [
-                str(document["id"]) for document in document_rows
-            ]
+            active_document_ids = [str(document["id"]) for document in document_rows]
             if active_document_ids:
                 placeholders = ",".join("?" for _ in active_document_ids)
                 chunks_deleted = conn.execute(
@@ -2392,14 +2394,12 @@ class BrainService:
         valid_as_of: str | None = None,
         temporal_request: TemporalRetrievalRequest | None = None,
     ) -> list[dict[str, Any]]:
-        self.init_workspace()
+        self._ensure_workspace()
         fts_query = build_fts_query(query)
         if not fts_query or limit <= 0:
             return []
         if temporal_request is not None and valid_as_of is not None:
-            raise ValueError(
-                "temporal_request and valid_as_of cannot both be provided"
-            )
+            raise ValueError("temporal_request and valid_as_of cannot both be provided")
         temporal = temporal_request or TemporalRetrievalRequest.resolve(
             query, valid_as_of
         )

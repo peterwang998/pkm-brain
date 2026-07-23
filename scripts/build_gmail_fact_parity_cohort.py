@@ -30,12 +30,13 @@ import yaml
 from pkm_brain.chunking import strip_frontmatter
 
 
-VERSION = "gmail_fact_parity_cohort_builder_v1"
+VERSION = "gmail_fact_parity_cohort_builder_v2"
 ADMISSION_VERSION = "gmail_fact_parity_admission_v1"
-PACKET_VERSION = "gmail_fact_parity_packet_v1"
-COHORT_VERSION = "gmail_fact_parity_cohort_v1"
-JOIN_VERSION = "gmail_fact_parity_admission_join_v1"
-MANIFEST_VERSION = "gmail_fact_parity_cohort_manifest_v1"
+PACKET_VERSION = "gmail_fact_parity_packet_v2"
+COHORT_VERSION = "gmail_fact_parity_cohort_v2"
+JOIN_VERSION = "gmail_fact_parity_admission_join_v2"
+BINDING_VERSION = "gmail_fact_parity_source_binding_v2"
+MANIFEST_VERSION = "gmail_fact_parity_cohort_manifest_v2"
 PRIVATE_FILE_MODE = 0o600
 PRIVATE_DIRECTORY_MODE = 0o700
 MIN_HMAC_KEY_BYTES = 32
@@ -43,8 +44,10 @@ OUTPUT_ARTIFACT_NAMES = (
     "packets.jsonl",
     "cohort.jsonl",
     "admissions.jsonl",
+    "source-bindings.jsonl",
     "manifest.json",
 )
+MANIFEST_HMAC_DOMAIN = b"gmail_fact_parity_cohort_manifest_v2\0"
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _MESSAGE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -351,6 +354,16 @@ def _opaque_id(key: bytes, prefix: str, value: Any) -> str:
     return f"gfp_{prefix}_{digest}"
 
 
+def _manifest_hmac(key: bytes, manifest: dict[str, Any]) -> str:
+    unsigned = dict(manifest)
+    unsigned.pop("manifest_hmac_sha256", None)
+    return hmac.new(
+        key,
+        MANIFEST_HMAC_DOMAIN + _canonical_json(unsigned),
+        hashlib.sha256,
+    ).hexdigest()
+
+
 def _write_private_new(path: Path, payload: bytes) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
@@ -445,6 +458,7 @@ def build_gmail_fact_parity_cohort(
     hmac_key = _load_hmac_key(hmac_key_path)
 
     packet_builds: list[tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]]] = []
+    binding_rows: list[dict[str, Any]] = []
     source_set_rows: list[dict[str, str]] = []
     original_members = 0
     v2_members = 0
@@ -490,6 +504,24 @@ def build_gmail_fact_parity_cohort(
         v2_ids = set(v2_admission.admitted_message_ids)
         union_ids = original_ids | v2_ids
         if not union_ids:
+            binding_rows.append(
+                {
+                    "version": BINDING_VERSION,
+                    "gmail_account_key": source_key.account_key,
+                    "gmail_thread_id": source_key.thread_id,
+                    "gmail_source_revision": source_key.source_revision,
+                    "source_sha256": source.source_sha256,
+                    "projection_version": source.projection_version,
+                    "classifier_version": source.classifier_version,
+                    "thread_id": thread_id,
+                    "revision_id": revision_id,
+                    "packet_id": None,
+                    "messages": [],
+                    "original_admitted_message_ids": [],
+                    "v2_admitted_message_ids": [],
+                    "union_admitted_message_ids": [],
+                }
+            )
             continue
         ordered_messages = [
             message for message in source.messages if message.message_id in union_ids
@@ -509,6 +541,41 @@ def build_gmail_fact_parity_cohort(
                 source.classifier_version,
                 [message.message_id for message in ordered_messages],
             ],
+        )
+        original_ordered_raw_ids = [
+            message.message_id
+            for message in ordered_messages
+            if message.message_id in original_ids
+        ]
+        v2_ordered_raw_ids = [
+            message.message_id
+            for message in ordered_messages
+            if message.message_id in v2_ids
+        ]
+        union_ordered_raw_ids = [message.message_id for message in ordered_messages]
+        binding_rows.append(
+            {
+                "version": BINDING_VERSION,
+                "gmail_account_key": source_key.account_key,
+                "gmail_thread_id": source_key.thread_id,
+                "gmail_source_revision": source_key.source_revision,
+                "source_sha256": source.source_sha256,
+                "projection_version": source.projection_version,
+                "classifier_version": source.classifier_version,
+                "thread_id": thread_id,
+                "revision_id": revision_id,
+                "packet_id": packet_id,
+                "messages": [
+                    {
+                        "gmail_message_id": message.message_id,
+                        "message_id": opaque_message_ids[message.message_id],
+                    }
+                    for message in ordered_messages
+                ],
+                "original_admitted_message_ids": original_ordered_raw_ids,
+                "v2_admitted_message_ids": v2_ordered_raw_ids,
+                "union_admitted_message_ids": union_ordered_raw_ids,
+            }
         )
         packet_row = {
             "version": PACKET_VERSION,
@@ -587,6 +654,9 @@ def build_gmail_fact_parity_cohort(
     packets_bytes = _jsonl_bytes(packet_rows)
     cohort_bytes = _jsonl_bytes(cohort_rows)
     joins_bytes = _jsonl_bytes(join_rows)
+    bindings_bytes = _jsonl_bytes(
+        sorted(binding_rows, key=lambda item: item["revision_id"])
+    )
     source_set_bytes = _jsonl_bytes(
         sorted(source_set_rows, key=lambda item: item["revision_id"])
     )
@@ -600,6 +670,7 @@ def build_gmail_fact_parity_cohort(
         "cohort_sha256": _sha256_bytes(cohort_bytes),
         "packet_sha256": _sha256_bytes(packets_bytes),
         "admission_join_sha256": _sha256_bytes(joins_bytes),
+        "source_binding_sha256": _sha256_bytes(bindings_bytes),
         "canonical_source_set_sha256": _sha256_bytes(source_set_bytes),
         "original_inventory_sha256": _sha256_bytes(
             original_inventory_path.read_bytes()
@@ -624,6 +695,7 @@ def build_gmail_fact_parity_cohort(
         "private_file_mode": "0600",
         "private_directory_mode": "0700",
     }
+    manifest["manifest_hmac_sha256"] = _manifest_hmac(hmac_key, manifest)
     manifest_bytes = _canonical_json(manifest) + b"\n"
 
     _publish_frozen_artifacts(
@@ -632,6 +704,7 @@ def build_gmail_fact_parity_cohort(
             "packets.jsonl": packets_bytes,
             "cohort.jsonl": cohort_bytes,
             "admissions.jsonl": joins_bytes,
+            "source-bindings.jsonl": bindings_bytes,
             "manifest.json": manifest_bytes,
         },
     )
@@ -640,6 +713,7 @@ def build_gmail_fact_parity_cohort(
         "version": VERSION,
         "cohort_sha256": manifest["cohort_sha256"],
         "packet_sha256": manifest["packet_sha256"],
+        "source_binding_sha256": manifest["source_binding_sha256"],
         "canonical_source_set_sha256": manifest["canonical_source_set_sha256"],
         "source_revisions": len(wanted),
         "packets": len(packet_rows),

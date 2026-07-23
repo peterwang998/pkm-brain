@@ -3,11 +3,14 @@
 
 The three phases deliberately use separate authenticated artifacts:
 
-* ``freeze`` commits one private source authority and exactly forty primary,
+* ``freeze`` authenticates the builder manifest that jointly commits one
+  complete private source authority and its exact source-to-Gmail binding file,
+  then commits that upstream manifest alongside exactly forty primary,
   thread-disjoint global/cold temporal queries (plus an optional contextual
   follow-up challenge cohort);
 * ``seal-run`` binds a retriever invocation to that exact authority and rejects
-  incomplete, mixed, duplicated, or future-leaking ranked results; and
+  missing query rows, mixed, duplicated, over-depth, or future-leaking ranked
+  results; and
 * ``score`` publishes only aggregate hit/recall metrics.  Challenge queries are
   always diagnostic and can never enter the primary metric denominator.
 
@@ -35,6 +38,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import tempfile
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
@@ -42,21 +46,41 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "gmail_temporal_retrieval_holdout_evaluator_v2"
-BUNDLE_MANIFEST_VERSION = "gmail_temporal_retrieval_bundle_manifest_v2"
-RUN_MANIFEST_VERSION = "gmail_temporal_retrieval_run_manifest_v2"
-SCORE_MANIFEST_VERSION = "gmail_temporal_retrieval_score_manifest_v2"
+VERSION = "gmail_temporal_retrieval_holdout_evaluator_v7"
+BUNDLE_MANIFEST_VERSION = "gmail_temporal_retrieval_bundle_manifest_v7"
+RUN_MANIFEST_VERSION = "gmail_temporal_retrieval_run_manifest_v7"
+SCORE_MANIFEST_VERSION = "gmail_temporal_retrieval_score_manifest_v7"
 SOURCE_VERSION = "gmail_temporal_retrieval_source_v1"
 SOURCE_CONTROL_VERSION = "gmail_temporal_retrieval_source_control_v1"
-QUERY_VERSION = "gmail_temporal_retrieval_query_v2"
-GOLD_VERSION = "gmail_temporal_retrieval_gold_v2"
-RESULT_VERSION = "gmail_temporal_retrieval_result_v1"
-SCORE_VERSION = "gmail_temporal_retrieval_score_v2"
-INDEX_RECEIPT_VERSION = "gmail_temporal_retrieval_index_receipt_v1"
+BINDING_VERSION = "gmail_temporal_retrieval_source_binding_v3"
+SOURCE_AUTHORITY_BUILDER_VERSION = (
+    "gmail_temporal_retrieval_source_authority_builder_v3"
+)
+SOURCE_AUTHORITY_MANIFEST_VERSION = (
+    "gmail_temporal_retrieval_source_authority_manifest_v2"
+)
+QUERY_VERSION = "gmail_temporal_retrieval_query_v3"
+GOLD_VERSION = "gmail_temporal_retrieval_gold_v3"
+RESULT_VERSION = "gmail_temporal_retrieval_result_v2"
+SCORE_VERSION = "gmail_temporal_retrieval_score_v3"
+RETRIEVER_RUNNER_VERSION = "gmail_temporal_retrieval_runner_v4"
+RETRIEVER_CONFIG_VERSION = "gmail_temporal_retrieval_configuration_v4"
+RETRIEVER_IMPLEMENTATION_VERSION = (
+    "gmail_temporal_retrieval_implementation_provenance_v3"
+)
+RETROSPECTIVE_RETRIEVAL_VERSION = "retrospective_evidence_retrieval_v1"
+INDEX_RECEIPT_VERSION = "gmail_temporal_retrieval_index_receipt_v2"
 
-BUNDLE_MANIFEST_DOMAIN = b"gmail_temporal_retrieval_bundle_manifest_v2\0"
-RUN_MANIFEST_DOMAIN = b"gmail_temporal_retrieval_run_manifest_v2\0"
-SCORE_MANIFEST_DOMAIN = b"gmail_temporal_retrieval_score_manifest_v2\0"
+BUNDLE_MANIFEST_DOMAIN = b"gmail_temporal_retrieval_bundle_manifest_v7\0"
+RUN_MANIFEST_DOMAIN = b"gmail_temporal_retrieval_run_manifest_v7\0"
+SCORE_MANIFEST_DOMAIN = b"gmail_temporal_retrieval_score_manifest_v7\0"
+SOURCE_AUTHORITY_MANIFEST_DOMAIN = (
+    b"gmail_temporal_retrieval_source_authority_manifest_v2\0"
+)
+SOURCE_AUTHORITY_OPAQUE_ID_DOMAIN = b"gmail_temporal_retrieval_source_authority_v1\0"
+CHUNK_INVENTORY_DOMAIN = b"gmail_temporal_retrieval_chunk_inventory_v1\0"
+SOURCE_AUTHORITY_SOURCE_ARTIFACT = "source-authority.jsonl"
+SOURCE_AUTHORITY_BINDING_ARTIFACT = "source-bindings.jsonl"
 
 SOURCE_ARTIFACT = "blind-source-authority.jsonl"
 SOURCE_CONTROL_ARTIFACT = "sealed-source-control.jsonl"
@@ -72,9 +96,12 @@ MANIFEST_ARTIFACT = "manifest.json"
 PRIMARY_QUERY_COUNT = 40
 MIN_PRIMARY_QUERIES_PER_KIND = 5
 MIN_PRIMARY_LIFECYCLE_QUERIES_PER_CLASS = 1
-RESULT_DEPTH = 10
+MIN_RESULT_DEPTH = 0
+MAX_RESULT_DEPTH = 10
 TOP_5_THRESHOLD = 0.90
 TOP_10_THRESHOLD = 0.95
+MACRO_RELEVANT_RECALL_AT_10_THRESHOLD = 0.90
+COMPLETE_QUERY_RECALL_AT_10_THRESHOLD = 0.85
 PRIVATE_FILE_MODE = 0o600
 PRIVATE_DIRECTORY_MODE = 0o700
 MIN_HMAC_KEY_BYTES = 32
@@ -124,6 +151,30 @@ _PROVENANCE_ROLES = {
     "index_receipt",
     "query_protocol",
 }
+_INDEX_COMPONENT_KEYS = {
+    "config_sha256",
+    "embedding_stamp_sha256",
+    "lancedb_tree_sha256",
+    "sqlite_sha256",
+    "sqlite_wal_sha256",
+}
+_QUERY_PROTOCOL_BYTES = (
+    "gmail_temporal_retrieval_query_protocol_v3\n"
+    "input=blind_query_id_query_text_as_of_only\n"
+    "challenge_context=local_bound_message_text_only\n"
+    "retrieval_api=BrainService.retrieve_retrospective_evidence\n"
+    "output=unique_opaque_sources_zero_to_ten_no_padding\n"
+    "future_and_context_sources=excluded\n"
+    "telemetry=disabled\n"
+).encode("utf-8")
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+_GIT_IMPLEMENTATION_PATHS = {
+    "retrospective_retrieval": "src/pkm_brain/retrospective_retrieval.py",
+    "runner": "scripts/run_gmail_temporal_retrieval.py",
+    "service": "src/pkm_brain/service.py",
+}
+_GIT_OBJECT_ID_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+_GIT_COMMAND_TIMEOUT_SECONDS = 10
 
 
 class GmailTemporalRetrievalHoldoutError(ValueError):
@@ -274,9 +325,298 @@ def _load_source_rows(
             raise GmailTemporalRetrievalHoldoutError("source authority is invalid")
         previous_key = key
         by_id[source_id] = row
-    if len(rows) < RESULT_DEPTH:
+    if len(rows) < MAX_RESULT_DEPTH:
         raise GmailTemporalRetrievalHoldoutError("source authority is incomplete")
     return rows, by_id
+
+
+def _expected_bound_source_id(key: bytes, account: str, message_id: str) -> str:
+    material = _canonical_json(["source", account, message_id])
+    digest = hmac.new(
+        key,
+        SOURCE_AUTHORITY_OPAQUE_ID_DOMAIN + material,
+        hashlib.sha256,
+    ).hexdigest()
+    return f"gtrs_{digest[:32]}"
+
+
+def _expected_bound_thread_scope_id(key: bytes, account: str, thread_id: str) -> str:
+    material = _canonical_json(["thread", account, thread_id])
+    digest = hmac.new(
+        key,
+        SOURCE_AUTHORITY_OPAQUE_ID_DOMAIN + material,
+        hashlib.sha256,
+    ).hexdigest()
+    return f"gtrt_{digest[:32]}"
+
+
+def _expected_chunk_inventory_authenticator(
+    key: bytes,
+    *,
+    source_id: str,
+    document_id: str,
+    gmail_account_key: str,
+    gmail_message_id: str,
+    gmail_thread_id: str,
+    chunks: Sequence[Mapping[str, Any]],
+) -> str:
+    material = {
+        "chunks": [dict(chunk) for chunk in chunks],
+        "document_id": document_id,
+        "gmail_account_key": gmail_account_key,
+        "gmail_message_id": gmail_message_id,
+        "gmail_thread_id": gmail_thread_id,
+        "source_id": source_id,
+    }
+    return hmac.new(
+        key,
+        CHUNK_INVENTORY_DOMAIN + _canonical_json(material),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _load_source_binding_rows(
+    raw: bytes,
+    *,
+    key: bytes,
+    sources: Mapping[str, Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], set[str], int]:
+    rows = _canonical_jsonl(raw, description="source bindings")
+    required = {
+        "available_at",
+        "chunk_inventory_hmac_sha256",
+        "chunks",
+        "document_content_sha256",
+        "document_id",
+        "gmail_account_key",
+        "gmail_message_id",
+        "gmail_thread_id",
+        "message_sha256",
+        "source_id",
+        "version",
+    }
+    previous_source_id: str | None = None
+    seen_sources: set[str] = set()
+    seen_messages: set[tuple[str, str]] = set()
+    document_hashes: dict[str, str] = {}
+    seen_chunks: set[str] = set()
+    for row in rows:
+        if set(row) != required or row.get("version") != BINDING_VERSION:
+            raise GmailTemporalRetrievalHoldoutError("source bindings are invalid")
+        source_id = _identifier(
+            row.get("source_id"), description="binding source identity"
+        )
+        account = _identifier(
+            row.get("gmail_account_key"), description="binding account identity"
+        )
+        message_id = _identifier(
+            row.get("gmail_message_id"), description="binding message identity"
+        )
+        thread_id = _identifier(
+            row.get("gmail_thread_id"), description="binding thread identity"
+        )
+        document_id = _identifier(
+            row.get("document_id"), description="binding document identity"
+        )
+        chunks = row.get("chunks")
+        chunk_inventory_authenticator = row.get("chunk_inventory_hmac_sha256")
+        if (
+            not isinstance(chunks, list)
+            or not isinstance(chunk_inventory_authenticator, str)
+            or _SHA256_RE.fullmatch(chunk_inventory_authenticator) is None
+        ):
+            raise GmailTemporalRetrievalHoldoutError(
+                "source binding chunk authority is invalid"
+            )
+        normalized_chunks: list[dict[str, Any]] = []
+        for chunk in chunks:
+            if not isinstance(chunk, dict) or set(chunk) != {
+                "chunk_id",
+                "end_offset",
+                "start_offset",
+                "text_sha256",
+            }:
+                raise GmailTemporalRetrievalHoldoutError(
+                    "source binding chunk authority is invalid"
+                )
+            chunk_id = _identifier(
+                chunk.get("chunk_id"), description="binding chunk identity"
+            )
+            start = chunk.get("start_offset")
+            end = chunk.get("end_offset")
+            text_sha256 = chunk.get("text_sha256")
+            if (
+                chunk_id in seen_chunks
+                or type(start) is not int
+                or type(end) is not int
+                or start < 0
+                or end <= start
+                or not isinstance(text_sha256, str)
+                or _SHA256_RE.fullmatch(text_sha256) is None
+            ):
+                raise GmailTemporalRetrievalHoldoutError(
+                    "source binding chunk authority is invalid"
+                )
+            seen_chunks.add(chunk_id)
+            normalized_chunks.append(dict(chunk))
+        if normalized_chunks != sorted(
+            normalized_chunks,
+            key=lambda chunk: (
+                chunk["start_offset"],
+                chunk["end_offset"],
+                chunk["chunk_id"],
+            ),
+        ) or not hmac.compare_digest(
+            chunk_inventory_authenticator,
+            _expected_chunk_inventory_authenticator(
+                key,
+                source_id=source_id,
+                document_id=document_id,
+                gmail_account_key=account,
+                gmail_message_id=message_id,
+                gmail_thread_id=thread_id,
+                chunks=normalized_chunks,
+            ),
+        ):
+            raise GmailTemporalRetrievalHoldoutError(
+                "source binding chunk authority is invalid"
+            )
+        source = sources.get(source_id)
+        document_hash = row.get("document_content_sha256")
+        message_hash = row.get("message_sha256")
+        if (
+            source is None
+            or source_id in seen_sources
+            or (previous_source_id is not None and source_id <= previous_source_id)
+            or row.get("available_at") != source.get("available_at")
+            or not hmac.compare_digest(
+                source_id, _expected_bound_source_id(key, account, message_id)
+            )
+            or not hmac.compare_digest(
+                str(source.get("thread_scope_id") or ""),
+                _expected_bound_thread_scope_id(key, account, thread_id),
+            )
+            or (account, message_id) in seen_messages
+            or not isinstance(document_hash, str)
+            or _SHA256_RE.fullmatch(document_hash) is None
+            or not isinstance(message_hash, str)
+            or _SHA256_RE.fullmatch(message_hash) is None
+            or (
+                document_id in document_hashes
+                and document_hashes[document_id] != document_hash
+            )
+        ):
+            raise GmailTemporalRetrievalHoldoutError(
+                "source binding authority is invalid"
+            )
+        _timestamp(row.get("available_at"), description="binding availability")
+        previous_source_id = source_id
+        seen_sources.add(source_id)
+        seen_messages.add((account, message_id))
+        document_hashes[document_id] = document_hash
+    if seen_sources != set(sources):
+        raise GmailTemporalRetrievalHoldoutError(
+            "source binding authority coverage is invalid"
+        )
+    return rows, set(document_hashes), len(seen_chunks)
+
+
+def _load_source_authority_manifest(
+    raw: bytes,
+    *,
+    key: bytes,
+    source_raw: bytes,
+    source_bindings_raw: bytes,
+    sources: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    manifest = _parse_json(raw, description="source authority manifest")
+    expected_keys = {
+        "artifact_sha256",
+        "binding_version",
+        "builder_version",
+        "chunk_binding",
+        "chunk_count",
+        "document_count",
+        "external_calls",
+        "header_chunk_clock",
+        "manifest_hmac_sha256",
+        "message_count",
+        "persistence_calls",
+        "private_content_printed",
+        "source_identity",
+        "source_scope",
+        "source_version",
+        "thread_identity",
+        "version",
+    }
+    if (
+        not isinstance(manifest, dict)
+        or raw != _canonical_json(manifest) + b"\n"
+        or set(manifest) != expected_keys
+    ):
+        raise GmailTemporalRetrievalHoldoutError("source authority manifest is invalid")
+    authenticator = manifest.get("manifest_hmac_sha256")
+    unsigned = dict(manifest)
+    unsigned.pop("manifest_hmac_sha256", None)
+    expected_authenticator = hmac.new(
+        key,
+        SOURCE_AUTHORITY_MANIFEST_DOMAIN + _canonical_json(unsigned),
+        hashlib.sha256,
+    ).hexdigest()
+    if not isinstance(authenticator, str) or not hmac.compare_digest(
+        authenticator, expected_authenticator
+    ):
+        raise GmailTemporalRetrievalHoldoutError(
+            "source authority manifest authentication failed"
+        )
+    artifact_hashes = manifest.get("artifact_sha256")
+    expected_artifact_hashes = {
+        SOURCE_AUTHORITY_SOURCE_ARTIFACT: _sha256_bytes(source_raw),
+        SOURCE_AUTHORITY_BINDING_ARTIFACT: _sha256_bytes(source_bindings_raw),
+    }
+    required_policy = {
+        "version": SOURCE_AUTHORITY_MANIFEST_VERSION,
+        "builder_version": SOURCE_AUTHORITY_BUILDER_VERSION,
+        "source_version": SOURCE_VERSION,
+        "binding_version": BINDING_VERSION,
+        "source_scope": "every_message_in_every_active_trusted_gmail_projection",
+        "source_identity": "hmac_account_and_provider_message_id",
+        "thread_identity": "hmac_account_and_provider_thread_id",
+        "header_chunk_clock": "latest_retained_message_provider_internal_date",
+        "chunk_binding": (
+            "authenticated_exact_chunk_id_range_text_sha256_and_source_assignment"
+        ),
+        "external_calls": 0,
+        "persistence_calls": 0,
+        "private_content_printed": False,
+    }
+    if artifact_hashes != expected_artifact_hashes or any(
+        manifest.get(name) != value for name, value in required_policy.items()
+    ):
+        raise GmailTemporalRetrievalHoldoutError(
+            "source authority manifest policy is invalid"
+        )
+    binding_rows, document_ids, authenticated_chunk_count = _load_source_binding_rows(
+        source_bindings_raw,
+        key=key,
+        sources=sources,
+    )
+    message_count = manifest.get("message_count")
+    document_count = manifest.get("document_count")
+    chunk_count = manifest.get("chunk_count")
+    if (
+        type(message_count) is not int
+        or message_count != len(sources)
+        or message_count != len(binding_rows)
+        or type(document_count) is not int
+        or document_count != len(document_ids)
+        or type(chunk_count) is not int
+        or chunk_count != authenticated_chunk_count
+    ):
+        raise GmailTemporalRetrievalHoldoutError(
+            "source authority manifest counts are invalid"
+        )
+    return manifest
 
 
 def _split_source_rows(
@@ -349,8 +689,13 @@ def _join_blind_source_control(
     return _load_source_rows(_jsonl_bytes(joined))
 
 
-def _string_list(value: Any, *, description: str) -> list[str]:
-    if not isinstance(value, list) or not value:
+def _string_list(
+    value: Any,
+    *,
+    description: str,
+    allow_empty: bool = False,
+) -> list[str]:
+    if not isinstance(value, list) or (not allow_empty and not value):
         raise GmailTemporalRetrievalHoldoutError(f"{description} is invalid")
     items = [_identifier(item, description=description) for item in value]
     if items != sorted(set(items)):
@@ -416,7 +761,9 @@ def _load_query_rows(
             row.get("relevant_source_ids"), description="relevant source authority"
         )
         context = _string_list(
-            row.get("context_source_ids"), description="query context authority"
+            row.get("context_source_ids"),
+            description="query context authority",
+            allow_empty=cohort == "primary",
         )
         if set(relevant) & set(context):
             raise GmailTemporalRetrievalHoldoutError(
@@ -684,6 +1031,8 @@ def freeze_retrieval_holdout(
     hmac_key_path: Path,
     output_root: Path,
     *,
+    source_bindings_path: Path,
+    source_authority_manifest_path: Path,
     challenge_queries_path: Path | None = None,
 ) -> dict[str, Any]:
     """Freeze the source/query authority into an authenticated private bundle."""
@@ -691,6 +1040,15 @@ def freeze_retrieval_holdout(
     key = _hmac_key(Path(hmac_key_path))
     source_raw = _private_file(
         Path(source_authority_path), description="source authority"
+    )
+    source_bindings_raw = _private_file(
+        Path(source_bindings_path), description="source bindings"
+    )
+    if not source_bindings_raw:
+        raise GmailTemporalRetrievalHoldoutError("source bindings are invalid")
+    source_authority_manifest_raw = _private_file(
+        Path(source_authority_manifest_path),
+        description="source authority manifest",
     )
     primary_raw = _private_file(
         Path(primary_queries_path), description="primary query authority"
@@ -703,6 +1061,13 @@ def freeze_retrieval_holdout(
         else None
     )
     source_rows, sources = _load_source_rows(source_raw)
+    _load_source_authority_manifest(
+        source_authority_manifest_raw,
+        key=key,
+        source_raw=source_raw,
+        source_bindings_raw=source_bindings_raw,
+        sources=sources,
+    )
     primary_rows, primary_by_id, primary_threads = _load_query_rows(
         primary_raw, cohort="primary", sources=sources
     )
@@ -759,6 +1124,10 @@ def freeze_retrieval_holdout(
         "artifact_sha256": {
             name: _sha256_bytes(raw) for name, raw in sorted(artifacts.items())
         },
+        "source_binding_sha256": _sha256_bytes(source_bindings_raw),
+        "source_authority_manifest_sha256": _sha256_bytes(
+            source_authority_manifest_raw
+        ),
         "source_count": len(source_rows),
         "primary_query_count": len(primary_rows),
         "primary_thread_group_count": len(primary_threads),
@@ -776,7 +1145,11 @@ def freeze_retrieval_holdout(
         "cohort_metrics_must_not_be_pooled": True,
         "context_relevance_overlap_allowed": False,
         "ranked_context_sources_allowed": False,
-        "query_gold_coverage": "complete_nonempty_source_authority_binding",
+        "query_gold_coverage": (
+            "complete_relevance_and_present_context_source_authority_binding"
+        ),
+        "primary_context_cardinality": "zero_or_more",
+        "challenge_context_cardinality": "one_or_more_when_present",
         "gold_isolation": (
             "sealed_taxonomy_context_relevance_and_thread_control_scorer_only"
         ),
@@ -790,7 +1163,9 @@ def freeze_retrieval_holdout(
         ),
         "primary_temporal_kind_coverage_passed": True,
         "future_leakage_policy": "all_query_evidence_available_at_or_before_as_of",
-        "result_depth": RESULT_DEPTH,
+        "minimum_result_depth": MIN_RESULT_DEPTH,
+        "maximum_result_depth": MAX_RESULT_DEPTH,
+        "missing_result_ranks_scored_as_misses": True,
         "primary_release_denominator": PRIMARY_QUERY_COUNT,
         "challenge_diagnostic_only": True,
         "diagnostic_denominator": "primary_global_cold_only",
@@ -807,6 +1182,13 @@ def freeze_retrieval_holdout(
     if (
         _private_file(Path(source_authority_path), description="source authority")
         != source_raw
+        or _private_file(Path(source_bindings_path), description="source bindings")
+        != source_bindings_raw
+        or _private_file(
+            Path(source_authority_manifest_path),
+            description="source authority manifest",
+        )
+        != source_authority_manifest_raw
         or _private_file(
             Path(primary_queries_path), description="primary query authority"
         )
@@ -828,6 +1210,8 @@ def freeze_retrieval_holdout(
         "version": VERSION,
         "status": "frozen",
         "sources": len(source_rows),
+        "source_binding_committed": True,
+        "source_authority_manifest_committed": True,
         "primary_queries": len(primary_rows),
         "primary_thread_groups": len(primary_threads),
         "challenge_queries": len(challenge_rows),
@@ -907,7 +1291,11 @@ def _load_bundle(
         "cohort_metrics_must_not_be_pooled": True,
         "context_relevance_overlap_allowed": False,
         "ranked_context_sources_allowed": False,
-        "query_gold_coverage": "complete_nonempty_source_authority_binding",
+        "query_gold_coverage": (
+            "complete_relevance_and_present_context_source_authority_binding"
+        ),
+        "primary_context_cardinality": "zero_or_more",
+        "challenge_context_cardinality": "one_or_more_when_present",
         "gold_isolation": (
             "sealed_taxonomy_context_relevance_and_thread_control_scorer_only"
         ),
@@ -917,7 +1305,9 @@ def _load_bundle(
         ),
         "primary_temporal_kind_coverage_passed": True,
         "future_leakage_policy": "all_query_evidence_available_at_or_before_as_of",
-        "result_depth": RESULT_DEPTH,
+        "minimum_result_depth": MIN_RESULT_DEPTH,
+        "maximum_result_depth": MAX_RESULT_DEPTH,
+        "missing_result_ranks_scored_as_misses": True,
         "primary_release_denominator": PRIMARY_QUERY_COUNT,
         "challenge_diagnostic_only": True,
         "diagnostic_denominator": "primary_global_cold_only",
@@ -942,6 +1332,7 @@ def _load_bundle(
         "challenge_diagnostic_only",
         "challenge_query_count",
         "challenge_retrieval_mode",
+        "challenge_context_cardinality",
         "challenge_temporal_query_kind_counts",
         "challenge_thread_group_count",
         "cohort_metrics_must_not_be_pooled",
@@ -955,9 +1346,13 @@ def _load_bundle(
         "manifest_hmac_sha256",
         "minimum_primary_lifecycle_queries_per_class",
         "minimum_primary_queries_per_temporal_kind",
+        "minimum_result_depth",
+        "maximum_result_depth",
+        "missing_result_ranks_scored_as_misses",
         "persistence_calls",
         "primary_blind_context_source_ids_exposed",
         "primary_blind_query_contract",
+        "primary_context_cardinality",
         "primary_query_count",
         "primary_lifecycle_query_class_counts",
         "primary_release_denominator",
@@ -973,9 +1368,10 @@ def _load_bundle(
         "ranked_context_sources_allowed",
         "release_authority",
         "release_holdout_eligible",
-        "result_depth",
         "routable",
+        "source_authority_manifest_sha256",
         "source_count",
+        "source_binding_sha256",
         "version",
     }
     if (
@@ -988,13 +1384,18 @@ def _load_bundle(
                 "primary_thread_group_count",
                 "challenge_query_count",
                 "challenge_thread_group_count",
-                "result_depth",
+                "minimum_result_depth",
+                "maximum_result_depth",
                 "primary_release_denominator",
                 "external_calls",
                 "persistence_calls",
             )
         )
         or not isinstance(manifest.get("release_holdout_eligible"), bool)
+        or not isinstance(manifest.get("source_binding_sha256"), str)
+        or _SHA256_RE.fullmatch(manifest["source_binding_sha256"]) is None
+        or not isinstance(manifest.get("source_authority_manifest_sha256"), str)
+        or _SHA256_RE.fullmatch(manifest["source_authority_manifest_sha256"]) is None
         or _bundle_artifacts(manifest) != artifacts
     ):
         raise GmailTemporalRetrievalHoldoutError("retrieval bundle policy is invalid")
@@ -1081,7 +1482,7 @@ def _load_result_rows(
             or query_id in ranked
             or (previous_id is not None and query_id <= previous_id)
             or not isinstance(retrieved, list)
-            or len(retrieved) != RESULT_DEPTH
+            or not MIN_RESULT_DEPTH <= len(retrieved) <= MAX_RESULT_DEPTH
         ):
             raise GmailTemporalRetrievalHoldoutError(
                 f"{cohort} retrieval result coverage is invalid"
@@ -1129,6 +1530,390 @@ def _load_result_rows(
     return rows, ranked
 
 
+def _result_depth_summary(
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[str, int]:
+    depths = [len(row["retrieved"]) for row in rows]
+    return {
+        "minimum_observed_result_depth": min(depths, default=0),
+        "maximum_observed_result_depth": max(depths, default=0),
+        "retrieved_result_count": sum(depths),
+    }
+
+
+def _validated_index_components(value: Any, *, description: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != _INDEX_COMPONENT_KEYS:
+        raise GmailTemporalRetrievalHoldoutError(f"{description} is invalid")
+    for name, digest in value.items():
+        if digest is not None and (
+            not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None
+        ):
+            raise GmailTemporalRetrievalHoldoutError(f"{description} is invalid")
+        if name in {"config_sha256", "sqlite_sha256"} and (
+            not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None
+        ):
+            raise GmailTemporalRetrievalHoldoutError(f"{description} is invalid")
+    return dict(value)
+
+
+def _git_environment() -> dict[str, str]:
+    environment = {
+        name: value for name, value in os.environ.items() if not name.startswith("GIT_")
+    }
+    environment.update(
+        {
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "LC_ALL": "C",
+        }
+    )
+    return environment
+
+
+def _git_output(repository_root: Path, arguments: Sequence[str]) -> bytes:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repository_root), *arguments],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_git_environment(),
+            timeout=_GIT_COMMAND_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise GmailTemporalRetrievalHoldoutError(
+            "authoritative Git implementation is unavailable"
+        ) from exc
+    if completed.returncode != 0:
+        raise GmailTemporalRetrievalHoldoutError(
+            "authoritative Git implementation is unavailable"
+        )
+    return completed.stdout
+
+
+def _stable_worktree_source(path: Path) -> bytes:
+    descriptor: int | None = None
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise GmailTemporalRetrievalHoldoutError(
+            "authoritative production implementation is unavailable"
+        )
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or path.is_symlink():
+            raise GmailTemporalRetrievalHoldoutError(
+                "authoritative production implementation is unavailable"
+            )
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0),
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_dev != metadata.st_dev
+            or opened.st_ino != metadata.st_ino
+        ):
+            raise GmailTemporalRetrievalHoldoutError(
+                "authoritative production implementation is unavailable"
+            )
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = None
+            raw = handle.read()
+            closed = os.fstat(handle.fileno())
+            if (
+                closed.st_dev != opened.st_dev
+                or closed.st_ino != opened.st_ino
+                or closed.st_size != opened.st_size
+                or closed.st_mtime_ns != opened.st_mtime_ns
+            ):
+                raise GmailTemporalRetrievalHoldoutError(
+                    "authoritative production implementation is unavailable"
+                )
+        if not raw:
+            raise GmailTemporalRetrievalHoldoutError(
+                "authoritative production implementation is unavailable"
+            )
+        return raw
+    except GmailTemporalRetrievalHoldoutError:
+        raise
+    except OSError as exc:
+        raise GmailTemporalRetrievalHoldoutError(
+            "authoritative production implementation is unavailable"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _verified_git_implementation_sources(
+    repository_root: Path,
+    relative_paths: Mapping[str, str],
+) -> dict[str, tuple[str, str]]:
+    """Return sources only when fixed worktree files equal immutable HEAD blobs."""
+
+    root = Path(repository_root).resolve()
+    try:
+        top_level = Path(
+            _git_output(root, ["rev-parse", "--show-toplevel"]).decode("utf-8").strip()
+        ).resolve()
+        head = (
+            _git_output(root, ["rev-parse", "--verify", "HEAD^{commit}"])
+            .decode("ascii")
+            .strip()
+        )
+    except (UnicodeError, OSError) as exc:
+        raise GmailTemporalRetrievalHoldoutError(
+            "authoritative Git implementation is unavailable"
+        ) from exc
+    if top_level != root or _GIT_OBJECT_ID_RE.fullmatch(head) is None:
+        raise GmailTemporalRetrievalHoldoutError(
+            "authoritative Git implementation is unavailable"
+        )
+    pathspecs = [relative_paths[role] for role in sorted(relative_paths)]
+    if _git_output(
+        root,
+        ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", *pathspecs],
+    ):
+        raise GmailTemporalRetrievalHoldoutError(
+            "authoritative production implementation working tree is dirty"
+        )
+
+    sources: dict[str, tuple[str, str]] = {}
+    for role, relative_path in sorted(relative_paths.items()):
+        if (
+            not isinstance(relative_path, str)
+            or not relative_path
+            or Path(relative_path).is_absolute()
+            or ".." in Path(relative_path).parts
+        ):
+            raise GmailTemporalRetrievalHoldoutError(
+                "authoritative Git implementation path is invalid"
+            )
+        try:
+            object_id = (
+                _git_output(
+                    root,
+                    ["rev-parse", "--verify", f"{head}:{relative_path}"],
+                )
+                .decode("ascii")
+                .strip()
+            )
+            index_object_id = (
+                _git_output(root, ["rev-parse", "--verify", f":{relative_path}"])
+                .decode("ascii")
+                .strip()
+            )
+            object_type = _git_output(root, ["cat-file", "-t", object_id]).strip()
+        except UnicodeError as exc:
+            raise GmailTemporalRetrievalHoldoutError(
+                "authoritative Git implementation is unavailable"
+            ) from exc
+        if (
+            _GIT_OBJECT_ID_RE.fullmatch(object_id) is None
+            or _GIT_OBJECT_ID_RE.fullmatch(index_object_id) is None
+            or not hmac.compare_digest(object_id, index_object_id)
+            or object_type != b"blob"
+        ):
+            raise GmailTemporalRetrievalHoldoutError(
+                "authoritative production implementation index is dirty"
+            )
+        blob = _git_output(root, ["cat-file", "blob", object_id])
+        worktree = _stable_worktree_source(root / relative_path)
+        if worktree != blob:
+            raise GmailTemporalRetrievalHoldoutError(
+                "production implementation does not match authoritative Git HEAD"
+            )
+        try:
+            source = blob.decode("utf-8")
+        except UnicodeError as exc:
+            raise GmailTemporalRetrievalHoldoutError(
+                "authoritative Git implementation is unavailable"
+            ) from exc
+        if not source:
+            raise GmailTemporalRetrievalHoldoutError(
+                "authoritative Git implementation is unavailable"
+            )
+        sources[role] = (source, _sha256_bytes(blob))
+
+    if _git_output(
+        root,
+        ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", *pathspecs],
+    ):
+        raise GmailTemporalRetrievalHoldoutError(
+            "authoritative production implementation working tree is dirty"
+        )
+    try:
+        head_after = (
+            _git_output(root, ["rev-parse", "--verify", "HEAD^{commit}"])
+            .decode("ascii")
+            .strip()
+        )
+    except UnicodeError as exc:
+        raise GmailTemporalRetrievalHoldoutError(
+            "authoritative Git implementation is unavailable"
+        ) from exc
+    if not hmac.compare_digest(head, head_after):
+        raise GmailTemporalRetrievalHoldoutError(
+            "authoritative Git HEAD changed during provenance verification"
+        )
+    return sources
+
+
+def _authoritative_implementation_sources() -> dict[str, tuple[str, str]]:
+    return _verified_git_implementation_sources(
+        _REPOSITORY_ROOT,
+        _GIT_IMPLEMENTATION_PATHS,
+    )
+
+
+def _load_implementation_provenance(raw: bytes) -> dict[str, Any]:
+    value = _parse_json(raw, description="retriever implementation provenance")
+    expected_keys = {
+        "production_api",
+        "retrospective_retrieval_sha256",
+        "retrospective_retrieval_source",
+        "runner_sha256",
+        "runner_source",
+        "service_sha256",
+        "service_source",
+        "version",
+    }
+    if (
+        not isinstance(value, dict)
+        or raw != _canonical_json(value) + b"\n"
+        or set(value) != expected_keys
+        or value.get("version") != RETRIEVER_IMPLEMENTATION_VERSION
+        or value.get("production_api") != "BrainService.retrieve_retrospective_evidence"
+    ):
+        raise GmailTemporalRetrievalHoldoutError(
+            "retriever implementation provenance is invalid"
+        )
+    authoritative_sources = _authoritative_implementation_sources()
+    for prefix in ("runner", "service", "retrospective_retrieval"):
+        source = value.get(f"{prefix}_source")
+        digest = value.get(f"{prefix}_sha256")
+        if (
+            not isinstance(source, str)
+            or not source
+            or not isinstance(digest, str)
+            or _SHA256_RE.fullmatch(digest) is None
+            or not hmac.compare_digest(digest, _sha256_bytes(source.encode("utf-8")))
+        ):
+            raise GmailTemporalRetrievalHoldoutError(
+                "retriever implementation provenance is invalid"
+            )
+        authoritative_source, authoritative_digest = authoritative_sources[prefix]
+        if source != authoritative_source or not hmac.compare_digest(
+            digest, authoritative_digest
+        ):
+            raise GmailTemporalRetrievalHoldoutError(
+                "retriever implementation provenance does not match "
+                "authoritative production implementation"
+            )
+    return value
+
+
+def _load_retriever_configuration(
+    raw: bytes,
+    *,
+    bundle_manifest: Mapping[str, Any],
+    implementation: Mapping[str, Any],
+    implementation_raw: bytes,
+) -> dict[str, Any]:
+    value = _parse_json(raw, description="retriever configuration")
+    expected_keys = {
+        "binding_sha256",
+        "brain_read_only",
+        "context_source_filter",
+        "fact_source_fusion",
+        "future_source_filter",
+        "implementation_provenance_sha256",
+        "index_components",
+        "live_source_index_artifact_sha256",
+        "live_source_index_components",
+        "mode",
+        "production_retrieval_api",
+        "production_retrieval_api_version",
+        "result_depth_policy",
+        "retrieval_execution",
+        "retrospective_retrieval_sha256",
+        "runner_sha256",
+        "runner_version",
+        "scratch_writes_discarded",
+        "service_sha256",
+        "snapshot_index_artifact_sha256",
+        "snapshot_index_components",
+        "source_recency_and_lineage",
+        "telemetry_recorded",
+        "temporal_fact_clock",
+        "version",
+    }
+    static_policy = {
+        "version": RETRIEVER_CONFIG_VERSION,
+        "runner_version": RETRIEVER_RUNNER_VERSION,
+        "brain_read_only": True,
+        "retrieval_execution": "disposable_transactional_index_snapshot",
+        "scratch_writes_discarded": True,
+        "telemetry_recorded": False,
+        "result_depth_policy": "zero_to_ten_no_padding",
+        "fact_source_fusion": "ranked_facts_then_deterministic_source_chunks",
+        "temporal_fact_clock": (
+            "source_availability_replay_via_complete_fact_citation_cutoff"
+        ),
+        "source_recency_and_lineage": "disabled_for_as_of_replay_determinism",
+        "future_source_filter": "available_at_lte_query_as_of",
+        "context_source_filter": "excluded_from_ranked_results",
+        "production_retrieval_api": "BrainService.retrieve_retrospective_evidence",
+        "production_retrieval_api_version": RETROSPECTIVE_RETRIEVAL_VERSION,
+    }
+    expected_binding_sha256 = bundle_manifest.get("source_binding_sha256")
+    if (
+        not isinstance(value, dict)
+        or raw != _canonical_json(value) + b"\n"
+        or set(value) != expected_keys
+        or value.get("mode") not in {"source", "temporal"}
+        or any(value.get(name) != expected for name, expected in static_policy.items())
+        or not isinstance(expected_binding_sha256, str)
+        or _SHA256_RE.fullmatch(expected_binding_sha256) is None
+        or not isinstance(value.get("binding_sha256"), str)
+        or not hmac.compare_digest(value["binding_sha256"], expected_binding_sha256)
+        or value.get("runner_sha256") != implementation.get("runner_sha256")
+        or value.get("service_sha256") != implementation.get("service_sha256")
+        or value.get("retrospective_retrieval_sha256")
+        != implementation.get("retrospective_retrieval_sha256")
+        or value.get("implementation_provenance_sha256")
+        != _sha256_bytes(implementation_raw)
+    ):
+        raise GmailTemporalRetrievalHoldoutError(
+            "retriever configuration contract is invalid"
+        )
+    snapshot_components = _validated_index_components(
+        value.get("snapshot_index_components"),
+        description="retriever snapshot index components",
+    )
+    index_components = _validated_index_components(
+        value.get("index_components"),
+        description="retriever index components",
+    )
+    live_components = _validated_index_components(
+        value.get("live_source_index_components"),
+        description="retriever live index components",
+    )
+    snapshot_commitment = _sha256_bytes(_canonical_json(snapshot_components))
+    live_commitment = _sha256_bytes(_canonical_json(live_components))
+    if (
+        index_components != snapshot_components
+        or value.get("snapshot_index_artifact_sha256") != snapshot_commitment
+        or value.get("live_source_index_artifact_sha256") != live_commitment
+    ):
+        raise GmailTemporalRetrievalHoldoutError(
+            "retriever index commitment is invalid"
+        )
+    return value
+
+
 def _load_retriever_provenance(
     paths: Mapping[str, Path],
     *,
@@ -1142,11 +1927,22 @@ def _load_retriever_provenance(
     }
     if any(not raw for raw in raw_by_role.values()):
         raise GmailTemporalRetrievalHoldoutError("retriever provenance is invalid")
+    if raw_by_role["query_protocol"] != _QUERY_PROTOCOL_BYTES:
+        raise GmailTemporalRetrievalHoldoutError("retriever query protocol is invalid")
+    implementation_raw = raw_by_role["implementation"]
+    implementation = _load_implementation_provenance(implementation_raw)
+    configuration = _load_retriever_configuration(
+        raw_by_role["configuration"],
+        bundle_manifest=bundle_manifest,
+        implementation=implementation,
+        implementation_raw=implementation_raw,
+    )
     receipt_raw = raw_by_role["index_receipt"]
     receipt = _parse_json(receipt_raw, description="retrieval index receipt")
     expected_receipt_keys = {
         "blind_primary_queries_sha256",
         "index_artifact_sha256",
+        "index_components",
         "snapshot_as_of",
         "source_authority_sha256",
         "source_count",
@@ -1163,9 +1959,17 @@ def _load_retriever_provenance(
         != bundle_manifest["artifact_sha256"][PRIMARY_QUERY_ARTIFACT]
         or type(receipt.get("source_count")) is not int
         or receipt.get("source_count") != bundle_manifest["source_count"]
-        or not isinstance(receipt.get("index_artifact_sha256"), str)
-        or _SHA256_RE.fullmatch(receipt["index_artifact_sha256"]) is None
+        or receipt.get("index_artifact_sha256")
+        != configuration.get("snapshot_index_artifact_sha256")
     ):
+        raise GmailTemporalRetrievalHoldoutError("retrieval index receipt is invalid")
+    receipt_components = _validated_index_components(
+        receipt.get("index_components"),
+        description="retrieval receipt index components",
+    )
+    if receipt_components != configuration.get("snapshot_index_components") or receipt[
+        "index_artifact_sha256"
+    ] != _sha256_bytes(_canonical_json(receipt_components)):
         raise GmailTemporalRetrievalHoldoutError("retrieval index receipt is invalid")
     _timestamp(receipt.get("snapshot_as_of"), description="index snapshot time")
     hashes = {role: _sha256_bytes(raw) for role, raw in sorted(raw_by_role.items())}
@@ -1235,6 +2039,7 @@ def seal_retrieval_run(
     artifacts = {PRIMARY_RESULT_ARTIFACT: _jsonl_bytes(primary_rows)}
     if challenge_rows:
         artifacts[CHALLENGE_RESULT_ARTIFACT] = _jsonl_bytes(challenge_rows)
+    result_depth_summary = _result_depth_summary([*primary_rows, *challenge_rows])
     manifest = {
         "version": RUN_MANIFEST_VERSION,
         "evaluator_version": VERSION,
@@ -1244,6 +2049,10 @@ def seal_retrieval_run(
         "source_artifact_sha256": dict(
             sorted(bundle_manifest["artifact_sha256"].items())
         ),
+        "source_authority_manifest_sha256": bundle_manifest[
+            "source_authority_manifest_sha256"
+        ],
+        "source_binding_sha256": bundle_manifest["source_binding_sha256"],
         "retriever_provenance_sha256": retriever_provenance_sha256,
         "retriever_provenance_artifact_sha256": provenance_hashes,
         "artifact_sha256": {
@@ -1251,7 +2060,10 @@ def seal_retrieval_run(
         },
         "primary_query_count": len(primary_rows),
         "challenge_query_count": len(challenge_rows),
-        "result_depth": RESULT_DEPTH,
+        "minimum_result_depth": MIN_RESULT_DEPTH,
+        "maximum_result_depth": MAX_RESULT_DEPTH,
+        "missing_result_ranks_scored_as_misses": True,
+        **result_depth_summary,
         "query_coverage": "exact_frozen_query_authority",
         "source_coverage": "exact_frozen_source_authority",
         "future_leakage_policy": "retrieved_source_available_at_or_before_query_as_of",
@@ -1308,7 +2120,9 @@ def seal_retrieval_run(
         "status": "sealed",
         "primary_queries": len(primary_rows),
         "challenge_queries": len(challenge_rows),
-        "result_depth": RESULT_DEPTH,
+        "minimum_result_depth": MIN_RESULT_DEPTH,
+        "maximum_result_depth": MAX_RESULT_DEPTH,
+        **result_depth_summary,
         "release_holdout_eligible": bundle_manifest["release_holdout_eligible"],
         "external_calls": 0,
         "persistence_calls": 0,
@@ -1369,9 +2183,15 @@ def _load_run(
         "source_artifact_sha256": dict(
             sorted(bundle_manifest["artifact_sha256"].items())
         ),
+        "source_authority_manifest_sha256": bundle_manifest[
+            "source_authority_manifest_sha256"
+        ],
+        "source_binding_sha256": bundle_manifest["source_binding_sha256"],
         "primary_query_count": PRIMARY_QUERY_COUNT,
         "challenge_query_count": len(challenge_queries),
-        "result_depth": RESULT_DEPTH,
+        "minimum_result_depth": MIN_RESULT_DEPTH,
+        "maximum_result_depth": MAX_RESULT_DEPTH,
+        "missing_result_ranks_scored_as_misses": True,
         "query_coverage": "exact_frozen_query_authority",
         "source_coverage": "exact_frozen_source_authority",
         "future_leakage_policy": "retrieved_source_available_at_or_before_query_as_of",
@@ -1407,6 +2227,11 @@ def _load_run(
         "external_calls",
         "future_leakage_policy",
         "manifest_hmac_sha256",
+        "maximum_observed_result_depth",
+        "maximum_result_depth",
+        "minimum_observed_result_depth",
+        "minimum_result_depth",
+        "missing_result_ranks_scored_as_misses",
         "persistence_calls",
         "primary_blind_context_source_ids_exposed",
         "primary_blind_query_contract",
@@ -1417,11 +2242,13 @@ def _load_run(
         "private_file_mode",
         "query_coverage",
         "release_holdout_eligible",
-        "result_depth",
+        "retrieved_result_count",
         "retriever_provenance_sha256",
         "retriever_provenance_artifact_sha256",
         "routable",
         "source_artifact_sha256",
+        "source_authority_manifest_sha256",
+        "source_binding_sha256",
         "source_bundle_manifest_hmac_sha256",
         "source_bundle_manifest_sha256",
         "source_coverage",
@@ -1435,7 +2262,11 @@ def _load_run(
             for name in (
                 "primary_query_count",
                 "challenge_query_count",
-                "result_depth",
+                "minimum_result_depth",
+                "maximum_result_depth",
+                "minimum_observed_result_depth",
+                "maximum_observed_result_depth",
+                "retrieved_result_count",
                 "external_calls",
                 "persistence_calls",
             )
@@ -1452,19 +2283,25 @@ def _load_run(
         )
     ):
         raise GmailTemporalRetrievalHoldoutError("retrieval run policy is invalid")
-    _primary_rows, primary_ranked = _load_result_rows(
+    primary_rows, primary_ranked = _load_result_rows(
         artifacts[PRIMARY_RESULT_ARTIFACT],
         cohort="primary",
         queries=primary_queries,
         sources=sources,
     )
     challenge_ranked: dict[str, list[str]] = {}
+    challenge_rows: list[dict[str, Any]] = []
     if challenge_queries:
-        _challenge_rows, challenge_ranked = _load_result_rows(
+        challenge_rows, challenge_ranked = _load_result_rows(
             artifacts[CHALLENGE_RESULT_ARTIFACT],
             cohort="challenge",
             queries=challenge_queries,
             sources=sources,
+        )
+    result_depth_summary = _result_depth_summary([*primary_rows, *challenge_rows])
+    if any(manifest.get(name) != value for name, value in result_depth_summary.items()):
+        raise GmailTemporalRetrievalHoldoutError(
+            "retrieval run result-depth policy is invalid"
         )
     if set(bundle_artifacts) != _bundle_artifacts(bundle_manifest):
         raise GmailTemporalRetrievalHoldoutError(
@@ -1514,31 +2351,53 @@ def _wilson_interval(numerator: int, denominator: int) -> dict[str, Any]:
     }
 
 
-def _cohort_metrics(
+def _retrieval_metrics(
     queries: Mapping[str, Mapping[str, Any]],
     ranked: Mapping[str, Sequence[str]],
-    *,
-    diagnostic_only: bool,
-    retrieval_mode: str,
 ) -> dict[str, Any]:
     hits_at_5 = 0
     hits_at_10 = 0
+    complete_at_10 = 0
     relevant_total = 0
     relevant_at_5 = 0
     relevant_at_10 = 0
+    macro_relevant_recall_at_5 = 0.0
+    macro_relevant_recall_at_10 = 0.0
+    reciprocal_rank_total = 0.0
+    result_depths: list[int] = []
     for query_id, query in queries.items():
         relevant = set(query["relevant_source_ids"])
-        top_5 = set(ranked[query_id][:5])
-        top_10 = set(ranked[query_id][:10])
+        retrieved = list(ranked[query_id])
+        top_5 = set(retrieved[:5])
+        top_10 = set(retrieved[:10])
+        matched_at_5 = len(relevant & top_5)
+        matched_at_10 = len(relevant & top_10)
         hits_at_5 += bool(relevant & top_5)
         hits_at_10 += bool(relevant & top_10)
+        complete_at_10 += relevant <= top_10
         relevant_total += len(relevant)
-        relevant_at_5 += len(relevant & top_5)
-        relevant_at_10 += len(relevant & top_10)
+        relevant_at_5 += matched_at_5
+        relevant_at_10 += matched_at_10
+        macro_relevant_recall_at_5 += matched_at_5 / len(relevant)
+        macro_relevant_recall_at_10 += matched_at_10 / len(relevant)
+        reciprocal_rank_total += next(
+            (
+                1.0 / rank
+                for rank, source_id in enumerate(retrieved[:10], start=1)
+                if source_id in relevant
+            ),
+            0.0,
+        )
+        result_depths.append(len(retrieved))
     count = len(queries)
     return {
         "queries": count,
         "thread_groups": count,
+        "retrieved_sources": sum(result_depths),
+        "queries_with_no_results": sum(depth == 0 for depth in result_depths),
+        "minimum_result_depth": min(result_depths, default=None),
+        "maximum_result_depth": max(result_depths, default=None),
+        "mean_result_depth": sum(result_depths) / count if count else None,
         "hits_at_5": hits_at_5,
         "hits_at_10": hits_at_10,
         "query_hit_rate_at_5": hits_at_5 / count if count else None,
@@ -1551,6 +2410,64 @@ def _cohort_metrics(
         ),
         "relevant_source_recall_at_10": (
             relevant_at_10 / relevant_total if relevant_total else None
+        ),
+        "macro_relevant_source_recall_at_5": (
+            macro_relevant_recall_at_5 / count if count else None
+        ),
+        "macro_relevant_source_recall_at_10": (
+            macro_relevant_recall_at_10 / count if count else None
+        ),
+        "mean_reciprocal_rank_at_10": (
+            reciprocal_rank_total / count if count else None
+        ),
+        "complete_queries_at_10": complete_at_10,
+        "complete_query_recall_at_10": complete_at_10 / count if count else None,
+        "complete_query_recall_at_10_interval_95": _wilson_interval(
+            complete_at_10, count
+        ),
+    }
+
+
+def _metric_breakdown(
+    queries: Mapping[str, Mapping[str, Any]],
+    ranked: Mapping[str, Sequence[str]],
+    *,
+    field: str,
+    values: Sequence[str],
+) -> dict[str, dict[str, Any]]:
+    return {
+        value: _retrieval_metrics(
+            {
+                query_id: query
+                for query_id, query in queries.items()
+                if query.get(field) == value
+            },
+            ranked,
+        )
+        for value in values
+    }
+
+
+def _cohort_metrics(
+    queries: Mapping[str, Mapping[str, Any]],
+    ranked: Mapping[str, Sequence[str]],
+    *,
+    diagnostic_only: bool,
+    retrieval_mode: str,
+) -> dict[str, Any]:
+    return {
+        **_retrieval_metrics(queries, ranked),
+        "temporal_query_kind_metrics": _metric_breakdown(
+            queries,
+            ranked,
+            field="temporal_query_kind",
+            values=sorted(_TEMPORAL_QUERY_KINDS),
+        ),
+        "lifecycle_query_class_metrics": _metric_breakdown(
+            queries,
+            ranked,
+            field="lifecycle_query_class",
+            values=sorted(_LIFECYCLE_QUERY_CLASSES),
         ),
         "retrieval_mode": retrieval_mode,
         "diagnostic_only": diagnostic_only,
@@ -1639,12 +2556,27 @@ def score_retrieval_holdout(
     )
     top_5_passed = primary_metrics["query_hit_rate_at_5"] >= TOP_5_THRESHOLD
     top_10_passed = primary_metrics["query_hit_rate_at_10"] >= TOP_10_THRESHOLD
-    retrieval_gate_passed = top_5_passed and top_10_passed
+    macro_recall_at_10_passed = (
+        primary_metrics["macro_relevant_source_recall_at_10"]
+        >= MACRO_RELEVANT_RECALL_AT_10_THRESHOLD
+    )
+    complete_query_recall_at_10_passed = (
+        primary_metrics["complete_query_recall_at_10"]
+        >= COMPLETE_QUERY_RECALL_AT_10_THRESHOLD
+    )
+    retrieval_gate_passed = all(
+        (
+            top_5_passed,
+            top_10_passed,
+            macro_recall_at_10_passed,
+            complete_query_recall_at_10_passed,
+        )
+    )
     diagnostic_prerequisite_checks = {
         "source_release_holdout_eligible": bundle_manifest["release_holdout_eligible"],
         "exact_forty_primary_thread_groups": len(primary_queries)
         == PRIMARY_QUERY_COUNT,
-        "exact_source_gold_and_result_coverage": True,
+        "complete_query_rows_and_bounded_ranked_results": True,
         "future_leakage_absent": True,
         "thread_scope_taxonomy_context_and_gold_hidden_from_primary_input": True,
         "primary_global_cold_input_is_text_only": True,
@@ -1655,6 +2587,8 @@ def score_retrieval_holdout(
         ],
         "top_5_query_hit_rate": top_5_passed,
         "top_10_query_hit_rate": top_10_passed,
+        "macro_relevant_source_recall_at_10": macro_recall_at_10_passed,
+        "complete_query_recall_at_10": complete_query_recall_at_10_passed,
     }
     # This evaluator binds a local index receipt, not an authenticated upstream
     # ingestion/index-authority chain.  Its metric can be a prerequisite, never
@@ -1678,8 +2612,17 @@ def score_retrieval_holdout(
         "primary_temporal_kind_coverage_passed": True,
         "required_query_hit_rate_at_5": TOP_5_THRESHOLD,
         "required_query_hit_rate_at_10": TOP_10_THRESHOLD,
+        "required_macro_relevant_source_recall_at_10": (
+            MACRO_RELEVANT_RECALL_AT_10_THRESHOLD
+        ),
+        "required_complete_query_recall_at_10": (COMPLETE_QUERY_RECALL_AT_10_THRESHOLD),
+        "minimum_result_depth": MIN_RESULT_DEPTH,
+        "maximum_result_depth": MAX_RESULT_DEPTH,
+        "missing_result_ranks_scored_as_misses": True,
         "top_5_gate_passed": top_5_passed,
         "top_10_gate_passed": top_10_passed,
+        "macro_relevant_source_recall_at_10_gate_passed": (macro_recall_at_10_passed),
+        "complete_query_recall_at_10_gate_passed": (complete_query_recall_at_10_passed),
         "retrieval_gate_passed": retrieval_gate_passed,
         "retrieval_metric_prerequisite_passed": retrieval_gate_passed,
         "diagnostic_prerequisite_checks": diagnostic_prerequisite_checks,
@@ -1740,6 +2683,15 @@ def score_retrieval_holdout(
         "primary_temporal_kind_coverage_passed": True,
         "top_5_threshold": TOP_5_THRESHOLD,
         "top_10_threshold": TOP_10_THRESHOLD,
+        "macro_relevant_source_recall_at_10_threshold": (
+            MACRO_RELEVANT_RECALL_AT_10_THRESHOLD
+        ),
+        "complete_query_recall_at_10_threshold": (
+            COMPLETE_QUERY_RECALL_AT_10_THRESHOLD
+        ),
+        "minimum_result_depth": MIN_RESULT_DEPTH,
+        "maximum_result_depth": MAX_RESULT_DEPTH,
+        "missing_result_ranks_scored_as_misses": True,
         "retrieval_gate_passed": retrieval_gate_passed,
         "retrieval_metric_prerequisite_passed": retrieval_gate_passed,
         "source_release_holdout_eligible": bundle_manifest["release_holdout_eligible"],
@@ -1804,6 +2756,11 @@ def score_retrieval_holdout(
         "query_hit_rate_at_10_interval_95": primary_metrics[
             "query_hit_rate_at_10_interval_95"
         ],
+        "mean_reciprocal_rank_at_10": primary_metrics["mean_reciprocal_rank_at_10"],
+        "macro_relevant_source_recall_at_10": primary_metrics[
+            "macro_relevant_source_recall_at_10"
+        ],
+        "complete_query_recall_at_10": primary_metrics["complete_query_recall_at_10"],
         "retrieval_gate_passed": retrieval_gate_passed,
         "retrieval_metric_prerequisite_passed": retrieval_gate_passed,
         "release_score_gate_passed": release_score_gate_passed,
@@ -1838,6 +2795,8 @@ def main() -> None:
 
     freeze_parser = subparsers.add_parser("freeze")
     freeze_parser.add_argument("--source-authority", type=Path, required=True)
+    freeze_parser.add_argument("--source-bindings", type=Path, required=True)
+    freeze_parser.add_argument("--source-authority-manifest", type=Path, required=True)
     freeze_parser.add_argument("--primary-queries", type=Path, required=True)
     freeze_parser.add_argument("--challenge-queries", type=Path)
     freeze_parser.add_argument("--hmac-key", type=Path, required=True)
@@ -1868,6 +2827,8 @@ def main() -> None:
                 args.primary_queries,
                 args.hmac_key,
                 args.output_root,
+                source_bindings_path=args.source_bindings,
+                source_authority_manifest_path=args.source_authority_manifest,
                 challenge_queries_path=args.challenge_queries,
             )
         elif args.command == "seal-run":

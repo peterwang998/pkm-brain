@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import stat
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -149,6 +150,8 @@ def _cohort(tmp_path: Path, *, unit_count: int) -> dict[str, Path]:
         "cohort": output / "cohort.jsonl",
         "admissions": output / "admissions.jsonl",
         "cohort_manifest": output / "manifest.json",
+        "source_bindings": output / "source-bindings.jsonl",
+        "hmac_key": key,
         "original_inventory": original,
         "v2_inventory": v2,
     }
@@ -175,9 +178,7 @@ def _run_output(
         "run_id": run_id,
         "arm": resolved_arm,
         "commit": (
-            parity.EXPECTED_ORIGINAL_COMMIT
-            if resolved_arm == "original"
-            else "b" * 40
+            parity.EXPECTED_ORIGINAL_COMMIT if resolved_arm == "original" else "b" * 40
         ),
         "prompt_version": (
             parity.EXPECTED_ORIGINAL_PROMPT_VERSION
@@ -200,19 +201,44 @@ def _run_output(
         ),
         "cohort_sha256": cohort_sha256,
         "packet_sha256": packet_sha256,
+        "stage_contract_version": parity.STAGE_CONTRACT_VERSION,
+        "stage_contract_sha256": parity.STAGE_CONTRACT_SHA256,
+        "adapter_sha256": "a" * 64,
+        "production_tree_sha256": (
+            parity.EXPECTED_ORIGINAL_PRODUCTION_TREE_SHA256
+            if resolved_arm == "original"
+            else "2" * 64
+        ),
+        "runtime_config_sha256": (
+            parity.EXPECTED_ORIGINAL_RUNTIME_CONFIG_SHA256
+            if resolved_arm == "original"
+            else "4" * 64
+        ),
+        "prompt_sha256": (
+            parity.EXPECTED_ORIGINAL_PROMPT_SHA256
+            if resolved_arm == "original"
+            else "6" * 64
+        ),
     }
+    invocation_prefix = f"invoke-{run_id}"
+    ledger = _invocation_ledger(invocation_prefix, packets, header)
+    header["invocation_ledger_sha256"] = hashlib.sha256(
+        parity._canonical_json(ledger)
+    ).hexdigest()
     members: dict[str, str] = {}
     rows = [header]
     for index, packet in enumerate(packets):
         message_id = packet["messages"][0]["message_id"]
         packet_members = []
         if not empty and index not in empty_packet_indexes:
+            stages = (stage_overrides or {}).get(
+                index, {stage: True for stage in parity.STAGES}
+            )
             member = {
                 "statement": f"PRIVATE_FACT_SENTINEL_{run_id}_{index}",
                 "evidence_message_ids": [message_id],
-                "stages": (stage_overrides or {}).get(
-                    index, {stage: True for stage in parity.STAGES}
-                ),
+                "stages": stages,
+                "stage_record": _stage_record(stages, index=index),
             }
             member_id = parity.gmail_fact_parity_member_id(
                 run_id,
@@ -227,6 +253,11 @@ def _run_output(
                 "statement": f"PRIVATE_DUPLICATE_SENTINEL_{run_id}",
                 "evidence_message_ids": [message_id],
                 "stages": {stage: True for stage in parity.STAGES},
+                "stage_record": _stage_record(
+                    {stage: True for stage in parity.STAGES},
+                    index=index,
+                    salt="duplicate",
+                ),
             }
             packet_members.append(duplicate)
         rows.append(
@@ -242,15 +273,73 @@ def _run_output(
     return members
 
 
+def _stage_record(
+    stages: dict[str, bool], *, index: int, salt: str = "primary"
+) -> dict[str, Any]:
+    if stages["persisted"]:
+        disposition = "applied"
+        action_status = "auto_applied"
+        persisted_fact_ids = [f"fact_synthetic_{index}_{salt}"]
+    elif stages["review"]:
+        disposition = "residue"
+        action_status = "needs_human"
+        persisted_fact_ids = []
+    else:
+        disposition = "deferred"
+        action_status = "proposed"
+        persisted_fact_ids = []
+    return {
+        "version": parity.STAGE_CONTRACT_VERSION,
+        "contract_sha256": parity.STAGE_CONTRACT_SHA256,
+        "candidate_sha256": hashlib.sha256(
+            f"candidate:{index}:{salt}".encode()
+        ).hexdigest(),
+        "action_id": f"action_synthetic_{index}_{salt}",
+        "stages": dict(stages),
+        "disposition": disposition,
+        "action_status": action_status,
+        "persisted_fact_ids": persisted_fact_ids,
+    }
+
+
+def _invocation_ledger(
+    invocation_prefix: str,
+    packets: list[dict[str, Any]],
+    header: dict[str, Any],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "invocation_id": f"{invocation_prefix}:{index}",
+            "ordinal": index,
+            "packet_id": packet["packet_id"],
+            "window_index": 0,
+            "window_count": 1,
+            "request_sha256": hashlib.sha256(
+                f"request:{invocation_prefix}:{packet['packet_id']}".encode()
+            ).hexdigest(),
+            "response_sha256": hashlib.sha256(
+                f"response:{invocation_prefix}:{packet['packet_id']}".encode()
+            ).hexdigest(),
+            "provider": parity.EXPECTED_PROVIDER,
+            "model": header["model"],
+            "reasoning_effort": header["reasoning_effort"],
+            "started_at": "2026-07-22T10:00:00+00:00",
+            "completed_at": "2026-07-22T10:00:30+00:00",
+        }
+        for index, packet in enumerate(packets)
+    ]
+
+
 def _receipt(path: Path, *, run_id: str, output: Path, invocation: str) -> None:
-    header = json.loads(output.read_text().splitlines()[0])
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    header = rows[0]
+    ledger = _invocation_ledger(invocation, rows[1:], header)
     _private_write(
         path,
         json.dumps(
             {
                 "version": parity.RECEIPT_VERSION,
                 "run_id": run_id,
-                "invocation_id": invocation,
                 "provider": "external-codex",
                 "model": header["model"],
                 "reasoning_effort": header["reasoning_effort"],
@@ -258,6 +347,8 @@ def _receipt(path: Path, *, run_id: str, output: Path, invocation: str) -> None:
                 "completed_at": "2026-07-22T10:01:00+00:00",
                 "output_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
                 "attestation": parity.INVOCATION_ATTESTATION,
+                "invocations": ledger,
+                **{key: header[key] for key in parity._RUN_BINDING_KEYS},
             },
             sort_keys=True,
         ),
@@ -354,6 +445,8 @@ def _fixture(
         cohort["cohort"],
         cohort["admissions"],
         cohort["cohort_manifest"],
+        cohort["source_bindings"],
+        cohort["hmac_key"],
         cohort["original_inventory"],
         cohort["v2_inventory"],
     )
@@ -431,6 +524,8 @@ def _fixture(
         cohort["cohort"],
         cohort["admissions"],
         cohort["cohort_manifest"],
+        cohort["source_bindings"],
+        cohort["hmac_key"],
         cohort["original_inventory"],
         cohort["v2_inventory"],
         bundle,
@@ -470,6 +565,8 @@ def _evaluate(files: dict[str, Any]) -> dict[str, Any]:
         files["packets"],
         files["admissions"],
         files["cohort_manifest"],
+        files["source_bindings"],
+        files["hmac_key"],
         files["original_inventory"],
         files["v2_inventory"],
         files["outputs"],
@@ -487,7 +584,14 @@ def test_complete_prepared_bundle_scores_three_runs_without_private_output(
     original_alias = files["aliases"]["original"]
 
     assert result["version"] == parity.VERSION
-    assert result["gate_passed"] is True
+    assert result["metric_gate_passed"] is True
+    assert result["gate_passed"] is False
+    assert result["target_authority_gate"]["canonical_adapter_exact"] is False
+    assert (
+        result["target_authority_gate"]["canonical_adapter_tracked_at_git_head"]
+        is False
+    )
+    assert result["target_authority_gate"]["canonical_adapter_git_head"] is None
     assert result["cohort"] == {
         "threads": 100,
         "messages": 100,
@@ -534,6 +638,103 @@ def test_complete_prepared_bundle_scores_three_runs_without_private_output(
     assert all(
         stat.S_IMODE(path.stat().st_mode) == 0o600 for path in files["bundle"].iterdir()
     )
+
+
+def test_canonical_adapter_authority_requires_exact_tracked_git_head_blobs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = tmp_path / "authority-repository"
+    scripts = repository / "scripts"
+    scripts.mkdir(parents=True)
+    runner_source = b"runner-at-head\n"
+    adapter_source = b"adapter-at-head\n"
+    (scripts / "run_gmail_fact_parity.py").write_bytes(runner_source)
+    (scripts / "gmail_fact_parity_production_adapter.py").write_bytes(adapter_source)
+    for command in (
+        ["git", "init", "-q"],
+        ["git", "config", "user.email", "parity@example.test"],
+        ["git", "config", "user.name", "Parity Test"],
+        ["git", "add", "scripts/run_gmail_fact_parity.py"],
+        ["git", "commit", "-qm", "track runner only"],
+    ):
+        subprocess.run(command, cwd=repository, check=True)
+
+    assert parity._expected_canonical_adapter_authority(repository) is None
+
+    subprocess.run(
+        ["git", "add", "scripts/gmail_fact_parity_production_adapter.py"],
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-qm", "track canonical adapter"],
+        cwd=repository,
+        check=True,
+    )
+    expected_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    poisoned_git_environment = {
+        "GIT_DIR": str(tmp_path / "attacker.git"),
+        "GIT_WORK_TREE": str(tmp_path / "attacker-worktree"),
+        "GIT_INDEX_FILE": str(tmp_path / "attacker-index"),
+        "GIT_OBJECT_DIRECTORY": str(tmp_path / "attacker-objects"),
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(tmp_path / "attacker-alternates"),
+        "GIT_REPLACE_REF_BASE": "refs/replace-attacker/",
+    }
+    for name, value in poisoned_git_environment.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("GIT_NO_REPLACE_OBJECTS", "0")
+    monkeypatch.setenv("GIT_OPTIONAL_LOCKS", "1")
+    monkeypatch.setenv("LC_ALL", "attacker-locale")
+    sanitized = parity._git_environment()
+    assert not set(poisoned_git_environment) & set(sanitized)
+    assert sanitized["GIT_NO_REPLACE_OBJECTS"] == "1"
+    assert sanitized["GIT_OPTIONAL_LOCKS"] == "0"
+    assert sanitized["LC_ALL"] == "C"
+
+    authority = parity._expected_canonical_adapter_authority(repository)
+    assert authority is not None
+    assert authority["git_head"] == expected_head
+    expected = hashlib.sha256(
+        parity._canonical_json(
+            {
+                "runner": hashlib.sha256(runner_source).hexdigest(),
+                "adapter": hashlib.sha256(adapter_source).hexdigest(),
+            }
+        )
+    ).hexdigest()
+    assert authority["adapter_sha256"] == expected
+    assert parity._expected_canonical_adapter_sha256(repository) == expected
+
+    real_git_output = parity._git_output
+    head_reads = 0
+
+    def raced_git_output(root: Path, arguments: tuple[str, ...]) -> bytes | None:
+        nonlocal head_reads
+        output = real_git_output(root, arguments)
+        if arguments == ("rev-parse", "--verify", "HEAD^{commit}"):
+            head_reads += 1
+            if head_reads == 2:
+                return b"0000000000000000000000000000000000000000\n"
+        return output
+
+    monkeypatch.setattr(parity, "_git_output", raced_git_output)
+    assert parity._expected_canonical_adapter_authority(repository) is None
+    monkeypatch.setattr(parity, "_git_output", real_git_output)
+
+    (scripts / "run_gmail_fact_parity.py").write_bytes(b"locally modified\n")
+    assert parity._expected_canonical_adapter_authority(repository) is None
+    assert parity._expected_canonical_adapter_sha256(repository) is None
+
+    (scripts / "run_gmail_fact_parity.py").write_bytes(runner_source)
+    (scripts / "gmail_fact_parity_production_adapter.py").unlink()
+    assert parity._expected_canonical_adapter_authority(repository) is None
 
 
 def test_preparer_generates_complete_private_work_queue_before_labels(
@@ -624,6 +825,8 @@ def test_preparer_refuses_incomplete_semantic_alignment(tmp_path: Path) -> None:
             files["cohort"],
             files["admissions"],
             files["cohort_manifest"],
+            files["source_bindings"],
+            files["hmac_key"],
             files["original_inventory"],
             files["v2_inventory"],
             tmp_path / "rejected-bundle",
@@ -661,6 +864,8 @@ def test_preparer_refuses_member_reuse_across_semantic_units(tmp_path: Path) -> 
             files["cohort"],
             files["admissions"],
             files["cohort_manifest"],
+            files["source_bindings"],
+            files["hmac_key"],
             files["original_inventory"],
             files["v2_inventory"],
             tmp_path / "rejected-bundle",
@@ -689,6 +894,8 @@ def test_preparer_requires_three_v2_runs(tmp_path: Path) -> None:
             files["cohort"],
             files["admissions"],
             files["cohort_manifest"],
+            files["source_bindings"],
+            files["hmac_key"],
             files["original_inventory"],
             files["v2_inventory"],
             tmp_path / "rejected-bundle",
@@ -720,6 +927,8 @@ def test_preparer_rejects_heterogeneous_v2_target_config(tmp_path: Path) -> None
             files["cohort"],
             files["admissions"],
             files["cohort_manifest"],
+            files["source_bindings"],
+            files["hmac_key"],
             files["original_inventory"],
             files["v2_inventory"],
             tmp_path / "rejected-bundle",
@@ -745,6 +954,8 @@ def test_evaluator_refuses_label_subset_even_with_refreshed_manifest(
         files["cohort"],
         files["admissions"],
         files["cohort_manifest"],
+        files["source_bindings"],
+        files["hmac_key"],
         files["original_inventory"],
         files["v2_inventory"],
     )
@@ -817,6 +1028,67 @@ def test_evaluator_rejects_work_queue_or_cohort_tampering(tmp_path: Path) -> Non
         _evaluate(files)
 
 
+def test_authenticated_source_binding_rejects_resigned_packet_permutation(
+    tmp_path: Path,
+) -> None:
+    files = _fixture(tmp_path, unit_count=3)
+    bindings = [
+        json.loads(line) for line in files["source_bindings"].read_text().splitlines()
+    ]
+    bindings[0]["packet_id"], bindings[1]["packet_id"] = (
+        bindings[1]["packet_id"],
+        bindings[0]["packet_id"],
+    )
+    _private_write(
+        files["source_bindings"], parity.gmail_fact_parity_jsonl_bytes(bindings)
+    )
+    manifest = json.loads(files["cohort_manifest"].read_text())
+    manifest["source_binding_sha256"] = hashlib.sha256(
+        files["source_bindings"].read_bytes()
+    ).hexdigest()
+    manifest["manifest_hmac_sha256"] = parity._manifest_hmac(
+        files["hmac_key"].read_bytes(), manifest
+    )
+    _private_write(files["cohort_manifest"], parity._canonical_json(manifest) + b"\n")
+
+    with pytest.raises(
+        parity.GmailFactParityError,
+        match="packet identity is invalid",
+    ):
+        parity.load_gmail_fact_parity_bound_evidence(
+            files["packets"],
+            files["cohort"],
+            files["admissions"],
+            files["cohort_manifest"],
+            files["source_bindings"],
+            files["hmac_key"],
+            files["original_inventory"],
+            files["v2_inventory"],
+        )
+
+
+def test_source_manifest_requires_owner_hmac(tmp_path: Path) -> None:
+    files = _fixture(tmp_path, unit_count=3)
+    manifest = json.loads(files["cohort_manifest"].read_text())
+    manifest["packet_count"] += 1
+    _private_write(files["cohort_manifest"], parity._canonical_json(manifest) + b"\n")
+
+    with pytest.raises(
+        parity.GmailFactParityError,
+        match="authentication is invalid",
+    ):
+        parity.load_gmail_fact_parity_bound_evidence(
+            files["packets"],
+            files["cohort"],
+            files["admissions"],
+            files["cohort_manifest"],
+            files["source_bindings"],
+            files["hmac_key"],
+            files["original_inventory"],
+            files["v2_inventory"],
+        )
+
+
 def test_evaluator_requires_distinct_receipts_and_unique_invocation_claims(
     tmp_path: Path,
 ) -> None:
@@ -837,6 +1109,8 @@ def test_evaluator_requires_distinct_receipts_and_unique_invocation_claims(
             files["packets"],
             files["admissions"],
             files["cohort_manifest"],
+            files["source_bindings"],
+            files["hmac_key"],
             files["original_inventory"],
             files["v2_inventory"],
             files["outputs"],
@@ -845,9 +1119,186 @@ def test_evaluator_requires_distinct_receipts_and_unique_invocation_claims(
 
     files = _fixture(tmp_path / "claim")
     value = json.loads(files["receipts"]["v2-b"].read_text())
-    value["invocation_id"] = "invoke-v2-a"
+    other = json.loads(files["receipts"]["v2-a"].read_text())
+    value["invocations"][0]["invocation_id"] = other["invocations"][0]["invocation_id"]
+    ledger_sha256 = hashlib.sha256(
+        parity._canonical_json(value["invocations"])
+    ).hexdigest()
+    output_rows = [
+        json.loads(line) for line in files["outputs"]["v2-b"].read_text().splitlines()
+    ]
+    output_rows[0]["invocation_ledger_sha256"] = ledger_sha256
+    _private_write(
+        files["outputs"]["v2-b"], parity.gmail_fact_parity_jsonl_bytes(output_rows)
+    )
+    value["invocation_ledger_sha256"] = ledger_sha256
+    value["output_sha256"] = hashlib.sha256(
+        files["outputs"]["v2-b"].read_bytes()
+    ).hexdigest()
     _private_write(files["receipts"]["v2-b"], json.dumps(value, sort_keys=True))
     with pytest.raises(parity.GmailFactParityError, match="invocation IDs"):
+        _evaluate(files)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "stage_contract_version",
+        "stage_contract_sha256",
+        "adapter_sha256",
+        "production_tree_sha256",
+        "runtime_config_sha256",
+        "prompt_sha256",
+        "invocation_ledger_sha256",
+    ],
+)
+def test_receipt_must_repeat_every_run_binding(tmp_path: Path, field: str) -> None:
+    files = _fixture(tmp_path)
+    path = files["receipts"]["v2-b"]
+    receipt = json.loads(path.read_text())
+    receipt[field] = (
+        "gmail_fact_parity_post_admission_stage_v999"
+        if field == "stage_contract_version"
+        else "f" * 64
+    )
+    _private_write(path, json.dumps(receipt, sort_keys=True))
+
+    with pytest.raises(parity.GmailFactParityError, match="receipt binding"):
+        _evaluate(files)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "error"),
+    [
+        (
+            "stage_contract_version",
+            "gmail_fact_parity_post_admission_stage_v999",
+            "stage contract binding",
+        ),
+        ("stage_contract_sha256", "f" * 64, "stage contract binding"),
+        ("adapter_sha256", "e" * 64, "share one exact adapter"),
+        ("production_tree_sha256", "d" * 64, "one exact target config"),
+        ("runtime_config_sha256", "c" * 64, "one exact target config"),
+        ("prompt_sha256", "b" * 64, "one exact target config"),
+    ],
+)
+def test_run_bindings_fail_closed_when_contract_or_repeated_target_changes(
+    tmp_path: Path,
+    field: str,
+    replacement: str,
+    error: str,
+) -> None:
+    files = _fixture(tmp_path)
+    path = files["outputs"]["v2-b"]
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    rows[0][field] = replacement
+    _private_write(path, parity.gmail_fact_parity_jsonl_bytes(rows))
+
+    with pytest.raises(parity.GmailFactParityError, match=error):
+        _evaluate(files)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["production_tree_sha256", "runtime_config_sha256", "prompt_sha256"],
+)
+def test_original_baseline_requires_exact_tree_prompt_and_runtime_bindings(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    files = _fixture(tmp_path)
+    output = files["outputs"]["original"]
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    rows[0][field] = "f" * 64
+    _private_write(output, parity.gmail_fact_parity_jsonl_bytes(rows))
+
+    with pytest.raises(
+        parity.GmailFactParityError,
+        match="pinned installed baseline",
+    ):
+        _evaluate(files)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        ("empty", "empty or invalid"),
+        ("ordinal", "ledger order"),
+        ("packet", "packet scope"),
+        ("window", "windows are incomplete"),
+        ("chronology", "invocation chronology"),
+        ("provider", "invocation provider"),
+        ("model", "invocation target"),
+        ("request", "ledger digest"),
+    ],
+)
+def test_invocation_ledger_tampering_fails_closed(
+    tmp_path: Path, mutation: str, error: str
+) -> None:
+    files = _fixture(tmp_path)
+    path = files["receipts"]["v2-b"]
+    receipt = json.loads(path.read_text())
+    ledger = receipt["invocations"]
+    if mutation == "empty":
+        receipt["invocations"] = []
+    elif mutation == "ordinal":
+        ledger[1]["ordinal"] = 0
+    elif mutation == "packet":
+        ledger[0]["packet_id"] = _id("gfp_p", 999_999)
+    elif mutation == "window":
+        ledger[0]["window_count"] = 2
+    elif mutation == "chronology":
+        ledger[0]["started_at"] = "2026-07-22T09:59:00+00:00"
+    elif mutation == "provider":
+        ledger[0]["provider"] = "local-model"
+    elif mutation == "model":
+        ledger[0]["model"] = "gpt-5.6-sol"
+    elif mutation == "request":
+        ledger[0]["request_sha256"] = "f" * 64
+    _private_write(path, json.dumps(receipt, sort_keys=True))
+
+    with pytest.raises(parity.GmailFactParityError, match=error):
+        _evaluate(files)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        ("contract", "stage record contract"),
+        ("stage_mismatch", "stages do not match"),
+        ("persistence", "internally inconsistent"),
+        ("action_status", "action status"),
+    ],
+)
+def test_member_stage_record_tampering_fails_closed(
+    tmp_path: Path, mutation: str, error: str
+) -> None:
+    files = _fixture(tmp_path)
+    path = files["outputs"]["v2-b"]
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    record = rows[1]["members"][0]["stage_record"]
+    if mutation == "contract":
+        record["contract_sha256"] = "f" * 64
+    elif mutation == "stage_mismatch":
+        record.update(
+            {
+                "stages": {
+                    "candidate": True,
+                    "review": True,
+                    "persisted": False,
+                },
+                "disposition": "residue",
+                "action_status": "needs_human",
+                "persisted_fact_ids": [],
+            }
+        )
+    elif mutation == "persistence":
+        record["persisted_fact_ids"] = []
+    elif mutation == "action_status":
+        record["action_status"] = "invented"
+    _private_write(path, parity.gmail_fact_parity_jsonl_bytes(rows))
+
+    with pytest.raises(parity.GmailFactParityError, match=error):
         _evaluate(files)
 
 
@@ -1000,7 +1451,9 @@ def test_all_empty_packet_gets_explicit_not_fact_label(tmp_path: Path) -> None:
     assert len(empty_labels) == 1
     assert empty_labels[0]["useful"] is False
     assert empty_labels[0]["classification"] == "not_fact"
-    assert _evaluate(files)["gate_passed"] is True
+    result = _evaluate(files)
+    assert result["metric_gate_passed"] is True
+    assert result["gate_passed"] is False
 
 
 def test_member_ids_are_adapter_derived_not_model_authored(tmp_path: Path) -> None:
@@ -1040,7 +1493,7 @@ def test_precision_counts_duplicate_members_and_gate_fails(tmp_path: Path) -> No
     assert result["gate_passed"] is False
 
 
-def test_exact_duplicate_split_across_judge_units_still_fails_structural_gate(
+def test_exact_duplicate_action_and_fact_ownership_fails_closed_before_judging(
     tmp_path: Path,
 ) -> None:
     files = _fixture(tmp_path / "base", unit_count=100, completed=False)
@@ -1061,98 +1514,101 @@ def test_exact_duplicate_split_across_judge_units_still_fails_structural_gate(
         files["cohort"],
         files["admissions"],
         files["cohort_manifest"],
+        files["source_bindings"],
+        files["hmac_key"],
         files["original_inventory"],
         files["v2_inventory"],
     )
-    runs = parity.load_gmail_fact_parity_runs(
-        files["outputs"], files["receipts"], evidence
-    )
-    duplicate_alias = runs["run_aliases"][duplicate_run_id]
-    first_packet_id = files["packets_value"][0]["packet_id"]
-    completed_rows = []
-    for packet in files["packets_value"]:
-        packet_id = packet["packet_id"]
-        members = {
-            runs["run_aliases"][run_id]: [
-                {
-                    "member_id": member["member_id"],
-                    "supported": True,
-                    "scope_correct": True,
-                    "critical_error": "none",
-                }
-                for member in runs["runs"][run_id]["packets"][packet_id]["members"]
-            ]
-            for run_id in runs["all_run_ids"]
-        }
-        if packet_id == first_packet_id:
-            duplicate_judgments = members[duplicate_alias]
-            assert len(duplicate_judgments) == 2
-            members[duplicate_alias] = [duplicate_judgments[0]]
-            completed_rows.append(
-                {
-                    "version": parity.COMPLETED_UNIT_VERSION,
-                    "packet_id": packet_id,
-                    "useful": True,
-                    "classification": "non_temporal",
-                    "members": members,
-                }
-            )
-            duplicate_only = {alias: [] for alias in runs["all_run_aliases"]}
-            duplicate_only[duplicate_alias] = [duplicate_judgments[1]]
-            completed_rows.append(
-                {
-                    "version": parity.COMPLETED_UNIT_VERSION,
-                    "packet_id": packet_id,
-                    "useful": True,
-                    "classification": "non_temporal",
-                    "members": duplicate_only,
-                }
-            )
-        else:
-            completed_rows.append(
-                {
-                    "version": parity.COMPLETED_UNIT_VERSION,
-                    "packet_id": packet_id,
-                    "useful": True,
-                    "classification": "non_temporal",
-                    "members": members,
-                }
-            )
+    with pytest.raises(
+        parity.GmailFactParityError,
+        match="candidate ownership is reused",
+    ):
+        parity.load_gmail_fact_parity_runs(
+            files["outputs"], files["receipts"], evidence
+        )
 
-    completed = tmp_path / "completed-duplicate-units.jsonl"
-    _private_write(completed, parity.gmail_fact_parity_jsonl_bytes(completed_rows))
-    queue_bytes = parity.gmail_fact_parity_jsonl_bytes(
-        parity.build_gmail_fact_parity_work_queue(evidence, runs)
+
+@pytest.mark.parametrize("without_action", [False, True])
+def test_run_wide_candidate_digest_has_exactly_one_record_owner(
+    tmp_path: Path,
+    without_action: bool,
+) -> None:
+    files = _fixture(tmp_path / str(without_action), unit_count=3, completed=False)
+    output = files["outputs"]["v2-a"]
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    first = rows[1]["members"][0]["stage_record"]
+    second = rows[2]["members"][0]["stage_record"]
+    second["candidate_sha256"] = first["candidate_sha256"]
+    if without_action:
+        for record in (first, second):
+            record["action_id"] = None
+            record["action_status"] = None
+            record["disposition"] = "deferred"
+            record["stages"] = {
+                "candidate": True,
+                "review": False,
+                "persisted": False,
+            }
+            record["persisted_fact_ids"] = []
+        rows[1]["members"][0]["stages"] = dict(first["stages"])
+        rows[2]["members"][0]["stages"] = dict(second["stages"])
+    _private_write(output, parity.gmail_fact_parity_jsonl_bytes(rows))
+    _receipt(
+        files["receipts"]["v2-a"],
+        run_id="v2-a",
+        output=output,
+        invocation="invoke-v2-a",
     )
-    judge_receipt = tmp_path / "duplicate-judge-receipt.json"
-    _judge_receipt(
-        judge_receipt,
-        completed_units=completed,
-        evidence=evidence,
-        work_queue=queue_bytes,
+
+    with pytest.raises(
+        parity.GmailFactParityError,
+        match="candidate ownership is reused",
+    ):
+        parity.load_gmail_fact_parity_runs(
+            files["outputs"], files["receipts"], files["evidence"]
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "error"),
+    [
+        ("action_id", "action ownership is reused"),
+        ("persisted_fact_ids", "persisted fact ownership is reused"),
+    ],
+)
+def test_run_wide_candidate_action_and_fact_ownership_is_one_to_one(
+    tmp_path: Path,
+    field: str,
+    error: str,
+) -> None:
+    files = _fixture(tmp_path / field, unit_count=3, completed=False)
+    output = files["outputs"]["v2-a"]
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    first = rows[1]["members"][0]["stage_record"]
+    second = rows[2]["members"][0]["stage_record"]
+    second[field] = json.loads(json.dumps(first[field]))
+    _private_write(output, parity.gmail_fact_parity_jsonl_bytes(rows))
+    _receipt(
+        files["receipts"]["v2-a"],
+        run_id="v2-a",
+        output=output,
+        invocation="invoke-v2-a",
     )
-    bundle = tmp_path / "duplicate-evaluation-bundle"
-    prepare.prepare_gmail_fact_parity_evaluation(
+    evidence = parity.load_gmail_fact_parity_bound_evidence(
         files["packets"],
         files["cohort"],
         files["admissions"],
         files["cohort_manifest"],
+        files["source_bindings"],
+        files["hmac_key"],
         files["original_inventory"],
         files["v2_inventory"],
-        bundle,
-        run_output_paths=files["outputs"],
-        run_receipt_paths=files["receipts"],
-        completed_units_path=completed,
-        judge_receipt_path=judge_receipt,
     )
 
-    result = _evaluate({**files, "bundle": bundle})
-    run = result["runs"][duplicate_alias]
-
-    assert all(stage["duplicate_members"] == 0 for stage in run["stages"].values())
-    assert run["structural_exact_duplicate_members"] == 1
-    assert run["gates"]["no_duplicate_members"] is False
-    assert result["gate_passed"] is False
+    with pytest.raises(parity.GmailFactParityError, match=error):
+        parity.load_gmail_fact_parity_runs(
+            files["outputs"], files["receipts"], evidence
+        )
 
 
 def test_all_run_stability_fails_when_each_pair_still_passes(tmp_path: Path) -> None:
@@ -1248,8 +1704,11 @@ def test_cli_stdout_contains_aggregates_only(
         str(files["packets"]),
         str(files["admissions"]),
         str(files["cohort_manifest"]),
+        str(files["source_bindings"]),
         str(files["original_inventory"]),
         str(files["v2_inventory"]),
+        "--hmac-key",
+        str(files["hmac_key"]),
     ]
     for run_id in RUN_IDS:
         evaluator_args.extend(["--run-output", f"{run_id}={files['outputs'][run_id]}"])
@@ -1257,9 +1716,12 @@ def test_cli_stdout_contains_aggregates_only(
             ["--run-receipt", f"{run_id}={files['receipts'][run_id]}"]
         )
     monkeypatch.setattr(sys, "argv", evaluator_args)
-    parity.main()
+    with pytest.raises(SystemExit) as exc_info:
+        parity.main()
+    assert exc_info.value.code == 1
     evaluator_stdout = capsys.readouterr().out
-    assert json.loads(evaluator_stdout)["gate_passed"] is True
+    assert json.loads(evaluator_stdout)["metric_gate_passed"] is True
+    assert json.loads(evaluator_stdout)["gate_passed"] is False
     assert "PRIVATE_FACT_SENTINEL" not in evaluator_stdout
     assert str(tmp_path) not in evaluator_stdout
 
@@ -1270,9 +1732,12 @@ def test_cli_stdout_contains_aggregates_only(
         str(files["cohort"]),
         str(files["admissions"]),
         str(files["cohort_manifest"]),
+        str(files["source_bindings"]),
         str(files["original_inventory"]),
         str(files["v2_inventory"]),
         str(queue_only),
+        "--hmac-key",
+        str(files["hmac_key"]),
     ]
     for run_id in RUN_IDS:
         preparer_args.extend(["--run-output", f"{run_id}={files['outputs'][run_id]}"])
@@ -1304,8 +1769,11 @@ def test_cli_exits_nonzero_after_printing_a_failed_gate(
         str(files["packets"]),
         str(files["admissions"]),
         str(files["cohort_manifest"]),
+        str(files["source_bindings"]),
         str(files["original_inventory"]),
         str(files["v2_inventory"]),
+        "--hmac-key",
+        str(files["hmac_key"]),
     ]
     for run_id in files["run_ids"]:
         evaluator_args.extend(["--run-output", f"{run_id}={files['outputs'][run_id]}"])

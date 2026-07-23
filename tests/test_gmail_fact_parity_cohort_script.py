@@ -147,9 +147,10 @@ def test_cohort_builder_freezes_opaque_identical_packets(tmp_path: Path) -> None
     )
 
     assert result == {
-        "version": "gmail_fact_parity_cohort_builder_v1",
+        "version": "gmail_fact_parity_cohort_builder_v2",
         "cohort_sha256": result["cohort_sha256"],
         "packet_sha256": result["packet_sha256"],
+        "source_binding_sha256": result["source_binding_sha256"],
         "canonical_source_set_sha256": result["canonical_source_set_sha256"],
         "source_revisions": 1,
         "packets": 1,
@@ -161,13 +162,20 @@ def test_cohort_builder_freezes_opaque_identical_packets(tmp_path: Path) -> None
         "external_calls": 0,
     }
     assert stat.S_IMODE(files["output"].stat().st_mode) == 0o700
-    for name in ("packets.jsonl", "cohort.jsonl", "admissions.jsonl", "manifest.json"):
+    for name in (
+        "packets.jsonl",
+        "cohort.jsonl",
+        "admissions.jsonl",
+        "source-bindings.jsonl",
+        "manifest.json",
+    ):
         assert stat.S_IMODE((files["output"] / name).stat().st_mode) == 0o600
 
     packet = json.loads((files["output"] / "packets.jsonl").read_text())
     index = json.loads((files["output"] / "cohort.jsonl").read_text())
     admissions = json.loads((files["output"] / "admissions.jsonl").read_text())
     manifest = json.loads((files["output"] / "manifest.json").read_text())
+    bindings = json.loads((files["output"] / "source-bindings.jsonl").read_text())
     assert packet["packet_id"].startswith("gfp_p_")
     assert packet["thread_id"].startswith("gfp_t_")
     assert packet["revision_id"].startswith("gfp_r_")
@@ -186,6 +194,16 @@ def test_cohort_builder_freezes_opaque_identical_packets(tmp_path: Path) -> None
     assert manifest["provider_ids_in_packet_metadata"] is False
     assert manifest["packet_policy"] == "union_admitted_messages_only"
     assert manifest["renderer_versions_are_provenance_not_identity"] is True
+    assert bindings["gmail_account_key"] == ACCOUNT_KEY
+    assert bindings["gmail_thread_id"] == THREAD_ID
+    assert bindings["gmail_source_revision"] == REVISION
+    assert [item["gmail_message_id"] for item in bindings["messages"]] == [
+        MESSAGE_1,
+        MESSAGE_2,
+    ]
+    unsigned = dict(manifest)
+    authenticator = unsigned.pop("manifest_hmac_sha256")
+    assert authenticator == cohort._manifest_hmac(b"k" * 32, unsigned)
 
     artifacts = b"".join(
         (files["output"] / name).read_bytes()
@@ -222,7 +240,12 @@ def test_cohort_ids_and_digests_are_portable_across_source_paths(
     )
 
     assert first_result == second_result
-    for name in ("packets.jsonl", "cohort.jsonl", "admissions.jsonl"):
+    for name in (
+        "packets.jsonl",
+        "cohort.jsonl",
+        "admissions.jsonl",
+        "source-bindings.jsonl",
+    ):
         assert (first["output"] / name).read_bytes() == (
             second["output"] / name
         ).read_bytes()

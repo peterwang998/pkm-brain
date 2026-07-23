@@ -4,7 +4,7 @@
 Without ``--completed-units`` this command freezes one work item for every
 packet and every emitted original/V2 member.  With a completed semantic-unit
 file, it refuses partial alignment and emits the exact alignment, labels, and
-manifest accepted by the v3 evaluator.  A completed file requires a bound
+manifest accepted by the v4 evaluator.  A completed file requires a bound
 external Codex Sol/medium judge receipt.  All written artifacts are owner-only;
 stdout contains aggregate counts and digests only.
 """
@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-VERSION = "gmail_fact_parity_preparation_v1"
+VERSION = "gmail_fact_parity_preparation_v2"
 PRIVATE_FILE_MODE = 0o600
 PRIVATE_DIRECTORY_MODE = 0o700
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -91,6 +91,7 @@ def _publish_frozen_artifacts(
 
 def _preparation_manifest(
     *,
+    semantic_bundle_complete: bool,
     release_ready: bool,
     evidence: Mapping[str, Any],
     run_evidence: Mapping[str, Any],
@@ -98,10 +99,13 @@ def _preparation_manifest(
 ) -> dict[str, Any]:
     return {
         "version": VERSION,
+        "semantic_bundle_complete": semantic_bundle_complete,
         "release_evidence_ready": release_ready,
         "cohort_sha256": evidence["cohort_sha256"],
         "packet_sha256": evidence["packet_sha256"],
         "cohort_manifest_sha256": evidence["cohort_manifest_sha256"],
+        "source_binding_sha256": evidence["source_binding_sha256"],
+        "canonical_source_set_sha256": evidence["canonical_source_set_sha256"],
         "packet_count": evidence["packet_count"],
         "thread_count": evidence["thread_count"],
         "message_count": evidence["message_count"],
@@ -128,6 +132,8 @@ def prepare_gmail_fact_parity_evaluation(
     cohort_path: Path,
     admissions_path: Path,
     cohort_manifest_path: Path,
+    source_bindings_path: Path,
+    hmac_key_path: Path,
     original_inventory_path: Path,
     v2_inventory_path: Path,
     output_root: Path,
@@ -149,6 +155,8 @@ def prepare_gmail_fact_parity_evaluation(
         "cohort": cohort_path,
         "admissions": admissions_path,
         "cohort_manifest": cohort_manifest_path,
+        "source_bindings": source_bindings_path,
+        "hmac_key": hmac_key_path,
         "original_inventory": original_inventory_path,
         "v2_inventory": v2_inventory_path,
         **{f"output:{key}": Path(value) for key, value in run_output_paths.items()},
@@ -164,6 +172,8 @@ def prepare_gmail_fact_parity_evaluation(
         cohort_path,
         admissions_path,
         cohort_manifest_path,
+        source_bindings_path,
+        hmac_key_path,
         original_inventory_path,
         v2_inventory_path,
     )
@@ -218,7 +228,8 @@ def prepare_gmail_fact_parity_evaluation(
         label_units = len(labels)
 
     preparation = _preparation_manifest(
-        release_ready=completed_units_path is not None,
+        semantic_bundle_complete=completed_units_path is not None,
+        release_ready=False,
         evidence=evidence,
         run_evidence=run_evidence,
         artifacts=artifacts,
@@ -227,7 +238,8 @@ def prepare_gmail_fact_parity_evaluation(
     _publish_frozen_artifacts(output_root, artifacts)
     return {
         "version": VERSION,
-        "release_evidence_ready": completed_units_path is not None,
+        "semantic_bundle_complete": completed_units_path is not None,
+        "release_evidence_ready": False,
         "cohort_sha256": evidence["cohort_sha256"],
         "packet_sha256": evidence["packet_sha256"],
         "packets": evidence["packet_count"],
@@ -250,9 +262,11 @@ def main() -> None:
     parser.add_argument("cohort", type=Path)
     parser.add_argument("admissions", type=Path)
     parser.add_argument("cohort_manifest", type=Path)
+    parser.add_argument("source_bindings", type=Path)
     parser.add_argument("original_inventory", type=Path)
     parser.add_argument("v2_inventory", type=Path)
     parser.add_argument("output_root", type=Path)
+    parser.add_argument("--hmac-key", type=Path, required=True)
     parser.add_argument("--completed-units", type=Path)
     parser.add_argument("--judge-receipt", type=Path)
     parser.add_argument(
@@ -275,6 +289,8 @@ def main() -> None:
                 args.cohort,
                 args.admissions,
                 args.cohort_manifest,
+                args.source_bindings,
+                args.hmac_key,
                 args.original_inventory,
                 args.v2_inventory,
                 args.output_root,

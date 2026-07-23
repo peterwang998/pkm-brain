@@ -2,7 +2,8 @@
 
 ## Status
 
-The local-only matched-source cohort is structurally frozen. It is **not**
+The local-only matched-source cohort has been rebuilt under the authenticated
+v2 authority. It is **not**
 semantic parity evidence and is **not** release-ready. No private model, network,
 database, or persistence call was made during the export and packet build.
 
@@ -51,6 +52,7 @@ The 2026-07-23 freeze produced:
 - 150 selected threads and 254 admitted messages;
 - byte-identical original and V2 inventories;
 - 150 opaque packets over 150 threads and 254 messages;
+- 150 owner-only raw-to-opaque source bindings and an HMAC-signed manifest;
 - owner-only `0700` directories and `0600` files;
 - zero external, database, or persistence calls; and
 - `semantic_denominator_verified=false` and `release_evidence_ready=false`.
@@ -60,9 +62,13 @@ Aggregate artifact identities:
 - admission inventory SHA-256:
   `8d35f935d76311dc42fa1a99d51d6dbac16348647946de2167956753852c19ef`;
 - cohort SHA-256:
-  `ce519e38c2c97ee7fbf11485422fbad3c254b85a7bf38da6c7436a56019fbd19`;
+  `f837c4b835491433d6b69ff923ac47225440f9b3966be525561da15a1c84a0fd`;
 - packet SHA-256:
-  `d93a2333da3648ed23954cff35589c12307a1521bb8c2a82cfdddad9f67235da`;
+  `46b074966bf25aeb434ce3906504c69616f63a2c79b9fae5b7627ba41a32be00`;
+- source-binding SHA-256:
+  `96ac3294aa644da3f18c41297970503852a7b621815d787eb4dd7061ed84e34e`;
+- manifest HMAC SHA-256:
+  `2445e174f59c8a4501ee4d137e9b8d64f365a44924b481779e40425f906ed85d`;
 - canonical source-set SHA-256:
   `9e2b969d6bb0788221c7c7b68c5447fbb5fb8e262a8bd72b3e8b3ba946213529`.
 
@@ -83,25 +89,46 @@ The completed local-only preparation was:
   /private/tmp/gmail-fact-parity-admissions-v1-20260723/original-admissions.jsonl \
   /private/tmp/gmail-fact-parity-admissions-v1-20260723/v2-admissions.jsonl \
   /private/tmp/gmail-temporal-holdout-v1-20260722-iter1.key \
-  /private/tmp/gmail-fact-parity-cohort-v1-20260723
+  /private/tmp/gmail-fact-parity-cohort-v2-20260723
 ```
 
 ## Remaining execution authority
 
-The repository still lacks the production adapter that turns one baseline run
-and three V2 runs over `packets.jsonl` into complete
-`gmail_fact_parity_run_v1` outputs and hash-bound receipts. That adapter is a
-hard blocker: existing runtime facts cannot substitute for fresh identical-
-packet runs, and raw count parity cannot substitute for semantic alignment.
+The repository now defines a canonical, hash-bound post-admission stage contract
+and a fail-closed `scripts/run_gmail_fact_parity.py` orchestrator that requires
+`gmail_fact_parity_run_v3` evidence. Candidate membership comes
+from an emitted validated candidate; review membership comes from a mapped
+policy/critic action or explicit review residue; persistence requires one
+applied action and exactly one matching current fact. Ambiguous candidate/action
+or action/fact mappings fail closed. Run headers and receipts bind the contract,
+adapter, production tree, runtime configuration, prompt, and a complete ordered
+per-invocation ledger. Production mode accepts only the canonical adapter path;
+test adapters require an explicit test-only Python authority. Candidate, action,
+and persisted-fact ownership is one-to-one across a run, and a dirty production
+checkout is rejected. Release authority additionally requires the runner and
+canonical adapter to be tracked and byte-identical to their current Git `HEAD`
+blobs. This is owner-process integrity, not host supply-chain attestation: the
+personal-use threat boundary trusts the local operating system, system Git
+executable, and repository object database.
+
+The orchestrator still lacks the canonical production adapter that executes one
+baseline run and three V2 runs over `packets.jsonl` and derives those contract
+records from isolated runtime actions and facts. The globally installed Brain
+CLI is stale and is rejected; the frozen original source environment is the
+baseline authority. That adapter is a hard blocker:
+schema-valid self-reports, existing runtime facts, and raw count parity cannot
+substitute for fresh identical-packet runs and semantic alignment.
 
 Once those four run artifacts exist, the existing preparer can freeze the
 private, arm-blind work queue. An external Codex Sol/medium judge must then
 align and judge every emitted member, with its receipt binding the cohort,
 packets, work queue, and completed units. Only the final evaluator can establish
-the release gate. Every V2 run must reach at least 95% semantic-unit retention,
+the metric gate. Every V2 run must reach at least 95% semantic-unit retention,
 95% thread retention, 95% macro-thread retention, and 95% supported precision at
 all three stages, with zero critical errors or duplicates and at least 95%
-three-run stability.
+three-run stability. The production release gate additionally requires the
+canonical adapter and independently authenticated invocations; both remain
+false today, so a structurally passing self-report cannot claim release.
 
 Until that execution and judging authority is provided, the correct status is
 **structurally prepared, semantic parity unmeasured**.

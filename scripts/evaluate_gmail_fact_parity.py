@@ -12,9 +12,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
+import os
 import re
+import runpy
 import stat
+import subprocess
 from collections import defaultdict
 from collections.abc import Mapping
 from datetime import datetime
@@ -22,20 +26,31 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "gmail_fact_parity_evaluation_v3"
-LABEL_VERSION = "gmail_fact_parity_unit_v3"
-MANIFEST_VERSION = "gmail_fact_parity_manifest_v3"
+_STAGE_CONTRACT_MODULE = runpy.run_path(
+    str(Path(__file__).with_name("gmail_fact_parity_contract.py"))
+)
+STAGE_CONTRACT_VERSION = str(_STAGE_CONTRACT_MODULE["CONTRACT_VERSION"])
+STAGE_CONTRACT_SHA256 = str(_STAGE_CONTRACT_MODULE["CONTRACT_SHA256"])
+STAGE_DISPOSITIONS = tuple(_STAGE_CONTRACT_MODULE["DISPOSITIONS"])
+ACCEPTED_ACTION_STATUSES = tuple(_STAGE_CONTRACT_MODULE["ACCEPTED_ACTION_STATUSES"])
+APPLIED_ACTION_STATUSES = tuple(_STAGE_CONTRACT_MODULE["APPLIED_ACTION_STATUSES"])
+
+
+VERSION = "gmail_fact_parity_evaluation_v4"
+LABEL_VERSION = "gmail_fact_parity_unit_v4"
+MANIFEST_VERSION = "gmail_fact_parity_manifest_v4"
 ALIGNMENT_VERSION = "gmail_fact_parity_alignment_unit_v1"
 COMPLETED_UNIT_VERSION = "gmail_fact_parity_completed_unit_v1"
 WORK_ITEM_VERSION = "gmail_fact_parity_alignment_work_item_v2"
-RUN_VERSION = "gmail_fact_parity_run_v1"
-RUN_PACKET_VERSION = "gmail_fact_parity_run_packet_v1"
-RECEIPT_VERSION = "gmail_fact_parity_run_receipt_v1"
+RUN_VERSION = "gmail_fact_parity_run_v3"
+RUN_PACKET_VERSION = "gmail_fact_parity_run_packet_v3"
+RECEIPT_VERSION = "gmail_fact_parity_run_receipt_v3"
 JUDGE_RECEIPT_VERSION = "gmail_fact_parity_judge_receipt_v1"
-COHORT_MANIFEST_VERSION = "gmail_fact_parity_cohort_manifest_v1"
-COHORT_VERSION = "gmail_fact_parity_cohort_v1"
-PACKET_VERSION = "gmail_fact_parity_packet_v1"
-ADMISSION_JOIN_VERSION = "gmail_fact_parity_admission_join_v1"
+COHORT_MANIFEST_VERSION = "gmail_fact_parity_cohort_manifest_v2"
+COHORT_VERSION = "gmail_fact_parity_cohort_v2"
+PACKET_VERSION = "gmail_fact_parity_packet_v2"
+ADMISSION_JOIN_VERSION = "gmail_fact_parity_admission_join_v2"
+BINDING_VERSION = "gmail_fact_parity_source_binding_v2"
 ADMISSION_INVENTORY_VERSION = "gmail_fact_parity_admission_v1"
 INVOCATION_ATTESTATION = "self_reported_not_cryptographically_verified"
 EXPECTED_PROVIDER = "external-codex"
@@ -45,6 +60,15 @@ EXPECTED_ORIGINAL_COMMIT = "d5405b9cf7a81775dfc84200892c206687756f3c"
 EXPECTED_ORIGINAL_PROMPT_VERSION = "extractor-evidence-units-v6-speaker-context"
 EXPECTED_ORIGINAL_MODEL = "gpt-5.6-luna"
 EXPECTED_ORIGINAL_REASONING_EFFORT = "low"
+EXPECTED_ORIGINAL_PRODUCTION_TREE_SHA256 = (
+    "550d116aae8b38f172a2a342509b187f33bff8b8d044a95294c65c757d7f08b5"
+)
+EXPECTED_ORIGINAL_PROMPT_SHA256 = (
+    "970706f3bb83fa2e25a66911f492074dc528d944e658cd76e3f0662b42304be6"
+)
+EXPECTED_ORIGINAL_RUNTIME_CONFIG_SHA256 = (
+    "bd7df34012733f2ca2da3e61d16fc3c942577783aa8a91d6ed8ee0737e5a237b"
+)
 EXPECTED_V2_PROMPT_VERSION = "extractor-evidence-units-v15-gmail-event-time"
 EXPECTED_V2_MODEL = "gpt-5.6-luna"
 EXPECTED_V2_REASONING_EFFORT = "low"
@@ -74,7 +98,7 @@ MIN_COHORT_THREADS = 100
 MIN_COHORT_MESSAGES = 100
 MIN_REFERENCE_UNITS_PER_STAGE = 50
 MIN_REFERENCE_THREADS_PER_STAGE = 30
-STAGES = ("candidate", "review", "persisted")
+STAGES = tuple(_STAGE_CONTRACT_MODULE["STAGES"])
 CLASSIFICATIONS = {"non_temporal", "temporal", "not_fact"}
 CRITICAL_ERRORS = {"none", "unsupported", "wrong_scope", "wrong_entity", "other"}
 
@@ -128,6 +152,15 @@ _WORK_ITEM_KEYS = {
     "messages",
     "members",
 }
+_RUN_BINDING_KEYS = {
+    "stage_contract_version",
+    "stage_contract_sha256",
+    "adapter_sha256",
+    "production_tree_sha256",
+    "runtime_config_sha256",
+    "prompt_sha256",
+    "invocation_ledger_sha256",
+}
 _RUN_HEADER_KEYS = {
     "version",
     "run_id",
@@ -138,13 +171,23 @@ _RUN_HEADER_KEYS = {
     "reasoning_effort",
     "cohort_sha256",
     "packet_sha256",
+    *_RUN_BINDING_KEYS,
 }
 _RUN_PACKET_KEYS = {"version", "run_id", "packet_id", "thread_id", "members"}
-_RUN_MEMBER_KEYS = {"statement", "evidence_message_ids", "stages"}
+_RUN_MEMBER_KEYS = {"statement", "evidence_message_ids", "stages", "stage_record"}
+_RUN_STAGE_RECORD_KEYS = {
+    "version",
+    "contract_sha256",
+    "candidate_sha256",
+    "action_id",
+    "stages",
+    "disposition",
+    "action_status",
+    "persisted_fact_ids",
+}
 _RECEIPT_KEYS = {
     "version",
     "run_id",
-    "invocation_id",
     "provider",
     "model",
     "reasoning_effort",
@@ -152,6 +195,22 @@ _RECEIPT_KEYS = {
     "completed_at",
     "output_sha256",
     "attestation",
+    "invocations",
+    *_RUN_BINDING_KEYS,
+}
+_INVOCATION_KEYS = {
+    "invocation_id",
+    "ordinal",
+    "packet_id",
+    "window_index",
+    "window_count",
+    "request_sha256",
+    "response_sha256",
+    "provider",
+    "model",
+    "reasoning_effort",
+    "started_at",
+    "completed_at",
 }
 _JUDGE_RECEIPT_KEYS = {
     "version",
@@ -216,6 +275,7 @@ _COHORT_MANIFEST_KEYS = {
     "cohort_sha256",
     "packet_sha256",
     "admission_join_sha256",
+    "source_binding_sha256",
     "canonical_source_set_sha256",
     "original_inventory_sha256",
     "v2_inventory_sha256",
@@ -237,7 +297,27 @@ _COHORT_MANIFEST_KEYS = {
     "provider_ids_in_packet_metadata",
     "private_file_mode",
     "private_directory_mode",
+    "manifest_hmac_sha256",
 }
+_SOURCE_BINDING_KEYS = {
+    "version",
+    "gmail_account_key",
+    "gmail_thread_id",
+    "gmail_source_revision",
+    "source_sha256",
+    "projection_version",
+    "classifier_version",
+    "thread_id",
+    "revision_id",
+    "packet_id",
+    "messages",
+    "original_admitted_message_ids",
+    "v2_admitted_message_ids",
+    "union_admitted_message_ids",
+}
+_SOURCE_BINDING_MESSAGE_KEYS = {"gmail_message_id", "message_id"}
+MIN_HMAC_KEY_BYTES = 32
+MANIFEST_HMAC_DOMAIN = b"gmail_fact_parity_cohort_manifest_v2\0"
 
 
 class GmailFactParityError(ValueError):
@@ -274,6 +354,182 @@ def _preparer_path() -> Path:
     return Path(__file__).with_name("prepare_gmail_fact_parity_evaluation.py")
 
 
+def _regular_file_bytes(path: Path) -> bytes | None:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        return None
+    flags = os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0)
+    descriptor: int | None = None
+    try:
+        before = path.lstat()
+        if not stat.S_ISREG(before.st_mode) or path.is_symlink():
+            return None
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_dev != before.st_dev
+            or opened.st_ino != before.st_ino
+        ):
+            return None
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = None
+            raw = handle.read()
+            after = os.fstat(handle.fileno())
+            if (
+                after.st_dev != opened.st_dev
+                or after.st_ino != opened.st_ino
+                or after.st_size != opened.st_size
+                or after.st_mtime_ns != opened.st_mtime_ns
+            ):
+                return None
+        return raw if raw else None
+    except OSError:
+        return None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _git_environment() -> dict[str, str]:
+    environment = {
+        name: value for name, value in os.environ.items() if not name.startswith("GIT_")
+    }
+    environment.update(
+        {
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "LC_ALL": "C",
+        }
+    )
+    return environment
+
+
+def _git_output(repository_root: Path, arguments: tuple[str, ...]) -> bytes | None:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repository_root), *arguments],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_git_environment(),
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return completed.stdout if completed.returncode == 0 else None
+
+
+def _git_head_bound_files(
+    repository_root: Path,
+    relative_paths: tuple[str, ...],
+) -> tuple[str, dict[str, bytes]] | None:
+    root = repository_root.resolve()
+    if not relative_paths or any(
+        Path(value).is_absolute() or ".." in Path(value).parts
+        for value in relative_paths
+    ):
+        return None
+    top_level_raw = _git_output(root, ("rev-parse", "--show-toplevel"))
+    head_raw = _git_output(root, ("rev-parse", "--verify", "HEAD^{commit}"))
+    if top_level_raw is None or head_raw is None:
+        return None
+    try:
+        top_level = top_level_raw.decode("utf-8").strip()
+        head = head_raw.decode("ascii").strip()
+    except UnicodeError:
+        return None
+    if Path(top_level).resolve() != root or _GIT_COMMIT_RE.fullmatch(head) is None:
+        return None
+    status_arguments = (
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+        "--",
+        *relative_paths,
+    )
+    if _git_output(root, status_arguments) != b"":
+        return None
+
+    blobs: dict[str, bytes] = {}
+    for relative_path in relative_paths:
+        local_bytes = _regular_file_bytes(root / relative_path)
+        if local_bytes is None:
+            return None
+        object_id_raw = _git_output(
+            root, ("rev-parse", "--verify", f"{head}:{relative_path}")
+        )
+        index_object_id_raw = _git_output(
+            root, ("rev-parse", "--verify", f":{relative_path}")
+        )
+        if object_id_raw is None or index_object_id_raw is None:
+            return None
+        try:
+            object_id = object_id_raw.decode("ascii").strip()
+            index_object_id = index_object_id_raw.decode("ascii").strip()
+        except UnicodeError:
+            return None
+        if (
+            _GIT_COMMIT_RE.fullmatch(object_id) is None
+            or _GIT_COMMIT_RE.fullmatch(index_object_id) is None
+            or not hmac.compare_digest(object_id, index_object_id)
+            or _git_output(root, ("cat-file", "-t", object_id)) != b"blob\n"
+        ):
+            return None
+        head_bytes = _git_output(root, ("cat-file", "blob", object_id))
+        if head_bytes is None:
+            return None
+        if not hmac.compare_digest(local_bytes, head_bytes):
+            return None
+        blobs[relative_path] = head_bytes
+    if _git_output(root, status_arguments) != b"":
+        return None
+    head_after_raw = _git_output(root, ("rev-parse", "--verify", "HEAD^{commit}"))
+    if head_after_raw is None:
+        return None
+    try:
+        head_after = head_after_raw.decode("ascii").strip()
+    except UnicodeError:
+        return None
+    if not hmac.compare_digest(head, head_after):
+        return None
+    return head, blobs
+
+
+def _expected_canonical_adapter_authority(
+    repository_root: Path | None = None,
+) -> dict[str, str] | None:
+    root = (
+        Path(repository_root).resolve()
+        if repository_root is not None
+        else Path(__file__).resolve().parents[1]
+    )
+    runner_path = "scripts/run_gmail_fact_parity.py"
+    adapter_path = "scripts/gmail_fact_parity_production_adapter.py"
+    bound = _git_head_bound_files(root, (runner_path, adapter_path))
+    if bound is None:
+        return None
+    git_head, blobs = bound
+    adapter_sha256 = _sha256_bytes(
+        _canonical_json(
+            {
+                "runner": _sha256_bytes(blobs[runner_path]),
+                "adapter": _sha256_bytes(blobs[adapter_path]),
+            }
+        )
+    )
+    return {"git_head": git_head, "adapter_sha256": adapter_sha256}
+
+
+def _expected_canonical_adapter_sha256(
+    repository_root: Path | None = None,
+) -> str | None:
+    authority = _expected_canonical_adapter_authority(repository_root)
+    return authority["adapter_sha256"] if authority is not None else None
+
+
 def _canonical_json(value: Any) -> bytes:
     return json.dumps(
         value,
@@ -281,6 +537,52 @@ def _canonical_json(value: Any) -> bytes:
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
+
+
+def _private_hmac_key(path: Path) -> bytes:
+    _private_file(path)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, flags)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise GmailFactParityError("HMAC key must be a mode-0600 regular file")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = None
+            key = handle.read()
+    except GmailFactParityError:
+        raise
+    except OSError as exc:
+        raise GmailFactParityError("HMAC key cannot be read safely") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if len(key) < MIN_HMAC_KEY_BYTES:
+        raise GmailFactParityError("HMAC key must contain at least 32 bytes")
+    return key
+
+
+def _derived_opaque_id(key: bytes, prefix: str, value: Any) -> str:
+    payload = b"gmail_fact_parity_v1\0" + prefix.encode("ascii") + b"\0"
+    payload += _canonical_json(value)
+    digest = hmac.new(key, payload, hashlib.sha256).hexdigest()[:32]
+    return f"gfp_{prefix}_{digest}"
+
+
+def _manifest_hmac(key: bytes, manifest: Mapping[str, Any]) -> str:
+    unsigned = dict(manifest)
+    unsigned.pop("manifest_hmac_sha256", None)
+    return hmac.new(
+        key,
+        MANIFEST_HMAC_DOMAIN + _canonical_json(unsigned),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def gmail_fact_parity_jsonl_bytes(rows: list[dict[str, Any]]) -> bytes:
@@ -386,7 +688,7 @@ def _parse_iso(value: Any, name: str) -> datetime:
     return parsed
 
 
-def _load_cohort_manifest(path: Path) -> dict[str, Any]:
+def _load_cohort_manifest(path: Path, *, hmac_key: bytes) -> dict[str, Any]:
     value = _load_json(path, label="cohort manifest")
     if set(value) != _COHORT_MANIFEST_KEYS:
         raise GmailFactParityError("cohort manifest schema is invalid")
@@ -396,6 +698,7 @@ def _load_cohort_manifest(path: Path) -> dict[str, Any]:
         "cohort_sha256",
         "packet_sha256",
         "admission_join_sha256",
+        "source_binding_sha256",
         "canonical_source_set_sha256",
         "original_inventory_sha256",
         "v2_inventory_sha256",
@@ -420,6 +723,13 @@ def _load_cohort_manifest(path: Path) -> dict[str, Any]:
         or value.get("private_directory_mode") != "0700"
     ):
         raise GmailFactParityError("cohort manifest privacy policy is invalid")
+    authenticator = value.get("manifest_hmac_sha256")
+    if (
+        not isinstance(authenticator, str)
+        or _SHA256_RE.fullmatch(authenticator) is None
+        or not hmac.compare_digest(authenticator, _manifest_hmac(hmac_key, value))
+    ):
+        raise GmailFactParityError("cohort manifest authentication is invalid")
     return value
 
 
@@ -670,17 +980,219 @@ def _renderer_summary(
     ]
 
 
+def _provider_message_list(value: Any, name: str) -> list[str]:
+    if (
+        not isinstance(value, list)
+        or any(
+            not isinstance(item, str) or _PROVIDER_MESSAGE_ID_RE.fullmatch(item) is None
+            for item in value
+        )
+        or len(value) != len(set(value))
+    ):
+        raise GmailFactParityError(f"{name} provider message IDs are invalid")
+    return list(value)
+
+
+def _load_and_verify_source_bindings(
+    path: Path,
+    *,
+    hmac_key: bytes,
+    packets: Mapping[str, Mapping[str, Any]],
+    cohort: Mapping[str, Mapping[str, Any]],
+    joins: Mapping[str, Mapping[str, Any]],
+    original_inventory: Mapping[tuple[str, str, str], Mapping[str, Any]],
+    v2_inventory: Mapping[tuple[str, str, str], Mapping[str, Any]],
+    manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    rows = _load_jsonl(path, label="source identity binding")
+    bindings: dict[tuple[str, str, str], dict[str, Any]] = {}
+    bound_packet_ids: set[str] = set()
+    source_set_rows: list[dict[str, str]] = []
+    for index, row in enumerate(rows):
+        if set(row) != _SOURCE_BINDING_KEYS or row.get("version") != BINDING_VERSION:
+            raise GmailFactParityError("source identity binding schema is invalid")
+        raw_key = (
+            _nonempty_string(row.get("gmail_account_key"), f"binding[{index}] account"),
+            _nonempty_string(row.get("gmail_thread_id"), f"binding[{index}] thread"),
+            _digest(row.get("gmail_source_revision"), f"binding[{index}] revision"),
+        )
+        if raw_key in bindings or raw_key not in original_inventory:
+            raise GmailFactParityError("source identity binding coverage is invalid")
+        raw_thread_key = [raw_key[0], raw_key[1]]
+        raw_revision_key = [*raw_thread_key, raw_key[2]]
+        thread_id = _opaque_id(row.get("thread_id"), "thread_id")
+        revision_id = _opaque_id(row.get("revision_id"), "revision_id")
+        if thread_id != _derived_opaque_id(
+            hmac_key, "t", raw_thread_key
+        ) or revision_id != _derived_opaque_id(hmac_key, "r", raw_revision_key):
+            raise GmailFactParityError("source identity binding opaque IDs are invalid")
+        projection_version = _positive_int(
+            row.get("projection_version"), f"binding[{index}] projection version"
+        )
+        classifier_version = _positive_int(
+            row.get("classifier_version"), f"binding[{index}] classifier version"
+        )
+        source_sha256 = _digest(
+            row.get("source_sha256"), f"binding[{index}] source digest"
+        )
+        original_raw = _provider_message_list(
+            row.get("original_admitted_message_ids"), f"binding[{index}] original"
+        )
+        v2_raw = _provider_message_list(
+            row.get("v2_admitted_message_ids"), f"binding[{index}] V2"
+        )
+        union_raw = _provider_message_list(
+            row.get("union_admitted_message_ids"), f"binding[{index}] union"
+        )
+        raw_messages = row.get("messages")
+        if not isinstance(raw_messages, list):
+            raise GmailFactParityError("source identity binding messages are invalid")
+        parsed_messages: list[tuple[str, str]] = []
+        for raw_message in raw_messages:
+            if (
+                not isinstance(raw_message, Mapping)
+                or set(raw_message) != _SOURCE_BINDING_MESSAGE_KEYS
+            ):
+                raise GmailFactParityError(
+                    "source identity binding message schema is invalid"
+                )
+            gmail_message_id = _nonempty_string(
+                raw_message.get("gmail_message_id"), "binding provider message ID"
+            )
+            if _PROVIDER_MESSAGE_ID_RE.fullmatch(gmail_message_id) is None:
+                raise GmailFactParityError(
+                    "source identity binding provider message ID is invalid"
+                )
+            message_id = _opaque_id(raw_message.get("message_id"), "message_id")
+            expected_message_id = _derived_opaque_id(
+                hmac_key, "m", [*raw_revision_key, gmail_message_id]
+            )
+            if message_id != expected_message_id:
+                raise GmailFactParityError(
+                    "source identity binding message identity is invalid"
+                )
+            parsed_messages.append((gmail_message_id, message_id))
+        if (
+            [item[0] for item in parsed_messages] != union_raw
+            or len(parsed_messages) != len(set(parsed_messages))
+            or set(original_raw)
+            != set(original_inventory[raw_key]["admitted_message_ids"])
+            or set(v2_raw) != set(v2_inventory[raw_key]["admitted_message_ids"])
+            or set(original_raw) | set(v2_raw) != set(union_raw)
+            or original_raw != [item for item in union_raw if item in set(original_raw)]
+            or v2_raw != [item for item in union_raw if item in set(v2_raw)]
+        ):
+            raise GmailFactParityError(
+                "source identity binding admission membership is invalid"
+            )
+
+        packet_id = row.get("packet_id")
+        if union_raw:
+            packet_id = _opaque_id(packet_id, "packet_id")
+            expected_packet_id = _derived_opaque_id(
+                hmac_key,
+                "p",
+                [raw_revision_key, projection_version, classifier_version, union_raw],
+            )
+            if packet_id != expected_packet_id or packet_id in bound_packet_ids:
+                raise GmailFactParityError(
+                    "source identity binding packet identity is invalid"
+                )
+            packet = packets.get(packet_id)
+            cohort_row = cohort.get(packet_id)
+            join = joins.get(packet_id)
+            opaque_union = [item[1] for item in parsed_messages]
+            opaque_original = [
+                opaque_id
+                for raw_id, opaque_id in parsed_messages
+                if raw_id in set(original_raw)
+            ]
+            opaque_v2 = [
+                opaque_id
+                for raw_id, opaque_id in parsed_messages
+                if raw_id in set(v2_raw)
+            ]
+            if (
+                packet is None
+                or cohort_row is None
+                or join is None
+                or packet["thread_id"] != thread_id
+                or packet["revision_id"] != revision_id
+                or packet["projection_version"] != projection_version
+                or packet["classifier_version"] != classifier_version
+                or [item["message_id"] for item in packet["messages"]] != opaque_union
+                or cohort_row["source_sha256"] != source_sha256
+                or join["original_message_ids"] != opaque_original
+                or join["v2_message_ids"] != opaque_v2
+                or join["union_message_ids"] != opaque_union
+            ):
+                raise GmailFactParityError(
+                    "source identity binding does not reconcile with packet artifacts"
+                )
+            expected_original_renderer = {
+                "projection_version": original_inventory[raw_key]["projection_version"],
+                "classifier_version": original_inventory[raw_key]["classifier_version"],
+                "source_sha256": original_inventory[raw_key]["source_sha256"],
+            }
+            expected_v2_renderer = {
+                "projection_version": v2_inventory[raw_key]["projection_version"],
+                "classifier_version": v2_inventory[raw_key]["classifier_version"],
+                "source_sha256": v2_inventory[raw_key]["source_sha256"],
+            }
+            if (
+                join["original_renderer"] != expected_original_renderer
+                or join["v2_renderer"] != expected_v2_renderer
+            ):
+                raise GmailFactParityError(
+                    "source identity binding renderer provenance is invalid"
+                )
+            bound_packet_ids.add(packet_id)
+        elif packet_id is not None or parsed_messages or original_raw or v2_raw:
+            raise GmailFactParityError(
+                "empty source identity binding has packet membership"
+            )
+        source_set_rows.append(
+            {"revision_id": revision_id, "source_sha256": source_sha256}
+        )
+        bindings[raw_key] = dict(row)
+
+    if (
+        set(bindings) != set(original_inventory)
+        or bound_packet_ids != set(packets)
+        or manifest.get("id_namespace")
+        != _derived_opaque_id(hmac_key, "k", "cohort-namespace")
+    ):
+        raise GmailFactParityError("source identity binding is incomplete")
+    canonical_source_set_sha256 = _sha256_bytes(
+        gmail_fact_parity_jsonl_bytes(
+            sorted(source_set_rows, key=lambda item: item["revision_id"])
+        )
+    )
+    if canonical_source_set_sha256 != manifest.get("canonical_source_set_sha256"):
+        raise GmailFactParityError(
+            "canonical source set commitment does not authenticate"
+        )
+    return {
+        "rows": bindings,
+        "sha256": _sha256(path),
+        "canonical_source_set_sha256": canonical_source_set_sha256,
+    }
+
+
 def load_gmail_fact_parity_bound_evidence(
     packets_path: Path,
     cohort_path: Path,
     admissions_path: Path,
     cohort_manifest_path: Path,
+    source_bindings_path: Path,
+    hmac_key_path: Path,
     original_inventory_path: Path,
     v2_inventory_path: Path,
 ) -> dict[str, Any]:
     """Load and reconcile the frozen private cohort and identical packets."""
 
-    manifest = _load_cohort_manifest(cohort_manifest_path)
+    hmac_key = _private_hmac_key(hmac_key_path)
+    manifest = _load_cohort_manifest(cohort_manifest_path, hmac_key=hmac_key)
     packets = _load_packets(packets_path)
     cohort = _load_cohort(cohort_path, packets)
     joins = _load_admission_joins(admissions_path, packets=packets)
@@ -701,6 +1213,10 @@ def load_gmail_fact_parity_bound_evidence(
     if _sha256(admissions_path) != manifest["admission_join_sha256"]:
         raise GmailFactParityError(
             "cohort manifest does not match opaque admission joins"
+        )
+    if _sha256(source_bindings_path) != manifest["source_binding_sha256"]:
+        raise GmailFactParityError(
+            "cohort manifest does not match source identity bindings"
         )
     if _sha256(original_inventory_path) != manifest["original_inventory_sha256"]:
         raise GmailFactParityError(
@@ -742,6 +1258,16 @@ def load_gmail_fact_parity_bound_evidence(
         or _renderer_summary(v2_inventory) != manifest["v2_renderer_provenance"]
     ):
         raise GmailFactParityError("cohort manifest counts do not reconcile")
+    source_bindings = _load_and_verify_source_bindings(
+        source_bindings_path,
+        hmac_key=hmac_key,
+        packets=packets,
+        cohort=cohort,
+        joins=joins,
+        original_inventory=original_inventory,
+        v2_inventory=v2_inventory,
+        manifest=manifest,
+    )
     return {
         "packets": packets,
         "cohort": cohort,
@@ -751,11 +1277,89 @@ def load_gmail_fact_parity_bound_evidence(
         "cohort_sha256": cohort_digest,
         "cohort_manifest_sha256": _sha256(cohort_manifest_path),
         "admission_join_sha256": _sha256(admissions_path),
+        "source_binding_sha256": source_bindings["sha256"],
+        "canonical_source_set_sha256": source_bindings["canonical_source_set_sha256"],
         "original_inventory_sha256": _sha256(original_inventory_path),
         "v2_inventory_sha256": _sha256(v2_inventory_path),
         "packet_count": len(packets),
         "thread_count": thread_count,
         "message_count": message_count,
+    }
+
+
+def _run_stage_record(value: Any, *, name: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != _RUN_STAGE_RECORD_KEYS:
+        raise GmailFactParityError(f"{name} stage record schema is invalid")
+    if (
+        value.get("version") != STAGE_CONTRACT_VERSION
+        or value.get("contract_sha256") != STAGE_CONTRACT_SHA256
+    ):
+        raise GmailFactParityError(f"{name} stage record contract is invalid")
+    stages = _stage_membership(value.get("stages"), f"{name} stage record")
+    candidate_digest = _digest(
+        value.get("candidate_sha256"), f"{name} candidate digest"
+    )
+    action_id = value.get("action_id")
+    if action_id is not None:
+        action_id = _nonempty_string(action_id, f"{name} action ID", maximum=256)
+    disposition = value.get("disposition")
+    if disposition not in STAGE_DISPOSITIONS:
+        raise GmailFactParityError(f"{name} stage record disposition is invalid")
+    action_status = value.get("action_status")
+    if action_status is not None and action_status not in ACCEPTED_ACTION_STATUSES:
+        raise GmailFactParityError(f"{name} stage record action status is invalid")
+    if (action_id is None) != (action_status is None):
+        raise GmailFactParityError(f"{name} stage record action identity is invalid")
+    raw_fact_ids = value.get("persisted_fact_ids")
+    if (
+        not isinstance(raw_fact_ids, list)
+        or any(
+            not isinstance(item, str) or not item.strip() or len(item) > 256
+            for item in raw_fact_ids
+        )
+        or len(raw_fact_ids) != len(set(raw_fact_ids))
+    ):
+        raise GmailFactParityError(f"{name} stage record fact IDs are invalid")
+
+    expected: tuple[str, bool, bool, int] | None = None
+    if action_status in APPLIED_ACTION_STATUSES:
+        expected = ("applied", True, True, 1)
+    elif action_status is None or action_status == "proposed":
+        expected = ("deferred", False, False, 0)
+    elif action_status == "needs_human":
+        if disposition == "rejected":
+            expected = ("rejected", False, False, 0)
+        elif disposition == "residue":
+            expected = ("residue", True, False, 0)
+        else:
+            expected = ("deferred", True, False, 0)
+    elif action_status == "failed":
+        expected = ("deferred", True, False, 0)
+    elif action_status in {"rejected", "dismissed"}:
+        expected = ("rejected", False, False, 0)
+    elif action_status == "reverted":
+        expected = ("rejected", True, False, 0)
+    if expected is None:
+        raise GmailFactParityError(f"{name} stage record is not derivable")
+    expected_disposition, expected_review, expected_persisted, expected_fact_count = (
+        expected
+    )
+    if (
+        disposition != expected_disposition
+        or stages["review"] is not expected_review
+        or stages["persisted"] is not expected_persisted
+        or len(raw_fact_ids) != expected_fact_count
+    ):
+        raise GmailFactParityError(f"{name} stage record is internally inconsistent")
+    return {
+        "version": STAGE_CONTRACT_VERSION,
+        "contract_sha256": STAGE_CONTRACT_SHA256,
+        "candidate_sha256": candidate_digest,
+        "action_id": action_id,
+        "stages": stages,
+        "disposition": disposition,
+        "action_status": action_status,
+        "persisted_fact_ids": list(raw_fact_ids),
     }
 
 
@@ -782,10 +1386,15 @@ def _run_member(
         or not set(evidence_ids) <= allowed_message_ids
     ):
         raise GmailFactParityError(f"{name} evidence messages are invalid")
+    stages = _stage_membership(value.get("stages"), name)
+    stage_record = _run_stage_record(value.get("stage_record"), name=name)
+    if stages != stage_record["stages"]:
+        raise GmailFactParityError(f"{name} stages do not match their stage record")
     return {
         "statement": statement,
         "evidence_message_ids": list(evidence_ids),
-        "stages": _stage_membership(value.get("stages"), name),
+        "stages": stages,
+        "stage_record": stage_record,
     }
 
 
@@ -810,7 +1419,7 @@ def gmail_fact_parity_member_id(
         raise GmailFactParityError("member identity input is invalid")
     material = _canonical_json(
         [
-            "gmail-fact-parity-member-v1",
+            "gmail-fact-parity-member-v2",
             run_id,
             packet_id,
             member_index,
@@ -839,6 +1448,20 @@ def _load_run_output(
         _nonempty_string(header.get(name), f"{run_id} {name}")
     if _GIT_COMMIT_RE.fullmatch(header["commit"]) is None:
         raise GmailFactParityError(f"{run_id} commit is not a full Git object ID")
+    for name in (
+        "stage_contract_sha256",
+        "adapter_sha256",
+        "production_tree_sha256",
+        "runtime_config_sha256",
+        "prompt_sha256",
+        "invocation_ledger_sha256",
+    ):
+        _digest(header.get(name), f"{run_id} {name}")
+    if (
+        header.get("stage_contract_version") != STAGE_CONTRACT_VERSION
+        or header.get("stage_contract_sha256") != STAGE_CONTRACT_SHA256
+    ):
+        raise GmailFactParityError(f"{run_id} stage contract binding is invalid")
     if (
         header.get("cohort_sha256") != evidence["cohort_sha256"]
         or header.get("packet_sha256") != evidence["packet_sha256"]
@@ -848,6 +1471,9 @@ def _load_run_output(
     packet_rows: dict[str, dict[str, Any]] = {}
     members: dict[str, dict[str, Any]] = {}
     member_signatures: set[bytes] = set()
+    candidate_owners: dict[str, tuple[str, int]] = {}
+    action_owners: dict[str, str] = {}
+    fact_owners: dict[str, str] = {}
     structural_exact_duplicates = 0
     for row in rows[1:]:
         if set(row) != _RUN_PACKET_KEYS or row.get("version") != RUN_PACKET_VERSION:
@@ -873,6 +1499,26 @@ def _load_run_output(
                 name=f"{run_id}.{packet_id}",
                 allowed_message_ids=allowed_message_ids,
             )
+            stage_record = parsed["stage_record"]
+            candidate_digest = stage_record["candidate_sha256"]
+            if candidate_digest in candidate_owners:
+                raise GmailFactParityError(
+                    f"{run_id} candidate ownership is reused across records"
+                )
+            candidate_owners[candidate_digest] = (packet_id, member_index)
+            action_id = stage_record["action_id"]
+            if action_id is not None:
+                if action_id in action_owners:
+                    raise GmailFactParityError(
+                        f"{run_id} action ownership is reused across candidates"
+                    )
+                action_owners[action_id] = candidate_digest
+            for fact_id in stage_record["persisted_fact_ids"]:
+                if fact_id in fact_owners:
+                    raise GmailFactParityError(
+                        f"{run_id} persisted fact ownership is reused across candidates"
+                    )
+                fact_owners[fact_id] = candidate_digest
             parsed_members.append(
                 {
                     "member_id": gmail_fact_parity_member_id(
@@ -910,6 +1556,85 @@ def _load_run_output(
     }
 
 
+def _invocation_ledger(
+    value: Any,
+    *,
+    run_id: str,
+    run: Mapping[str, Any],
+    receipt_started: datetime,
+    receipt_completed: datetime,
+) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or not value:
+        raise GmailFactParityError(f"{run_id} invocation ledger is empty or invalid")
+    parsed: list[dict[str, Any]] = []
+    invocation_ids: set[str] = set()
+    scopes: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    previous_started: datetime | None = None
+    for ordinal, raw_item in enumerate(value):
+        if not isinstance(raw_item, Mapping) or set(raw_item) != _INVOCATION_KEYS:
+            raise GmailFactParityError(f"{run_id} invocation ledger schema is invalid")
+        invocation_id = raw_item.get("invocation_id")
+        if (
+            not isinstance(invocation_id, str)
+            or _INVOCATION_ID_RE.fullmatch(invocation_id) is None
+            or invocation_id in invocation_ids
+            or raw_item.get("ordinal") != ordinal
+        ):
+            raise GmailFactParityError(f"{run_id} invocation ledger order is invalid")
+        invocation_ids.add(invocation_id)
+        packet_id = _opaque_id(raw_item.get("packet_id"), "packet_id")
+        if packet_id not in run["packets"]:
+            raise GmailFactParityError(f"{run_id} invocation packet scope is invalid")
+        window_index = _positive_int(
+            raw_item.get("window_index"),
+            f"{run_id} invocation window_index",
+            allow_zero=True,
+        )
+        window_count = _positive_int(
+            raw_item.get("window_count"), f"{run_id} invocation window_count"
+        )
+        if window_index >= window_count:
+            raise GmailFactParityError(f"{run_id} invocation window scope is invalid")
+        scopes[packet_id].append((window_index, window_count))
+        _digest(raw_item.get("request_sha256"), f"{run_id} invocation request")
+        _digest(raw_item.get("response_sha256"), f"{run_id} invocation response")
+        if raw_item.get("provider") != EXPECTED_PROVIDER:
+            raise GmailFactParityError(f"{run_id} invocation provider is invalid")
+        if (
+            raw_item.get("model") != run["model"]
+            or raw_item.get("reasoning_effort") != run["reasoning_effort"]
+        ):
+            raise GmailFactParityError(f"{run_id} invocation target is invalid")
+        started = _parse_iso(
+            raw_item.get("started_at"), f"{run_id} invocation started_at"
+        )
+        completed = _parse_iso(
+            raw_item.get("completed_at"), f"{run_id} invocation completed_at"
+        )
+        if (
+            completed < started
+            or started < receipt_started
+            or completed > receipt_completed
+            or (previous_started is not None and started < previous_started)
+        ):
+            raise GmailFactParityError(f"{run_id} invocation chronology is invalid")
+        previous_started = started
+        parsed.append(dict(raw_item))
+
+    if set(scopes) != set(run["packets"]):
+        raise GmailFactParityError(
+            f"{run_id} invocation ledger does not cover every packet"
+        )
+    for packet_scopes in scopes.values():
+        window_counts = {count for _, count in packet_scopes}
+        if len(window_counts) != 1:
+            raise GmailFactParityError(f"{run_id} invocation window counts disagree")
+        window_count = next(iter(window_counts))
+        if {index for index, _ in packet_scopes} != set(range(window_count)):
+            raise GmailFactParityError(f"{run_id} invocation windows are incomplete")
+    return parsed
+
+
 def _load_receipt(
     path: Path,
     *,
@@ -920,18 +1645,17 @@ def _load_receipt(
     if set(value) != _RECEIPT_KEYS or value.get("version") != RECEIPT_VERSION:
         raise GmailFactParityError(f"{expected_run_id} run receipt schema is invalid")
     run_id = value.get("run_id")
-    invocation_id = value.get("invocation_id")
-    if (
-        run_id != expected_run_id
-        or _RUN_ID_RE.fullmatch(str(run_id)) is None
-        or not isinstance(invocation_id, str)
-        or _INVOCATION_ID_RE.fullmatch(invocation_id) is None
-    ):
+    if run_id != expected_run_id or _RUN_ID_RE.fullmatch(str(run_id)) is None:
         raise GmailFactParityError(f"{expected_run_id} run receipt identity is invalid")
     started = _parse_iso(value.get("started_at"), f"{run_id} started_at")
     completed = _parse_iso(value.get("completed_at"), f"{run_id} completed_at")
     if completed < started:
         raise GmailFactParityError(f"{run_id} receipt chronology is invalid")
+    for name in _RUN_BINDING_KEYS:
+        if value.get(name) != run.get(name):
+            raise GmailFactParityError(
+                f"{run_id} receipt binding does not match its run"
+            )
     if (
         value.get("output_sha256") != run["output_sha256"]
         or value.get("model") != run["model"]
@@ -940,7 +1664,16 @@ def _load_receipt(
         or value.get("attestation") != INVOCATION_ATTESTATION
     ):
         raise GmailFactParityError(f"{run_id} receipt does not match its run output")
-    return {**value, "receipt_sha256": _sha256(path)}
+    invocations = _invocation_ledger(
+        value.get("invocations"),
+        run_id=run_id,
+        run=run,
+        receipt_started=started,
+        receipt_completed=completed,
+    )
+    if _sha256_bytes(_canonical_json(invocations)) != run["invocation_ledger_sha256"]:
+        raise GmailFactParityError(f"{run_id} invocation ledger digest is invalid")
+    return {**value, "invocations": invocations, "receipt_sha256": _sha256(path)}
 
 
 def load_gmail_fact_parity_judge_receipt(
@@ -987,7 +1720,9 @@ def load_gmail_fact_parity_judge_receipt(
             "completed-units judge receipt does not match the required external judge"
         )
     run_invocation_ids = {
-        receipt["invocation_id"] for receipt in run_evidence["receipts"].values()
+        invocation["invocation_id"]
+        for receipt in run_evidence["receipts"].values()
+        for invocation in receipt["invocations"]
     }
     if invocation_id in run_invocation_ids:
         raise GmailFactParityError(
@@ -1027,30 +1762,59 @@ def load_gmail_fact_parity_runs(
     original_target_config = {
         "commit": runs[original_id]["commit"],
         "prompt_version": runs[original_id]["prompt_version"],
+        "prompt_sha256": runs[original_id]["prompt_sha256"],
         "model": runs[original_id]["model"],
         "reasoning_effort": runs[original_id]["reasoning_effort"],
+        "production_tree_sha256": runs[original_id]["production_tree_sha256"],
+        "runtime_config_sha256": runs[original_id]["runtime_config_sha256"],
+        "adapter_sha256": runs[original_id]["adapter_sha256"],
     }
-    if original_target_config != {
+    if {
+        key: original_target_config[key]
+        for key in (
+            "commit",
+            "prompt_version",
+            "prompt_sha256",
+            "model",
+            "reasoning_effort",
+            "production_tree_sha256",
+            "runtime_config_sha256",
+        )
+    } != {
         "commit": EXPECTED_ORIGINAL_COMMIT,
         "prompt_version": EXPECTED_ORIGINAL_PROMPT_VERSION,
+        "prompt_sha256": EXPECTED_ORIGINAL_PROMPT_SHA256,
         "model": EXPECTED_ORIGINAL_MODEL,
         "reasoning_effort": EXPECTED_ORIGINAL_REASONING_EFFORT,
+        "production_tree_sha256": EXPECTED_ORIGINAL_PRODUCTION_TREE_SHA256,
+        "runtime_config_sha256": EXPECTED_ORIGINAL_RUNTIME_CONFIG_SHA256,
     }:
         raise GmailFactParityError(
             "original target config is not the pinned installed baseline"
         )
+    adapter_digests = {run["adapter_sha256"] for run in runs.values()}
+    if len(adapter_digests) != 1:
+        raise GmailFactParityError("runs do not share one exact adapter")
     v2_target_config = {
         "commit": runs[v2_ids[0]]["commit"],
         "prompt_version": runs[v2_ids[0]]["prompt_version"],
+        "prompt_sha256": runs[v2_ids[0]]["prompt_sha256"],
         "model": runs[v2_ids[0]]["model"],
         "reasoning_effort": runs[v2_ids[0]]["reasoning_effort"],
+        "production_tree_sha256": runs[v2_ids[0]]["production_tree_sha256"],
+        "runtime_config_sha256": runs[v2_ids[0]]["runtime_config_sha256"],
+        "adapter_sha256": runs[v2_ids[0]]["adapter_sha256"],
     }
     if any(
         {
             "commit": runs[run_id]["commit"],
             "prompt_version": runs[run_id]["prompt_version"],
+            "prompt_sha256": runs[run_id]["prompt_sha256"],
             "model": runs[run_id]["model"],
             "reasoning_effort": runs[run_id]["reasoning_effort"],
+            "production_tree_sha256": runs[run_id]["production_tree_sha256"],
+            "runtime_config_sha256": runs[run_id]["runtime_config_sha256"],
+            "adapter_sha256": runs[run_id]["adapter_sha256"],
         }
         != v2_target_config
         for run_id in v2_ids
@@ -1062,6 +1826,16 @@ def load_gmail_fact_parity_runs(
         or v2_target_config["reasoning_effort"] != EXPECTED_V2_REASONING_EFFORT
     ):
         raise GmailFactParityError("V2 target config is not the pinned release config")
+    canonical_adapter_authority = _expected_canonical_adapter_authority()
+    expected_adapter_sha256 = (
+        canonical_adapter_authority["adapter_sha256"]
+        if canonical_adapter_authority is not None
+        else None
+    )
+    exact_adapter_authority = (
+        expected_adapter_sha256 is not None
+        and adapter_digests == {expected_adapter_sha256}
+    )
     receipts = {
         run_id: _load_receipt(
             Path(run_receipt_paths[run_id]),
@@ -1070,7 +1844,11 @@ def load_gmail_fact_parity_runs(
         )
         for run_id, run in runs.items()
     }
-    invocation_ids = [receipt["invocation_id"] for receipt in receipts.values()]
+    invocation_ids = [
+        invocation["invocation_id"]
+        for receipt in receipts.values()
+        for invocation in receipt["invocations"]
+    ]
     if len(invocation_ids) != len(set(invocation_ids)):
         raise GmailFactParityError("claimed invocation IDs must be unique")
     aliases = {
@@ -1103,6 +1881,21 @@ def load_gmail_fact_parity_runs(
         "original_target_config": original_target_config,
         "v2_run_aliases": [aliases[item] for item in v2_ids],
         "v2_target_config": v2_target_config,
+        "target_authority": {
+            "original_baseline_exact": True,
+            "v2_runs_consistent": True,
+            "canonical_adapter_available": expected_adapter_sha256 is not None,
+            "canonical_adapter_tracked_at_git_head": (
+                canonical_adapter_authority is not None
+            ),
+            "canonical_adapter_git_head": (
+                canonical_adapter_authority["git_head"]
+                if canonical_adapter_authority is not None
+                else None
+            ),
+            "canonical_adapter_exact": exact_adapter_authority,
+            "passed": exact_adapter_authority,
+        },
         "independent_invocations_verified": False,
         "claimed_invocation_ids_unique": True,
     }
@@ -1386,7 +2179,14 @@ def _run_manifest(
         "model": run["model"],
         "reasoning_effort": run["reasoning_effort"],
         "provider": receipt["provider"],
-        "invocation_id": receipt["invocation_id"],
+        "stage_contract_version": run["stage_contract_version"],
+        "stage_contract_sha256": run["stage_contract_sha256"],
+        "adapter_sha256": run["adapter_sha256"],
+        "production_tree_sha256": run["production_tree_sha256"],
+        "runtime_config_sha256": run["runtime_config_sha256"],
+        "prompt_sha256": run["prompt_sha256"],
+        "invocation_ledger_sha256": run["invocation_ledger_sha256"],
+        "invocation_count": len(receipt["invocations"]),
         "output_sha256": run["output_sha256"],
         "receipt_sha256": receipt["receipt_sha256"],
         "packet_count": len(run["packets"]),
@@ -1410,7 +2210,7 @@ def build_gmail_fact_parity_manifest(
     judge_receipt: Mapping[str, Any],
     labels: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Build the only accepted v3 manifest from fully reconciled artifacts."""
+    """Build the only accepted v4 manifest from fully reconciled artifacts."""
 
     preparer = _preparer_path()
     if not preparer.is_file():
@@ -1427,6 +2227,8 @@ def build_gmail_fact_parity_manifest(
         "packet_sha256": evidence["packet_sha256"],
         "cohort_manifest_sha256": evidence["cohort_manifest_sha256"],
         "admission_join_sha256": evidence["admission_join_sha256"],
+        "source_binding_sha256": evidence["source_binding_sha256"],
+        "canonical_source_set_sha256": evidence["canonical_source_set_sha256"],
         "original_inventory_sha256": evidence["original_inventory_sha256"],
         "v2_inventory_sha256": evidence["v2_inventory_sha256"],
         "label_unit_count": len(labels),
@@ -1446,6 +2248,8 @@ def build_gmail_fact_parity_manifest(
             for run_id in run_evidence["v2_run_ids"]
         ],
         "v2_target_config": dict(run_evidence["v2_target_config"]),
+        "original_target_config": dict(run_evidence["original_target_config"]),
+        "target_authority": dict(run_evidence["target_authority"]),
         "judge": {
             "provider": judge_receipt["provider"],
             "model": judge_receipt["model"],
@@ -1622,6 +2426,8 @@ def evaluate_gmail_fact_parity(
     packets_path: Path,
     admissions_path: Path,
     cohort_manifest_path: Path,
+    source_bindings_path: Path,
+    hmac_key_path: Path,
     original_inventory_path: Path,
     v2_inventory_path: Path,
     run_output_paths: Mapping[str, Path],
@@ -1640,6 +2446,8 @@ def evaluate_gmail_fact_parity(
         "packets": packets_path,
         "admissions": admissions_path,
         "cohort_manifest": cohort_manifest_path,
+        "source_bindings": source_bindings_path,
+        "hmac_key": hmac_key_path,
         "original_inventory": original_inventory_path,
         "v2_inventory": v2_inventory_path,
         **{f"output:{key}": Path(value) for key, value in run_output_paths.items()},
@@ -1651,6 +2459,8 @@ def evaluate_gmail_fact_parity(
         cohort_path,
         admissions_path,
         cohort_manifest_path,
+        source_bindings_path,
+        hmac_key_path,
         original_inventory_path,
         v2_inventory_path,
     )
@@ -1809,8 +2619,7 @@ def evaluate_gmail_fact_parity(
                 stage_by_thread[row["thread_id"]].append(row)
             stage_thread_recalls = [
                 sum(
-                    _has_good_evidence(row, row["v2"][run_alias], stage)
-                    for row in rows
+                    _has_good_evidence(row, row["v2"][run_alias], stage) for row in rows
                 )
                 / len(rows)
                 for rows in stage_by_thread.values()
@@ -1824,9 +2633,7 @@ def evaluate_gmail_fact_parity(
                 "retained_units": retained,
                 "retention": _ratio(retained, len(reference_denominators[stage])),
                 "retained_threads": retained_threads,
-                "thread_retention": _ratio(
-                    retained_threads, len(stage_thread_recalls)
-                ),
+                "thread_retention": _ratio(retained_threads, len(stage_thread_recalls)),
                 "macro_thread_retention": (
                     sum(stage_thread_recalls) / len(stage_thread_recalls)
                     if stage_thread_recalls
@@ -1891,15 +2698,12 @@ def evaluate_gmail_fact_parity(
                     for stage, value in stage_results.items()
                 },
                 **{
-                    f"{stage}_thread_retention": value["thread_retention"]
-                    is not None
+                    f"{stage}_thread_retention": value["thread_retention"] is not None
                     and value["thread_retention"] >= MIN_RETENTION
                     for stage, value in stage_results.items()
                 },
                 **{
-                    f"{stage}_macro_thread_retention": value[
-                        "macro_thread_retention"
-                    ]
+                    f"{stage}_macro_thread_retention": value["macro_thread_retention"]
                     is not None
                     and value["macro_thread_retention"] >= MIN_RETENTION
                     for stage, value in stage_results.items()
@@ -1958,6 +2762,11 @@ def evaluate_gmail_fact_parity(
     all_run_gates = all(
         all(result["gates"].values()) for result in run_results.values()
     )
+    metric_gate_passed = (
+        all_run_gates
+        and coverage_gate["passed"]
+        and all(item["passed"] for item in stability)
+    )
     return {
         "version": VERSION,
         "manifest_version": manifest["version"],
@@ -1974,6 +2783,8 @@ def evaluate_gmail_fact_parity(
             "packet_sha256": manifest["packet_sha256"],
             "cohort_manifest_sha256": manifest["cohort_manifest_sha256"],
             "admission_join_sha256": evidence["admission_join_sha256"],
+            "source_binding_sha256": evidence["source_binding_sha256"],
+            "canonical_source_set_sha256": evidence["canonical_source_set_sha256"],
             "original_inventory_sha256": evidence["original_inventory_sha256"],
             "v2_inventory_sha256": evidence["v2_inventory_sha256"],
             "run_output_sha256": {
@@ -1998,6 +2809,7 @@ def evaluate_gmail_fact_parity(
         },
         "coverage_gate": coverage_gate,
         "v2_target_config": dict(run_evidence["v2_target_config"]),
+        "target_authority_gate": dict(run_evidence["target_authority"]),
         "runs": run_results,
         "evidence_execution": {
             run_evidence["run_aliases"][run_id]: {
@@ -2027,9 +2839,10 @@ def evaluate_gmail_fact_parity(
             "contract_sha256": judge_receipt["judge_contract_sha256"],
             "attestation": judge_receipt["attestation"],
         },
-        "gate_passed": all_run_gates
-        and coverage_gate["passed"]
-        and all(item["passed"] for item in stability),
+        "metric_gate_passed": metric_gate_passed,
+        "gate_passed": metric_gate_passed
+        and run_evidence["target_authority"]["passed"]
+        and run_evidence["independent_invocations_verified"],
         "private_content_printed": False,
     }
 
@@ -2060,8 +2873,10 @@ def main() -> None:
     parser.add_argument("packets", type=Path)
     parser.add_argument("admissions", type=Path)
     parser.add_argument("cohort_manifest", type=Path)
+    parser.add_argument("source_bindings", type=Path)
     parser.add_argument("original_inventory", type=Path)
     parser.add_argument("v2_inventory", type=Path)
+    parser.add_argument("--hmac-key", type=Path, required=True)
     parser.add_argument(
         "--run-output",
         action="append",
@@ -2088,6 +2903,8 @@ def main() -> None:
         args.packets,
         args.admissions,
         args.cohort_manifest,
+        args.source_bindings,
+        args.hmac_key,
         args.original_inventory,
         args.v2_inventory,
         _run_artifact_arguments(args.run_output),

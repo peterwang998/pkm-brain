@@ -118,14 +118,17 @@ of every supported, scope-correct original-Brain non-temporal fact unit at
 candidate, review, and persistence stages, with at least 50 units across 30
 threads and reconciled source/thread counts. Its scores are not pooled with
 either temporal cohort. On 40 frozen temporal-recall queries, top-five retrieval
-must reach at least 90% and top-ten at least 95%. This primary retrieval gate is
-global and cold: the retriever receives only query ID, query text, and the as-of
-clock. Temporal query kind, lifecycle class, context source IDs, thread scope,
-and relevance gold stay sealed for validation and scoring. Any contextual
-follow-up queries belong to a separate diagnostic cohort whose metrics are
-never pooled with the 40-query primary denominator. A retrospective retrieval
-run without authenticated index authority is preview evidence only; a
-promotion rollup needs a separately trusted prospective retrieval authority.
+must reach at least 90% and top-ten at least 95%. Query hits cannot hide partial
+timeline recall: macro relevant-source recall at ten must also reach 90%, and at
+least 85% of queries must retrieve their complete relevant source set at ten.
+This primary retrieval gate is global and cold: the retriever receives only
+query ID, query text, and the as-of clock. Temporal query kind, lifecycle class,
+context source IDs, thread scope, and relevance gold stay sealed for validation
+and scoring. Any contextual follow-up queries belong to a separate diagnostic
+cohort whose metrics are never pooled with the 40-query primary denominator. A
+retrospective retrieval run without authenticated index authority is preview
+evidence only; a promotion rollup needs a separately trusted prospective
+retrieval authority.
 
 Temporal cognition may add structure; it may not recreate the earlier
 522-sources-to-10-facts collapse. Historical imports can populate a
@@ -207,6 +210,62 @@ messages, so it cannot establish original-Brain parity. A separate,
 thread-disjoint identical-packet preflight froze 150 fact-rich threads and 254
 messages after excluding all 325 temporal-holdout threads; see
 [Gmail Fact-Parity Preflight — 2026-07-23](gmail-fact-parity-preflight-2026-07-23.md).
+
+### Complete Gmail retrieval authority — 2026-07-23
+
+The retrieval benchmark is now executable through the production Brain service,
+but it is not semantically scored. A local-only authority build over the isolated
+v7 Brain index bound all 6,960 active Gmail thread projections, 7,859 retained
+messages, and 15,953 indexed chunks. This is deliberately the complete active
+Gmail retrieval corpus rather than only the gold examples: irrelevant mail can
+therefore consume a ranked position instead of disappearing and inflating
+recall. Every indexed message-section chunk resolves to exactly one trusted
+provider message. The thread-title chunk is clocked conservatively to the last
+retained provider message because the renderer derives that title from the
+newest non-empty subject. Separator newlines remain in the preceding message's
+authority envelope, and cross-message chunks fail closed.
+
+Source and thread identities are HMAC-opaque. The owner-only v3 binding retains
+the provider account, message, thread, document, content, and message-text
+hashes plus each assigned chunk's ID, offsets, and text hash. Every source row
+has its own HMAC and the signed builder manifest authenticates the exact chunk
+count. During holdout freeze, the evaluator recomputes every opaque source and
+thread identity, rejects even a
+re-signed source-to-message, thread-scope, or chunk-assignment permutation, and commits the exact
+binding and builder-manifest hashes into the bundle. The runner independently
+re-verified all 7,859 message authorities and all 15,953 chunk bindings against
+trusted Gmail frontmatter and the index before query execution.
+
+The executed route is now the public read-only
+`BrainService.retrieve_retrospective_evidence` API. It keeps the source
+availability cutoff separate from Brain's knowledge clock, so a historical
+message-time query does not incorrectly exclude facts imported during the 2026
+backfill. The temporal arm ranks complete-citation facts before deterministic
+source chunks; a missing, future, or unmapped citation discards that whole fact
+signal. Context contributes retrieval terms but cannot change temporal intent,
+which is resolved from the user query alone. Both arms disable recency and exposure lineage for replay, exclude
+context sources, return zero to ten unpadded results, and write no telemetry or
+Brain state. Each run queries a disposable SQLite/vector snapshot, binds both
+the live source and actual scratch commitments, and verifies both remain
+unchanged. Its implementation receipt hashes the runner, the public service
+surface, and the focused retrospective-retrieval module that implements the
+executed path. The scorer accepts only the runner's exact configuration,
+protocol, embedded source hashes, and mutually consistent snapshot receipt.
+Those submitted implementation bytes must also equal their fixed Git `HEAD`
+blobs, with clean index and worktree state. This is owner-process integrity,
+not host supply-chain attestation: the personal-use threat boundary trusts the
+local operating system, system Git executable, and repository object database.
+
+The scorer reports query hit rate at five and ten, micro and macro
+relevant-source recall, complete-query recall, MRR, result-depth diagnostics,
+and temporal-kind/lifecycle breakdowns. Its release prerequisite requires 90%
+query hit at five, 95% query hit at ten, 90% macro relevant-source recall at ten,
+and 85% complete-query recall at ten. A real-index, content-free smoke test ran
+both source and temporal arms through the public API with zero writes and zero
+results for a synthetic non-matching query. No frozen 40-query Gmail relevance
+authority exists yet, so temporal retrieval quality remains **unmeasured**; the
+new machinery prevents an optimistic or identity-swapped score from being
+mistaken for evidence.
 
 ## Outcome So Far
 
