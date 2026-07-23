@@ -528,8 +528,11 @@ _LABEL_ALTERNATIVE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
-        "quality": {"enum": ["exact", "partial"]},
-        "expected_verdict": {"enum": ["supported", "uncertain"]},
+        "quality": {"type": "string", "enum": ["exact", "partial"]},
+        "expected_verdict": {
+            "type": "string",
+            "enum": ["supported", "uncertain"],
+        },
         "locator": _LABEL_LOCATOR_SCHEMA,
     },
     "required": ["quality", "expected_verdict", "locator"],
@@ -540,8 +543,14 @@ _LABEL_MEMBER_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
     "properties": {
         "member_id": {"type": "string", "minLength": 1},
-        "expected_verdict": {"enum": ["supported", "uncertain"]},
-        "baseline_frontier_grade": {"const": "pending_adapter_recompute"},
+        "expected_verdict": {
+            "type": "string",
+            "enum": ["supported", "uncertain"],
+        },
+        "baseline_frontier_grade": {
+            "type": "string",
+            "const": "pending_adapter_recompute",
+        },
         "alternatives": {
             "type": "array",
             "minItems": 1,
@@ -562,7 +571,10 @@ _LABEL_UNIT_SCHEMA: dict[str, Any] = {
     "properties": {
         "unit_id": {"type": "string", "minLength": 1},
         "truth": {"type": "string", "minLength": 1},
-        "baseline_frontier_grade": {"const": "pending_adapter_recompute"},
+        "baseline_frontier_grade": {
+            "type": "string",
+            "const": "pending_adapter_recompute",
+        },
         "members": {"type": "array", "minItems": 1, "items": _LABEL_MEMBER_SCHEMA},
     },
     "required": ["unit_id", "truth", "baseline_frontier_grade", "members"],
@@ -575,7 +587,7 @@ def _label_response_schema(max_items: int) -> dict[str, Any]:
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "version": {"const": LABEL_RESPONSE_VERSION},
+            "version": {"type": "string", "const": LABEL_RESPONSE_VERSION},
             "labels": {
                 "type": "array",
                 "minItems": 1,
@@ -585,17 +597,18 @@ def _label_response_schema(max_items: int) -> dict[str, Any]:
                     "additionalProperties": False,
                     "properties": {
                         "sample_id": {"type": "string", "minLength": 1},
-                        "label_status": {"const": "labeled"},
+                        "label_status": {"type": "string", "const": "labeled"},
                         "expected_material": {"type": "boolean"},
                         "expected_filter": {
-                            "enum": ["should_admit", "should_suppress"]
+                            "type": "string",
+                            "enum": ["should_admit", "should_suppress"],
                         },
                         "hard_negative": {"type": "boolean"},
                         "semantic_units": {
                             "type": "array",
                             "items": _LABEL_UNIT_SCHEMA,
                         },
-                        "critical_error": {"const": "none"},
+                        "critical_error": {"type": "string", "const": "none"},
                         "notes": _schema_string_or_null(),
                     },
                     "required": [
@@ -621,7 +634,7 @@ def _verifier_response_schema(max_items: int) -> dict[str, Any]:
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "version": {"const": VERIFIER_RESPONSE_VERSION},
+            "version": {"type": "string", "const": VERIFIER_RESPONSE_VERSION},
             "pages": {
                 "type": "array",
                 "minItems": 1,
@@ -640,11 +653,12 @@ def _verifier_response_schema(max_items: int) -> dict[str, Any]:
                                 "properties": {
                                     "candidate_id": {"type": "string", "minLength": 1},
                                     "verdict": {
+                                        "type": "string",
                                         "enum": [
                                             "supported",
                                             "uncertain",
                                             "unsupported",
-                                        ]
+                                        ],
                                     },
                                 },
                                 "required": ["candidate_id", "verdict"],
@@ -955,8 +969,7 @@ def _load_adapter_manifest(
         or _SHA256_RE.fullmatch(str(manifest["label_authority_manifest_sha256"]))
         is None
         or manifest.get("label_chronology_verified") is not True
-        or _LOGICAL_RUN_RE.fullmatch(str(manifest.get("label_logical_run_id")))
-        is None
+        or _LOGICAL_RUN_RE.fullmatch(str(manifest.get("label_logical_run_id"))) is None
         or any(
             not isinstance(manifest.get(field), str)
             or _SHA256_RE.fullmatch(str(manifest[field])) is None
@@ -2203,10 +2216,14 @@ def run_labels(
     label_completed = [
         _aware_timestamp(attempt.receipt.get("completed_at")) for attempt in attempts
     ]
-    if not attempts or any(
-        _LABEL_INVOCATION_RE.fullmatch(value) is None
-        for value in call_hashes["invocation_ids"]
-    ) or any(value is None for value in (*label_started, *label_completed)):
+    if (
+        not attempts
+        or any(
+            _LABEL_INVOCATION_RE.fullmatch(value) is None
+            for value in call_hashes["invocation_ids"]
+        )
+        or any(value is None for value in (*label_started, *label_completed))
+    ):
         raise GmailTemporalExternalRunnerError("label invocation authority is invalid")
     authority_unsigned = {
         "version": finalizer.LABEL_AUTHORITY_VERSION,

@@ -33,6 +33,32 @@ def _load() -> Any:
 runner = _load()
 
 
+def _assert_strict_structured_output_schema(value: Any) -> None:
+    if isinstance(value, dict):
+        if "const" in value or "enum" in value:
+            assert "type" in value
+        if value.get("type") == "object":
+            assert value.get("additionalProperties") is False
+            properties = value.get("properties")
+            assert isinstance(properties, dict)
+            assert set(value.get("required", [])) == set(properties)
+        for nested in value.values():
+            _assert_strict_structured_output_schema(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            _assert_strict_structured_output_schema(nested)
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [runner._label_response_schema(2), runner._verifier_response_schema(2)],
+)
+def test_external_response_schemas_follow_strict_structured_output_contract(
+    schema: dict[str, Any],
+) -> None:
+    _assert_strict_structured_output_schema(schema)
+
+
 def _label_fields(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "sample_id": row["sample_id"],
@@ -175,10 +201,13 @@ def test_labels_happy_path_is_source_only_resumable_and_finalizer_compatible(
     )
     assert authority["source_only_labeling"] is True
     assert authority["internal_evaluation_artifacts_inspected"] is False
-    assert authority["receipt_set_sha256"] == runner.recompute_call_set_hashes(
-        output,
-        fixture["key"],
-    )["receipt_set_sha256"]
+    assert (
+        authority["receipt_set_sha256"]
+        == runner.recompute_call_set_hashes(
+            output,
+            fixture["key"],
+        )["receipt_set_sha256"]
+    )
 
     # Restore the unrelated frozen artifact, then prove the ordinary finalizer
     # consumes the runner outputs without any translation.
