@@ -36,7 +36,7 @@ from pkm_brain.gmail_temporal_selection import (
 )
 
 
-AUDIT_VERSION = "gmail_temporal_frontier_audit_v1"
+AUDIT_VERSION = "gmail_temporal_frontier_audit_v2"
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SOURCE_PATHS = {
     name: _REPO_ROOT / "src" / "pkm_brain" / f"{name}.py"
@@ -293,6 +293,11 @@ def audit_gmail_temporal_frontier(path: Path) -> dict[str, Any]:
             counts["frontier_empty_batches"] += int(not frontier.candidates)
             counts["frontier_incomplete_batches"] += int(not frontier.complete)
             counts["omitted_candidate_mentions"] += (
+                frontier.omitted_candidate_mention_count
+            )
+            coverage["empty_frontier_batches"] += int(not frontier.candidates)
+            coverage["incomplete_frontier_batches"] += int(not frontier.complete)
+            coverage["omitted_candidate_mentions"] += (
                 frontier.omitted_candidate_mention_count
             )
             counts["pages"] += page_count

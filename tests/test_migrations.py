@@ -9,7 +9,7 @@ from pkm_brain.db import connection, init_db
 from pkm_brain.migrations import MIGRATIONS, run_migrations
 
 
-EXPECTED_MIGRATIONS = list(range(1, 25))
+EXPECTED_MIGRATIONS = list(range(1, 26))
 
 
 def test_fresh_db_applies_registered_migrations(tmp_path: Path) -> None:
@@ -68,6 +68,20 @@ def test_fresh_db_applies_registered_migrations(tmp_path: Path) -> None:
         watermark_columns = {
             row["name"]
             for row in conn.execute("PRAGMA table_info(cos_stage_watermarks)")
+        }
+        temporal_run_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(gmail_temporal_review_runs)")
+        }
+        temporal_artifact_columns = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info(gmail_temporal_review_artifacts)"
+            )
+        }
+        temporal_head_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(gmail_temporal_review_heads)")
         }
         tables = {
             row["name"]
@@ -173,6 +187,44 @@ def test_fresh_db_applies_registered_migrations(tmp_path: Path) -> None:
     assert {"stage", "document_id", "content_hash", "model", "prompt_version", "status"}.issubset(
         watermark_columns
     )
+    assert {
+        "input_key",
+        "message_scope_key",
+        "pipeline_scope",
+        "document_id",
+        "document_content_hash",
+        "gmail_account_key",
+        "gmail_thread_id",
+        "gmail_source_revision",
+        "gmail_message_id",
+        "message_internal_at",
+        "message_start_offset",
+        "message_end_offset",
+        "source_sha256",
+        "source_locator_hash",
+        "grouping_policy_fingerprint",
+        "projection_sha256",
+        "artifact_set_sha256",
+        "projection_json",
+        "complete",
+        "routable",
+    }.issubset(temporal_run_columns)
+    assert {
+        "run_id",
+        "artifact_kind",
+        "source_artifact_key",
+        "candidate_authorization",
+        "payload_sha256",
+        "payload_json",
+        "routable",
+    }.issubset(temporal_artifact_columns)
+    assert {
+        "message_scope_key",
+        "pipeline_scope",
+        "run_id",
+        "generation",
+        "updated_at",
+    }.issubset(temporal_head_columns)
 
 
 def test_migrations_rerun_is_noop(tmp_path: Path) -> None:

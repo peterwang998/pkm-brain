@@ -1,7 +1,7 @@
 # Temporal Cognition Implementation Plan
 
-**Status:** T0-T5 implemented and evaluated in isolated Brain v2; T5A evidence-first Gmail discovery, apply-time provenance, and historical replay are complete; T5B now includes review-only expression batching, temporal rescue, event-title candidates, and association-isolated reduction, but human-grounded calibration, live lifecycle validation, optional backfill, and controlled promotion remain open
-**Last verified:** 2026-07-21 against the unpromoted temporal-cognition branch based on baseline commit `d5405b9`; the content-safe replay preserved current fact-admission parity, the bounded current-source replay covered all 265 important-temporal proxy threads, and the full 1,297-test suite passed while promotion remained blocked on accuracy evidence
+**Status:** T0-T5 are implemented and evaluated in isolated Brain v2. T5A evidence-first Gmail discovery, apply-time provenance, and historical replay are complete. T5B now includes recall-wide review batching, a complete validator-backed frontier, three-run consensus, message-level alternative/reschedule grouping, a source-bound review ledger, and a fail-closed original-Brain parity evaluator. The private semantic holdout, actual parity execution, authoritative post-ingest runner, live canary, optional backfill, and controlled promotion remain open.
+**Last verified:** 2026-07-22 against the unpromoted temporal-cognition branch. The frozen v19 synthetic gate reached 36/36 effective members, 31/32 confirmed members, 100% artifact precision, zero critical errors, and 1.0 semantic stability. The local historical audit found no admitted frontier gaps, and the full 1,579-test suite passed. These results do not replace the private holdout or authorize promotion.
 **Owning specs:** [Capture And Knowledge](../specs/capture-and-knowledge.md), [Curation And Review](../specs/curation-and-review.md), and [Retrieval And Memory](../specs/retrieval-and-memory.md)
 
 ## Objective
@@ -255,6 +255,21 @@ The first 120-record stratified cohort is now a development set because it was r
 
 T5B development outcome: the endpoint-only arm preserved a 68.7% Sol-supported material-record rate while raising the Sol-supported proposal rate from 63.4% to 80.0% and reducing critical-error labels from 23 to 15. These are independent-model support rates on reused development data, not human-grounded recall or precision. A diagnostic remap through the stricter validator then produced a 62.4% supported material-record rate, an 80.6% supported proposal rate, and 14 critical-error labels; it removed eight proposals but exposed the coverage cost of fail-closed repair. A later boundary-only diagnostic remained below target at 53 of 71 useful records and 63 of 80 supported proposals, so validator relaxation was rejected as the primary recall strategy. The expression-centric packet planner, explicit temporal rescue, structured event-title candidates, segment-local lifecycle guards, and association-isolated reducer are now implemented and covered by the full regression suite. Their fresh external Gmail quality pass awaits explicit informed approval to transmit the private cohort; see [Gmail Temporal Recall Iteration](../audits/gmail-temporal-recall-iteration-2026-07-21.md). No free-text class can emit high confidence or route automatically. Structured ICS extraction, stable lifecycle identity with a separate reconciliation pass, a fresh human holdout, and a live content-changing canary remain required.
 
+T5B persistence follow-through: the frozen v19 artifacts now have a separate
+message-level review projection for explicit alternatives, reschedules, and
+split-semantic conflicts. It preserves each candidate's original semantics and
+defer state, represents a missing endpoint explicitly, and never counts a group
+as another fact. Migration 25 adds a review-only append ledger plus a
+compare-and-swap current head. The ledger accepts only complete, deferred,
+non-routable output whose Gmail Knowledge lineage, immutable message range,
+trusted internal time, transformed analyzer input, and three evidence
+fingerprints validate and remain hash-bound; exact replay is idempotent and
+rollback retains all history. This is a low-level sink: a promotion runner must
+still derive trusted text, construct the analyzer/batcher/frontier, recompute a
+three-raw-run ensemble, and compute the evidence hashes internally so runtime
+code cannot submit a prebuilt projection. Runtime invocation remains disabled
+pending that runner, the fresh private holdout, and the review-only canary.
+
 ### T6 — Controlled Promotion And Optional Backfill
 
 Deliverables:
@@ -270,7 +285,7 @@ Historical backfill is optional and never implicit. Unknown/absent time is a val
 
 Hard gates remain mandatory:
 
-- migrations 22-24 are additive, idempotent, and fixture-upgrade tested;
+- migrations 22-25 are additive, idempotent, and fixture-upgrade tested;
 - extractor v12 preserves base-fact recall and source provenance;
 - malformed temporal enrichment never rejects a valid base fact;
 - event time requires exactly one primary event entity and survives revisions/inverses;

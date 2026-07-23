@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .chunking import strip_frontmatter
+from .source_dates import gmail_message_source_evidence
 from .wiki import parse_frontmatter
 
 
@@ -589,23 +590,14 @@ def _message_source_evidence(
 ) -> _MessageEvidence | None:
     """Keep sender-controlled subject/body, excluding connector metadata clocks."""
 
-    _heading, first_separator, remainder = rendered_message.partition("\n\n")
-    if not first_separator:
+    evidence = gmail_message_source_evidence(rendered_message)
+    if evidence is None:
         return None
-    metadata, second_separator, payload = remainder.partition("\n\n")
-    if not second_separator:
-        return None
-    subject_line = next(
-        (line for line in metadata.splitlines() if line.startswith("Subject: ")),
-        "",
-    )
-    subject = subject_line.removeprefix("Subject: ") if subject_line else ""
-    evidence = "\n\n".join(value for value in (subject_line, payload) if value).strip()
     return _MessageEvidence(
-        text=evidence or "[No retained text body]",
+        text=evidence.text,
         internal_at=internal_at,
-        subject=subject,
-        body=payload,
+        subject=evidence.subject,
+        body=evidence.body,
     )
 
 

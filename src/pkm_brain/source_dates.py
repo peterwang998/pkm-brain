@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,45 @@ GMAIL_MESSAGE_TIMESTAMPS_VERSION = 1
 GMAIL_SOURCE_REVISION = re.compile(r"^[0-9a-f]{64}$")
 GMAIL_PROVIDER_MESSAGE_ID = re.compile(r"^[A-Za-z0-9_.-]+$")
 SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+
+
+@dataclass(frozen=True)
+class GmailMessageSourceEvidence:
+    """Sender-controlled selector input derived from one rendered message."""
+
+    text: str
+    subject: str
+    body: str
+
+
+def gmail_message_source_evidence(
+    rendered_message: str,
+) -> GmailMessageSourceEvidence | None:
+    """Remove connector heading/metadata exactly as temporal evaluation does.
+
+    Connector timestamp offsets cover the full rendered message.  Temporal
+    analysis instead receives only its first ``Subject:`` metadata line and the
+    retained payload, joined with one blank line.  Keeping this transform shared
+    prevents persistence replay from hashing a different evidence surface.
+    """
+
+    _heading, first_separator, remainder = rendered_message.partition("\n\n")
+    if not first_separator:
+        return None
+    metadata, second_separator, payload = remainder.partition("\n\n")
+    if not second_separator:
+        return None
+    subject_line = next(
+        (line for line in metadata.splitlines() if line.startswith("Subject: ")),
+        "",
+    )
+    subject = subject_line.removeprefix("Subject: ") if subject_line else ""
+    evidence = "\n\n".join(value for value in (subject_line, payload) if value).strip()
+    return GmailMessageSourceEvidence(
+        text=evidence or "[No retained text body]",
+        subject=subject,
+        body=payload,
+    )
 
 
 def document_source_date_metadata(document: dict[str, Any]) -> dict[str, Any]:

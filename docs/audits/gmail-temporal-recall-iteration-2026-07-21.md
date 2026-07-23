@@ -1,11 +1,13 @@
 # Gmail Temporal Recall Iteration — 2026-07-21
 
 **Status:** the review-only architecture passes the current frozen synthetic gate
-in three separately requested Luna-medium runs. A private Gmail holdout,
-same-source original-Brain parity, and persistence validation remain pending. A
+in three separately requested Luna-medium runs. Its source-bound append ledger,
+idempotent replay, stale-head handling, and rollback primitives are implemented
+and tested. A private Gmail holdout, actual same-source original-Brain parity
+run, authoritative post-ingest runner, and review-only canary remain pending. A
 final ontology-aligned Sol-medium diagnostic independently accepted every
 production artifact with zero critical errors. Nothing in this audit authorizes
-automatic persistence, routing, reminders, or calendar actions.
+automatic fact promotion, routing, reminders, or calendar actions.
 
 **Exploratory target used before 2026-07-22:** at least 85% useful-record recall,
 at least 90% supported-proposal precision, and less than 1% critical semantic
@@ -57,8 +59,11 @@ with at least 50 genuinely useful temporal records, must demonstrate at least
 95% effective member recall, at least 90% confirmed recall, at least 95%
 confirmed precision, at least 90% review-arm precision, no critical supported
 errors, and no more than 5% noise admitted to review. The same cohort must retain
-at least 95% of the original Brain's independently judged useful non-temporal
-facts, with source and thread counts reconciled. Temporal cognition may add
+at least 95% of every supported, scope-correct original-Brain non-temporal fact
+unit at candidate, review, and persistence stages, with source and thread counts
+reconciled. A separate source-only usefulness slice may be reported as a
+diagnostic, but it cannot shrink the release denominator. Temporal cognition
+may add
 structure; it may not recreate the earlier
 522-sources-to-10-facts collapse. The existing 120-message development cohort can
 fill this role only after its labels are frozen independently of the current
@@ -429,6 +434,112 @@ as triage coverage and never improve effective recall.
 
 The selector output remains a non-routable evidence sidecar. A resolved occurrence should ultimately reference a stable event entity. Schedules, deadlines, cancellations, completions, and replacements should update an append-only event lifecycle only after event identity is reconciled. Ordinary durable facts remain ordinary facts; they are not required to carry a temporal object merely because their source email contains a date.
 
+### 9. Message-level temporal structure
+
+The frozen candidate and artifact semantics remain unchanged. A separate pure
+review projection now groups message-local artifacts only when exact source
+grammar supplies the structure:
+
+- `single` for an independent temporal artifact;
+- `alternatives` for an explicit source-local `X or Y` date/time list;
+- `reschedule` for an explicit `rescheduled ... from X to Y` frame; and
+- `split_semantics` for a parent cluster that still has competing semantic
+  signatures and therefore authorizes no candidate.
+
+Group members carry an ordered role (`independent`, `alternative`,
+`rescheduled_old`, `rescheduled_replacement`, or `unresolved`) and an explicit
+`present`, `missing`, or `conflicted` state. A group is metadata, not another
+fact or recall artifact. It cannot increase the benchmark score, authorize a
+candidate, route work, or rewrite relation, kind, lifecycle, normalization, or
+the candidate's original defer state. Every projected wrapper remains
+`requires_defer=true` and `routable=false`.
+
+Two frozen v19 records exercise the intended behavior:
+
+- `syn_lifecycle_03`, “The hiring interview was rescheduled from August 14,
+  2027 to August 16, 2027,” produces two uncertainty artifacts in one complete
+  reschedule group. Their source roles are ordered old then replacement, while
+  both underlying hypotheses remain the pipeline's original
+  `relation=unspecified`, `kind=unspecified`, `lifecycle=unknown`, and deferred.
+- `syn_ambiguous_04`, “Possible dates are August 18, 2027 or August 19, 2027,”
+  produces two uncertainty artifacts in one complete alternatives group, with
+  source order 1 then 2. Reducer-equivalent subject aliases remain collapsed
+  inside each artifact rather than becoming duplicate facts.
+
+Missing endpoints remain visible as non-authorizing incomplete group members.
+Incompatible subject families produce a conflicted group. This representation
+improves review-time temporal recall without pretending that message-local
+subject aliases are already durable event identity.
+
+### 10. Review-only persistence boundary
+
+Migration 25 adds an append-only ledger in the main Brain database for complete
+Gmail temporal review runs and their supported citations, uncertainty sidecars,
+and split-semantic cluster reviews. Groups remain embedded projection metadata
+and are not inserted as extra artifacts. A separate compare-and-swap head points
+to the current run for one Gmail message and pipeline scope; rollback only moves
+or clears that head and retains immutable history. Exact replay is idempotent,
+while the same deterministic input key producing different canonical bytes
+fails closed. Partial projections, routable output, stale source authority,
+failed artifact writes, and cross-scope head pointers are rejected atomically.
+This ledger does not write facts, open questions, the Gmail mirror, or the Chief
+of Staff operational database, and no daemon or external-call path is enabled.
+Head reads revalidate the bound source and return an explicit `current`, `stale`,
+or `cleared` status; rollback cannot restore a superseded or otherwise stale
+Gmail source, although a stale head can still be safely cleared.
+
+The persistence boundary is downstream of trusted Gmail Knowledge projections,
+not the operational mirror. It revalidates connector-authored lineage, immutable
+document content, the exact provider-message range, its trusted internal time,
+and the deterministic subject-plus-payload text hash before accepting a review
+projection. Three ordered SHA-256 component evidence fingerprints are required
+and hash-bound, while
+`independent_invocations_verified=false` remains explicit because file hashes
+cannot prove independent model execution.
+
+This is intentionally a low-level, non-routable ledger sink, not yet the
+production runner. Canonical projection validation proves internal consistency;
+it does not prove that a caller actually ran the analyzer, batcher, complete
+frontier, three raw verifier invocations, and ensemble reducer. Before runtime
+integration, one authoritative runner must derive the trusted message text,
+construct those stages itself, accept exactly three raw checkpoint/verdict
+inputs, compute their hashes, and call the sink privately. Runtime code must not
+be able to submit an arbitrary prebuilt projection.
+
+### 11. Local historical structural audit
+
+A fresh local-only audit of the frozen 120-record private development cohort
+processed 111 records with temporal expressions, 672 expressions/batches,
+2,167 candidates, and 613 verifier pages. All 80 admitted records that contained
+temporal expressions had candidates and pages; there were no admitted frontier
+gaps. The five other admitted `durable_no_lead` records had no detected temporal
+expression, so they are a separate discovery question rather than an omitted
+frontier.
+
+All 14 incomplete frontiers and all 104 omitted candidate mentions occurred in
+the `suppressed_advertising_temporal` rescue stratum. The admitted high-confidence,
+ambiguous, lifecycle, and durable-lead strata each had zero incomplete frontiers
+and zero omitted candidate mentions. This is strong structural coverage evidence,
+not semantic precision or recall: no private external judge was called, and the
+cohort remains development data rather than the fresh blind holdout.
+
+The original-Brain parity evaluator is also now fail-closed rather than a
+placeholder ratio script. It requires the frozen cohort and every packet, one
+complete original run, at least three complete V2 runs, exact packet/member
+coverage, complete arm-blind semantic alignment and labels, hash-bound receipts,
+and no omitted emitted member. The judge queue contains the canonical private
+message evidence under opaque run aliases; its receipt binds the cohort, packet,
+queue, completed judgments, and pinned Sol-medium contract. The release
+denominator is every supported, scope-correct original non-temporal unit rather
+than the judge's `useful` label. Each V2 stage must retain and precisely reproduce
+at least 95% of at least 50 such units across at least 30 threads, and three
+same-configuration V2 runs must reach at least 95% all-run
+intersection-over-union stability. Exact duplicate outputs, critical errors,
+heterogeneous target configurations, incomplete provenance, and a false gate all
+fail structurally or exit nonzero. It reports only aggregate/opaque results and
+explicitly does not claim cryptographic proof of independent invocation. The
+actual private parity extraction and labeling run remains outstanding.
+
 ## Verification
 
 - Focused regression suites cover lossless batching, singleton fallback,
@@ -439,8 +550,10 @@ The selector output remains a non-routable evidence sidecar. A resolved occurren
 - The historical replay and fresh packet planner print aggregates only.
 - The planner, frontier, verdict validator, ensemble reducer, and evaluator are
   non-routable and make no external calls by themselves.
-- The final complete repository run passed all 1,531 tests; focused independent
-  review also passed 207 tests, Ruff, and diff checks.
+- The final complete repository run passed all 1,579 tests. The expanded
+  temporal integration suite passed 473 tests; the final parity/cohort suite
+  passed 43 tests under independent review. Ruff, formatting, compilation, and
+  diff checks also passed.
 
 ## What Remains Before A Release Claim
 
@@ -450,12 +563,15 @@ The selector output remains a non-routable evidence sidecar. A resolved occurren
    score one arm-blind proposal union; do not reinterpret model-judge support as
    human-gold accuracy.
 2. Measure original-Brain parity on the same sources. Reconcile source and thread
-   counts and require at least 95% retention of independently useful non-temporal
-   facts.
-3. Integrate verifier and uncertainty sidecars into Gmail ingestion with complete
-   page accounting, deterministic replay, idempotent persistence, and no duplicate
-   active event or temporal reference. The integration must consume split-semantic
-   cluster reviews explicitly, even though they authorize no candidate.
+   counts and require at least 95% retention and precision over every supported,
+   scope-correct original non-temporal unit at candidate, review, and persistence
+   stages. Do not condition the release denominator on a `useful` label.
+3. Add the authoritative post-ingest runner described above. It must reconstruct
+   trusted message evidence, recompute the analyzer/batcher/frontier/three-run
+   ensemble and projection, then use the implemented idempotent ledger without
+   exposing its prebuilt-projection sink to runtime callers. It must consume
+   split-semantic cluster reviews explicitly, even though they authorize no
+   candidate, and prevent duplicate active event or temporal references.
 4. Run a review-only canary with an easy rollback. Keep reminder and calendar
    automation disabled until the separate 99%-precision exact-only gate passes.
 

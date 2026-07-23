@@ -867,6 +867,153 @@ def _migration_024_event_time(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migration_025_gmail_temporal_review_persistence(
+    conn: sqlite3.Connection,
+) -> None:
+    """Persist only complete, non-routable Gmail temporal review projections.
+
+    Runs and artifacts are an append-only evidence ledger.  The mutable head is
+    deliberately separate so replay and rollback never rewrite verifier output.
+    """
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS gmail_temporal_review_runs (
+          id TEXT PRIMARY KEY,
+          input_key TEXT NOT NULL UNIQUE,
+          message_scope_key TEXT NOT NULL,
+          pipeline_scope TEXT NOT NULL,
+          document_id TEXT NOT NULL REFERENCES documents(id),
+          document_content_hash TEXT NOT NULL,
+          gmail_account_key TEXT NOT NULL,
+          gmail_thread_id TEXT NOT NULL,
+          gmail_source_revision TEXT NOT NULL,
+          gmail_message_id TEXT NOT NULL,
+          message_internal_at TEXT NOT NULL,
+          message_start_offset INTEGER NOT NULL,
+          message_end_offset INTEGER NOT NULL,
+          source_sha256 TEXT NOT NULL,
+          source_locator_hash TEXT NOT NULL,
+          source_locator_json TEXT NOT NULL,
+          projection_version TEXT NOT NULL,
+          analysis_fingerprint TEXT NOT NULL,
+          batch_plan_fingerprint TEXT NOT NULL,
+          ensemble_policy_fingerprint TEXT NOT NULL,
+          grouping_policy_fingerprint TEXT NOT NULL,
+          projection_fingerprint TEXT NOT NULL,
+          projection_sha256 TEXT NOT NULL,
+          artifact_set_sha256 TEXT NOT NULL,
+          projection_json TEXT NOT NULL,
+          complete INTEGER NOT NULL CHECK(complete = 1),
+          routable INTEGER NOT NULL CHECK(routable = 0),
+          created_at TEXT NOT NULL,
+          CHECK(message_start_offset >= 0),
+          CHECK(message_end_offset > message_start_offset),
+          UNIQUE(id, message_scope_key, pipeline_scope),
+          UNIQUE(message_scope_key, pipeline_scope, input_key)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_gmail_temporal_review_runs_scope
+        ON gmail_temporal_review_runs(message_scope_key, pipeline_scope, created_at)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_gmail_temporal_review_runs_document
+        ON gmail_temporal_review_runs(document_id, document_content_hash)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS gmail_temporal_review_artifacts (
+          id TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL REFERENCES gmail_temporal_review_runs(id),
+          artifact_kind TEXT NOT NULL CHECK(
+            artifact_kind IN (
+              'supported_citation', 'uncertainty_sidecar', 'cluster_review'
+            )
+          ),
+          source_artifact_key TEXT NOT NULL,
+          candidate_authorization INTEGER NOT NULL CHECK(
+            candidate_authorization IN (0, 1)
+          ),
+          payload_sha256 TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          routable INTEGER NOT NULL CHECK(routable = 0),
+          created_at TEXT NOT NULL,
+          UNIQUE(run_id, artifact_kind, source_artifact_key)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_gmail_temporal_review_artifacts_run
+        ON gmail_temporal_review_artifacts(run_id, artifact_kind)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS gmail_temporal_review_heads (
+          message_scope_key TEXT NOT NULL,
+          pipeline_scope TEXT NOT NULL,
+          run_id TEXT,
+          generation INTEGER NOT NULL CHECK(generation >= 1),
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY(message_scope_key, pipeline_scope),
+          FOREIGN KEY(run_id, message_scope_key, pipeline_scope)
+            REFERENCES gmail_temporal_review_runs(
+              id, message_scope_key, pipeline_scope
+            )
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_gmail_temporal_review_heads_run
+        ON gmail_temporal_review_heads(run_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_gmail_temporal_review_runs_no_update
+        BEFORE UPDATE ON gmail_temporal_review_runs
+        BEGIN
+          SELECT RAISE(ABORT, 'gmail temporal review runs are immutable');
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_gmail_temporal_review_runs_no_delete
+        BEFORE DELETE ON gmail_temporal_review_runs
+        BEGIN
+          SELECT RAISE(ABORT, 'gmail temporal review runs are immutable');
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_gmail_temporal_review_artifacts_no_update
+        BEFORE UPDATE ON gmail_temporal_review_artifacts
+        BEGIN
+          SELECT RAISE(ABORT, 'gmail temporal review artifacts are immutable');
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_gmail_temporal_review_artifacts_no_delete
+        BEFORE DELETE ON gmail_temporal_review_artifacts
+        BEGIN
+          SELECT RAISE(ABORT, 'gmail temporal review artifacts are immutable');
+        END
+        """
+    )
+
+
 MIGRATIONS: list[Migration] = [
     (1, "add_origin_identity", _migration_001_add_origin_identity),
     (2, "create_sync_runs", _migration_002_create_sync_runs),
@@ -896,6 +1043,11 @@ MIGRATIONS: list[Migration] = [
     (22, "temporal_facts", _migration_022_temporal_facts),
     (23, "fact_revisions", _migration_023_fact_revisions),
     (24, "event_time", _migration_024_event_time),
+    (
+        25,
+        "gmail_temporal_review_persistence",
+        _migration_025_gmail_temporal_review_persistence,
+    ),
 ]
 
 

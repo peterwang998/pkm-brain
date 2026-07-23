@@ -47,7 +47,7 @@ def test_frontier_audit_reports_content_free_current_coverage(tmp_path: Path) ->
 
     result = audit_module.audit_gmail_temporal_frontier(cohort)
 
-    assert result["version"] == "gmail_temporal_frontier_audit_v1"
+    assert result["version"] == "gmail_temporal_frontier_audit_v2"
     assert result["private_content_printed"] is False
     assert result["external_calls"] == 0
     assert result["private_file_mode"] == "0o600"
@@ -58,6 +58,9 @@ def test_frontier_audit_reports_content_free_current_coverage(tmp_path: Path) ->
     assert result["counts"]["frontier_candidates"] > 0
     assert result["admitted_frontier_gaps"] == []
     assert result["stratum_coverage"]["important_high_confidence"] == {
+        "empty_frontier_batches": 0,
+        "incomplete_frontier_batches": 0,
+        "omitted_candidate_mentions": 0,
         "records": 1,
         "with_candidates": 1,
         "with_expressions": 1,
