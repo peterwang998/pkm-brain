@@ -174,17 +174,26 @@ def _run_output(
         "version": parity.RUN_VERSION,
         "run_id": run_id,
         "arm": resolved_arm,
-        "commit": "a" * 40 if resolved_arm == "original" else "b" * 40,
+        "commit": (
+            parity.EXPECTED_ORIGINAL_COMMIT
+            if resolved_arm == "original"
+            else "b" * 40
+        ),
         "prompt_version": (
-            "original-fact-v1"
+            parity.EXPECTED_ORIGINAL_PROMPT_VERSION
             if resolved_arm == "original"
             else parity.EXPECTED_V2_PROMPT_VERSION
         ),
-        "model": model or parity.EXPECTED_V2_MODEL,
+        "model": model
+        or (
+            parity.EXPECTED_ORIGINAL_MODEL
+            if resolved_arm == "original"
+            else parity.EXPECTED_V2_MODEL
+        ),
         "reasoning_effort": (
             reasoning_effort
             or (
-                "medium"
+                parity.EXPECTED_ORIGINAL_REASONING_EFFORT
                 if resolved_arm == "original"
                 else parity.EXPECTED_V2_REASONING_EFFORT
             )
@@ -515,7 +524,7 @@ def test_complete_prepared_bundle_scores_three_runs_without_private_output(
         "arm": "original",
         "provider": "external-codex",
         "model": "gpt-5.6-luna",
-        "reasoning_effort": "medium",
+        "reasoning_effort": "low",
         "attestation": parity.INVOCATION_ATTESTATION,
     }
     serialized = json.dumps(result, sort_keys=True)
@@ -862,6 +871,33 @@ def test_external_provider_and_sol_medium_judge_are_enforced(tmp_path: Path) -> 
 @pytest.mark.parametrize(
     ("field", "replacement"),
     [
+        ("commit", "0" * 40),
+        ("prompt_version", "extractor-evidence-units-v5"),
+        ("model", "gpt-5.6-sol"),
+        ("reasoning_effort", "medium"),
+    ],
+)
+def test_original_arm_must_match_the_pinned_installed_baseline(
+    tmp_path: Path,
+    field: str,
+    replacement: str,
+) -> None:
+    files = _fixture(tmp_path)
+    path = files["outputs"]["original"]
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    rows[0][field] = replacement
+    _private_write(path, parity.gmail_fact_parity_jsonl_bytes(rows))
+
+    with pytest.raises(
+        parity.GmailFactParityError,
+        match="original target config is not the pinned installed baseline",
+    ):
+        _evaluate(files)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
         ("work_queue_sha256", "0" * 64),
         ("completed_units_sha256", "1" * 64),
         ("cohort_sha256", "2" * 64),
@@ -1183,9 +1219,13 @@ def test_stage_boundary_loss_fails_only_the_affected_stage_gate(
     assert run["stages"]["candidate"]["retention"] == 1.0
     assert run["stages"]["review"]["retention"] == 1.0
     assert run["stages"]["persisted"]["retention"] == 0.94
+    assert run["stages"]["persisted"]["thread_retention"] == 0.94
+    assert run["stages"]["persisted"]["macro_thread_retention"] == 0.94
     assert run["gates"]["candidate_retention"] is True
     assert run["gates"]["review_retention"] is True
     assert run["gates"]["persisted_retention"] is False
+    assert run["gates"]["persisted_thread_retention"] is False
+    assert run["gates"]["persisted_macro_thread_retention"] is False
     assert result["gate_passed"] is False
 
 
@@ -1281,7 +1321,7 @@ def test_cli_exits_nonzero_after_printing_a_failed_gate(
     assert json.loads(capsys.readouterr().out)["gate_passed"] is False
 
 
-def test_public_result_redacts_arbitrary_original_metadata_and_run_ids(
+def test_public_result_redacts_arbitrary_run_ids_and_reports_pinned_baseline(
     tmp_path: Path,
 ) -> None:
     run_ids = (
@@ -1290,15 +1330,11 @@ def test_public_result_redacts_arbitrary_original_metadata_and_run_ids(
         "PRIVATE_V2_RUN_BRAVO",
         "PRIVATE_V2_RUN_CHARLIE",
     )
-    original_model = "PRIVATE_ORIGINAL_MODEL_SENTINEL"
-    original_effort = "PRIVATE_ORIGINAL_EFFORT_SENTINEL"
     files = _fixture(
         tmp_path,
         unit_count=20,
         run_ids=run_ids,
         original_run_id=run_ids[0],
-        original_model=original_model,
-        original_reasoning_effort=original_effort,
     )
 
     result = _evaluate(files)
@@ -1306,10 +1342,8 @@ def test_public_result_redacts_arbitrary_original_metadata_and_run_ids(
     original_alias = files["aliases"][run_ids[0]]
 
     assert all(run_id not in serialized for run_id in run_ids)
-    assert original_model not in serialized
-    assert original_effort not in serialized
-    assert result["evidence_execution"][original_alias]["model"] == "other"
-    assert result["evidence_execution"][original_alias]["reasoning_effort"] == "other"
+    assert result["evidence_execution"][original_alias]["model"] == "gpt-5.6-luna"
+    assert result["evidence_execution"][original_alias]["reasoning_effort"] == "low"
 
 
 def test_run_artifact_argument_parser_rejects_ambiguity() -> None:

@@ -1039,7 +1039,16 @@ def test_candidate_gold_rejects_uncertain_default_negative_even_when_precision_p
         for member in unit.members
         for candidate_id in candidate_evaluator._member_matches(member)
     }
-    default_negative = next(iter(set(candidates) - positive_ids))
+    material_sample_ids = {
+        str(sample["sample_id"])
+        for sample in candidate_evaluator._load_jsonl(sample_path)
+        if sample["gold"]["expected_material"] is True
+    }
+    default_negative = next(
+        candidate_id
+        for candidate_id in set(candidates) - positive_ids
+        if candidates[candidate_id].sample_id in material_sample_ids
+    )
     verdicts[default_negative] = "uncertain"
     _write_candidate_evidence(
         sample_path=sample_path,

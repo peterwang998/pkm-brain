@@ -41,6 +41,10 @@ INVOCATION_ATTESTATION = "self_reported_not_cryptographically_verified"
 EXPECTED_PROVIDER = "external-codex"
 EXPECTED_JUDGE_MODEL = "gpt-5.6-sol"
 EXPECTED_JUDGE_REASONING_EFFORT = "medium"
+EXPECTED_ORIGINAL_COMMIT = "d5405b9cf7a81775dfc84200892c206687756f3c"
+EXPECTED_ORIGINAL_PROMPT_VERSION = "extractor-evidence-units-v6-speaker-context"
+EXPECTED_ORIGINAL_MODEL = "gpt-5.6-luna"
+EXPECTED_ORIGINAL_REASONING_EFFORT = "low"
 EXPECTED_V2_PROMPT_VERSION = "extractor-evidence-units-v15-gmail-event-time"
 EXPECTED_V2_MODEL = "gpt-5.6-luna"
 EXPECTED_V2_REASONING_EFFORT = "low"
@@ -1019,6 +1023,22 @@ def load_gmail_fact_parity_runs(
         raise GmailFactParityError("exactly one original run is required")
     if len(v2_ids) < MIN_V2_RUNS:
         raise GmailFactParityError(f"at least {MIN_V2_RUNS} V2 runs are required")
+    original_id = originals[0]
+    original_target_config = {
+        "commit": runs[original_id]["commit"],
+        "prompt_version": runs[original_id]["prompt_version"],
+        "model": runs[original_id]["model"],
+        "reasoning_effort": runs[original_id]["reasoning_effort"],
+    }
+    if original_target_config != {
+        "commit": EXPECTED_ORIGINAL_COMMIT,
+        "prompt_version": EXPECTED_ORIGINAL_PROMPT_VERSION,
+        "model": EXPECTED_ORIGINAL_MODEL,
+        "reasoning_effort": EXPECTED_ORIGINAL_REASONING_EFFORT,
+    }:
+        raise GmailFactParityError(
+            "original target config is not the pinned installed baseline"
+        )
     v2_target_config = {
         "commit": runs[v2_ids[0]]["commit"],
         "prompt_version": runs[v2_ids[0]]["prompt_version"],
@@ -1073,13 +1093,14 @@ def load_gmail_fact_parity_runs(
     return {
         "runs": runs,
         "receipts": receipts,
-        "original_run_id": originals[0],
+        "original_run_id": original_id,
         "v2_run_ids": v2_ids,
         "all_run_ids": [originals[0], *v2_ids],
         "run_aliases": aliases,
         "alias_run_ids": {alias: run_id for run_id, alias in aliases.items()},
         "all_run_aliases": [aliases[originals[0]], *(aliases[item] for item in v2_ids)],
-        "original_run_alias": aliases[originals[0]],
+        "original_run_alias": aliases[original_id],
+        "original_target_config": original_target_config,
         "v2_run_aliases": [aliases[item] for item in v2_ids],
         "v2_target_config": v2_target_config,
         "independent_invocations_verified": False,
@@ -1783,6 +1804,18 @@ def evaluate_gmail_fact_parity(
                 )
                 for row in labels
             )
+            stage_by_thread: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for row in reference_denominators[stage]:
+                stage_by_thread[row["thread_id"]].append(row)
+            stage_thread_recalls = [
+                sum(
+                    _has_good_evidence(row, row["v2"][run_alias], stage)
+                    for row in rows
+                )
+                / len(rows)
+                for rows in stage_by_thread.values()
+            ]
+            retained_threads = sum(value > 0 for value in stage_thread_recalls)
             stage_results[stage] = {
                 "original_non_temporal_units": len(reference_denominators[stage]),
                 "original_non_temporal_threads": reference_thread_counts[stage],
@@ -1790,6 +1823,15 @@ def evaluate_gmail_fact_parity(
                 "raw_present_units": raw_retained,
                 "retained_units": retained,
                 "retention": _ratio(retained, len(reference_denominators[stage])),
+                "retained_threads": retained_threads,
+                "thread_retention": _ratio(
+                    retained_threads, len(stage_thread_recalls)
+                ),
+                "macro_thread_retention": (
+                    sum(stage_thread_recalls) / len(stage_thread_recalls)
+                    if stage_thread_recalls
+                    else None
+                ),
                 "useful_retained_units": useful_retained,
                 "useful_retention_diagnostic": _ratio(
                     useful_retained, len(useful_denominators[stage])
@@ -1818,18 +1860,8 @@ def evaluate_gmail_fact_parity(
             )
             for row in labels
         )
-        by_thread: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for row in reference_denominators["candidate"]:
-            by_thread[row["thread_id"]].append(row)
-        thread_recalls = [
-            sum(
-                _has_good_evidence(row, row["v2"][run_alias], "candidate")
-                for row in rows
-            )
-            / len(rows)
-            for rows in by_thread.values()
-        ]
-        reference_thread_coverage = sum(value > 0 for value in thread_recalls)
+        candidate_stage = stage_results["candidate"]
+        reference_thread_coverage = candidate_stage["retained_threads"]
         structural_duplicates = run_evidence["runs"][run_id][
             "structural_exact_duplicate_members"
         ]
@@ -1843,14 +1875,12 @@ def evaluate_gmail_fact_parity(
                 "attestation": run_evidence["receipts"][run_id]["attestation"],
             },
             "stages": stage_results,
-            "reference_thread_count": len(thread_recalls),
+            "reference_thread_count": reference_thread_counts["candidate"],
             "reference_thread_coverage": reference_thread_coverage,
             "reference_thread_coverage_rate": _ratio(
-                reference_thread_coverage, len(thread_recalls)
+                reference_thread_coverage, reference_thread_counts["candidate"]
             ),
-            "macro_candidate_recall": (
-                sum(thread_recalls) / len(thread_recalls) if thread_recalls else None
-            ),
+            "macro_candidate_recall": candidate_stage["macro_thread_retention"],
             "critical_error_members": critical_members,
             "critical_error_units": critical_units,
             "structural_exact_duplicate_members": structural_duplicates,
@@ -1858,6 +1888,20 @@ def evaluate_gmail_fact_parity(
                 **{
                     f"{stage}_retention": value["retention"] is not None
                     and value["retention"] >= MIN_RETENTION
+                    for stage, value in stage_results.items()
+                },
+                **{
+                    f"{stage}_thread_retention": value["thread_retention"]
+                    is not None
+                    and value["thread_retention"] >= MIN_RETENTION
+                    for stage, value in stage_results.items()
+                },
+                **{
+                    f"{stage}_macro_thread_retention": value[
+                        "macro_thread_retention"
+                    ]
+                    is not None
+                    and value["macro_thread_retention"] >= MIN_RETENTION
                     for stage, value in stage_results.items()
                 },
                 **{

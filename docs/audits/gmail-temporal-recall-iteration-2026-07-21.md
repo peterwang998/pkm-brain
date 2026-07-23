@@ -54,25 +54,94 @@ an allowed alternative for the same member. Parent-cluster reviews created by
 split three-run semantics are triage signals only; they authorize no candidate
 and cannot improve primary recall.
 
-### Private-distribution gate
+### Private-distribution gate: two estimands
 
-A frozen, thread-grouped historical Gmail holdout of roughly 150 messages,
-with at least 50 genuinely useful temporal records, at least 60 required
-temporal members, and at least 40 hard negatives, must demonstrate at least
-95% effective member recall, at least 90% confirmed recall, at least 95%
-confirmed precision, at least 90% review-arm precision, no critical supported
-errors, and no more than 5% noise admitted to review. The same cohort must retain
-at least 95% of every supported, scope-correct original-Brain non-temporal fact
-unit at candidate, review, and persistence stages, with at least 50 units across
-30 threads and reconciled source/thread counts. On 40 frozen temporal-recall
-queries, top-five retrieval must reach at least 90% and top-ten at least 95%.
-A separate source-only usefulness slice may be reported as a
-diagnostic, but it cannot shrink the release denominator. Temporal cognition
-may add
-structure; it may not recreate the earlier
-522-sources-to-10-facts collapse. The existing 120-message development cohort can
-fill this role only after its labels are frozen independently of the current
-pipeline.
+One cohort cannot simultaneously estimate natural-mail noise and guarantee a
+large positive recall denominator. The release benchmark therefore has two
+mandatory, thread-disjoint cohorts whose scores are never pooled.
+
+The **natural 150-message primary cohort** estimates population operability. It
+must contain at least 40 source-labeled hard negatives and demonstrate at least
+95% supported-artifact precision, zero supported artifacts on source-labeled
+suppressed mail, no critical errors, and uncertainty review on no more than 5%
+of negative messages. It also reports preparation coverage, useful-message
+recall, review artifacts per 100 messages, and expected daily review burden.
+Useful-message recall is diagnostic on this cohort because the naturally
+occurring positive denominator may be sparse; it is never padded or silently
+replaced with selected positives. The sealed 75-message reserve may extend a
+precision denominator only in its authenticated order. Activating it is a
+regression diagnostic and requires a newly frozen 150/100/75 set before a later
+release claim.
+
+Passing this operability gate alone can authorize at most a new-thread
+review-only beta. A representative production claim continues the preregistered
+prospective stream in fixed order until it contains at least 20 naturally
+material messages, then requires at least 90% effective recall on that natural
+positive set. The continuation reports new-thread targets and message-unseen
+updates in existing threads separately; the latter is mandatory because
+replies, cancellations, and reschedules are central Gmail behavior. Total
+abstention therefore cannot pass the production recall gate.
+
+The **balanced 100-message challenge cohort** estimates conditional temporal
+capability, reported explicitly as *stress recall*, not population recall. It
+must contain at least 30 useful records, 60 semantic members, 30 supported
+members, and 20 source-labeled hard negatives. It must reach at least 95%
+effective member recall, 90% confirmed recall, 90% complete-unit recall, 90%
+exact-unit recall, 95% supported-artifact precision, and 90% review-artifact
+precision, with zero critical errors. Reschedule, cancellation, completion,
+ambiguous-time, candidate-free temporal forms, admitted-zero, and preparation
+failure cases remain in their applicable denominators. Lifecycle coverage is a
+required reported check. A failed or underpowered challenge gate cannot be
+hidden by a strong natural score.
+
+Source-only Sol-medium labels must be created without access to predictions and
+then owner-calibrated through two separate sealed audits: a fixed HMAC-selected
+25% of each cohort plus every error from that cohort. Model labels are called
+source labels, not human gold. Owner corrections and audit dispositions are
+authenticated and the two audit populations remain separate.
+
+Within the single retained owner authority root, the first materialized freeze
+is irrevocable: changing the HMAC key or seed and redrawing after inspecting
+membership, proxy strata, labels, or predictions is forbidden. Every attempt
+in that retained root is retained and disclosed. This is an owner-process
+guarantee, not proof that no alternate authority root exists; downstream
+artifacts carry that exact scope and do not claim independent re-verification.
+Source-only labels are sealed before any verifier output is opened. The sealed natural reserve may be
+activated in authenticated order only as a regression diagnostic; any later
+release claim requires a newly frozen 150/100/75 set. An underpowered challenge
+requires a disclosed, versioned redesign rather than a silent reroll.
+
+Original-Brain preservation is measured on a separately frozen, identical-packet
+parity cohort because the natural temporal cohort is not guaranteed to contain
+enough admitted non-temporal facts. That parity cohort must retain at least 95%
+of every supported, scope-correct original-Brain non-temporal fact unit at
+candidate, review, and persistence stages, with at least 50 units across 30
+threads and reconciled source/thread counts. Its scores are not pooled with
+either temporal cohort. On 40 frozen temporal-recall queries, top-five retrieval
+must reach at least 90% and top-ten at least 95%. This primary retrieval gate is
+global and cold: the retriever receives only query ID, query text, and the as-of
+clock. Temporal query kind, lifecycle class, context source IDs, thread scope,
+and relevance gold stay sealed for validation and scoring. Any contextual
+follow-up queries belong to a separate diagnostic cohort whose metrics are
+never pooled with the 40-query primary denominator. A retrospective retrieval
+run without authenticated index authority is preview evidence only; a
+promotion rollup needs a separately trusted prospective retrieval authority.
+
+Temporal cognition may add structure; it may not recreate the earlier
+522-sources-to-10-facts collapse. Historical imports can populate a
+retrospective label-blind preview but cannot become unseen release evidence:
+the old 120-message cohort bindings are unrecoverable, and later random variants
+were inspected during development. A prospective release freeze therefore uses
+baseline-excluded future threads for the natural primary and reserve. Its
+balanced challenge may intentionally use historically exposed cases to preserve
+rare temporal strata, but its exact overlap and evidence scope must be stated;
+it cannot inherit the primary cohort's prospective-unseen claim.
+
+These thresholds are practical personal-use point estimates, not narrow
+population-confidence guarantees. The final promotion report must include raw
+numerators, denominators, and Wilson 95% intervals for every rate. The sealed
+reserve and live monitoring catch regressions; the sample sizes are not evidence
+for silent automation.
 
 ### Operational gate
 
@@ -91,10 +160,53 @@ failure visible as quarantine rather than silent omission. Provider change to
 the local mirror should be p95 within 15 minutes and end-to-end review p95 within
 30 minutes. Historical backfill may average at most two verifier pages per
 incoming message and use a candidate-bearing p95 ceiling of 24 pages. The
-steady-state canary must run for at least 72 hours or 200 messages, whichever is
-longer, and should target p95 at most 12 because routine daily mail should not
-resemble dense historical digests. No backlog may remain older
+steady-state canary must run for at least seven days and 300 messages, include
+at least 20 naturally material temporal cases plus message-unseen updates to
+existing threads, and should target p95 at most 12 because routine daily mail
+should not resemble dense historical digests. No backlog may remain older
 than 24 hours, and user-visible review noise is capped at ten items per day.
+
+### Locked retrospective development freeze — 2026-07-23
+
+The current builder bytes produced one authenticated local-only `150/100/75`
+freeze at
+`/private/tmp/gmail-temporal-holdout-v4-20260723-retrospective-v15`. Its root
+manifest SHA-256 is
+`5acc5cc02414646adc417513c65fbc6596e11d66f81e24521704b4ee156f8fb0`;
+the bound builder SHA-256 is
+`c2703850963409f33c69f5dd9ce0ca7d5479b5e6fde61fecac7e1281489700a7`.
+The natural 150 contains 28 candidate-bearing messages, 314 candidates, 125
+verifier pages, and 86 deterministic hard-negative proxies. The balanced 100
+contains 55 candidate-bearing messages, 253 candidates, 179 pages, 47
+lifecycle-source messages, 30 hard-negative proxies, 25 fact-lane cases, 30
+temporal-rescue cases, 25 temporal forms without candidates, and ten weak
+advertising candidates. Page maxima are 20 and 22 respectively. The sealed
+reserve contains 75 messages.
+
+This proves bounded, authenticated preparation only. It made zero external
+model or persistence calls and printed no private content. It is historical,
+the preceding freeze variants were inspected while the harness was developed,
+and future tuning against its labels will make it development data. It can
+therefore drive recall iteration but cannot support a representative or
+prospective release claim. The final release requires a new unseen freeze.
+
+The v15 bundle also predates the canonical freeze-attempt authority ledger.
+Current readers may open that exact authenticated artifact only as legacy,
+retrospective, non-release evidence; they explicitly downgrade its signed
+no-reroll booleans to unverified. That guarantee cannot be added
+retrospectively. The first release-capable replacement must be built with the
+v5 builder using one retained owner-only authority root, a stable authority
+HMAC key distinct from the holdout key, and a stable milestone/evidence-class
+identity so the attempt is durably recorded before cohort selection or
+publication and cannot be rerolled through another output path or key within
+that retained root. A caller could create another root, so this is deliberately
+not described as a global or independently verified no-reroll guarantee.
+
+The temporal natural cohort also contains only four original fact-admitted
+messages, so it cannot establish original-Brain parity. A separate,
+thread-disjoint identical-packet preflight froze 150 fact-rich threads and 254
+messages after excluding all 325 temporal-holdout threads; see
+[Gmail Fact-Parity Preflight — 2026-07-23](gmail-fact-parity-preflight-2026-07-23.md).
 
 ## Outcome So Far
 
@@ -497,6 +609,31 @@ Incompatible subject families produce a conflicted group. This representation
 improves review-time temporal recall without pretending that message-local
 subject aliases are already durable event identity.
 
+### 9A. Cross-message event lifecycle projection
+
+`gmail_temporal_thread_lifecycle.py` now supplies the missing pure representation
+for a later message that cancels, completes, or reschedules an earlier event.
+It accepts one current immutable thread snapshot, current message-level review
+heads, and exact artifact/hypothesis assertions to a stable event identity. Only
+owner- or externally-verified assertions with one identical key may reconcile
+messages. Same-thread membership, matching dates, unverified assertions, and
+conflicting keys remain unresolved and cannot change event state.
+
+The projection retains every occurrence. A supported reschedule marks the old
+occurrence superseded and links it to the replacement; cancellation and
+completion become terminal review metadata without deleting history. Implicit
+schedule changes do not overwrite a current occurrence. Stale heads,
+cross-thread inputs, missing trusted chronology, and incompatible identity fail
+closed. Every view remains derived, deferred, and non-routable.
+
+This closes the representation gap, not the production integration gap.
+`gmail_temporal_event_identity.py` now supplies a bounded pure identity bridge:
+it compares only event-centered units, requires three complete external verdict
+sets, merges only unanimous cliques, preserves prior event keys as threads grow,
+and refuses a merge of two previously distinct events. There is still no live
+identity-verdict executor, scheduled verifier/runner, or ledger integration for
+the thread view, so the existing-thread canary remains blocked.
+
 ### 10. Review-only persistence boundary
 
 Migration 25 adds an append-only ledger in the main Brain database for complete
@@ -641,7 +778,7 @@ or message text, and makes zero model or persistence calls.
 - The historical replay and fresh packet planner print aggregates only.
 - The planner, frontier, verdict validator, ensemble reducer, and evaluator are
   non-routable and make no external calls by themselves.
-- The final complete repository run passed all 1,625 tests, including the 20
+- The final complete repository run passed all 1,807 tests, including the 20
   connector tests that require a temporary localhost OAuth callback. The focused
   current Gmail policy/runner/batching/frontier/persistence/migration suite
   passed 353 tests, including the aggregate audit's privacy tests.
@@ -649,11 +786,12 @@ or message text, and makes zero model or persistence calls.
 
 ## What Remains Before A Release Claim
 
-1. Freeze human labels for the thread-grouped private Gmail holdout independently
-   of this pipeline. With explicit informed approval, run the pinned verifier and
-   report the private-distribution metrics above. Preserve raw page verdicts and
-   score one arm-blind proposal union; do not reinterpret model-judge support as
-   human-gold accuracy.
+1. With explicit informed approval, create prediction-blind source-only
+   Sol-medium labels for both frozen Gmail cohorts, run three separately invoked
+   Luna-medium verifier passes, and report the two non-pooled estimands above.
+   Preserve raw page verdicts, bind invocation receipts, and complete the sealed
+   owner audit over 25% plus every error in each cohort. Do not reinterpret
+   model-label agreement as human-gold accuracy.
 2. Measure original-Brain parity on the same sources. Reconcile source and thread
    counts and require at least 95% retention and precision over every supported,
    scope-correct original non-temporal unit at candidate, review, and persistence

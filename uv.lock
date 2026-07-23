@@ -1049,6 +1049,8 @@ embeddings = [
 dev = [
     { name = "pytest" },
     { name = "ruff" },
+    { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
 
 [package.metadata]
@@ -1067,6 +1069,7 @@ provides-extras = ["embeddings"]
 dev = [
     { name = "pytest", specifier = ">=9.0.3" },
     { name = "ruff", specifier = ">=0.15.12" },
+    { name = "scipy", specifier = ">=1.15.0" },
 ]
 
 [[package]]

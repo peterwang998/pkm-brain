@@ -43,6 +43,7 @@ MIN_SUPPORTED_REQUIRED_MEMBER_RECALL = 0.90
 MIN_STRICT_SUPPORTED_PRECISION = 0.95
 MIN_RECALL_ARM_PRECISION = 0.90
 MAX_SUPPORTED_TO_UNCERTAIN_RATE = 0.20
+MAX_ACCEPTED_NEGATIVE_REVIEW_RATE = 0.05
 RUN_MANIFEST_VERSION = "gmail_temporal_candidate_benchmark_run_v1"
 EXPECTED_CHECKPOINT_VERSION = "gmail_temporal_frontier_luna_checkpoint_v7"
 EXPECTED_MODEL = "gpt-5.6-luna"
@@ -1225,6 +1226,18 @@ def evaluate(
     units = _compile_gold(samples, candidates)
     if not units:
         raise CandidateGoldError("benchmark contains no semantic units")
+    expected_material_by_sample: dict[str, bool] = {}
+    hard_negative_by_sample: dict[str, bool] = {}
+    for sample in samples:
+        sample_id = str(sample["sample_id"])
+        expected_material = sample["gold"].get("expected_material")
+        hard_negative = sample["gold"].get("hard_negative", False)
+        if not isinstance(expected_material, bool):
+            raise CandidateGoldError("record materiality gold is malformed")
+        if not isinstance(hard_negative, bool) or (expected_material and hard_negative):
+            raise CandidateGoldError("record hard-negative gold is malformed")
+        expected_material_by_sample[sample_id] = expected_material
+        hard_negative_by_sample[sample_id] = hard_negative
     if prevalidated_verdict_maps is None:
         if manifest is None:
             raise CandidateGoldError("single-run manifest is unavailable")
@@ -1297,6 +1310,31 @@ def evaluate(
         supported_artifacts,
         units,
         candidates,
+    )
+    negative_artifact_ids = {
+        artifact.artifact_id
+        for artifact in artifacts
+        if artifact.candidate_ids
+        and not expected_material_by_sample[
+            candidates[artifact.candidate_ids[0]].sample_id
+        ]
+    }
+    material_invalid_artifact_ids = set(artifact_scores["invalid_artifact_ids"]) - (
+        negative_artifact_ids
+    )
+    sidecar_artifact_ids = {
+        artifact.artifact_id
+        for artifact in artifacts
+        if artifact.kind == "uncertainty_sidecar"
+    }
+    supported_artifact_ids = {
+        artifact.artifact_id
+        for artifact in artifacts
+        if artifact.kind == "supported_citation"
+    }
+    material_impure_sidecar_ids = material_invalid_artifact_ids & sidecar_artifact_ids
+    material_supported_overclaim_ids = (
+        material_invalid_artifact_ids & supported_artifact_ids
     )
 
     frontier_scores = _selection_scores(units, frontier_ids)
@@ -1437,11 +1475,18 @@ def evaluate(
     useful_records = 0
     recalled_useful_records = 0
     selected_noise_records = 0
+    negative_records = 0
+    hard_negative_records = 0
+    supported_hard_negative_records = 0
+    supported_hard_negative_artifacts = 0
+    supported_negative_records = 0
+    supported_negative_artifacts = 0
+    material_default_negative_supported = 0
+    material_default_negative_accepted = 0
     for sample in samples:
         sample_id = str(sample["sample_id"])
-        expected_material = sample["gold"].get("expected_material")
-        if not isinstance(expected_material, bool):
-            raise CandidateGoldError("record materiality gold is malformed")
+        expected_material = expected_material_by_sample[sample_id]
+        hard_negative = hard_negative_by_sample[sample_id]
         sample_candidate_ids = {
             candidate_id
             for candidate_id, runtime in candidates.items()
@@ -1456,7 +1501,32 @@ def evaluate(
                 )
             )
         else:
-            selected_noise_records += int(bool(sample_candidate_ids & accepted_ids))
+            negative_records += 1
+            accepted = bool(sample_candidate_ids & accepted_ids)
+            selected_noise_records += int(accepted)
+            supported_count = len(sample_candidate_ids & supported_ids)
+            supported_negative_artifacts += supported_count
+            supported_negative_records += int(supported_count > 0)
+            if hard_negative:
+                hard_negative_records += 1
+                supported_hard_negative_artifacts += supported_count
+                supported_hard_negative_records += int(supported_count > 0)
+
+    for candidate_id in supported_ids:
+        runtime = candidates[candidate_id]
+        if (
+            expected_material_by_sample[runtime.sample_id]
+            and candidate_id not in matches_by_candidate
+        ):
+            material_default_negative_supported += 1
+            material_default_negative_accepted += 1
+    for candidate_id in uncertain_ids:
+        runtime = candidates[candidate_id]
+        if (
+            expected_material_by_sample[runtime.sample_id]
+            and candidate_id not in matches_by_candidate
+        ):
+            material_default_negative_accepted += 1
 
     frontier_metrics = _recall_metrics(frontier_scores)
     supported_metrics = _recall_metrics(supported_scores)
@@ -1520,6 +1590,9 @@ def evaluate(
     )
     default_negative_count = len(candidates) - len(matches_by_candidate)
     useful_record_recall = _ratio(recalled_useful_records, useful_records)
+    accepted_negative_review_rate = (
+        selected_noise_records / negative_records if negative_records else 0.0
+    )
     gates = {
         "end_to_end_any_recall": review_metrics["any_unit_recall"]
         >= MIN_END_TO_END_ANY_RECALL,
@@ -1545,18 +1618,25 @@ def evaluate(
         >= MIN_END_TO_END_REQUIRED_MEMBER_RECALL,
         "effective_artifact_precision": effective_artifact_precision
         >= MIN_RECALL_ARM_PRECISION,
-        "uncertainty_hypothesis_purity": int(artifact_scores["impure_sidecar_count"])
-        == 0,
-        "no_selected_noise": selected_noise_records == 0,
+        "uncertainty_hypothesis_purity": not material_impure_sidecar_ids,
+        "accepted_negative_review_rate": accepted_negative_review_rate
+        <= MAX_ACCEPTED_NEGATIVE_REVIEW_RATE,
+        "no_supported_hard_negative_artifacts": (
+            supported_hard_negative_artifacts == 0
+        ),
+        "no_supported_negative_artifacts": supported_negative_artifacts == 0,
         "no_redundant_artifacts": not artifact_scores["redundant_artifact_ids"],
         # Compatibility key: aliases inside one sidecar hypothesis are no
         # longer duplicates, but a second production artifact for one member is.
         "no_duplicate_aliases": not artifact_scores["redundant_artifact_ids"],
-        "no_supported_overclaims": supported_overclaim_count == 0,
+        "no_supported_overclaims": (
+            not material_supported_overclaim_ids
+            and supported_negative_artifacts == 0
+        ),
         "no_critical_calibration_errors": not critical_calibration_error_candidates,
         "no_default_negative_supported": default_negative_supported == 0,
         # Compatibility key, now evaluated at artifact/hypothesis granularity.
-        "no_default_negative_accepted": not artifact_scores["invalid_artifact_ids"],
+        "no_default_negative_accepted": material_default_negative_accepted == 0,
         "frontier_ratchet": (
             unit_ratchet_regressions == 0 and not member_ratchet_regressions
         ),
@@ -1583,6 +1663,7 @@ def evaluate(
         "uncertainty_hypotheses": int(artifact_scores["hypothesis_count"]),
         "pure_uncertainty_sidecars": int(artifact_scores["pure_sidecar_count"]),
         "impure_uncertainty_sidecars": int(artifact_scores["impure_sidecar_count"]),
+        "material_impure_uncertainty_sidecars": len(material_impure_sidecar_ids),
         "unmatched_uncertainty_hypotheses": int(
             artifact_scores["unmatched_hypothesis_count"]
         ),
@@ -1595,6 +1676,7 @@ def evaluate(
         "matched_artifacts": matched_effective_artifacts,
         "redundant_artifacts": len(artifact_scores["redundant_artifact_ids"]),
         "unmatched_artifacts": len(artifact_scores["invalid_artifact_ids"]),
+        "material_unmatched_artifacts": len(material_invalid_artifact_ids),
         "supported_redundant_artifacts": len(
             supported_artifact_scores["redundant_artifact_ids"]
         ),
@@ -1642,6 +1724,7 @@ def evaluate(
         "effective_member_recall": effective_member_recall,
         "uncertain_truth_precision": uncertain_truth_precision,
         "supported_overclaim_count": supported_overclaim_count,
+        "material_supported_overclaim_count": len(material_supported_overclaim_ids),
         "raw_supported_overclaim_count": raw_supported_overclaim_count,
         "critical_calibration_error_count": len(critical_calibration_error_candidates),
         "critical_calibration_error_candidates": (
@@ -1663,7 +1746,18 @@ def evaluate(
         "default_negative_candidates": default_negative_count,
         "default_negative_supported": default_negative_supported,
         "default_negative_accepted": default_negative_accepted,
+        "material_default_negative_supported": (material_default_negative_supported),
+        "material_default_negative_accepted": material_default_negative_accepted,
+        "negative_records": negative_records,
         "selected_noise_records": selected_noise_records,
+        "accepted_negative_review_records": selected_noise_records,
+        "accepted_negative_review_rate": accepted_negative_review_rate,
+        "maximum_accepted_negative_review_rate": (MAX_ACCEPTED_NEGATIVE_REVIEW_RATE),
+        "hard_negative_records": hard_negative_records,
+        "supported_hard_negative_records": supported_hard_negative_records,
+        "supported_hard_negative_artifacts": supported_hard_negative_artifacts,
+        "supported_negative_records": supported_negative_records,
+        "supported_negative_artifacts": supported_negative_artifacts,
         "frontier_ratchet_regressions": (
             unit_ratchet_regressions + len(member_ratchet_regressions)
         ),
