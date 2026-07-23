@@ -136,6 +136,26 @@ def _regular_file(path: Path, *, private: bool = False) -> None:
         raise GmailFactParityRunnerError("private input must have mode 0600")
 
 
+def _declared_executable(value: Any) -> tuple[Path, Path]:
+    """Keep a venv launcher path while validating its final executable target."""
+
+    raw = str(value or "").strip()
+    if not raw:
+        raise GmailFactParityRunnerError("adapter Python executable is invalid")
+    expanded = Path(raw).expanduser()
+    declared = Path(os.path.abspath(expanded))
+    try:
+        target = declared.resolve(strict=True)
+    except OSError as exc:
+        raise GmailFactParityRunnerError(
+            "adapter Python executable is invalid"
+        ) from exc
+    _regular_file(target)
+    if not os.access(declared, os.X_OK) or not os.access(target, os.X_OK):
+        raise GmailFactParityRunnerError("adapter Python executable is invalid")
+    return declared, target
+
+
 def _read_regular_bytes(path: Path, *, private: bool = False) -> bytes:
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
@@ -356,9 +376,8 @@ def load_adapter_manifest(
     if (model, effort) != (expected_model, expected_effort):
         raise GmailFactParityRunnerError("adapter model configuration is not pinned")
 
-    python = Path(str(value.get("python_executable") or "")).expanduser().resolve()
+    python, python_target = _declared_executable(value.get("python_executable"))
     adapter = Path(str(value.get("adapter_path") or "")).expanduser().resolve()
-    _regular_file(python)
     _regular_file(adapter)
     if kind == "production" and adapter != CANONICAL_PRODUCTION_ADAPTER:
         raise GmailFactParityRunnerError(
@@ -382,10 +401,13 @@ def load_adapter_manifest(
         )
 
     runner_path = Path(__file__).resolve()
+    python_target_sha256 = sha256_bytes(_read_regular_bytes(python_target))
     return {
         **dict(value),
         "production_root": root,
         "python_executable": python,
+        "python_executable_target": python_target,
+        "python_executable_target_sha256": python_target_sha256,
         "adapter_path": adapter,
         "production_tree_sha256": production_tree_sha256(root),
         "prompt_sha256": _combined_file_sha256(prompt_paths, root=root),
@@ -395,10 +417,33 @@ def load_adapter_manifest(
                 {
                     "runner": sha256_bytes(_read_regular_bytes(runner_path)),
                     "adapter": sha256_bytes(_read_regular_bytes(adapter)),
+                    "python_executable": str(python),
+                    "python_executable_target": str(python_target),
+                    "python_executable_target_sha256": python_target_sha256,
                 }
             )
         ),
     }
+
+
+def _verify_manifest_executable(manifest: Mapping[str, Any]) -> None:
+    declared = Path(manifest["python_executable"])
+    expected_target = Path(manifest["python_executable_target"])
+    try:
+        current_target = declared.resolve(strict=True)
+    except OSError as exc:
+        raise GmailFactParityRunnerError(
+            "adapter Python executable changed after manifest validation"
+        ) from exc
+    if (
+        current_target != expected_target
+        or not os.access(declared, os.X_OK)
+        or sha256_bytes(_read_regular_bytes(current_target))
+        != manifest["python_executable_target_sha256"]
+    ):
+        raise GmailFactParityRunnerError(
+            "adapter Python executable changed after manifest validation"
+        )
 
 
 def _write_private_new(path: Path, payload: bytes) -> None:
@@ -439,6 +484,7 @@ def _adapter_response(
     scratch: Path,
     timeout_seconds: int,
 ) -> dict[str, Any]:
+    _verify_manifest_executable(manifest)
     token = secrets.token_hex(8)
     request_path = scratch / f"request-{token}.json"
     response_path = scratch / f"response-{token}.json"

@@ -751,6 +751,145 @@ claim about semantic precision or recall on private Gmail, retrieval quality,
 original-Brain parity, or production readiness. It performs no private-data,
 external-model, network, retrieval, or persistence evaluation.
 
+### 9C. Date-free thread lifecycle contrast
+
+The message-local temporal path has a separate, material recall hole: replies
+such as “the interview was cancelled” or “it was completed” can update an
+already-known event without containing a new date. Making up a temporal
+expression for such a reply would conflate event identity with time and would
+reintroduce the instability this architecture is intended to remove.
+
+The checked-in contextual-lifecycle experiment instead derives a review-only
+event observation from the current message and a complete, externally verified
+same-thread prior-event snapshot. It cannot create an event or occurrence. The
+full eligible anchor snapshot—including event key, source message and clock,
+aliases, status, and verification basis—is bound into both the plan and every
+observation. An exact body-local alias can produce a supported review
+observation. Subject-only pronouns, endpoint-free reschedules, and duplicate or
+recurring aliases remain uncertain and never select an event identity. Modal,
+conditional, negated, denied, reported or refuted, interrogative, quoted, and
+stale-subject contexts fail closed. An unrelated date elsewhere in the message
+does not suppress recovery; the standard path takes precedence only when its
+frontier contains a cue-local candidate for the same lifecycle mention.
+
+The hardened public contrast now contains 87 synthetic cases: 32 intended
+lifecycle updates and 55 matched negatives. A shared, text-free assertion
+profile evaluates both lifecycle mentions and canonical occurrence/deadline
+leads across direct, modal, epistemic, conditional, attributed, refuted,
+interrogative, quoted, and forwarded forms. It also examines modifiers between
+paired event/date spans, while keeping unrelated coordinated clauses local.
+Only exact normalized alias sequences can support an identity; subset or
+reordered aliases remain uncertain. The current analyzer produced some temporal
+lead somewhere in 7 of 32 positives, but produced zero cue-linked lifecycle
+candidates for all 32. The contextual experiment recovered 32 of 32
+effectively, confirmed all 17 assertion-safe cases, retained all 15 ambiguous
+cases without selecting an identity, suppressed 55 of 55 negatives, and emitted
+zero critical or authorization errors. Supported-observation and broader
+review-observation precision were both 100% on this constructed fixture.
+
+This is architecture-selection evidence, not a production score. The fixture is
+synthetic and implementation-visible, the path is explicitly disabled, and no
+private Gmail, external model, retrieval, persistence, identity-verdict
+executor, or durable anchor-head loader participated. Every output remains
+deferred, non-authorizing, and non-routable. The result supports preserving
+date-free lifecycle updates as event-centered observations; it does not support
+adding inferred dates to ordinary facts or enabling automatic lifecycle
+transitions.
+
+### 9D. Production parity and retrieval measurement paths
+
+Two previously missing measurement paths are now implemented without weakening
+the release gates.
+
+The canonical fact-parity adapter runs a sealed packet through the real
+`extract_recent_documents` API in a disposable Brain home. Original Brain and
+V2 index the same canonically renumbered message body; V2 additionally receives
+its real trusted Gmail timestamp, policy, source-type, secret-masking, and safety
+context. That means indexed semantic input is controlled while each arm retains
+its actual production behavior—strict prompt-byte equivalence is intentionally
+not claimed for secret-bearing mail. Every external-Codex extractor, retry,
+resolver, and critic invocation must pass through a private shim that binds its
+request hash, response hash, model, effort, chronology, and external session ID.
+A failed or malformed invocation poisons the ledger so a swallowed provider
+failure cannot masquerade as complete evidence. Candidate evidence is mapped
+back to provider messages from production chunk offsets, and run-scoped actions
+and persisted facts are interpreted only by the central parity contract. The
+adapter does not force promotion or persistence and still cannot independently
+prove that provider sessions were separate; the evaluator therefore continues
+to report `independent_invocations_verified=false`.
+
+The retrieval query-authoring path now authenticates the complete 7,859-message
+source authority and requires an owner-created, source-only eligibility pool
+before selecting queries. Arbitrary 40-thread sampling was rejected because it
+would almost certainly miss the required temporal strata; selecting exactly 40
+by hand would make HMAC ranking ceremonial. The replacement requires at least
+twice the final quota in every protected source-only temporal stratum—80
+candidates in total at minimum—plus lifecycle-class depth. It then HMAC-selects
+7 deadline, 7 lifecycle, 7 occurrence, 7 relative, 6 schedule, and 6 timeline
+threads, with cancellation, current-status, and reschedule coverage. Kind and
+lifecycle annotations cannot be relabeled after selection. Query and relevance
+authoring require explicit no-fact, no-prediction, no-retriever, complete-source,
+and source-only attestations; protected identifiers cannot be copied into the
+query. Because the worksheet exposes every current message in a selected
+thread, primary query `as_of` must be no earlier than the latest visible source.
+Historical prefix evaluation needs a separate future cohort with protected
+cutoffs chosen before source text is shown.
+
+Neither path has been run over private Gmail with an external model. Completing
+the fact-parity score still requires informed private-data authorization, while
+the 40-query retrieval score requires the owner to create the 80-row source-only
+eligibility authority and complete the selected worksheet. HMAC-key or
+eligibility rerolls remain an owner-process risk unless their first commitment
+is retained or externally timestamped.
+
+### 9E. Event-bound temporal context retrieval contrast
+
+The first same-thread retrieval contrast was rejected despite an apparent
+complete-set gain. It could omit the final cancellation when more than three
+updates followed an anchor, admit a different event merely because it appeared
+in the same thread, misread questions and attributed text as assertions, and
+replace useful direct results in ranks six through ten. Its public 100% score
+was therefore construction-valid only and did not justify the flat-tail design.
+
+The replacement keeps the canonical direct ranking byte-for-byte unchanged and
+adds at most three verified nested context references plus one separately
+bounded review-only reference. Thread membership is now only a transport
+constraint, and account scope plus provider thread identity are distinct typed
+inputs rather than an unenforceable string convention. A query must match an
+alias authorized for one unique externally verified event key on a top-five
+direct anchor; candidates must carry
+that same key in the same opaque account-scoped thread. Whole-message token
+overlap cannot select a key. A uniquely possible but not verified upstream
+identity may appear only as separately marked review context and can never
+select the target event. The shared assertion profile admits canonical asserted
+temporal language and rejects non-asserted source scopes. Current-status queries
+prefer the newest verified lifecycle update; timelines use bounded chronological
+change-point coverage. The separate review budget prevents a newer uncertain
+terminal update from being crowded out by three verified timeline points without
+displacing any verified point. Cutoffs and exclusions remain hard constraints.
+
+The public v2 contrast contains 16 fixture families and 24 authored queries. It
+includes long lifecycle chains, sibling events sharing a project token,
+mixed-content wrong-key anchors, paired-span modifiers, quoted and attributed
+claims, a unique-event pronoun review item, acronym and Unicode identities,
+same-subject multi-topic threads, canonical deadline paraphrases, a protected
+rank-ten direct result, as-of/exclusion cases, and exact controls. Macro
+required-source recall rose from 57.3% in the planted direct baseline to 100% in
+the answer-evidence union; micro recall rose from 24 of 48 to 48 of 48, and
+complete required sets rose from 5 of 24 to 24 of 24. All 24 direct rankings and
+all 51 protected direct items remained unchanged. All 24 verified context items
+were required evidence; one additional review-only context item remained
+separate. All seven lifecycle heads were correct, with zero forbidden,
+future, excluded, authorization, or persistence errors.
+
+These are deterministic, implementation-visible regression checks, not a
+population precision or recall estimate. The sidecar is production-disabled,
+is not wired into normal `search` or `retrieve_context`, and cannot activate
+without an upstream verified event-identity substrate. It deliberately makes no
+top-five or top-ten improvement claim because those direct rankings are
+unchanged; the measured gain is bounded answer-context recall. Private-gold
+validation is still required before even review-only integration.
+
 ### 10. Review-only persistence boundary
 
 Migration 25 adds an append-only ledger in the main Brain database for complete

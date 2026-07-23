@@ -230,6 +230,29 @@ def test_manifest_fails_closed_on_prompt_or_commit_mismatch(tmp_path: Path) -> N
         runner.load_adapter_manifest(wrong_commit, allow_test_adapter=True)
 
 
+def test_manifest_preserves_declared_venv_python_symlink(tmp_path: Path) -> None:
+    adapter = tmp_path / "adapter.py"
+    _fake_adapter(adapter)
+    venv_python = tmp_path / ".venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.symlink_to(Path(sys.executable).resolve())
+    manifest = _manifest(
+        tmp_path,
+        adapter,
+        python_executable=str(venv_python),
+    )
+
+    loaded = runner.load_adapter_manifest(manifest, allow_test_adapter=True)
+
+    assert loaded["python_executable"] == venv_python.absolute()
+    assert loaded["python_executable_target"] == Path(sys.executable).resolve()
+
+    venv_python.unlink()
+    venv_python.symlink_to("/bin/false")
+    with pytest.raises(runner.GmailFactParityRunnerError, match="changed after"):
+        runner._verify_manifest_executable(loaded)
+
+
 def test_production_manifest_rejects_a_dirty_source_checkout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
