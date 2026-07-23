@@ -36,15 +36,15 @@ ACCEPTED_ACTION_STATUSES = tuple(_STAGE_CONTRACT_MODULE["ACCEPTED_ACTION_STATUSE
 APPLIED_ACTION_STATUSES = tuple(_STAGE_CONTRACT_MODULE["APPLIED_ACTION_STATUSES"])
 
 
-VERSION = "gmail_fact_parity_evaluation_v4"
+VERSION = "gmail_fact_parity_evaluation_v5"
 LABEL_VERSION = "gmail_fact_parity_unit_v4"
-MANIFEST_VERSION = "gmail_fact_parity_manifest_v4"
+MANIFEST_VERSION = "gmail_fact_parity_manifest_v5"
 ALIGNMENT_VERSION = "gmail_fact_parity_alignment_unit_v1"
 COMPLETED_UNIT_VERSION = "gmail_fact_parity_completed_unit_v1"
 WORK_ITEM_VERSION = "gmail_fact_parity_alignment_work_item_v2"
-RUN_VERSION = "gmail_fact_parity_run_v3"
+RUN_VERSION = "gmail_fact_parity_run_v4"
 RUN_PACKET_VERSION = "gmail_fact_parity_run_packet_v3"
-RECEIPT_VERSION = "gmail_fact_parity_run_receipt_v3"
+RECEIPT_VERSION = "gmail_fact_parity_run_receipt_v4"
 JUDGE_RECEIPT_VERSION = "gmail_fact_parity_judge_receipt_v1"
 COHORT_MANIFEST_VERSION = "gmail_fact_parity_cohort_manifest_v2"
 COHORT_VERSION = "gmail_fact_parity_cohort_v2"
@@ -156,6 +156,7 @@ _RUN_BINDING_KEYS = {
     "stage_contract_version",
     "stage_contract_sha256",
     "adapter_sha256",
+    "adapter_executable_sha256",
     "production_tree_sha256",
     "runtime_config_sha256",
     "prompt_sha256",
@@ -1451,6 +1452,7 @@ def _load_run_output(
     for name in (
         "stage_contract_sha256",
         "adapter_sha256",
+        "adapter_executable_sha256",
         "production_tree_sha256",
         "runtime_config_sha256",
         "prompt_sha256",
@@ -1768,6 +1770,7 @@ def load_gmail_fact_parity_runs(
         "production_tree_sha256": runs[original_id]["production_tree_sha256"],
         "runtime_config_sha256": runs[original_id]["runtime_config_sha256"],
         "adapter_sha256": runs[original_id]["adapter_sha256"],
+        "adapter_executable_sha256": runs[original_id]["adapter_executable_sha256"],
     }
     if {
         key: original_target_config[key]
@@ -1794,7 +1797,7 @@ def load_gmail_fact_parity_runs(
         )
     adapter_digests = {run["adapter_sha256"] for run in runs.values()}
     if len(adapter_digests) != 1:
-        raise GmailFactParityError("runs do not share one exact adapter")
+        raise GmailFactParityError("runs do not share one exact adapter code digest")
     v2_target_config = {
         "commit": runs[v2_ids[0]]["commit"],
         "prompt_version": runs[v2_ids[0]]["prompt_version"],
@@ -1804,6 +1807,7 @@ def load_gmail_fact_parity_runs(
         "production_tree_sha256": runs[v2_ids[0]]["production_tree_sha256"],
         "runtime_config_sha256": runs[v2_ids[0]]["runtime_config_sha256"],
         "adapter_sha256": runs[v2_ids[0]]["adapter_sha256"],
+        "adapter_executable_sha256": runs[v2_ids[0]]["adapter_executable_sha256"],
     }
     if any(
         {
@@ -1815,6 +1819,7 @@ def load_gmail_fact_parity_runs(
             "production_tree_sha256": runs[run_id]["production_tree_sha256"],
             "runtime_config_sha256": runs[run_id]["runtime_config_sha256"],
             "adapter_sha256": runs[run_id]["adapter_sha256"],
+            "adapter_executable_sha256": runs[run_id]["adapter_executable_sha256"],
         }
         != v2_target_config
         for run_id in v2_ids
@@ -1894,6 +1899,8 @@ def load_gmail_fact_parity_runs(
                 else None
             ),
             "canonical_adapter_exact": exact_adapter_authority,
+            "per_run_executable_bindings_present": True,
+            "cross_arm_executable_equality_required": False,
             "passed": exact_adapter_authority,
         },
         "independent_invocations_verified": False,
@@ -2182,6 +2189,7 @@ def _run_manifest(
         "stage_contract_version": run["stage_contract_version"],
         "stage_contract_sha256": run["stage_contract_sha256"],
         "adapter_sha256": run["adapter_sha256"],
+        "adapter_executable_sha256": run["adapter_executable_sha256"],
         "production_tree_sha256": run["production_tree_sha256"],
         "runtime_config_sha256": run["runtime_config_sha256"],
         "prompt_sha256": run["prompt_sha256"],
@@ -2210,7 +2218,7 @@ def build_gmail_fact_parity_manifest(
     judge_receipt: Mapping[str, Any],
     labels: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Build the only accepted v4 manifest from fully reconciled artifacts."""
+    """Build the only accepted v5 manifest from fully reconciled artifacts."""
 
     preparer = _preparer_path()
     if not preparer.is_file():

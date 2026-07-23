@@ -204,6 +204,9 @@ def _run_output(
         "stage_contract_version": parity.STAGE_CONTRACT_VERSION,
         "stage_contract_sha256": parity.STAGE_CONTRACT_SHA256,
         "adapter_sha256": "a" * 64,
+        "adapter_executable_sha256": (
+            "7" * 64 if resolved_arm == "original" else "8" * 64
+        ),
         "production_tree_sha256": (
             parity.EXPECTED_ORIGINAL_PRODUCTION_TREE_SHA256
             if resolved_arm == "original"
@@ -576,7 +579,19 @@ def _evaluate(files: dict[str, Any]) -> dict[str, Any]:
 
 def test_complete_prepared_bundle_scores_three_runs_without_private_output(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    canonical_authority = {"git_head": "9" * 40, "adapter_sha256": "f" * 64}
+    monkeypatch.setattr(
+        parity,
+        "_expected_canonical_adapter_authority",
+        lambda: canonical_authority,
+    )
+    monkeypatch.setattr(
+        prepare.evaluator,
+        "_expected_canonical_adapter_authority",
+        lambda: canonical_authority,
+    )
     files = _fixture(tmp_path, unit_count=100)
 
     result = _evaluate(files)
@@ -586,8 +601,6 @@ def test_complete_prepared_bundle_scores_three_runs_without_private_output(
     assert result["version"] == parity.VERSION
     assert result["metric_gate_passed"] is True
     assert result["gate_passed"] is False
-    canonical_authority = parity._expected_canonical_adapter_authority()
-    assert canonical_authority is not None
     assert result["target_authority_gate"]["canonical_adapter_available"] is True
     assert result["target_authority_gate"]["canonical_adapter_exact"] is False
     assert (
@@ -598,6 +611,13 @@ def test_complete_prepared_bundle_scores_three_runs_without_private_output(
         == canonical_authority["git_head"]
     )
     assert result["target_authority_gate"]["passed"] is False
+    assert (
+        result["target_authority_gate"]["per_run_executable_bindings_present"] is True
+    )
+    assert (
+        result["target_authority_gate"]["cross_arm_executable_equality_required"]
+        is False
+    )
     assert result["cohort"] == {
         "threads": 100,
         "messages": 100,
@@ -644,6 +664,47 @@ def test_complete_prepared_bundle_scores_three_runs_without_private_output(
     assert all(
         stat.S_IMODE(path.stat().st_mode) == 0o600 for path in files["bundle"].iterdir()
     )
+
+
+def test_canonical_code_gate_allows_distinct_arm_executable_bindings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canonical_authority = {"git_head": "9" * 40, "adapter_sha256": "a" * 64}
+    monkeypatch.setattr(
+        parity,
+        "_expected_canonical_adapter_authority",
+        lambda: canonical_authority,
+    )
+    monkeypatch.setattr(
+        prepare.evaluator,
+        "_expected_canonical_adapter_authority",
+        lambda: canonical_authority,
+    )
+
+    files = _fixture(tmp_path, unit_count=100)
+    result = _evaluate(files)
+
+    assert result["target_authority_gate"]["canonical_adapter_exact"] is True
+    assert result["target_authority_gate"]["passed"] is True
+    assert result["metric_gate_passed"] is True
+    assert result["gate_passed"] is False
+    assert result["invocation_attestation"]["independent_invocations_verified"] is False
+    assert (
+        files["run_evidence"]["original_target_config"]["adapter_executable_sha256"]
+        != files["run_evidence"]["v2_target_config"]["adapter_executable_sha256"]
+    )
+    assert files["run_evidence"]["target_authority"] == {
+        "original_baseline_exact": True,
+        "v2_runs_consistent": True,
+        "canonical_adapter_available": True,
+        "canonical_adapter_tracked_at_git_head": True,
+        "canonical_adapter_git_head": "9" * 40,
+        "canonical_adapter_exact": True,
+        "per_run_executable_bindings_present": True,
+        "cross_arm_executable_equality_required": False,
+        "passed": True,
+    }
 
 
 def test_canonical_adapter_authority_requires_exact_tracked_git_head_blobs(
@@ -1152,6 +1213,7 @@ def test_evaluator_requires_distinct_receipts_and_unique_invocation_claims(
         "stage_contract_version",
         "stage_contract_sha256",
         "adapter_sha256",
+        "adapter_executable_sha256",
         "production_tree_sha256",
         "runtime_config_sha256",
         "prompt_sha256",
@@ -1183,6 +1245,11 @@ def test_receipt_must_repeat_every_run_binding(tmp_path: Path, field: str) -> No
         ),
         ("stage_contract_sha256", "f" * 64, "stage contract binding"),
         ("adapter_sha256", "e" * 64, "share one exact adapter"),
+        (
+            "adapter_executable_sha256",
+            "9" * 64,
+            "one exact target config",
+        ),
         ("production_tree_sha256", "d" * 64, "one exact target config"),
         ("runtime_config_sha256", "c" * 64, "one exact target config"),
         ("prompt_sha256", "b" * 64, "one exact target config"),

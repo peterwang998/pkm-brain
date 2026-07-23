@@ -96,7 +96,8 @@ The completed local-only preparation was:
 
 The repository now defines a canonical, hash-bound post-admission stage contract
 and a fail-closed `scripts/run_gmail_fact_parity.py` orchestrator that requires
-`gmail_fact_parity_run_v3` evidence. Candidate membership comes
+`gmail_fact_parity_run_v4` evidence and produces a
+`gmail_fact_parity_manifest_v5` evaluation bundle. Candidate membership comes
 from an emitted validated candidate; review membership comes from a mapped
 policy/critic action or explicit review residue; persistence requires one
 applied action and exactly one matching current fact. Ambiguous candidate/action
@@ -105,19 +106,29 @@ adapter, production tree, runtime configuration, prompt, and a complete ordered
 per-invocation ledger. Production mode accepts only the canonical adapter path;
 test adapters require an explicit test-only Python authority. Candidate, action,
 and persisted-fact ownership is one-to-one across a run, and a dirty production
-checkout is rejected. Release authority additionally requires the runner and
+checkout is rejected. `adapter_sha256` is the shared code identity over the
+runner and canonical adapter bytes. Each run separately records
+`adapter_executable_sha256`, which binds its declared Python launcher, resolved
+target, and target bytes; Original and V2 may use different bound launchers,
+while all repeated V2 runs must use one exact executable binding. The runner
+revalidates both identities immediately before and after each adapter invocation,
+so this separation does not require an untracked shared launcher or weaken
+executable provenance. Release authority additionally requires the runner and
 canonical adapter to be tracked and byte-identical to their current Git `HEAD`
 blobs. This is owner-process integrity, not host supply-chain attestation: the
 personal-use threat boundary trusts the local operating system, system Git
 executable, and repository object database.
 
-The orchestrator still lacks the canonical production adapter that executes one
-baseline run and three V2 runs over `packets.jsonl` and derives those contract
-records from isolated runtime actions and facts. The globally installed Brain
-CLI is stale and is rejected; the frozen original source environment is the
-baseline authority. That adapter is a hard blocker:
-schema-valid self-reports, existing runtime facts, and raw count parity cannot
-substitute for fresh identical-packet runs and semantic alignment.
+The orchestrator now has the canonical production adapter in
+`scripts/gmail_fact_parity_production_adapter.py`. It executes sealed packets
+through the production extraction API in disposable Brain homes, records the
+external Codex invocations, and derives contract records from run-scoped
+actions and facts. The globally installed Brain CLI remains stale and is
+rejected; the frozen original source tree is the baseline authority.
+The remaining blocker is execution and judgment of the private cohort: an
+implemented adapter, schema-valid self-reports, existing runtime facts, and raw
+count parity cannot substitute for fresh identical-packet runs and semantic
+alignment.
 
 Once those four run artifacts exist, the existing preparer can freeze the
 private, arm-blind work queue. An external Codex Sol/medium judge must then

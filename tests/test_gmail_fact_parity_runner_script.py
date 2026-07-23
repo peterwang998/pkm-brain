@@ -202,6 +202,11 @@ def test_runner_derives_contract_stages_and_emits_v2_evidence(tmp_path: Path) ->
         receipt, expected_run_id="v2-a", run=parsed
     )
     assert len(parsed_receipt["invocations"]) == 1
+    assert parsed_receipt["adapter_sha256"] == parsed["adapter_sha256"]
+    assert (
+        parsed_receipt["adapter_executable_sha256"]
+        == parsed["adapter_executable_sha256"]
+    )
 
 
 def test_test_adapter_requires_explicit_test_only_authority(tmp_path: Path) -> None:
@@ -250,6 +255,56 @@ def test_manifest_preserves_declared_venv_python_symlink(tmp_path: Path) -> None
     venv_python.unlink()
     venv_python.symlink_to("/bin/false")
     with pytest.raises(runner.GmailFactParityRunnerError, match="changed after"):
+        runner._verify_manifest_executable(loaded)
+
+
+def test_adapter_code_authority_is_stable_across_distinct_declared_launchers(
+    tmp_path: Path,
+) -> None:
+    adapter = tmp_path / "adapter.py"
+    _fake_adapter(adapter)
+    launchers = []
+    loaded_manifests = []
+    for arm in ("original", "v2"):
+        launcher = tmp_path / arm / ".venv" / "bin" / "python"
+        launcher.parent.mkdir(parents=True)
+        launcher.symlink_to(Path(sys.executable).resolve())
+        launchers.append(launcher)
+        manifest = _manifest(
+            tmp_path,
+            adapter,
+            python_executable=str(launcher),
+        )
+        loaded_manifests.append(
+            runner.load_adapter_manifest(manifest, allow_test_adapter=True)
+        )
+
+    expected_code_sha256 = runner.sha256_bytes(
+        runner.canonical_json(
+            {
+                "runner": runner.sha256_bytes(RUNNER_PATH.read_bytes()),
+                "adapter": runner.sha256_bytes(adapter.read_bytes()),
+            }
+        )
+    )
+
+    assert {item["adapter_sha256"] for item in loaded_manifests} == {
+        expected_code_sha256
+    }
+    assert len({item["adapter_executable_sha256"] for item in loaded_manifests}) == len(
+        launchers
+    )
+
+
+def test_manifest_revalidation_rejects_adapter_code_mutation(tmp_path: Path) -> None:
+    adapter = tmp_path / "adapter.py"
+    _fake_adapter(adapter)
+    manifest = _manifest(tmp_path, adapter)
+    loaded = runner.load_adapter_manifest(manifest, allow_test_adapter=True)
+
+    adapter.write_text("raise SystemExit(0)\n", encoding="utf-8")
+
+    with pytest.raises(runner.GmailFactParityRunnerError, match="adapter code changed"):
         runner._verify_manifest_executable(loaded)
 
 

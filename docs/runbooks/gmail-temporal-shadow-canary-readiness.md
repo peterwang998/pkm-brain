@@ -2,7 +2,7 @@
 
 **Status:** structurally runnable in an isolated Brain home; semantic canary launch is blocked
 
-**Last verified:** 2026-07-23 with nine focused shadow-audit tests passing, including authenticated-state tamper rejection, CLI release-clock isolation, stale-generation rejection, and concurrent-observation serialization
+**Last verified:** 2026-07-23 with the public synthetic ledger smoke passing, plus nine focused shadow-audit tests and seven ledger-smoke tests passing
 
 ## Decision
 
@@ -21,6 +21,69 @@ also no durable end-to-end freshness
 clock and no owner-label path that turns a candidate-bearing proxy into the
 required material-case and precision/recall denominators. These are fail-closed
 blockers, not metrics to infer from structural preparation.
+
+## Public Synthetic Ledger Smoke
+
+The repository has one runnable, aggregate-only smoke for the temporal ledger
+boundary. It uses a public synthetic Gmail Knowledge document in a new,
+explicitly marked root and a non-production pipeline scope. It makes no Gmail,
+network, provider, or model call.
+
+The outer root and inner Brain home carry a nonce-bound marker pair. Before any
+resume ledger or source read, the smoke rejects overlap with the configured
+production Brain home and rejects symlinked, hard-linked, foreign-owned, or
+otherwise redirected members in the synthetic home.
+
+Run it with a parent that may exist and a child smoke root that must not:
+
+```bash
+cd /Users/Peter/Documents/Codex/2026-07-14/what/work/pkm-brain-temporal
+
+SMOKE_PARENT="$(mktemp -d "${TMPDIR:-/tmp}/brain-temporal-ledger.XXXXXX")"
+SMOKE_ROOT="$SMOKE_PARENT/run"
+
+.venv/bin/python scripts/smoke_gmail_temporal_ledger_public.py run \
+  --root "$SMOKE_ROOT"
+```
+
+`run` persists one valid deferred event-time review projection and then invokes
+the script's `resume` command in a fresh Python process. A passing report proves
+all of the following against the production ledger and recovery library APIs:
+
+- the first projection creates one immutable run, one artifact, and one mutable
+  head at generation 1;
+- exact replay after a fresh interpreter creates no new or changed temporal
+  rows;
+- a stale compare-and-swap advance fails without leaving a candidate run or
+  artifact behind;
+- head rollback, idempotent rollback replay, source-bound clear, and a
+  post-clear advance produce the expected generations through generation 5;
+- superseding the source document makes the head explicitly stale and prevents
+  restoring an older run;
+- a coordinated knowledge/operations database-pair recovery set verifies, an
+  isolated restore contains identical rows across all five temporal ledger
+  tables, and the restored home remains quarantined with no daemon start; and
+- stdout contains aggregate checks and counts only. It contains no source text,
+  provider identity, message identity, run ID, message-scope key, or local path.
+
+This smoke does **not** prove:
+
+- Gmail provider sync, encrypted-archive append, Knowledge capture, shadow
+  observation, or the full sequence between those systems;
+- production-scope runner execution receipts, three genuine external verifier
+  invocations, or invocation independence—the expected execution and component
+  row counts are zero and `independent_invocations_verified=false`;
+- temporal extraction semantics, event identity, lifecycle correctness,
+  precision, recall, private-data behavior, or freshness latency;
+- recovery of source files or a complete Brain home—the coordinated recovery
+  primitive covers the database pair, and this smoke asserts the temporal rows
+  within that boundary; or
+- crash recovery from a process killed inside a transaction, a temporal
+  scheduler, a durable canary cycle receipt, or an operator-facing rollback
+  command.
+
+The smoke therefore closes the isolated temporal-ledger integration gap. It
+does not change this runbook's semantic-canary no-go decision.
 
 ## Which Gmail Store Drives This Canary
 
@@ -214,8 +277,9 @@ Rollback is therefore:
 
 Do not treat temporal-ledger head rollback as available operational recovery.
 The library has compare-and-swap rollback and source-bound clear primitives,
-but the current canary has no supported CLI around them. The preparation-only
-harness intentionally never exercises those writes.
+and the public synthetic ledger smoke exercises those primitives in its marked
+temporary root, but the current canary has no supported CLI around them. The
+preparation-only harness intentionally never exercises those writes.
 
 ## Fail-Closed Blockers Before Semantic Launch
 
@@ -239,7 +303,8 @@ harness intentionally never exercises those writes.
    transport clock.
 5. **Operational rollback:** expose and test canary-scope disable, stale-head
    clearing, compare-and-swap rollback, restart, idempotent replay, and bounded
-   failure quarantine through the actual launcher.
+   failure quarantine through the actual launcher. The public synthetic smoke
+   proves the ledger/recovery subset in isolation, not launcher integration.
 6. **Dedicated scheduling:** run archive sync, Knowledge capture, preparation,
    verifier execution, and observation with durable per-cycle status. The
    existing daemon schedules mirror, archive, and Knowledge jobs, but not the

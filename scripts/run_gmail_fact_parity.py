@@ -129,6 +129,38 @@ def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _adapter_code_sha256(*, runner_path: Path, adapter_path: Path) -> str:
+    """Bind canonical adapter behavior independently of its arm launcher."""
+
+    return sha256_bytes(
+        canonical_json(
+            {
+                "runner": sha256_bytes(_read_regular_bytes(runner_path)),
+                "adapter": sha256_bytes(_read_regular_bytes(adapter_path)),
+            }
+        )
+    )
+
+
+def _adapter_executable_sha256(
+    *,
+    declared: Path,
+    target: Path,
+    target_sha256: str,
+) -> str:
+    """Bind one arm to its exact declared launcher and resolved executable."""
+
+    return sha256_bytes(
+        canonical_json(
+            {
+                "python_executable": str(declared),
+                "python_executable_target": str(target),
+                "python_executable_target_sha256": target_sha256,
+            }
+        )
+    )
+
+
 def _regular_file(path: Path, *, private: bool = False) -> None:
     if path.is_symlink() or not path.is_file():
         raise GmailFactParityRunnerError("required input is not a regular file")
@@ -412,16 +444,14 @@ def load_adapter_manifest(
         "production_tree_sha256": production_tree_sha256(root),
         "prompt_sha256": _combined_file_sha256(prompt_paths, root=root),
         "runtime_config_sha256": sha256_bytes(canonical_json(runtime_config)),
-        "adapter_sha256": sha256_bytes(
-            canonical_json(
-                {
-                    "runner": sha256_bytes(_read_regular_bytes(runner_path)),
-                    "adapter": sha256_bytes(_read_regular_bytes(adapter)),
-                    "python_executable": str(python),
-                    "python_executable_target": str(python_target),
-                    "python_executable_target_sha256": python_target_sha256,
-                }
-            )
+        "adapter_sha256": _adapter_code_sha256(
+            runner_path=runner_path,
+            adapter_path=adapter,
+        ),
+        "adapter_executable_sha256": _adapter_executable_sha256(
+            declared=python,
+            target=python_target,
+            target_sha256=python_target_sha256,
         ),
     }
 
@@ -443,6 +473,27 @@ def _verify_manifest_executable(manifest: Mapping[str, Any]) -> None:
     ):
         raise GmailFactParityRunnerError(
             "adapter Python executable changed after manifest validation"
+        )
+    if (
+        _adapter_executable_sha256(
+            declared=declared,
+            target=current_target,
+            target_sha256=str(manifest["python_executable_target_sha256"]),
+        )
+        != manifest["adapter_executable_sha256"]
+    ):
+        raise GmailFactParityRunnerError(
+            "adapter Python executable binding changed after manifest validation"
+        )
+    if (
+        _adapter_code_sha256(
+            runner_path=Path(__file__).resolve(),
+            adapter_path=Path(manifest["adapter_path"]),
+        )
+        != manifest["adapter_sha256"]
+    ):
+        raise GmailFactParityRunnerError(
+            "adapter code changed after manifest validation"
         )
 
 
@@ -511,6 +562,7 @@ def _adapter_response(
             capture_output=True,
             timeout=timeout_seconds,
         )
+        _verify_manifest_executable(manifest)
         if completed.returncode != 0 or completed.stdout or completed.stderr:
             raise GmailFactParityRunnerError(
                 "production adapter failed or emitted console output "
@@ -758,6 +810,7 @@ def execute_gmail_fact_parity_run(
         "stage_contract_version": STAGE_CONTRACT_VERSION,
         "stage_contract_sha256": STAGE_CONTRACT_SHA256,
         "adapter_sha256": manifest["adapter_sha256"],
+        "adapter_executable_sha256": manifest["adapter_executable_sha256"],
         "production_tree_sha256": manifest["production_tree_sha256"],
         "runtime_config_sha256": manifest["runtime_config_sha256"],
         "prompt_sha256": manifest["prompt_sha256"],
