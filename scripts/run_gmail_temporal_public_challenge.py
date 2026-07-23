@@ -1445,7 +1445,7 @@ def _validate_plan_authority(
             raise PublicChallengeError("logical run spans inconsistent identities")
         call_ids.add(call_id)
         by_key[key] = raw_call
-    if len(set(logical_by_run.values())) != RUN_COUNT or set(by_key) != {
+    if (units and len(set(logical_by_run.values())) != RUN_COUNT) or set(by_key) != {
         (run, unit.unit_ordinal) for run in range(1, RUN_COUNT + 1) for unit in units
     }:
         raise PublicChallengeError("public challenge logical runs are incomplete")
@@ -1641,25 +1641,27 @@ def _validate_component_evidence(
             by_run_case[key] = call
     components_root = output_root / "components"
     candidate_cases = [case for case in cases if case.preparation.requests]
+    paths = BrainPaths.from_value(str(challenge["brain_home"]))
+    authorities = {
+        case.case_id: production_runner._build_authority(  # noqa: SLF001
+            paths,
+            document_id=case.document_id,
+            gmail_message_id=case.gmail_message_id,
+        )
+        for case in cases
+    }
     if not candidate_cases:
         if components_root.exists() or components_root.is_symlink():
             raise PublicChallengeError("zero-work challenge fabricated components")
-        return ({case.case_id: () for case in cases}, {})
+        return ({case.case_id: () for case in cases}, authorities)
     _private_directory(components_root)
     if {path.name for path in components_root.iterdir()} != {
         case.case_id for case in candidate_cases
     }:
         raise PublicChallengeError("public component case coverage is invalid")
-    paths = BrainPaths.from_value(str(challenge["brain_home"]))
     output: dict[str, tuple[Path, ...]] = {}
-    authorities: dict[str, Any] = {}
     for case in cases:
-        authority = production_runner._build_authority(  # noqa: SLF001
-            paths,
-            document_id=case.document_id,
-            gmail_message_id=case.gmail_message_id,
-        )
-        authorities[case.case_id] = authority
+        authority = authorities[case.case_id]
         if not case.preparation.requests:
             output[case.case_id] = ()
             continue

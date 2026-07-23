@@ -168,7 +168,7 @@ def _ingest_case(
     return str(row["id"]), message_id
 
 
-def _fixture(tmp_path: Path) -> dict[str, Path]:
+def _fixture(tmp_path: Path, *, all_zero_work: bool = False) -> dict[str, Path]:
     paths = BrainPaths.from_value(tmp_path / "brain")
     BrainService(paths).init_workspace()
     scheduled = _ingest_case(
@@ -179,8 +179,12 @@ def _fixture(tmp_path: Path) -> dict[str, Path]:
             "The public Aster interview is scheduled for September 20, 2027. "
             "Please keep this synthetic appointment on the planning list."
         ),
-        labels=("CATEGORY_PERSONAL",),
-        sender="colleague@public.example.test",
+        labels=(("CATEGORY_PROMOTIONS",) if all_zero_work else ("CATEGORY_PERSONAL",)),
+        sender=(
+            "offers@public.example.test"
+            if all_zero_work
+            else "colleague@public.example.test"
+        ),
     )
     advertising = _ingest_case(
         paths,
@@ -445,6 +449,45 @@ def test_success_seals_all_three_runs_before_results_and_keeps_files_private(
     assert score["smoke_gate_passed"] is False
     assert score["test_invoker_used"] is True
     assert (output / "score.json").is_file()
+
+
+def test_all_zero_work_challenge_scores_as_zero_recall_without_calls(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path, all_zero_work=True)
+    output = tmp_path / "zero-work-run"
+    fake = FakeCodex()
+
+    result = challenge.run_public_challenge(
+        fixture["manifest"],
+        fixture["key"],
+        output,
+        invoke=fake,
+        test_only_allow_injected_invoker=True,
+    )
+
+    assert result["candidate_cases"] == 0
+    assert result["zero_work_cases"] == 2
+    assert result["invocations"] == 0
+    assert fake.calls == []
+    assert not (output / "calls").exists()
+    assert not (output / "components").exists()
+
+    score = challenge.score_public_challenge(
+        fixture["manifest"],
+        fixture["gold"],
+        fixture["key"],
+        output,
+    )
+
+    assert score["gold_members"] == 1
+    assert score["matched_members"] == 0
+    assert score["effective_member_recall"] == 0.0
+    assert score["confirmed_member_recall"] == 0.0
+    assert score["supported_artifact_precision"] == 0.0
+    assert score["review_output_precision"] == 0.0
+    assert score["selected_negative_cases"] == 0
+    assert score["smoke_gate_passed"] is False
 
 
 def datetime_from_iso(value: str) -> Any:

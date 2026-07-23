@@ -97,7 +97,8 @@ The completed local-only preparation was:
 The repository now defines a canonical, hash-bound post-admission stage contract
 and a fail-closed `scripts/run_gmail_fact_parity.py` orchestrator that requires
 `gmail_fact_parity_run_v4` evidence and produces a
-`gmail_fact_parity_manifest_v5` evaluation bundle. Candidate membership comes
+`gmail_fact_parity_manifest_v5` bundle scored as
+`gmail_fact_parity_evaluation_v6`. Candidate membership comes
 from an emitted validated candidate; review membership comes from a mapped
 policy/critic action or explicit review residue; persistence requires one
 applied action and exactly one matching current fact. Ambiguous candidate/action
@@ -112,12 +113,16 @@ runner and canonical adapter bytes. Each run separately records
 target, and target bytes; Original and V2 may use different bound launchers,
 while all repeated V2 runs must use one exact executable binding. The runner
 revalidates both identities immediately before and after each adapter invocation,
-so this separation does not require an untracked shared launcher or weaken
-executable provenance. Release authority additionally requires the runner and
-canonical adapter to be tracked and byte-identical to their current Git `HEAD`
-blobs. This is owner-process integrity, not host supply-chain attestation: the
-personal-use threat boundary trusts the local operating system, system Git
-executable, and repository object database.
+so this separation does not require an untracked shared launcher. These per-run
+digests record internal agreement; they are not independent launcher authority,
+because an arbitrary executable could emit a self-consistent digest and artifact
+pair. Release target authority therefore remains fail-closed until trusted
+Original and V2 launcher bindings are pinned independently and match the
+receipts. Separately, canonical-adapter authority requires the runner and
+adapter to be tracked and byte-identical to their current Git `HEAD` blobs. This
+is owner-process integrity, not host supply-chain attestation: the personal-use
+threat boundary trusts the local operating system, system Git executable, and
+repository object database.
 
 The orchestrator now has the canonical production adapter in
 `scripts/gmail_fact_parity_production_adapter.py`. It executes sealed packets

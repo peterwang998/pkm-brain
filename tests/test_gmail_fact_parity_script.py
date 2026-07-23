@@ -618,6 +618,12 @@ def test_complete_prepared_bundle_scores_three_runs_without_private_output(
         result["target_authority_gate"]["cross_arm_executable_equality_required"]
         is False
     )
+    assert result["target_authority_gate"]["trusted_launcher_bindings_pinned"] is False
+    assert result["target_authority_gate"]["trusted_launcher_bindings_exact"] is False
+    assert (
+        result["target_authority_gate"]["launcher_authority_limitation"]
+        == parity.LAUNCHER_AUTHORITY_LIMITATION
+    )
     assert result["cohort"] == {
         "threads": 100,
         "messages": 100,
@@ -666,7 +672,7 @@ def test_complete_prepared_bundle_scores_three_runs_without_private_output(
     )
 
 
-def test_canonical_code_gate_allows_distinct_arm_executable_bindings(
+def test_canonical_code_gate_rejects_unpinned_arm_executable_bindings(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -686,10 +692,23 @@ def test_canonical_code_gate_allows_distinct_arm_executable_bindings(
     result = _evaluate(files)
 
     assert result["target_authority_gate"]["canonical_adapter_exact"] is True
-    assert result["target_authority_gate"]["passed"] is True
+    assert result["target_authority_gate"]["passed"] is False
+    assert result["target_authority_gate"]["trusted_launcher_bindings_pinned"] is False
+    assert result["target_authority_gate"]["trusted_launcher_bindings_exact"] is False
     assert result["metric_gate_passed"] is True
     assert result["gate_passed"] is False
     assert result["invocation_attestation"]["independent_invocations_verified"] is False
+    # These syntactically valid, attacker-chosen bindings reconcile across each
+    # run and receipt.  Canonical adapter code alone must not elevate them to a
+    # trusted launcher authority.
+    assert (
+        files["run_evidence"]["original_target_config"]["adapter_executable_sha256"]
+        == "7" * 64
+    )
+    assert (
+        files["run_evidence"]["v2_target_config"]["adapter_executable_sha256"]
+        == "8" * 64
+    )
     assert (
         files["run_evidence"]["original_target_config"]["adapter_executable_sha256"]
         != files["run_evidence"]["v2_target_config"]["adapter_executable_sha256"]
@@ -703,7 +722,10 @@ def test_canonical_code_gate_allows_distinct_arm_executable_bindings(
         "canonical_adapter_exact": True,
         "per_run_executable_bindings_present": True,
         "cross_arm_executable_equality_required": False,
-        "passed": True,
+        "trusted_launcher_bindings_pinned": False,
+        "trusted_launcher_bindings_exact": False,
+        "launcher_authority_limitation": parity.LAUNCHER_AUTHORITY_LIMITATION,
+        "passed": False,
     }
 
 

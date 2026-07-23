@@ -36,7 +36,7 @@ ACCEPTED_ACTION_STATUSES = tuple(_STAGE_CONTRACT_MODULE["ACCEPTED_ACTION_STATUSE
 APPLIED_ACTION_STATUSES = tuple(_STAGE_CONTRACT_MODULE["APPLIED_ACTION_STATUSES"])
 
 
-VERSION = "gmail_fact_parity_evaluation_v5"
+VERSION = "gmail_fact_parity_evaluation_v6"
 LABEL_VERSION = "gmail_fact_parity_unit_v4"
 MANIFEST_VERSION = "gmail_fact_parity_manifest_v5"
 ALIGNMENT_VERSION = "gmail_fact_parity_alignment_unit_v1"
@@ -53,6 +53,9 @@ ADMISSION_JOIN_VERSION = "gmail_fact_parity_admission_join_v2"
 BINDING_VERSION = "gmail_fact_parity_source_binding_v2"
 ADMISSION_INVENTORY_VERSION = "gmail_fact_parity_admission_v1"
 INVOCATION_ATTESTATION = "self_reported_not_cryptographically_verified"
+LAUNCHER_AUTHORITY_LIMITATION = (
+    "per_run_executable_bindings_present_but_not_independently_trusted"
+)
 EXPECTED_PROVIDER = "external-codex"
 EXPECTED_JUDGE_MODEL = "gpt-5.6-sol"
 EXPECTED_JUDGE_REASONING_EFFORT = "medium"
@@ -1841,6 +1844,13 @@ def load_gmail_fact_parity_runs(
         expected_adapter_sha256 is not None
         and adapter_digests == {expected_adapter_sha256}
     )
+    # A digest emitted by the runner proves that a run and its receipt agree on
+    # one launcher.  It does not independently prove that the launcher was a
+    # trusted executable: an arbitrary program can fabricate a self-consistent
+    # digest and artifact pair.  Keep this sub-gate fail closed until release
+    # authority supplies separately pinned, per-arm launcher bindings.
+    trusted_launcher_bindings_pinned = False
+    trusted_launcher_bindings_exact = False
     receipts = {
         run_id: _load_receipt(
             Path(run_receipt_paths[run_id]),
@@ -1901,7 +1911,10 @@ def load_gmail_fact_parity_runs(
             "canonical_adapter_exact": exact_adapter_authority,
             "per_run_executable_bindings_present": True,
             "cross_arm_executable_equality_required": False,
-            "passed": exact_adapter_authority,
+            "trusted_launcher_bindings_pinned": trusted_launcher_bindings_pinned,
+            "trusted_launcher_bindings_exact": trusted_launcher_bindings_exact,
+            "launcher_authority_limitation": LAUNCHER_AUTHORITY_LIMITATION,
+            "passed": exact_adapter_authority and trusted_launcher_bindings_exact,
         },
         "independent_invocations_verified": False,
         "claimed_invocation_ids_unique": True,
