@@ -347,6 +347,42 @@ def test_zero_verified_budget_preserves_separate_review_only_channel() -> None:
     assert plan.answer_evidence_ids == baseline + ("atlas-review",)
 
 
+def test_zero_verified_budget_does_not_surface_review_older_than_verified() -> None:
+    sources = (
+        _source(
+            "atlas-m1",
+            ordinal=1,
+            text="Subject: Atlas\n\nAtlas launch was booked for October 2, 2027.",
+        ),
+        _source(
+            "atlas-review",
+            ordinal=2,
+            text="Subject: Atlas\n\nIt was cancelled.",
+            verified_key=None,
+            contextual_key="event:atlas",
+        ),
+        _source(
+            "atlas-verified",
+            ordinal=3,
+            text="Subject: Atlas\n\nAtlas launch was confirmed for October 8, 2027.",
+        ),
+    ) + _distractors()
+
+    plan = plan_gmail_temporal_thread_retrieval_experiment(
+        query="What is the current status of the Atlas launch?",
+        temporal_intent="lifecycle",
+        source_available_as_of=CUTOFF,
+        baseline_ranked_evidence_ids=_baseline(),
+        evidence_sources=sources,
+        verified_context_limit=0,
+    )
+
+    assert plan.target_event_identity_key == "event:atlas"
+    assert plan.verified_context_evidence_ids == ()
+    assert plan.review_context_evidence_ids == ()
+    assert plan.context_evidence_ids == ()
+
+
 def test_zero_verified_budget_does_not_weaken_review_context_safeguards() -> None:
     sources = (
         _source(

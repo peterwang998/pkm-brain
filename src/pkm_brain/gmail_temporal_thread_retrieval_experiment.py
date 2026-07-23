@@ -328,7 +328,7 @@ def plan_gmail_temporal_thread_retrieval_experiment(
     if intent == "lifecycle":
         review_floor = _latest_watermark(
             direct_watermark,
-            tuple(_watermark(item) for item in selected_verified),
+            tuple(_watermark(item) for item in verified),
         )
         if review_floor is not None:
             review = tuple(
