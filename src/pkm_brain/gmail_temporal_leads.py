@@ -577,9 +577,10 @@ def analyze_gmail_temporal_leads(
         omitted_expression_count = 0
         omitted_mention_count = 0
     version = "gmail_temporal_leads_v2"
+    source_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
     snapshot_fingerprint = _analysis_snapshot_fingerprint(
         version=version,
-        source=source,
+        source_sha256=source_sha256,
         anchor=anchor,
         chunk_id=chunk_id,
         scope_bound=scope_bound,
@@ -596,10 +597,10 @@ def analyze_gmail_temporal_leads(
         omitted_mention_count=omitted_mention_count,
         graph_truncated=graph_truncated,
     )
-    return TemporalLeadAnalysis(
+    result = TemporalLeadAnalysis(
         version=version,
         snapshot_fingerprint=snapshot_fingerprint,
-        source_sha256=hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        source_sha256=source_sha256,
         scope_bound=scope_bound,
         fact_admitted=fact_admitted is True,
         association_admission_basis=admission_basis,
@@ -615,6 +616,123 @@ def analyze_gmail_temporal_leads(
         retained_edge_count=len(leads),
         graph_truncated=graph_truncated,
     )
+    validate_gmail_temporal_lead_analysis_authority(
+        result,
+        expected_snapshot_fingerprint=snapshot_fingerprint,
+        source_sha256=source_sha256,
+        message_internal_at=message_internal_at,
+        chunk_id=chunk_id,
+    )
+    return result
+
+
+def validate_gmail_temporal_lead_analysis_authority(
+    analysis: TemporalLeadAnalysis,
+    *,
+    expected_snapshot_fingerprint: str,
+    source_sha256: str,
+    message_internal_at: str | datetime | None,
+    chunk_id: str | None,
+) -> None:
+    """Rebind one content-free analysis to its exact trusted Gmail inputs.
+
+    The snapshot fingerprint is an integrity receipt, not merely an identifier.
+    Recomputing it here prevents a frozen analysis from being copied with altered
+    mentions, expressions, leads, or counters while retaining the old receipt.
+    Callers must independently obtain ``expected_snapshot_fingerprint`` and the
+    other inputs from the current trusted review head.
+    """
+
+    scope_bound = isinstance(chunk_id, str) and bool(chunk_id.strip())
+    count_values = (
+        (
+            analysis.candidate_edge_count,
+            analysis.omitted_expression_count,
+            analysis.omitted_mention_count,
+            analysis.retained_edge_count,
+        )
+        if isinstance(analysis, TemporalLeadAnalysis)
+        else ()
+    )
+    if (
+        not isinstance(analysis, TemporalLeadAnalysis)
+        or analysis.version != "gmail_temporal_leads_v2"
+        or not isinstance(expected_snapshot_fingerprint, str)
+        or not expected_snapshot_fingerprint.startswith("gta_")
+        or len(expected_snapshot_fingerprint) != 68
+        or not isinstance(source_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", source_sha256) is None
+        or analysis.source_sha256 != source_sha256
+        or analysis.scope_bound is not scope_bound
+        or not isinstance(analysis.fact_admitted, bool)
+        or analysis.association_admission_basis
+        not in {
+            "none",
+            "fact",
+            "temporal_rescue",
+        }
+        or (analysis.association_admission_basis == "fact")
+        is not analysis.fact_admitted
+        or not isinstance(analysis.expressions, tuple)
+        or not isinstance(analysis.mentions, tuple)
+        or not isinstance(analysis.leads, tuple)
+        or any(
+            not isinstance(item, TemporalExpression) for item in analysis.expressions
+        )
+        or any(not isinstance(item, TemporalMention) for item in analysis.mentions)
+        or any(not isinstance(item, TemporalLead) for item in analysis.leads)
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in count_values
+        )
+        or analysis.retained_edge_count != len(analysis.leads)
+        or analysis.candidate_edge_count < analysis.retained_edge_count
+        or analysis.candidate_edge_count_exact
+        is not (
+            analysis.omitted_expression_count == 0
+            and analysis.omitted_mention_count == 0
+        )
+        or not isinstance(analysis.graph_truncated, bool)
+    ):
+        raise ValueError("temporal analysis authority is invalid or stale")
+
+    expression_ids = tuple(item.expression_id for item in analysis.expressions)
+    mention_ids = tuple(item.mention_id for item in analysis.mentions)
+    lead_ids = tuple(item.lead_id for item in analysis.leads)
+    if (
+        len(expression_ids) != len(set(expression_ids))
+        or len(mention_ids) != len(set(mention_ids))
+        or len(lead_ids) != len(set(lead_ids))
+        or any(
+            lead.expression_id not in set(expression_ids)
+            or lead.mention_id not in set(mention_ids)
+            for lead in analysis.leads
+        )
+    ):
+        raise ValueError("temporal analysis authority graph is invalid")
+
+    expected = _analysis_snapshot_fingerprint(
+        version=analysis.version,
+        source_sha256=source_sha256,
+        anchor=_aware_internal_time(message_internal_at),
+        chunk_id=chunk_id,
+        scope_bound=scope_bound,
+        fact_admitted=analysis.fact_admitted,
+        association_admission_basis=analysis.association_admission_basis,
+        expressions=analysis.expressions,
+        mentions=analysis.mentions,
+        leads=analysis.leads,
+        candidate_edge_count=analysis.candidate_edge_count,
+        candidate_edge_count_exact=analysis.candidate_edge_count_exact,
+        omitted_expression_count=analysis.omitted_expression_count,
+        omitted_mention_count=analysis.omitted_mention_count,
+        graph_truncated=analysis.graph_truncated,
+    )
+    if (
+        analysis.snapshot_fingerprint != expected
+        or expected_snapshot_fingerprint != expected
+    ):
+        raise ValueError("temporal analysis fingerprint is invalid or stale")
 
 
 def _expressions(
@@ -2847,7 +2965,7 @@ def _opaque_scope_prefix(chunk_id: str | None, text: str) -> str:
 def _analysis_snapshot_fingerprint(
     *,
     version: str,
-    source: str,
+    source_sha256: str,
     anchor: datetime | None,
     chunk_id: str | None,
     scope_bound: bool,
@@ -2867,7 +2985,7 @@ def _analysis_snapshot_fingerprint(
     payload = {
         "schema": "gmail_temporal_analysis_snapshot_v2",
         "analysis_version": version,
-        "source_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        "source_sha256": source_sha256,
         "anchor": anchor.isoformat() if anchor is not None else None,
         "chunk_id_sha256": (
             hashlib.sha256(str(chunk_id).encode("utf-8")).hexdigest()

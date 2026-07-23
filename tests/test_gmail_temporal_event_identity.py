@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict, replace
+from datetime import datetime, timezone
 from typing import Callable, Mapping
 
 import pytest
@@ -22,6 +23,7 @@ from pkm_brain.gmail_temporal_event_identity import (
     make_gmail_temporal_event_identity_verdict_set,
     plan_gmail_temporal_event_identity,
     resolve_gmail_temporal_event_identity,
+    validate_gmail_temporal_event_identity_resolution,
 )
 from pkm_brain.gmail_temporal_frontier import (
     GmailTemporalCandidateEnsembleVerdictSet,
@@ -37,13 +39,19 @@ from pkm_brain.gmail_temporal_leads import (
     TemporalLeadAnalysis,
     analyze_gmail_temporal_leads,
 )
-from pkm_brain.gmail_temporal_persistence import GmailTemporalSourceLocator
+from pkm_brain.gmail_temporal_persistence import (
+    GmailTemporalSourceLocator,
+    gmail_temporal_message_scope_key,
+)
 from pkm_brain.gmail_temporal_review import (
     GmailTemporalReviewBatchResult,
+    GmailTemporalReviewHypothesis,
     GmailTemporalReviewProjection,
+    canonical_gmail_temporal_review_projection_bytes,
     project_gmail_temporal_review,
 )
 from pkm_brain.gmail_temporal_thread_lifecycle import (
+    GmailTemporalThreadLifecycleError,
     GmailTemporalThreadMessageAuthority,
     GmailTemporalThreadMessageReview,
     GmailTemporalThreadSnapshotAuthority,
@@ -57,6 +65,7 @@ DOCUMENT = "doc-gmail-current"
 DOCUMENT_HASH = "d" * 64
 SOURCE_REVISION = "e" * 64
 PIPELINE = "gmail_temporal_review_v1"
+_ANALYSIS_AUTHORITIES: dict[str, TemporalLeadAnalysis] = {}
 
 CandidateSelector = Callable[
     [tuple[GmailTemporalVerificationCandidate, ...]],
@@ -110,9 +119,15 @@ def _projection(
 ) -> GmailTemporalReviewProjection:
     analysis = analyze_gmail_temporal_leads(
         text=text,
-        message_internal_at=internal_at,
+        message_internal_at=datetime.fromisoformat(internal_at).astimezone(
+            timezone.utc
+        ),
         fact_admitted=True,
-        chunk_id=chunk_id,
+        chunk_id=gmail_temporal_message_scope_key(
+            gmail_account_key=ACCOUNT,
+            gmail_thread_id=THREAD,
+            gmail_message_id=chunk_id,
+        ),
     )
     batch_plan: GmailTemporalBatchPlan = plan_gmail_temporal_selector_batches(
         text=text,
@@ -140,12 +155,14 @@ def _projection(
                 ),
             )
         )
-    return project_gmail_temporal_review(
+    projection = project_gmail_temporal_review(
         text=text,
         analysis=analysis,
         batch_plan=batch_plan,
         batch_results=tuple(results),
     )
+    _ANALYSIS_AUTHORITIES[projection.analysis_fingerprint] = analysis
+    return projection
 
 
 def _select_lifecycle(lifecycle: str) -> CandidateSelector:
@@ -194,13 +211,18 @@ def _message(
     run_id = f"gtrr_{provider_message_id}"
     return (
         GmailTemporalThreadMessageAuthority(
-            version="gmail_temporal_thread_message_authority_v1",
+            version="gmail_temporal_thread_message_authority_v2",
             source=source,
             pipeline_scope=PIPELINE,
             current_review_run_id=run_id,
             current_head_generation=(
                 order if head_generation is None else head_generation
             ),
+            current_analysis_fingerprint=projection.analysis_fingerprint,
+            current_projection_fingerprint=projection.projection_fingerprint,
+            current_projection_sha256=hashlib.sha256(
+                canonical_gmail_temporal_review_projection_bytes(projection)
+            ).hexdigest(),
         ),
         GmailTemporalThreadMessageReview(
             version="gmail_temporal_thread_message_review_v1",
@@ -216,14 +238,21 @@ def _snapshot(
         tuple[GmailTemporalThreadMessageAuthority, GmailTemporalThreadMessageReview],
         ...,
     ],
+    *,
+    prior_resolution: GmailTemporalEventIdentityResolution | None = None,
 ) -> tuple[
     GmailTemporalThreadSnapshotAuthority,
     tuple[GmailTemporalThreadMessageReview, ...],
 ]:
     return (
         GmailTemporalThreadSnapshotAuthority(
-            version="gmail_temporal_thread_snapshot_authority_v1",
+            version="gmail_temporal_thread_snapshot_authority_v2",
             messages=tuple(item[0] for item in pairs),
+            prior_event_identity_resolution_fingerprint=(
+                prior_resolution.resolution_fingerprint
+                if prior_resolution is not None
+                else None
+            ),
         ),
         tuple(item[1] for item in pairs),
     )
@@ -234,11 +263,26 @@ def _plan(
         tuple[GmailTemporalThreadMessageAuthority, GmailTemporalThreadMessageReview],
         ...,
     ],
+    *,
+    prior_resolution: GmailTemporalEventIdentityResolution | None = None,
 ) -> GmailTemporalEventIdentityPlan:
-    authority, messages = _snapshot(pairs)
+    authority, messages = _snapshot(
+        pairs,
+        prior_resolution=prior_resolution,
+    )
     return plan_gmail_temporal_event_identity(
         snapshot_authority=authority,
         messages=messages,
+        analysis_authorities=_analysis_authorities(messages),
+    )
+
+
+def _analysis_authorities(
+    messages: tuple[GmailTemporalThreadMessageReview, ...],
+) -> tuple[TemporalLeadAnalysis, ...]:
+    return tuple(
+        _ANALYSIS_AUTHORITIES[message.projection.analysis_fingerprint]
+        for message in messages
     )
 
 
@@ -248,15 +292,19 @@ def _resolve(
     *,
     prior_resolution=None,
 ):
-    sets = tuple(
-        make_gmail_temporal_event_identity_verdict_set(
-            plan=plan,
-            run_ordinal=ordinal,
-            invocation_id=f"external-event-identity-{ordinal}",
-            response_sha256=str(ordinal) * 64,
-            verdicts=verdicts,  # type: ignore[arg-type]
+    sets = (
+        tuple(
+            make_gmail_temporal_event_identity_verdict_set(
+                plan=plan,
+                run_ordinal=ordinal,
+                invocation_id=f"external-event-identity-{ordinal}",
+                response_sha256=str(ordinal) * 64,
+                verdicts=verdicts,  # type: ignore[arg-type]
+            )
+            for ordinal in (1, 2, 3)
         )
-        for ordinal in (1, 2, 3)
+        if plan.pairs
+        else ()
     )
     return resolve_gmail_temporal_event_identity(
         plan=plan,
@@ -303,22 +351,72 @@ def _refingerprint_resolution(
     )
 
 
+def _refingerprint_projection(
+    projection: GmailTemporalReviewProjection,
+) -> GmailTemporalReviewProjection:
+    material = asdict(projection)
+    material.pop("projection_fingerprint")
+    encoded = json.dumps(
+        material,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return replace(
+        projection,
+        projection_fingerprint="gtrp_" + hashlib.sha256(encoded).hexdigest(),
+    )
+
+
+def _with_subject_type_references(
+    hypothesis: GmailTemporalReviewHypothesis,
+    references: tuple[tuple[str, str], ...],
+) -> GmailTemporalReviewHypothesis:
+    signature = (
+        hypothesis.expression_id,
+        hypothesis.relation,
+        hypothesis.kind,
+        hypothesis.lifecycle,
+        hypothesis.normalized_value,
+    )
+    material = {
+        "version": "gmail_temporal_review_hypothesis_v2",
+        "signature": signature,
+        "subject_type_references": references,
+    }
+    return replace(
+        hypothesis,
+        hypothesis_id="gtrh_"
+        + hashlib.sha256(
+            json.dumps(
+                material,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest(),
+        subject_type_references=references,
+    )
+
+
 def _forge_resolution_event_key(
     resolution: GmailTemporalEventIdentityResolution,
     event_identity_key: str,
 ) -> GmailTemporalEventIdentityResolution:
-    assert len(resolution.clusters) == 1
+    cluster = next(item for item in resolution.clusters if len(item.unit_ids) > 1)
     forged = replace(
         resolution,
         resolution_fingerprint="",
-        clusters=(
-            replace(
-                resolution.clusters[0],
-                event_identity_key=event_identity_key,
-            ),
+        clusters=tuple(
+            replace(item, event_identity_key=event_identity_key)
+            if item == cluster
+            else item
+            for item in resolution.clusters
         ),
         assertions=tuple(
             replace(assertion, event_identity_key=event_identity_key)
+            if assertion.provenance_ref == cluster.provenance_ref
+            else assertion
             for assertion in resolution.assertions
         ),
     )
@@ -331,7 +429,7 @@ def _cluster_receipt(
     pair_ids: tuple[str, ...],
 ) -> tuple[str, str]:
     material = {
-        "version": "gmail_temporal_event_identity_cluster_v1",
+        "version": "gmail_temporal_event_identity_cluster_v2",
         "plan_fingerprint": resolution.plan_fingerprint,
         "unit_ids": unit_ids,
         "supporting_pair_ids": pair_ids,
@@ -448,6 +546,9 @@ def test_schedule_reschedule_cancel_projects_one_verified_lifecycle() -> None:
     lifecycle = project_gmail_temporal_thread_lifecycle(
         snapshot_authority=authority,
         messages=_with_assertions(messages, resolution.assertions),
+        event_identity_analysis_authorities=_analysis_authorities(messages),
+        event_identity_plan=plan,
+        event_identity_resolution=resolution,
     )
     assert len(lifecycle.events) == 1
     event = lifecycle.events[0]
@@ -459,6 +560,286 @@ def test_schedule_reschedule_cancel_projects_one_verified_lifecycle() -> None:
     assert [item.state for item in event.occurrences] == [
         "superseded",
         "cancelled",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("text", "lifecycle", "expected_subject_type"),
+    (
+        ("The upload is scheduled for August 18, 2027.", "scheduled", "action"),
+        (
+            "The arrival was cancelled on August 18, 2027.",
+            "cancelled",
+            "boundary",
+        ),
+    ),
+)
+def test_non_event_temporal_artifacts_are_retained_but_not_identity_units(
+    text: str,
+    lifecycle: str,
+    expected_subject_type: str,
+) -> None:
+    projection = _projection(
+        text,
+        _select_lifecycle(lifecycle),
+        internal_at="2027-08-01T09:00:00-07:00",
+        chunk_id=f"non-event-{expected_subject_type}",
+    )
+
+    assert len(projection.artifacts) == 1
+    hypothesis = projection.artifacts[0].hypotheses[0]
+    assert hypothesis.subject_type_references == (
+        (hypothesis.subject_mention_ids[0], expected_subject_type),
+    )
+    pairs = (
+        _message(
+            order=1,
+            provider_message_id=f"non-event-{expected_subject_type}",
+            projection=projection,
+            internal_at="2027-08-01T09:00:00-07:00",
+            start_offset=0,
+        ),
+    )
+    plan = _plan(pairs)
+
+    assert plan.units == ()
+    assert plan.pairs == ()
+    assert plan.pages == ()
+
+
+def test_normal_interview_event_remains_an_identity_unit() -> None:
+    projection = _projection(
+        "The Apollo interview is scheduled for August 14, 2027.",
+        _select_lifecycle("scheduled"),
+        internal_at="2027-08-01T09:00:00-07:00",
+        chunk_id="eventhood-interview",
+    )
+    plan = _plan(
+        (
+            _message(
+                order=1,
+                provider_message_id="eventhood-interview",
+                projection=projection,
+                internal_at="2027-08-01T09:00:00-07:00",
+                start_offset=0,
+            ),
+        ),
+    )
+
+    assert projection.artifacts[0].hypotheses[0].subject_type_references[0][1] == (
+        "event"
+    )
+    assert len(plan.units) == 1
+    assert (
+        plan.units[0].hypothesis_id
+        == projection.artifacts[0].hypotheses[0].hypothesis_id
+    )
+
+
+def test_event_predicate_transition_remains_an_identity_unit() -> None:
+    projection = _projection(
+        "The benefits policy takes effect on August 18, 2027.",
+        _select_relation("occurrence"),
+        internal_at="2027-08-01T09:00:00-07:00",
+        chunk_id="eventhood-transition",
+    )
+    plan = _plan(
+        (
+            _message(
+                order=1,
+                provider_message_id="eventhood-transition",
+                projection=projection,
+                internal_at="2027-08-01T09:00:00-07:00",
+                start_offset=0,
+            ),
+        )
+    )
+
+    assert projection.artifacts[0].hypotheses[0].subject_type_references[0][1] == (
+        "event_predicate"
+    )
+    assert len(plan.units) == 1
+    assert (
+        plan.units[0].hypothesis_id
+        == projection.artifacts[0].hypotheses[0].hypothesis_id
+    )
+
+
+def test_refingerprinted_action_to_event_subject_type_forgery_is_rejected() -> None:
+    projection = _projection(
+        "The upload is scheduled for August 18, 2027.",
+        _select_lifecycle("scheduled"),
+        internal_at="2027-08-01T09:00:00-07:00",
+        chunk_id="eventhood-forged-action",
+    )
+    assert len(projection.artifacts) == 1
+    artifact = projection.artifacts[0]
+    hypothesis = artifact.hypotheses[0]
+    assert hypothesis.subject_type_references == (
+        (hypothesis.subject_mention_ids[0], "action"),
+    )
+    forged_hypothesis = _with_subject_type_references(
+        hypothesis,
+        ((hypothesis.subject_mention_ids[0], "event"),),
+    )
+    forged_projection = _refingerprint_projection(
+        replace(
+            projection,
+            projection_fingerprint="",
+            artifacts=(replace(artifact, hypotheses=(forged_hypothesis,)),),
+        )
+    )
+    pairs = (
+        _message(
+            order=1,
+            provider_message_id="eventhood-forged-action",
+            projection=forged_projection,
+            internal_at="2027-08-01T09:00:00-07:00",
+            start_offset=0,
+        ),
+    )
+
+    with pytest.raises(
+        GmailTemporalEventIdentityError,
+        match="subject types do not match analysis authority",
+    ):
+        _plan(pairs)
+
+    assert forged_hypothesis.subject_type_references == (
+        (hypothesis.subject_mention_ids[0], "event"),
+    )
+
+
+def test_one_event_unit_resolves_locally_and_projects_a_scheduled_event() -> None:
+    schedule = _projection(
+        "The dental appointment is scheduled for September 2, 2027.",
+        _select_lifecycle("scheduled"),
+        internal_at="2027-08-01T09:00:00-07:00",
+        chunk_id="message-1",
+    )
+    pairs = (
+        _message(
+            order=1,
+            provider_message_id="message-1",
+            projection=schedule,
+            internal_at="2027-08-01T09:00:00-07:00",
+            start_offset=0,
+        ),
+    )
+    plan = _plan(pairs)
+
+    assert len(plan.units) == 1
+    assert plan.pairs == ()
+    assert plan.pages == ()
+    resolution = resolve_gmail_temporal_event_identity(
+        plan=plan,
+        verdict_sets=(),
+    )
+
+    assert resolution.verdict_set_fingerprints == ()
+    assert resolution.pair_consensus == ()
+    assert len(resolution.clusters) == 1
+    assert resolution.clusters[0].unit_ids == (plan.units[0].unit_id,)
+    assert resolution.clusters[0].supporting_pair_ids == ()
+    assert len(resolution.assertions) == 1
+    assert resolution.assertions[0].verification == "source_bound_self_identity"
+
+    authority, messages = _snapshot(pairs)
+    lifecycle = project_gmail_temporal_thread_lifecycle(
+        snapshot_authority=authority,
+        messages=_with_assertions(messages, resolution.assertions),
+        event_identity_analysis_authorities=_analysis_authorities(messages),
+        event_identity_plan=plan,
+        event_identity_resolution=resolution,
+    )
+    assert len(lifecycle.events) == 1
+    assert lifecycle.events[0].current_status == "scheduled"
+    assert lifecycle.events[0].occurrences[0].normalized_value == "2027-09-02"
+    assert lifecycle.unresolved_alternatives == ()
+
+    external_empty_set = make_gmail_temporal_event_identity_verdict_set(
+        plan=plan,
+        run_ordinal=1,
+        invocation_id="unnecessary-external-call",
+        response_sha256="1" * 64,
+        verdicts={},
+    )
+    with pytest.raises(GmailTemporalEventIdentityError, match="zero verdict sets"):
+        resolve_gmail_temporal_event_identity(
+            plan=plan,
+            verdict_sets=(external_empty_set,),
+        )
+
+
+def test_source_bound_self_identity_cannot_be_rebound_to_a_foreign_key() -> None:
+    schedule = _projection(
+        "The dental appointment is scheduled for September 2, 2027.",
+        _select_lifecycle("scheduled"),
+        internal_at="2027-08-01T09:00:00-07:00",
+        chunk_id="message-1",
+    )
+    pairs = (
+        _message(
+            order=1,
+            provider_message_id="message-1",
+            projection=schedule,
+            internal_at="2027-08-01T09:00:00-07:00",
+            start_offset=0,
+        ),
+    )
+    resolution = resolve_gmail_temporal_event_identity(
+        plan=_plan(pairs),
+        verdict_sets=(),
+    )
+    forged = replace(
+        resolution.assertions[0],
+        event_identity_key="gmail-event:" + "f" * 64,
+    )
+    authority, messages = _snapshot(pairs)
+
+    with pytest.raises(GmailTemporalThreadLifecycleError, match="source-bound"):
+        project_gmail_temporal_thread_lifecycle(
+            snapshot_authority=authority,
+            messages=_with_assertions(messages, (forged,)),
+        )
+
+
+def test_one_terminal_unit_gets_self_identity_but_not_invented_history() -> None:
+    cancellation = _projection(
+        "The dentist appointment scheduled for August 14, 2027 was cancelled.",
+        _select_lifecycle("cancelled"),
+        internal_at="2027-08-15T09:00:00-07:00",
+        chunk_id="message-1",
+    )
+    pairs = (
+        _message(
+            order=1,
+            provider_message_id="message-1",
+            projection=cancellation,
+            internal_at="2027-08-15T09:00:00-07:00",
+            start_offset=0,
+        ),
+    )
+    plan = _plan(pairs)
+    resolution = resolve_gmail_temporal_event_identity(
+        plan=plan,
+        verdict_sets=(),
+    )
+    authority, messages = _snapshot(pairs)
+
+    lifecycle = project_gmail_temporal_thread_lifecycle(
+        snapshot_authority=authority,
+        messages=_with_assertions(messages, resolution.assertions),
+        event_identity_analysis_authorities=_analysis_authorities(messages),
+        event_identity_plan=plan,
+        event_identity_resolution=resolution,
+    )
+
+    assert len(lifecycle.events) == 1
+    assert lifecycle.events[0].current_status == "unresolved"
+    assert lifecycle.events[0].occurrences == ()
+    assert [item.reason for item in lifecycle.unresolved_alternatives] == [
+        "terminal_transition_lacks_current_scheduled_occurrence"
     ]
 
 
@@ -475,30 +856,49 @@ def test_same_title_distinct_events_do_not_merge() -> None:
         internal_at="2027-08-02T09:00:00-07:00",
         chunk_id="message-2",
     )
-    plan = _plan(
-        (
-            _message(
-                order=1,
-                provider_message_id="message-1",
-                projection=first,
-                internal_at="2027-08-01T09:00:00-07:00",
-                start_offset=0,
-            ),
-            _message(
-                order=2,
-                provider_message_id="message-2",
-                projection=second,
-                internal_at="2027-08-02T09:00:00-07:00",
-                start_offset=1_000,
-            ),
-        )
+    pairs = (
+        _message(
+            order=1,
+            provider_message_id="message-1",
+            projection=first,
+            internal_at="2027-08-01T09:00:00-07:00",
+            start_offset=0,
+        ),
+        _message(
+            order=2,
+            provider_message_id="message-2",
+            projection=second,
+            internal_at="2027-08-02T09:00:00-07:00",
+            start_offset=1_000,
+        ),
     )
+    plan = _plan(pairs)
 
     resolution = _resolve(plan, _uniform_verdicts(plan, "different_event"))
 
     assert [item.consensus for item in resolution.pair_consensus] == ["different_event"]
-    assert resolution.clusters == ()
-    assert resolution.assertions == ()
+    assert len(resolution.clusters) == 2
+    assert all(len(item.unit_ids) == 1 for item in resolution.clusters)
+    assert len({item.event_identity_key for item in resolution.clusters}) == 2
+    assert len(resolution.assertions) == 2
+    assert {item.verification for item in resolution.assertions} == {
+        "source_bound_self_identity"
+    }
+
+    authority, messages = _snapshot(pairs)
+    lifecycle = project_gmail_temporal_thread_lifecycle(
+        snapshot_authority=authority,
+        messages=_with_assertions(messages, resolution.assertions),
+        event_identity_analysis_authorities=_analysis_authorities(messages),
+        event_identity_plan=plan,
+        event_identity_resolution=resolution,
+    )
+    assert len(lifecycle.events) == 2
+    assert {item.current_status for item in lifecycle.events} == {"scheduled"}
+    assert {item.occurrences[0].normalized_value for item in lifecycle.events} == {
+        "2027-08-14",
+        "2027-09-14",
+    }
 
 
 def test_non_clique_transitive_links_fail_closed_including_same_message_pair() -> None:
@@ -645,9 +1045,234 @@ def test_event_key_and_unit_ids_survive_append_and_thread_revision() -> None:
     assert {item.unit_authority_fingerprint for item in expanded_plan.units} != {
         item.unit_authority_fingerprint for item in initial_plan.units
     }
-    assert expanded_resolution.clusters[0].event_identity_key == (
+    expanded_event_cluster = next(
+        item for item in expanded_resolution.clusters if len(item.unit_ids) == 2
+    )
+    assert expanded_event_cluster.event_identity_key == (
         initial_resolution.clusters[0].event_identity_key
     )
+
+
+def test_prior_singleton_key_survives_later_same_event_join() -> None:
+    schedule = _projection(
+        "The Apollo interview is scheduled for August 14, 2027.",
+        _select_lifecycle("scheduled"),
+        internal_at="2027-08-01T09:00:00-07:00",
+        chunk_id="message-1",
+    )
+    initial_pairs = (
+        _message(
+            order=1,
+            provider_message_id="message-1",
+            projection=schedule,
+            internal_at="2027-08-01T09:00:00-07:00",
+            start_offset=0,
+        ),
+    )
+    initial_plan = _plan(initial_pairs)
+    prior = resolve_gmail_temporal_event_identity(
+        plan=initial_plan,
+        verdict_sets=(),
+    )
+    prior_key = prior.clusters[0].event_identity_key
+
+    cancellation = _projection(
+        "The Apollo interview was cancelled on August 14, 2027.",
+        _select_lifecycle("cancelled"),
+        internal_at="2027-08-02T09:00:00-07:00",
+        chunk_id="message-2",
+    )
+    expanded_pairs = (
+        *initial_pairs,
+        _message(
+            order=2,
+            provider_message_id="message-2",
+            projection=cancellation,
+            internal_at="2027-08-02T09:00:00-07:00",
+            start_offset=1_000,
+        ),
+    )
+    expanded_plan = _plan(expanded_pairs, prior_resolution=prior)
+    updated = _resolve(
+        expanded_plan,
+        _uniform_verdicts(expanded_plan, "same_event"),
+        prior_resolution=prior,
+    )
+
+    assert len(updated.clusters) == 1
+    assert len(updated.clusters[0].unit_ids) == 2
+    assert updated.clusters[0].event_identity_key == prior_key
+    assert {item.verification for item in updated.assertions} == {"external_verified"}
+    authority, messages = _snapshot(expanded_pairs, prior_resolution=prior)
+    lifecycle = project_gmail_temporal_thread_lifecycle(
+        snapshot_authority=authority,
+        messages=_with_assertions(messages, updated.assertions),
+        event_identity_analysis_authorities=_analysis_authorities(messages),
+        event_identity_plan=expanded_plan,
+        event_identity_resolution=updated,
+        event_identity_prior_resolution=prior,
+    )
+    assert lifecycle.events[0].current_status == "cancelled"
+
+
+def test_uncertain_append_preserves_prior_singleton_and_new_unit_stays_unresolved() -> (
+    None
+):
+    schedule = _projection(
+        "The Apollo interview is scheduled for August 14, 2027.",
+        _select_lifecycle("scheduled"),
+        internal_at="2027-08-01T09:00:00-07:00",
+        chunk_id="message-1",
+    )
+    initial_pairs = (
+        _message(
+            order=1,
+            provider_message_id="message-1",
+            projection=schedule,
+            internal_at="2027-08-01T09:00:00-07:00",
+            start_offset=0,
+        ),
+    )
+    prior = resolve_gmail_temporal_event_identity(
+        plan=_plan(initial_pairs),
+        verdict_sets=(),
+    )
+    cancellation = _projection(
+        "The Apollo interview was cancelled on August 14, 2027.",
+        _select_lifecycle("cancelled"),
+        internal_at="2027-08-02T09:00:00-07:00",
+        chunk_id="message-2",
+    )
+    expanded_pairs = (
+        *initial_pairs,
+        _message(
+            order=2,
+            provider_message_id="message-2",
+            projection=cancellation,
+            internal_at="2027-08-02T09:00:00-07:00",
+            start_offset=1_000,
+        ),
+    )
+    expanded_plan = _plan(expanded_pairs, prior_resolution=prior)
+    pair_id = expanded_plan.pairs[0].pair_id
+    verdict_sets = tuple(
+        make_gmail_temporal_event_identity_verdict_set(
+            plan=expanded_plan,
+            run_ordinal=ordinal,
+            invocation_id=f"external-uncertain-{ordinal}",
+            response_sha256=str(ordinal) * 64,
+            verdicts={pair_id: "same_event" if ordinal < 3 else "different_event"},
+        )
+        for ordinal in (1, 2, 3)
+    )
+
+    updated = resolve_gmail_temporal_event_identity(
+        plan=expanded_plan,
+        verdict_sets=verdict_sets,
+        prior_resolution=prior,
+    )
+
+    assert [item.consensus for item in updated.pair_consensus] == ["uncertain"]
+    assert len(updated.clusters) == 2
+    assert all(len(item.unit_ids) == 1 for item in updated.clusters)
+    prior_unit_id = prior.clusters[0].unit_ids[0]
+    retained = next(item for item in updated.clusters if prior_unit_id in item.unit_ids)
+    assert retained.event_identity_key == prior.clusters[0].event_identity_key
+    assert len(updated.assertions) == 2
+    assert {item.verification for item in updated.assertions} == {
+        "source_bound_self_identity"
+    }
+
+    authority, messages = _snapshot(expanded_pairs, prior_resolution=prior)
+    lifecycle = project_gmail_temporal_thread_lifecycle(
+        snapshot_authority=authority,
+        messages=_with_assertions(messages, updated.assertions),
+        event_identity_analysis_authorities=_analysis_authorities(messages),
+        event_identity_plan=expanded_plan,
+        event_identity_resolution=updated,
+        event_identity_prior_resolution=prior,
+    )
+    assert len(lifecycle.events) == 2
+    assert sorted(item.current_status for item in lifecycle.events) == [
+        "scheduled",
+        "unresolved",
+    ]
+    assert [item.reason for item in lifecycle.unresolved_alternatives] == [
+        "terminal_transition_lacks_current_scheduled_occurrence"
+    ]
+
+    replay = resolve_gmail_temporal_event_identity(
+        plan=expanded_plan,
+        verdict_sets=verdict_sets,
+        prior_resolution=prior,
+    )
+    assert replay == updated
+
+    joined_plan = _plan(expanded_pairs, prior_resolution=updated)
+    joined = _resolve(
+        joined_plan,
+        _uniform_verdicts(joined_plan, "same_event"),
+        prior_resolution=updated,
+    )
+    assert len(joined.clusters) == 1
+    assert len(joined.clusters[0].unit_ids) == 2
+    assert joined.clusters[0].event_identity_key == (
+        prior.clusters[0].event_identity_key
+    )
+
+
+def test_later_clique_cannot_merge_two_prior_multi_unit_event_keys() -> None:
+    projections = (
+        _projection(
+            "The Apollo interview is scheduled for August 14, 2027.",
+            _select_lifecycle("scheduled"),
+            internal_at="2027-08-01T09:00:00-07:00",
+            chunk_id="message-1",
+        ),
+        _projection(
+            "The Apollo interview was cancelled on August 14, 2027.",
+            _select_lifecycle("cancelled"),
+            internal_at="2027-08-02T09:00:00-07:00",
+            chunk_id="message-2",
+        ),
+        _projection(
+            "The budget review is scheduled for September 14, 2027.",
+            _select_lifecycle("scheduled"),
+            internal_at="2027-08-03T09:00:00-07:00",
+            chunk_id="message-3",
+        ),
+        _projection(
+            "The budget review was cancelled on September 14, 2027.",
+            _select_lifecycle("cancelled"),
+            internal_at="2027-08-04T09:00:00-07:00",
+            chunk_id="message-4",
+        ),
+    )
+    pairs = tuple(
+        _message(
+            order=index,
+            provider_message_id=f"message-{index}",
+            projection=projection,
+            internal_at=f"2027-08-0{index}T09:00:00-07:00",
+            start_offset=(index - 1) * 1_000,
+        )
+        for index, projection in enumerate(projections, start=1)
+    )
+    plan = _plan(pairs)
+    prior_verdicts = _uniform_verdicts(plan, "different_event")
+    prior_verdicts[_pair_for_orders(plan, 1, 2).pair_id] = "same_event"
+    prior_verdicts[_pair_for_orders(plan, 3, 4).pair_id] = "same_event"
+    prior = _resolve(plan, prior_verdicts)
+    assert len(prior.clusters) == 2
+    assert all(len(item.unit_ids) == 2 for item in prior.clusters)
+
+    updated_plan = _plan(pairs, prior_resolution=prior)
+    with pytest.raises(GmailTemporalEventIdentityError, match="multiple prior"):
+        _resolve(
+            updated_plan,
+            _uniform_verdicts(updated_plan, "same_event"),
+            prior_resolution=prior,
+        )
 
 
 def test_prior_resolution_preserves_key_when_older_same_event_message_arrives() -> None:
@@ -691,37 +1316,36 @@ def test_prior_resolution_preserves_key_when_older_same_event_message_arrives() 
     )
     revised_hash = "a" * 64
     revised_revision = "b" * 64
-    expanded_plan = _plan(
-        (
-            _message(
-                order=1,
-                provider_message_id="message-1",
-                projection=delayed_schedule,
-                internal_at="2027-07-30T09:00:00-07:00",
-                start_offset=0,
-                document_hash=revised_hash,
-                source_revision=revised_revision,
-            ),
-            _message(
-                order=2,
-                provider_message_id="message-2",
-                projection=later_schedule,
-                internal_at="2027-08-01T09:00:00-07:00",
-                start_offset=1_000,
-                document_hash=revised_hash,
-                source_revision=revised_revision,
-            ),
-            _message(
-                order=3,
-                provider_message_id="message-3",
-                projection=cancellation,
-                internal_at="2027-08-02T09:00:00-07:00",
-                start_offset=2_000,
-                document_hash=revised_hash,
-                source_revision=revised_revision,
-            ),
-        )
+    expanded_pairs = (
+        _message(
+            order=1,
+            provider_message_id="message-1",
+            projection=delayed_schedule,
+            internal_at="2027-07-30T09:00:00-07:00",
+            start_offset=0,
+            document_hash=revised_hash,
+            source_revision=revised_revision,
+        ),
+        _message(
+            order=2,
+            provider_message_id="message-2",
+            projection=later_schedule,
+            internal_at="2027-08-01T09:00:00-07:00",
+            start_offset=1_000,
+            document_hash=revised_hash,
+            source_revision=revised_revision,
+        ),
+        _message(
+            order=3,
+            provider_message_id="message-3",
+            projection=cancellation,
+            internal_at="2027-08-02T09:00:00-07:00",
+            start_offset=2_000,
+            document_hash=revised_hash,
+            source_revision=revised_revision,
+        ),
     )
+    expanded_plan = _plan(expanded_pairs, prior_resolution=prior)
     updated = _resolve(
         expanded_plan,
         _uniform_verdicts(expanded_plan, "same_event"),
@@ -731,6 +1355,112 @@ def test_prior_resolution_preserves_key_when_older_same_event_message_arrives() 
     assert (
         updated.clusters[0].event_identity_key == prior.clusters[0].event_identity_key
     )
+    assert updated.clusters[0].event_identity_anchor_unit_id == (
+        prior.clusters[0].event_identity_anchor_unit_id
+    )
+    assert updated.prior_resolution_fingerprint == prior.resolution_fingerprint
+    with pytest.raises(
+        GmailTemporalEventIdentityError,
+        match="requires its exact prior authority",
+    ):
+        validate_gmail_temporal_event_identity_resolution(
+            plan=expanded_plan,
+            resolution=updated,
+        )
+    validate_gmail_temporal_event_identity_resolution(
+        plan=expanded_plan,
+        resolution=updated,
+        prior_resolution=prior,
+    )
+
+    third_plan = _plan(expanded_pairs, prior_resolution=updated)
+    third = _resolve(
+        third_plan,
+        _uniform_verdicts(third_plan, "same_event"),
+        prior_resolution=updated,
+    )
+    assert third.clusters[0].event_identity_key == (
+        prior.clusters[0].event_identity_key
+    )
+    assert third.clusters[0].event_identity_anchor_unit_id == (
+        prior.clusters[0].event_identity_anchor_unit_id
+    )
+
+
+def test_refingerprinted_same_cluster_member_key_substitution_is_rejected() -> None:
+    schedule = _projection(
+        "The Apollo interview is scheduled for August 14, 2027.",
+        _select_lifecycle("scheduled"),
+        internal_at="2027-08-01T09:00:00-07:00",
+        chunk_id="message-1",
+    )
+    cancellation = _projection(
+        "The Apollo interview was cancelled on August 14, 2027.",
+        _select_lifecycle("cancelled"),
+        internal_at="2027-08-02T09:00:00-07:00",
+        chunk_id="message-2",
+    )
+    pairs = (
+        _message(
+            order=1,
+            provider_message_id="message-1",
+            projection=schedule,
+            internal_at="2027-08-01T09:00:00-07:00",
+            start_offset=0,
+        ),
+        _message(
+            order=2,
+            provider_message_id="message-2",
+            projection=cancellation,
+            internal_at="2027-08-02T09:00:00-07:00",
+            start_offset=1_000,
+        ),
+    )
+    plan = _plan(pairs)
+    resolution = _resolve(plan, _uniform_verdicts(plan, "same_event"))
+    cluster = resolution.clusters[0]
+    substitute_anchor = next(
+        unit_id
+        for unit_id in cluster.unit_ids
+        if unit_id != cluster.event_identity_anchor_unit_id
+    )
+    substitute_key = _event_key_for_unit(substitute_anchor)
+    forged = _refingerprint_resolution(
+        replace(
+            resolution,
+            clusters=(
+                replace(
+                    cluster,
+                    event_identity_anchor_unit_id=substitute_anchor,
+                    event_identity_key=substitute_key,
+                ),
+            ),
+            assertions=tuple(
+                replace(assertion, event_identity_key=substitute_key)
+                for assertion in resolution.assertions
+            ),
+        )
+    )
+
+    with pytest.raises(
+        GmailTemporalEventIdentityError,
+        match="event anchor is not canonical or prior-derived",
+    ):
+        validate_gmail_temporal_event_identity_resolution(
+            plan=plan,
+            resolution=forged,
+        )
+
+    with pytest.raises(
+        GmailTemporalEventIdentityError,
+        match="does not match the trusted thread authority",
+    ):
+        authorized_plan = _plan(pairs, prior_resolution=resolution)
+        _resolve(
+            authorized_plan,
+            _uniform_verdicts(authorized_plan, "same_event"),
+            prior_resolution=forged,
+        )
 
 
 @pytest.mark.parametrize("foreign_key_source", ["arbitrary", "unclustered_unit"])
@@ -755,31 +1485,30 @@ def test_fabricated_prior_resolution_cannot_inject_a_foreign_event_key(
         internal_at="2027-08-03T09:00:00-07:00",
         chunk_id="message-3",
     )
-    plan = _plan(
-        (
-            _message(
-                order=1,
-                provider_message_id="message-1",
-                projection=schedule,
-                internal_at="2027-08-01T09:00:00-07:00",
-                start_offset=0,
-            ),
-            _message(
-                order=2,
-                provider_message_id="message-2",
-                projection=cancellation,
-                internal_at="2027-08-02T09:00:00-07:00",
-                start_offset=1_000,
-            ),
-            _message(
-                order=3,
-                provider_message_id="message-3",
-                projection=unrelated,
-                internal_at="2027-08-03T09:00:00-07:00",
-                start_offset=2_000,
-            ),
-        )
+    pairs = (
+        _message(
+            order=1,
+            provider_message_id="message-1",
+            projection=schedule,
+            internal_at="2027-08-01T09:00:00-07:00",
+            start_offset=0,
+        ),
+        _message(
+            order=2,
+            provider_message_id="message-2",
+            projection=cancellation,
+            internal_at="2027-08-02T09:00:00-07:00",
+            start_offset=1_000,
+        ),
+        _message(
+            order=3,
+            provider_message_id="message-3",
+            projection=unrelated,
+            internal_at="2027-08-03T09:00:00-07:00",
+            start_offset=2_000,
+        ),
     )
+    plan = _plan(pairs)
     verdicts = _uniform_verdicts(plan, "different_event")
     verdicts[_pair_for_orders(plan, 1, 2).pair_id] = "same_event"
     prior = _resolve(plan, verdicts)
@@ -795,9 +1524,14 @@ def test_fabricated_prior_resolution_cannot_inject_a_foreign_event_key(
 
     with pytest.raises(
         GmailTemporalEventIdentityError,
-        match="event key is not anchored",
+        match="does not match the trusted thread authority",
     ):
-        _resolve(plan, verdicts, prior_resolution=forged_prior)
+        authorized_plan = _plan(pairs, prior_resolution=prior)
+        _resolve(
+            authorized_plan,
+            verdicts,
+            prior_resolution=forged_prior,
+        )
 
 
 @pytest.mark.parametrize("forgery", ["omit_clique_member", "replace_pair_id"])
@@ -824,18 +1558,17 @@ def test_fabricated_prior_resolution_cannot_rewrite_cluster_topology(
             chunk_id="message-3",
         ),
     )
-    plan = _plan(
-        tuple(
-            _message(
-                order=index,
-                provider_message_id=f"message-{index}",
-                projection=projection,
-                internal_at=f"2027-08-0{index}T09:00:00-07:00",
-                start_offset=(index - 1) * 1_000,
-            )
-            for index, projection in enumerate(projections, start=1)
+    pairs = tuple(
+        _message(
+            order=index,
+            provider_message_id=f"message-{index}",
+            projection=projection,
+            internal_at=f"2027-08-0{index}T09:00:00-07:00",
+            start_offset=(index - 1) * 1_000,
         )
+        for index, projection in enumerate(projections, start=1)
     )
+    plan = _plan(pairs)
     verdicts = _uniform_verdicts(plan, "same_event")
     prior = _resolve(plan, verdicts)
     cluster = prior.clusters[0]
@@ -891,8 +1624,12 @@ def test_fabricated_prior_resolution_cannot_rewrite_cluster_topology(
         )
     )
 
-    with pytest.raises(GmailTemporalEventIdentityError, match="topology"):
-        _resolve(plan, verdicts, prior_resolution=forged)
+    authorized_plan = _plan(pairs, prior_resolution=prior)
+    with pytest.raises(
+        GmailTemporalEventIdentityError,
+        match="does not match the trusted thread authority",
+    ):
+        _resolve(authorized_plan, verdicts, prior_resolution=forged)
 
 
 def test_deadline_hypotheses_are_excluded_and_bounds_are_consistent() -> None:
@@ -916,6 +1653,13 @@ def test_deadline_hypotheses_are_excluded_and_bounds_are_consistent() -> None:
 
     assert plan.units == ()
     assert plan.pairs == ()
+    resolution = resolve_gmail_temporal_event_identity(
+        plan=plan,
+        verdict_sets=(),
+    )
+    assert resolution.verdict_set_fingerprints == ()
+    assert resolution.clusters == ()
+    assert resolution.assertions == ()
     assert MAX_EVENT_IDENTITY_PAIRS == (
         MAX_EVENT_IDENTITY_UNITS * (MAX_EVENT_IDENTITY_UNITS - 1) // 2
     )
@@ -978,7 +1722,12 @@ def test_incomplete_stale_and_conflicting_external_sets_fail_closed() -> None:
         verdict_sets=sets,
     )
     assert conflicting.pair_consensus[0].consensus == "uncertain"
-    assert conflicting.assertions == ()
+    assert len(conflicting.clusters) == 2
+    assert all(len(item.unit_ids) == 1 for item in conflicting.clusters)
+    assert len(conflicting.assertions) == 2
+    assert {item.verification for item in conflicting.assertions} == {
+        "source_bound_self_identity"
+    }
 
     with pytest.raises(GmailTemporalEventIdentityError, match="stale"):
         resolve_gmail_temporal_event_identity(

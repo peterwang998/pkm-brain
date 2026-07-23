@@ -28,6 +28,7 @@ from pkm_brain.gmail_projection import (
     gmail_projection_session_id,
 )
 from pkm_brain.gmail_temporal_review import (
+    GMAIL_TEMPORAL_REVIEW_PROJECTION_VERSION,
     GmailTemporalReviewArtifact,
     GmailTemporalReviewClusterReview,
     GmailTemporalReviewGroup,
@@ -168,17 +169,20 @@ def _source(
 def _projection(
     *, suffix: str = "a", source_sha256: str = SOURCE_SHA256
 ) -> GmailTemporalReviewProjection:
+    supported_subject_types = ((f"subject-supported-{suffix}", "event"),)
     supported_hypothesis = GmailTemporalReviewHypothesis(
-        version="gmail_temporal_review_hypothesis_v1",
+        version="gmail_temporal_review_hypothesis_v2",
         hypothesis_id=_hypothesis_id(
             expression_id=f"expression-supported-{suffix}",
             relation="scheduled_for",
             kind="planned",
             lifecycle="scheduled",
             normalized_value="2026-08-01T17:00:00+00:00",
+            subject_type_references=supported_subject_types,
         ),
         expression_id=f"expression-supported-{suffix}",
         subject_mention_ids=(f"subject-supported-{suffix}",),
+        subject_type_references=supported_subject_types,
         lifecycle_mention_ids=(f"lifecycle-supported-{suffix}",),
         relation="scheduled_for",
         kind="planned",
@@ -187,17 +191,20 @@ def _projection(
         candidate_ids=(f"candidate-supported-{suffix}",),
         candidate_requires_defer=False,
     )
+    uncertain_subject_types = ((f"subject-uncertain-{suffix}", "event_predicate"),)
     uncertain_hypothesis = GmailTemporalReviewHypothesis(
-        version="gmail_temporal_review_hypothesis_v1",
+        version="gmail_temporal_review_hypothesis_v2",
         hypothesis_id=_hypothesis_id(
             expression_id=f"expression-uncertain-{suffix}",
             relation="occurrence",
             kind="actual",
             lifecycle="unknown",
             normalized_value=None,
+            subject_type_references=uncertain_subject_types,
         ),
         expression_id=f"expression-uncertain-{suffix}",
         subject_mention_ids=(f"subject-uncertain-{suffix}",),
+        subject_type_references=uncertain_subject_types,
         lifecycle_mention_ids=(),
         relation="occurrence",
         kind="actual",
@@ -207,7 +214,7 @@ def _projection(
         candidate_requires_defer=True,
     )
     supported = GmailTemporalReviewArtifact(
-        version="gmail_temporal_review_artifact_v1",
+        version="gmail_temporal_review_artifact_v2",
         artifact_id=f"supported:candidate-supported-{suffix}",
         kind="supported_citation",
         evidence_status="supported",
@@ -218,7 +225,7 @@ def _projection(
         hypotheses=(supported_hypothesis,),
     )
     uncertain = GmailTemporalReviewArtifact(
-        version="gmail_temporal_review_artifact_v1",
+        version="gmail_temporal_review_artifact_v2",
         artifact_id=f"uncertainty:cluster-uncertain-{suffix}",
         kind="uncertainty_sidecar",
         evidence_status="uncertain",
@@ -261,7 +268,7 @@ def _projection(
         ),
     )
     projection = GmailTemporalReviewProjection(
-        version="gmail_temporal_review_projection_v1",
+        version="gmail_temporal_review_projection_v2",
         projection_fingerprint="",
         analysis_fingerprint=f"analysis-{suffix}",
         source_sha256=source_sha256,
@@ -339,6 +346,7 @@ def _hypothesis_id(
     kind: str,
     lifecycle: str,
     normalized_value: str | None,
+    subject_type_references: tuple[tuple[str, str], ...],
 ) -> str:
     signature = (
         expression_id,
@@ -348,8 +356,9 @@ def _hypothesis_id(
         normalized_value,
     )
     material = {
-        "version": "gmail_temporal_review_hypothesis_v1",
+        "version": "gmail_temporal_review_hypothesis_v2",
         "signature": signature,
+        "subject_type_references": subject_type_references,
     }
     return "gtrh_" + hashlib.sha256(_canonical_bytes(material)).hexdigest()
 
@@ -546,6 +555,102 @@ def test_production_head_without_matching_execution_receipt_is_stale(
     assert head.stale_reason == "runner_execution_missing"
 
 
+def test_v1_projection_head_is_stale_replaceable_and_not_restorable(
+    tmp_path: Path,
+) -> None:
+    paths = _workspace(tmp_path)
+    target_scope = "gmail-temporal-review/schema-retirement"
+    seed = persist_gmail_temporal_review_projection(
+        paths,
+        source=_source(),
+        pipeline_scope="gmail-temporal-review/schema-retirement-seed",
+        projection=_projection(suffix="seed"),
+        expected_head_run_id=None,
+        expected_head_generation=None,
+    )
+    with connection(paths.sqlite_path) as conn:
+        stored = dict(
+            conn.execute(
+                "SELECT * FROM gmail_temporal_review_runs WHERE id = ?",
+                (seed.run_id,),
+            ).fetchone()
+        )
+        legacy_payload = json.loads(stored["projection_json"])
+        legacy_payload["version"] = "gmail_temporal_review_projection_v1"
+        for artifact in legacy_payload["artifacts"]:
+            artifact["version"] = "gmail_temporal_review_artifact_v1"
+            for hypothesis in artifact["hypotheses"]:
+                hypothesis["version"] = "gmail_temporal_review_hypothesis_v1"
+                hypothesis.pop("subject_type_references")
+        legacy_json = _canonical_bytes(legacy_payload).decode("utf-8")
+        stored.update(
+            id="legacy-schema-run",
+            input_key="legacy-schema-input",
+            pipeline_scope=target_scope,
+            projection_version="gmail_temporal_review_projection_v1",
+            projection_json=legacy_json,
+            projection_sha256=hashlib.sha256(legacy_json.encode("utf-8")).hexdigest(),
+        )
+        columns = tuple(stored)
+        conn.execute(
+            f"INSERT INTO gmail_temporal_review_runs({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' for _ in columns)})",
+            tuple(stored[column] for column in columns),
+        )
+        conn.execute(
+            """
+            INSERT INTO gmail_temporal_review_heads(
+              message_scope_key, pipeline_scope, run_id, generation, updated_at
+            ) VALUES (?, ?, 'legacy-schema-run', 1, ?)
+            """,
+            (seed.message_scope_key, target_scope, "2026-07-22T20:00:00+00:00"),
+        )
+
+    stale = get_gmail_temporal_review_head(
+        paths,
+        message_scope_key=seed.message_scope_key,
+        pipeline_scope=target_scope,
+    )
+
+    assert stale is not None
+    assert stale.source_status == "stale"
+    assert stale.stale_reason == "projection_schema_retired"
+
+    replacement = persist_gmail_temporal_review_projection(
+        paths,
+        source=_source(),
+        pipeline_scope=target_scope,
+        projection=_projection(suffix="replacement"),
+        expected_head_run_id="legacy-schema-run",
+        expected_head_generation=1,
+    )
+    current = get_gmail_temporal_review_head(
+        paths,
+        message_scope_key=seed.message_scope_key,
+        pipeline_scope=target_scope,
+    )
+
+    assert current is not None
+    assert current.run_id == replacement.run_id
+    assert current.generation == 2
+    assert current.source_status == "current"
+    with pytest.raises(
+        GmailTemporalPersistenceError,
+        match="rollback target review projection schema is retired",
+    ):
+        rollback_gmail_temporal_review_head(
+            paths,
+            message_scope_key=seed.message_scope_key,
+            pipeline_scope=target_scope,
+            expected_run_id=replacement.run_id,
+            expected_generation=2,
+            restore_run_id="legacy-schema-run",
+        )
+    assert GMAIL_TEMPORAL_REVIEW_PROJECTION_VERSION == (
+        "gmail_temporal_review_projection_v2"
+    )
+
+
 def test_same_input_key_with_different_projection_bytes_fails_closed(
     tmp_path: Path,
 ) -> None:
@@ -567,6 +672,9 @@ def test_same_input_key_with_different_projection_bytes_fails_closed(
             kind=original.artifacts[0].hypotheses[0].kind,
             lifecycle=original.artifacts[0].hypotheses[0].lifecycle,
             normalized_value="2026-08-02T17:00:00+00:00",
+            subject_type_references=(
+                original.artifacts[0].hypotheses[0].subject_type_references
+            ),
         ),
         normalized_value="2026-08-02T17:00:00+00:00",
     )

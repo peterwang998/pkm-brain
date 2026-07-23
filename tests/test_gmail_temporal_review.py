@@ -32,6 +32,7 @@ from pkm_brain.gmail_temporal_review import (
     GmailTemporalReviewError,
     GmailTemporalReviewGroup,
     GmailTemporalReviewGroupMember,
+    GmailTemporalReviewHypothesis,
     GmailTemporalReviewProjection,
     canonical_gmail_temporal_review_projection_bytes,
     gmail_temporal_review_projection_payload,
@@ -207,9 +208,43 @@ def _refingerprinted(
     )
 
 
+def _with_subject_type_references(
+    hypothesis: GmailTemporalReviewHypothesis,
+    references: tuple[tuple[str, str], ...],
+) -> GmailTemporalReviewHypothesis:
+    signature = (
+        hypothesis.expression_id,
+        hypothesis.relation,
+        hypothesis.kind,
+        hypothesis.lifecycle,
+        hypothesis.normalized_value,
+    )
+    material = {
+        "version": "gmail_temporal_review_hypothesis_v2",
+        "signature": signature,
+        "subject_type_references": references,
+    }
+    return replace(
+        hypothesis,
+        hypothesis_id="gtrh_"
+        + hashlib.sha256(
+            json.dumps(
+                material,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest(),
+        subject_type_references=references,
+    )
+
+
 def test_single_projection_is_canonical_content_free_and_always_deferred() -> None:
     text = "The Super Secret Meeting is scheduled for August 14, 2027."
-    _, _, _, projection = _fixture(text, _select_lifecycle("scheduled", "supported"))
+    analysis, _, _, projection = _fixture(
+        text,
+        _select_lifecycle("scheduled", "supported"),
+    )
 
     assert len(projection.artifacts) == 1
     artifact = projection.artifacts[0]
@@ -219,6 +254,11 @@ def test_single_projection_is_canonical_content_free_and_always_deferred() -> No
     )
     assert artifact.candidate_authorization is True
     assert artifact.hypotheses[0].candidate_requires_defer is False
+    mention_types = {item.mention_id: item.mention_type for item in analysis.mentions}
+    assert artifact.hypotheses[0].subject_type_references == tuple(
+        (mention_id, mention_types[mention_id])
+        for mention_id in artifact.hypotheses[0].subject_mention_ids
+    )
     assert artifact.hypotheses[0].requires_defer is True
     assert artifact.requires_defer is True
     assert artifact.routable is False
@@ -242,6 +282,64 @@ def test_single_projection_is_canonical_content_free_and_always_deferred() -> No
         gmail_temporal_review_projection_payload(projection)["projection_fingerprint"]
         == projection.projection_fingerprint
     )
+
+
+@pytest.mark.parametrize(
+    ("text", "lifecycle", "expected_type"),
+    (
+        ("The upload is scheduled for August 18, 2027.", "scheduled", "action"),
+        (
+            "The arrival was cancelled on August 18, 2027.",
+            "cancelled",
+            "boundary",
+        ),
+    ),
+)
+def test_non_event_temporal_artifacts_preserve_exact_subject_types(
+    text: str,
+    lifecycle: str,
+    expected_type: str,
+) -> None:
+    _, _, _, projection = _fixture(
+        text,
+        _select_lifecycle(lifecycle, "supported"),
+        chunk_id=f"review-subject-type-{expected_type}",
+    )
+
+    assert len(projection.artifacts) == 1
+    hypothesis = projection.artifacts[0].hypotheses[0]
+    assert hypothesis.subject_type_references == (
+        (hypothesis.subject_mention_ids[0], expected_type),
+    )
+
+
+def test_subject_type_references_fail_closed_when_incomplete_or_mixed() -> None:
+    text = "The meeting is scheduled for August 14, 2027."
+    _, _, _, projection = _fixture(
+        text,
+        _select_lifecycle("scheduled", "supported"),
+        chunk_id="review-subject-type-integrity",
+    )
+    artifact = projection.artifacts[0]
+    hypothesis = artifact.hypotheses[0]
+    subject_id = hypothesis.subject_mention_ids[0]
+    invalid_references = (
+        (),
+        ((f"{subject_id}-mismatch", "event"),),
+        tuple(sorted(((subject_id, "action"), (subject_id, "event")))),
+    )
+
+    for references in invalid_references:
+        changed_hypothesis = _with_subject_type_references(hypothesis, references)
+        changed_projection = _refingerprinted(
+            replace(
+                projection,
+                projection_fingerprint="",
+                artifacts=(replace(artifact, hypotheses=(changed_hypothesis,)),),
+            )
+        )
+        with pytest.raises(GmailTemporalReviewError, match="artifact structure"):
+            canonical_gmail_temporal_review_projection_bytes(changed_projection)
 
 
 def test_v19_syn_ambiguous_04_preserves_alternatives_and_alias_collapse() -> None:

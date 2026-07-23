@@ -614,10 +614,15 @@ subject aliases are already durable event identity.
 `gmail_temporal_thread_lifecycle.py` now supplies the missing pure representation
 for a later message that cancels, completes, or reschedules an earlier event.
 It accepts one current immutable thread snapshot, current message-level review
-heads, and exact artifact/hypothesis assertions to a stable event identity. Only
-owner- or externally-verified assertions with one identical key may reconcile
-messages. Same-thread membership, matching dates, unverified assertions, and
-conflicting keys remain unresolved and cannot change event state.
+heads, and the resolver's complete content-free lead analyses, plan, resolution,
+and exact parent resolution when one is declared. The lifecycle payload retains
+and revalidates that authority instead of trusting caller-authored assertions.
+A source-bound self assertion therefore authorizes only its provisional
+single-source view. Only assertions from a validated unanimous external
+resolution may reconcile different observations. Owner corrections deliberately
+fail closed until a trusted owner-receipt ledger exists. Same-thread membership,
+matching dates, unverified or uncertain cross-unit identity, and conflicting
+keys cannot change another observation's event state.
 
 The projection retains every occurrence. A supported reschedule marks the old
 occurrence superseded and links it to the replacement; cancellation and
@@ -627,12 +632,49 @@ cross-thread inputs, missing trusted chronology, and incompatible identity fail
 closed. Every view remains derived, deferred, and non-routable.
 
 This closes the representation gap, not the production integration gap.
-`gmail_temporal_event_identity.py` now supplies a bounded pure identity bridge:
-it compares only event-centered units, requires three complete external verdict
-sets, merges only unanimous cliques, preserves prior event keys as threads grow,
-and refuses a merge of two previously distinct events. There is still no live
-identity-verdict executor, scheduled verifier/runner, or ledger integration for
-the thread view, so the existing-thread canary remains blocked.
+`gmail_temporal_event_identity.py` now supplies a bounded pure identity bridge.
+Exact subject-type references are rebound to the immutable content-free lead
+analysis, keeping actions, boundaries, and deadlines visible in temporal review
+without manufacturing event entities. Every adjacency-isolated
+event unit receives a deterministic, provisional source-self key; a zero-pair
+plan therefore resolves locally with zero model calls. Pair uncertainty remains
+explicit and gives no cross-unit authority. Pairful plans still require three
+complete external verdict sets, merge only unanimous cliques, preserve prior
+keys as threads grow, and refuse a merge of two prior multi-unit event clusters.
+An exact-plan binder prevents assertion targets from being swapped before the
+lifecycle view is built. Lifecycle construction and serialization require the
+same analyses, plan, resolution, and parent authority for every resolver-verified
+assertion, so the binder cannot be bypassed by directly constructing message
+assertions. The analysis snapshot hash is now recomputed from its complete
+content-free graph and exact trusted Gmail inputs instead of merely comparing a
+caller-carried string. Thread snapshot authority v2 additionally binds the
+current ledger's analysis fingerprint, projection fingerprint, and canonical
+projection SHA-256. It also carries the exact prior identity-resolution head
+authorized for the next plan. A valid `{B,C}` event can therefore retain anchor
+`B` when an earlier message `A` arrives and continue through a later generation,
+while a refingerprinted substitute parent is rejected against the unchanged
+trusted receipt. The review, identity, assertion, lifecycle, and thread-authority
+wire schemas are v2; persisted v1 review heads remain immutable history but are
+stale and must be atomically regenerated. The pure authority records still need
+a durable loader and append-only identity-head ledger before this becomes a
+hostile-caller boundary. There is also no live identity-verdict executor,
+scheduled thread runner, or retrieval integration, so the existing-thread canary
+remains blocked.
+
+The stable long-term model is two-level: every eligible source claim has a
+searchable temporal-observation identity, while only verified equivalence creates
+or updates a canonical event. Fresh uncertain observations remain recallable but
+cannot deduplicate, drive reminders, or transition another observation's
+lifecycle. The present source-self lifecycle view is a review-only bridge toward
+that model, not a claim that structural addressability equals semantic recall.
+
+The public synthetic structural diagnostic now exercises five scenarios across
+six message runs: seven eligible event units yield five provisional source-self
+views, six structural clusters, one canonical cross-unit consensus cluster, and
+five lifecycle views; two deadline artifacts remain non-event review artifacts.
+All eleven safety invariants pass with zero private Gmail records and zero external
+model calls. This establishes structural addressability only. It does not
+measure semantic recall or precision on personal mail.
 
 ### 10. Review-only persistence boundary
 
@@ -778,7 +820,7 @@ or message text, and makes zero model or persistence calls.
 - The historical replay and fresh packet planner print aggregates only.
 - The planner, frontier, verdict validator, ensemble reducer, and evaluator are
   non-routable and make no external calls by themselves.
-- The final complete repository run passed all 1,807 tests, including the 20
+- The final complete repository run passed all 1,836 tests, including the 20
   connector tests that require a temporary localhost OAuth callback. The focused
   current Gmail policy/runner/batching/frontier/persistence/migration suite
   passed 353 tests, including the aggregate audit's privacy tests.

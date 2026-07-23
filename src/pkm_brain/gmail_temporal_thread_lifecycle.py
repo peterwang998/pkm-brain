@@ -3,11 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
-from typing import Any, Literal, Mapping
+from typing import TYPE_CHECKING, Any, Literal, Mapping
 
 from .gmail_temporal_persistence import GmailTemporalSourceLocator
+from .gmail_temporal_leads import TemporalLeadAnalysis
 from .gmail_temporal_review import (
     GmailTemporalReviewArtifact,
     GmailTemporalReviewError,
@@ -17,21 +18,33 @@ from .gmail_temporal_review import (
     gmail_temporal_review_projection_payload,
 )
 
+if TYPE_CHECKING:
+    from .gmail_temporal_event_identity import (
+        GmailTemporalEventIdentityPlan,
+        GmailTemporalEventIdentityResolution,
+    )
 
-_PROJECTION_VERSION = "gmail_temporal_thread_lifecycle_projection_v1"
-_AUTHORITY_VERSION = "gmail_temporal_thread_snapshot_authority_v1"
-_MESSAGE_AUTHORITY_VERSION = "gmail_temporal_thread_message_authority_v1"
+
+_PROJECTION_VERSION = "gmail_temporal_thread_lifecycle_projection_v2"
+_AUTHORITY_VERSION = "gmail_temporal_thread_snapshot_authority_v2"
+_MESSAGE_AUTHORITY_VERSION = "gmail_temporal_thread_message_authority_v2"
 _MESSAGE_REVIEW_VERSION = "gmail_temporal_thread_message_review_v1"
-_IDENTITY_ASSERTION_VERSION = "gmail_temporal_event_identity_assertion_v1"
+_IDENTITY_ASSERTION_VERSION = "gmail_temporal_event_identity_assertion_v2"
 _SOURCE_REF_VERSION = "gmail_temporal_lifecycle_source_ref_v1"
 _OCCURRENCE_VERSION = "gmail_temporal_lifecycle_occurrence_v1"
 _UNRESOLVED_VERSION = "gmail_temporal_lifecycle_unresolved_alternative_v1"
+_EVENT_IDENTITY_UNIT_VERSION = "gmail_temporal_event_identity_unit_v2"
+_EVENT_IDENTITY_KEY_VERSION = "gmail_temporal_stable_event_key_v1"
 
 _OPAQUE_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,511}$")
-_VERIFIED_IDENTITY_AUTHORITIES = frozenset({"external_verified", "owner_verified"})
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+_VERIFIED_IDENTITY_AUTHORITIES = frozenset(
+    {"source_bound_self_identity", "external_verified", "owner_verified"}
+)
 
 IdentityVerification = Literal[
     "unverified",
+    "source_bound_self_identity",
     "external_verified",
     "owner_verified",
 ]
@@ -49,31 +62,37 @@ class GmailTemporalThreadLifecycleError(ValueError):
 class GmailTemporalThreadMessageAuthority:
     """One current ledger head bound to its current immutable source locator."""
 
-    version: Literal["gmail_temporal_thread_message_authority_v1"]
+    version: Literal["gmail_temporal_thread_message_authority_v2"]
     source: GmailTemporalSourceLocator
     pipeline_scope: str
     current_review_run_id: str
     current_head_generation: int
+    current_analysis_fingerprint: str
+    current_projection_fingerprint: str
+    current_projection_sha256: str
 
 
 @dataclass(frozen=True)
 class GmailTemporalThreadSnapshotAuthority:
     """Trusted current ordering and heads for one immutable Gmail thread revision."""
 
-    version: Literal["gmail_temporal_thread_snapshot_authority_v1"]
+    version: Literal["gmail_temporal_thread_snapshot_authority_v2"]
     messages: tuple[GmailTemporalThreadMessageAuthority, ...]
+    prior_event_identity_resolution_fingerprint: str | None = None
 
 
 @dataclass(frozen=True)
 class GmailTemporalEventIdentityAssertion:
-    """Explicit provenance for a cross-message event-identity assertion.
+    """Explicit provenance for an event-identity assertion.
 
-    Only owner- or externally-verified assertions may authorize reconciliation.
-    Even then, the assertion only authorizes this review-only projection; it can
-    never authorize a fact, reminder, action, or route.
+    Source-bound self authority binds one source event unit only to itself.
+    Cross-message reconciliation still requires an owner- or externally-verified
+    shared key. Even then, the assertion only authorizes this review-only
+    projection; it can never authorize a fact, reminder, action, or route.
     """
 
-    version: Literal["gmail_temporal_event_identity_assertion_v1"]
+    version: Literal["gmail_temporal_event_identity_assertion_v2"]
+    unit_id: str
     projection_fingerprint: str
     artifact_id: str
     hypothesis_id: str
@@ -168,10 +187,14 @@ class GmailTemporalLifecycleUnresolvedAlternative:
 class GmailTemporalThreadLifecycleProjection:
     """Pure, deterministic lifecycle view over one current Gmail thread."""
 
-    version: Literal["gmail_temporal_thread_lifecycle_projection_v1"]
+    version: Literal["gmail_temporal_thread_lifecycle_projection_v2"]
     projection_fingerprint: str
     snapshot_authority: GmailTemporalThreadSnapshotAuthority
     source_messages: tuple[GmailTemporalThreadMessageReview, ...]
+    event_identity_analysis_authorities: tuple[TemporalLeadAnalysis, ...] | None
+    event_identity_plan: GmailTemporalEventIdentityPlan | None
+    event_identity_resolution: GmailTemporalEventIdentityResolution | None
+    event_identity_prior_resolution: GmailTemporalEventIdentityResolution | None
     events: tuple[GmailTemporalEventLifecycleView, ...]
     unresolved_alternatives: tuple[GmailTemporalLifecycleUnresolvedAlternative, ...]
     complete: Literal[True]
@@ -212,18 +235,32 @@ def project_gmail_temporal_thread_lifecycle(
     *,
     snapshot_authority: GmailTemporalThreadSnapshotAuthority,
     messages: tuple[GmailTemporalThreadMessageReview, ...],
+    event_identity_analysis_authorities: tuple[TemporalLeadAnalysis, ...] | None = None,
+    event_identity_plan: GmailTemporalEventIdentityPlan | None = None,
+    event_identity_resolution: GmailTemporalEventIdentityResolution | None = None,
+    event_identity_prior_resolution: GmailTemporalEventIdentityResolution | None = None,
 ) -> GmailTemporalThreadLifecycleProjection:
     """Derive non-routable event lifecycle views from ordered message reviews.
 
     Current source/head authority is an explicit input so stale projections fail
-    before reduction. Cross-message reconciliation requires exact equality of an
-    owner- or externally-verified event key. Thread membership or matching dates
-    are never identity evidence.
+    before reduction. Every resolver-verified assertion is rebound to its exact
+    analyses, plan, resolution, and declared parent. Cross-message reconciliation
+    requires one externally verified shared key; owner authority remains closed
+    until a trusted owner-receipt ledger exists. Thread membership or matching
+    dates are never identity evidence.
     """
 
     normalized_authority, normalized_messages = _validate_inputs(
         snapshot_authority=snapshot_authority,
         messages=messages,
+    )
+    _validate_event_identity_authority(
+        snapshot_authority=normalized_authority,
+        messages=normalized_messages,
+        event_identity_analysis_authorities=event_identity_analysis_authorities,
+        event_identity_plan=event_identity_plan,
+        event_identity_resolution=event_identity_resolution,
+        event_identity_prior_resolution=event_identity_prior_resolution,
     )
     events: dict[str, _MutableEvent] = {}
     unresolved: list[GmailTemporalLifecycleUnresolvedAlternative] = []
@@ -285,6 +322,24 @@ def project_gmail_temporal_thread_lifecycle(
         "version": _PROJECTION_VERSION,
         "snapshot_authority": asdict(normalized_authority),
         "source_messages": [asdict(item) for item in normalized_messages],
+        "event_identity_analysis_authorities": (
+            [asdict(item) for item in event_identity_analysis_authorities]
+            if event_identity_analysis_authorities is not None
+            else None
+        ),
+        "event_identity_plan": (
+            asdict(event_identity_plan) if event_identity_plan is not None else None
+        ),
+        "event_identity_resolution": (
+            asdict(event_identity_resolution)
+            if event_identity_resolution is not None
+            else None
+        ),
+        "event_identity_prior_resolution": (
+            asdict(event_identity_prior_resolution)
+            if event_identity_prior_resolution is not None
+            else None
+        ),
         "events": [asdict(item) for item in event_views],
         "unresolved_alternatives": [asdict(item) for item in unresolved_tuple],
         "complete": True,
@@ -295,10 +350,14 @@ def project_gmail_temporal_thread_lifecycle(
     }
     fingerprint = "gtlp_" + hashlib.sha256(_canonical_bytes(material)).hexdigest()
     return GmailTemporalThreadLifecycleProjection(
-        version="gmail_temporal_thread_lifecycle_projection_v1",
+        version="gmail_temporal_thread_lifecycle_projection_v2",
         projection_fingerprint=fingerprint,
         snapshot_authority=normalized_authority,
         source_messages=normalized_messages,
+        event_identity_analysis_authorities=event_identity_analysis_authorities,
+        event_identity_plan=event_identity_plan,
+        event_identity_resolution=event_identity_resolution,
+        event_identity_prior_resolution=event_identity_prior_resolution,
         events=event_views,
         unresolved_alternatives=unresolved_tuple,
         complete=True,
@@ -332,6 +391,20 @@ def gmail_temporal_thread_lifecycle_projection_payload(
         or any(item.routable for item in projection.unresolved_alternatives)
     ):
         raise GmailTemporalThreadLifecycleError("thread lifecycle projection is stale")
+    expected_projection = project_gmail_temporal_thread_lifecycle(
+        snapshot_authority=projection.snapshot_authority,
+        messages=projection.source_messages,
+        event_identity_analysis_authorities=(
+            projection.event_identity_analysis_authorities
+        ),
+        event_identity_plan=projection.event_identity_plan,
+        event_identity_resolution=projection.event_identity_resolution,
+        event_identity_prior_resolution=projection.event_identity_prior_resolution,
+    )
+    if projection != expected_projection:
+        raise GmailTemporalThreadLifecycleError(
+            "thread lifecycle projection does not match its deterministic derivation"
+        )
     return asdict(projection)
 
 
@@ -359,6 +432,155 @@ def validate_gmail_temporal_thread_review_inputs(
     )
 
 
+def gmail_temporal_event_identity_unit_id(
+    *,
+    source_anchor: Mapping[str, str],
+    artifact: GmailTemporalReviewArtifact,
+    hypothesis: GmailTemporalReviewHypothesis,
+) -> str:
+    """Derive the stable source-bound identity-unit key shared by both reducers."""
+
+    expected_source_keys = {
+        "gmail_account_key",
+        "gmail_thread_id",
+        "gmail_message_id",
+        "source_sha256",
+    }
+    if (
+        not isinstance(source_anchor, Mapping)
+        or set(source_anchor) != expected_source_keys
+        or any(
+            not isinstance(source_anchor[key], str) or not source_anchor[key]
+            for key in expected_source_keys
+        )
+        or not isinstance(artifact, GmailTemporalReviewArtifact)
+        or not isinstance(hypothesis, GmailTemporalReviewHypothesis)
+        or hypothesis not in artifact.hypotheses
+    ):
+        raise GmailTemporalThreadLifecycleError(
+            "event identity unit source authority is invalid"
+        )
+    material = {
+        "version": _EVENT_IDENTITY_UNIT_VERSION,
+        "source_anchor": dict(source_anchor),
+        "artifact_semantics": {
+            "version": artifact.version,
+            "artifact_id": artifact.artifact_id,
+            "kind": artifact.kind,
+            "evidence_status": artifact.evidence_status,
+        },
+        "hypothesis_semantics": {
+            "version": hypothesis.version,
+            "hypothesis_id": hypothesis.hypothesis_id,
+            "expression_id": hypothesis.expression_id,
+            "subject_mention_ids": hypothesis.subject_mention_ids,
+            "subject_type_references": hypothesis.subject_type_references,
+            "lifecycle_mention_ids": hypothesis.lifecycle_mention_ids,
+            "relation": hypothesis.relation,
+            "kind": hypothesis.kind,
+            "lifecycle": hypothesis.lifecycle,
+            "normalized_value": hypothesis.normalized_value,
+            "candidate_requires_defer": hypothesis.candidate_requires_defer,
+        },
+    }
+    return "gteiu_" + hashlib.sha256(_canonical_bytes(material)).hexdigest()
+
+
+def gmail_temporal_source_bound_event_identity_key(unit_id: str) -> str:
+    """Derive the event key for a unit that is asserted only equal to itself."""
+
+    normalized_unit_id = _opaque(unit_id, "event identity unit id")
+    digest = hashlib.sha256(
+        _canonical_bytes(
+            {
+                "version": _EVENT_IDENTITY_KEY_VERSION,
+                "anchor_unit_id": normalized_unit_id,
+            }
+        )
+    ).hexdigest()
+    return f"gmail-event:{digest}"
+
+
+def gmail_temporal_source_bound_self_provenance(unit_id: str) -> str:
+    """Return provenance that can be re-bound to the exact source unit locally."""
+
+    return f"gteiself:{_opaque(unit_id, 'event identity unit id')}"
+
+
+def _validate_event_identity_authority(
+    *,
+    snapshot_authority: GmailTemporalThreadSnapshotAuthority,
+    messages: tuple[GmailTemporalThreadMessageReview, ...],
+    event_identity_analysis_authorities: tuple[TemporalLeadAnalysis, ...] | None,
+    event_identity_plan: GmailTemporalEventIdentityPlan | None,
+    event_identity_resolution: GmailTemporalEventIdentityResolution | None,
+    event_identity_prior_resolution: GmailTemporalEventIdentityResolution | None,
+) -> None:
+    assertions = tuple(
+        assertion for message in messages for assertion in message.identity_assertions
+    )
+    if any(item.verification == "owner_verified" for item in assertions):
+        raise GmailTemporalThreadLifecycleError(
+            "owner-verified identity requires trusted owner-lineage authority"
+        )
+    has_resolver_verified = any(
+        item.verification in {"source_bound_self_identity", "external_verified"}
+        for item in assertions
+    )
+    if (
+        len(
+            {
+                event_identity_analysis_authorities is None,
+                event_identity_plan is None,
+                event_identity_resolution is None,
+            }
+        )
+        != 1
+    ):
+        raise GmailTemporalThreadLifecycleError(
+            "event identity analyses, plan, and resolution must be supplied together"
+        )
+    if event_identity_plan is None:
+        if event_identity_prior_resolution is not None:
+            raise GmailTemporalThreadLifecycleError(
+                "prior identity resolution requires current plan authority"
+            )
+        if has_resolver_verified:
+            raise GmailTemporalThreadLifecycleError(
+                "resolver-verified identity requires complete plan and resolution authority"
+            )
+        return
+
+    # Lifecycle consumes the resolver's exact binding, never a caller-authored
+    # assertion tuple. Import locally to keep the lifecycle/identity type split
+    # acyclic while reusing the resolver's full structural validation boundary.
+    from .gmail_temporal_event_identity import (  # noqa: PLC0415
+        GmailTemporalEventIdentityError,
+        bind_gmail_temporal_event_identity_resolution,
+    )
+
+    bare_messages = tuple(
+        replace(message, identity_assertions=()) for message in messages
+    )
+    try:
+        expected_messages = bind_gmail_temporal_event_identity_resolution(
+            snapshot_authority=snapshot_authority,
+            messages=bare_messages,
+            analysis_authorities=event_identity_analysis_authorities,
+            plan=event_identity_plan,
+            resolution=event_identity_resolution,
+            prior_resolution=event_identity_prior_resolution,
+        )
+    except GmailTemporalEventIdentityError as exc:
+        raise GmailTemporalThreadLifecycleError(
+            "event identity plan or resolution authority is invalid"
+        ) from exc
+    if expected_messages != messages:
+        raise GmailTemporalThreadLifecycleError(
+            "message identity assertions do not match the exact resolver binding"
+        )
+
+
 def _validate_inputs(
     *,
     snapshot_authority: GmailTemporalThreadSnapshotAuthority,
@@ -378,6 +600,16 @@ def _validate_inputs(
         raise GmailTemporalThreadLifecycleError(
             "complete ordered snapshot authority is required"
         )
+    prior_resolution_fingerprint = (
+        snapshot_authority.prior_event_identity_resolution_fingerprint
+    )
+    if (
+        prior_resolution_fingerprint is not None
+        and _OPAQUE_KEY.fullmatch(prior_resolution_fingerprint) is None
+    ):
+        raise GmailTemporalThreadLifecycleError(
+            "prior event identity resolution authority is invalid"
+        )
 
     normalized_authorities: list[GmailTemporalThreadMessageAuthority] = []
     normalized_messages: list[GmailTemporalThreadMessageReview] = []
@@ -392,6 +624,9 @@ def _validate_inputs(
         if (
             not isinstance(authority, GmailTemporalThreadMessageAuthority)
             or authority.version != _MESSAGE_AUTHORITY_VERSION
+            or _OPAQUE_KEY.fullmatch(authority.current_analysis_fingerprint) is None
+            or _OPAQUE_KEY.fullmatch(authority.current_projection_fingerprint) is None
+            or _SHA256_HEX.fullmatch(authority.current_projection_sha256) is None
         ):
             raise GmailTemporalThreadLifecycleError("message authority is invalid")
         if (
@@ -490,14 +725,30 @@ def _validate_inputs(
             raise GmailTemporalThreadLifecycleError(
                 "message projection source hash is stale"
             )
+        if (
+            payload.get("analysis_fingerprint")
+            != authority.current_analysis_fingerprint
+            or payload.get("projection_fingerprint")
+            != authority.current_projection_fingerprint
+            or hashlib.sha256(_canonical_bytes(payload)).hexdigest()
+            != authority.current_projection_sha256
+        ):
+            raise GmailTemporalThreadLifecycleError(
+                "message projection does not match the current ledger receipt"
+            )
         _validate_identity_assertions(message)
         normalized_authorities.append(
             GmailTemporalThreadMessageAuthority(
-                version="gmail_temporal_thread_message_authority_v1",
+                version="gmail_temporal_thread_message_authority_v2",
                 source=authority_source,
                 pipeline_scope=scope_name,
                 current_review_run_id=current_run,
                 current_head_generation=authority.current_head_generation,
+                current_analysis_fingerprint=(authority.current_analysis_fingerprint),
+                current_projection_fingerprint=(
+                    authority.current_projection_fingerprint
+                ),
+                current_projection_sha256=authority.current_projection_sha256,
             )
         )
         normalized_messages.append(
@@ -511,8 +762,9 @@ def _validate_inputs(
         )
     return (
         GmailTemporalThreadSnapshotAuthority(
-            version="gmail_temporal_thread_snapshot_authority_v1",
+            version="gmail_temporal_thread_snapshot_authority_v2",
             messages=tuple(normalized_authorities),
+            prior_event_identity_resolution_fingerprint=(prior_resolution_fingerprint),
         ),
         tuple(normalized_messages),
     )
@@ -522,9 +774,15 @@ def _validate_identity_assertions(message: GmailTemporalThreadMessageReview) -> 
     if not isinstance(message.identity_assertions, tuple):
         raise GmailTemporalThreadLifecycleError("identity assertions must be immutable")
     targets = {
-        (artifact.artifact_id, hypothesis.hypothesis_id)
+        (artifact.artifact_id, hypothesis.hypothesis_id): (artifact, hypothesis)
         for artifact in message.projection.artifacts
         for hypothesis in artifact.hypotheses
+    }
+    source_anchor = {
+        "gmail_account_key": message.source.gmail_account_key,
+        "gmail_thread_id": message.source.gmail_thread_id,
+        "gmail_message_id": message.source.gmail_message_id,
+        "source_sha256": message.source.source_sha256,
     }
     seen: set[tuple[str, ...]] = set()
     for item in message.identity_assertions:
@@ -533,7 +791,12 @@ def _validate_identity_assertions(message: GmailTemporalThreadMessageReview) -> 
             or item.version != _IDENTITY_ASSERTION_VERSION
             or item.projection_fingerprint != message.projection.projection_fingerprint
             or item.verification
-            not in {"unverified", "external_verified", "owner_verified"}
+            not in {
+                "unverified",
+                "source_bound_self_identity",
+                "external_verified",
+                "owner_verified",
+            }
             or item.candidate_authorization is not False
             or item.requires_defer is not True
             or item.routable is not False
@@ -543,13 +806,34 @@ def _validate_identity_assertions(message: GmailTemporalThreadMessageReview) -> 
             )
         artifact_id = _opaque(item.artifact_id, "identity artifact id")
         hypothesis_id = _opaque(item.hypothesis_id, "identity hypothesis id")
+        unit_id = _opaque(item.unit_id, "event identity unit id")
         event_key = _opaque(item.event_identity_key, "event identity key")
         provenance = _opaque(item.provenance_ref, "identity provenance ref")
         if (artifact_id, hypothesis_id) not in targets:
             raise GmailTemporalThreadLifecycleError(
                 "event identity assertion targets an unknown source hypothesis"
             )
+        artifact, hypothesis = targets[(artifact_id, hypothesis_id)]
+        expected_unit_id = gmail_temporal_event_identity_unit_id(
+            source_anchor=source_anchor,
+            artifact=artifact,
+            hypothesis=hypothesis,
+        )
+        if unit_id != expected_unit_id:
+            raise GmailTemporalThreadLifecycleError(
+                "event identity assertion targets the wrong source unit"
+            )
+        if item.verification == "source_bound_self_identity":
+            if event_key != gmail_temporal_source_bound_event_identity_key(
+                expected_unit_id
+            ) or provenance != gmail_temporal_source_bound_self_provenance(
+                expected_unit_id
+            ):
+                raise GmailTemporalThreadLifecycleError(
+                    "source-bound self identity assertion is invalid"
+                )
         signature = (
+            unit_id,
             artifact_id,
             hypothesis_id,
             event_key,
@@ -574,6 +858,7 @@ def _assertions_by_hypothesis(
             sorted(
                 items,
                 key=lambda item: (
+                    item.unit_id,
                     item.event_identity_key,
                     item.verification,
                     item.provenance_ref,
@@ -1087,6 +1372,7 @@ def _freeze_event(event: _MutableEvent) -> GmailTemporalEventLifecycleView:
         sorted(
             event.identity_provenance,
             key=lambda item: (
+                item.unit_id,
                 item.projection_fingerprint,
                 item.artifact_id,
                 item.hypothesis_id,
@@ -1281,6 +1567,7 @@ def _extend_unique_assertions(
 ) -> None:
     seen = {
         (
+            item.unit_id,
             item.projection_fingerprint,
             item.artifact_id,
             item.hypothesis_id,
@@ -1292,6 +1579,7 @@ def _extend_unique_assertions(
     }
     for item in values:
         signature = (
+            item.unit_id,
             item.projection_fingerprint,
             item.artifact_id,
             item.hypothesis_id,

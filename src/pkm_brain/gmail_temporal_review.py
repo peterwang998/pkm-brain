@@ -21,16 +21,20 @@ from .gmail_temporal_frontier import (
     validate_gmail_temporal_candidate_verdict_set,
 )
 from .gmail_temporal_leads import TemporalExpression, TemporalLeadAnalysis
-from .gmail_temporal_selection import classify_gmail_temporal_subject_pair
+from .gmail_temporal_selection import (
+    GMAIL_TEMPORAL_SUBJECT_TYPES,
+    classify_gmail_temporal_subject_pair,
+)
 
 
-_PROJECTION_VERSION = "gmail_temporal_review_projection_v1"
-_ARTIFACT_VERSION = "gmail_temporal_review_artifact_v1"
-_HYPOTHESIS_VERSION = "gmail_temporal_review_hypothesis_v1"
+GMAIL_TEMPORAL_REVIEW_PROJECTION_VERSION = "gmail_temporal_review_projection_v2"
+_PROJECTION_VERSION = GMAIL_TEMPORAL_REVIEW_PROJECTION_VERSION
+_ARTIFACT_VERSION = "gmail_temporal_review_artifact_v2"
+_HYPOTHESIS_VERSION = "gmail_temporal_review_hypothesis_v2"
 _CLUSTER_REVIEW_VERSION = "gmail_temporal_review_cluster_review_v1"
 _GROUP_VERSION = "gmail_temporal_review_group_v1"
 _GROUP_MEMBER_VERSION = "gmail_temporal_review_group_member_v1"
-_GROUPING_POLICY_VERSION = "gmail_temporal_review_grouping_policy_v1"
+_GROUPING_POLICY_VERSION = "gmail_temporal_review_grouping_policy_v2"
 
 ReviewArtifactKind = Literal["supported_citation", "uncertainty_sidecar"]
 ReviewEvidenceStatus = Literal["supported", "uncertain"]
@@ -87,10 +91,11 @@ class GmailTemporalReviewBatchResult:
 class GmailTemporalReviewHypothesis:
     """One semantic hypothesis after reducer-equivalent subject aliases collapse."""
 
-    version: Literal["gmail_temporal_review_hypothesis_v1"]
+    version: Literal["gmail_temporal_review_hypothesis_v2"]
     hypothesis_id: str
     expression_id: str
     subject_mention_ids: tuple[str, ...]
+    subject_type_references: tuple[tuple[str, str], ...]
     lifecycle_mention_ids: tuple[str, ...]
     relation: str
     kind: str
@@ -106,7 +111,7 @@ class GmailTemporalReviewHypothesis:
 class GmailTemporalReviewArtifact:
     """A supported citation or uncertainty sidecar visible to a review consumer."""
 
-    version: Literal["gmail_temporal_review_artifact_v1"]
+    version: Literal["gmail_temporal_review_artifact_v2"]
     artifact_id: str
     kind: ReviewArtifactKind
     evidence_status: ReviewEvidenceStatus
@@ -178,7 +183,7 @@ class GmailTemporalReviewGroup:
 class GmailTemporalReviewProjection:
     """Canonical, raw-source-content-free output for one complete Gmail message."""
 
-    version: Literal["gmail_temporal_review_projection_v1"]
+    version: Literal["gmail_temporal_review_projection_v2"]
     projection_fingerprint: str
     analysis_fingerprint: str
     source_sha256: str
@@ -229,6 +234,7 @@ def gmail_temporal_review_grouping_policy_fingerprint() -> str:
         "version": _GROUPING_POLICY_VERSION,
         "artifact_hypothesis_signature": [
             "expression_id",
+            "subject_type_references",
             "relation",
             "kind",
             "lifecycle",
@@ -355,10 +361,21 @@ def project_gmail_temporal_review(
                 candidate.candidate_id
             ]
 
+    subject_types_by_id = {
+        mention.mention_id: mention.mention_type for mention in analysis.mentions
+    }
+    if len(subject_types_by_id) != len(analysis.mentions):
+        raise GmailTemporalReviewError("analysis subject type authority is ambiguous")
+
     artifacts: list[GmailTemporalReviewArtifact] = []
     cluster_reviews: list[GmailTemporalReviewClusterReview] = []
     for authority in authorities:
-        artifacts.extend(_artifacts_for_authority(authority))
+        artifacts.extend(
+            _artifacts_for_authority(
+                authority,
+                subject_types_by_id=subject_types_by_id,
+            )
+        )
         cluster_reviews.extend(_cluster_reviews_for_authority(authority))
     artifacts_tuple = tuple(
         sorted(
@@ -414,7 +431,7 @@ def project_gmail_temporal_review(
         "routable": False,
     }
     projection = GmailTemporalReviewProjection(
-        version="gmail_temporal_review_projection_v1",
+        version="gmail_temporal_review_projection_v2",
         projection_fingerprint="gtrp_"
         + hashlib.sha256(_canonical_bytes(material)).hexdigest(),
         analysis_fingerprint=analysis.snapshot_fingerprint,
@@ -555,6 +572,8 @@ def _validate_batch_result(
 
 def _artifacts_for_authority(
     authority: _BatchAuthority,
+    *,
+    subject_types_by_id: Mapping[str, str],
 ) -> tuple[GmailTemporalReviewArtifact, ...]:
     candidates = {item.candidate_id: item for item in authority.candidates}
     supported = set(authority.ensemble.verdict_set.supported_candidate_ids)
@@ -564,10 +583,13 @@ def _artifacts_for_authority(
             continue
         candidate = candidates[candidate_id]
         cluster_id = authority.candidate_cluster[candidate_id]
-        hypothesis = _review_hypothesis((candidate,))
+        hypothesis = _review_hypothesis(
+            (candidate,),
+            subject_types_by_id=subject_types_by_id,
+        )
         artifacts.append(
             GmailTemporalReviewArtifact(
-                version="gmail_temporal_review_artifact_v1",
+                version="gmail_temporal_review_artifact_v2",
                 artifact_id=f"supported:{candidate_id}",
                 kind="supported_citation",
                 evidence_status="supported",
@@ -605,12 +627,15 @@ def _artifacts_for_authority(
                 candidate
             )
         hypotheses = tuple(
-            _review_hypothesis(tuple(by_signature[signature]))
+            _review_hypothesis(
+                tuple(by_signature[signature]),
+                subject_types_by_id=subject_types_by_id,
+            )
             for signature in sorted(by_signature, key=_signature_sort_key)
         )
         artifacts.append(
             GmailTemporalReviewArtifact(
-                version="gmail_temporal_review_artifact_v1",
+                version="gmail_temporal_review_artifact_v2",
                 artifact_id=f"uncertainty:{uncertainty.cluster_id}",
                 kind="uncertainty_sidecar",
                 evidence_status="uncertain",
@@ -644,6 +669,8 @@ def _cluster_reviews_for_authority(
 
 def _review_hypothesis(
     candidates: tuple[GmailTemporalVerificationCandidate, ...],
+    *,
+    subject_types_by_id: Mapping[str, str],
 ) -> GmailTemporalReviewHypothesis:
     if not candidates:
         raise GmailTemporalReviewError("review hypothesis cannot be empty")
@@ -652,17 +679,36 @@ def _review_hypothesis(
         raise GmailTemporalReviewError("review hypothesis mixes semantic signatures")
     expression_id, relation, kind, lifecycle, normalized_value = signature
     candidate_ids = tuple(item.candidate_id for item in candidates)
+    subject_mention_ids = tuple(
+        sorted({item.subject_mention_id for item in candidates})
+    )
+    try:
+        subject_type_references = tuple(
+            (mention_id, subject_types_by_id[mention_id])
+            for mention_id in subject_mention_ids
+        )
+    except KeyError as exc:
+        raise GmailTemporalReviewError(
+            "review hypothesis subject type authority is incomplete"
+        ) from exc
+    if not _subject_type_references_are_valid(
+        subject_mention_ids,
+        subject_type_references,
+    ):
+        raise GmailTemporalReviewError(
+            "review hypothesis subject type authority is invalid"
+        )
     material = {
         "version": _HYPOTHESIS_VERSION,
         "signature": signature,
+        "subject_type_references": subject_type_references,
     }
     return GmailTemporalReviewHypothesis(
-        version="gmail_temporal_review_hypothesis_v1",
+        version="gmail_temporal_review_hypothesis_v2",
         hypothesis_id="gtrh_" + hashlib.sha256(_canonical_bytes(material)).hexdigest(),
         expression_id=expression_id,
-        subject_mention_ids=tuple(
-            sorted({item.subject_mention_id for item in candidates})
-        ),
+        subject_mention_ids=subject_mention_ids,
+        subject_type_references=subject_type_references,
         lifecycle_mention_ids=tuple(
             sorted(
                 {
@@ -679,6 +725,37 @@ def _review_hypothesis(
         candidate_ids=candidate_ids,
         candidate_requires_defer=any(item.requires_defer for item in candidates),
     )
+
+
+def _subject_type_references_are_valid(
+    subject_mention_ids: tuple[str, ...],
+    subject_type_references: tuple[tuple[str, str], ...],
+) -> bool:
+    """Require one canonical, supported type for every exact subject endpoint."""
+
+    if (
+        not isinstance(subject_mention_ids, tuple)
+        or not subject_mention_ids
+        or subject_mention_ids != tuple(sorted(subject_mention_ids))
+        or len(subject_mention_ids) != len(set(subject_mention_ids))
+        or not isinstance(subject_type_references, tuple)
+        or not subject_type_references
+        or subject_type_references != tuple(sorted(subject_type_references))
+    ):
+        return False
+    reference_ids: list[str] = []
+    for reference in subject_type_references:
+        if (
+            not isinstance(reference, tuple)
+            or len(reference) != 2
+            or not isinstance(reference[0], str)
+            or not reference[0]
+            or not isinstance(reference[1], str)
+            or reference[1] not in GMAIL_TEMPORAL_SUBJECT_TYPES
+        ):
+            return False
+        reference_ids.append(reference[0])
+    return tuple(reference_ids) == subject_mention_ids
 
 
 def _candidate_signature(
@@ -1302,6 +1379,9 @@ def _artifact_is_valid(item: GmailTemporalReviewArtifact) -> bool:
     expression_ids: set[str] = set()
     hypothesis_ids: set[str] = set()
     for hypothesis in hypotheses:
+        if not isinstance(hypothesis, GmailTemporalReviewHypothesis):
+            return False
+        subject_type_references = hypothesis.subject_type_references
         signature = (
             hypothesis.expression_id,
             hypothesis.relation,
@@ -1316,6 +1396,7 @@ def _artifact_is_valid(item: GmailTemporalReviewArtifact) -> bool:
                     {
                         "version": _HYPOTHESIS_VERSION,
                         "signature": signature,
+                        "subject_type_references": subject_type_references,
                     }
                 )
             ).hexdigest()
@@ -1325,9 +1406,10 @@ def _artifact_is_valid(item: GmailTemporalReviewArtifact) -> bool:
             or hypothesis.hypothesis_id != expected_hypothesis_id
             or hypothesis.hypothesis_id in hypothesis_ids
             or not hypothesis.expression_id
-            or not hypothesis.subject_mention_ids
-            or len(hypothesis.subject_mention_ids)
-            != len(set(hypothesis.subject_mention_ids))
+            or not _subject_type_references_are_valid(
+                hypothesis.subject_mention_ids,
+                subject_type_references,
+            )
             or len(hypothesis.lifecycle_mention_ids)
             != len(set(hypothesis.lifecycle_mention_ids))
             or not hypothesis.candidate_ids

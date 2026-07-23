@@ -12,6 +12,7 @@ from typing import Any, Iterator, Mapping, Sequence
 from .chunking import strip_frontmatter
 from .db import connection
 from .gmail_temporal_review import (
+    GMAIL_TEMPORAL_REVIEW_PROJECTION_VERSION,
     GmailTemporalReviewError,
     GmailTemporalReviewProjection,
     canonical_gmail_temporal_review_projection_bytes,
@@ -500,6 +501,20 @@ def get_gmail_temporal_review_head(
         head = _head_from_row(row)
         if head.run_id is None:
             return replace(head, source_status="cleared")
+        try:
+            run = _run_row(conn, head.run_id)
+        except GmailTemporalHeadConflict:
+            return replace(
+                head,
+                source_status="stale",
+                stale_reason="source_document_not_active",
+            )
+        if str(run["projection_version"]) != GMAIL_TEMPORAL_REVIEW_PROJECTION_VERSION:
+            return replace(
+                head,
+                source_status="stale",
+                stale_reason="projection_schema_retired",
+            )
         if pipeline == _PRODUCTION_PIPELINE_SCOPE:
             execution = conn.execute(
                 """
@@ -521,7 +536,6 @@ def get_gmail_temporal_review_head(
                     stale_reason="runner_execution_missing",
                 )
         try:
-            run = _run_row(conn, head.run_id)
             _validate_document_authority(conn, _locator_from_run(run))
         except GmailTemporalHeadConflict:
             return replace(
@@ -588,6 +602,13 @@ def rollback_gmail_temporal_review_head(
                 if target is None:
                     raise GmailTemporalPersistenceError(
                         "rollback target is not a complete run in this message scope"
+                    )
+                if (
+                    str(target["projection_version"])
+                    != GMAIL_TEMPORAL_REVIEW_PROJECTION_VERSION
+                ):
+                    raise GmailTemporalPersistenceError(
+                        "rollback target review projection schema is retired"
                     )
                 try:
                     _validate_document_authority(conn, _locator_from_run(target))

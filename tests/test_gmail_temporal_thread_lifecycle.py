@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import replace
+import hashlib
+import json
+from dataclasses import asdict, replace
+from datetime import datetime, timezone
 from typing import Callable
 
 import pytest
@@ -24,10 +27,20 @@ from pkm_brain.gmail_temporal_leads import (
     TemporalLeadAnalysis,
     analyze_gmail_temporal_leads,
 )
-from pkm_brain.gmail_temporal_persistence import GmailTemporalSourceLocator
+from pkm_brain.gmail_temporal_persistence import (
+    GmailTemporalSourceLocator,
+    gmail_temporal_message_scope_key,
+)
+from pkm_brain.gmail_temporal_event_identity import (
+    bind_gmail_temporal_event_identity_resolution,
+    make_gmail_temporal_event_identity_verdict_set,
+    plan_gmail_temporal_event_identity,
+    resolve_gmail_temporal_event_identity,
+)
 from pkm_brain.gmail_temporal_review import (
     GmailTemporalReviewBatchResult,
     GmailTemporalReviewProjection,
+    canonical_gmail_temporal_review_projection_bytes,
     project_gmail_temporal_review,
 )
 from pkm_brain.gmail_temporal_thread_lifecycle import (
@@ -37,8 +50,12 @@ from pkm_brain.gmail_temporal_thread_lifecycle import (
     GmailTemporalThreadMessageReview,
     GmailTemporalThreadSnapshotAuthority,
     canonical_gmail_temporal_thread_lifecycle_projection_bytes,
+    gmail_temporal_event_identity_unit_id,
+    gmail_temporal_source_bound_event_identity_key,
+    gmail_temporal_source_bound_self_provenance,
     gmail_temporal_thread_lifecycle_projection_payload,
     project_gmail_temporal_thread_lifecycle,
+    validate_gmail_temporal_thread_review_inputs,
 )
 
 
@@ -54,6 +71,7 @@ CandidateSelector = Callable[
     [tuple[GmailTemporalVerificationCandidate, ...]],
     dict[str, str],
 ]
+_ANALYSIS_AUTHORITIES: dict[str, TemporalLeadAnalysis] = {}
 
 
 def _verdict_rows(
@@ -102,9 +120,15 @@ def _projection(
 ) -> GmailTemporalReviewProjection:
     analysis = analyze_gmail_temporal_leads(
         text=text,
-        message_internal_at=internal_at,
+        message_internal_at=datetime.fromisoformat(internal_at).astimezone(
+            timezone.utc
+        ),
         fact_admitted=True,
-        chunk_id=chunk_id,
+        chunk_id=gmail_temporal_message_scope_key(
+            gmail_account_key=ACCOUNT,
+            gmail_thread_id=THREAD,
+            gmail_message_id=chunk_id,
+        ),
     )
     batch_plan: GmailTemporalBatchPlan = plan_gmail_temporal_selector_batches(
         text=text,
@@ -132,12 +156,14 @@ def _projection(
                 ),
             )
         )
-    return project_gmail_temporal_review(
+    projection = project_gmail_temporal_review(
         text=text,
         analysis=analysis,
         batch_plan=batch_plan,
         batch_results=tuple(results),
     )
+    _ANALYSIS_AUTHORITIES[projection.analysis_fingerprint] = analysis
+    return projection
 
 
 def _select_lifecycle(lifecycle: str) -> CandidateSelector:
@@ -171,34 +197,64 @@ def _message(
         source_sha256=projection.source_sha256,
     )
     run_id = f"gtrr_message_{index}"
-    assertions = tuple(
-        GmailTemporalEventIdentityAssertion(
-            version="gmail_temporal_event_identity_assertion_v1",
-            projection_fingerprint=projection.projection_fingerprint,
-            artifact_id=artifact.artifact_id,
-            hypothesis_id=hypothesis.hypothesis_id,
-            event_identity_key=event_key,
-            verification=verification,  # type: ignore[arg-type]
-            provenance_ref=f"receipt:{index}:{key_index}",
+
+    def unit_id(artifact, hypothesis) -> str:
+        return gmail_temporal_event_identity_unit_id(
+            source_anchor={
+                "gmail_account_key": source.gmail_account_key,
+                "gmail_thread_id": source.gmail_thread_id,
+                "gmail_message_id": source.gmail_message_id,
+                "source_sha256": source.source_sha256,
+            },
+            artifact=artifact,
+            hypothesis=hypothesis,
         )
-        for artifact in projection.artifacts
-        for hypothesis in artifact.hypotheses
-        for key_index, event_key in enumerate(event_keys, start=1)
-    )
+
+    assertions = []
+    for artifact in projection.artifacts:
+        for hypothesis in artifact.hypotheses:
+            source_unit_id = unit_id(artifact, hypothesis)
+            for key_index, requested_event_key in enumerate(event_keys, start=1):
+                event_key = requested_event_key
+                provenance_ref = f"receipt:{index}:{key_index}"
+                if verification == "source_bound_self_identity":
+                    event_key = gmail_temporal_source_bound_event_identity_key(
+                        source_unit_id
+                    )
+                    provenance_ref = gmail_temporal_source_bound_self_provenance(
+                        source_unit_id
+                    )
+                assertions.append(
+                    GmailTemporalEventIdentityAssertion(
+                        version="gmail_temporal_event_identity_assertion_v2",
+                        unit_id=source_unit_id,
+                        projection_fingerprint=projection.projection_fingerprint,
+                        artifact_id=artifact.artifact_id,
+                        hypothesis_id=hypothesis.hypothesis_id,
+                        event_identity_key=event_key,
+                        verification=verification,  # type: ignore[arg-type]
+                        provenance_ref=provenance_ref,
+                    )
+                )
     return (
         GmailTemporalThreadMessageAuthority(
-            version="gmail_temporal_thread_message_authority_v1",
+            version="gmail_temporal_thread_message_authority_v2",
             source=source,
             pipeline_scope=PIPELINE,
             current_review_run_id=run_id,
             current_head_generation=index,
+            current_analysis_fingerprint=projection.analysis_fingerprint,
+            current_projection_fingerprint=projection.projection_fingerprint,
+            current_projection_sha256=hashlib.sha256(
+                canonical_gmail_temporal_review_projection_bytes(projection)
+            ).hexdigest(),
         ),
         GmailTemporalThreadMessageReview(
             version="gmail_temporal_thread_message_review_v1",
             source=source,
             review_run_id=run_id,
             projection=projection,
-            identity_assertions=assertions,
+            identity_assertions=tuple(assertions),
         ),
     )
 
@@ -209,12 +265,95 @@ def _project(
         ...,
     ],
 ):
+    authority = GmailTemporalThreadSnapshotAuthority(
+        version="gmail_temporal_thread_snapshot_authority_v2",
+        messages=tuple(item[0] for item in pairs),
+    )
+    messages = tuple(item[1] for item in pairs)
+    validate_gmail_temporal_thread_review_inputs(
+        snapshot_authority=authority,
+        messages=messages,
+    )
+    resolver_assertions = tuple(
+        assertion
+        for message in messages
+        for assertion in message.identity_assertions
+        if assertion.verification in {"source_bound_self_identity", "external_verified"}
+    )
+    if not resolver_assertions:
+        return project_gmail_temporal_thread_lifecycle(
+            snapshot_authority=authority,
+            messages=messages,
+        )
+    keys_by_unit: dict[str, set[str]] = {}
+    for assertion in resolver_assertions:
+        keys_by_unit.setdefault(assertion.unit_id, set()).add(
+            assertion.event_identity_key
+        )
+    if any(len(keys) != 1 for keys in keys_by_unit.values()) or any(
+        assertion.verification
+        not in {"source_bound_self_identity", "external_verified"}
+        for message in messages
+        for assertion in message.identity_assertions
+    ):
+        return project_gmail_temporal_thread_lifecycle(
+            snapshot_authority=authority,
+            messages=messages,
+        )
+
+    bare_messages = tuple(
+        replace(message, identity_assertions=()) for message in messages
+    )
+    analysis_authorities = tuple(
+        _ANALYSIS_AUTHORITIES[message.projection.analysis_fingerprint]
+        for message in bare_messages
+    )
+    plan = plan_gmail_temporal_event_identity(
+        snapshot_authority=authority,
+        messages=bare_messages,
+        analysis_authorities=analysis_authorities,
+    )
+    verdicts = {
+        pair.pair_id: (
+            "same_event"
+            if keys_by_unit.get(pair.left_unit_id)
+            == keys_by_unit.get(pair.right_unit_id)
+            and keys_by_unit.get(pair.left_unit_id) is not None
+            else "different_event"
+        )
+        for pair in plan.pairs
+    }
+    verdict_sets = (
+        tuple(
+            make_gmail_temporal_event_identity_verdict_set(
+                plan=plan,
+                run_ordinal=ordinal,
+                invocation_id=f"lifecycle-test-{ordinal}",
+                response_sha256=str(ordinal) * 64,
+                verdicts=verdicts,
+            )
+            for ordinal in (1, 2, 3)
+        )
+        if plan.pairs
+        else ()
+    )
+    resolution = resolve_gmail_temporal_event_identity(
+        plan=plan,
+        verdict_sets=verdict_sets,
+    )
+    bound_messages = bind_gmail_temporal_event_identity_resolution(
+        snapshot_authority=authority,
+        messages=bare_messages,
+        analysis_authorities=analysis_authorities,
+        plan=plan,
+        resolution=resolution,
+    )
     return project_gmail_temporal_thread_lifecycle(
-        snapshot_authority=GmailTemporalThreadSnapshotAuthority(
-            version="gmail_temporal_thread_snapshot_authority_v1",
-            messages=tuple(item[0] for item in pairs),
-        ),
-        messages=tuple(item[1] for item in pairs),
+        snapshot_authority=authority,
+        messages=bound_messages,
+        event_identity_analysis_authorities=analysis_authorities,
+        event_identity_plan=plan,
+        event_identity_resolution=resolution,
     )
 
 
@@ -299,6 +438,48 @@ def test_schedule_reschedule_terminal_retains_every_occurrence_and_artifact(
     )
 
 
+def test_refingerprinted_caller_mutation_cannot_replace_derived_lifecycle() -> None:
+    projection = _projection(
+        "The Apollo interview is scheduled for August 14, 2027.",
+        _select_lifecycle("scheduled"),
+        internal_at="2027-08-01T09:00:00-07:00",
+        chunk_id="message-1",
+    )
+    result = _project(
+        (
+            _message(
+                index=1,
+                projection=projection,
+                internal_at="2027-08-01T09:00:00-07:00",
+            ),
+        )
+    )
+    forged = replace(
+        result,
+        events=(replace(result.events[0], current_status="cancelled"),),
+    )
+    material = asdict(forged)
+    material.pop("projection_fingerprint")
+    forged = replace(
+        forged,
+        projection_fingerprint="gtlp_"
+        + hashlib.sha256(
+            json.dumps(
+                material,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest(),
+    )
+
+    with pytest.raises(
+        GmailTemporalThreadLifecycleError,
+        match="does not match its deterministic derivation",
+    ):
+        gmail_temporal_thread_lifecycle_projection_payload(forged)
+
+
 def test_same_thread_and_date_without_verified_identity_never_merge() -> None:
     first = _projection(
         "The Apollo interview is scheduled for August 14, 2027.",
@@ -361,7 +542,9 @@ def test_unverified_identity_is_preserved_but_never_authorizes_reconciliation() 
     )
 
 
-def test_unverified_later_message_cannot_change_a_verified_event_state() -> None:
+def test_mixed_manual_verified_and_unverified_assertions_require_exact_binding() -> (
+    None
+):
     schedule = _projection(
         "The Apollo interview is scheduled for August 14, 2027.",
         _select_lifecycle("scheduled"),
@@ -375,30 +558,31 @@ def test_unverified_later_message_cannot_change_a_verified_event_state() -> None
         chunk_id="message-2",
     )
 
-    result = _project(
-        (
-            _message(
-                index=1,
-                projection=schedule,
-                internal_at="2027-08-01T09:00:00-07:00",
-            ),
-            _message(
-                index=2,
-                projection=cancellation,
-                internal_at="2027-08-02T09:00:00-07:00",
-                verification="unverified",
-            ),
-        )
+    pairs = (
+        _message(
+            index=1,
+            projection=schedule,
+            internal_at="2027-08-01T09:00:00-07:00",
+            verification="source_bound_self_identity",
+        ),
+        _message(
+            index=2,
+            projection=cancellation,
+            internal_at="2027-08-02T09:00:00-07:00",
+            verification="unverified",
+        ),
     )
 
-    assert result.events[0].current_status == "scheduled"
-    assert result.events[0].occurrences[0].state == "scheduled"
-    assert (
-        result.unresolved_alternatives[0].reason == "stable_event_identity_unverified"
-    )
+    with pytest.raises(
+        GmailTemporalThreadLifecycleError,
+        match="complete plan and resolution authority",
+    ):
+        _project(pairs)
 
 
-def test_conflicting_verified_identity_assertions_stay_unresolved() -> None:
+def test_caller_authored_external_identity_assertions_fail_without_resolver_authority() -> (
+    None
+):
     projection = _projection(
         "The Apollo interview is scheduled for August 14, 2027.",
         _select_lifecycle("scheduled"),
@@ -412,16 +596,11 @@ def test_conflicting_verified_identity_assertions_stay_unresolved() -> None:
         event_keys=("event:apollo-a", "event:apollo-b"),
     )
 
-    result = _project((pair,))
-
-    assert result.events == ()
-    assert len(result.unresolved_alternatives) == 1
-    alternative = result.unresolved_alternatives[0]
-    assert alternative.reason == "conflicting_verified_event_identity"
-    assert alternative.possible_event_identity_keys == (
-        "event:apollo-a",
-        "event:apollo-b",
-    )
+    with pytest.raises(
+        GmailTemporalThreadLifecycleError,
+        match="complete plan and resolution authority",
+    ):
+        _project((pair,))
 
 
 def test_different_schedule_without_explicit_reschedule_does_not_overwrite() -> None:
@@ -476,7 +655,7 @@ def test_stale_head_cross_thread_and_missing_chronology_fail_closed() -> None:
         internal_at="2027-08-01T09:00:00-07:00",
     )
     snapshot = GmailTemporalThreadSnapshotAuthority(
-        version="gmail_temporal_thread_snapshot_authority_v1",
+        version="gmail_temporal_thread_snapshot_authority_v2",
         messages=(authority,),
     )
 
