@@ -79,21 +79,13 @@ class FakeCodex:
         if self.fail_at == len(self.calls):
             raise RuntimeError("synthetic provider failure with no source echo")
         return {
-            "version": challenge.external.VERIFIER_RESPONSE_VERSION,
-            "pages": [
-                {
-                    "request_fingerprint": payload["request_fingerprint"],
-                    "verdicts": [
-                        {
-                            "candidate_id": candidate_id,
-                            "verdict": self.verdict,
-                        }
-                        for cluster in payload["page"]["clusters"]
-                        for candidate_id in cluster["candidate_ids"]
-                    ],
-                }
+            "version": challenge.PUBLIC_VERIFIER_RESPONSE_VERSION,
+            "verdicts": {
+                candidate_id: self.verdict
                 for payload in request["requests"]
-            ],
+                for cluster in payload["page"]["clusters"]
+                for candidate_id in cluster["candidate_ids"]
+            },
         }
 
 
@@ -112,6 +104,37 @@ class SequencedFakeCodex(FakeCodex):
     ) -> Mapping[str, Any]:
         self.verdict = self.verdicts[len(self.calls)]
         return super().__call__(request, schema, model, reasoning_effort, timeout)
+
+
+class LegacyFakeCodex(FakeCodex):
+    def __call__(
+        self,
+        request: Mapping[str, Any],
+        _schema: Mapping[str, Any],
+        model: str,
+        reasoning_effort: str,
+        _timeout: int,
+    ) -> Mapping[str, Any]:
+        self.calls.append(dict(request))
+        assert model == GMAIL_TEMPORAL_VERIFIER_MODEL
+        assert reasoning_effort == GMAIL_TEMPORAL_VERIFIER_REASONING_EFFORT
+        return {
+            "version": challenge.external.VERIFIER_RESPONSE_VERSION,
+            "pages": [
+                {
+                    "request_fingerprint": payload["request_fingerprint"],
+                    "verdicts": [
+                        {
+                            "candidate_id": candidate_id,
+                            "verdict": self.verdict,
+                        }
+                        for cluster in payload["page"]["clusters"]
+                        for candidate_id in cluster["candidate_ids"]
+                    ],
+                }
+                for payload in request["requests"]
+            ],
+        }
 
 
 def _write_key(path: Path) -> Path:
@@ -779,6 +802,17 @@ def _row_with_candidate_ids(
 
 def _unit_response(unit: Any) -> dict[str, Any]:
     return {
+        "version": challenge.PUBLIC_VERIFIER_RESPONSE_VERSION,
+        "verdicts": {
+            candidate_id: "unsupported"
+            for row in unit.rows
+            for candidate_id in row.candidate_ids
+        },
+    }
+
+
+def _legacy_unit_response(unit: Any) -> dict[str, Any]:
+    return {
         "version": challenge.external.VERIFIER_RESPONSE_VERSION,
         "pages": [
             {
@@ -827,29 +861,104 @@ def test_bounded_units_pack_multi_page_cases_atomically() -> None:
     ]
 
 
-def test_verifier_schema_pins_exact_call_identifiers_and_page_count() -> None:
+def test_verifier_schema_requires_every_exact_candidate_as_an_object_key() -> None:
     unit = challenge.bounded_public_call_units(
         (_row("case-one", 1, 100), _row("case-one", 2, 100))
     )[0]
 
     schema = challenge._verifier_response_schema(unit)  # noqa: SLF001
-    pages = schema["properties"]["pages"]
-    page_properties = pages["items"]["properties"]
+    verdicts = schema["properties"]["verdicts"]
+    expected = [candidate_id for row in unit.rows for candidate_id in row.candidate_ids]
 
-    assert pages["minItems"] == pages["maxItems"] == 2
-    assert page_properties["request_fingerprint"]["enum"] == [
-        row.request_fingerprint for row in unit.rows
-    ]
-    assert set(
-        page_properties["verdicts"]["items"]["properties"]["candidate_id"]["enum"]
-    ) == {candidate_id for row in unit.rows for candidate_id in row.candidate_ids}
+    assert schema["properties"]["version"]["const"] == (
+        challenge.PUBLIC_VERIFIER_RESPONSE_VERSION
+    )
+    assert verdicts["additionalProperties"] is False
+    assert verdicts["required"] == expected
+    assert set(verdicts["properties"]) == set(expected)
+    assert all(
+        value["enum"] == ["supported", "uncertain", "unsupported"]
+        for value in verdicts["properties"].values()
+    )
 
 
-def test_verifier_response_uses_candidate_ids_and_canonicalizes_page_order() -> None:
+def test_public_request_contract_agrees_with_compact_provider_schema() -> None:
+    unit = challenge.bounded_public_call_units(
+        (_row("case-one", 1, 100), _row("case-one", 2, 100))
+    )[0]
+
+    request = unit.request
+    protocol = request["response_protocol"]
+    schema = challenge._verifier_response_schema(unit)  # noqa: SLF001
+    expected = [candidate_id for row in unit.rows for candidate_id in row.candidate_ids]
+
+    assert protocol == {
+        "version": challenge.PUBLIC_VERIFIER_REQUEST_PROTOCOL_VERSION,
+        "response_version": challenge.PUBLIC_VERIFIER_RESPONSE_VERSION,
+        "shape": "compact_exact_candidate_key_map",
+        "candidate_key_source": "requests[].page.clusters[].candidate_ids",
+        "allowed_verdicts": ["supported", "uncertain", "unsupported"],
+    }
+    assert "frozen legacy metadata superseded" in request["contract"]
+    assert "Do not return pages" in request["contract"]
+    assert schema["properties"]["version"]["const"] == protocol["response_version"]
+    assert schema["properties"]["verdicts"]["required"] == expected
+    assert all(
+        value["enum"] == protocol["allowed_verdicts"]
+        for value in schema["properties"]["verdicts"]["properties"].values()
+    )
+
+
+def test_compact_verifier_response_reconstructs_sealed_page_order() -> None:
     unit = challenge.bounded_public_call_units(
         (_row("case-one", 1, 100), _row("case-one", 2, 100))
     )[0]
     response = _unit_response(unit)
+    response["verdicts"] = dict(reversed(tuple(response["verdicts"].items())))
+
+    validated = challenge._validate_response(unit, response)  # noqa: SLF001
+
+    assert [page["request_fingerprint"] for page in validated["case-one"]] == [
+        row.request_fingerprint for row in unit.rows
+    ]
+    assert [
+        verdict["candidate_id"]
+        for page in validated["case-one"]
+        for verdict in page["verdicts"]
+    ] == [candidate_id for row in unit.rows for candidate_id in row.candidate_ids]
+
+
+@pytest.mark.parametrize("mutation", ("missing", "unknown"))
+def test_compact_verifier_response_rejects_inexact_candidate_keys(
+    mutation: str,
+) -> None:
+    unit = challenge.bounded_public_call_units(
+        (_row("case-one", 1, 100), _row("case-one", 2, 100))
+    )[0]
+    response = _unit_response(unit)
+    if mutation == "missing":
+        response["verdicts"].pop(unit.rows[1].candidate_ids[0])
+    else:
+        response["verdicts"]["gtvc_ffffffffffffffffffffffffffffffff"] = "unsupported"
+
+    with pytest.raises(challenge.PublicChallengeError, match="candidate coverage"):
+        challenge._validate_response(unit, response)  # noqa: SLF001
+
+
+def test_compact_verifier_response_rejects_invalid_verdict() -> None:
+    unit = challenge.bounded_public_call_units((_row("case-one", 1, 100),))[0]
+    response = _unit_response(unit)
+    response["verdicts"][unit.rows[0].candidate_ids[0]] = "maybe"
+
+    with pytest.raises(challenge.PublicChallengeError, match="verdict is invalid"):
+        challenge._validate_response(unit, response)  # noqa: SLF001
+
+
+def test_legacy_verifier_response_canonicalizes_page_order() -> None:
+    unit = challenge.bounded_public_call_units(
+        (_row("case-one", 1, 100), _row("case-one", 2, 100))
+    )[0]
+    response = _legacy_unit_response(unit)
     response["pages"] = list(reversed(response["pages"]))
 
     validated = challenge._validate_response(unit, response)  # noqa: SLF001
@@ -865,11 +974,13 @@ def test_verifier_response_uses_candidate_ids_and_canonicalizes_page_order() -> 
 
 
 @pytest.mark.parametrize("mutation", ("unknown", "duplicate"))
-def test_verifier_response_rejects_non_bijective_page_authority(mutation: str) -> None:
+def test_legacy_verifier_response_rejects_non_bijective_page_authority(
+    mutation: str,
+) -> None:
     unit = challenge.bounded_public_call_units(
         (_row("case-one", 1, 100), _row("case-one", 2, 100))
     )[0]
-    response = _unit_response(unit)
+    response = _legacy_unit_response(unit)
     if mutation == "duplicate":
         response["pages"][1]["request_fingerprint"] = response["pages"][0][
             "request_fingerprint"
@@ -883,7 +994,7 @@ def test_verifier_response_rejects_non_bijective_page_authority(mutation: str) -
         challenge._validate_response(unit, response)  # noqa: SLF001
 
 
-def test_verifier_response_rejects_nonempty_candidate_omission() -> None:
+def test_legacy_verifier_response_rejects_nonempty_candidate_omission() -> None:
     candidate_ids = (
         "gtvc_00000000000000000000000000000001",
         "gtvc_00000000000000000000000000000002",
@@ -891,7 +1002,7 @@ def test_verifier_response_rejects_nonempty_candidate_omission() -> None:
     unit = challenge.bounded_public_call_units(
         (_row_with_candidate_ids("case-one", 1, candidate_ids),)
     )[0]
-    response = _unit_response(unit)
+    response = _legacy_unit_response(unit)
     response["pages"][0]["verdicts"].pop()
 
     with pytest.raises(challenge.PublicChallengeError, match="candidate coverage"):
@@ -899,11 +1010,13 @@ def test_verifier_response_rejects_nonempty_candidate_omission() -> None:
 
 
 @pytest.mark.parametrize("mutation", ("duplicate", "unknown"))
-def test_verifier_response_rejects_invalid_candidate_coverage(mutation: str) -> None:
+def test_legacy_verifier_response_rejects_invalid_candidate_coverage(
+    mutation: str,
+) -> None:
     unit = challenge.bounded_public_call_units(
         (_row("case-one", 1, 100), _row("case-one", 2, 100))
     )[0]
-    response = _unit_response(unit)
+    response = _legacy_unit_response(unit)
     response["pages"][1]["verdicts"][0]["candidate_id"] = (
         unit.rows[0].candidate_ids[0]
         if mutation == "duplicate"
@@ -914,11 +1027,23 @@ def test_verifier_response_rejects_invalid_candidate_coverage(mutation: str) -> 
         challenge._validate_response(unit, response)  # noqa: SLF001
 
 
-def test_bounded_units_reject_duplicate_candidate_authority_before_schema() -> None:
+def test_bounded_units_partition_duplicate_candidates_across_cases() -> None:
     first = _row("case-one", 1, 100)
     second = _row_with_candidate_ids("case-two", 2, first.candidate_ids)
 
-    with pytest.raises(challenge.PublicChallengeError, match="candidate authority"):
+    units = challenge.bounded_public_call_units((first, second))
+
+    assert [[row.case_id for row in unit.rows] for unit in units] == [
+        ["case-one"],
+        ["case-two"],
+    ]
+
+
+def test_bounded_units_reject_duplicate_candidates_within_one_case() -> None:
+    first = _row("case-one", 1, 100)
+    second = _row_with_candidate_ids("case-one", 2, first.candidate_ids)
+
+    with pytest.raises(challenge.PublicChallengeError, match="one public case"):
         challenge.bounded_public_call_units((first, second))
 
 
@@ -927,6 +1052,37 @@ def test_bounded_units_reject_non_string_candidate_authority_before_schema() -> 
 
     with pytest.raises(challenge.PublicChallengeError, match="candidate authority"):
         challenge.bounded_public_call_units((malformed,))
+
+
+def test_archived_protocol_selection_ignores_unselected_builder_ceiling() -> None:
+    row = _row("case-one", 1, 41_000)
+    compact = challenge.bounded_public_call_units((row,))
+    with pytest.raises(challenge.PublicChallengeError, match="cannot fit"):
+        challenge._legacy_bounded_public_call_units((row,))  # noqa: SLF001
+    plan = {
+        "calls": [
+            {
+                "run_ordinal": run_ordinal,
+                "unit_ordinal": unit.unit_ordinal,
+                "case_ids": list(unit.case_ids),
+                "request_fingerprints": [
+                    request_row.request_fingerprint for request_row in unit.rows
+                ],
+                "request_sha256": unit.request_sha256,
+                "request_bytes": len(
+                    challenge._canonical_json(unit.request) + b"\n"  # noqa: SLF001
+                ),
+            }
+            for run_ordinal in range(1, challenge.RUN_COUNT + 1)
+            for unit in compact
+        ]
+    }
+
+    selected = challenge._archived_public_call_units((row,), plan)  # noqa: SLF001
+
+    assert [unit.request_sha256 for unit in selected] == [
+        unit.request_sha256 for unit in compact
+    ]
 
 
 @pytest.mark.parametrize("variant", ["missing", "tampered"])
@@ -1870,6 +2026,60 @@ def test_scorer_upgrade_accepts_authenticated_prior_prediction_launcher(
         )
         assert value["prediction_launcher_exact_artifact_verified"] is True
         assert value["scorer_sha256"] == current_hashes["launcher"]
+
+
+def test_scorer_upgrade_accepts_legacy_request_and_response_protocol(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(tmp_path)
+    output = tmp_path / "legacy-prior-launcher-run"
+    current_hashes = challenge._source_hashes()  # noqa: SLF001
+    prior_artifact = tmp_path / "reviewed-legacy-launcher.py"
+    prior_artifact.write_bytes(b"# exact reviewed legacy launcher artifact\n")
+    prior_artifact.chmod(0o600)
+    prior_sha256 = hashlib.sha256(prior_artifact.read_bytes()).hexdigest()
+    prior_hashes = {**current_hashes, "launcher": prior_sha256}
+
+    with monkeypatch.context() as run_patch:
+        run_patch.setattr(challenge, "_source_hashes", lambda: prior_hashes)
+        run_patch.setattr(
+            challenge,
+            "bounded_public_call_units",
+            challenge._legacy_bounded_public_call_units,  # noqa: SLF001
+        )
+        challenge.run_public_challenge(
+            fixture["manifest"],
+            fixture["key"],
+            output,
+            invoke=LegacyFakeCodex(),
+            test_only_allow_injected_invoker=True,
+        )
+
+    score = challenge.score_public_challenge(
+        fixture["manifest"],
+        fixture["gold"],
+        fixture["key"],
+        output,
+        evaluation_mode="development_replay",
+        prediction_launcher_artifact=prior_artifact,
+    )
+
+    assert score["prediction_launcher_sha256"] == prior_sha256
+    assert score["prediction_launcher_trust_basis"] == ("exact_prior_launcher_artifact")
+    response = json.loads(
+        (output / "calls" / "run-1" / "unit-001" / "response.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    request = json.loads(
+        (output / "calls" / "run-1" / "unit-001" / "request.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert response["version"] == challenge.external.VERIFIER_RESPONSE_VERSION
+    assert request["contract"].startswith("Each requests[] item is one frozen")
+    assert "response_protocol" not in request
 
 
 @pytest.mark.parametrize(
