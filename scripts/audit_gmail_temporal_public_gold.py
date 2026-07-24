@@ -329,7 +329,6 @@ def _disposition_schema() -> dict[str, Any]:
                 "type": "array",
                 "items": {"type": "string", "enum": sorted(_ISSUE_CODES)},
                 "minItems": 1,
-                "uniqueItems": True,
             },
             "rationale": {"type": "string"},
         },

@@ -111,6 +111,30 @@ def test_canonical_fixture_and_generator_hash_allowlists_are_exact() -> None:
         assert len(fixture["cases"]) == 100
 
 
+def test_response_schema_uses_provider_supported_array_constraints() -> None:
+    schema = audit._response_schema()  # noqa: SLF001
+
+    def walk(value: object) -> None:
+        if isinstance(value, dict):
+            assert "uniqueItems" not in value
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(schema)
+    with pytest.raises(audit.PublicGoldAuditError, match="response is invalid"):
+        audit._validate_disposition(  # noqa: SLF001
+            {
+                "disposition": "correction_needed",
+                "issue_codes": ["wrong_value", "wrong_value"],
+                "rationale": "Duplicate codes remain invalid at runtime.",
+            },
+            label="member",
+        )
+
+
 def test_real_100_case_audit_is_blind_bounded_pinned_and_hmac_sealed(
     tmp_path: Path,
 ) -> None:
