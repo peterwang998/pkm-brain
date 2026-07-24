@@ -368,10 +368,10 @@ def test_candidate_gold_oracle_covers_units_without_alias_inflation(
     assert result["useful_records"] == 27
     assert result["semantic_units"] == 34
     assert result["semantic_members"] == 36
-    # The bounded intake-opening grammar intentionally exposes both the named
-    # registration subject and predicate alternatives; the oracle must reject
-    # the cross-bound endpoint instead of hiding it from the precision test.
-    assert result["frontier_candidates"] == 95
+    # Direct predicates and actions now own their expressions, removing both
+    # cross-bound endpoint fallbacks and object-as-event aliases while every
+    # required semantic member remains reachable.
+    assert result["frontier_candidates"] == 85
     assert result["frontier"]["any_unit_recall"] == 1.0
     assert result["frontier"]["required_member_recall"] == 1.0
     assert result["frontier"]["complete_unit_recall"] == 1.0

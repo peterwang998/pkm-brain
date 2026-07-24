@@ -42,8 +42,8 @@ _ENSEMBLE_CLUSTER_REVIEW_VERSION = "gmail_temporal_candidate_ensemble_cluster_re
 _ENSEMBLE_VERSION = "gmail_temporal_candidate_three_run_ensemble_v3"
 _ENSEMBLE_POLICY_VERSION = "gmail_temporal_candidate_three_run_consensus_v3"
 _ENSEMBLE_RUN_COUNT = 3
-GMAIL_TEMPORAL_CANDIDATE_POLICY_VERSION = "gmail_temporal_candidate_policy_v3"
-GMAIL_TEMPORAL_FRONTIER_POLICY_VERSION = "gmail_temporal_frontier_policy_v2"
+GMAIL_TEMPORAL_CANDIDATE_POLICY_VERSION = "gmail_temporal_candidate_policy_v4"
+GMAIL_TEMPORAL_FRONTIER_POLICY_VERSION = "gmail_temporal_frontier_policy_v3"
 _VERDICTS = {"supported", "unsupported", "uncertain"}
 _SUBSUMING_EXPLICIT_LIFECYCLES = frozenset(
     {
@@ -60,6 +60,7 @@ _LIFECYCLE_SCOPE_CONFLICT_BLOCKERS = frozenset(
         "lifecycle_subject_binding_unverified",
     }
 )
+_EXACT_CANCELLED_SLOT_REPAIR = "cancelled_scheduled_slot_derived_as_planned_occurrence"
 ClusterUncertaintyReason = Literal[
     "model_uncertain",
     "conflicting_supported_candidates",
@@ -253,8 +254,14 @@ def gmail_temporal_candidate_policy_fingerprint() -> str:
         },
         "frontier_subsumption": {
             "exact_reschedule_subsumes_unknown_alias": True,
-            "cancelled_scheduled_slot_subsumes_stale_schedule": True,
+            "cancelled_scheduled_slot_subsumes_stale_schedule": (
+                "source_verified_alias_component_only"
+            ),
             "terminal_timestamp_does_not_subsume_schedule": True,
+            "deadline_action_subsumes_generic_cue_subject": True,
+            "direct_action_and_predicate_exclude_cross_expression_fallbacks": True,
+            "direct_action_excludes_unled_nonaction_fallbacks": True,
+            "named_opening_event_subsumes_opening_predicate_alias": True,
         },
     }
     return "gtcp_" + hashlib.sha256(_canonical_bytes(material)).hexdigest()
@@ -352,6 +359,11 @@ def build_gmail_temporal_candidate_frontier(
         batch=batch,
         candidates=tuple(candidates),
     )
+    simplified = _omit_redundant_verification_candidates(
+        analysis=analysis,
+        batch=batch,
+        candidates=simplified,
+    )
     ordered = tuple(
         sorted(
             simplified,
@@ -438,7 +450,10 @@ def _omit_subsumed_lifecycle_free_bases(
             for candidate in values
             if candidate.lifecycle_mention_id is not None
             and candidate.lifecycle in _SUBSUMING_EXPLICIT_LIFECYCLES
-            and not candidate.requires_defer
+            and (
+                not candidate.requires_defer
+                or _EXACT_CANCELLED_SLOT_REPAIR in candidate.repair_flags
+            )
             and candidate.normalized_value is not None
         )
         if not explicit:
@@ -479,6 +494,182 @@ def _omit_subsumed_lifecycle_free_bases(
                 for candidate in explicit
             ):
                 omitted.add(base.candidate_id)
+    return tuple(
+        candidate for candidate in candidates if candidate.candidate_id not in omitted
+    )
+
+
+def _omit_redundant_verification_candidates(
+    *,
+    analysis: TemporalLeadAnalysis,
+    batch: GmailTemporalSelectorBatch,
+    candidates: tuple[GmailTemporalVerificationCandidate, ...],
+) -> tuple[GmailTemporalVerificationCandidate, ...]:
+    """Remove source-proven cue aliases and relation-conflicted fallbacks.
+
+    This is deliberately narrower than model selection. It only removes a
+    candidate when another candidate in the same immutable expression packet is
+    a deterministic semantic replacement: an action instead of its generic
+    deadline cue, a named event instead of its opening predicate, or a led direct
+    relation instead of an unled relation-conflicted fallback.
+    """
+
+    mentions = {item.mention_id: item for item in analysis.mentions}
+    batch_mentions = {item.mention_id: item for item in batch.mentions}
+    leads = {item.lead_id: item for item in analysis.leads}
+    omitted: set[str] = set()
+
+    def semantics(
+        candidate: GmailTemporalVerificationCandidate,
+    ) -> tuple[object, ...]:
+        return (
+            candidate.expression_id,
+            candidate.lifecycle_mention_id,
+            candidate.relation,
+            candidate.kind,
+            candidate.lifecycle,
+            candidate.normalized_value,
+        )
+
+    def direct(candidate: GmailTemporalVerificationCandidate) -> bool:
+        lead = leads.get(candidate.selected_lead_id or "")
+        return lead is not None and lead.association_mode == "direct_grammar"
+
+    action_candidates = tuple(
+        candidate
+        for candidate in candidates
+        if mentions[candidate.subject_mention_id].mention_type == "action"
+    )
+    for candidate in candidates:
+        mention = mentions[candidate.subject_mention_id]
+        batch_mention = batch_mentions.get(candidate.subject_mention_id)
+        if (
+            mention.mention_type == "deadline"
+            and batch_mention is not None
+            and " ".join(batch_mention.surface.casefold().split())
+            in {"deadline", "due date", "no later than"}
+            and any(
+                semantics(action) == semantics(candidate)
+                and mentions[action.subject_mention_id].segment_id == mention.segment_id
+                and direct(action)
+                for action in action_candidates
+            )
+        ):
+            omitted.add(candidate.candidate_id)
+
+    for candidate in candidates:
+        mention = mentions[candidate.subject_mention_id]
+        batch_mention = batch_mentions.get(candidate.subject_mention_id)
+        if (
+            mention.mention_type != "event_predicate"
+            or mention.boundary_role != "occurrence_start"
+            or batch_mention is None
+            or " ".join(batch_mention.surface.casefold().split())
+            not in {"open", "opens", "opened", "will open"}
+        ):
+            continue
+        if any(
+            other.candidate_id != candidate.candidate_id
+            and semantics(other) == semantics(candidate)
+            and mentions[other.subject_mention_id].mention_type
+            in {"event", "event_title_candidate"}
+            and direct(other)
+            for other in candidates
+        ):
+            omitted.add(candidate.candidate_id)
+
+    direct_relations: dict[str, set[str]] = {}
+    direct_action_expressions: dict[str, set[str]] = {}
+    direct_action_subjects: dict[str, set[str]] = {}
+    direct_predicate_expressions: dict[str, set[str]] = {}
+    direct_nonaction_deadline_expressions: set[str] = set()
+    for lead in analysis.leads:
+        mention = mentions[lead.mention_id]
+        if lead.association_mode != "direct_grammar":
+            continue
+        if mention.mention_type == "action":
+            direct_action_expressions.setdefault(lead.mention_id, set()).add(
+                lead.expression_id
+            )
+            direct_action_subjects.setdefault(lead.expression_id, set()).add(
+                lead.mention_id
+            )
+        elif mention.mention_type == "event_predicate":
+            direct_predicate_expressions.setdefault(lead.mention_id, set()).add(
+                lead.expression_id
+            )
+        if lead.relation == "deadline" and mention.mention_type in {
+            "deadline",
+            "event_predicate",
+        }:
+            direct_nonaction_deadline_expressions.add(lead.expression_id)
+    for candidate in candidates:
+        if direct(candidate):
+            direct_relations.setdefault(candidate.expression_id, set()).add(
+                candidate.relation
+            )
+    for candidate in candidates:
+        mention = mentions[candidate.subject_mention_id]
+        if (
+            candidate.expression_id in direct_action_subjects
+            and mention.mention_type != "action"
+            and not direct(candidate)
+        ):
+            omitted.add(candidate.candidate_id)
+            continue
+        if (
+            mention.mention_type == "action"
+            and candidate.expression_id in direct_nonaction_deadline_expressions
+            and not direct(candidate)
+        ):
+            omitted.add(candidate.candidate_id)
+            continue
+        if (
+            mention.mention_type == "action"
+            and candidate.subject_mention_id in direct_action_expressions
+            and candidate.expression_id
+            not in direct_action_expressions[candidate.subject_mention_id]
+            and candidate.expression_id in direct_action_subjects
+        ):
+            omitted.add(candidate.candidate_id)
+            continue
+        if (
+            candidate.subject_mention_id in direct_predicate_expressions
+            and candidate.expression_id
+            not in direct_predicate_expressions[candidate.subject_mention_id]
+        ):
+            omitted.add(candidate.candidate_id)
+            continue
+        if (
+            candidate.selected_lead_id is None
+            and candidate.expression_id in direct_relations
+            and candidate.relation != "unspecified"
+            and candidate.relation not in direct_relations[candidate.expression_id]
+        ):
+            omitted.add(candidate.candidate_id)
+
+    certified_cancellation_bindings = {
+        candidate.binding_id
+        for candidate in candidates
+        if candidate.lifecycle == "cancelled"
+        and _EXACT_CANCELLED_SLOT_REPAIR in candidate.repair_flags
+    }
+    certified_cancellation_component_bindings: set[str] = set()
+    for component in _source_verified_alias_binding_components(
+        analysis=analysis,
+        batch=batch,
+        candidates=candidates,
+    ):
+        if certified_cancellation_bindings.intersection(component):
+            certified_cancellation_component_bindings.update(component)
+    for candidate in candidates:
+        if (
+            candidate.binding_id in certified_cancellation_component_bindings
+            and candidate.selected_lead_id is None
+            and _EXACT_CANCELLED_SLOT_REPAIR not in candidate.repair_flags
+        ):
+            omitted.add(candidate.candidate_id)
+
     return tuple(
         candidate for candidate in candidates if candidate.candidate_id not in omitted
     )

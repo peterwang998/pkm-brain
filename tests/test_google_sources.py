@@ -10,6 +10,7 @@ from pkm_brain.google_api import GoogleAPIError
 from pkm_brain.google_normalization import (
     normalize_calendar_event,
     normalize_gmail_message,
+    strip_quoted_history,
 )
 from pkm_brain.google_routes import (
     calendar_event_route,
@@ -49,6 +50,74 @@ class FakeClient:
 
 def encoded(value: str) -> str:
     return base64.urlsafe_b64encode(value.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def test_explicit_archived_note_marker_strips_the_entire_history_tail() -> None:
+    value = (
+        "The current answer has no active date.\n\n"
+        "> Archived note:\n"
+        "The old interview was scheduled for August 14.\n"
+        "This unquoted line is still part of the archived note."
+    )
+
+    normalized, removed = strip_quoted_history(value)
+
+    assert normalized == "The current answer has no active date."
+    assert removed == len(value) - len(normalized)
+
+
+@pytest.mark.parametrize(
+    "marker",
+    (
+        ">> Archived note:",
+        "> Archived note :",
+        "> **Archived note:**",
+    ),
+)
+def test_archived_note_marker_variants_strip_the_entire_history_tail(
+    marker: str,
+) -> None:
+    value = (
+        "The current answer has no active date.\n\n"
+        f"{marker}\n"
+        "The old interview was scheduled for August 14."
+    )
+
+    normalized, removed = strip_quoted_history(value)
+
+    assert normalized == "The current answer has no active date."
+    assert removed == len(value) - len(normalized)
+
+
+def test_gmail_message_normalization_excludes_the_archived_note_tail() -> None:
+    value = (
+        "The current answer has no active date.\n\n"
+        "> Archived note:\n"
+        "The old interview was scheduled for August 14.\n"
+        "This unquoted line is still part of the archived note."
+    )
+    message = normalize_gmail_message(
+        {
+            "id": "message-archived-note",
+            "threadId": "thread-archived-note",
+            "payload": {
+                "mimeType": "text/plain",
+                "body": {"data": encoded(value)},
+            },
+        }
+    )
+
+    assert message.body == "The current answer has no active date."
+    assert message.quoted_chars_removed == len(value) - len(message.body)
+
+
+def test_unquoted_archived_note_text_is_not_inferred_to_be_history() -> None:
+    value = "Current answer.\n\nArchived note:\nStill authored text."
+
+    normalized, removed = strip_quoted_history(value)
+
+    assert normalized == value
+    assert removed == 0
 
 
 def gmail_thread(thread_id: str = "thread-1") -> dict[str, Any]:
@@ -395,9 +464,7 @@ def test_gmail_invalid_incremental_page_token_replays_retained_history() -> None
                 "history": [
                     {
                         "id": "10",
-                        "messagesAdded": [
-                            {"message": {"id": "m1", "threadId": "t1"}}
-                        ],
+                        "messagesAdded": [{"message": {"id": "m1", "threadId": "t1"}}],
                     }
                 ],
                 "historyId": "11",
@@ -694,9 +761,7 @@ def test_gmail_history_overflow_is_drained_before_advancing_page_token() -> None
                 "history": [
                     {
                         "id": "11",
-                        "messagesAdded": [
-                            {"message": {"id": "m4", "threadId": "t4"}}
-                        ],
+                        "messagesAdded": [{"message": {"id": "m4", "threadId": "t4"}}],
                     }
                 ],
                 "historyId": "12",
@@ -717,7 +782,9 @@ def test_gmail_history_overflow_is_drained_before_advancing_page_token() -> None
     assert final_client.calls[0][1]["pageToken"] == "history-page-2"
 
 
-def test_google_readers_fail_closed_when_provider_exceeds_requested_page_bound() -> None:
+def test_google_readers_fail_closed_when_provider_exceeds_requested_page_bound() -> (
+    None
+):
     calendar = GoogleCalendarReader(
         FakeClient(
             [
@@ -772,9 +839,7 @@ def test_google_readers_fail_closed_when_provider_exceeds_requested_page_bound()
 
 
 def test_gmail_pending_backlog_accepts_its_durable_count_and_byte_envelope() -> None:
-    pending = tuple(
-        f"thread-{index:038d}" for index in range(MAX_PENDING_THREAD_IDS)
-    )
+    pending = tuple(f"thread-{index:038d}" for index in range(MAX_PENDING_THREAD_IDS))
 
     assert _validated_pending_thread_ids(pending) == pending
 
@@ -786,10 +851,7 @@ def test_gmail_pending_backlog_rejects_count_or_encoded_payload_overflow() -> No
         )
     with pytest.raises(ValueError, match="durable continuation bound"):
         _validated_pending_thread_ids(
-            tuple(
-                f"{index:05d}-{'x' * 50}"
-                for index in range(MAX_PENDING_THREAD_IDS)
-            )
+            tuple(f"{index:05d}-{'x' * 50}" for index in range(MAX_PENDING_THREAD_IDS))
         )
 
 

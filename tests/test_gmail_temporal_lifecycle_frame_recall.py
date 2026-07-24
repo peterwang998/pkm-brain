@@ -255,6 +255,221 @@ def test_cancelled_scheduled_slot_is_representable_as_a_planned_occurrence(
 
 
 @pytest.mark.parametrize(
+    ("clock", "expected_value", "expected_blocker"),
+    (
+        ("2:00 PM", None, "missing_timezone"),
+        (
+            "2:00 PM PST",
+            "2027-06-14T14:00:00-08:00",
+            "timezone_abbreviation_requires_review",
+        ),
+    ),
+)
+def test_cancelled_slot_lifecycle_survives_deferred_time_normalization(
+    clock: str,
+    expected_value: str | None,
+    expected_blocker: str,
+) -> None:
+    text = (
+        f"The Cedar design review scheduled for June 14, 2027 at {clock} "
+        "has been cancelled."
+    )
+    analysis, all_candidates = _analysis_and_candidates(text)
+    matches = tuple(
+        candidate
+        for candidate in _event_candidates(analysis, all_candidates)
+        if candidate.lifecycle == "cancelled"
+    )
+
+    assert len(matches) == 1
+    candidate = matches[0]
+    assert (candidate.relation, candidate.kind) == ("occurrence", "planned")
+    assert candidate.normalized_value == expected_value
+    assert expected_blocker in candidate.blockers
+    assert candidate.repair_flags == (
+        "cancelled_scheduled_slot_derived_as_planned_occurrence",
+    )
+    assert candidate.requires_defer is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "The Cedar design review scheduled for June 14, 2027 has been cancelled?",
+        "Perhaps the Cedar design review scheduled for June 14, 2027 has been "
+        "cancelled.",
+        "It seems the Cedar design review scheduled for June 14, 2027 has been "
+        "cancelled.",
+        "I think the Cedar design review scheduled for June 14, 2027 has been "
+        "cancelled.",
+        "It is possible that the Cedar design review scheduled for June 14, 2027 "
+        "has been cancelled.",
+        "Please confirm the Cedar design review scheduled for June 14, 2027 has "
+        "been cancelled.",
+        "Do you know whether the Cedar design review scheduled for June 14, 2027 "
+        "has been cancelled.",
+    ),
+)
+def test_nonassertive_scheduled_slot_cancellation_remains_deferred(
+    text: str,
+) -> None:
+    analysis, all_candidates = _analysis_and_candidates(text)
+    event_candidates = _event_candidates(analysis, all_candidates)
+    cancellations = tuple(
+        candidate
+        for candidate in event_candidates
+        if candidate.lifecycle == "cancelled"
+    )
+
+    assert cancellations
+    assert all(
+        (candidate.relation, candidate.kind) == ("occurrence", "planned")
+        for candidate in cancellations
+    )
+    assert all(candidate.requires_defer for candidate in cancellations)
+    assert all(
+        candidate.repair_flags
+        == ("cancelled_scheduled_slot_assertion_strength_unverified",)
+        for candidate in cancellations
+    )
+    assert any(candidate.lifecycle == "scheduled" for candidate in event_candidates)
+    assert not any(
+        candidate.lifecycle == "cancelled" and not candidate.requires_defer
+        for candidate in event_candidates
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "It is false that the Cedar design review scheduled for June 14, 2027 "
+        "has been cancelled.",
+        "According to Alex, the Cedar design review scheduled for June 14, 2027 "
+        "has been cancelled.",
+        "Alex said the Cedar design review scheduled for June 14, 2027 has been "
+        "cancelled.",
+        "We heard the Cedar design review scheduled for June 14, 2027 has been "
+        "cancelled.",
+        "Rumor has it the Cedar design review scheduled for June 14, 2027 has "
+        "been cancelled.",
+    ),
+)
+def test_denied_or_attributed_scheduled_slot_cancellation_remains_deferred(
+    text: str,
+) -> None:
+    analysis, all_candidates = _analysis_and_candidates(text)
+    event_candidates = _event_candidates(analysis, all_candidates)
+    cancellations = tuple(
+        candidate
+        for candidate in event_candidates
+        if candidate.lifecycle == "cancelled"
+    )
+
+    assert cancellations
+    assert all(
+        (candidate.relation, candidate.kind) == ("occurrence", "planned")
+        for candidate in cancellations
+    )
+    assert all(candidate.requires_defer for candidate in cancellations)
+    assert all(
+        candidate.repair_flags
+        == ("cancelled_scheduled_slot_assertion_strength_unverified",)
+        for candidate in cancellations
+    )
+    assert any(candidate.lifecycle == "scheduled" for candidate in event_candidates)
+    assert not any(
+        candidate.lifecycle == "cancelled" and not candidate.requires_defer
+        for candidate in event_candidates
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "If approved, the Cedar design review scheduled for June 14, 2027 has "
+        "been cancelled.",
+        "Unless this is a mistake, the Cedar design review scheduled for June "
+        "14, 2027 has been cancelled.",
+        "Assuming the report is correct, the Cedar design review scheduled for "
+        "June 14, 2027 has been cancelled.",
+        "Although unconfirmed, the Cedar design review scheduled for June 14, "
+        "2027 has been cancelled.",
+    ),
+)
+def test_sentence_initial_qualified_cancellation_remains_deferred(
+    text: str,
+) -> None:
+    analysis, all_candidates = _analysis_and_candidates(text)
+    event_candidates = _event_candidates(analysis, all_candidates)
+    cancellations = tuple(
+        candidate
+        for candidate in event_candidates
+        if candidate.lifecycle == "cancelled"
+    )
+
+    assert cancellations
+    assert all(candidate.requires_defer for candidate in cancellations)
+    assert all(
+        candidate.repair_flags
+        == ("cancelled_scheduled_slot_assertion_strength_unverified",)
+        for candidate in cancellations
+    )
+    assert any(candidate.lifecycle == "scheduled" for candidate in event_candidates)
+    assert not any(
+        candidate.lifecycle == "cancelled" and not candidate.requires_defer
+        for candidate in event_candidates
+    )
+
+
+def test_affirmative_transition_before_cancelled_slot_keeps_exact_certificate() -> None:
+    text = (
+        "For clarity, the Cedar design review scheduled for June 14, 2027 has "
+        "been cancelled."
+    )
+    analysis, all_candidates = _analysis_and_candidates(text)
+    cancellations = tuple(
+        candidate
+        for candidate in _event_candidates(analysis, all_candidates)
+        if candidate.lifecycle == "cancelled"
+    )
+
+    assert len(cancellations) == 1
+    assert cancellations[0].requires_defer is False
+    assert cancellations[0].repair_flags == (
+        "cancelled_scheduled_slot_derived_as_planned_occurrence",
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "The Cedar design review scheduled for June 14, 2027 has been cancelled!",
+        "For clarity, the Cedar design review scheduled for June 14, 2027 has "
+        "been cancelled.",
+        "The Perhaps Foundation design review scheduled for June 14, 2027 has "
+        "been cancelled.",
+    ),
+)
+def test_affirmative_scheduled_slot_cancellation_keeps_exact_certificate(
+    text: str,
+) -> None:
+    analysis, all_candidates = _analysis_and_candidates(text)
+    cancellations = tuple(
+        candidate
+        for candidate in _event_candidates(analysis, all_candidates)
+        if candidate.lifecycle == "cancelled"
+    )
+
+    assert len(cancellations) == 1
+    candidate = cancellations[0]
+    assert (candidate.relation, candidate.kind) == ("occurrence", "planned")
+    assert candidate.repair_flags == (
+        "cancelled_scheduled_slot_derived_as_planned_occurrence",
+    )
+    assert candidate.requires_defer is False
+
+
+@pytest.mark.parametrize(
     "text",
     (
         "The Cedar design review scheduled for June 14, 2027 was cancelled "

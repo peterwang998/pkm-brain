@@ -211,6 +211,12 @@ def test_cross_predicate_by_date_is_not_an_action_deadline() -> None:
     assert discover(text) == ()
 
 
+def test_agentive_by_phrase_is_not_an_action_deadline() -> None:
+    text = "Please send the report prepared by Alice on May 14, 2027."
+
+    assert discover(text) == ()
+
+
 def test_actual_occurrence_is_distinct_from_planned_occurrence() -> None:
     (candidate,) = discover("Orchid Interview occurred on January 3, 2027.")
 

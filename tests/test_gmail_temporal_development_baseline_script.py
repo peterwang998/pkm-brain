@@ -215,7 +215,7 @@ def test_freezer_emits_opaque_authenticated_private_baseline(tmp_path: Path) -> 
     assert manifest_hmac == baseline._manifest_hmac(files["key"], manifest)
     assert (
         manifest["policy_namespace"]
-        == "gmail_projection_v7_classifier_v5_message_policy_v1"
+        == "gmail_projection_v8_classifier_v5_message_policy_v1"
     )
     assert (
         manifest["thread_scope_artifact"]["sha256"]
@@ -323,7 +323,7 @@ def test_freezer_fails_closed_on_stale_projection_authority(tmp_path: Path) -> N
 
     with pytest.raises(
         baseline.GmailTemporalDevelopmentBaselineError,
-        match="projection-v7 Gmail authority is incomplete",
+        match="projection-v8 Gmail authority is incomplete",
     ):
         baseline.freeze_gmail_temporal_development_baseline(
             files["paths"].home,

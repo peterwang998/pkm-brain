@@ -18,7 +18,7 @@ from .gmail_temporal_leads import (
 BatchField = Literal["subject", "body", "message"]
 BatchContextRole = Literal["local", "subject_bridge"]
 BatchMentionRole = Literal["local", "subject_bridge"]
-GMAIL_TEMPORAL_BATCHING_POLICY_VERSION = "gmail_temporal_batching_policy_v2"
+GMAIL_TEMPORAL_BATCHING_POLICY_VERSION = "gmail_temporal_batching_policy_v3"
 BatchOmissionReason = Literal[
     "fact_not_admitted",
     "scope_not_bound",
@@ -36,6 +36,9 @@ _LEAD_ID_RE = re.compile(r"gtl_[0-9a-f]{16}:l[1-9][0-9]*\Z")
 _SENTENCE_BOUNDARY_RE = re.compile(r"[.!?;](?:[\"')\]]+)?(?=\s|$)")
 _FORWARD_MARKER_RE = re.compile(
     r"^(?:-{2,}\s*(?:original message|forwarded message)\s*-{2,}|"
+    r"-{2,}\s*forwarded history\s*-{2,}|"
+    r">+\s*(?:\*\*|__)?\s*archived\s+note\s*:?\s*(?:\*\*|__)?|"
+    r"begin forwarded message:?|"
     r"on .{1,200} wrote:)\s*$",
     re.IGNORECASE,
 )

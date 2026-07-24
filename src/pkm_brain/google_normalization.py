@@ -23,6 +23,10 @@ _REPLY_MARKERS = (
     re.compile(r"^\s*On .{1,500} wrote:\s*$", re.IGNORECASE),
     re.compile(r"^\s*-{2,}\s*Original Message\s*-{2,}\s*$", re.IGNORECASE),
     re.compile(r"^\s*Begin forwarded message:\s*$", re.IGNORECASE),
+    re.compile(
+        r"^\s*>+\s*(?:\*\*|__)?\s*Archived\s+note\s*:\s*(?:\*\*|__)?\s*$",
+        re.IGNORECASE,
+    ),
     re.compile(r"^\s*_{5,}\s*$"),
 )
 _HEADER_QUOTE_START = re.compile(r"^\s*(?:From|Sent):\s+.+$", re.IGNORECASE)
@@ -148,8 +152,14 @@ def normalize_calendar_event(value: Mapping[str, Any]) -> NormalizedCalendarEven
         (attendee for attendee in attendees if attendee.get("self") is True),
         None,
     )
-    title = "Private event" if private else (_bounded(value.get("summary"), CALENDAR_TITLE_CAP) or "Untitled event")
-    details = None if private else _bounded(value.get("description"), CALENDAR_DETAILS_CAP)
+    title = (
+        "Private event"
+        if private
+        else (_bounded(value.get("summary"), CALENDAR_TITLE_CAP) or "Untitled event")
+    )
+    details = (
+        None if private else _bounded(value.get("description"), CALENDAR_DETAILS_CAP)
+    )
     location = None if private else _bounded(value.get("location"), 1_000)
     return NormalizedCalendarEvent(
         event_id=event_id,
@@ -166,8 +176,7 @@ def normalize_calendar_event(value: Mapping[str, Any]) -> NormalizedCalendarEven
         ends_at=_bounded(end.get("dateTime"), 100),
         end_date=_bounded(end.get("date"), 100),
         source_timezone=(
-            _bounded(start.get("timeZone"), 200)
-            or _bounded(end.get("timeZone"), 200)
+            _bounded(start.get("timeZone"), 200) or _bounded(end.get("timeZone"), 200)
         ),
         recurrence=tuple(
             normalized
@@ -210,7 +219,9 @@ def normalize_gmail_thread(
         if isinstance(message, Mapping)
     ]
     normalized_operator_emails = {
-        str(address).strip().casefold() for address in operator_emails if str(address).strip()
+        str(address).strip().casefold()
+        for address in operator_emails
+        if str(address).strip()
     }
     messages = [
         normalize_gmail_message(
@@ -322,7 +333,9 @@ def strip_quoted_history(value: str) -> tuple[str, int]:
     for index, line in enumerate(lines):
         if any(pattern.match(line) for pattern in _REPLY_MARKERS):
             break
-        if _HEADER_QUOTE_START.match(line) and _looks_like_header_quote(lines[index : index + 5]):
+        if _HEADER_QUOTE_START.match(line) and _looks_like_header_quote(
+            lines[index : index + 5]
+        ):
             break
         if line.lstrip().startswith(">"):
             continue
@@ -351,7 +364,22 @@ class _EmailHTMLParser(HTMLParser):
         "tr",
     }
     ALWAYS_IGNORE = {"head", "script", "style", "svg"}
-    VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+    VOID = {
+        "area",
+        "base",
+        "br",
+        "col",
+        "embed",
+        "hr",
+        "img",
+        "input",
+        "link",
+        "meta",
+        "param",
+        "source",
+        "track",
+        "wbr",
+    }
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -383,9 +411,9 @@ class _EmailHTMLParser(HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         normalized_tag = tag.casefold()
         ignored = bool(self.ignore_boundaries)
-        if (
-            self.ignore_boundaries
-            and self.ignore_boundaries[-1] == (normalized_tag, self.depth)
+        if self.ignore_boundaries and self.ignore_boundaries[-1] == (
+            normalized_tag,
+            self.depth,
         ):
             self.ignore_boundaries.pop()
         self.depth = max(0, self.depth - 1)
@@ -561,7 +589,9 @@ def _gmail_message_class(
         for message in messages
     ):
         return "human"
-    if any(_MARKETING_HEADERS.intersection(message_headers) for message_headers in headers):
+    if any(
+        _MARKETING_HEADERS.intersection(message_headers) for message_headers in headers
+    ):
         return "marketing"
     senders = " ".join(message_headers.get("from", "") for message_headers in headers)
     if _NO_REPLY.search(senders) or _TRANSACTIONAL_SUBJECT.search(subject or ""):
@@ -575,7 +605,9 @@ def _strip_attachment_data(
     attachment_ancestor: bool = False,
 ) -> None:
     blocked_by_attachment = attachment_ancestor or _is_attachment(part)
-    if blocked_by_attachment or not str(part.get("mimeType") or "").casefold().startswith("text/"):
+    if blocked_by_attachment or not str(
+        part.get("mimeType") or ""
+    ).casefold().startswith("text/"):
         body = part.get("body")
         if isinstance(body, dict):
             body.pop("data", None)
@@ -588,11 +620,7 @@ def _strip_attachment_data(
 
 
 def _looks_like_header_quote(lines: list[str]) -> bool:
-    names = {
-        line.split(":", 1)[0].strip().casefold()
-        for line in lines
-        if ":" in line
-    }
+    names = {line.split(":", 1)[0].strip().casefold() for line in lines if ":" in line}
     return len(names.intersection({"from", "sent", "to", "subject", "date"})) >= 3
 
 

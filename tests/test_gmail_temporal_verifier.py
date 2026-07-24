@@ -10,7 +10,7 @@ from pkm_brain.gmail_temporal_verifier import (
 
 
 def test_temporal_verifier_policy_is_pinned_and_content_free() -> None:
-    assert GMAIL_TEMPORAL_VERIFIER_POLICY_VERSION.endswith("_v5")
+    assert GMAIL_TEMPORAL_VERIFIER_POLICY_VERSION.endswith("_v6")
     assert GMAIL_TEMPORAL_VERIFIER_MODEL == "gpt-5.6-luna"
     assert GMAIL_TEMPORAL_VERIFIER_REASONING_EFFORT == "medium"
     assert "requires_defer" in GMAIL_TEMPORAL_CANDIDATE_VERIFIER_CONTRACT
@@ -31,6 +31,12 @@ def test_temporal_verifier_policy_is_pinned_and_content_free() -> None:
         GMAIL_TEMPORAL_CANDIDATE_VERIFIER_CONTRACT
     )
     assert "Repeated direct schedules are also separate assertions" in (
+        GMAIL_TEMPORAL_CANDIDATE_VERIFIER_CONTRACT
+    )
+    assert "Deadline words are relation cues" in (
+        GMAIL_TEMPORAL_CANDIDATE_VERIFIER_CONTRACT
+    )
+    assert "cancelled_scheduled_slot_derived_as_planned_occurrence" in (
         GMAIL_TEMPORAL_CANDIDATE_VERIFIER_CONTRACT
     )
     assert "null normalized value" in GMAIL_TEMPORAL_CANDIDATE_VERIFIER_CONTRACT

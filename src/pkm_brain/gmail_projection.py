@@ -12,9 +12,11 @@ import json
 # V6 keeps those message scopes independent when one thread contains both a bulk
 # promotion and a separate qualifying transactional event. V7 adds a trusted
 # per-message delivery/advertising/relevance index so temporal review never uses
-# one thread-level label as the recall boundary for a different message.
+# one thread-level label as the recall boundary for a different message. V8 treats
+# the explicit ``> Archived note:`` marker as a quoted-history boundary and removes
+# its full tail before projection rather than retaining unquoted archived content.
 # Each semantic renderer change gets a new version.
-GMAIL_KNOWLEDGE_PROJECTION_VERSION = 7
+GMAIL_KNOWLEDGE_PROJECTION_VERSION = 8
 GMAIL_KNOWLEDGE_CLASSIFIER_VERSION = 5
 GMAIL_MESSAGE_POLICY_VERSION = 1
 

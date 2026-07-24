@@ -69,7 +69,7 @@ def _projection_text(index: int) -> str:
         f"gmail_account_key: {json.dumps(account)}\n"
         f"gmail_thread_id: {json.dumps(thread)}\n"
         f"gmail_source_revision: {json.dumps(revision)}\n"
-        "gmail_projection_version: 7\n"
+        "gmail_projection_version: 8\n"
         "gmail_classifier_version: 5\n"
         f"gmail_message_ids: {json.dumps([message])}\n"
         f"gmail_fact_admitted_message_ids: {json.dumps([message])}\n"
@@ -186,8 +186,7 @@ def test_export_freezes_identical_non_holdout_admissions_accepted_by_builder(
     }
     assert stat.S_IMODE(files["export"].stat().st_mode) == 0o700
     assert all(
-        stat.S_IMODE(path.stat().st_mode) == 0o600
-        for path in files["export"].iterdir()
+        stat.S_IMODE(path.stat().st_mode) == 0o600 for path in files["export"].iterdir()
     )
 
     cohort_result = cohort.build_gmail_fact_parity_cohort(

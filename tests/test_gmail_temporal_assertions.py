@@ -95,6 +95,10 @@ def test_direct_lifecycle_assertion_is_retained_without_granting_authority() -> 
             "reported_assertion",
         ),
         (
+            "Subject: Update\n\nRumor has it the interview was cancelled.",
+            "reported_assertion",
+        ),
+        (
             "Subject: Update\n\nIt is false that the interview was cancelled.",
             "refuted_assertion",
         ),

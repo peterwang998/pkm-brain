@@ -222,8 +222,31 @@ _DEADLINE_CUE_RE = re.compile(
     r"|\b(?:applications?|registration|submissions?)\s+(?:close|closes)\b",
     re.IGNORECASE,
 )
+GMAIL_TEMPORAL_ACTION_VERBS = (
+    "accept",
+    "apply",
+    "approve",
+    "book",
+    "complete",
+    "confirm",
+    "decline",
+    "file",
+    "finish",
+    "pay",
+    "provide",
+    "register",
+    "renew",
+    "reply",
+    "respond",
+    "rsvp",
+    "send",
+    "sign",
+    "submit",
+    "upload",
+    "verify",
+)
 _ACTION_BEFORE_BY_RE = re.compile(
-    r"\b(?:apply|complete|file|finish|pay|register|reply|respond|send|submit)\b",
+    rf"\b(?:{'|'.join(GMAIL_TEMPORAL_ACTION_VERBS)})\b",
     re.IGNORECASE,
 )
 _INTAKE_NAME_FIRST_PATTERN = (
@@ -669,6 +692,7 @@ def _cue_for_expression(
         clause_start = expression.start - len(prefix)
 
     cues: list[_Cue] = []
+    direct_action_by_cues: list[_Cue] = []
     intake_opening = next(
         (
             match
@@ -739,15 +763,26 @@ def _cue_for_expression(
                 re.IGNORECASE,
             )
         )
-        if actions and not crosses_predicate and _clean_cue_gap(prefix[match.end() :]):
-            cues.append(
-                _Cue(
-                    "deadline",
-                    "planned",
-                    clause_start + match.start(),
-                    clause_start + match.end(),
-                )
+        if (
+            actions
+            and not crosses_predicate
+            and _action_by_gap_targets_expression(prefix[match.end() :])
+        ):
+            cue = _Cue(
+                "deadline",
+                "planned",
+                clause_start + match.start(),
+                clause_start + match.end(),
             )
+            cues.append(cue)
+            direct_action_by_cues.append(cue)
+    if direct_action_by_cues:
+        # ``submit ... by the deadline: DATE`` contains both a generic deadline
+        # noun and the more informative action connector.  Preserve the action
+        # cue so the lead layer can bind the date to ``submit``.  This priority
+        # is safe because the connector was just proven to target this exact
+        # expression rather than an intervening agent (``by Alice``).
+        return max(direct_action_by_cues, key=lambda item: item.end)
     return max(cues, key=lambda item: item.end, default=None)
 
 
@@ -808,6 +843,35 @@ def _clean_cue_gap(value: str) -> bool:
         r"\b(?:today|tomorrow)\b",
         value,
         re.IGNORECASE,
+    )
+
+
+def _action_by_gap_targets_expression(value: str) -> bool:
+    """Accept only bounded date connectors after an action's ``by`` cue.
+
+    The former permissive gap accepted an arbitrary noun phrase, so an
+    agentive phrase such as ``send the report prepared by Alice on DATE`` was
+    misread as a submission deadline.  Keep ordinary direct deadlines and a
+    small set of explicit business-day/date labels while rejecting names and
+    free prose between ``by`` and the temporal expression.
+    """
+
+    if not _clean_cue_gap(value):
+        return False
+    gap = value.strip(" \t\r\n,;:-")
+    if not gap:
+        return True
+    return (
+        re.fullmatch(
+            r"(?:(?:the\s+)?(?:deadline|due\s+date)(?:\s+is)?|"
+            r"(?:(?:the\s+)?(?:end\s+of\s+day|close\s+of\s+business)|eod|cob)"
+            r"(?:\s+on)?|"
+            r"(?:on\s+)?(?:monday|tuesday|wednesday|thursday|friday|"
+            r"saturday|sunday))",
+            gap,
+            re.IGNORECASE,
+        )
+        is not None
     )
 
 

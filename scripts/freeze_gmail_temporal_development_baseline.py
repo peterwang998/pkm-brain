@@ -2,7 +2,7 @@
 """Freeze the current Gmail thread universe for future holdout exclusion.
 
 This command is a local, read-only corpus audit.  It validates every active or
-deleted projection-v7 Gmail document against the connector-authored timestamp
+deleted projection-v8 Gmail document against the connector-authored timestamp
 and message-policy indexes, then writes only keyed opaque thread scopes.  A
 future release holdout built with the same HMAC key can prove that none of its
 threads overlap this development baseline without retaining or disclosing
@@ -52,7 +52,7 @@ PRIVATE_FILE_MODE = 0o600
 PRIVATE_DIRECTORY_MODE = 0o700
 MIN_HMAC_KEY_BYTES = 32
 MAX_HMAC_KEY_BYTES = 4096
-EXPECTED_PROJECTION_VERSION = 7
+EXPECTED_PROJECTION_VERSION = 8
 EXPECTED_CLASSIFIER_VERSION = 5
 EXPECTED_MESSAGE_POLICY_VERSION = 1
 THREAD_SCOPE_ARTIFACT = "development-thread-scopes.jsonl"
@@ -264,7 +264,7 @@ def _freeze_scope_rows(
             or len(policies) != retained_count
         ):
             raise GmailTemporalDevelopmentBaselineError(
-                "projection-v7 Gmail authority is incomplete"
+                "projection-v8 Gmail authority is incomplete"
             )
 
         thread_key = (account_key, thread_id)

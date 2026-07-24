@@ -144,7 +144,7 @@ def _evidence() -> dict[str, Any]:
         "packet_id": PACKET_ID,
         "thread_id": THREAD_ID,
         "revision_id": REVISION_ID,
-        "projection_version": 7,
+        "projection_version": 8,
         "classifier_version": 5,
         "messages": [
             {

@@ -9,6 +9,7 @@ from typing import Literal, TypeVar
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .gmail_temporal_discovery import (
+    GMAIL_TEMPORAL_ACTION_VERBS,
     discover_gmail_temporal_candidates,
     gmail_temporal_event_head_is_artifact_object,
 )
@@ -17,7 +18,7 @@ from .gmail_temporal_discovery import (
 TemporalRelation = Literal["occurrence", "deadline"]
 TemporalKind = Literal["planned", "actual"]
 TemporalField = Literal["subject", "body", "message"]
-GMAIL_TEMPORAL_LEAD_POLICY_VERSION = "gmail_temporal_lead_policy_v7"
+GMAIL_TEMPORAL_LEAD_POLICY_VERSION = "gmail_temporal_lead_policy_v8"
 AssociationAdmissionBasis = Literal["none", "fact", "temporal_rescue"]
 ResolutionStatus = Literal["resolved", "ambiguous", "unresolved"]
 AssociationMode = Literal[
@@ -366,9 +367,7 @@ _DEADLINE_MENTION_RE = re.compile(
     re.IGNORECASE,
 )
 _ACTION_MENTION_RE = re.compile(
-    r"\b(?:accept|apply|approve|book|complete|confirm|decline|file|finish|pay|"
-    r"provide|register|renew|reply|respond|rsvp|send|sign|submit|upload|"
-    r"verify)\b",
+    rf"\b(?:{'|'.join(GMAIL_TEMPORAL_ACTION_VERBS)})\b",
     re.IGNORECASE,
 )
 _EVENT_PREDICATE_RE = re.compile(
@@ -386,14 +385,21 @@ _EFFECTIVE_STATE_PREDICATE_RE = re.compile(
     re.IGNORECASE,
 )
 _EFFECTIVE_STATE_OBSERVATION_RE = re.compile(r"is\s+effective\Z", re.IGNORECASE)
-_OPENING_PREDICATE_RE = re.compile(r"(?:opened|opens|will\s+open)\Z", re.IGNORECASE)
+_OPENING_PREDICATE_RE = re.compile(
+    r"(?:open|opened|opens|will\s+open)\Z",
+    re.IGNORECASE,
+)
 _ACTUAL_OPENING_PREDICATE_RE = re.compile(r"opened\Z", re.IGNORECASE)
-_CLOSING_PREDICATE_RE = re.compile(r"(?:closed|closes|will\s+close)\Z", re.IGNORECASE)
+_CLOSING_PREDICATE_RE = re.compile(
+    r"(?:close|closed|closes|will\s+close)\Z",
+    re.IGNORECASE,
+)
 _ACTUAL_CLOSING_PREDICATE_RE = re.compile(r"closed\Z", re.IGNORECASE)
 _OPENING_PREDICATE_SCAN_RE = re.compile(
     r"\b(?:open|opened|opens|will\s+open)\b", re.IGNORECASE
 )
 _BARE_INTAKE_OPENING_PREDICATE_RE = re.compile(r"\bopen\b", re.IGNORECASE)
+_BARE_INTAKE_CLOSING_PREDICATE_RE = re.compile(r"\bclose\b", re.IGNORECASE)
 _INTAKE_BOUNDARY_PREDICATE_RE = re.compile(
     r"(?P<state>\b(?:(?:is|are|will[ \t]+be|remains?)[ \t]+open))"
     r"(?:[ \t]+from\b)|"
@@ -427,10 +433,21 @@ _EFFECTIVE_BOUNDARY_SUBJECT_RE = re.compile(
     re.IGNORECASE,
 )
 _PREDICATE_EXPRESSION_LINK_RE = re.compile(
-    r"[ \t]*(?:[:,@-][ \t]*)?(?:(?:at|from|on)[ \t]+)?\Z",
+    r"[ \t]*(?:[:,@-][ \t]*)?"
+    r"(?:(?:at|by|from|no[ \t]+later[ \t]+than|on)[ \t]+)?\Z",
+    re.IGNORECASE,
+)
+_PREDICATE_ADDITIONAL_EXPRESSION_LINK_RE = re.compile(
+    r"[ \t]*(?:for[ \t]+[A-Za-z0-9]"
+    r"[A-Za-z0-9 /'\N{RIGHT SINGLE QUOTATION MARK}-]{0,40})?"
+    r"[ \t]*(?:,?[ \t]*(?:and|or)[ \t]+)\Z",
     re.IGNORECASE,
 )
 _INTAKE_POST_EXPRESSION_BOUNDARY_RE = re.compile(r"[ \t]*(?:[.!?;)\]}\"'”’][ \t]*)*")
+_INTAKE_TRAILING_INDEPENDENT_CLAUSE_RE = re.compile(
+    r"[ \t]*(?:,[ \t]*)?(?:and|but|then|while)[ \t]+\S",
+    re.IGNORECASE,
+)
 _OPENING_RESOURCE_SUBJECT_RE = re.compile(
     r"(?:online[ \t]+)?portal(?:[ \t]+(?:window|period|cycle|intake))?",
     re.IGNORECASE,
@@ -583,6 +600,7 @@ _SOURCE_BOUND_EVENT_MODIFIERS = frozenset(
         "partner",
         "performance",
         "planning",
+        "portfolio",
         "product",
         "project",
         "quarterly",
@@ -605,6 +623,9 @@ _SOURCE_BOUND_OPTION_NEXT_LINK_RE = re.compile(
     re.IGNORECASE,
 )
 GMAIL_TEMPORAL_CLAUSE_BOUND_EVENT_TITLE_BLOCKER = "clause_bound_event_title_review_only"
+GMAIL_TEMPORAL_SUPERSEDED_HISTORICAL_BLOCKER = (
+    "historical_tail_superseded_by_authored_update"
+)
 _SUBJECT_REPLY_PREFIX_RE = re.compile(r"(?i)^(?:(?:re|fw|fwd)\s*:\s*)+")
 _GENERIC_EVENT_TITLE_RE = re.compile(
     r"(?i)^(?:calendar\s+)?(?:invite|invitation|reminder|notification|update|"
@@ -626,9 +647,32 @@ _QUOTED_LINE_RE = re.compile(r"(?m)^[ \t]*>[^\n]*(?:\n|\Z)")
 _FORWARDED_ORIGINAL_MARKER_RE = re.compile(
     r"(?im)^[ \t]*(?:"
     r"-{2,}[ \t]*(?:original|forwarded)[ \t]+message[ \t]*-{2,}|"
+    r"-{2,}[ \t]*forwarded[ \t]+history[ \t]*-{2,}|"
+    r"(?:>[ \t]*)+(?:\*\*|__)?[ \t]*archived[ \t]+note[ \t]*:?[ \t]*(?:\*\*|__)?|"
     r"begin[ \t]+forwarded[ \t]+message:?|"
     r"on[ \t]+[^\r\n]{1,500}[ \t]+wrote:"
     r")[ \t]*\r?$"
+)
+_NO_ACTIVE_DATE_CLAUSE_RE = re.compile(
+    r"(?:there\s+is\s+)?no\s+(?:currently\s+)?active\s+date"
+    r"(?:\s+for\s+(?:this|the)\s+(?:item|event|meeting|appointment))?",
+    re.IGNORECASE,
+)
+_CURRENT_STATUS_SUBJECT_IDENTITY_RE = re.compile(
+    r"(?:current\s+)?status(?:\s+update)?\s+(?:of|for)\s+(?P<identity>.+)",
+    re.IGNORECASE,
+)
+_HISTORICAL_SCHEDULE_CLAUSE_RE = re.compile(
+    r"\s*(?:are|had\s+been|has\s+been|is|previously|was|were|will\s+be)\s+"
+    r"(?:re)?scheduled\b",
+    re.IGNORECASE,
+)
+_HISTORICAL_CONJUNCT_BOUNDARY_RE = re.compile(
+    r"[,;]\s*(?:and|but|then|whereas|while)\b",
+    re.IGNORECASE,
+)
+_GENERIC_STATUS_IDENTITY_TOKENS = frozenset(
+    {"appointment", "event", "item", "meeting", "status", "the", "this", "update"}
 )
 _BOUNDARY_RE = re.compile(
     r"\b(?:arrival|arrives?|check[ -]?out|completion|ends?|returns?)\b",
@@ -712,6 +756,14 @@ _ACTUAL_CONTEXT_RE = re.compile(
 _DEADLINE_ASSOCIATION_RE = re.compile(
     r"\b(?:by|before|deadline|due|no\s+later\s+than|until)\b", re.IGNORECASE
 )
+_DIRECT_ACTION_DEADLINE_CUE_RE = re.compile(
+    r"(?:by|no\s+later\s+than)\Z", re.IGNORECASE
+)
+_COORDINATING_CLAUSE_BOUNDARY_RE = re.compile(
+    r"(?:[,;]\s*(?:and|but|then)\b|\b(?:but|then)\b|"
+    r"\b(?:is|are|was|were|has|have|had|will)\b)",
+    re.IGNORECASE,
+)
 _FORBIDDEN_ASSOCIATION_PUNCTUATION_RE = re.compile(r"[.!?;]")
 
 _NORTH_AMERICAN_ABBREVIATION_OFFSETS = {
@@ -769,6 +821,7 @@ def analyze_gmail_temporal_leads(
     fields = _field_ranges(source)
     segments = _segment_ranges(source, fields)
     quoted_or_forwarded_ranges = _quoted_or_forwarded_ranges(source)
+    superseded_historical_ranges = _superseded_historical_ranges(source)
     scope_prefix = _opaque_scope_prefix(chunk_id, source)
     expressions = _expressions(
         source,
@@ -776,6 +829,7 @@ def analyze_gmail_temporal_leads(
         fields,
         segments,
         quoted_or_forwarded_ranges,
+        superseded_historical_ranges,
         scope_prefix,
     )
     mentions = _mentions(
@@ -784,6 +838,7 @@ def analyze_gmail_temporal_leads(
         segments,
         expressions,
         quoted_or_forwarded_ranges,
+        superseded_historical_ranges,
         scope_prefix,
     )
     admission_basis: AssociationAdmissionBasis = (
@@ -979,6 +1034,7 @@ def _expressions(
     fields: tuple[_FieldRange, ...],
     segments: tuple[_SegmentRange, ...],
     quoted_or_forwarded_ranges: tuple[tuple[int, int], ...],
+    superseded_historical_ranges: tuple[tuple[int, int], ...],
     scope_prefix: str,
 ) -> tuple[TemporalExpression, ...]:
     anchor_day = anchor.date() if anchor else None
@@ -1058,6 +1114,11 @@ def _expressions(
                         item.start,
                         item.end,
                         quoted_or_forwarded_ranges,
+                    ),
+                    *_superseded_historical_blocker(
+                        item.start,
+                        item.end,
+                        superseded_historical_ranges,
                     ),
                     *(
                         ("multiple_normalization_options",)
@@ -1891,6 +1952,7 @@ def _mentions(
     segments: tuple[_SegmentRange, ...],
     expressions: tuple[TemporalExpression, ...],
     quoted_or_forwarded_ranges: tuple[tuple[int, int], ...],
+    superseded_historical_ranges: tuple[tuple[int, int], ...],
     scope_prefix: str,
 ) -> tuple[TemporalMention, ...]:
     drafts: list[_MentionDraft] = []
@@ -2047,6 +2109,35 @@ def _mentions(
                 "planned",
                 "occurrence_start",
                 None,
+            )
+        )
+    for match in _BARE_INTAKE_CLOSING_PREDICATE_RE.finditer(text):
+        field = _field_for_span(fields, match.start(), match.end())
+        if not _deadline_closure_context(
+            text,
+            fields,
+            field,
+            match.start(),
+            match.end(),
+        ) or not _predicate_has_forward_expression(
+            text,
+            fields=fields,
+            segments=segments,
+            expressions=expressions,
+            predicate_start=match.start(),
+            link_end=match.end(),
+        ):
+            continue
+        drafts.append(
+            _MentionDraft(
+                match.start(),
+                match.end(),
+                "event_predicate",
+                "deadline",
+                "planned",
+                "deadline",
+                None,
+                ("predicate_mention_review_only",),
             )
         )
     drafts.extend(
@@ -2213,6 +2304,11 @@ def _mentions(
                         item.start,
                         item.end,
                         quoted_or_forwarded_ranges,
+                    ),
+                    *_superseded_historical_blocker(
+                        item.start,
+                        item.end,
+                        superseded_historical_ranges,
                     ),
                 )
             ),
@@ -2661,10 +2757,16 @@ def _opening_expression_tail_is_supported(
                     text[closing.end() : closing_expression.start]
                 )
                 is not None
-                and _INTAKE_POST_EXPRESSION_BOUNDARY_RE.fullmatch(
-                    text[closing_expression.end : segment.end]
+                and (
+                    _INTAKE_POST_EXPRESSION_BOUNDARY_RE.fullmatch(
+                        text[closing_expression.end : segment.end]
+                    )
+                    is not None
+                    or _INTAKE_TRAILING_INDEPENDENT_CLAUSE_RE.match(
+                        text[closing_expression.end : segment.end]
+                    )
+                    is not None
                 )
-                is not None
             ):
                 return True
     return False
@@ -2901,6 +3003,8 @@ def _associate(
                 continue
             mention = _mention_for_strict_candidate(
                 strict_mentions,
+                text=text,
+                expression=expression,
                 relation=candidate.relation,
                 cue_start=candidate.cue_span.start,
                 cue_end=candidate.cue_span.end,
@@ -2922,6 +3026,35 @@ def _associate(
                 )
             )
             paired.add((expression.expression_id, mention.mention_id))
+
+    direct_predicate_expression_ids: dict[str, str] = {}
+    for expression, mention in _direct_predicate_expression_pairs(
+        text,
+        broad_expressions,
+        broad_edge_mentions,
+    ):
+        pair = (expression.expression_id, mention.mention_id)
+        direct_predicate_expression_ids[mention.mention_id] = expression.expression_id
+        if pair in paired:
+            continue
+        relation, kind = _relation_and_kind(text, expression, mention)
+        blockers = _association_blockers(
+            expression,
+            mention,
+            mentions,
+            mode="direct_grammar",
+        )
+        raw.append(
+            (
+                expression,
+                mention,
+                "direct_grammar",
+                relation,
+                kind,
+                blockers,
+            )
+        )
+        paired.add(pair)
     candidate_edge_count += len(raw)
 
     local_edges: list[tuple[int, TemporalExpression, TemporalMention]] = []
@@ -2931,6 +3064,12 @@ def _associate(
             if (
                 pair in paired
                 or expression.field != mention.field
+                or (
+                    mention.mention_type == "event_predicate"
+                    and mention.mention_id in direct_predicate_expression_ids
+                    and direct_predicate_expression_ids[mention.mention_id]
+                    != expression.expression_id
+                )
                 or not _source_bound_title_pair_is_authorized(
                     text,
                     expressions,
@@ -3016,6 +3155,12 @@ def _associate(
             if (
                 pair in paired
                 or expression.field != mention.field
+                or (
+                    mention.mention_type == "event_predicate"
+                    and mention.mention_id in direct_predicate_expression_ids
+                    and direct_predicate_expression_ids[mention.mention_id]
+                    != expression.expression_id
+                )
                 or not _source_bound_title_pair_is_authorized(
                     text,
                     expressions,
@@ -3413,7 +3558,9 @@ def _association_blockers(
             in_scope = distance <= _MAX_LOCAL_ASSOCIATION_GAP
         if not in_scope:
             continue
-        if other.mention_type == "artifact":
+        if other.mention_type == "artifact" and not (
+            mode == "direct_grammar" and mention.mention_type == "action"
+        ):
             blockers.extend(other.blockers or ("artifact_context",))
         elif other.mention_type == "boundary":
             blockers.extend(
@@ -3439,7 +3586,15 @@ def _relation_and_kind(
     relation = mention.relation
     if mention.mention_type == "action":
         relation = (
-            "deadline" if _DEADLINE_ASSOCIATION_RE.search(association_text) else None
+            "deadline"
+            if _action_deadline_association_supported(
+                text,
+                expression=expression,
+                mention=mention,
+                window_start=start,
+                window_end=end,
+            )
+            else None
         )
     kind = mention.kind
     if kind is None:
@@ -3450,6 +3605,77 @@ def _relation_and_kind(
         elif relation == "deadline":
             kind = "planned"
     return relation, kind
+
+
+def _action_deadline_association_supported(
+    text: str,
+    *,
+    expression: TemporalExpression,
+    mention: TemporalMention,
+    window_start: int,
+    window_end: int,
+) -> bool:
+    """Distinguish a deadline connector from an agentive ``by`` phrase."""
+
+    association_text = text[window_start:window_end]
+    if re.search(
+        r"\b(?:before|deadline|due|no\s+later\s+than|until)\b",
+        association_text,
+        re.IGNORECASE,
+    ):
+        return True
+    for match in re.finditer(r"\bby\b", association_text, re.IGNORECASE):
+        cue_start = window_start + match.start()
+        cue_end = window_start + match.end()
+        if mention.end <= cue_start <= expression.start:
+            action_to_cue = text[mention.end : cue_start]
+            if (
+                _FORBIDDEN_ASSOCIATION_PUNCTUATION_RE.search(action_to_cue) is None
+                and _COORDINATING_CLAUSE_BOUNDARY_RE.search(action_to_cue) is None
+                and _action_by_expression_gap_supported(
+                    text[cue_end : expression.start]
+                )
+            ):
+                return True
+        elif cue_end <= expression.start <= expression.end <= mention.start:
+            # Preserve the established date-first grammar: ``By DATE, submit``.
+            if (
+                _action_by_expression_gap_supported(text[cue_end : expression.start])
+                and re.fullmatch(
+                    r"[ \t]*,?[ \t]*", text[expression.end : mention.start]
+                )
+                is not None
+            ):
+                return True
+    return False
+
+
+def _action_by_expression_gap_supported(value: str) -> bool:
+    if len(value) > 180 or re.search(r"[;.!?\n]", value):
+        return False
+    if re.search(
+        r"\b(?:january|february|march|april|may|june|july|august|"
+        r"september|october|november|december)\.?\s+\d{1,2}"
+        r"|\b\d{4}-\d{2}-\d{2}\b|\b(?:today|tomorrow)\b",
+        value,
+        re.IGNORECASE,
+    ):
+        return False
+    gap = value.strip(" \t\r\n,;:-")
+    if not gap:
+        return True
+    return (
+        re.fullmatch(
+            r"(?:(?:the\s+)?(?:deadline|due\s+date)(?:\s+is)?|"
+            r"(?:(?:the\s+)?(?:end\s+of\s+day|close\s+of\s+business)|eod|cob)"
+            r"(?:\s+on)?|"
+            r"(?:on\s+)?(?:monday|tuesday|wednesday|thursday|friday|"
+            r"saturday|sunday))",
+            gap,
+            re.IGNORECASE,
+        )
+        is not None
+    )
 
 
 def _expression_for_span(
@@ -3471,25 +3697,104 @@ def _expression_for_span(
 def _mention_for_strict_candidate(
     mentions: tuple[TemporalMention, ...],
     *,
+    text: str,
+    expression: TemporalExpression,
     relation: str,
     cue_start: int,
     cue_end: int,
     field: TemporalField,
 ) -> TemporalMention | None:
     compatible = [
-        item
-        for item in mentions
-        if item.field == field
-        and (
-            item.relation == relation
-            or (relation == "deadline" and item.mention_type == "action")
-        )
+        item for item in mentions if item.field == field and item.relation == relation
     ]
+    cue_surface = text[cue_start:cue_end].strip()
+    if relation == "deadline" and _DIRECT_ACTION_DEADLINE_CUE_RE.fullmatch(cue_surface):
+        action_candidates = [
+            item
+            for item in mentions
+            if item.mention_type == "action"
+            and item.field == field
+            and item.segment_id == expression.segment_id
+            and item.end <= cue_start
+            and cue_start - item.end <= 90
+            and _FORBIDDEN_ASSOCIATION_PUNCTUATION_RE.search(text[item.end : cue_start])
+            is None
+            and _COORDINATING_CLAUSE_BOUNDARY_RE.search(text[item.end : cue_start])
+            is None
+        ]
+        if action_candidates:
+            return min(
+                action_candidates,
+                key=lambda item: _span_distance(
+                    item.start,
+                    item.end,
+                    cue_start,
+                    cue_end,
+                ),
+            )
     return min(
         compatible,
         key=lambda item: _span_distance(item.start, item.end, cue_start, cue_end),
         default=None,
     )
+
+
+def _direct_predicate_expression_pairs(
+    text: str,
+    expressions: tuple[TemporalExpression, ...],
+    mentions: tuple[TemporalMention, ...],
+) -> tuple[tuple[TemporalExpression, TemporalMention], ...]:
+    """Bind an opening or closing predicate only to its adjacent expression."""
+
+    output: list[tuple[TemporalExpression, TemporalMention]] = []
+    for mention in mentions:
+        surface = text[mention.start : mention.end]
+        if mention.mention_type != "event_predicate" or not (
+            _OPENING_PREDICATE_RE.fullmatch(surface)
+            or _CLOSING_PREDICATE_RE.fullmatch(surface)
+        ):
+            continue
+        adjacent = tuple(
+            sorted(
+                (
+                    expression
+                    for expression in expressions
+                    if expression.field == mention.field
+                    and expression.segment_id == mention.segment_id
+                    and expression.start >= mention.end
+                    and _PREDICATE_EXPRESSION_LINK_RE.fullmatch(
+                        text[mention.end : expression.start]
+                    )
+                    is not None
+                ),
+                key=lambda expression: (expression.start, expression.end),
+            )
+        )
+        if not adjacent:
+            continue
+        first = adjacent[0]
+        output.append((first, mention))
+        previous = first
+        for expression in sorted(
+            (
+                item
+                for item in expressions
+                if item.field == mention.field
+                and item.segment_id == mention.segment_id
+                and item.start >= first.end
+            ),
+            key=lambda item: (item.start, item.end),
+        ):
+            if (
+                _PREDICATE_ADDITIONAL_EXPRESSION_LINK_RE.fullmatch(
+                    text[previous.end : expression.start]
+                )
+                is None
+            ):
+                break
+            output.append((expression, mention))
+            previous = expression
+    return tuple(output)
 
 
 def _association_gap(
@@ -3683,6 +3988,87 @@ def _quoted_or_forwarded_ranges(text: str) -> tuple[tuple[int, int], ...]:
     return tuple(merged)
 
 
+def _superseded_historical_ranges(text: str) -> tuple[tuple[int, int], ...]:
+    """Return matching historical clauses superseded by the authored update.
+
+    A current-state denial only supersedes quoted history for the event named in
+    the message subject.  Even within one forwarded tail, unrelated deadlines
+    remain reviewable.  This conservative identity certificate intentionally
+    prefers recall when the event cannot be matched from source text.
+    """
+
+    marker = _FORWARDED_ORIGINAL_MARKER_RE.search(text)
+    if marker is None:
+        return ()
+    clause_matches = tuple(re.finditer(r"[^.!?;\r\n]+", text))
+    authored_clauses = tuple(
+        match
+        for match in clause_matches
+        if match.end() <= marker.start() and match.group().strip()
+    )
+    if (
+        not authored_clauses
+        or _NO_ACTIVE_DATE_CLAUSE_RE.fullmatch(authored_clauses[-1].group().strip())
+        is None
+    ):
+        return ()
+    history_start = marker.end()
+
+    identity_tokens = _current_status_subject_identity_tokens(text)
+    if not identity_tokens:
+        return ()
+    identity_pattern = re.compile(
+        r"(?<!\w)"
+        + r"(?:[\W_]+)".join(re.escape(token) for token in identity_tokens)
+        + r"(?!\w)",
+        re.IGNORECASE,
+    )
+    ranges: list[tuple[int, int]] = []
+    for match in identity_pattern.finditer(text, history_start):
+        boundary = re.search(r"[.!?;\r\n]", text[match.end() :])
+        clause_end = len(text) if boundary is None else match.end() + boundary.end()
+        schedule = _HISTORICAL_SCHEDULE_CLAUSE_RE.match(
+            text,
+            match.end(),
+            clause_end,
+        )
+        if schedule is None:
+            continue
+        coordinator = _HISTORICAL_CONJUNCT_BOUNDARY_RE.search(
+            text,
+            schedule.end(),
+            clause_end,
+        )
+        ranges.append(
+            (
+                match.start(),
+                coordinator.start() if coordinator is not None else clause_end,
+            )
+        )
+    return tuple(ranges)
+
+
+def _current_status_subject_identity_tokens(text: str) -> tuple[str, ...]:
+    """Return a distinctive event identity from an explicit status subject."""
+
+    subject_match = re.search(r"(?im)^Subject:[ \t]*(?P<subject>[^\r\n]+)", text)
+    if subject_match is None:
+        return ()
+    subject = _SUBJECT_REPLY_PREFIX_RE.sub("", subject_match.group("subject"))
+    match = _CURRENT_STATUS_SUBJECT_IDENTITY_RE.fullmatch(subject.strip())
+    if match is None:
+        return ()
+    tokens = tuple(
+        token.casefold()
+        for token in re.findall(r"[^\W_]+", match.group("identity"), re.UNICODE)
+    )
+    if len(tokens) < 2 or not any(
+        token not in _GENERIC_STATUS_IDENTITY_TOKENS for token in tokens
+    ):
+        return ()
+    return tokens
+
+
 def _quoted_or_forwarded_blocker(
     start: int,
     end: int,
@@ -3692,6 +4078,18 @@ def _quoted_or_forwarded_blocker(
         range_start < end and start < range_end for range_start, range_end in ranges
     ):
         return ("quoted_or_forwarded_context",)
+    return ()
+
+
+def _superseded_historical_blocker(
+    start: int,
+    end: int,
+    ranges: tuple[tuple[int, int], ...],
+) -> tuple[str, ...]:
+    if any(
+        range_start < end and start < range_end for range_start, range_end in ranges
+    ):
+        return (GMAIL_TEMPORAL_SUPERSEDED_HISTORICAL_BLOCKER,)
     return ()
 
 

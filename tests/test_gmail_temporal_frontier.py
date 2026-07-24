@@ -127,6 +127,425 @@ def test_frontier_is_deterministic_bounded_and_validator_backed() -> None:
         first.complete = False  # type: ignore[misc]
 
 
+def test_action_is_the_only_subject_for_a_no_later_than_deadline() -> None:
+    text = "Please send the Pebble Shore board summary no later than May 14, 2027."
+    analysis, plan = analyze_and_plan(text)
+    frontier = build_gmail_temporal_candidate_frontier(
+        analysis=analysis,
+        batch=plan.batches[0],
+    )
+    surfaces = {
+        mention.mention_id: text[mention.start : mention.end]
+        for mention in analysis.mentions
+    }
+
+    assert len(frontier.candidates) == 1
+    candidate = frontier.candidates[0]
+    assert surfaces[candidate.subject_mention_id] == "send"
+    assert (candidate.relation, candidate.lifecycle) == ("deadline", "none")
+    assert candidate.requires_defer is False
+    assert candidate.supporting_lead_present is True
+    assert candidate.blockers == ()
+
+
+def test_action_is_retained_through_an_explicit_named_deadline_connector() -> None:
+    text = "Please submit the report by the deadline: May 14, 2027."
+    analysis, plan = analyze_and_plan(text)
+    candidates = tuple(
+        candidate
+        for batch in plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+    )
+    surfaces = {
+        mention.mention_id: text[mention.start : mention.end]
+        for mention in analysis.mentions
+    }
+
+    assert len(candidates) == 1
+    assert (
+        surfaces[candidates[0].subject_mention_id],
+        candidates[0].normalized_value,
+        candidates[0].relation,
+    ) == ("submit", "2027-05-14", "deadline")
+
+
+@pytest.mark.parametrize(
+    "label",
+    (
+        "the end of day on",
+        "the close of business on",
+    ),
+)
+def test_action_deadline_accepts_bounded_business_day_labels(label: str) -> None:
+    text = f"Please submit the report by {label} May 14, 2027."
+    analysis, plan = analyze_and_plan(text)
+    candidates = tuple(
+        candidate
+        for batch in plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+    )
+    surfaces = {
+        mention.mention_id: text[mention.start : mention.end]
+        for mention in analysis.mentions
+    }
+
+    action_candidates = tuple(
+        candidate
+        for candidate in candidates
+        if surfaces[candidate.subject_mention_id] == "submit"
+    )
+    assert len(action_candidates) == 1
+    assert (
+        surfaces[action_candidates[0].subject_mention_id],
+        action_candidates[0].normalized_value,
+        action_candidates[0].relation,
+    ) == ("submit", "2027-05-14", "deadline")
+
+
+def test_two_direct_action_deadlines_do_not_create_a_cross_product() -> None:
+    text = "Submit the report by May 14, 2027 and pay the invoice by May 20, 2027."
+    analysis, plan = analyze_and_plan(text)
+    surfaces = {
+        mention.mention_id: text[mention.start : mention.end]
+        for mention in analysis.mentions
+    }
+    candidates = tuple(
+        candidate
+        for batch in plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+    )
+
+    assert {
+        (
+            surfaces[candidate.subject_mention_id].casefold(),
+            candidate.normalized_value,
+            candidate.relation,
+        )
+        for candidate in candidates
+    } == {
+        ("submit", "2027-05-14", "deadline"),
+        ("pay", "2027-05-20", "deadline"),
+    }
+
+
+def test_two_extended_vocabulary_action_deadlines_do_not_create_a_cross_product() -> (
+    None
+):
+    text = "Upload the report by May 14, 2027 and sign the contract by May 20, 2027."
+    analysis, plan = analyze_and_plan(text)
+    surfaces = {
+        mention.mention_id: text[mention.start : mention.end]
+        for mention in analysis.mentions
+    }
+    candidates = tuple(
+        candidate
+        for batch in plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+    )
+
+    assert {
+        (
+            surfaces[candidate.subject_mention_id].casefold(),
+            candidate.normalized_value,
+            candidate.relation,
+        )
+        for candidate in candidates
+    } == {
+        ("upload", "2027-05-14", "deadline"),
+        ("sign", "2027-05-20", "deadline"),
+    }
+
+
+def test_confirm_action_deadline_uses_the_action_not_its_object() -> None:
+    text = "Confirm the booking by May 14, 2027."
+    analysis, plan = analyze_and_plan(text)
+    surfaces = {
+        mention.mention_id: text[mention.start : mention.end]
+        for mention in analysis.mentions
+    }
+    candidates = tuple(
+        candidate
+        for batch in plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+    )
+
+    assert len(candidates) == 1
+    assert (
+        surfaces[candidates[0].subject_mention_id].casefold(),
+        candidates[0].normalized_value,
+        candidates[0].relation,
+    ) == ("confirm", "2027-05-14", "deadline")
+
+
+def test_direct_action_does_not_hide_a_separately_scheduled_booking() -> None:
+    text = "The booking is scheduled for May 10, 2027. Confirm it by May 14, 2027."
+    analysis, plan = analyze_and_plan(text)
+    surfaces = {
+        mention.mention_id: text[mention.start : mention.end]
+        for mention in analysis.mentions
+    }
+    candidates = tuple(
+        candidate
+        for batch in plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+    )
+
+    assert any(
+        surfaces[candidate.subject_mention_id].casefold() == "booking"
+        and candidate.normalized_value == "2027-05-10"
+        and candidate.relation == "occurrence"
+        and candidate.lifecycle == "scheduled"
+        for candidate in candidates
+    )
+    assert any(
+        surfaces[candidate.subject_mention_id].casefold() == "confirm"
+        and candidate.normalized_value == "2027-05-14"
+        and candidate.relation == "deadline"
+        for candidate in candidates
+    )
+
+
+def test_agentive_by_phrase_never_creates_a_deadline_candidate() -> None:
+    text = "Please send the report prepared by Alice on May 14, 2027."
+    analysis, plan = analyze_and_plan(text)
+    candidates = tuple(
+        candidate
+        for batch in plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+    )
+
+    assert all(candidate.relation != "deadline" for candidate in candidates)
+
+
+def test_standalone_deadline_subject_remains_available() -> None:
+    text = "The application deadline is May 14, 2027."
+    analysis, plan = analyze_and_plan(text)
+    candidates = tuple(
+        candidate
+        for batch in plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+    )
+    surfaces = {
+        mention.mention_id: text[mention.start : mention.end]
+        for mention in analysis.mentions
+    }
+
+    assert any(
+        surfaces[candidate.subject_mention_id].casefold() == "deadline"
+        and candidate.relation == "deadline"
+        for candidate in candidates
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_subject"),
+    (
+        (
+            "Please send the report, but the application deadline is May 14, 2027.",
+            "deadline",
+        ),
+        (
+            "Please send the report, but applications close May 14, 2027.",
+            "close",
+        ),
+        (
+            "Please send the report, but applications close no later than "
+            "May 14, 2027.",
+            "close",
+        ),
+    ),
+)
+def test_unrelated_action_never_replaces_a_named_or_closing_deadline(
+    text: str,
+    expected_subject: str,
+) -> None:
+    analysis, plan = analyze_and_plan(text)
+    candidates = tuple(
+        candidate
+        for batch in plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+    )
+    surfaces = {
+        mention.mention_id: text[mention.start : mention.end]
+        for mention in analysis.mentions
+    }
+
+    assert candidates
+    assert all(
+        surfaces[candidate.subject_mention_id] != "send" for candidate in candidates
+    )
+    assert any(
+        surfaces[candidate.subject_mention_id].casefold() == expected_subject
+        and candidate.normalized_value == "2027-05-14"
+        and candidate.relation == "deadline"
+        for candidate in candidates
+    )
+
+
+@pytest.mark.parametrize(
+    "marker",
+    (
+        "> Archived note:",
+        "---------- Forwarded history ----------",
+    ),
+)
+def test_authored_no_active_date_suppresses_a_historical_schedule(
+    marker: str,
+) -> None:
+    text = (
+        "Subject: Current status of Orchard meeting\n\n"
+        "There is no active date for this item.\n\n"
+        f"{marker}\nThe Orchard meeting was scheduled for May 14, 2027."
+    )
+    analysis, plan = analyze_and_plan(text)
+
+    assert plan.batches
+    assert all(
+        build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+        == ()
+        for batch in plan.batches
+    )
+
+
+def test_forwarded_schedule_without_authored_denial_remains_reviewable() -> None:
+    text = (
+        "Subject: Orchard meeting\n\n"
+        "---------- Forwarded history ----------\n"
+        "The Orchard meeting was scheduled for May 14, 2027."
+    )
+    analysis, plan = analyze_and_plan(text)
+    candidates = tuple(
+        candidate
+        for batch in plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+    )
+
+    assert candidates
+    assert all("quoted_or_forwarded_context" in item.blockers for item in candidates)
+
+
+@pytest.mark.parametrize("coordinator", ("and", "while", "whereas"))
+def test_authored_denial_keeps_unrelated_forwarded_deadline_reviewable(
+    coordinator: str,
+) -> None:
+    text = (
+        "Subject: Current status of Orchard meeting\n\n"
+        "There is no active date for this item.\n\n"
+        "---------- Forwarded history ----------\n"
+        "The Orchard meeting was scheduled for May 10, 2027, "
+        f"{coordinator} "
+        "the tax filing deadline is May 14, 2027."
+    )
+    analysis, plan = analyze_and_plan(text)
+    candidates = tuple(
+        candidate
+        for batch in plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+    )
+    surfaces = {
+        mention.mention_id: text[mention.start : mention.end]
+        for mention in analysis.mentions
+    }
+
+    assert candidates
+    assert all(candidate.normalized_value != "2027-05-10" for candidate in candidates)
+    assert any(
+        surfaces[candidate.subject_mention_id].casefold() == "deadline"
+        and candidate.normalized_value == "2027-05-14"
+        and "quoted_or_forwarded_context" in candidate.blockers
+        and "historical_tail_superseded_by_authored_update" not in candidate.blockers
+        for candidate in candidates
+    )
+
+
+def test_matching_identity_inside_an_unrelated_forwarded_subject_stays_reviewable() -> (
+    None
+):
+    text = (
+        "Subject: Current status of Orchard meeting\n\n"
+        "There is no active date for this item.\n\n"
+        "---------- Forwarded history ----------\n"
+        "The Orchard meeting organizer was scheduled for a tax interview "
+        "on May 14, 2027."
+    )
+    analysis, plan = analyze_and_plan(text)
+    candidates = tuple(
+        candidate
+        for batch in plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+    )
+
+    assert candidates
+    assert all(
+        "historical_tail_superseded_by_authored_update" not in candidate.blockers
+        for candidate in candidates
+    )
+
+
+def test_identity_mention_does_not_suppress_unrelated_same_clause_deadline() -> None:
+    text = (
+        "Subject: Current status of Orchard meeting\n\n"
+        "There is no active date for this item.\n\n"
+        "---------- Forwarded history ----------\n"
+        "After the Orchard meeting, the tax filing deadline is May 14, 2027."
+    )
+    analysis, plan = analyze_and_plan(text)
+    candidates = tuple(
+        candidate
+        for batch in plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+    )
+    mentions = {item.mention_id: item for item in analysis.mentions}
+
+    assert any(
+        mentions[candidate.subject_mention_id].mention_type == "deadline"
+        and candidate.normalized_value == "2027-05-14"
+        for candidate in candidates
+    )
+
+
 @pytest.mark.parametrize(
     ("artifact_text", "genuine_text", "expected_value"),
     (
@@ -185,6 +604,122 @@ def test_exact_terminal_lifecycle_omits_redundant_base(lifecycle: str) -> None:
     )
 
     assert {item.lifecycle for item in frontier.candidates} == {lifecycle}
+
+
+def test_exact_long_title_cancelled_slot_omits_unled_variants() -> None:
+    text = (
+        "Subject: Radian 002 Yarrow Commons forum\n\n"
+        "The Radian 002 Yarrow Commons forum scheduled for May 14, 2027 "
+        "has been cancelled."
+    )
+    analysis, plan = analyze_and_plan(text)
+    candidates = tuple(
+        candidate
+        for batch in plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+    )
+    surfaces = {
+        mention.mention_id: text[mention.start : mention.end]
+        for mention in analysis.mentions
+    }
+
+    assert len(candidates) == 1
+    assert surfaces[candidates[0].subject_mention_id] == (
+        "Radian 002 Yarrow Commons forum"
+    )
+    assert (candidates[0].relation, candidates[0].lifecycle) == (
+        "occurrence",
+        "cancelled",
+    )
+    assert candidates[0].repair_flags == (
+        "cancelled_scheduled_slot_derived_as_planned_occurrence",
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "The meeting scheduled for May 14, 2027 has been cancelled, and the "
+        "filing deadline is the same date.",
+        "The meeting scheduled for May 14, 2027 was called off, and the filing "
+        "deadline is the same date.",
+    ),
+)
+def test_qualified_cancellation_keeps_unrelated_same_date_deadline_reviewable(
+    text: str,
+) -> None:
+    analysis, plan = analyze_and_plan(text)
+    candidates = tuple(
+        candidate
+        for batch in plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+    )
+    mentions = {item.mention_id: item for item in analysis.mentions}
+    surfaces = {
+        mention.mention_id: text[mention.start : mention.end]
+        for mention in analysis.mentions
+    }
+    cancellation_lifecycle_ids = {
+        mention.mention_id
+        for mention in analysis.mentions
+        if mention.lifecycle_role == "cancelled"
+    }
+    cancellation_candidates = tuple(
+        candidate
+        for candidate in candidates
+        if candidate.lifecycle_mention_id in cancellation_lifecycle_ids
+        and surfaces[candidate.subject_mention_id] == "meeting"
+    )
+
+    assert cancellation_candidates
+    assert all(candidate.requires_defer for candidate in cancellation_candidates)
+    assert all(
+        "cancelled_scheduled_slot_derived_as_planned_occurrence"
+        not in candidate.repair_flags
+        for candidate in cancellation_candidates
+    )
+    assert any(
+        mentions[candidate.subject_mention_id].mention_type == "deadline"
+        and surfaces[candidate.subject_mention_id] == "deadline"
+        for candidate in candidates
+    )
+
+
+def test_certified_cancellation_pruning_is_confined_to_its_alias_component() -> None:
+    text = (
+        "Subject: Filing deadline / meeting update\n\n"
+        "The meeting scheduled for May 14, 2027 has been cancelled."
+    )
+    analysis, plan = analyze_and_plan(text)
+    candidates = tuple(
+        candidate
+        for batch in plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+    )
+    mentions = {item.mention_id: item for item in analysis.mentions}
+
+    cancellation = next(
+        candidate
+        for candidate in candidates
+        if candidate.lifecycle == "cancelled"
+        and "cancelled_scheduled_slot_derived_as_planned_occurrence"
+        in candidate.repair_flags
+    )
+
+    assert mentions[cancellation.subject_mention_id].mention_type == "event"
+    assert any(
+        mentions[candidate.subject_mention_id].mention_type == "deadline"
+        for candidate in candidates
+    )
 
 
 def test_deferred_lifecycle_retains_base_for_recall() -> None:
@@ -736,31 +1271,41 @@ def test_generic_intake_targets_never_gain_a_strict_named_frontier(text: str) ->
 
 
 @pytest.mark.parametrize(
-    ("text", "surface", "expected_kind", "expected_date"),
+    (
+        "text",
+        "surface",
+        "expected_kind",
+        "expected_date",
+        "expect_predicate_candidate",
+    ),
     (
         (
             "The portal opens August 12, 2027.",
             "opens",
             "planned",
             "2027-08-12",
+            True,
         ),
         (
             "The portal will open August 12, 2027.",
             "will open",
             "planned",
             "2027-08-12",
+            True,
         ),
         (
             "The portal opened August 12, 2027.",
             "opened",
             "actual",
             "2027-08-12",
+            True,
         ),
         (
             "Registration opens August 12, 2027 and closes August 20, 2027.",
             "opens",
             "planned",
             "2027-08-12",
+            False,
         ),
     ),
 )
@@ -769,6 +1314,7 @@ def test_bounded_opening_inflections_reach_forced_defer_frontier(
     surface: str,
     expected_kind: str,
     expected_date: str,
+    expect_predicate_candidate: bool,
 ) -> None:
     analysis, plan = analyze_and_plan(text)
     predicate = next(
@@ -788,6 +1334,9 @@ def test_bounded_opening_inflections_reach_forced_defer_frontier(
         and candidate.normalized_value == expected_date
     )
 
+    if not expect_predicate_candidate:
+        assert candidates == ()
+        return
     assert candidates
     assert {item.relation for item in candidates} == {"occurrence"}
     assert {item.kind for item in candidates} == {expected_kind}
@@ -891,11 +1440,7 @@ def test_coordinated_opening_closing_has_one_strict_opening_event_subject(
         for candidate in candidates
         if candidate.normalized_value == "2029-11-12"
     )
-    assert closing_fallbacks
-    assert all(
-        candidate.requires_defer is True and candidate.supporting_lead_present is False
-        for candidate in closing_fallbacks
-    )
+    assert closing_fallbacks == ()
     opening_predicate = next(
         item
         for item in analysis.mentions
@@ -911,8 +1456,132 @@ def test_coordinated_opening_closing_has_one_strict_opening_event_subject(
         if candidate.subject_mention_id == opening_predicate.mention_id
         and candidate.normalized_value == "2029-11-03"
     )
-    assert predicate_candidates
-    assert all(candidate.relation == "occurrence" for candidate in predicate_candidates)
+    assert predicate_candidates == ()
+
+    closing_predicate = next(
+        item
+        for item in analysis.mentions
+        if item.mention_type == "event_predicate"
+        and text[item.start : item.end] == "closes"
+    )
+    closing_candidates = tuple(
+        candidate
+        for batch in plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+        if candidate.subject_mention_id == closing_predicate.mention_id
+        and candidate.normalized_value == "2029-11-12"
+    )
+    assert len(closing_candidates) == 1
+    assert closing_candidates[0].relation == "deadline"
+    assert closing_candidates[0].supporting_lead_present is True
+
+
+def test_direct_closing_predicate_has_no_same_relation_cross_date_candidate() -> None:
+    text = "The tax deadline is May 25, 2027, and Registration closes May 20, 2027."
+    analysis, plan = analyze_and_plan(text)
+    closing = next(
+        mention
+        for mention in analysis.mentions
+        if mention.mention_type == "event_predicate"
+        and text[mention.start : mention.end] == "closes"
+    )
+    candidates = tuple(
+        candidate
+        for batch in plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+        if candidate.subject_mention_id == closing.mention_id
+    )
+
+    assert len(candidates) == 1
+    assert (
+        candidates[0].normalized_value,
+        candidates[0].relation,
+        candidates[0].supporting_lead_present,
+    ) == ("2027-05-20", "deadline", True)
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "Applications close May 14, 2027 for domestic and May 20, 2027 "
+        "for international.",
+        "Applications close May 14, 2027 or May 20, 2027.",
+    ),
+)
+def test_direct_closing_predicate_retains_coordinated_source_dates(text: str) -> None:
+    analysis, plan = analyze_and_plan(text)
+    closing = next(
+        mention
+        for mention in analysis.mentions
+        if mention.mention_type == "event_predicate"
+        and text[mention.start : mention.end] == "close"
+    )
+    candidates = tuple(
+        candidate
+        for batch in plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+        if candidate.subject_mention_id == closing.mention_id
+    )
+
+    assert {
+        (
+            candidate.normalized_value,
+            candidate.relation,
+            candidate.supporting_lead_present,
+        )
+        for candidate in candidates
+    } == {
+        ("2027-05-14", "deadline", True),
+        ("2027-05-20", "deadline", True),
+    }
+
+
+def test_open_close_pair_survives_a_trailing_independent_deadline() -> None:
+    text = (
+        "Registration opens May 14, 2027 and closes May 20, 2027, while the "
+        "tax deadline is May 25, 2027."
+    )
+    analysis, plan = analyze_and_plan(text)
+    candidates = tuple(
+        candidate
+        for batch in plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+    )
+    surfaces = {
+        mention.mention_id: text[mention.start : mention.end]
+        for mention in analysis.mentions
+    }
+
+    assert any(
+        surfaces[candidate.subject_mention_id] == "Registration"
+        and candidate.normalized_value == "2027-05-14"
+        and candidate.relation == "occurrence"
+        for candidate in candidates
+    )
+    assert any(
+        surfaces[candidate.subject_mention_id] == "closes"
+        and candidate.normalized_value == "2027-05-20"
+        and candidate.relation == "deadline"
+        for candidate in candidates
+    )
+    assert any(
+        surfaces[candidate.subject_mention_id] == "deadline"
+        and candidate.normalized_value == "2027-05-25"
+        and candidate.relation == "deadline"
+        for candidate in candidates
+    )
 
 
 def test_page_plan_clusters_adjacent_compound_event_nouns() -> None:

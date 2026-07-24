@@ -16,7 +16,7 @@ from .gmail_temporal_leads import (
 )
 
 
-ASSESSMENT_VERSION = "gmail_temporal_source_assertion_assessment_v1"
+ASSESSMENT_VERSION = "gmail_temporal_source_assertion_assessment_v2"
 
 AssertionDisposition = Literal["asserted", "blocked"]
 
@@ -89,6 +89,7 @@ _EPISTEMIC_BEFORE_CUE = re.compile(
 )
 _REPORTED_BEFORE_CUE = re.compile(
     r"\b(?:according\s+to|per)\s+[^,;.!?\r\n]{1,100}[,:]?|"
+    r"\brumou?r\s+has\s+it(?:\s+that)?\b|"
     r"\b(?:we|I)\s+(?:heard|were\s+told|was\s+told)\b|"
     r"\b(?:someone|they|he|she|the\s+(?:sender|report|message|notice))\s+"
     r"(?:said|says|reported|reports|claimed|claims|wrote|writes|announced)\b",
@@ -199,7 +200,7 @@ class GmailTemporalLeadAssertion:
 class GmailTemporalSourceAssertionAssessment:
     """Pure, disabled, content-redacted semantic assertion assessment."""
 
-    version: Literal["gmail_temporal_source_assertion_assessment_v1"]
+    version: Literal["gmail_temporal_source_assertion_assessment_v2"]
     assessment_fingerprint: str
     source_sha256: str
     analysis_fingerprint: str
@@ -358,6 +359,30 @@ def _assess_temporal_lead(
         evidence_end=end,
         disposition="blocked" if blockers else "asserted",
         blockers=blockers,
+    )
+
+
+def gmail_temporal_source_assertion_blockers(
+    text: str,
+    *,
+    start: int,
+    end: int,
+    inherited_blockers: tuple[str, ...] = (),
+    future_lifecycle: bool = False,
+) -> tuple[str, ...]:
+    """Classify assertion-strength blockers for one bounded text span.
+
+    This shared entry point keeps deterministic lifecycle-frame certificates
+    aligned with the standalone source-assertion assessment. Callers retain
+    the evidence as reviewable when any blocker is returned.
+    """
+
+    return _source_assertion_blockers(
+        text,
+        start=start,
+        end=end,
+        inherited_blockers=inherited_blockers,
+        future_lifecycle=future_lifecycle,
     )
 
 

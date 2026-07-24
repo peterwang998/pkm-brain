@@ -126,6 +126,34 @@ def test_sentence_punctuation_blocks_local_but_layout_newlines_stay_soft() -> No
     assert blank_line.leads[0].confidence_tier == "review_resolved"
 
 
+def test_direct_opening_predicate_excludes_distant_same_segment_date() -> None:
+    text = (
+        "On July 1, 2027, after an intentionally lengthy administrative "
+        "publication, reconciliation, compliance, and partner-confirmation "
+        "preface, Registration opens August 12, 2027."
+    )
+    result = analyze(text)
+    opening = next(
+        item
+        for item in result.mentions
+        if item.mention_type == "event_predicate"
+        and text[item.start : item.end] == "opens"
+    )
+    opening_leads = tuple(
+        item for item in result.leads if item.mention_id == opening.mention_id
+    )
+
+    assert len({item.segment_id for item in result.expressions}) == 1
+    assert len(opening_leads) == 1
+    assert opening_leads[0].association_mode == "direct_grammar"
+    expression = next(
+        item
+        for item in result.expressions
+        if item.expression_id == opening_leads[0].expression_id
+    )
+    assert text[expression.start : expression.end] == "August 12, 2027"
+
+
 def test_subject_and_message_singleton_fallbacks_are_explicit() -> None:
     subject = analyze(
         "Subject: Orchid Interview\n\nPlease keep July 22, 2027 available."
@@ -332,6 +360,85 @@ def test_structural_labels_and_common_predicates_expand_the_mention_inventory() 
         item for item in action_predicate.leads if item.mention_id == action.mention_id
     )
     assert (action_lead.relation, action_lead.kind) == ("deadline", "planned")
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "Please send the report by May 14, 2027.",
+        "Please send the report no later than May 14, 2027.",
+    ),
+)
+def test_strict_action_deadline_preference_is_limited_to_direct_connectors(
+    text: str,
+) -> None:
+    result = analyze(text)
+    action = next(
+        item
+        for item in result.mentions
+        if item.mention_type == "action" and text[item.start : item.end] == "send"
+    )
+    action_lead = next(
+        item for item in result.leads if item.mention_id == action.mention_id
+    )
+
+    assert action_lead.association_mode == "direct_grammar"
+    assert (action_lead.relation, action_lead.kind) == ("deadline", "planned")
+
+
+def test_action_deadline_connector_can_name_the_deadline_without_losing_action() -> (
+    None
+):
+    text = "Please submit the report by the deadline: May 14, 2027."
+    result = analyze(text)
+    direct = tuple(
+        item for item in result.leads if item.association_mode == "direct_grammar"
+    )
+
+    assert len(direct) == 1
+    mention = next(
+        item for item in result.mentions if item.mention_id == direct[0].mention_id
+    )
+    assert text[mention.start : mention.end] == "submit"
+    assert (direct[0].relation, direct[0].kind) == ("deadline", "planned")
+
+
+def test_agentive_by_phrase_does_not_give_an_action_deadline_semantics() -> None:
+    text = "Please send the report prepared by Alice on May 14, 2027."
+    result = analyze(text)
+    send = next(
+        item
+        for item in result.mentions
+        if item.mention_type == "action" and text[item.start : item.end] == "send"
+    )
+    leads = tuple(item for item in result.leads if item.mention_id == send.mention_id)
+
+    assert leads
+    assert all(item.association_mode != "direct_grammar" for item in leads)
+    assert all(item.relation is None for item in leads)
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "Please send the report, but the application deadline is May 14, 2027.",
+        "The application deadline is May 14, 2027.",
+    ),
+)
+def test_named_deadline_remains_the_strict_subject_across_unrelated_actions(
+    text: str,
+) -> None:
+    result = analyze(text)
+    direct = tuple(
+        item for item in result.leads if item.association_mode == "direct_grammar"
+    )
+
+    assert len(direct) == 1
+    mention = next(
+        item for item in result.mentions if item.mention_id == direct[0].mention_id
+    )
+    assert text[mention.start : mention.end] == "deadline"
+    assert (direct[0].relation, direct[0].kind) == ("deadline", "planned")
 
 
 def test_structured_when_label_creates_deferred_subject_event_title_candidate() -> None:
@@ -1234,6 +1341,148 @@ def test_forwarded_or_original_tail_temporal_evidence_is_blocked(
     assert result.leads
     assert all(
         "quoted_or_forwarded_context" in item.blockers
+        for item in (*result.expressions, *result.mentions, *result.leads)
+    )
+
+
+@pytest.mark.parametrize(
+    "marker",
+    (
+        "> Archived note:",
+        "---------- Forwarded history ----------",
+    ),
+)
+def test_superseded_historical_tail_has_a_hard_negative_certificate(
+    marker: str,
+) -> None:
+    text = (
+        "Subject: Current status of Orchard meeting\n\n"
+        "There is no active date for this item.\n\n"
+        f"{marker}\nThe Orchard meeting was scheduled for May 14, 2027."
+    )
+    result = analyze(text)
+
+    historical = tuple(
+        item
+        for item in (*result.expressions, *result.mentions, *result.leads)
+        if "quoted_or_forwarded_context" in item.blockers
+    )
+    assert historical
+    assert all(
+        "historical_tail_superseded_by_authored_update" in item.blockers
+        for item in historical
+    )
+
+
+def test_forwarded_history_without_current_state_denial_remains_reviewable() -> None:
+    text = (
+        "Subject: Orchard meeting\n\n"
+        "---------- Forwarded history ----------\n"
+        "The Orchard meeting was scheduled for May 14, 2027."
+    )
+    result = analyze(text)
+
+    assert result.leads
+    assert all("quoted_or_forwarded_context" in item.blockers for item in result.leads)
+    assert all(
+        "historical_tail_superseded_by_authored_update" not in item.blockers
+        for item in result.leads
+    )
+
+
+def test_current_state_denial_does_not_supersede_unrelated_forwarded_fact() -> None:
+    text = (
+        "Subject: Current status of Orchard meeting\n\n"
+        "There is no active date for this item.\n\n"
+        "---------- Forwarded history ----------\n"
+        "The tax filing deadline is May 14, 2027."
+    )
+    result = analyze(text)
+
+    assert result.leads
+    assert all("quoted_or_forwarded_context" in item.blockers for item in result.leads)
+    assert all(
+        "historical_tail_superseded_by_authored_update" not in item.blockers
+        for item in (*result.expressions, *result.mentions, *result.leads)
+    )
+
+
+@pytest.mark.parametrize("coordinator", ("while", "whereas"))
+def test_current_state_denial_only_supersedes_the_matching_historical_conjunct(
+    coordinator: str,
+) -> None:
+    text = (
+        "Subject: Current status of Orchard meeting\n\n"
+        "There is no active date for this item.\n\n"
+        "---------- Forwarded history ----------\n"
+        "The Orchard meeting was scheduled for May 10, 2027, "
+        f"{coordinator} the tax filing deadline is May 14, 2027."
+    )
+    result = analyze(text)
+
+    ranged_items = (*result.expressions, *result.mentions)
+    orchard = tuple(
+        item
+        for item in ranged_items
+        if item.start < text.index(coordinator)
+        and "quoted_or_forwarded_context" in item.blockers
+    )
+    tax = tuple(item for item in ranged_items if item.start > text.index(coordinator))
+    assert orchard
+    assert tax
+    assert all(
+        "historical_tail_superseded_by_authored_update" in item.blockers
+        for item in orchard
+    )
+    assert all(
+        "historical_tail_superseded_by_authored_update" not in item.blockers
+        for item in tax
+    )
+
+
+def test_matching_identity_inside_a_different_subject_is_not_superseded() -> None:
+    text = (
+        "Subject: Current status of Orchard meeting\n\n"
+        "There is no active date for this item.\n\n"
+        "---------- Forwarded history ----------\n"
+        "The Orchard meeting organizer was scheduled for a tax interview "
+        "on May 14, 2027."
+    )
+    result = analyze(text)
+
+    assert result.leads
+    assert all(
+        "historical_tail_superseded_by_authored_update" not in item.blockers
+        for item in (*result.expressions, *result.mentions, *result.leads)
+    )
+
+
+def test_unquoted_archived_note_is_authored_temporal_content() -> None:
+    text = (
+        "Subject: Orchard meeting\n\n"
+        "Archived note:\n"
+        "The Orchard meeting is scheduled for May 14, 2027."
+    )
+    result = analyze(text)
+
+    assert result.leads
+    assert all(
+        "quoted_or_forwarded_context" not in item.blockers
+        for item in (*result.expressions, *result.mentions, *result.leads)
+    )
+
+
+def test_tense_without_provenance_does_not_infer_superseded_history() -> None:
+    text = (
+        "Subject: Current status of Orchard meeting\n\n"
+        "There is no active date for this item. Actually, "
+        "the Orchard meeting was rescheduled for May 14, 2027."
+    )
+    result = analyze(text)
+
+    assert result.leads
+    assert all(
+        "historical_tail_superseded_by_authored_update" not in item.blockers
         for item in (*result.expressions, *result.mentions, *result.leads)
     )
 

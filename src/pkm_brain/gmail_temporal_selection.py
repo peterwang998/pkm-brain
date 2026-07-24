@@ -11,7 +11,11 @@ from .gmail_temporal_batching import (
     GmailTemporalSelectorBatch,
     validate_gmail_temporal_batch_manifest,
 )
+from .gmail_temporal_assertions import (
+    gmail_temporal_source_assertion_blockers,
+)
 from .gmail_temporal_leads import (
+    GMAIL_TEMPORAL_SUPERSEDED_HISTORICAL_BLOCKER,
     TemporalExpression,
     TemporalLead,
     TemporalLeadAnalysis,
@@ -26,7 +30,7 @@ SelectionDecision = Literal[
     "reject_nonmaterial",
 ]
 SelectionConfidence = Literal["high", "medium", "low"]
-GMAIL_TEMPORAL_SELECTION_POLICY_VERSION = "gmail_temporal_selection_policy_v4"
+GMAIL_TEMPORAL_SELECTION_POLICY_VERSION = "gmail_temporal_selection_policy_v6"
 TemporalSubjectPairRelation = Literal["alias", "coordinated", "distinct"]
 SelectionRelation = Literal["occurrence", "deadline", "unspecified"]
 SelectionKind = Literal["planned", "actual", "unspecified"]
@@ -93,6 +97,7 @@ GMAIL_TEMPORAL_HARD_SCOPE_BLOCKERS = frozenset(
     {
         "competing_lifecycle_expression_cue",
         "expression_subject_clause_scope_conflict",
+        GMAIL_TEMPORAL_SUPERSEDED_HISTORICAL_BLOCKER,
     }
 )
 _COORDINATING_SUBJECT_SEPARATOR_RE = re.compile(
@@ -150,6 +155,30 @@ _SCHEDULED_SLOT_TERMINAL_LINK_RE = re.compile(
 )
 _SCHEDULED_SLOT_CLEAN_TERMINAL_RE = re.compile(
     r"\s*(?:[.!?]+[\"')\]]*)?\s*\Z",
+)
+_SCHEDULED_SLOT_NONASSERTIVE_PREFIX_RE = re.compile(
+    r"\A\s*(?:"
+    r"(?:perhaps|maybe|possibly|probably|apparently|allegedly|reportedly|"
+    r"presumably|supposedly|conceivably|likely|unlikely)\b|"
+    r"it\s+(?:is|was)\s+(?:probable|possible|likely|unlikely)\s+that\b|"
+    r"(?:it\s+)?(?:appears?|seems?)(?:\s+(?:to|that|as\s+if))?\b|"
+    r"(?:I|we)\s+(?:think|believe|suspect|guess|suppose|doubt)\b|"
+    r"as\s+far\s+as\s+(?:I|we)\s+know\b|"
+    r"please\s+confirm\b|"
+    r"(?:can|could)\s+you\s+confirm\b|"
+    r"do\s+you\s+know(?:\s+whether)?\b|"
+    r"I\s+wonder(?:\s+whether)?\b"
+    r")",
+    re.IGNORECASE,
+)
+_SCHEDULED_SLOT_QUALIFIED_PREFIX_RE = re.compile(
+    r"\A\s*(?:"
+    r"if\b|unless\b|assuming\b|supposing\b|"
+    r"provided\s+that\b|in\s+case\b|on\s+condition\s+that\b|"
+    r"although\b|though\b|even\s+if\b|"
+    r"pending\b|subject\s+to\b|contingent\s+on\b"
+    r")",
+    re.IGNORECASE,
 )
 _LIFECYCLE_CONTEXT_BLOCKERS = frozenset(
     {"lifecycle_cancelled", "lifecycle_completed", "lifecycle_rescheduled"}
@@ -1150,13 +1179,10 @@ def _exact_scheduled_slot_cancellation_frame(
     mentions: dict[str, TemporalMention],
     batch: GmailTemporalSelectorBatch,
 ) -> _ExactLifecycleFrame | None:
-    if (
-        expression.resolution_status != "resolved"
-        or len(expression.normalized_options) != 1
-        or not _complete_normalization_is_valid(expression.normalized_options[0])
-        or expression.blockers
-    ):
-        return None
+    # This frame certifies the lifecycle grammar, not the timestamp.  A missing,
+    # abbreviated, ambiguous, or invalid timezone remains visible through the
+    # expression/normalization blockers below and therefore forces review, while
+    # the source-explicit cancellation continues to be represented as such.
     scheduled = tuple(
         candidate
         for candidate in mentions.values()
@@ -1197,6 +1223,12 @@ def _exact_scheduled_slot_cancellation_frame(
         batch.segment_end,
         field=lifecycle.field,
     )
+    prefix = _source_slice(
+        batch,
+        batch.segment_start,
+        subject.start,
+        field=subject.field,
+    )
     # Exact cancellation is a closed terminal grammar: after ``cancelled`` only
     # sentence-ending punctuation may remain.  Any lexical continuation could
     # qualify, condition, contrast, or replace the cancellation, so retain the
@@ -1205,12 +1237,42 @@ def _exact_scheduled_slot_cancellation_frame(
     qualified = trailing is None or (
         _SCHEDULED_SLOT_CLEAN_TERMINAL_RE.fullmatch(trailing) is None
     )
+    # Exact-frame grammar leaves assertion framing either before the subject or
+    # after the terminal cue. Probe only the pre-subject framing through the
+    # shared classifier; lexical trailing text is already handled as qualified.
+    assertion_probe = (prefix or "") + "cancelled"
+    assertion_blockers = gmail_temporal_source_assertion_blockers(
+        assertion_probe,
+        start=len(prefix or ""),
+        end=len(assertion_probe),
+        inherited_blockers=lifecycle.blockers,
+        future_lifecycle=True,
+    )
+    assertion_strength_unverified = (
+        prefix is None
+        or _SCHEDULED_SLOT_QUALIFIED_PREFIX_RE.match(prefix) is not None
+        or bool(set(assertion_blockers) - {"epistemic_assertion"})
+        # The broad source classifier deliberately has high recall.  In this
+        # exact frame, require epistemic language to lead the prefix so a proper
+        # name such as ``Perhaps Foundation`` is not treated as a hedge.
+        or (
+            "epistemic_assertion" in assertion_blockers
+            and _SCHEDULED_SLOT_NONASSERTIVE_PREFIX_RE.match(prefix) is not None
+        )
+        or (
+            trailing is not None
+            and "?" in trailing
+            and _SCHEDULED_SLOT_CLEAN_TERMINAL_RE.fullmatch(trailing) is not None
+        )
+    )
     return _ExactLifecycleFrame(
         lifecycle="cancelled",
         relation="occurrence",
         kind="planned",
         repair_flag=(
-            "cancelled_scheduled_slot_has_ambiguous_trailing_qualification"
+            "cancelled_scheduled_slot_assertion_strength_unverified"
+            if assertion_strength_unverified
+            else "cancelled_scheduled_slot_has_ambiguous_trailing_qualification"
             if qualified
             else "cancelled_scheduled_slot_derived_as_planned_occurrence"
         ),

@@ -657,6 +657,32 @@ def test_quoted_or_human_promotional_language_does_not_change_admission() -> Non
     assert human_normalized.fact_eligible is True
 
 
+def test_projection_excludes_the_full_explicit_archived_note_tail() -> None:
+    message = opened_message(
+        body_text=(
+            "There is no active date for the Oatgrass Lane interview.\n\n"
+            "> Archived note:\n"
+            "The Oatgrass Lane interview was scheduled for August 14.\n"
+            "An unquoted archived line named September 3 as a backup."
+        ),
+    )
+
+    normalized = normalize_gmail_thread(
+        snapshot(),
+        ArchiveThreadResult(
+            "thread-1", 1, (message,), False, account_key="gmail.primary"
+        ),
+    )
+
+    assert "There is no active date for the Oatgrass Lane interview." in (
+        normalized.markdown
+    )
+    assert "> Archived note:" not in normalized.markdown
+    assert "August 14" not in normalized.markdown
+    assert "September 3" not in normalized.markdown
+    assert normalized.quoted_chars_removed > 0
+
+
 def test_projection_bytes_are_deterministic_and_concise_human_reply_is_kept() -> None:
     message = opened_message(
         body_text="Yes, I agree. I will send the final note tomorrow morning."
