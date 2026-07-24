@@ -87,7 +87,7 @@ GOLD_AUDIT_APPROVED_FIXTURE_SHA256 = {
     2: "473bd0a0a691c72b112235d3e882bc7a80aacb0e9184cef18782735227eb1653",
 }
 GOLD_AUDIT_CONTRACT_SHA256 = (
-    "4ad5280ed193622403487789bee06ba9a6a21cc9ae30cfdd9825c1e1a1e27a0f"
+    "d11f3f2893e0598f470d3a0a3539ee7c9d5a0babf0130c71fbf374500ff6990f"
 )
 GOLD_AUDIT_MAX_BATCH_CASES = 4
 GOLD_AUDIT_MAX_REQUEST_BYTES = 48_000
@@ -4388,7 +4388,7 @@ def _gold_audit_ordinal_dispositions(
     if not isinstance(values, list) or len(values) != expected_count:
         raise PublicChallengeError(f"public gold audit {label} coverage is invalid")
     output: list[dict[str, Any]] = []
-    for expected_ordinal, item in enumerate(values):
+    for expected_ordinal, item in enumerate(values, start=1):
         if (
             not isinstance(item, Mapping)
             or set(item) != {ordinal_name, "disposition", "issue_codes", "rationale"}

@@ -561,11 +561,17 @@ def _write_gold_audit_root(
                 **valid,
                 "members": [
                     {"member_ordinal": ordinal, **valid}
-                    for ordinal, _ in enumerate(row["proposed_gold"]["members"])
+                    for ordinal, _ in enumerate(
+                        row["proposed_gold"]["members"],
+                        start=1,
+                    )
                 ],
                 "forbidden_bindings": [
                     {"forbidden_ordinal": ordinal, **valid}
-                    for ordinal, _ in enumerate(row["proposed_gold"]["forbidden"])
+                    for ordinal, _ in enumerate(
+                        row["proposed_gold"]["forbidden"],
+                        start=1,
+                    )
                 ],
                 "group_flag": dict(valid),
             }

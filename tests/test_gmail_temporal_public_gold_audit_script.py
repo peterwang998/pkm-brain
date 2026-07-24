@@ -70,7 +70,7 @@ def _response(
         case = _valid_disposition()
         members = [
             {"member_ordinal": ordinal, **_valid_disposition()}
-            for ordinal, _ in enumerate(row["proposed_gold"]["members"])
+            for ordinal, _ in enumerate(row["proposed_gold"]["members"], start=1)
         ]
         if row["case_id"] == corrected_case:
             case = {
@@ -79,7 +79,7 @@ def _response(
                 "rationale": "One normalized value needs correction.",
             }
             members[0] = {
-                "member_ordinal": 0,
+                "member_ordinal": 1,
                 "disposition": "correction_needed",
                 "issue_codes": ["wrong_value"],
                 "rationale": "The normalized value differs from the source.",
@@ -91,7 +91,10 @@ def _response(
                 "members": members,
                 "forbidden_bindings": [
                     {"forbidden_ordinal": ordinal, **_valid_disposition()}
-                    for ordinal, _ in enumerate(row["proposed_gold"]["forbidden"])
+                    for ordinal, _ in enumerate(
+                        row["proposed_gold"]["forbidden"],
+                        start=1,
+                    )
                 ],
                 "group_flag": _valid_disposition(),
             }
@@ -114,6 +117,17 @@ def test_canonical_fixture_and_generator_hash_allowlists_are_exact() -> None:
 def test_response_schema_uses_provider_supported_array_constraints() -> None:
     schema = audit._response_schema()  # noqa: SLF001
 
+    case_schema = schema["properties"]["cases"]["items"]["properties"]
+    assert (
+        case_schema["members"]["items"]["properties"]["member_ordinal"]["minimum"] == 1
+    )
+    assert (
+        case_schema["forbidden_bindings"]["items"]["properties"]["forbidden_ordinal"][
+            "minimum"
+        ]
+        == 1
+    )
+
     def walk(value: object) -> None:
         if isinstance(value, dict):
             assert "uniqueItems" not in value
@@ -132,6 +146,13 @@ def test_response_schema_uses_provider_supported_array_constraints() -> None:
                 "rationale": "Duplicate codes remain invalid at runtime.",
             },
             label="member",
+        )
+    with pytest.raises(audit.PublicGoldAuditError, match="coverage is invalid"):
+        audit._validate_ordinal_dispositions(  # noqa: SLF001
+            [{"member_ordinal": 0, **_valid_disposition()}],
+            expected_count=1,
+            ordinal_name="member_ordinal",
+            label="member response",
         )
 
 

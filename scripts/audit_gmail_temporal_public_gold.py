@@ -264,10 +264,12 @@ Promotional or routine noise may correctly have no semantic members even when it
 mentions a date.
 
 Return one case in input order and one disposition for every proposed member and
-forbidden binding in ordinal order. Use `valid` with issue_codes exactly [`none`]
-when correct. Use `correction_needed` with one or more specific non-`none` issue
-codes when incorrect. Report an omitted semantic member at case level with
-`missing_member`. Keep rationales terse and do not quote or restate the source."""
+forbidden binding in ordinal order. Ordinals are one-based: the first proposed
+member or forbidden binding is ordinal 1. Use `valid` with issue_codes exactly
+[`none`] when correct. Use `correction_needed` with one or more specific
+non-`none` issue codes when incorrect. Report an omitted semantic member at case
+level with `missing_member`. Keep rationales terse and do not quote or restate
+the source."""
 
 
 def _request_case(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -356,7 +358,7 @@ def _ordinal_disposition_schema(ordinal_name: str) -> dict[str, Any]:
     value = _disposition_schema()
     value["required"] = [ordinal_name, *value["required"]]
     value["properties"] = {
-        ordinal_name: {"type": "integer", "minimum": 0},
+        ordinal_name: {"type": "integer", "minimum": 1},
         **value["properties"],
     }
     return value
@@ -449,7 +451,7 @@ def _validate_ordinal_dispositions(
     if not isinstance(values, list) or len(values) != expected_count:
         raise PublicGoldAuditError(f"public audit {label} coverage is invalid")
     output: list[dict[str, Any]] = []
-    for expected_ordinal, item in enumerate(values):
+    for expected_ordinal, item in enumerate(values, start=1):
         if (
             not isinstance(item, Mapping)
             or set(item) != {ordinal_name, "disposition", "issue_codes", "rationale"}
