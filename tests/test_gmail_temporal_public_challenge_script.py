@@ -755,6 +755,44 @@ def _row(case_id: str, ordinal: int, filler_size: int) -> Any:
     )
 
 
+def _row_with_candidate_ids(
+    case_id: str,
+    ordinal: int,
+    candidate_ids: tuple[str, ...],
+) -> Any:
+    row = _row(case_id, ordinal, 100)
+    payload = dict(row.payload)
+    page = dict(payload["page"])
+    page["clusters"] = [{"candidate_ids": list(candidate_ids)}]
+    payload["page"] = page
+    return challenge._RequestRow(  # noqa: SLF001
+        case_id=row.case_id,
+        request_fingerprint=row.request_fingerprint,
+        payload=payload,
+        batch_fingerprint=row.batch_fingerprint,
+        frontier_fingerprint=row.frontier_fingerprint,
+        page_plan_fingerprint=row.page_plan_fingerprint,
+        page_fingerprint=row.page_fingerprint,
+        candidate_ids=candidate_ids,
+    )
+
+
+def _unit_response(unit: Any) -> dict[str, Any]:
+    return {
+        "version": challenge.external.VERIFIER_RESPONSE_VERSION,
+        "pages": [
+            {
+                "request_fingerprint": row.request_fingerprint,
+                "verdicts": [
+                    {"candidate_id": candidate_id, "verdict": "unsupported"}
+                    for candidate_id in row.candidate_ids
+                ],
+            }
+            for row in unit.rows
+        ],
+    }
+
+
 def test_bounded_units_use_shared_item_and_byte_ceiling() -> None:
     rows = tuple(_row(f"case-{index}", index, 14_000) for index in range(1, 6))
 
@@ -787,6 +825,108 @@ def test_bounded_units_pack_multi_page_cases_atomically() -> None:
         ["case-one", "case-one"],
         ["case-two", "case-two", "case-two"],
     ]
+
+
+def test_verifier_schema_pins_exact_call_identifiers_and_page_count() -> None:
+    unit = challenge.bounded_public_call_units(
+        (_row("case-one", 1, 100), _row("case-one", 2, 100))
+    )[0]
+
+    schema = challenge._verifier_response_schema(unit)  # noqa: SLF001
+    pages = schema["properties"]["pages"]
+    page_properties = pages["items"]["properties"]
+
+    assert pages["minItems"] == pages["maxItems"] == 2
+    assert page_properties["request_fingerprint"]["enum"] == [
+        row.request_fingerprint for row in unit.rows
+    ]
+    assert set(
+        page_properties["verdicts"]["items"]["properties"]["candidate_id"]["enum"]
+    ) == {candidate_id for row in unit.rows for candidate_id in row.candidate_ids}
+
+
+def test_verifier_response_uses_candidate_ids_and_canonicalizes_page_order() -> None:
+    unit = challenge.bounded_public_call_units(
+        (_row("case-one", 1, 100), _row("case-one", 2, 100))
+    )[0]
+    response = _unit_response(unit)
+    response["pages"] = list(reversed(response["pages"]))
+
+    validated = challenge._validate_response(unit, response)  # noqa: SLF001
+
+    assert [page["request_fingerprint"] for page in validated["case-one"]] == [
+        row.request_fingerprint for row in unit.rows
+    ]
+    assert [
+        verdict["candidate_id"]
+        for page in validated["case-one"]
+        for verdict in page["verdicts"]
+    ] == [candidate_id for row in unit.rows for candidate_id in row.candidate_ids]
+
+
+@pytest.mark.parametrize("mutation", ("unknown", "duplicate"))
+def test_verifier_response_rejects_non_bijective_page_authority(mutation: str) -> None:
+    unit = challenge.bounded_public_call_units(
+        (_row("case-one", 1, 100), _row("case-one", 2, 100))
+    )[0]
+    response = _unit_response(unit)
+    if mutation == "duplicate":
+        response["pages"][1]["request_fingerprint"] = response["pages"][0][
+            "request_fingerprint"
+        ]
+    else:
+        response["pages"][1]["request_fingerprint"] = (
+            "gtrq_ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        )
+
+    with pytest.raises(challenge.PublicChallengeError, match="page authority"):
+        challenge._validate_response(unit, response)  # noqa: SLF001
+
+
+def test_verifier_response_rejects_nonempty_candidate_omission() -> None:
+    candidate_ids = (
+        "gtvc_00000000000000000000000000000001",
+        "gtvc_00000000000000000000000000000002",
+    )
+    unit = challenge.bounded_public_call_units(
+        (_row_with_candidate_ids("case-one", 1, candidate_ids),)
+    )[0]
+    response = _unit_response(unit)
+    response["pages"][0]["verdicts"].pop()
+
+    with pytest.raises(challenge.PublicChallengeError, match="candidate coverage"):
+        challenge._validate_response(unit, response)  # noqa: SLF001
+
+
+@pytest.mark.parametrize("mutation", ("duplicate", "unknown"))
+def test_verifier_response_rejects_invalid_candidate_coverage(mutation: str) -> None:
+    unit = challenge.bounded_public_call_units(
+        (_row("case-one", 1, 100), _row("case-one", 2, 100))
+    )[0]
+    response = _unit_response(unit)
+    response["pages"][1]["verdicts"][0]["candidate_id"] = (
+        unit.rows[0].candidate_ids[0]
+        if mutation == "duplicate"
+        else "gtvc_ffffffffffffffffffffffffffffffff"
+    )
+
+    with pytest.raises(challenge.PublicChallengeError, match="candidate coverage"):
+        challenge._validate_response(unit, response)  # noqa: SLF001
+
+
+def test_bounded_units_reject_duplicate_candidate_authority_before_schema() -> None:
+    first = _row("case-one", 1, 100)
+    second = _row_with_candidate_ids("case-two", 2, first.candidate_ids)
+
+    with pytest.raises(challenge.PublicChallengeError, match="candidate authority"):
+        challenge.bounded_public_call_units((first, second))
+
+
+def test_bounded_units_reject_non_string_candidate_authority_before_schema() -> None:
+    malformed = _row_with_candidate_ids("case-one", 1, (None,))  # type: ignore[arg-type]
+
+    with pytest.raises(challenge.PublicChallengeError, match="candidate authority"):
+        challenge.bounded_public_call_units((malformed,))
 
 
 @pytest.mark.parametrize("variant", ["missing", "tampered"])

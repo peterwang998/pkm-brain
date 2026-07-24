@@ -143,6 +143,7 @@ _LOGICAL_RUN_ID_RE = re.compile(r"^gtpvc_(?:test_)?r_[0-9a-f]{64}$")
 _RUNNER_POLICY_RE = re.compile(r"^gtrun_[0-9a-f]{64}$")
 _TARGET_FINGERPRINT_RE = re.compile(r"^gtrt_[0-9a-f]{64}$")
 _REQUEST_FINGERPRINT_RE = re.compile(r"^gtrq_[0-9a-f]{64}$")
+_CANDIDATE_ID_RE = re.compile(r"^gtvc_[0-9a-f]{32}$")
 
 _CHALLENGE_KEYS = {
     "version",
@@ -965,6 +966,17 @@ def _archived_request_rows(
 def bounded_public_call_units(rows: Sequence[_RequestRow]) -> tuple[_CallUnit, ...]:
     """Apply the private holdout's exact item and serialized-byte ceilings."""
 
+    candidate_ids = [candidate_id for row in rows for candidate_id in row.candidate_ids]
+    if any(
+        not row.candidate_ids
+        or any(
+            not isinstance(candidate_id, str)
+            or _CANDIDATE_ID_RE.fullmatch(candidate_id) is None
+            for candidate_id in row.candidate_ids
+        )
+        for row in rows
+    ) or len(candidate_ids) != len(set(candidate_ids)):
+        raise PublicChallengeError("verifier candidate authority is invalid")
     shared_rows = [
         {
             "case_id": row.case_id,
@@ -1238,20 +1250,28 @@ def _validate_response(
     pages = response.get("pages")
     if not isinstance(pages, list) or len(pages) != len(unit.rows):
         raise PublicChallengeError("external verifier response coverage is invalid")
-    by_case: dict[str, list[Mapping[str, Any]]] = {
-        case_id: [] for case_id in unit.case_ids
-    }
-    for row, page in zip(unit.rows, pages, strict=True):
+    rows_by_fingerprint = {row.request_fingerprint: row for row in unit.rows}
+    if len(rows_by_fingerprint) != len(unit.rows):
+        raise PublicChallengeError("external verifier request authority is invalid")
+    verdicts_by_fingerprint: dict[str, dict[str, str]] = {}
+    for page in pages:
+        if not isinstance(page, Mapping) or set(page) != {
+            "request_fingerprint",
+            "verdicts",
+        }:
+            raise PublicChallengeError("external verifier page authority is invalid")
+        request_fingerprint = page.get("request_fingerprint")
         if (
-            not isinstance(page, Mapping)
-            or set(page) != {"request_fingerprint", "verdicts"}
-            or page.get("request_fingerprint") != row.request_fingerprint
+            not isinstance(request_fingerprint, str)
+            or request_fingerprint not in rows_by_fingerprint
+            or request_fingerprint in verdicts_by_fingerprint
         ):
             raise PublicChallengeError("external verifier page authority is invalid")
+        row = rows_by_fingerprint[request_fingerprint]
         verdicts = page.get("verdicts")
-        if not isinstance(verdicts, list):
+        if not isinstance(verdicts, list) or not verdicts:
             raise PublicChallengeError("external verifier verdicts are invalid")
-        actual: list[str] = []
+        parsed: dict[str, str] = {}
         for verdict in verdicts:
             if (
                 not isinstance(verdict, Mapping)
@@ -1261,11 +1281,25 @@ def _validate_response(
                 not in {"supported", "uncertain", "unsupported"}
             ):
                 raise PublicChallengeError("external verifier verdict is invalid")
-            actual.append(str(verdict["candidate_id"]))
-        if tuple(actual) != row.candidate_ids:
+            candidate_id = str(verdict["candidate_id"])
+            if candidate_id in parsed:
+                raise PublicChallengeError(
+                    "external verifier candidate coverage is invalid"
+                )
+            parsed[candidate_id] = str(verdict["verdict"])
+        if set(parsed) != set(row.candidate_ids):
             raise PublicChallengeError(
                 "external verifier candidate coverage is invalid"
             )
+        verdicts_by_fingerprint[request_fingerprint] = parsed
+    if set(verdicts_by_fingerprint) != set(rows_by_fingerprint):
+        raise PublicChallengeError("external verifier response coverage is invalid")
+
+    by_case: dict[str, list[Mapping[str, Any]]] = {
+        case_id: [] for case_id in unit.case_ids
+    }
+    for row in unit.rows:
+        parsed = verdicts_by_fingerprint[row.request_fingerprint]
         by_case[row.case_id].append(
             {
                 "request_fingerprint": row.request_fingerprint,
@@ -1273,10 +1307,88 @@ def _validate_response(
                 "frontier_fingerprint": row.frontier_fingerprint,
                 "page_plan_fingerprint": row.page_plan_fingerprint,
                 "page_fingerprint": row.page_fingerprint,
-                "verdicts": [dict(item) for item in verdicts],
+                "verdicts": [
+                    {"candidate_id": candidate_id, "verdict": parsed[candidate_id]}
+                    for candidate_id in row.candidate_ids
+                ],
             }
         )
     return {key: tuple(value) for key, value in by_case.items()}
+
+
+def _verifier_response_schema(unit: _CallUnit) -> dict[str, Any]:
+    """Constrain redundant response identifiers to this exact sealed call."""
+
+    request_fingerprints = [row.request_fingerprint for row in unit.rows]
+    candidate_ids = [
+        candidate_id for row in unit.rows for candidate_id in row.candidate_ids
+    ]
+    if (
+        not request_fingerprints
+        or len(request_fingerprints) != len(set(request_fingerprints))
+        or not candidate_ids
+        or any(
+            not isinstance(candidate_id, str)
+            or _CANDIDATE_ID_RE.fullmatch(candidate_id) is None
+            for candidate_id in candidate_ids
+        )
+        or len(candidate_ids) != len(set(candidate_ids))
+    ):
+        raise PublicChallengeError("external verifier request authority is invalid")
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "version": {
+                "type": "string",
+                "const": external.VERIFIER_RESPONSE_VERSION,
+            },
+            "pages": {
+                "type": "array",
+                "minItems": len(unit.rows),
+                "maxItems": len(unit.rows),
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "request_fingerprint": {
+                            "type": "string",
+                            "enum": request_fingerprints,
+                        },
+                        "verdicts": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": max(
+                                len(row.candidate_ids) for row in unit.rows
+                            ),
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "candidate_id": {
+                                        "type": "string",
+                                        "enum": sorted(set(candidate_ids)),
+                                    },
+                                    "verdict": {
+                                        "type": "string",
+                                        "enum": [
+                                            "supported",
+                                            "uncertain",
+                                            "unsupported",
+                                        ],
+                                    },
+                                },
+                                "required": ["candidate_id", "verdict"],
+                            },
+                        },
+                    },
+                    "required": ["request_fingerprint", "verdicts"],
+                },
+            },
+        },
+        "required": ["version", "pages"],
+    }
 
 
 def _call_path(output_root: Path, run_ordinal: int, unit_ordinal: int) -> Path:
@@ -1349,7 +1461,7 @@ def _execute_call(
     try:
         response = invoke(
             unit.request,
-            external._verifier_response_schema(len(unit.rows)),  # noqa: SLF001
+            _verifier_response_schema(unit),
             GMAIL_TEMPORAL_VERIFIER_MODEL,
             GMAIL_TEMPORAL_VERIFIER_REASONING_EFFORT,
             timeout_seconds,
