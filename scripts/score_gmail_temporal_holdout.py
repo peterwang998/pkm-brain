@@ -2161,6 +2161,7 @@ def score_gmail_temporal_holdout(
                 confirmed_artifacts,
                 units,
                 candidates,
+                confidence_neutral=False,
             )
             (
                 challenge_lifecycle_source_gold_metrics,

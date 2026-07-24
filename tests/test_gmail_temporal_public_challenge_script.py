@@ -46,8 +46,14 @@ INTERNAL_AT = "2027-09-12T09:00:00-07:00"
 
 
 class FakeCodex:
-    def __init__(self, *, fail_at: int | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        fail_at: int | None = None,
+        verdict: str = "unsupported",
+    ) -> None:
         self.fail_at = fail_at
+        self.verdict = verdict
         self.calls: list[dict[str, Any]] = []
 
     def __call__(
@@ -71,7 +77,7 @@ class FakeCodex:
                     "verdicts": [
                         {
                             "candidate_id": candidate_id,
-                            "verdict": "unsupported",
+                            "verdict": self.verdict,
                         }
                         for cluster in payload["page"]["clusters"]
                         for candidate_id in cluster["candidate_ids"]
@@ -168,7 +174,14 @@ def _ingest_case(
     return str(row["id"]), message_id
 
 
-def _fixture(tmp_path: Path, *, all_zero_work: bool = False) -> dict[str, Path]:
+def _fixture(
+    tmp_path: Path,
+    *,
+    all_zero_work: bool = False,
+    expected_verdict: str = "supported",
+    gold_subject: str = "public Aster interview",
+    canonical_subject_required: bool = True,
+) -> dict[str, Path]:
     paths = BrainPaths.from_value(tmp_path / "brain")
     BrainService(paths).init_workspace()
     scheduled = _ingest_case(
@@ -205,12 +218,12 @@ def _fixture(tmp_path: Path, *, all_zero_work: bool = False) -> dict[str, Path]:
                 "case_id": "scheduled",
                 "members": [
                     {
-                        "subject": "public Aster interview",
+                        "subject": gold_subject,
                         "relation": "occurrence",
                         "lifecycle": "scheduled",
                         "value": "2027-09-20",
-                        "expected_verdict": "supported",
-                        "canonical_subject_required": True,
+                        "expected_verdict": expected_verdict,
+                        "canonical_subject_required": canonical_subject_required,
                     }
                 ],
             },
@@ -484,6 +497,44 @@ def test_success_seals_all_three_runs_before_results_and_keeps_files_private(
     assert signed_score["cases"][0]["canonical_subject_members"] == 1
     assert signed_score["cases"][0]["canonical_subject_members_recovered"] == 0
     assert signed_score["gates"]["all_canonical_subjects_recovered"] is False
+
+
+def test_score_separates_semantic_match_from_supported_calibration(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(
+        tmp_path,
+        expected_verdict="uncertain",
+        gold_subject="interview",
+        canonical_subject_required=False,
+    )
+    output = tmp_path / "overconfident-run"
+
+    challenge.run_public_challenge(
+        fixture["manifest"],
+        fixture["key"],
+        output,
+        invoke=FakeCodex(verdict="supported"),
+        test_only_allow_injected_invoker=True,
+    )
+    score = challenge.score_public_challenge(
+        fixture["manifest"],
+        fixture["gold"],
+        fixture["key"],
+        output,
+        evaluation_mode="development_replay",
+    )
+
+    assert score["gold_members"] == 1
+    assert score["matched_members"] == 1
+    assert score["effective_member_recall"] == 1.0
+    assert score["artifacts"] == 2
+    assert score["matched_supported_artifacts"] == 0
+    assert score["overconfident_artifacts"] == 1
+    assert score["supported_artifact_precision"] == 0.0
+    assert score["review_artifact_precision"] == 0.5
+    assert score["review_output_precision"] == 0.5
+    assert score["confirmed_members"] == 0
 
 
 def test_scorer_upgrade_accepts_authenticated_prior_prediction_launcher(

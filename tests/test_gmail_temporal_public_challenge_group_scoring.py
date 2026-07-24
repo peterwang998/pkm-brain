@@ -78,6 +78,14 @@ def test_multi_value_gold_matches_complete_per_expression_alternatives_group() -
         subject_surfaces={"m1": "Marigold project debrief"},
     ) == (("a1", "a2"), "g1")
 
+    for artifact in projection["artifacts"]:
+        artifact["evidence_status"] = "supported"
+    assert challenge._alternatives_artifacts(  # noqa: SLF001
+        projection,
+        member,
+        subject_surfaces={"m1": "Marigold project debrief"},
+    ) == (("a1", "a2"), "g1")
+
 
 def test_alternatives_group_rejects_impure_or_incomplete_identity() -> None:
     projection = {
@@ -295,6 +303,115 @@ def test_supported_gold_counts_pure_uncertainty_as_effective_not_confirmed() -> 
         (supported,),
         member,
     )
+    assert (
+        challenge._supported_artifact_calibration(  # noqa: SLF001
+            supported,
+            "supported",
+        )
+        == "calibrated"
+    )
+
+
+def test_uncertain_gold_keeps_supported_semantic_match_but_flags_overconfidence() -> (
+    None
+):
+    artifact = {
+        **_artifact("a1", "m1", "2027-09-25"),
+        "evidence_status": "supported",
+    }
+    member = {
+        "subject": "Marigold project debrief",
+        "relation": "occurrence",
+        "lifecycle": "none",
+        "value": "2027-09-25",
+        "expected_verdict": "uncertain",
+    }
+    uncertain_artifact = {**artifact, "evidence_status": "uncertain"}
+
+    assert challenge._exact_artifact_match(  # noqa: SLF001
+        artifact,
+        member,
+        subject_surfaces={"m1": "Marigold project debrief"},
+    )
+    assert not challenge._artifacts_confirm_supported_member(  # noqa: SLF001
+        (artifact,),
+        member,
+    )
+    assert (
+        challenge._supported_artifact_calibration(  # noqa: SLF001
+            artifact,
+            "uncertain",
+        )
+        == "overconfident"
+    )
+    assert challenge._exact_artifact_match(  # noqa: SLF001
+        uncertain_artifact,
+        member,
+        subject_surfaces={"m1": "Marigold project debrief"},
+    )
+    assert (
+        challenge._supported_artifact_calibration(  # noqa: SLF001
+            uncertain_artifact,
+            "uncertain",
+        )
+        is None
+    )
+    for invalid_status in ("unsupported", None):
+        assert not challenge._exact_artifact_match(  # noqa: SLF001
+            {**artifact, "evidence_status": invalid_status},
+            member,
+            subject_surfaces={"m1": "Marigold project debrief"},
+        )
+
+
+def test_exact_match_selection_is_order_independent_and_calibration_preferred() -> None:
+    uncertain = _artifact("z-uncertain", "m1", "2027-09-25")
+    supported = _artifact("a-supported", "m1", "2027-09-25")
+    supported["evidence_status"] = "supported"
+    artifacts = {
+        "z-uncertain": uncertain,
+        "a-supported": supported,
+    }
+    member = {
+        "subject": "Marigold project debrief",
+        "relation": "occurrence",
+        "lifecycle": "none",
+        "value": "2027-09-25",
+        "expected_verdict": "supported",
+    }
+
+    assert (
+        challenge._best_exact_artifact_id(  # noqa: SLF001
+            artifacts,
+            member,
+            subject_surfaces={"m1": "Marigold project debrief"},
+            artifact_subject_aliases={},
+            excluded_artifact_ids=set(),
+        )
+        == "a-supported"
+    )
+    assert (
+        challenge._best_exact_artifact_id(  # noqa: SLF001
+            dict(reversed(tuple(artifacts.items()))),
+            {**member, "expected_verdict": "uncertain"},
+            subject_surfaces={"m1": "Marigold project debrief"},
+            artifact_subject_aliases={},
+            excluded_artifact_ids=set(),
+        )
+        == "z-uncertain"
+    )
+
+
+def test_cluster_reviews_are_unscored_workload_not_false_artifacts() -> None:
+    precision, all_outputs_scored = challenge._review_artifact_metrics(  # noqa: SLF001
+        artifact_count=2,
+        matched_artifact_count=2,
+        cluster_review_count=1,
+        gold_member_count=2,
+    )
+
+    assert precision == 1.0
+    assert all_outputs_scored is False
 
 
 def test_complete_production_subject_family_expands_only_its_artifact() -> None:
@@ -539,6 +656,38 @@ def test_canonical_subject_flag_is_current_v4_only_and_must_be_boolean() -> None
     }
     with pytest.raises(challenge.PublicChallengeError, match="member schema"):
         challenge._validate_gold(legacy)  # noqa: SLF001
+
+
+def test_gold_rejects_calibration_only_duplicate_members() -> None:
+    member = {
+        "subject": "Lumen Quay planning session",
+        "relation": "occurrence",
+        "lifecycle": "scheduled",
+        "value": "2027-09-22",
+        "expected_verdict": "supported",
+        "canonical_subject_required": True,
+    }
+    gold = {
+        "version": challenge.GOLD_VERSION,
+        "created_before_predictions": True,
+        "cases": [
+            {
+                "case_id": "positive",
+                "members": [
+                    member,
+                    {
+                        **member,
+                        "expected_verdict": "uncertain",
+                        "canonical_subject_required": False,
+                    },
+                ],
+            },
+            {"case_id": "negative", "members": []},
+        ],
+    }
+
+    with pytest.raises(challenge.PublicChallengeError, match="duplicated"):
+        challenge._validate_gold(gold)  # noqa: SLF001
 
 
 def test_structural_component_keys_keep_independent_groups_separate() -> None:

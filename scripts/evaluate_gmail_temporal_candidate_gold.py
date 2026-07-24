@@ -45,6 +45,7 @@ MIN_RECALL_ARM_PRECISION = 0.90
 MAX_SUPPORTED_TO_UNCERTAIN_RATE = 0.20
 MAX_ACCEPTED_NEGATIVE_REVIEW_RATE = 0.05
 RUN_MANIFEST_VERSION = "gmail_temporal_candidate_benchmark_run_v1"
+EVALUATION_VERSION = "gmail_temporal_candidate_gold_evaluation_v2"
 EXPECTED_CHECKPOINT_VERSION = "gmail_temporal_frontier_luna_checkpoint_v7"
 EXPECTED_MODEL = "gpt-5.6-luna"
 EXPECTED_REASONING_EFFORT = "medium"
@@ -928,6 +929,8 @@ def _artifact_match_edges(
     artifacts: tuple[ProductionArtifact, ...],
     units: tuple[GoldUnit, ...],
     candidates: Mapping[str, RuntimeCandidate],
+    *,
+    confidence_neutral: bool,
 ) -> tuple[
     dict[str, ArtifactMatchEdge],
     set[str],
@@ -944,8 +947,10 @@ def _artifact_match_edges(
         str,
         list[tuple[tuple[str, str, str], float, str]],
     ] = defaultdict(list)
+    expected_verdict_by_member: dict[tuple[str, str, str], str] = {}
     for unit in units:
         for member in unit.members:
+            expected_verdict_by_member[member.key] = member.expected_verdict
             expected = _member_expected_verdicts(member)
             for candidate_id, quality in _member_matches(member).items():
                 candidate_memberships[candidate_id].append(
@@ -959,21 +964,22 @@ def _artifact_match_edges(
         if artifact.kind == "supported_citation":
             memberships = candidate_memberships.get(artifact.candidate_ids[0], [])
             valid = [
-                (member_key, quality)
+                (member_key, quality, expected_verdict)
                 for member_key, quality, expected_verdict in memberships
-                if quality == 1.0 and expected_verdict == "supported"
+                if quality == 1.0
+                and (confidence_neutral or expected_verdict == "supported")
             ]
             if len(valid) > 1:
                 raise CandidateGoldError(
                     "one supported citation satisfies multiple semantic members"
                 )
             if valid:
-                member_key, quality = valid[0]
+                member_key, quality, expected_verdict = valid[0]
                 edges[artifact.artifact_id] = ArtifactMatchEdge(
                     artifact_id=artifact.artifact_id,
                     member_key=member_key,
                     quality=quality,
-                    priority=0,
+                    priority=0 if expected_verdict == "supported" else 1,
                 )
             continue
 
@@ -1034,11 +1040,18 @@ def _artifact_match_edges(
         # exact plus partial ambiguity must stay partial.
         quality = min(member_scores[member_key] for member_scores in hypothesis_members)
         pure_sidecars.add(artifact.artifact_id)
+        expected_verdict = expected_verdict_by_member[member_key]
         edges[artifact.artifact_id] = ArtifactMatchEdge(
             artifact_id=artifact.artifact_id,
             member_key=member_key,
             quality=quality,
-            priority=1 if quality == 1.0 else 2,
+            priority=(
+                0
+                if quality == 1.0 and expected_verdict == "uncertain"
+                else 1
+                if quality == 1.0
+                else 2
+            ),
         )
     return edges, pure_sidecars, sidecar_unmatched_hypotheses
 
@@ -1047,6 +1060,8 @@ def _match_production_artifacts(
     artifacts: tuple[ProductionArtifact, ...],
     units: tuple[GoldUnit, ...],
     candidates: Mapping[str, RuntimeCandidate],
+    *,
+    confidence_neutral: bool = True,
 ) -> dict[str, Any]:
     """Deterministic maximum matching under the release preference order.
 
@@ -1054,13 +1069,15 @@ def _match_production_artifacts(
     most one semantic edge.  Sorting those edges by exact-supported, then
     exact-uncertainty, then partial-uncertainty therefore produces a
     maximum-cardinality one-to-one matching while resolving competition for a
-    member in the required order.
+    member in the required order.  Effective review scoring is confidence
+    neutral; confirmed scoring opts into the stricter expected-verdict match.
     """
 
     edges, pure_sidecars, sidecar_unmatched_hypotheses = _artifact_match_edges(
         artifacts,
         units,
         candidates,
+        confidence_neutral=confidence_neutral,
     )
     matched_members: dict[tuple[str, str, str], ArtifactMatchEdge] = {}
     matched_artifacts: set[str] = set()
@@ -1310,6 +1327,7 @@ def evaluate(
         supported_artifacts,
         units,
         candidates,
+        confidence_neutral=False,
     )
     negative_artifact_ids = {
         artifact.artifact_id
@@ -1327,14 +1345,9 @@ def evaluate(
         for artifact in artifacts
         if artifact.kind == "uncertainty_sidecar"
     }
-    supported_artifact_ids = {
-        artifact.artifact_id
-        for artifact in artifacts
-        if artifact.kind == "supported_citation"
-    }
     material_impure_sidecar_ids = material_invalid_artifact_ids & sidecar_artifact_ids
     material_supported_overclaim_ids = (
-        material_invalid_artifact_ids & supported_artifact_ids
+        set(supported_artifact_scores["invalid_artifact_ids"]) - negative_artifact_ids
     )
 
     frontier_scores = _selection_scores(units, frontier_ids)
@@ -1630,8 +1643,7 @@ def evaluate(
         # longer duplicates, but a second production artifact for one member is.
         "no_duplicate_aliases": not artifact_scores["redundant_artifact_ids"],
         "no_supported_overclaims": (
-            not material_supported_overclaim_ids
-            and supported_negative_artifacts == 0
+            not material_supported_overclaim_ids and supported_negative_artifacts == 0
         ),
         "no_critical_calibration_errors": not critical_calibration_error_candidates,
         "no_default_negative_supported": default_negative_supported == 0,
@@ -1644,6 +1656,7 @@ def evaluate(
         "frontier_member_ratchet": not member_ratchet_regressions,
     }
     return {
+        "evaluation_version": EVALUATION_VERSION,
         "run_provenance": run_provenance,
         "records": len(samples),
         "useful_records": useful_records,

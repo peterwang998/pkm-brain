@@ -584,6 +584,63 @@ def test_artifact_scoring_rejects_unmatched_alias_in_collapsed_hypothesis(
     assert scores["unmatched_hypothesis_count"] == 1
 
 
+def test_artifact_scoring_prefers_calibrated_uncertainty_duplicate(
+    tmp_path: Path,
+) -> None:
+    (
+        _,
+        _,
+        _,
+        _,
+        _,
+        candidates,
+        _,
+        units,
+        _,
+    ) = _candidate_fixture(tmp_path)
+    member = next(
+        member
+        for unit in units
+        for member in unit.members
+        if member.expected_verdict == "uncertain"
+    )
+    matches = candidate_evaluator._member_matches(member)
+    expected = candidate_evaluator._member_expected_verdicts(member)
+    candidate_id = next(
+        candidate_id
+        for candidate_id, quality in matches.items()
+        if quality == 1.0 and expected[candidate_id] == "uncertain"
+    )
+    hypothesis = candidate_evaluator._artifact_hypothesis(candidates[candidate_id])
+    supported = candidate_evaluator.ProductionArtifact(
+        artifact_id="supported:first-lexically",
+        kind="supported_citation",
+        candidate_ids=(candidate_id,),
+        hypotheses=(hypothesis,),
+    )
+    uncertainty = candidate_evaluator.ProductionArtifact(
+        artifact_id="uncertainty:second-lexically",
+        kind="uncertainty_sidecar",
+        candidate_ids=(candidate_id,),
+        hypotheses=(hypothesis,),
+    )
+
+    scores = candidate_evaluator._match_production_artifacts(
+        (supported, uncertainty),
+        (
+            candidate_evaluator.GoldUnit(
+                key=(member.key[0], member.key[1]),
+                baseline_grade=member.baseline_grade,
+                members=(member,),
+            ),
+        ),
+        candidates,
+    )
+
+    assert scores["matched_artifact_ids"] == {uncertainty.artifact_id}
+    assert scores["redundant_artifact_ids"] == {supported.artifact_id}
+
+
 def test_artifact_scoring_uses_least_specific_pure_sidecar_hypothesis(
     tmp_path: Path,
 ) -> None:
@@ -1206,9 +1263,20 @@ def test_candidate_gold_rejects_expected_uncertain_promoted_to_supported(
         manifest_path,
     )
 
-    assert result["strict_supported_precision"] >= 0.95
+    assert result["evaluation_version"] == (
+        "gmail_temporal_candidate_gold_evaluation_v2"
+    )
+    assert result["effective_artifact_precision"] == 1.0
+    assert result["effective_member_recall"] == 1.0
+    assert result["review"]["required_member_recall"] == 1.0
+    assert result["strict_supported_precision"] == 32 / 33
+    assert result["supported_required_member_recall"] == 1.0
+    assert result["supported_unmatched_artifacts"] == 1
     assert result["supported_overclaim_count"] == 1
+    assert result["material_supported_overclaim_count"] == 1
     assert result["critical_calibration_error_count"] == 1
+    assert result["verdict_calibration_mismatches"] == 1
+    assert result["accepted_semantic_error_count"] == 0
     assert result["gates"]["no_supported_overclaims"] is False
     assert result["gates"]["no_critical_calibration_errors"] is False
     assert result["candidate_gate_passed"] is False

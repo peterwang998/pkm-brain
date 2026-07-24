@@ -57,7 +57,7 @@ CALL_START_VERSION = "gmail_temporal_public_challenge_call_start_v3"
 CALL_RECEIPT_VERSION = "gmail_temporal_public_challenge_call_receipt_v3"
 PREDICTION_SEAL_VERSION = "gmail_temporal_public_challenge_prediction_seal_v3"
 RESULT_VERSION = "gmail_temporal_public_challenge_result_v3"
-SCORE_VERSION = "gmail_temporal_public_challenge_score_v9"
+SCORE_VERSION = "gmail_temporal_public_challenge_score_v10"
 GOLD_VERSION = "public_blind_gmail_temporal_gold_v4"
 LEGACY_STRUCTURED_GOLD_VERSION = "public_blind_gmail_temporal_gold_v3"
 LEGACY_GOLD_VERSION = "public_blind_gmail_temporal_gold_v2"
@@ -78,7 +78,7 @@ CALL_START_DOMAIN = b"gmail_temporal_public_challenge_call_start_v3\0"
 CALL_RECEIPT_DOMAIN = b"gmail_temporal_public_challenge_call_receipt_v3\0"
 PREDICTION_SEAL_DOMAIN = b"gmail_temporal_public_challenge_prediction_seal_v3\0"
 RESULT_DOMAIN = b"gmail_temporal_public_challenge_result_v3\0"
-SCORE_DOMAIN = b"gmail_temporal_public_challenge_score_v9\0"
+SCORE_DOMAIN = b"gmail_temporal_public_challenge_score_v10\0"
 PUBLIC_ROOT_AUTHORITY_DOMAIN = b"gmail_temporal_public_root_authority_v2\0"
 MAX_PREDICTION_LAUNCHER_ARTIFACT_BYTES = 4 * 1024 * 1024
 
@@ -2706,12 +2706,13 @@ def _exact_artifact_match(
     subject_surfaces: Mapping[str, str],
     subject_alias_surfaces: Sequence[str] = (),
 ) -> bool:
-    expected_verdict = member.get("expected_verdict", "supported")
     evidence_status = artifact.get("evidence_status")
-    if expected_verdict == "uncertain":
-        if evidence_status != "uncertain":
-            return False
-    elif evidence_status not in {"supported", "uncertain"}:
+    # Semantic correctness and verifier calibration are distinct estimands.  A
+    # status disagreement must not erase an otherwise exact temporal binding
+    # from recall, structure, canonical identity, or artifact precision.  The
+    # scoring loop separately credits only supported output against supported
+    # gold in ``supported_artifact_precision`` and ``confirmed_member_recall``.
+    if evidence_status not in {"supported", "uncertain"}:
         return False
     hypotheses = _artifact_hypotheses(artifact)
     if not hypotheses or not all(
@@ -2735,6 +2736,39 @@ def _exact_artifact_match(
     return actual_values == {member.get("value")}
 
 
+def _best_exact_artifact_id(
+    artifacts: Mapping[str, Mapping[str, Any]],
+    member: Mapping[str, Any],
+    *,
+    subject_surfaces: Mapping[str, str],
+    artifact_subject_aliases: Mapping[str, Sequence[str]],
+    excluded_artifact_ids: set[str],
+) -> str | None:
+    """Choose deterministically, preferring confidence calibration second."""
+
+    expected_verdict = str(member.get("expected_verdict", "supported"))
+    candidates = [
+        artifact_id
+        for artifact_id, artifact in artifacts.items()
+        if artifact_id not in excluded_artifact_ids
+        and _exact_artifact_match(
+            artifact,
+            member,
+            subject_surfaces=subject_surfaces,
+            subject_alias_surfaces=artifact_subject_aliases.get(artifact_id, ()),
+        )
+    ]
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda artifact_id: (
+            artifacts[artifact_id].get("evidence_status") != expected_verdict,
+            artifact_id,
+        ),
+    )
+
+
 def _artifacts_confirm_supported_member(
     artifacts: Sequence[Mapping[str, Any]],
     member: Mapping[str, Any],
@@ -2744,6 +2778,34 @@ def _artifacts_confirm_supported_member(
         and artifacts
         and all(item.get("evidence_status") == "supported" for item in artifacts)
     )
+
+
+def _supported_artifact_calibration(
+    artifact: Mapping[str, Any],
+    expected_verdict: str,
+) -> str | None:
+    """Classify a supported output without changing its semantic match."""
+
+    if artifact.get("evidence_status") != "supported":
+        return None
+    return "calibrated" if expected_verdict == "supported" else "overconfident"
+
+
+def _review_artifact_metrics(
+    *,
+    artifact_count: int,
+    matched_artifact_count: int,
+    cluster_review_count: int,
+    gold_member_count: int,
+) -> tuple[float, bool]:
+    """Score semantic artifacts and expose whether every review output was scored."""
+
+    precision = (
+        matched_artifact_count / artifact_count
+        if artifact_count
+        else (1.0 if gold_member_count == 0 else 0.0)
+    )
+    return precision, cluster_review_count == 0
 
 
 def _artifacts_recover_canonical_subject(
@@ -2777,6 +2839,7 @@ def _alternatives_artifacts(
     *,
     subject_surfaces: Mapping[str, str],
     artifact_subject_aliases: Mapping[str, Sequence[str]] | None = None,
+    excluded_artifact_ids: set[str] | None = None,
 ) -> tuple[tuple[str, ...], str] | None:
     """Match one option-set gold member to production's per-expression artifacts.
 
@@ -2784,7 +2847,8 @@ def _alternatives_artifacts(
     expressions.  An explicit ``X or Y`` option set is therefore represented as
     one complete alternatives group containing one uncertainty artifact per
     expression, not as one multi-value artifact.  Score that exact production
-    shape without weakening subject, relation, lifecycle, or status matching.
+    shape without weakening subject, relation, or lifecycle matching. Confidence
+    calibration is ranked second and scored independently.
     """
 
     expected_values = member.get("values")
@@ -2799,6 +2863,8 @@ def _alternatives_artifacts(
         for item in projection.get("artifacts", [])
         if isinstance(item, Mapping) and isinstance(item.get("artifact_id"), str)
     }
+    excluded = excluded_artifact_ids or set()
+    matches: list[tuple[int, str, tuple[str, ...]]] = []
     for group in projection.get("groups", []):
         if (
             not isinstance(group, Mapping)
@@ -2832,7 +2898,8 @@ def _alternatives_artifacts(
             hypotheses = _artifact_hypotheses(artifact) if artifact is not None else []
             if (
                 artifact is None
-                or artifact.get("evidence_status") != "uncertain"
+                or artifact_id in excluded
+                or artifact.get("evidence_status") not in {"supported", "uncertain"}
                 or not hypotheses
                 or not all(
                     _hypothesis_matches_member(
@@ -2865,8 +2932,16 @@ def _alternatives_artifacts(
         if valid and actual_values == set(expected_values):
             group_id = group.get("group_id")
             if isinstance(group_id, str) and group_id:
-                return tuple(matched), group_id
-    return None
+                matched_ids = tuple(matched)
+                calibration_mismatches = sum(
+                    artifacts[artifact_id].get("evidence_status") != "uncertain"
+                    for artifact_id in matched_ids
+                )
+                matches.append((calibration_mismatches, group_id, matched_ids))
+    if not matches:
+        return None
+    _, group_id, matched_ids = min(matches)
+    return matched_ids, group_id
 
 
 def _reschedule_artifact(
@@ -2875,6 +2950,7 @@ def _reschedule_artifact(
     *,
     subject_surfaces: Mapping[str, str],
     artifact_subject_aliases: Mapping[str, Sequence[str]] | None = None,
+    excluded_artifact_ids: set[str] | None = None,
 ) -> tuple[str, str] | None:
     artifacts = {
         str(item.get("artifact_id")): item
@@ -2882,6 +2958,9 @@ def _reschedule_artifact(
         if isinstance(item, Mapping)
     }
     role = member.get("lifecycle")
+    expected_verdict = str(member.get("expected_verdict", "supported"))
+    excluded = excluded_artifact_ids or set()
+    matches: list[tuple[bool, str, str]] = []
     for group in projection.get("groups", []):
         if (
             not isinstance(group, Mapping)
@@ -2900,7 +2979,7 @@ def _reschedule_artifact(
                 continue
             artifact_id = str(artifact_ids[0])
             artifact = artifacts.get(artifact_id)
-            if artifact is None:
+            if artifact is None or artifact_id in excluded:
                 continue
             if _exact_artifact_match(
                 artifact,
@@ -2914,8 +2993,17 @@ def _reschedule_artifact(
             ):
                 group_id = group.get("group_id")
                 if isinstance(group_id, str) and group_id:
-                    return artifact_id, group_id
-    return None
+                    matches.append(
+                        (
+                            artifact.get("evidence_status") != expected_verdict,
+                            group_id,
+                            artifact_id,
+                        )
+                    )
+    if not matches:
+        return None
+    _, group_id, artifact_id = min(matches)
+    return artifact_id, group_id
 
 
 def _forbidden_hypothesis_matches(
@@ -2965,6 +3053,22 @@ def _structural_component_key(
         _normalized_subject(member.get("subject"))
     )
     return f"reschedule:{subject_key}"
+
+
+def _semantic_member_identity(member: Mapping[str, Any]) -> bytes:
+    """Ignore calibration-only fields when detecting duplicate gold targets."""
+
+    values = member.get("values")
+    if not isinstance(values, list):
+        values = [member.get("value")]
+    return _canonical_json(
+        {
+            "subject": _normalized_subject(member.get("subject")),
+            "relation": member.get("relation"),
+            "lifecycle": member.get("lifecycle"),
+            "values": sorted(values),
+        }
+    )
 
 
 def _validate_gold(gold: Mapping[str, Any]) -> None:
@@ -3115,7 +3219,7 @@ def _validate_gold(gold: Mapping[str, Any]) -> None:
                     "public semantic gold value schema is invalid"
                 )
             expected_values.update(values)
-            identity = _canonical_json(dict(member))
+            identity = _semantic_member_identity(member)
             if identity in seen_members:
                 raise PublicChallengeError("public semantic gold member is duplicated")
             seen_members.add(identity)
@@ -3311,6 +3415,7 @@ def score_public_challenge(
     total_artifacts = 0
     supported_artifacts = 0
     matched_artifact_ids: set[tuple[str, str]] = set()
+    matched_artifact_expected_verdicts: dict[tuple[str, str], str] = {}
     cluster_reviews = 0
     negative_cases = 0
     selected_negative_cases = 0
@@ -3409,12 +3514,18 @@ def score_public_challenge(
             case_canonical_subject_members += int(canonical_subject_required)
             matched_ids: tuple[str, ...] = ()
             structural_group_id: str | None = None
+            used_case_artifact_ids = {
+                artifact_id
+                for used_case_id, artifact_id in matched_artifact_ids
+                if used_case_id == case_id
+            }
             if "values" in member and projection is not None:
                 alternatives_match = _alternatives_artifacts(
                     projection,
                     member,
                     subject_surfaces=subject_surfaces,
                     artifact_subject_aliases=artifact_subject_aliases,
+                    excluded_artifact_ids=used_case_artifact_ids,
                 )
                 if alternatives_match is not None:
                     matched_ids, structural_group_id = alternatives_match
@@ -3431,25 +3542,21 @@ def score_public_challenge(
                     member,
                     subject_surfaces=subject_surfaces,
                     artifact_subject_aliases=artifact_subject_aliases,
+                    excluded_artifact_ids=used_case_artifact_ids,
                 )
                 if reschedule_match is not None:
                     matched_id, structural_group_id = reschedule_match
                     matched_ids = (matched_id,)
             else:
-                for artifact_id, artifact in available.items():
-                    if (case_id, artifact_id) in matched_artifact_ids:
-                        continue
-                    if _exact_artifact_match(
-                        artifact,
-                        member,
-                        subject_surfaces=subject_surfaces,
-                        subject_alias_surfaces=artifact_subject_aliases.get(
-                            artifact_id,
-                            (),
-                        ),
-                    ):
-                        matched_ids = (artifact_id,)
-                        break
+                artifact_id = _best_exact_artifact_id(
+                    available,
+                    member,
+                    subject_surfaces=subject_surfaces,
+                    artifact_subject_aliases=artifact_subject_aliases,
+                    excluded_artifact_ids=used_case_artifact_ids,
+                )
+                if artifact_id is not None:
+                    matched_ids = (artifact_id,)
             if not matched_ids or any(
                 (case_id, artifact_id) in matched_artifact_ids
                 for artifact_id in matched_ids
@@ -3457,6 +3564,12 @@ def score_public_challenge(
                 continue
             matched_artifact_ids.update(
                 (case_id, artifact_id) for artifact_id in matched_ids
+            )
+            matched_artifact_expected_verdicts.update(
+                {
+                    (case_id, artifact_id): str(expected_verdict)
+                    for artifact_id in matched_ids
+                }
             )
             matched_members += 1
             case_matches += 1
@@ -3505,10 +3618,25 @@ def score_public_challenge(
         and any(
             isinstance(item, Mapping)
             and item.get("artifact_id") == artifact_id
-            and item.get("evidence_status") == "supported"
+            and _supported_artifact_calibration(item, expected_verdict) == "calibrated"
             for item in result_rows[case_id]["projection"].get("artifacts", [])
         )
-        for case_id, artifact_id in matched_artifact_ids
+        for (case_id, artifact_id), expected_verdict in (
+            matched_artifact_expected_verdicts.items()
+        )
+    )
+    overconfident_artifacts = sum(
+        result_rows[case_id]["projection"] is not None
+        and any(
+            isinstance(item, Mapping)
+            and item.get("artifact_id") == artifact_id
+            and _supported_artifact_calibration(item, expected_verdict)
+            == "overconfident"
+            for item in result_rows[case_id]["projection"].get("artifacts", [])
+        )
+        for (case_id, artifact_id), expected_verdict in (
+            matched_artifact_expected_verdicts.items()
+        )
     )
     effective_recall = matched_members / gold_members if gold_members else 1.0
     confirmed_recall = (
@@ -3524,11 +3652,15 @@ def score_public_challenge(
         if supported_artifacts
         else (1.0 if supported_gold_members == 0 else 0.0)
     )
-    review_outputs = total_artifacts + cluster_reviews
-    review_precision = (
-        len(matched_artifact_ids) / review_outputs
-        if review_outputs
-        else (1.0 if gold_members == 0 else 0.0)
+    # Cluster reviews are escalation records, not semantic artifacts.  Current
+    # gold has no representation against which their correctness can be
+    # judged, so report them as unscored workload instead of silently counting
+    # every escalation as a false-positive artifact.
+    review_artifact_precision, all_review_outputs_scored = _review_artifact_metrics(
+        artifact_count=total_artifacts,
+        matched_artifact_count=len(matched_artifact_ids),
+        cluster_review_count=cluster_reviews,
+        gold_member_count=gold_members,
     )
     complete_group_recall = (
         complete_group_components_recovered / complete_group_components
@@ -3544,7 +3676,8 @@ def score_public_challenge(
             canonical_subject_members_recovered == canonical_subject_members
         ),
         "perfect_supported_precision": supported_precision == 1.0,
-        "perfect_review_precision": review_precision == 1.0,
+        "perfect_review_artifact_precision": review_artifact_precision == 1.0,
+        "all_review_outputs_scored": all_review_outputs_scored,
         "complete_structural_groups": (
             complete_group_components_recovered == complete_group_components
         ),
@@ -3584,8 +3717,11 @@ def score_public_challenge(
             ),
             "artifacts": total_artifacts,
             "supported_artifacts": supported_artifacts,
+            "matched_supported_artifacts": matched_supported_artifacts,
+            "overconfident_artifacts": overconfident_artifacts,
             "matched_artifacts": len(matched_artifact_ids),
             "cluster_reviews": cluster_reviews,
+            "unscored_cluster_reviews": cluster_reviews,
             "negative_cases": negative_cases,
             "selected_negative_cases": selected_negative_cases,
             "forbidden_hypotheses": forbidden_hypotheses,
@@ -3597,7 +3733,8 @@ def score_public_challenge(
             "confirmed_member_recall": confirmed_recall,
             "canonical_subject_recall": canonical_subject_recall,
             "supported_artifact_precision": supported_precision,
-            "review_output_precision": review_precision,
+            "review_artifact_precision": review_artifact_precision,
+            "review_output_precision": review_artifact_precision,
             "complete_group_recall": complete_group_recall,
             "cases": per_case,
             "gates": gate,
@@ -3623,7 +3760,10 @@ def score_public_challenge(
         "canonical_subject_members_recovered": canonical_subject_members_recovered,
         "artifacts": total_artifacts,
         "supported_artifacts": supported_artifacts,
+        "matched_supported_artifacts": matched_supported_artifacts,
+        "overconfident_artifacts": overconfident_artifacts,
         "cluster_reviews": cluster_reviews,
+        "unscored_cluster_reviews": cluster_reviews,
         "negative_cases": negative_cases,
         "selected_negative_cases": selected_negative_cases,
         "forbidden_hypotheses": forbidden_hypotheses,
@@ -3631,7 +3771,8 @@ def score_public_challenge(
         "confirmed_member_recall": confirmed_recall,
         "canonical_subject_recall": canonical_subject_recall,
         "supported_artifact_precision": supported_precision,
-        "review_output_precision": review_precision,
+        "review_artifact_precision": review_artifact_precision,
+        "review_output_precision": review_artifact_precision,
         "complete_group_recall": complete_group_recall,
         "complete_group_components": complete_group_components,
         "complete_group_components_recovered": complete_group_components_recovered,
