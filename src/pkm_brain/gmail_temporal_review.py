@@ -35,10 +35,14 @@ _HYPOTHESIS_VERSION = "gmail_temporal_review_hypothesis_v3"
 _CLUSTER_REVIEW_VERSION = "gmail_temporal_review_cluster_review_v1"
 _GROUP_VERSION = "gmail_temporal_review_group_v1"
 _GROUP_MEMBER_VERSION = "gmail_temporal_review_group_member_v1"
-_GROUPING_POLICY_VERSION = "gmail_temporal_review_grouping_policy_v8"
+_GROUPING_POLICY_VERSION = "gmail_temporal_review_grouping_policy_v11"
 
 _EVENT_IDENTITY_SUBJECT_TYPES = frozenset(
     {"event", "event_title_candidate", "event_predicate"}
+)
+_EVENT_TITLE_DISTINCT_HEAD_SEPARATOR_RE = re.compile(
+    r"\b(?:and|or|versus|vs\.?)\b|[&,/+|;]",
+    re.IGNORECASE,
 )
 
 ReviewArtifactKind = Literal["supported_citation", "uncertainty_sidecar"]
@@ -319,9 +323,27 @@ def gmail_temporal_review_grouping_policy_fingerprint() -> str:
         ],
         "candidate_defer_state": "conservative_any_alias_requires_defer",
         "alias_policy": {
-            "family_basis": "existing_source_verified_subject_alias_components",
+            "family_basis": (
+                "existing_source_verified_subject_alias_components_with_"
+                "non_frontier_title_metadata_and_narrow_literal_multi_root_proof"
+            ),
             "verifier_subjects_remain_exact": True,
             "aliases_are_non_authorizing_identity_metadata": True,
+            "non_frontier_titles_require_same_batch_source_proof": True,
+            "multi_root_title_attachment": {
+                "candidate_roots_are_never_merged": True,
+                "coordinated_frontier_titles_stay_isolated": True,
+                "distinct_head_separator_pattern": (
+                    _EVENT_TITLE_DISTINCT_HEAD_SEPARATOR_RE.pattern
+                ),
+                "one_exact_title_literal_contains_each_root_span": True,
+                "generic_root_spans_are_adjacent_without_coordination": True,
+                "exact_expression_endpoint_sets_required": True,
+                "concrete_relation_sets_must_match": True,
+                "exactly_one_concrete_lifecycle_root_required": True,
+                "all_other_roots_are_unspecified_none_fallbacks": True,
+                "competing_titles_fail_closed": True,
+            },
             "canonical_type": "event_title_candidate",
             "canonical_requires_event_centered_selected_subjects": True,
             "canonical_requires_exactly_one_title_candidate": True,
@@ -998,6 +1020,19 @@ def _subject_alias_families(
     batches: tuple[GmailTemporalSelectorBatch, ...],
     candidates: tuple[GmailTemporalVerificationCandidate, ...],
 ) -> dict[str, str]:
+    """Build source-proven identity families without expanding verifier authority.
+
+    Candidate subjects establish the authoritative family components.  A title
+    mention that was retained in the deterministic batch packet but did not
+    produce a verifier candidate may join an existing component when it is an
+    event-centered, source-proven alias in that same batch.  When one exact title
+    matches multiple generic components, it may attach only to the unique
+    lifecycle-specific component while exact-endpoint unspecified/none fallback
+    components remain separate.  The extended mentions are identity metadata
+    only; review hypotheses continue to cite the original candidate endpoints
+    exactly.
+    """
+
     subject_ids = tuple(sorted({item.subject_mention_id for item in candidates}))
     mentions = {item.mention_id: item for item in analysis.mentions}
     if any(value not in mentions for value in subject_ids):
@@ -1020,10 +1055,29 @@ def _subject_alias_families(
         batch.manifest.batch_fingerprint: set(batch.manifest.mention_ids)
         for batch in batches
     }
+    isolated_frontier_titles = frozenset(
+        title_id
+        for title_id in subject_ids
+        if _frontier_title_has_coordinated_event_heads(
+            title_id=title_id,
+            mentions=mentions,
+            batches=batches,
+        )
+    )
     for index, first_id in enumerate(subject_ids):
         first = mentions[first_id]
         for second_id in subject_ids[index + 1 :]:
             second = mentions[second_id]
+            # A frontier title can overlap every event head that it spells.  That
+            # overlap is not alias authority when the source explicitly
+            # coordinates those heads (for example, ``seminar and workshop``).
+            # Keep the title as its own verifier endpoint instead of letting it
+            # transitively merge otherwise distinct event families.
+            if (
+                first_id in isolated_frontier_titles
+                or second_id in isolated_frontier_titles
+            ):
+                continue
             if first.start < second.end and second.start < first.end:
                 union(first_id, second_id)
                 continue
@@ -1045,6 +1099,79 @@ def _subject_alias_families(
     components: dict[str, list[str]] = {}
     for subject_id in subject_ids:
         components.setdefault(find(subject_id), []).append(subject_id)
+
+    # First inventory every title-to-root relation without mutating the candidate
+    # union-find.  This lets competing title candidates veto a bridge instead of
+    # gaining authority through iteration order or a transitive attachment.
+    title_matching_roots: dict[str, frozenset[str]] = {}
+    for title_id in sorted(mentions):
+        title = mentions[title_id]
+        if title_id in parent or title.mention_type != "event_title_candidate":
+            continue
+        matching_roots: set[str] = set()
+        for subject_id in subject_ids:
+            subject = mentions[subject_id]
+            if subject.mention_type not in _EVENT_IDENTITY_SUBJECT_TYPES:
+                continue
+            for batch in batches:
+                visible = batch_mention_ids[batch.manifest.batch_fingerprint]
+                if title_id not in visible or subject_id not in visible:
+                    continue
+                if (title.start < subject.end and subject.start < title.end) or (
+                    classify_gmail_temporal_subject_pair(
+                        title,
+                        subject,
+                        batch=batch,
+                    )
+                    == "alias"
+                ):
+                    matching_roots.add(find(subject_id))
+                    break
+        if matching_roots:
+            title_matching_roots[title_id] = frozenset(matching_roots)
+
+    multi_root_targets: dict[str, str] = {}
+    for title_id, matching_roots in title_matching_roots.items():
+        if len(matching_roots) < 2:
+            continue
+        if not _title_literal_covers_candidate_roots(
+            title_id=title_id,
+            roots=matching_roots,
+            components=components,
+            mentions=mentions,
+            batches=batches,
+        ):
+            continue
+        target_root = _unique_concrete_title_attachment_root(
+            roots=matching_roots,
+            components=components,
+            candidates=candidates,
+        )
+        if target_root is not None:
+            multi_root_targets[title_id] = target_root
+
+    # Single-root titles preserve the v9 behavior.  A multi-root title attaches
+    # only to its unique concrete lifecycle root; fallback roots are neither
+    # merged nor extended.  Rejected titles stay outside every family.
+    title_extensions: dict[str, list[str]] = {}
+    for title_id, original_roots in title_matching_roots.items():
+        if title_id in multi_root_targets:
+            if any(
+                other_id != title_id and bool(original_roots & other_roots)
+                for other_id, other_roots in title_matching_roots.items()
+            ):
+                continue
+            target_roots = {multi_root_targets[title_id]}
+        elif len(original_roots) == 1:
+            target_roots = {find(next(iter(original_roots)))}
+        else:
+            continue
+        if len(target_roots) == 1:
+            title_extensions.setdefault(next(iter(target_roots)), []).append(title_id)
+
+    for root, title_ids in title_extensions.items():
+        components[root].extend(title_ids)
+
     output: dict[str, str] = {}
     for values in components.values():
         material = {
@@ -1055,6 +1182,244 @@ def _subject_alias_families(
         for value in values:
             output[value] = family_id
     return output
+
+
+def _frontier_title_has_coordinated_event_heads(
+    *,
+    title_id: str,
+    mentions: Mapping[str, Any],
+    batches: tuple[GmailTemporalSelectorBatch, ...],
+) -> bool:
+    """Keep an explicitly coordinated frontier title outside component families."""
+
+    title = mentions[title_id]
+    if title.mention_type != "event_title_candidate":
+        return False
+    event_spans = tuple(
+        sorted(
+            {
+                (mention.start, mention.end)
+                for mention in mentions.values()
+                if mention.mention_type == "event"
+                and mention.field == title.field
+                and title.start <= mention.start
+                and mention.end <= title.end
+            }
+        )
+    )
+    if len(event_spans) < 2:
+        return False
+
+    title_surfaces = {
+        item.surface
+        for batch in batches
+        for item in batch.mentions
+        if item.mention_id == title_id
+    }
+    if len(title_surfaces) != 1:
+        return True
+    title_surface = next(iter(title_surfaces))
+    if len(title_surface) != title.end - title.start:
+        return True
+
+    return any(
+        _EVENT_TITLE_DISTINCT_HEAD_SEPARATOR_RE.search(
+            title_surface[first_end - title.start : second_start - title.start]
+        )
+        is not None
+        for (_, first_end), (second_start, _) in zip(
+            event_spans,
+            event_spans[1:],
+        )
+    )
+
+
+def _title_literal_covers_candidate_roots(
+    *,
+    title_id: str,
+    roots: frozenset[str],
+    components: Mapping[str, list[str]],
+    mentions: Mapping[str, Any],
+    batches: tuple[GmailTemporalSelectorBatch, ...],
+) -> bool:
+    """Require exact title literals to contain every candidate root span."""
+
+    title_surfaces = {
+        item.surface
+        for batch in batches
+        for item in batch.mentions
+        if item.mention_id == title_id and item.surface.strip()
+    }
+    if len(title_surfaces) != 1:
+        return False
+    title_surface = next(iter(title_surfaces))
+    title_tokens = tuple(re.findall(r"\S+", title_surface.strip()))
+    if not title_tokens:
+        return False
+    literal_pattern = re.compile(
+        r"(?<!\w)"
+        + r"\s+".join(re.escape(token) for token in title_tokens)
+        + r"(?!\w)",
+        re.IGNORECASE,
+    )
+
+    root_title_spans: dict[str, tuple[int, int]] = {}
+    for root in roots:
+        root_surfaces = {
+            item.surface.strip()
+            for batch in batches
+            for item in batch.mentions
+            if item.mention_id in components[root] and item.surface.strip()
+        }
+        if len(root_surfaces) != 1:
+            return False
+        root_tokens = tuple(re.findall(r"\S+", next(iter(root_surfaces))))
+        root_pattern = re.compile(
+            r"(?<!\w)"
+            + r"\s+".join(re.escape(token) for token in root_tokens)
+            + r"(?!\w)",
+            re.IGNORECASE,
+        )
+        matches = tuple(root_pattern.finditer(title_surface))
+        if len(matches) != 1:
+            return False
+        root_title_spans[root] = matches[0].span()
+
+    ordered_title_spans = tuple(sorted(root_title_spans.values()))
+    if len(set(ordered_title_spans)) != len(ordered_title_spans):
+        return False
+    if any(
+        first_end > second_start
+        for (_, first_end), (second_start, _) in zip(
+            ordered_title_spans,
+            ordered_title_spans[1:],
+        )
+    ):
+        return False
+    if any(
+        any(not character.isspace() and character not in "-–—" for character in gap)
+        for gap in (
+            title_surface[first_end:second_start]
+            for (_, first_end), (second_start, _) in zip(
+                ordered_title_spans,
+                ordered_title_spans[1:],
+            )
+        )
+    ):
+        return False
+
+    covered_subject_ids: set[str] = set()
+    for batch in batches:
+        batch_mentions = {item.mention_id: item for item in batch.mentions}
+        title = batch_mentions.get(title_id)
+        if title is None:
+            continue
+        for context in batch.contexts:
+            for match in literal_pattern.finditer(context.surface):
+                literal_start = context.start + match.start()
+                literal_end = context.start + match.end()
+                for root in roots:
+                    covered_subject_ids.update(
+                        subject_id
+                        for subject_id in components[root]
+                        if subject_id in batch_mentions
+                        and mentions[subject_id].field == context.field
+                        and literal_start <= mentions[subject_id].start
+                        and mentions[subject_id].end <= literal_end
+                    )
+    return all(
+        subject_id in covered_subject_ids
+        for root in roots
+        for subject_id in components[root]
+    )
+
+
+def _unique_concrete_title_attachment_root(
+    *,
+    roots: frozenset[str],
+    components: Mapping[str, list[str]],
+    candidates: tuple[GmailTemporalVerificationCandidate, ...],
+) -> str | None:
+    """Return one concrete root surrounded only by exact fallback roots."""
+
+    subject_root = {
+        subject_id: root for root in roots for subject_id in components[root]
+    }
+    by_root: dict[
+        str,
+        dict[str, list[GmailTemporalVerificationCandidate]],
+    ] = {root: {} for root in roots}
+    for candidate in candidates:
+        root = subject_root.get(candidate.subject_mention_id)
+        if root is not None:
+            by_root[root].setdefault(candidate.expression_id, []).append(candidate)
+
+    endpoint_sets = {frozenset(values) for values in by_root.values()}
+    if len(endpoint_sets) != 1 or not next(iter(endpoint_sets), frozenset()):
+        return None
+    endpoint_ids = next(iter(endpoint_sets))
+    for expression_id in endpoint_ids:
+        relation_sets = tuple(
+            {
+                candidate.relation
+                for candidate in by_root[root][expression_id]
+                if candidate.relation != "unspecified"
+            }
+            for root in roots
+        )
+        if any(len(values) != 1 for values in relation_sets):
+            return None
+        if len({next(iter(values)) for values in relation_sets}) != 1:
+            return None
+
+        normalized_values = {
+            candidate.normalized_value
+            for root in roots
+            for candidate in by_root[root][expression_id]
+            if candidate.normalized_value is not None
+        }
+        if len(normalized_values) > 1:
+            return None
+
+    concrete_roots: list[str] = []
+    fallback_roots: list[str] = []
+    for root in roots:
+        root_candidates = tuple(
+            candidate
+            for endpoint_candidates in by_root[root].values()
+            for candidate in endpoint_candidates
+        )
+        concrete = tuple(
+            candidate
+            for candidate in root_candidates
+            if candidate.lifecycle not in {"none", "unknown"}
+        )
+        if concrete:
+            if any(
+                len(
+                    {
+                        candidate.lifecycle
+                        for candidate in by_root[root][expression_id]
+                        if candidate.lifecycle not in {"none", "unknown"}
+                    }
+                )
+                != 1
+                for expression_id in endpoint_ids
+            ):
+                return None
+            concrete_roots.append(root)
+            continue
+        if all(
+            candidate.kind == "unspecified"
+            and candidate.lifecycle in {"none", "unknown"}
+            for candidate in root_candidates
+        ):
+            fallback_roots.append(root)
+            continue
+        return None
+    if len(concrete_roots) != 1 or len(fallback_roots) != len(roots) - 1:
+        return None
+    return concrete_roots[0]
 
 
 def _subject_alias_family_members(

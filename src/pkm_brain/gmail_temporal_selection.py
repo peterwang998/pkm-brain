@@ -26,7 +26,7 @@ SelectionDecision = Literal[
     "reject_nonmaterial",
 ]
 SelectionConfidence = Literal["high", "medium", "low"]
-GMAIL_TEMPORAL_SELECTION_POLICY_VERSION = "gmail_temporal_selection_policy_v3"
+GMAIL_TEMPORAL_SELECTION_POLICY_VERSION = "gmail_temporal_selection_policy_v4"
 TemporalSubjectPairRelation = Literal["alias", "coordinated", "distinct"]
 SelectionRelation = Literal["occurrence", "deadline", "unspecified"]
 SelectionKind = Literal["planned", "actual", "unspecified"]
@@ -120,7 +120,7 @@ _RESCHEDULE_ENDPOINT_LINK_RE = re.compile(
     re.IGNORECASE,
 )
 _RESCHEDULE_SUBJECT_LINK_RE = re.compile(
-    r"\s*(?:(?:has\s+been|was)\s*)?",
+    r"\s*(?:(?:has\s+been|is\s+now|was)\s*)?",
     re.IGNORECASE,
 )
 _RESCHEDULE_INDEPENDENT_TEMPORAL_CLAUSE_RE = re.compile(

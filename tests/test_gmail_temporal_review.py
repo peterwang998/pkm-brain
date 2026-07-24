@@ -444,6 +444,621 @@ def test_supported_generic_event_preserves_evidence_and_promotes_unique_title_id
     )
 
 
+@pytest.mark.parametrize(
+    ("text", "generic_surface", "generic_field", "title_surface", "title_field"),
+    (
+        (
+            "The Northstar design review is scheduled for October 2, 2027.",
+            "review",
+            "message",
+            "Northstar design review",
+            "message",
+        ),
+        (
+            "Subject: Northstar Planning Workshop\n\n"
+            "The northstar planning workshop is scheduled for October 2, 2027.",
+            "workshop",
+            "body",
+            "Northstar Planning Workshop",
+            "subject",
+        ),
+    ),
+)
+def test_non_frontier_title_extends_exact_generic_candidate_identity_metadata(
+    text: str,
+    generic_surface: str,
+    generic_field: str,
+    title_surface: str,
+    title_field: str,
+) -> None:
+    analysis = analyze_gmail_temporal_leads(
+        text=text,
+        message_internal_at="2027-08-10T09:00:00-07:00",
+        fact_admitted=True,
+        chunk_id=f"review-non-frontier-title-{generic_surface}",
+    )
+    batch_plan = plan_gmail_temporal_selector_batches(text=text, analysis=analysis)
+    generic = next(
+        mention
+        for mention in analysis.mentions
+        if mention.mention_type == "event"
+        and mention.field == generic_field
+        and text[mention.start : mention.end].casefold() == generic_surface
+    )
+    title = next(
+        mention
+        for mention in analysis.mentions
+        if mention.mention_type == "event_title_candidate"
+        and mention.field == title_field
+        and text[mention.start : mention.end] == title_surface
+    )
+    candidate = next(
+        candidate
+        for batch in batch_plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+        if candidate.subject_mention_id == generic.mention_id
+    )
+
+    # Simulate the production frontier shape that exposed the bug: the exact
+    # generic endpoint is verifiable, while the source-inventoried title is not
+    # itself a verifier candidate.
+    subject_families = review_module._subject_alias_families(  # noqa: SLF001
+        analysis=analysis,
+        batches=batch_plan.batches,
+        candidates=(candidate,),
+    )
+    subject_family_members = review_module._subject_alias_family_members(  # noqa: SLF001
+        subject_families
+    )
+    mention_types = {
+        mention.mention_id: mention.mention_type for mention in analysis.mentions
+    }
+    hypothesis = review_module._review_hypothesis(  # noqa: SLF001
+        (candidate,),
+        subject_types_by_id=mention_types,
+        subject_families=subject_families,
+        subject_family_members=subject_family_members,
+    )
+
+    assert hypothesis.subject_mention_ids == (generic.mention_id,)
+    assert hypothesis.candidate_ids == (candidate.candidate_id,)
+    assert set(hypothesis.subject_alias_mention_ids) == {
+        generic.mention_id,
+        title.mention_id,
+    }
+    assert hypothesis.canonical_subject_mention_id == title.mention_id
+
+
+def test_non_frontier_title_extension_fails_closed_for_ambiguous_titles() -> None:
+    text = "The Northstar design review is scheduled for October 2, 2027."
+    analysis = analyze_gmail_temporal_leads(
+        text=text,
+        message_internal_at="2027-08-10T09:00:00-07:00",
+        fact_admitted=True,
+        chunk_id="review-ambiguous-non-frontier-titles",
+    )
+    batch_plan = plan_gmail_temporal_selector_batches(text=text, analysis=analysis)
+    batch = batch_plan.batches[0]
+    title = next(
+        mention
+        for mention in analysis.mentions
+        if mention.mention_type == "event_title_candidate"
+    )
+    generic = next(
+        mention for mention in analysis.mentions if mention.mention_type == "event"
+    )
+    candidate = next(
+        item
+        for item in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+        if item.subject_mention_id == generic.mention_id
+    )
+    second_title_start = text.index("design review")
+    second_title = replace(
+        title,
+        mention_id=f"{title.mention_id}:ambiguous-title",
+        start=second_title_start,
+    )
+    batch_title = next(
+        item for item in batch.mentions if item.mention_id == title.mention_id
+    )
+    second_batch_title = replace(
+        batch_title,
+        mention_id=second_title.mention_id,
+        start=second_title.start,
+        surface=text[second_title.start : second_title.end],
+    )
+    extended_analysis = replace(
+        analysis,
+        mentions=(*analysis.mentions, second_title),
+    )
+    extended_batch = replace(
+        batch,
+        manifest=replace(
+            batch.manifest,
+            mention_ids=(*batch.manifest.mention_ids, second_title.mention_id),
+        ),
+        mentions=(*batch.mentions, second_batch_title),
+    )
+
+    subject_families = review_module._subject_alias_families(  # noqa: SLF001
+        analysis=extended_analysis,
+        batches=(extended_batch,),
+        candidates=(candidate,),
+    )
+    subject_family_members = review_module._subject_alias_family_members(  # noqa: SLF001
+        subject_families
+    )
+    aliases, _, canonical = review_module._subject_identity_metadata(  # noqa: SLF001
+        subject_mention_ids=(generic.mention_id,),
+        subject_types_by_id={
+            mention.mention_id: mention.mention_type
+            for mention in extended_analysis.mentions
+        },
+        subject_families=subject_families,
+        subject_family_members=subject_family_members,
+    )
+
+    assert set(aliases) == {
+        generic.mention_id,
+        title.mention_id,
+        second_title.mention_id,
+    }
+    assert canonical is None
+
+
+def test_non_frontier_titles_cannot_merge_distinct_generic_events() -> None:
+    text = (
+        "The Northstar design review is scheduled for October 2, 2027. "
+        "The Lumen Quay planning session is scheduled for October 3, 2027."
+    )
+    analysis = analyze_gmail_temporal_leads(
+        text=text,
+        message_internal_at="2027-08-10T09:00:00-07:00",
+        fact_admitted=True,
+        chunk_id="review-non-frontier-title-cross-event-negative",
+    )
+    batch_plan = plan_gmail_temporal_selector_batches(text=text, analysis=analysis)
+    surfaces = {
+        mention.mention_id: text[mention.start : mention.end]
+        for mention in analysis.mentions
+    }
+    generic_ids = {
+        mention.mention_id
+        for mention in analysis.mentions
+        if mention.mention_type == "event"
+        and surfaces[mention.mention_id] in {"review", "session"}
+    }
+    candidates = tuple(
+        candidate
+        for batch in batch_plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+        if candidate.subject_mention_id in generic_ids
+    )
+
+    subject_families = review_module._subject_alias_families(  # noqa: SLF001
+        analysis=analysis,
+        batches=batch_plan.batches,
+        candidates=candidates,
+    )
+    families_by_surface = {
+        surfaces[mention_id]: family_id
+        for mention_id, family_id in subject_families.items()
+    }
+
+    assert (
+        families_by_surface["review"] == families_by_surface["Northstar design review"]
+    )
+    assert (
+        families_by_surface["session"]
+        == families_by_surface["Lumen Quay planning session"]
+    )
+    assert families_by_surface["review"] != families_by_surface["session"]
+
+
+@pytest.mark.parametrize("coordinator", ("and", "&"))
+def test_coordinated_frontier_title_cannot_canonicalize_one_component_event(
+    coordinator: str,
+) -> None:
+    title = f"Northstar seminar {coordinator} Lumen workshop"
+    text = f"Subject: {title}\n\nThe {title} are scheduled for October 2, 2027."
+
+    def select_workshop(
+        _expression_id: str,
+        analysis: TemporalLeadAnalysis,
+        candidates: tuple[GmailTemporalVerificationCandidate, ...],
+    ) -> dict[str, str]:
+        mentions = {item.mention_id: item for item in analysis.mentions}
+        candidate = next(
+            item
+            for item in candidates
+            if mentions[item.subject_mention_id].mention_type == "event"
+            and mentions[item.subject_mention_id].field == "body"
+            and text[
+                mentions[item.subject_mention_id].start : mentions[
+                    item.subject_mention_id
+                ].end
+            ]
+            == "workshop"
+            and item.lifecycle == "scheduled"
+        )
+        return {candidate.candidate_id: "supported"}
+
+    analysis, batch_plan, _, projection = _fixture(
+        text,
+        select_workshop,
+        chunk_id=f"review-coordinated-frontier-title-{coordinator}",
+    )
+    mentions = {item.mention_id: item for item in analysis.mentions}
+    title_id = next(
+        mention.mention_id
+        for mention in analysis.mentions
+        if mention.mention_type == "event_title_candidate"
+        and mention.field == "subject"
+    )
+    assert any(
+        candidate.subject_mention_id == title_id
+        for batch in batch_plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+    )
+
+    assert len(projection.artifacts) == 1
+    hypothesis = projection.artifacts[0].hypotheses[0]
+    assert {
+        text[mentions[mention_id].start : mentions[mention_id].end]
+        for mention_id in hypothesis.subject_mention_ids
+    } == {"workshop"}
+    assert title_id not in hypothesis.subject_alias_mention_ids
+    assert hypothesis.canonical_subject_mention_id is None
+
+
+def test_compound_frontier_title_without_coordination_remains_canonical() -> None:
+    title = "Northstar review meeting"
+    text = f"Subject: {title}\n\nThe {title} is scheduled for October 2, 2027."
+
+    def select_meeting(
+        _expression_id: str,
+        analysis: TemporalLeadAnalysis,
+        candidates: tuple[GmailTemporalVerificationCandidate, ...],
+    ) -> dict[str, str]:
+        mentions = {item.mention_id: item for item in analysis.mentions}
+        candidate = next(
+            item
+            for item in candidates
+            if mentions[item.subject_mention_id].mention_type == "event"
+            and mentions[item.subject_mention_id].field == "body"
+            and text[
+                mentions[item.subject_mention_id].start : mentions[
+                    item.subject_mention_id
+                ].end
+            ]
+            == "meeting"
+            and item.lifecycle == "scheduled"
+        )
+        return {candidate.candidate_id: "supported"}
+
+    analysis, batch_plan, _, projection = _fixture(
+        text,
+        select_meeting,
+        chunk_id="review-compound-frontier-title",
+    )
+    title_id = next(
+        mention.mention_id
+        for mention in analysis.mentions
+        if mention.mention_type == "event_title_candidate"
+        and mention.field == "subject"
+    )
+    assert any(
+        candidate.subject_mention_id == title_id
+        for batch in batch_plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+    )
+
+    hypothesis = projection.artifacts[0].hypotheses[0]
+    assert title_id in hypothesis.subject_alias_mention_ids
+    assert hypothesis.canonical_subject_mention_id == title_id
+
+
+def _multi_root_title_authority(
+    text: str,
+    *,
+    chunk_id: str,
+) -> tuple[
+    TemporalLeadAnalysis,
+    GmailTemporalBatchPlan,
+    tuple[GmailTemporalVerificationCandidate, ...],
+    str,
+    str,
+    str,
+]:
+    analysis = analyze_gmail_temporal_leads(
+        text=text,
+        message_internal_at="2027-08-10T09:00:00-07:00",
+        fact_admitted=True,
+        chunk_id=chunk_id,
+    )
+    batch_plan = plan_gmail_temporal_selector_batches(text=text, analysis=analysis)
+    candidate_index = {
+        candidate.candidate_id: candidate
+        for batch in batch_plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+    }
+    candidates = tuple(candidate_index.values())
+    title_id = next(
+        mention.mention_id
+        for mention in analysis.mentions
+        if mention.mention_type == "event_title_candidate"
+        and mention.field == "subject"
+    )
+    subject_ids = {candidate.subject_mention_id for candidate in candidates}
+    candidates_by_subject = {
+        subject_id: tuple(
+            candidate
+            for candidate in candidates
+            if candidate.subject_mention_id == subject_id
+        )
+        for subject_id in subject_ids
+    }
+    concrete_id = next(
+        subject_id
+        for subject_id, subject_candidates in candidates_by_subject.items()
+        if any(
+            candidate.lifecycle not in {"none", "unknown"}
+            for candidate in subject_candidates
+        )
+    )
+    fallback_id = next(
+        subject_id
+        for subject_id, subject_candidates in candidates_by_subject.items()
+        if all(
+            candidate.kind == "unspecified"
+            and candidate.lifecycle in {"none", "unknown"}
+            for candidate in subject_candidates
+        )
+    )
+    return (
+        analysis,
+        batch_plan,
+        candidates,
+        title_id,
+        concrete_id,
+        fallback_id,
+    )
+
+
+@pytest.mark.parametrize(
+    ("title", "body"),
+    (
+        (
+            "Silverbrook training workshop",
+            "The Silverbrook training workshop has been rescheduled from "
+            "August 20, 2027 to August 21, 2027.",
+        ),
+        (
+            "Thistle Point launch briefing",
+            "Update: the Thistle Point launch briefing is now rescheduled to "
+            "August 23, 2027 from August 22, 2027.",
+        ),
+    ),
+)
+def test_multi_root_title_attaches_only_to_exact_lifecycle_root(
+    title: str,
+    body: str,
+) -> None:
+    text = f"Subject: {title}\n\n{body}"
+    analysis, _, _, projection = _fixture(
+        text,
+        _select_exact_reschedule("supported"),
+        chunk_id=f"review-multi-root-title-{title}",
+    )
+    surfaces = {
+        mention.mention_id: text[mention.start : mention.end]
+        for mention in analysis.mentions
+    }
+    title_id = next(
+        mention.mention_id
+        for mention in analysis.mentions
+        if mention.mention_type == "event_title_candidate"
+        and surfaces[mention.mention_id] == title
+    )
+
+    assert len(projection.artifacts) == 2
+    assert len(projection.groups) == 1
+    assert projection.groups[0].kind == "reschedule"
+    assert projection.groups[0].coverage == "complete"
+    for artifact in projection.artifacts:
+        hypothesis = artifact.hypotheses[0]
+        assert hypothesis.canonical_subject_mention_id == title_id
+        assert title_id in hypothesis.subject_alias_mention_ids
+        assert title_id not in hypothesis.subject_mention_ids
+        assert len(hypothesis.subject_alias_mention_ids) == 2
+
+
+@pytest.mark.parametrize("conflict", ("endpoint", "relation", "lifecycle"))
+def test_multi_root_title_fails_closed_for_structural_root_conflicts(
+    conflict: str,
+) -> None:
+    text = (
+        "Subject: Silverbrook training workshop\n\n"
+        "The Silverbrook training workshop has been rescheduled from "
+        "August 20, 2027 to August 21, 2027."
+    )
+    (
+        analysis,
+        batch_plan,
+        candidates,
+        title_id,
+        concrete_id,
+        fallback_id,
+    ) = _multi_root_title_authority(
+        text,
+        chunk_id=f"review-multi-root-{conflict}-negative",
+    )
+    if conflict == "endpoint":
+        last_expression_id = analysis.expressions[-1].expression_id
+        candidates = tuple(
+            candidate
+            for candidate in candidates
+            if not (
+                candidate.subject_mention_id == fallback_id
+                and candidate.expression_id == last_expression_id
+            )
+        )
+    elif conflict == "relation":
+        candidates = tuple(
+            replace(candidate, relation="deadline")
+            if candidate.subject_mention_id == fallback_id
+            else candidate
+            for candidate in candidates
+        )
+    else:
+        candidates = tuple(
+            replace(candidate, kind="actual", lifecycle="cancelled")
+            if candidate.subject_mention_id == fallback_id
+            else candidate
+            for candidate in candidates
+        )
+
+    subject_families = review_module._subject_alias_families(  # noqa: SLF001
+        analysis=analysis,
+        batches=batch_plan.batches,
+        candidates=candidates,
+    )
+
+    assert subject_families[concrete_id] != subject_families[fallback_id]
+    assert title_id not in subject_families
+
+
+def test_multi_root_title_requires_every_root_inside_an_exact_title_literal() -> None:
+    title = "Silverbrook training workshop"
+    text = (
+        f"Subject: {title}\n\n"
+        "The workshop has been rescheduled from August 20, 2027 "
+        "to August 21, 2027."
+    )
+    analysis, _, _, projection = _fixture(
+        text,
+        _select_exact_reschedule("supported"),
+        chunk_id="review-multi-root-title-literal-negative",
+    )
+    title_id = next(
+        mention.mention_id
+        for mention in analysis.mentions
+        if mention.mention_type == "event_title_candidate"
+    )
+
+    assert len(projection.artifacts) == 2
+    assert all(
+        artifact.hypotheses[0].canonical_subject_mention_id is None
+        and title_id not in artifact.hypotheses[0].subject_alias_mention_ids
+        for artifact in projection.artifacts
+    )
+
+
+def test_multi_root_title_fails_closed_when_another_title_competes() -> None:
+    text = (
+        "Subject: Silverbrook training workshop\n\n"
+        "The Silverbrook training workshop has been rescheduled from "
+        "August 20, 2027 to August 21, 2027."
+    )
+    (
+        analysis,
+        batch_plan,
+        candidates,
+        title_id,
+        concrete_id,
+        fallback_id,
+    ) = _multi_root_title_authority(
+        text,
+        chunk_id="review-multi-root-competing-title-negative",
+    )
+    title = next(
+        mention for mention in analysis.mentions if mention.mention_id == title_id
+    )
+    competing_title = replace(title, mention_id=f"{title_id}:competing")
+    extended_analysis = replace(
+        analysis,
+        mentions=(*analysis.mentions, competing_title),
+    )
+    extended_batches = tuple(
+        replace(
+            batch,
+            manifest=replace(
+                batch.manifest,
+                mention_ids=(*batch.manifest.mention_ids, competing_title.mention_id),
+            ),
+            mentions=(
+                *batch.mentions,
+                replace(
+                    next(
+                        mention
+                        for mention in batch.mentions
+                        if mention.mention_id == title_id
+                    ),
+                    mention_id=competing_title.mention_id,
+                ),
+            ),
+        )
+        for batch in batch_plan.batches
+    )
+
+    subject_families = review_module._subject_alias_families(  # noqa: SLF001
+        analysis=extended_analysis,
+        batches=extended_batches,
+        candidates=candidates,
+    )
+
+    assert subject_families[concrete_id] != subject_families[fallback_id]
+    assert title_id not in subject_families
+    assert competing_title.mention_id not in subject_families
+
+
+def test_multi_root_title_does_not_attach_across_coordinated_event_names() -> None:
+    title = "Northstar review and Lumen session"
+    text = (
+        f"Subject: {title}\n\n"
+        f"The {title} has been rescheduled from August 20, 2027 "
+        "to August 21, 2027."
+    )
+    (
+        analysis,
+        batch_plan,
+        candidates,
+        title_id,
+        concrete_id,
+        fallback_id,
+    ) = _multi_root_title_authority(
+        text,
+        chunk_id="review-multi-root-distinct-events-negative",
+    )
+
+    subject_families = review_module._subject_alias_families(  # noqa: SLF001
+        analysis=analysis,
+        batches=batch_plan.batches,
+        candidates=candidates,
+    )
+
+    assert subject_families[concrete_id] != subject_families[fallback_id]
+    assert title_id not in subject_families
+
+
 def test_subject_identity_canonicalization_fails_closed_for_two_named_titles() -> None:
     aliases, references, canonical = review_module._subject_identity_metadata(  # noqa: SLF001
         subject_mention_ids=("bare",),

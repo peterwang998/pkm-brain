@@ -177,14 +177,21 @@ _MALFORMED_DAY_FIRST_RANGE_RE = re.compile(
 )
 
 _EVENT_NOUN_RE = re.compile(
-    r"\b(?:appointment|booking|call|ceremony|class|conference|concert|demo|"
-    r"dinner|exam|flight|hearing|interview|launch|meeting|offsite|party|"
-    r"presentation|reservation|review|session|stay|trip|visit|webinar|workshop)\b",
+    r"\b(?:appointment|booking|briefing|call|ceremony|class|conference|concert|"
+    r"consultation|demo|dinner|exam|flight|hearing|interview|kickoff|launch|"
+    r"meeting|offsite|party|presentation|rehearsal|reservation|review|seminar|"
+    r"session|stay|trip|visit|webinar|workshop)\b",
     re.IGNORECASE,
 )
 _EVENT_ARTIFACT_RE = re.compile(
     r"\b(?:agenda|attachment|brief|deck|details|dial-in|invite|invitation|link|"
     r"notes|preparation|prep|recording|reminder|room|summary|transcript)\b",
+    re.IGNORECASE,
+)
+_EVENT_ARTIFACT_OBJECT_LINK_RE = re.compile(
+    r"[ \t]+(?:of|from)[ \t]+"
+    r"(?:(?:a|an|the|this|that|our|your)[ \t]+)?"
+    r"(?:[A-Za-z0-9][A-Za-z0-9'\N{RIGHT SINGLE QUOTATION MARK}.-]*[ \t]+){0,4}\Z",
     re.IGNORECASE,
 )
 _EVENT_BOUNDARY_LABEL_RE = re.compile(
@@ -217,6 +224,61 @@ _DEADLINE_CUE_RE = re.compile(
 )
 _ACTION_BEFORE_BY_RE = re.compile(
     r"\b(?:apply|complete|file|finish|pay|register|reply|respond|send|submit)\b",
+    re.IGNORECASE,
+)
+_INTAKE_NAME_FIRST_PATTERN = (
+    r"(?-i:[A-Z][A-Za-z0-9]*(?:[-'\N{RIGHT SINGLE QUOTATION MARK}]"
+    r"[A-Za-z0-9]+)?)"
+)
+_INTAKE_NAME_TOKEN_PATTERN = rf"(?:{_INTAKE_NAME_FIRST_PATTERN}|(?-i:[0-9]{{2,8}}))"
+_INTAKE_NAME_LEADING_BLOCKER_PATTERN = (
+    r"i|we|you|they|he|she|please|keep|use|review|reviewed|maintain|leave|"
+    r"hold|consider|mark|make|set|test|tested|see|saw|show|report|reported"
+)
+_INTAKE_NAME_PREFIX_PATTERN = (
+    rf"(?!(?i:{_INTAKE_NAME_LEADING_BLOCKER_PATTERN})\b)"
+    rf"{_INTAKE_NAME_FIRST_PATTERN}"
+    rf"(?:[ \t]+{_INTAKE_NAME_TOKEN_PATTERN}){{1,3}}[ \t]+"
+)
+_INTAKE_NAME_TARGET_PATTERN = (
+    rf"{_INTAKE_NAME_FIRST_PATTERN}"
+    rf"(?:[ \t]+{_INTAKE_NAME_TOKEN_PATTERN}){{1,4}}"
+)
+_INTAKE_APPLICATION_WINDOW_PATTERN = (
+    r"application[ \t]+(?:cycle|intake|period|portal|window)"
+)
+_INTAKE_SINGULAR_SUBJECT_PATTERN = (
+    rf"(?:{_INTAKE_NAME_PREFIX_PATTERN}"
+    rf"(?:registration|{_INTAKE_APPLICATION_WINDOW_PATTERN})|"
+    rf"registration(?:[ \t]+for[ \t]+{_INTAKE_NAME_TARGET_PATTERN})?|"
+    rf"{_INTAKE_APPLICATION_WINDOW_PATTERN}"
+    rf"(?:[ \t]+for[ \t]+{_INTAKE_NAME_TARGET_PATTERN})?)"
+)
+_INTAKE_PLURAL_SUBJECT_PATTERN = (
+    rf"(?:{_INTAKE_NAME_PREFIX_PATTERN}applications|"
+    rf"applications(?:[ \t]+for[ \t]+{_INTAKE_NAME_TARGET_PATTERN})?)"
+)
+_INTAKE_THIRD_PERSON_OPENING_RES = (
+    re.compile(
+        rf"\A[ \t]*(?:(?:our|the|your)[ \t]+)?"
+        rf"(?P<subject>{_INTAKE_SINGULAR_SUBJECT_PATTERN})"
+        r"[ \t]+(?P<cue>opens)(?:[ \t]+(?:at|on))?[ \t]*\Z",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\A[ \t]*(?:(?:our|the|your)[ \t]+)?"
+        rf"(?P<subject>{_INTAKE_PLURAL_SUBJECT_PATTERN})"
+        r"[ \t]+(?P<cue>open)(?:[ \t]+(?:at|on))?[ \t]*\Z",
+        re.IGNORECASE,
+    ),
+)
+_CLAUSE_END_AFTER_EXPRESSION_RE = re.compile(
+    r"\A[ \t]*(?:[)\]}\"'\N{RIGHT DOUBLE QUOTATION MARK}"
+    r"\N{RIGHT SINGLE QUOTATION MARK}][ \t]*)*(?:[.!?;]|\r?\n|\Z)"
+)
+_OPENING_TO_CLOSING_CONNECTOR_RE = re.compile(
+    r"\A[ \t]*(?:,[ \t]*)?(?:and|then)[ \t]+closes"
+    r"(?:[ \t]+(?:at|on))?[ \t]*\Z",
     re.IGNORECASE,
 )
 
@@ -272,7 +334,7 @@ def discover_gmail_temporal_candidates(
     expressions = _discover_expressions(text, anchor.date())
     output: list[GmailTemporalCandidate] = []
     for expression in expressions:
-        cue = _cue_for_expression(text, expression)
+        cue = _cue_for_expression(text, expression, expressions)
         if cue is None or (cue.relation == "deadline" and expression.end_date):
             continue
         if cue.relation == "deadline":
@@ -586,7 +648,11 @@ def _timezone_for_text(value: str) -> tuple[timezone | ZoneInfo | None, str]:
         return None, ""
 
 
-def _cue_for_expression(text: str, expression: _Expression) -> _Cue | None:
+def _cue_for_expression(
+    text: str,
+    expression: _Expression,
+    expressions: list[_Expression],
+) -> _Cue | None:
     clause_start = (
         max(
             text.rfind("\n", 0, expression.start),
@@ -603,11 +669,38 @@ def _cue_for_expression(text: str, expression: _Expression) -> _Cue | None:
         clause_start = expression.start - len(prefix)
 
     cues: list[_Cue] = []
+    intake_opening = next(
+        (
+            match
+            for pattern in _INTAKE_THIRD_PERSON_OPENING_RES
+            if (match := pattern.fullmatch(prefix)) is not None
+        ),
+        None,
+    )
+    if intake_opening is not None and _bounded_intake_opening_tail(
+        text,
+        expression=expression,
+        expressions=expressions,
+    ):
+        cue_start, cue_end = intake_opening.span("cue")
+        cues.append(
+            _Cue(
+                "occurrence",
+                "planned",
+                clause_start + cue_start,
+                clause_start + cue_end,
+            )
+        )
     for pattern, kind in ((_PLANNED_CUE_RE, "planned"), (_ACTUAL_CUE_RE, "actual")):
         for match in pattern.finditer(prefix):
             noun_prefix = prefix[: match.start()]
             nouns = list(_EVENT_NOUN_RE.finditer(noun_prefix))
             if not nouns or match.start() - nouns[-1].end() > 180:
+                continue
+            if gmail_temporal_event_head_is_artifact_object(
+                noun_prefix,
+                event_head_start=nouns[-1].start(),
+            ):
                 continue
             event_subject_tail = prefix[nouns[-1].end() : match.start()]
             if _EVENT_ARTIFACT_RE.search(
@@ -656,6 +749,55 @@ def _cue_for_expression(text: str, expression: _Expression) -> _Cue | None:
                 )
             )
     return max(cues, key=lambda item: item.end, default=None)
+
+
+def gmail_temporal_event_head_is_artifact_object(
+    text: str,
+    *,
+    event_head_start: int,
+) -> bool:
+    """Return whether an event head is the bounded object of an artifact noun."""
+
+    if (
+        not isinstance(text, str)
+        or isinstance(event_head_start, bool)
+        or not isinstance(event_head_start, int)
+        or not 0 <= event_head_start <= len(text)
+    ):
+        return False
+    prefix = text[:event_head_start]
+    artifacts = list(_EVENT_ARTIFACT_RE.finditer(prefix))
+    if not artifacts:
+        return False
+    return (
+        _EVENT_ARTIFACT_OBJECT_LINK_RE.fullmatch(prefix[artifacts[-1].end() :])
+        is not None
+    )
+
+
+def _bounded_intake_opening_tail(
+    text: str,
+    *,
+    expression: _Expression,
+    expressions: list[_Expression],
+) -> bool:
+    """Admit a terminal opening or one exact coordinated closing endpoint."""
+
+    if _CLAUSE_END_AFTER_EXPRESSION_RE.match(text[expression.end :]) is not None:
+        return True
+    following = min(
+        (item for item in expressions if item.start >= expression.end),
+        key=lambda item: (item.start, item.end),
+        default=None,
+    )
+    return bool(
+        following is not None
+        and _OPENING_TO_CLOSING_CONNECTOR_RE.fullmatch(
+            text[expression.end : following.start]
+        )
+        is not None
+        and _CLAUSE_END_AFTER_EXPRESSION_RE.match(text[following.end :]) is not None
+    )
 
 
 def _clean_cue_gap(value: str) -> bool:

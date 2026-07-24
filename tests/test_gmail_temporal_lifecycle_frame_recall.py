@@ -79,6 +79,14 @@ def _event_candidates(analysis, candidates):
                 "2027-06-16": "rescheduled_replacement",
             },
         ),
+        (
+            "The Juniper seminar is now rescheduled to June 16, 2027 "
+            "from June 14, 2027.",
+            {
+                "2027-06-16": "rescheduled_replacement",
+                "2027-06-14": "rescheduled_old",
+            },
+        ),
     ),
 )
 def test_exact_reschedule_frames_expose_both_endpoint_roles_before_verification(
@@ -131,6 +139,28 @@ def test_incomplete_or_ambiguous_reschedules_remain_unknown(text: str) -> None:
     )
     assert all(candidate.requires_defer for candidate in candidates)
     assert all(candidate.routable is False for candidate in candidates)
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "The Cedar design review is reportedly rescheduled to June 16, 2027 "
+        "from June 14, 2027.",
+        "The Cedar design review is now possibly rescheduled to June 16, 2027 "
+        "from June 14, 2027.",
+    ),
+)
+def test_inverse_reschedule_subject_link_does_not_accept_unbounded_qualifiers(
+    text: str,
+) -> None:
+    analysis, all_candidates = _analysis_and_candidates(text)
+    candidates = _event_candidates(analysis, all_candidates)
+
+    assert candidates
+    assert not any(
+        candidate.lifecycle in {"rescheduled_old", "rescheduled_replacement"}
+        for candidate in candidates
+    )
 
 
 def test_exact_reschedule_ignores_a_later_unrelated_deadline() -> None:

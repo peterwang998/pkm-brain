@@ -8,13 +8,16 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Literal, TypeVar
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .gmail_temporal_discovery import discover_gmail_temporal_candidates
+from .gmail_temporal_discovery import (
+    discover_gmail_temporal_candidates,
+    gmail_temporal_event_head_is_artifact_object,
+)
 
 
 TemporalRelation = Literal["occurrence", "deadline"]
 TemporalKind = Literal["planned", "actual"]
 TemporalField = Literal["subject", "body", "message"]
-GMAIL_TEMPORAL_LEAD_POLICY_VERSION = "gmail_temporal_lead_policy_v3"
+GMAIL_TEMPORAL_LEAD_POLICY_VERSION = "gmail_temporal_lead_policy_v7"
 AssociationAdmissionBasis = Literal["none", "fact", "temporal_rescue"]
 ResolutionStatus = Literal["resolved", "ambiguous", "unresolved"]
 AssociationMode = Literal[
@@ -350,10 +353,11 @@ _CLOCK_RE = re.compile(
 _CLOCK_LINK_RE = re.compile(r"^\s*(?:(?:,?\s*(?:at|@)\s+)|T|,\s*|\s+)$", re.IGNORECASE)
 
 _EVENT_NOUN_RE = re.compile(
-    r"\b(?:appointment|booking|call|ceremony|class|conference|concert|demo|"
-    r"delivery|dinner|event|exam|flight|forum|hearing|interview|launch|meeting|"
-    r"offsite|orientation|party|pickup|presentation|reservation|review|"
-    r"screening|session|stay|summit|tour|training|trip|visit|webinar|workshop)\b",
+    r"\b(?:appointment|booking|briefing|call|ceremony|class|conference|concert|"
+    r"consultation|demo|delivery|dinner|event|exam|flight|forum|hearing|"
+    r"interview|kickoff|launch|meeting|offsite|orientation|party|pickup|"
+    r"presentation|rehearsal|reservation|review|screening|seminar|session|stay|"
+    r"summit|tour|training|trip|visit|webinar|workshop)\b",
     re.IGNORECASE,
 )
 _DEADLINE_MENTION_RE = re.compile(
@@ -387,8 +391,9 @@ _ACTUAL_OPENING_PREDICATE_RE = re.compile(r"opened\Z", re.IGNORECASE)
 _CLOSING_PREDICATE_RE = re.compile(r"(?:closed|closes|will\s+close)\Z", re.IGNORECASE)
 _ACTUAL_CLOSING_PREDICATE_RE = re.compile(r"closed\Z", re.IGNORECASE)
 _OPENING_PREDICATE_SCAN_RE = re.compile(
-    r"\b(?:opened|opens|will\s+open)\b", re.IGNORECASE
+    r"\b(?:open|opened|opens|will\s+open)\b", re.IGNORECASE
 )
+_BARE_INTAKE_OPENING_PREDICATE_RE = re.compile(r"\bopen\b", re.IGNORECASE)
 _INTAKE_BOUNDARY_PREDICATE_RE = re.compile(
     r"(?P<state>\b(?:(?:is|are|will[ \t]+be|remains?)[ \t]+open))"
     r"(?:[ \t]+from\b)|"
@@ -430,6 +435,50 @@ _OPENING_RESOURCE_SUBJECT_RE = re.compile(
     r"(?:online[ \t]+)?portal(?:[ \t]+(?:window|period|cycle|intake))?",
     re.IGNORECASE,
 )
+_INTAKE_NAME_FIRST_PATTERN = (
+    r"(?-i:[A-Z][A-Za-z0-9]*(?:[-'\N{RIGHT SINGLE QUOTATION MARK}]"
+    r"[A-Za-z0-9]+)?)"
+)
+_INTAKE_NAME_TOKEN_PATTERN = rf"(?:{_INTAKE_NAME_FIRST_PATTERN}|(?-i:[0-9]{{2,8}}))"
+_INTAKE_NAME_LEADING_BLOCKER_PATTERN = (
+    r"i|we|you|they|he|she|please|keep|use|review|reviewed|maintain|leave|"
+    r"hold|consider|mark|make|set|test|tested|see|saw|show|report|reported"
+)
+_INTAKE_NAME_PREFIX_PATTERN = (
+    rf"(?!(?i:{_INTAKE_NAME_LEADING_BLOCKER_PATTERN})\b)"
+    rf"{_INTAKE_NAME_FIRST_PATTERN}"
+    rf"(?:[ \t]+{_INTAKE_NAME_TOKEN_PATTERN}){{1,3}}[ \t]+"
+)
+_INTAKE_NAME_TARGET_PATTERN = (
+    rf"{_INTAKE_NAME_FIRST_PATTERN}"
+    rf"(?:[ \t]+{_INTAKE_NAME_TOKEN_PATTERN}){{1,4}}"
+)
+_INTAKE_APPLICATION_WINDOW_PATTERN = (
+    r"application[ \t]+(?:cycle|intake|period|portal|window)"
+)
+_INTAKE_SINGULAR_SUBJECT_PATTERN = (
+    rf"(?:{_INTAKE_NAME_PREFIX_PATTERN}"
+    rf"(?:registration|{_INTAKE_APPLICATION_WINDOW_PATTERN})|"
+    rf"registration(?:[ \t]+for[ \t]+{_INTAKE_NAME_TARGET_PATTERN})?|"
+    rf"{_INTAKE_APPLICATION_WINDOW_PATTERN}"
+    rf"(?:[ \t]+for[ \t]+{_INTAKE_NAME_TARGET_PATTERN})?)"
+)
+_INTAKE_PLURAL_SUBJECT_PATTERN = (
+    rf"(?:{_INTAKE_NAME_PREFIX_PATTERN}applications|"
+    rf"applications(?:[ \t]+for[ \t]+{_INTAKE_NAME_TARGET_PATTERN})?)"
+)
+_THIRD_PERSON_INTAKE_OPENING_SUBJECT_RES = {
+    "open": re.compile(
+        rf"\A[ \t]*(?:(?:our|the|your)[ \t]+)?"
+        rf"(?P<subject>{_INTAKE_PLURAL_SUBJECT_PATTERN})[ \t]*\Z",
+        re.IGNORECASE,
+    ),
+    "opens": re.compile(
+        rf"\A[ \t]*(?:(?:our|the|your)[ \t]+)?"
+        rf"(?P<subject>{_INTAKE_SINGULAR_SUBJECT_PATTERN})[ \t]*\Z",
+        re.IGNORECASE,
+    ),
+}
 _OPENING_TO_CLOSING_COORDINATION_RE = re.compile(
     r"[ \t]*(?:,[ \t]*)?(?:and|but|then)[ \t]+",
     re.IGNORECASE,
@@ -468,20 +517,28 @@ _EVENT_TITLE_LABEL_RE = re.compile(
 # whitespace in every token prevents a title from crossing a source line or
 # sentence boundary.
 _SOURCE_BOUND_EVENT_HEAD_PATTERN = (
-    r"appointment|booking|call|ceremony|class|conference|concert|debrief|demo|"
-    r"dinner|event|exam|flight|forum|hearing|interview|launch|meeting|offsite|"
-    r"orientation|party|presentation|reservation|review|screening|session|stay|"
-    r"summit|tour|training|trip|visit|webinar|workshop"
+    r"appointment|booking|briefing|call|ceremony|class|conference|concert|"
+    r"consultation|debrief|demo|dinner|event|exam|flight|forum|hearing|interview|"
+    r"kickoff|launch|meeting|offsite|orientation|party|presentation|rehearsal|"
+    r"reservation|review|screening|seminar|session|stay|summit|tour|training|"
+    r"trip|visit|webinar|workshop"
 )
 _SOURCE_BOUND_EVENT_TOKEN_PATTERN = (
-    r"[A-Za-z][A-Za-z0-9]*(?:[-'\N{RIGHT SINGLE QUOTATION MARK}][A-Za-z0-9]+)*"
+    r"(?:[A-Za-z][A-Za-z0-9]*"
+    r"(?:[-'\N{RIGHT SINGLE QUOTATION MARK}][A-Za-z0-9]+)*|[0-9]{2,8})"
 )
 _SOURCE_BOUND_EVENT_NAME_PATTERN = (
     r"(?:[A-Z]|[a-z](?=[A-Za-z0-9]*[A-Z]))"
     r"[A-Za-z0-9]*(?:[-'\N{RIGHT SINGLE QUOTATION MARK}][A-Za-z0-9]+)*"
 )
+_SOURCE_BOUND_EVENT_DISCOURSE_PREFIX_PATTERN = (
+    r"Separately|Independently|"
+    r"In[ \t]+a[ \t]+separate[ \t]+item|"
+    r"On[ \t]+another[ \t]+line"
+)
 _SOURCE_BOUND_EVENT_TITLE_RE = re.compile(
     rf"(?:\A|(?<=[.!?;\r\n]))[ \t]*"
+    rf"(?:(?i:{_SOURCE_BOUND_EVENT_DISCOURSE_PREFIX_PATTERN})[ \t]*,[ \t]*)?"
     rf"(?i:The)[ \t]+"
     rf"(?P<title>{_SOURCE_BOUND_EVENT_NAME_PATTERN}"
     rf"(?:[ \t]+{_SOURCE_BOUND_EVENT_TOKEN_PATTERN}){{0,5}}[ \t]+"
@@ -489,7 +546,9 @@ _SOURCE_BOUND_EVENT_TITLE_RE = re.compile(
     rf"[ \t]+(?P<predicate>"
     rf"(?i:may[ \t]+(?:happen|occur|take[ \t]+place)[ \t]+on)|"
     rf"(?i:has[ \t]+been[ \t]+rescheduled[ \t]+(?:to|from))|"
-    rf"(?i:(?:(?:is|was|has[ \t]+been)[ \t]+)?scheduled[ \t]+(?:for|on))"
+    rf"(?i:(?:(?:is|was|has[ \t]+been)[ \t]+)?scheduled[ \t]+(?:for|on))|"
+    rf"(?i:(?:starts?|begins?|will[ \t]+(?:start|begin))"
+    rf"(?:[ \t]+(?:at|on))?)"
     rf")\b"
 )
 _SOURCE_BOUND_EVENT_ROUTINE_MODIFIER_RE = re.compile(
@@ -1836,6 +1895,11 @@ def _mentions(
 ) -> tuple[TemporalMention, ...]:
     drafts: list[_MentionDraft] = []
     for match in _EVENT_NOUN_RE.finditer(text):
+        if gmail_temporal_event_head_is_artifact_object(
+            text,
+            event_head_start=match.start(),
+        ):
+            continue
         field = _field_for_span(fields, match.start(), match.end())
         kind = _context_kind(text, fields, field, match.start(), match.end())
         drafts.append(
@@ -1924,6 +1988,65 @@ def _mentions(
                 boundary_role,
                 None,
                 tuple(predicate_blockers),
+            )
+        )
+        if opening_predicate and surface.casefold() == "opens":
+            subject_span = _third_person_intake_opening_subject_span(
+                text,
+                fields=fields,
+                field_name=field,
+                predicate_start=match.start(),
+            )
+            if subject_span is not None:
+                drafts.append(
+                    _MentionDraft(
+                        subject_span[0],
+                        subject_span[1],
+                        "event",
+                        "occurrence",
+                        "planned",
+                        "occurrence_start",
+                        None,
+                    )
+                )
+    for match in _BARE_INTAKE_OPENING_PREDICATE_RE.finditer(text):
+        field = _field_for_span(fields, match.start(), match.end())
+        subject_span = _third_person_intake_opening_subject_span(
+            text,
+            fields=fields,
+            field_name=field,
+            predicate_start=match.start(),
+        )
+        if subject_span is None or not _opening_predicate_context_supported(
+            text,
+            fields=fields,
+            segments=segments,
+            expressions=expressions,
+            predicate_start=match.start(),
+            predicate_end=match.end(),
+        ):
+            continue
+        drafts.append(
+            _MentionDraft(
+                match.start(),
+                match.end(),
+                "event_predicate",
+                "occurrence",
+                "planned",
+                "occurrence_start",
+                None,
+                ("predicate_mention_review_only",),
+            )
+        )
+        drafts.append(
+            _MentionDraft(
+                subject_span[0],
+                subject_span[1],
+                "event",
+                "occurrence",
+                "planned",
+                "occurrence_start",
+                None,
             )
         )
     drafts.extend(
@@ -2434,6 +2557,16 @@ def _opening_boundary_subject_context(
     field_name: TemporalField,
     predicate_start: int,
 ) -> bool:
+    if (
+        _third_person_intake_opening_subject_span(
+            text,
+            fields=fields,
+            field_name=field_name,
+            predicate_start=predicate_start,
+        )
+        is not None
+    ):
+        return True
     if _intake_boundary_subject_context(
         text,
         fields=fields,
@@ -2458,6 +2591,35 @@ def _opening_boundary_subject_context(
         flags=re.IGNORECASE,
     )
     return _OPENING_RESOURCE_SUBJECT_RE.fullmatch(subject) is not None
+
+
+def _third_person_intake_opening_subject_span(
+    text: str,
+    *,
+    fields: tuple[_FieldRange, ...],
+    field_name: TemporalField,
+    predicate_start: int,
+) -> tuple[int, int] | None:
+    """Return the explicit intake subject of an agreeing ``open(s)`` frame."""
+
+    field = next((item for item in fields if item.name == field_name), None)
+    lower, _upper = _clause_window(
+        text,
+        predicate_start,
+        predicate_start,
+        padding=100,
+        lower_bound=field.start if field else 0,
+        upper_bound=field.end if field else len(text),
+    )
+    cue = re.match(r"(?:opens|open)\b", text[predicate_start:], re.IGNORECASE)
+    if cue is None:
+        return None
+    pattern = _THIRD_PERSON_INTAKE_OPENING_SUBJECT_RES[cue.group(0).casefold()]
+    match = pattern.fullmatch(text[lower:predicate_start])
+    if match is None:
+        return None
+    start, end = match.span("subject")
+    return lower + start, lower + end
 
 
 def _opening_expression_tail_is_supported(
@@ -2560,6 +2722,16 @@ def _intake_boundary_subject_context(
     field_name: TemporalField,
     predicate_start: int,
 ) -> bool:
+    if (
+        _third_person_intake_opening_subject_span(
+            text,
+            fields=fields,
+            field_name=field_name,
+            predicate_start=predicate_start,
+        )
+        is not None
+    ):
+        return True
     field = next((item for item in fields if item.name == field_name), None)
     lower, _upper = _clause_window(
         text,
@@ -3338,6 +3510,14 @@ def _source_bound_title_pair_is_authorized(
 ) -> bool:
     """Keep a rescued title on only the expressions its source frame names."""
 
+    intake_opening = _source_bound_intake_opening_pair_authorization(
+        text,
+        expressions=expressions,
+        expression=expression,
+        mention=mention,
+    )
+    if intake_opening is not None:
+        return intake_opening
     if GMAIL_TEMPORAL_CLAUSE_BOUND_EVENT_TITLE_BLOCKER not in mention.blockers:
         return True
     matches = tuple(
@@ -3397,6 +3577,57 @@ def _source_bound_title_pair_is_authorized(
             authorized.add(candidate.expression_id)
             previous = candidate
     return expression.expression_id in authorized
+
+
+def _source_bound_intake_opening_pair_authorization(
+    text: str,
+    *,
+    expressions: tuple[TemporalExpression, ...],
+    expression: TemporalExpression,
+    mention: TemporalMention,
+) -> bool | None:
+    """Confine a synthesized intake event subject to its opening endpoint."""
+
+    if mention.mention_type != "event":
+        return None
+    predicate = re.match(
+        r"[ \t]+(?P<cue>opens?)(?:[ \t]+(?:at|on))?[ \t]*",
+        text[mention.end :],
+        re.IGNORECASE,
+    )
+    if predicate is None:
+        return None
+    predicate_start = mention.end + predicate.start("cue")
+    subject_span = _third_person_intake_opening_subject_span(
+        text,
+        fields=_field_ranges(text),
+        field_name=mention.field,
+        predicate_start=predicate_start,
+    )
+    if subject_span != (mention.start, mention.end):
+        return None
+    predicate_end = mention.end + predicate.end()
+    right_hand = tuple(
+        sorted(
+            (
+                candidate
+                for candidate in expressions
+                if candidate.field == mention.field
+                and candidate.segment_id == mention.segment_id
+                and candidate.start >= predicate_end
+            ),
+            key=lambda candidate: (candidate.start, candidate.end),
+        )
+    )
+    if not right_hand:
+        return False
+    first = right_hand[0]
+    if (
+        _PREDICATE_EXPRESSION_LINK_RE.fullmatch(text[predicate_end : first.start])
+        is None
+    ):
+        return False
+    return expression.expression_id == first.expression_id
 
 
 def _confidence_tier(

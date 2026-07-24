@@ -127,6 +127,55 @@ def test_frontier_is_deterministic_bounded_and_validator_backed() -> None:
         first.complete = False  # type: ignore[misc]
 
 
+@pytest.mark.parametrize(
+    ("artifact_text", "genuine_text", "expected_value"),
+    (
+        (
+            "The recording of the seminar is scheduled for deletion on "
+            "November 3, 2029.",
+            "The Juniper seminar is scheduled for November 3, 2029.",
+            "2029-11-03",
+        ),
+        (
+            "The transcript from the briefing is scheduled for publication on "
+            "November 4, 2029.",
+            "The Juniper briefing is scheduled for November 4, 2029.",
+            "2029-11-04",
+        ),
+    ),
+)
+def test_artifact_owned_event_head_does_not_reach_candidate_frontier(
+    artifact_text: str,
+    genuine_text: str,
+    expected_value: str,
+) -> None:
+    artifact_analysis, artifact_plan = analyze_and_plan(artifact_text)
+    artifact_candidates = tuple(
+        candidate
+        for batch in artifact_plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=artifact_analysis,
+            batch=batch,
+        ).candidates
+    )
+    assert artifact_candidates == ()
+
+    genuine_analysis, genuine_plan = analyze_and_plan(genuine_text)
+    genuine_candidates = tuple(
+        candidate
+        for batch in genuine_plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=genuine_analysis,
+            batch=batch,
+        ).candidates
+    )
+    assert any(
+        (candidate.relation, candidate.kind, candidate.normalized_value)
+        == ("occurrence", "planned", expected_value)
+        for candidate in genuine_candidates
+    )
+
+
 @pytest.mark.parametrize("lifecycle", ("cancelled", "completed"))
 def test_exact_terminal_lifecycle_omits_redundant_base(lifecycle: str) -> None:
     analysis, plan = analyze_and_plan(f"The meeting was {lifecycle} on May 14, 2027.")
@@ -514,11 +563,19 @@ def test_missing_benchmark_predicates_produce_nonempty_frontiers() -> None:
 
         assert len(frontiers) == expected_count
         assert all(frontier.candidates for frontier in frontiers)
-        assert all(
-            candidate.requires_defer
-            for frontier in frontiers
-            for candidate in frontier.candidates
+        candidates = tuple(
+            candidate for frontier in frontiers for candidate in frontier.candidates
         )
+        if text.startswith(("Registration opens", "Applications open")):
+            assert any(
+                candidate.relation == "occurrence"
+                and candidate.kind == "planned"
+                and candidate.normalized_value == "2027-08-12"
+                and candidate.requires_defer is False
+                for candidate in candidates
+            )
+        else:
+            assert all(candidate.requires_defer for candidate in candidates)
 
 
 @pytest.mark.parametrize(
@@ -632,6 +689,8 @@ def test_effective_boundary_modifier_heads_do_not_create_unsafe_frontiers(
         "The clerk opens the report on August 12, 2027.",
         "We opened the application on August 12, 2027.",
         "The application report opens August 12, 2027.",
+        "Keep Marigold Residency applications open August 12, 2027.",
+        "We reviewed Marigold Residency applications open on August 12, 2027.",
         "Registration opens August 12, 2027 reports show.",
     ),
 )
@@ -651,6 +710,29 @@ def test_opening_inflection_lookalikes_have_no_frontier_candidates(
     assert analysis.leads == ()
     assert frontiers
     assert all(frontier.candidates == () for frontier in frontiers)
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "Applications for QA open August 12, 2027.",
+        "Registration for the report opens August 12, 2027.",
+    ),
+)
+def test_generic_intake_targets_never_gain_a_strict_named_frontier(text: str) -> None:
+    analysis, plan = analyze_and_plan(text)
+    candidates = tuple(
+        candidate
+        for batch in plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+    )
+
+    assert not any(item.mention_type == "event" for item in analysis.mentions)
+    assert candidates
+    assert all(candidate.requires_defer for candidate in candidates)
 
 
 @pytest.mark.parametrize(
@@ -710,6 +792,127 @@ def test_bounded_opening_inflections_reach_forced_defer_frontier(
     assert {item.relation for item in candidates} == {"occurrence"}
     assert {item.kind for item in candidates} == {expected_kind}
     assert all(item.requires_defer is True for item in candidates)
+
+
+@pytest.mark.parametrize(
+    ("text", "subject_surface"),
+    (
+        (
+            "Marigold Residency applications open November 3, 2029.",
+            "Marigold Residency applications",
+        ),
+        (
+            "The Marigold Residency application window opens November 3, 2029.",
+            "Marigold Residency application window",
+        ),
+        (
+            "Registration for Marigold Residency opens November 3, 2029.",
+            "Registration for Marigold Residency",
+        ),
+    ),
+)
+def test_common_named_intake_openings_reach_a_strict_bounded_frontier(
+    text: str,
+    subject_surface: str,
+) -> None:
+    analysis, plan = analyze_and_plan(text)
+    event = next(
+        item
+        for item in analysis.mentions
+        if item.mention_type == "event"
+        and text[item.start : item.end] == subject_surface
+    )
+    candidates = tuple(
+        candidate
+        for batch in plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+        if candidate.subject_mention_id == event.mention_id
+        and candidate.normalized_value == "2029-11-03"
+    )
+
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert (
+        candidate.relation,
+        candidate.kind,
+        candidate.lifecycle,
+        candidate.supporting_lead_present,
+        candidate.requires_defer,
+    ) == ("occurrence", "planned", "none", True, False)
+
+
+@pytest.mark.parametrize(
+    ("subject", "cue"),
+    (
+        ("Registration", "opens"),
+        ("Applications", "open"),
+        ("Marigold Residency registration", "opens"),
+        ("Foxglove Fellows applications", "open"),
+        ("Registration for Marigold Residency", "opens"),
+    ),
+)
+def test_coordinated_opening_closing_has_one_strict_opening_event_subject(
+    subject: str,
+    cue: str,
+) -> None:
+    text = f"{subject} {cue} November 3, 2029 and closes November 12, 2029."
+    analysis, plan = analyze_and_plan(text)
+    event = next(
+        item
+        for item in analysis.mentions
+        if item.mention_type == "event" and text[item.start : item.end] == subject
+    )
+    candidates = tuple(
+        candidate
+        for batch in plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+        if candidate.subject_mention_id == event.mention_id
+    )
+
+    opening = next(
+        candidate
+        for candidate in candidates
+        if candidate.normalized_value == "2029-11-03"
+    )
+    assert (
+        opening.relation,
+        opening.kind,
+        opening.requires_defer,
+        opening.supporting_lead_present,
+    ) == ("occurrence", "planned", False, True)
+    closing_fallbacks = tuple(
+        candidate
+        for candidate in candidates
+        if candidate.normalized_value == "2029-11-12"
+    )
+    assert closing_fallbacks
+    assert all(
+        candidate.requires_defer is True and candidate.supporting_lead_present is False
+        for candidate in closing_fallbacks
+    )
+    opening_predicate = next(
+        item
+        for item in analysis.mentions
+        if item.mention_type == "event_predicate" and text[item.start : item.end] == cue
+    )
+    predicate_candidates = tuple(
+        candidate
+        for batch in plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+        if candidate.subject_mention_id == opening_predicate.mention_id
+        and candidate.normalized_value == "2029-11-03"
+    )
+    assert predicate_candidates
+    assert all(candidate.relation == "occurrence" for candidate in predicate_candidates)
 
 
 def test_page_plan_clusters_adjacent_compound_event_nouns() -> None:

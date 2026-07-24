@@ -952,11 +952,71 @@ def test_portal_opening_inflections_preserve_transition_kind(
 
 
 @pytest.mark.parametrize(
+    ("text", "subject_surface"),
+    (
+        ("Registration opens November 3, 2029.", "Registration"),
+        ("Applications open November 3, 2029.", "Applications"),
+        ("The application window opens November 3, 2029.", "application window"),
+        (
+            "Marigold Residency registration opens November 3, 2029.",
+            "Marigold Residency registration",
+        ),
+        (
+            "Foxglove Fellows applications open November 3, 2029.",
+            "Foxglove Fellows applications",
+        ),
+        (
+            "The Marigold Residency application window opens November 3, 2029.",
+            "Marigold Residency application window",
+        ),
+        (
+            "Registration for Marigold Residency opens November 3, 2029.",
+            "Registration for Marigold Residency",
+        ),
+        (
+            "Applications for Foxglove Fellows open November 3, 2029.",
+            "Applications for Foxglove Fellows",
+        ),
+    ),
+)
+def test_bounded_third_person_intake_opening_has_a_strict_event_subject(
+    text: str,
+    subject_surface: str,
+) -> None:
+    result = analyze(text, admitted=False, rescue=True)
+    event = next(
+        item
+        for item in result.mentions
+        if item.mention_type == "event"
+        and text[item.start : item.end] == subject_surface
+    )
+    lead = next(
+        item
+        for item in result.leads
+        if item.mention_id == event.mention_id
+        and item.association_mode == "direct_grammar"
+    )
+
+    assert (event.relation, event.kind, event.boundary_role) == (
+        "occurrence",
+        "planned",
+        "occurrence_start",
+    )
+    assert (lead.relation, lead.kind, lead.confidence_tier) == (
+        "occurrence",
+        "planned",
+        "strict_direct",
+    )
+
+
+@pytest.mark.parametrize(
     "text",
     (
         "The clerk opens the report on August 12, 2027.",
         "We opened the application on August 12, 2027.",
         "The application report opens August 12, 2027.",
+        "Keep Marigold Residency applications open August 12, 2027.",
+        "We reviewed Marigold Residency applications open on August 12, 2027.",
         "Registration opens August 12, 2027 reports show.",
     ),
 )
@@ -967,6 +1027,27 @@ def test_opening_inflections_reject_transitive_or_unbounded_lookalikes(
 
     assert not any(item.mention_type == "event_predicate" for item in result.mentions)
     assert result.leads == ()
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "Applications for QA open August 12, 2027.",
+        "Registration for the report opens August 12, 2027.",
+    ),
+)
+def test_generic_intake_targets_remain_review_only_without_a_named_event(
+    text: str,
+) -> None:
+    result = analyze(text, admitted=False, rescue=True)
+
+    assert not any(item.mention_type == "event" for item in result.mentions)
+    assert result.leads
+    assert all(
+        lead.confidence_tier == "review_ambiguous"
+        and "predicate_mention_review_only" in lead.blockers
+        for lead in result.leads
+    )
 
 
 @pytest.mark.parametrize(

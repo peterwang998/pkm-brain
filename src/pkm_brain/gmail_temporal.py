@@ -10,6 +10,7 @@ from .gmail_sensitive_data import (
     gmail_payload_contains_sensitive_value,
     gmail_sensitive_values,
 )
+from .gmail_temporal_discovery import gmail_temporal_event_head_is_artifact_object
 
 
 _MONTHS = {
@@ -60,9 +61,9 @@ _TIME_OF_DAY_RE = re.compile(
     re.IGNORECASE,
 )
 _EVENT_NOUN_RE = re.compile(
-    r"\b(?:appointment|booking|ceremony|conference|demo|dinner|flight|"
-    r"interview|launch|meeting|offsite|presentation|reservation|session|stay|"
-    r"rental|trip|visit|workshop)\b",
+    r"\b(?:appointment|booking|briefing|ceremony|conference|consultation|demo|"
+    r"dinner|flight|interview|kickoff|launch|meeting|offsite|presentation|"
+    r"rehearsal|reservation|seminar|session|stay|rental|trip|visit|workshop)\b",
     re.IGNORECASE,
 )
 _PLANNED_CUE_RE = re.compile(
@@ -431,6 +432,11 @@ def _temporal_sentence_for_expression(
                 continue
             nouns = list(_EVENT_NOUN_RE.finditer(sentence, 0, cue.start()))
             if not nouns or cue.start() - nouns[-1].end() > 140:
+                continue
+            if gmail_temporal_event_head_is_artifact_object(
+                sentence,
+                event_head_start=nouns[-1].start(),
+            ):
                 continue
             return _TemporalSentence(
                 text=sentence,

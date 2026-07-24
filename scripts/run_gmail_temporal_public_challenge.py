@@ -17,6 +17,7 @@ import hashlib
 import hmac
 import importlib.util
 import json
+import math
 import os
 import re
 import secrets
@@ -30,6 +31,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from pkm_brain import gmail_temporal_review as production_review
 from pkm_brain.db import connection
 from pkm_brain.gmail_temporal_runner import (
     GMAIL_TEMPORAL_COMPONENT_VERSION,
@@ -57,12 +59,39 @@ CALL_START_VERSION = "gmail_temporal_public_challenge_call_start_v3"
 CALL_RECEIPT_VERSION = "gmail_temporal_public_challenge_call_receipt_v3"
 PREDICTION_SEAL_VERSION = "gmail_temporal_public_challenge_prediction_seal_v3"
 RESULT_VERSION = "gmail_temporal_public_challenge_result_v3"
-SCORE_VERSION = "gmail_temporal_public_challenge_score_v10"
+SCORE_VERSION = "gmail_temporal_public_challenge_score_v13"
 GOLD_VERSION = "public_blind_gmail_temporal_gold_v4"
 LEGACY_STRUCTURED_GOLD_VERSION = "public_blind_gmail_temporal_gold_v3"
 LEGACY_GOLD_VERSION = "public_blind_gmail_temporal_gold_v2"
 PUBLIC_ROOT_AUTHORITY_VERSION = "gmail_temporal_public_root_authority_v2"
 PUBLIC_ROOT_AUTHORITY_FILENAME = "public_temporal_challenge_authority.json"
+FRONTIER_DIAGNOSTICS_VERSION = "gmail_temporal_public_frontier_diagnostics_v1"
+FRONTIER_DIAGNOSTICS_FILENAME = "frontier-diagnostics.json"
+GOLD_AUDIT_SUMMARY_VERSION = "gmail_temporal_public_gold_audit_summary_v1"
+GOLD_AUDIT_PLAN_VERSION = "gmail_temporal_public_gold_audit_plan_v1"
+GOLD_AUDIT_RECEIPT_VERSION = "gmail_temporal_public_gold_audit_receipt_v1"
+GOLD_AUDIT_DETAIL_VERSION = "gmail_temporal_public_gold_audit_detail_v1"
+GOLD_AUDIT_REQUEST_VERSION = "gmail_temporal_public_gold_audit_request_v1"
+GOLD_AUDIT_RESPONSE_VERSION = "gmail_temporal_public_gold_audit_response_v1"
+GOLD_AUDIT_SCOPE = "public_synthetic_prediction_blind_gold_audit"
+GOLD_AUDIT_PROVIDER = "external-codex"
+GOLD_AUDIT_MODEL = "gpt-5.6-sol"
+GOLD_AUDIT_REASONING_EFFORT = "medium"
+GOLD_AUDIT_FIXTURE_VERSION = "gmail_temporal_public_challenge_fixture_v3"
+GOLD_AUDIT_FIXTURE_GENERATOR_VERSION = "gmail_temporal_public_scale_fixture_builder_v1"
+GOLD_AUDIT_FIXTURE_GENERATOR_SHA256 = (
+    "75e379814d68e95a4f951602083c816aa37f55b4fedfcf8820fa7c4eb7da5d11"
+)
+GOLD_AUDIT_APPROVED_FIXTURE_SHA256 = {
+    1: "e67075ea3be61de904b78305b452adcc90df9a9a45058fb9340df798fa1566ac",
+    2: "473bd0a0a691c72b112235d3e882bc7a80aacb0e9184cef18782735227eb1653",
+}
+GOLD_AUDIT_CONTRACT_SHA256 = (
+    "4ad5280ed193622403487789bee06ba9a6a21cc9ae30cfdd9825c1e1a1e27a0f"
+)
+GOLD_AUDIT_MAX_BATCH_CASES = 4
+GOLD_AUDIT_MAX_REQUEST_BYTES = 48_000
+GOLD_AUDIT_MAX_RESPONSE_BYTES = 32_768
 PUBLIC_TEST_PROVIDER = "injected-test-double"
 PUBLIC_NO_CALL_PROVIDER = "none"
 
@@ -78,8 +107,28 @@ CALL_START_DOMAIN = b"gmail_temporal_public_challenge_call_start_v3\0"
 CALL_RECEIPT_DOMAIN = b"gmail_temporal_public_challenge_call_receipt_v3\0"
 PREDICTION_SEAL_DOMAIN = b"gmail_temporal_public_challenge_prediction_seal_v3\0"
 RESULT_DOMAIN = b"gmail_temporal_public_challenge_result_v3\0"
-SCORE_DOMAIN = b"gmail_temporal_public_challenge_score_v10\0"
+SCORE_DOMAIN = b"gmail_temporal_public_challenge_score_v13\0"
 PUBLIC_ROOT_AUTHORITY_DOMAIN = b"gmail_temporal_public_root_authority_v2\0"
+FRONTIER_DIAGNOSTICS_DOMAIN = b"gmail_temporal_public_frontier_diagnostics_v1\0"
+GOLD_AUDIT_SUMMARY_DOMAIN = b"gmail_temporal_public_gold_audit_summary_v1\0"
+GOLD_AUDIT_PLAN_DOMAIN = b"gmail_temporal_public_gold_audit_plan_v1\0"
+GOLD_AUDIT_RECEIPT_DOMAIN = b"gmail_temporal_public_gold_audit_receipt_v1\0"
+GOLD_AUDIT_DETAIL_DOMAIN = b"gmail_temporal_public_gold_audit_detail_v1\0"
+MIN_PAIRWISE_STABILITY = 0.95
+MIN_FRONTIER_MEMBER_RECALL = 0.95
+MIN_EFFECTIVE_MEMBER_RECALL = 0.90
+MIN_CONFIRMED_MEMBER_RECALL = 0.90
+MIN_COMPLETE_UNIT_RECALL = 0.90
+MIN_EXACT_UNIT_RECALL = 0.90
+MIN_CRITICAL_LIFECYCLE_EFFECTIVE_RECALL = 0.95
+MIN_CRITICAL_TEMPORAL_EFFECTIVE_RECALL = 0.95
+MIN_CRITICAL_TEMPORAL_CATEGORY_RECALL = 0.95
+MIN_CANONICAL_TITLE_RECALL = 0.90
+MIN_CANONICAL_SUBJECT_RECALL = 0.90
+MIN_SUPPORTED_ARTIFACT_PRECISION = 0.95
+MIN_REVIEW_ARTIFACT_PRECISION = 0.90
+MIN_CRITICAL_VERDICT_STABILITY = 0.95
+MIN_CANDIDATE_BEARING_NEGATIVE_REJECTION = 0.80
 MAX_PREDICTION_LAUNCHER_ARTIFACT_BYTES = 4 * 1024 * 1024
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -122,6 +171,255 @@ _PUBLIC_ROOT_AUTHORITY_KEYS = {
     "cases",
     "authority_hmac_sha256",
 }
+_FRONTIER_DIAGNOSTICS_KEYS = {
+    "version",
+    "challenge_id",
+    "challenge_manifest_sha256",
+    "gold_sha256",
+    "fixture_sha256",
+    "aggregates",
+    "cases",
+    "public_synthetic",
+    "contains_private_gmail",
+    "release_eligible",
+    "frontier_diagnostics_hmac_sha256",
+}
+_FRONTIER_DIAGNOSTICS_AGGREGATE_KEYS = {
+    "cases",
+    "positive_cases",
+    "negative_cases",
+    "gold_members",
+    "frontier_covered_gold_members",
+    "frontier_missing_gold_members",
+    "positive_zero_work_cases",
+    "candidate_bearing_positive_cases",
+    "candidate_bearing_negative_cases",
+}
+_FRONTIER_DIAGNOSTICS_CASE_KEYS = {
+    "case_id",
+    "gold_members",
+    "frontier_covered_gold_members",
+    "frontier_missing_gold_members",
+    "positive",
+    "candidate_count",
+    "candidate_bearing",
+    "verifier_request_count",
+    "zero_work",
+    "positive_zero_work",
+}
+_GOLD_AUDIT_SUMMARY_KEYS = {
+    "version",
+    "status",
+    "created_at",
+    "scope",
+    "fixture_sha256",
+    "fixture_variant",
+    "fixture_generator_version",
+    "fixture_generator_sha256",
+    "fixture_generator_exact_bytes_verified",
+    "plan_sha256",
+    "detail_sha256",
+    "batch_count",
+    "provider",
+    "model",
+    "reasoning_effort",
+    "external_calls",
+    "restricted_execution",
+    "ephemeral_execution",
+    "local_model_used",
+    "test_invoker_used",
+    "public_synthetic",
+    "contains_private_gmail",
+    "pipeline_predictions_present",
+    "prediction_artifacts_read",
+    "private_content_printed",
+    "diagnostic_only",
+    "release_eligible",
+    "case_count",
+    "valid_case_count",
+    "correction_case_count",
+    "member_count",
+    "valid_member_count",
+    "correction_member_count",
+    "forbidden_binding_count",
+    "valid_forbidden_binding_count",
+    "correction_forbidden_binding_count",
+    "valid_group_flag_count",
+    "correction_group_flag_count",
+    "summary_hmac_sha256",
+}
+_GOLD_AUDIT_PLAN_KEYS = {
+    "version",
+    "created_at",
+    "scope",
+    "fixture_version",
+    "fixture_variant",
+    "fixture_sha256",
+    "fixture_generator_version",
+    "fixture_generator_sha256",
+    "fixture_generator_exact_bytes_verified",
+    "case_count",
+    "batch_count",
+    "request_sha256",
+    "provider",
+    "model",
+    "reasoning_effort",
+    "public_synthetic",
+    "contains_private_gmail",
+    "pipeline_predictions_present",
+    "prediction_artifacts_read",
+    "diagnostic_only",
+    "release_eligible",
+    "plan_hmac_sha256",
+}
+_GOLD_AUDIT_DETAIL_KEYS = {
+    "version",
+    "status",
+    "created_at",
+    "scope",
+    "fixture_sha256",
+    "fixture_variant",
+    "fixture_generator_version",
+    "fixture_generator_sha256",
+    "fixture_generator_exact_bytes_verified",
+    "plan_sha256",
+    "provider",
+    "model",
+    "reasoning_effort",
+    "public_synthetic",
+    "contains_private_gmail",
+    "pipeline_predictions_present",
+    "prediction_artifacts_read",
+    "diagnostic_only",
+    "release_eligible",
+    "calls",
+    "cases",
+    "aggregates",
+    "detail_hmac_sha256",
+}
+_GOLD_AUDIT_RECEIPT_KEYS = {
+    "version",
+    "unit_ordinal",
+    "started_at",
+    "completed_at",
+    "provider",
+    "model",
+    "reasoning_effort",
+    "request_sha256",
+    "response_sha256",
+    "case_count",
+    "public_synthetic",
+    "contains_private_gmail",
+    "pipeline_predictions_present",
+    "restricted_execution",
+    "ephemeral_execution",
+    "local_model_used",
+    "test_invoker_used",
+    "receipt_hmac_sha256",
+}
+_GOLD_AUDIT_DETAIL_CALL_KEYS = {
+    "unit_ordinal",
+    "request_sha256",
+    "response_sha256",
+    "receipt_sha256",
+    "case_count",
+}
+_GOLD_AUDIT_REQUEST_KEYS = {
+    "version",
+    "phase",
+    "contract",
+    "challenge_id",
+    "fixture_created_at",
+    "message_internal_at",
+    "account_email",
+    "public_synthetic",
+    "contains_private_gmail",
+    "pipeline_predictions_present",
+    "cases",
+}
+_GOLD_AUDIT_REQUEST_CASE_KEYS = {"case_id", "source", "proposed_gold"}
+_GOLD_AUDIT_REQUEST_SOURCE_KEYS = {"sender", "subject", "body", "label_ids"}
+_GOLD_AUDIT_REQUEST_GOLD_KEYS = {
+    "members",
+    "forbidden",
+    "complete_group_required",
+}
+_GOLD_AUDIT_RESPONSE_KEYS = {"version", "cases"}
+_GOLD_AUDIT_RESPONSE_CASE_KEYS = {
+    "case_id",
+    "disposition",
+    "issue_codes",
+    "rationale",
+    "members",
+    "forbidden_bindings",
+    "group_flag",
+}
+_GOLD_AUDIT_DISPOSITION_KEYS = {"disposition", "issue_codes", "rationale"}
+_GOLD_AUDIT_ISSUE_CODES = frozenset(
+    {
+        "none",
+        "unsupported_member",
+        "missing_member",
+        "wrong_subject",
+        "wrong_relation",
+        "wrong_lifecycle",
+        "wrong_value",
+        "wrong_verdict",
+        "wrong_canonical_requirement",
+        "wrong_forbidden_binding",
+        "wrong_group_requirement",
+        "irrelevant_temporal_content",
+        "other",
+    }
+)
+_GOLD_AUDIT_FIXTURE_KEYS = {
+    "version",
+    "challenge_id",
+    "created_at",
+    "message_internal_at",
+    "account_email",
+    "public_synthetic",
+    "contains_private_gmail",
+    "release_eligible",
+    "cases",
+}
+_GOLD_AUDIT_FIXTURE_CASE_KEYS = {
+    "case_id",
+    "sender",
+    "subject",
+    "body",
+    "label_ids",
+    "members",
+    "forbidden",
+    "complete_group_required",
+}
+_LIFECYCLE_ROLES = (
+    "none",
+    "unknown",
+    "scheduled",
+    "cancelled",
+    "completed",
+    "rescheduled_old",
+    "rescheduled_replacement",
+)
+_CRITICAL_LIFECYCLE_ROLES = (
+    "scheduled",
+    "cancelled",
+    "rescheduled_old",
+    "rescheduled_replacement",
+)
+_TEMPORAL_RELATIONS = (
+    "occurrence",
+    "deadline",
+    "unspecified",
+)
+_CRITICAL_TEMPORAL_CATEGORIES = (
+    "scheduled",
+    "cancelled",
+    "rescheduled_old",
+    "rescheduled_replacement",
+    "deadline",
+)
 _NORMALIZED_TEMPORAL_VALUE_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)?$"
 )
@@ -197,6 +495,14 @@ class _PredictionSourceProvenance:
     trust_basis: str
     exact_artifact_verified: bool
     scorer_sha256: str
+
+
+@dataclass(frozen=True)
+class _PublicCandidateAuthority:
+    candidate: Any
+    subject_alias_surfaces: frozenset[str]
+    canonical_subject_surface: str | None
+    parent_cluster_id: str
 
 
 def _load_script(name: str, path: Path) -> ModuleType:
@@ -2791,6 +3097,32 @@ def _supported_artifact_calibration(
     return "calibrated" if expected_verdict == "supported" else "overconfident"
 
 
+def _critical_temporal_categories_for_member(
+    member: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Return the release categories represented by a critical gold binding."""
+
+    categories: list[str] = []
+    lifecycle = member.get("lifecycle")
+    if lifecycle in _CRITICAL_LIFECYCLE_ROLES:
+        categories.append(str(lifecycle))
+    if member.get("relation") == "deadline":
+        categories.append("deadline")
+    return tuple(categories)
+
+
+def _artifact_has_critical_temporal_hypothesis(
+    artifact: Mapping[str, Any],
+) -> bool:
+    """Return whether an output asserts a deadline or critical event lifecycle."""
+
+    return any(
+        hypothesis.get("relation") == "deadline"
+        or hypothesis.get("lifecycle") in _CRITICAL_LIFECYCLE_ROLES
+        for hypothesis in _artifact_hypotheses(artifact)
+    )
+
+
 def _review_artifact_metrics(
     *,
     artifact_count: int,
@@ -2806,6 +3138,643 @@ def _review_artifact_metrics(
         else (1.0 if gold_member_count == 0 else 0.0)
     )
     return precision, cluster_review_count == 0
+
+
+def _wilson_interval(numerator: int, denominator: int) -> dict[str, Any]:
+    """Return the two-sided 95% Wilson interval for an observed proportion."""
+
+    if (
+        isinstance(numerator, bool)
+        or isinstance(denominator, bool)
+        or numerator < 0
+        or denominator < 0
+        or numerator > denominator
+    ):
+        raise PublicChallengeError("public challenge metric count is invalid")
+    if denominator == 0:
+        return {
+            "numerator": numerator,
+            "denominator": denominator,
+            "estimate": None,
+            "wilson_95_lower": None,
+            "wilson_95_upper": None,
+            "interval_defined": False,
+        }
+    z = 1.959963984540054
+    estimate = numerator / denominator
+    z_squared = z * z
+    scale = 1.0 + z_squared / denominator
+    center = (estimate + z_squared / (2.0 * denominator)) / scale
+    radius = (
+        z
+        * math.sqrt(
+            estimate * (1.0 - estimate) / denominator
+            + z_squared / (4.0 * denominator * denominator)
+        )
+        / scale
+    )
+    return {
+        "numerator": numerator,
+        "denominator": denominator,
+        "estimate": estimate,
+        "wilson_95_lower": max(0.0, center - radius),
+        "wilson_95_upper": min(1.0, center + radius),
+        "interval_defined": True,
+    }
+
+
+def _semantic_unit_key(member: Mapping[str, Any], member_ordinal: int) -> str:
+    """Return the case-local semantic unit identity for one gold member."""
+
+    if member.get("lifecycle") in {
+        "rescheduled_old",
+        "rescheduled_replacement",
+    }:
+        subject = _normalized_subject(member.get("subject"))
+        if subject is None:
+            raise PublicChallengeError("semantic unit subject is invalid")
+        return f"reschedule:{subject}"
+    if "values" in member:
+        return f"alternatives:{member_ordinal}"
+    return f"member:{member_ordinal}"
+
+
+def _semantic_unit_metrics(
+    members: Sequence[Mapping[str, Any]],
+    outcomes: Sequence[Mapping[str, Any]],
+) -> dict[str, int]:
+    """Score complete and exact case-local units from already matched members.
+
+    A reschedule pair is one unit. One explicit alternatives member is one unit,
+    because its matcher already requires every alternative in one complete
+    production group. Every other member is a singleton. Exactness is stricter
+    than completeness only where the frozen gold requires a canonical subject.
+    """
+
+    if len(members) != len(outcomes):
+        raise PublicChallengeError("semantic unit outcome coverage is invalid")
+    units: defaultdict[str, list[tuple[Mapping[str, Any], Mapping[str, Any]]]] = (
+        defaultdict(list)
+    )
+    for ordinal, (member, outcome) in enumerate(zip(members, outcomes, strict=True)):
+        if (
+            not isinstance(member, Mapping)
+            or not isinstance(outcome, Mapping)
+            or set(outcome) != {"matched", "exact", "structural_group_id"}
+            or not isinstance(outcome.get("matched"), bool)
+            or not isinstance(outcome.get("exact"), bool)
+            or outcome.get("structural_group_id") is not None
+            and not isinstance(outcome.get("structural_group_id"), str)
+        ):
+            raise PublicChallengeError("semantic unit outcome is invalid")
+        units[_semantic_unit_key(member, ordinal)].append((member, outcome))
+
+    complete_units = 0
+    exact_units = 0
+    for rows in units.values():
+        requires_group = any(
+            "values" in member
+            or member.get("lifecycle") in {"rescheduled_old", "rescheduled_replacement"}
+            for member, _ in rows
+        )
+        group_ids = {
+            str(outcome["structural_group_id"])
+            for _, outcome in rows
+            if outcome.get("structural_group_id") is not None
+        }
+        coherent_group = not requires_group or (
+            len(group_ids) == 1
+            and all(
+                outcome.get("structural_group_id") is not None for _, outcome in rows
+            )
+        )
+        complete = coherent_group and all(
+            bool(outcome["matched"]) for _, outcome in rows
+        )
+        exact = complete and all(bool(outcome["exact"]) for _, outcome in rows)
+        complete_units += int(complete)
+        exact_units += int(exact)
+    return {
+        "semantic_units": len(units),
+        "complete_units": complete_units,
+        "exact_units": exact_units,
+    }
+
+
+def _reschedule_unit_metrics(
+    members: Sequence[Mapping[str, Any]],
+    outcomes: Sequence[Mapping[str, Any]],
+) -> dict[str, int]:
+    """Score old/replacement pairs as coherent lifecycle units."""
+
+    if len(members) != len(outcomes):
+        raise PublicChallengeError("reschedule unit outcome coverage is invalid")
+    units: defaultdict[str, list[tuple[Mapping[str, Any], Mapping[str, Any]]]] = (
+        defaultdict(list)
+    )
+    for member, outcome in zip(members, outcomes, strict=True):
+        if member.get("lifecycle") not in {
+            "rescheduled_old",
+            "rescheduled_replacement",
+        }:
+            continue
+        subject = _normalized_subject(member.get("subject"))
+        if subject is None:
+            raise PublicChallengeError("reschedule unit subject is invalid")
+        units[subject].append((member, outcome))
+
+    complete_units = 0
+    for rows in units.values():
+        roles = {str(member.get("lifecycle")) for member, _ in rows}
+        group_ids = {
+            str(outcome["structural_group_id"])
+            for _, outcome in rows
+            if outcome.get("structural_group_id") is not None
+        }
+        complete_units += int(
+            roles == {"rescheduled_old", "rescheduled_replacement"}
+            and len(group_ids) == 1
+            and all(
+                outcome.get("matched") is True
+                and outcome.get("structural_group_id") is not None
+                for _, outcome in rows
+            )
+        )
+    return {
+        "reschedule_units": len(units),
+        "complete_reschedule_units": complete_units,
+    }
+
+
+def _pairwise_jaccard(
+    values: tuple[set[Any], set[Any], set[Any]],
+) -> tuple[list[dict[str, Any]], float]:
+    rows: list[dict[str, Any]] = []
+    for first, second in ((0, 1), (0, 2), (1, 2)):
+        intersection = values[first] & values[second]
+        union = values[first] | values[second]
+        jaccard = len(intersection) / len(union) if union else 1.0
+        rows.append(
+            {
+                "first_run": first + 1,
+                "second_run": second + 1,
+                "first_count": len(values[first]),
+                "second_count": len(values[second]),
+                "intersection_count": len(intersection),
+                "union_count": len(union),
+                "jaccard": jaccard,
+            }
+        )
+    return rows, min(float(row["jaccard"]) for row in rows)
+
+
+def _raw_candidate_verdicts_by_run(
+    calls: Sequence[_CompletedCall],
+) -> tuple[
+    dict[tuple[str, str], str],
+    dict[tuple[str, str], str],
+    dict[tuple[str, str], str],
+]:
+    output: dict[int, dict[tuple[str, str], str]] = {
+        ordinal: {} for ordinal in range(1, RUN_COUNT + 1)
+    }
+    for call in calls:
+        if call.run_ordinal not in output:
+            raise PublicChallengeError("public stability run identity is invalid")
+        verdicts = output[call.run_ordinal]
+        for case_id, pages in call.case_pages.items():
+            for page in pages:
+                for row in page.get("verdicts", []):
+                    if not isinstance(row, Mapping):
+                        raise PublicChallengeError(
+                            "public stability verdict is invalid"
+                        )
+                    candidate_id = row.get("candidate_id")
+                    verdict = row.get("verdict")
+                    key = (case_id, str(candidate_id or ""))
+                    if (
+                        not isinstance(candidate_id, str)
+                        or not candidate_id
+                        or verdict not in {"supported", "uncertain", "unsupported"}
+                        or key in verdicts
+                    ):
+                        raise PublicChallengeError(
+                            "public stability verdict authority is invalid"
+                        )
+                    verdicts[key] = str(verdict)
+    key_sets = [set(output[ordinal]) for ordinal in range(1, RUN_COUNT + 1)]
+    if any(values != key_sets[0] for values in key_sets[1:]):
+        raise PublicChallengeError("public stability candidate coverage differs")
+    return tuple(output[ordinal] for ordinal in range(1, RUN_COUNT + 1))  # type: ignore[return-value]
+
+
+def _public_candidate_authority(
+    authorities: Mapping[str, Any],
+) -> dict[tuple[str, str], _PublicCandidateAuthority]:
+    output: dict[tuple[str, str], _PublicCandidateAuthority] = {}
+    for case_id, authority in authorities.items():
+        subject_surfaces = _authority_subject_surfaces(authority)
+        candidates = tuple(
+            candidate
+            for batch in authority.batches
+            for candidate in batch.frontier_candidates
+        )
+        try:
+            family_ids = production_review._subject_alias_families(  # noqa: SLF001
+                analysis=authority.analysis,
+                batches=authority.batch_plan.batches,
+                candidates=candidates,
+            )
+        except production_review.GmailTemporalReviewError as exc:
+            raise PublicChallengeError(
+                "public stability alias authority is invalid"
+            ) from exc
+        family_surfaces: defaultdict[str, set[str]] = defaultdict(set)
+        for mention_id, family_id in family_ids.items():
+            surface = subject_surfaces.get(mention_id)
+            if isinstance(surface, str) and surface:
+                family_surfaces[family_id].add(surface)
+        family_members = production_review._subject_alias_family_members(  # noqa: SLF001
+            family_ids
+        )
+        subject_types = {
+            mention.mention_id: mention.mention_type
+            for mention in authority.analysis.mentions
+        }
+
+        cluster_by_candidate: dict[str, str] = {}
+        for batch in authority.batches:
+            for page in batch.page_plan.pages:
+                for cluster in page.clusters:
+                    for candidate_id in cluster.candidate_ids:
+                        previous = cluster_by_candidate.setdefault(
+                            candidate_id,
+                            cluster.cluster_id,
+                        )
+                        if previous != cluster.cluster_id:
+                            raise PublicChallengeError(
+                                "public stability parent cluster is ambiguous"
+                            )
+        for candidate in candidates:
+            candidate_id = candidate.candidate_id
+            cluster_id = cluster_by_candidate.get(candidate_id)
+            surface = subject_surfaces.get(candidate.subject_mention_id)
+            if not isinstance(cluster_id, str) or not cluster_id or not surface:
+                raise PublicChallengeError(
+                    "public stability candidate authority is incomplete"
+                )
+            aliases = {surface}
+            family_id = family_ids.get(candidate.subject_mention_id)
+            if family_id is not None:
+                aliases.update(family_surfaces.get(family_id, ()))
+            try:
+                _, _, canonical_id = production_review._subject_identity_metadata(  # noqa: SLF001
+                    subject_mention_ids=(candidate.subject_mention_id,),
+                    subject_types_by_id=subject_types,
+                    subject_families=family_ids,
+                    subject_family_members=family_members,
+                )
+            except production_review.GmailTemporalReviewError as exc:
+                raise PublicChallengeError(
+                    "public stability canonical authority is invalid"
+                ) from exc
+            canonical_surface = (
+                subject_surfaces.get(canonical_id)
+                if isinstance(canonical_id, str)
+                else None
+            )
+            key = (case_id, candidate_id)
+            if key in output:
+                raise PublicChallengeError(
+                    "public stability candidate authority is duplicated"
+                )
+            output[key] = _PublicCandidateAuthority(
+                candidate=candidate,
+                subject_alias_surfaces=frozenset(aliases),
+                canonical_subject_surface=canonical_surface,
+                parent_cluster_id=cluster_id,
+            )
+    return output
+
+
+def _candidate_matches_gold_member_value(
+    authority: _PublicCandidateAuthority,
+    member: Mapping[str, Any],
+    expected_value: str,
+) -> bool:
+    candidate = authority.candidate
+    expected_subject = _normalized_subject(member.get("subject"))
+    return bool(
+        expected_subject is not None
+        and candidate.relation == member.get("relation")
+        and candidate.lifecycle == member.get("lifecycle")
+        and candidate.normalized_value == expected_value
+        and any(
+            _normalized_subject(surface) == expected_subject
+            for surface in authority.subject_alias_surfaces
+        )
+        and (
+            member.get("canonical_subject_required") is not True
+            or _normalized_subject(authority.canonical_subject_surface)
+            == expected_subject
+        )
+    )
+
+
+def _recompute_frontier_gold_coverage(
+    *,
+    authorities: Mapping[str, Any],
+    gold_rows: Mapping[str, Mapping[str, Any]],
+    selected_ids: Sequence[str],
+) -> dict[str, Any]:
+    """Recompute member coverage from current production candidates and gold."""
+
+    candidate_authority = _public_candidate_authority(authorities)
+    by_case: defaultdict[str, list[_PublicCandidateAuthority]] = defaultdict(list)
+    for (case_id, _candidate_id), authority in candidate_authority.items():
+        by_case[case_id].append(authority)
+
+    cases: list[dict[str, Any]] = []
+    for case_id in selected_ids:
+        members = gold_rows[case_id].get("members")
+        if not isinstance(members, list):
+            raise PublicChallengeError("public frontier gold is invalid")
+        covered = 0
+        for member in members:
+            if not isinstance(member, Mapping):
+                raise PublicChallengeError("public frontier gold member is invalid")
+            raw_values = member.get("values")
+            values = (
+                [str(value) for value in raw_values]
+                if isinstance(raw_values, list)
+                else [str(member.get("value"))]
+            )
+            if values and all(
+                any(
+                    _candidate_matches_gold_member_value(
+                        authority,
+                        member,
+                        expected_value,
+                    )
+                    for authority in by_case.get(case_id, ())
+                )
+                for expected_value in values
+            ):
+                covered += 1
+        cases.append(
+            {
+                "case_id": case_id,
+                "gold_members": len(members),
+                "frontier_covered_gold_members": covered,
+                "frontier_missing_gold_members": len(members) - covered,
+            }
+        )
+    return {
+        "gold_members": sum(row["gold_members"] for row in cases),
+        "frontier_covered_gold_members": sum(
+            row["frontier_covered_gold_members"] for row in cases
+        ),
+        "frontier_missing_gold_members": sum(
+            row["frontier_missing_gold_members"] for row in cases
+        ),
+        "cases": cases,
+    }
+
+
+def _pairwise_verdict_agreement(
+    verdicts_by_run: tuple[
+        Mapping[Any, str],
+        Mapping[Any, str],
+        Mapping[Any, str],
+    ],
+    candidate_keys: Sequence[Any],
+) -> tuple[list[dict[str, Any]], float]:
+    """Compare exact supported/uncertain/unsupported calibration across runs."""
+
+    rows: list[dict[str, Any]] = []
+    for first, second in ((0, 1), (0, 2), (1, 2)):
+        agreements = sum(
+            verdicts_by_run[first][key] == verdicts_by_run[second][key]
+            for key in candidate_keys
+        )
+        rows.append(
+            {
+                "first_run": first + 1,
+                "second_run": second + 1,
+                "candidate_count": len(candidate_keys),
+                "agreement_count": agreements,
+                "agreement": (
+                    agreements / len(candidate_keys) if candidate_keys else 1.0
+                ),
+            }
+        )
+    return rows, min(float(row["agreement"]) for row in rows)
+
+
+def _gold_member_verdict_status(
+    *,
+    verdicts: Mapping[tuple[str, str], str],
+    case_candidates: Mapping[tuple[str, str], _PublicCandidateAuthority],
+    member: Mapping[str, Any],
+) -> str:
+    """Collapse exact candidate verdicts to one confidence class per gold member."""
+
+    raw_values = member.get("values")
+    values = (
+        [str(value) for value in raw_values]
+        if isinstance(raw_values, list)
+        else [str(member.get("value"))]
+    )
+    value_statuses: list[str] = []
+    for expected_value in values:
+        statuses = {
+            verdicts[key]
+            for key, authority in case_candidates.items()
+            if _candidate_matches_gold_member_value(
+                authority,
+                member,
+                expected_value,
+            )
+        }
+        if "supported" in statuses:
+            value_statuses.append("supported")
+        elif "uncertain" in statuses:
+            value_statuses.append("uncertain")
+        else:
+            value_statuses.append("unsupported")
+    if value_statuses and all(value == "supported" for value in value_statuses):
+        return "supported"
+    if value_statuses and all(value != "unsupported" for value in value_statuses):
+        return "uncertain"
+    return "unsupported"
+
+
+def _three_run_stability(
+    *,
+    calls: Sequence[_CompletedCall],
+    authorities: Mapping[str, Any],
+    gold_rows: Mapping[str, Mapping[str, Any]],
+    selected_ids: Sequence[str],
+) -> dict[str, Any]:
+    """Derive alias-collapsed stability only from authenticated call evidence."""
+
+    verdicts_by_run = _raw_candidate_verdicts_by_run(calls)
+    candidate_authority = _public_candidate_authority(authorities)
+    expected_candidate_keys = set(candidate_authority)
+    if any(set(verdicts) != expected_candidate_keys for verdicts in verdicts_by_run):
+        raise PublicChallengeError("public stability candidate authority is stale")
+
+    accepted_parent_clusters = tuple(
+        {
+            (key[0], candidate_authority[key].parent_cluster_id)
+            for key, verdict in verdicts.items()
+            if verdict != "unsupported"
+        }
+        for verdicts in verdicts_by_run
+    )
+    parent_pairs, parent_minimum = _pairwise_jaccard(accepted_parent_clusters)  # type: ignore[arg-type]
+
+    accepted_gold_members: list[set[tuple[str, int]]] = []
+    critical_gold_member_verdicts: list[dict[tuple[str, int], str]] = []
+    critical_gold_member_categories: dict[tuple[str, int], tuple[str, ...]] = {}
+    for verdicts in verdicts_by_run:
+        accepted: set[tuple[str, int]] = set()
+        critical_verdicts: dict[tuple[str, int], str] = {}
+        for case_id in selected_ids:
+            members = gold_rows[case_id].get("members")
+            if not isinstance(members, list):
+                raise PublicChallengeError("public stability gold is invalid")
+            case_candidates = {
+                key: value
+                for key, value in candidate_authority.items()
+                if key[0] == case_id
+            }
+            for member_ordinal, member in enumerate(members):
+                if not isinstance(member, Mapping):
+                    raise PublicChallengeError("public stability gold is invalid")
+                member_key = (case_id, member_ordinal)
+                member_status = _gold_member_verdict_status(
+                    verdicts=verdicts,
+                    case_candidates=case_candidates,
+                    member=member,
+                )
+                if member_status != "unsupported":
+                    accepted.add(member_key)
+                categories = _critical_temporal_categories_for_member(member)
+                if categories:
+                    previous = critical_gold_member_categories.setdefault(
+                        member_key,
+                        categories,
+                    )
+                    if previous != categories:
+                        raise PublicChallengeError(
+                            "public critical stability category is inconsistent"
+                        )
+                    critical_verdicts[member_key] = member_status
+        accepted_gold_members.append(accepted)
+        critical_gold_member_verdicts.append(critical_verdicts)
+    member_pairs, member_minimum = _pairwise_jaccard(
+        tuple(accepted_gold_members)  # type: ignore[arg-type]
+    )
+
+    candidate_keys = sorted(expected_candidate_keys)
+    exact_candidate_pairs, exact_candidate_minimum = _pairwise_verdict_agreement(
+        verdicts_by_run,
+        candidate_keys,
+    )
+    critical_candidate_keys = [
+        key
+        for key in candidate_keys
+        if candidate_authority[key].candidate.relation == "deadline"
+        or candidate_authority[key].candidate.lifecycle in _CRITICAL_LIFECYCLE_ROLES
+    ]
+    critical_candidate_pairs, critical_candidate_minimum = _pairwise_verdict_agreement(
+        verdicts_by_run, critical_candidate_keys
+    )
+    critical_gold_member_keys = sorted(critical_gold_member_categories)
+    if any(
+        set(verdicts) != set(critical_gold_member_keys)
+        for verdicts in critical_gold_member_verdicts
+    ):
+        raise PublicChallengeError("public critical gold stability is incomplete")
+    critical_gold_member_pairs, critical_gold_member_minimum = (
+        _pairwise_verdict_agreement(
+            tuple(critical_gold_member_verdicts),  # type: ignore[arg-type]
+            critical_gold_member_keys,
+        )
+    )
+    critical_gold_category_stability: dict[str, dict[str, Any]] = {}
+    for category in _CRITICAL_TEMPORAL_CATEGORIES:
+        category_keys = [
+            key
+            for key in critical_gold_member_keys
+            if category in critical_gold_member_categories[key]
+        ]
+        category_pairs, category_minimum = _pairwise_verdict_agreement(
+            tuple(critical_gold_member_verdicts),  # type: ignore[arg-type]
+            category_keys,
+        )
+        critical_gold_category_stability[category] = {
+            "member_count": len(category_keys),
+            "pairwise": category_pairs,
+            "minimum_pairwise_agreement": category_minimum,
+            "gate_passed": (
+                bool(category_keys)
+                and category_minimum >= MIN_CRITICAL_VERDICT_STABILITY
+            ),
+        }
+    nonvacuous_critical_category_gates = [
+        row["gate_passed"]
+        for row in critical_gold_category_stability.values()
+        if row["member_count"] > 0
+    ]
+
+    return {
+        "basis": (
+            "authenticated_case_atomic_raw_verdicts_with_source_verified_alias_collapse"
+        ),
+        "run_count": RUN_COUNT,
+        "minimum_required_pairwise_jaccard": MIN_PAIRWISE_STABILITY,
+        "accepted_parent_clusters": {
+            "pairwise": parent_pairs,
+            "minimum_pairwise_jaccard": parent_minimum,
+            "gate_passed": parent_minimum >= MIN_PAIRWISE_STABILITY,
+        },
+        "accepted_gold_members": {
+            "pairwise": member_pairs,
+            "minimum_pairwise_jaccard": member_minimum,
+            "gate_passed": member_minimum >= MIN_PAIRWISE_STABILITY,
+        },
+        "exact_candidate_verdict_agreement_diagnostic_only": {
+            "pairwise": exact_candidate_pairs,
+            "minimum_pairwise_agreement": exact_candidate_minimum,
+        },
+        "critical_candidate_verdict_agreement": {
+            "critical_basis": (
+                "deadline_relation_or_scheduled_cancelled_reschedule_lifecycle"
+            ),
+            "candidate_count": len(critical_candidate_keys),
+            "minimum_required_pairwise_agreement": MIN_CRITICAL_VERDICT_STABILITY,
+            "pairwise": critical_candidate_pairs,
+            "minimum_pairwise_agreement": critical_candidate_minimum,
+            "gate_passed": (
+                bool(critical_candidate_keys)
+                and critical_candidate_minimum >= MIN_CRITICAL_VERDICT_STABILITY
+            ),
+        },
+        "critical_gold_member_verdict_agreement": {
+            "critical_basis": (
+                "gold_deadline_relation_or_scheduled_cancelled_reschedule_lifecycle"
+            ),
+            "member_count": len(critical_gold_member_keys),
+            "minimum_required_pairwise_agreement": MIN_CRITICAL_VERDICT_STABILITY,
+            "pairwise": critical_gold_member_pairs,
+            "minimum_pairwise_agreement": critical_gold_member_minimum,
+            "categories": critical_gold_category_stability,
+            "gate_passed": bool(nonvacuous_critical_category_gates)
+            and all(nonvacuous_critical_category_gates),
+        },
+    }
 
 
 def _artifacts_recover_canonical_subject(
@@ -3266,6 +4235,660 @@ def _validate_gold(gold: Mapping[str, Any]) -> None:
         raise PublicChallengeError("public semantic gold denominators are vacuous")
 
 
+def _frontier_diagnostic_count(value: Any) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise PublicChallengeError("frontier diagnostics count is invalid")
+    return value
+
+
+def _load_frontier_diagnostics(
+    path: Path,
+    *,
+    key: bytes,
+    challenge: Mapping[str, Any],
+    challenge_raw: bytes,
+    gold_rows: Mapping[str, Mapping[str, Any]],
+    gold_raw: bytes,
+    cases: Sequence[_Case],
+) -> tuple[dict[str, Any], bytes]:
+    """Authenticate content-free freeze diagnostics and bind their denominators."""
+
+    value, raw = _load_signed_artifact(
+        path,
+        key=key,
+        domain=FRONTIER_DIAGNOSTICS_DOMAIN,
+        signature_field="frontier_diagnostics_hmac_sha256",
+        label="public frontier diagnostics",
+    )
+    aggregates = value.get("aggregates")
+    raw_cases = value.get("cases")
+    if (
+        set(value) != _FRONTIER_DIAGNOSTICS_KEYS
+        or value.get("version") != FRONTIER_DIAGNOSTICS_VERSION
+        or value.get("challenge_id") != challenge["challenge_id"]
+        or value.get("challenge_manifest_sha256") != _sha256(challenge_raw)
+        or value.get("gold_sha256") != _sha256(gold_raw)
+        or value.get("gold_sha256") != challenge["gold_sha256"]
+        or _SHA256_RE.fullmatch(str(value.get("fixture_sha256") or "")) is None
+        or value.get("public_synthetic") is not True
+        or value.get("contains_private_gmail") is not False
+        or value.get("release_eligible") is not False
+        or not isinstance(aggregates, Mapping)
+        or set(aggregates) != _FRONTIER_DIAGNOSTICS_AGGREGATE_KEYS
+        or not isinstance(raw_cases, list)
+        or len(raw_cases) != len(cases)
+    ):
+        raise PublicChallengeError("public frontier diagnostics authority is invalid")
+    for aggregate_value in aggregates.values():
+        _frontier_diagnostic_count(aggregate_value)
+
+    normalized_cases: list[dict[str, Any]] = []
+    for case, row in zip(cases, raw_cases, strict=True):
+        if not isinstance(row, Mapping) or set(row) != _FRONTIER_DIAGNOSTICS_CASE_KEYS:
+            raise PublicChallengeError("public frontier diagnostics case is invalid")
+        gold_row = gold_rows.get(case.case_id)
+        members = gold_row.get("members") if isinstance(gold_row, Mapping) else None
+        if not isinstance(members, list):
+            raise PublicChallengeError("public frontier diagnostics gold is invalid")
+        gold_member_count = _frontier_diagnostic_count(row.get("gold_members"))
+        covered = _frontier_diagnostic_count(row.get("frontier_covered_gold_members"))
+        missing = _frontier_diagnostic_count(row.get("frontier_missing_gold_members"))
+        candidate_count = _frontier_diagnostic_count(row.get("candidate_count"))
+        request_count = _frontier_diagnostic_count(row.get("verifier_request_count"))
+        positive = bool(members)
+        candidate_bearing = case.preparation.candidate_count > 0
+        zero_work = not case.preparation.requests
+        if (
+            row.get("case_id") != case.case_id
+            or gold_member_count != len(members)
+            or covered + missing != gold_member_count
+            or row.get("positive") is not positive
+            or candidate_count != case.preparation.candidate_count
+            or row.get("candidate_bearing") is not candidate_bearing
+            or request_count != len(case.preparation.requests)
+            or row.get("zero_work") is not zero_work
+            or row.get("positive_zero_work") is not (positive and zero_work)
+        ):
+            raise PublicChallengeError("public frontier diagnostics case is stale")
+        normalized_cases.append(dict(row))
+
+    expected_aggregates = {
+        "cases": len(normalized_cases),
+        "positive_cases": sum(bool(row["positive"]) for row in normalized_cases),
+        "negative_cases": sum(not row["positive"] for row in normalized_cases),
+        "gold_members": sum(row["gold_members"] for row in normalized_cases),
+        "frontier_covered_gold_members": sum(
+            row["frontier_covered_gold_members"] for row in normalized_cases
+        ),
+        "frontier_missing_gold_members": sum(
+            row["frontier_missing_gold_members"] for row in normalized_cases
+        ),
+        "positive_zero_work_cases": sum(
+            bool(row["positive_zero_work"]) for row in normalized_cases
+        ),
+        "candidate_bearing_positive_cases": sum(
+            bool(row["positive"] and row["candidate_bearing"])
+            for row in normalized_cases
+        ),
+        "candidate_bearing_negative_cases": sum(
+            bool(not row["positive"] and row["candidate_bearing"])
+            for row in normalized_cases
+        ),
+    }
+    if dict(aggregates) != expected_aggregates:
+        raise PublicChallengeError("public frontier diagnostics aggregate is stale")
+    return (
+        {
+            "version": FRONTIER_DIAGNOSTICS_VERSION,
+            "sha256": _sha256(raw),
+            "fixture_sha256": value["fixture_sha256"],
+            "aggregates": expected_aggregates,
+            "cases": normalized_cases,
+        },
+        raw,
+    )
+
+
+def _gold_audit_disposition(value: Any, *, label: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != _GOLD_AUDIT_DISPOSITION_KEYS:
+        raise PublicChallengeError(f"public gold audit {label} is invalid")
+    disposition = value.get("disposition")
+    issue_codes = value.get("issue_codes")
+    rationale = value.get("rationale")
+    if (
+        disposition not in {"valid", "correction_needed"}
+        or not isinstance(issue_codes, list)
+        or not issue_codes
+        or len(issue_codes) != len(set(issue_codes))
+        or any(code not in _GOLD_AUDIT_ISSUE_CODES for code in issue_codes)
+        or not isinstance(rationale, str)
+        or not rationale.strip()
+        or len(rationale) > 1_000
+        or "\x00" in rationale
+        or disposition == "valid"
+        and issue_codes != ["none"]
+        or disposition == "correction_needed"
+        and "none" in issue_codes
+    ):
+        raise PublicChallengeError(f"public gold audit {label} is invalid")
+    return {
+        "disposition": disposition,
+        "issue_codes": list(issue_codes),
+        "rationale": rationale,
+    }
+
+
+def _gold_audit_ordinal_dispositions(
+    values: Any,
+    *,
+    expected_count: int,
+    ordinal_name: str,
+    label: str,
+) -> list[dict[str, Any]]:
+    if not isinstance(values, list) or len(values) != expected_count:
+        raise PublicChallengeError(f"public gold audit {label} coverage is invalid")
+    output: list[dict[str, Any]] = []
+    for expected_ordinal, item in enumerate(values):
+        if (
+            not isinstance(item, Mapping)
+            or set(item) != {ordinal_name, "disposition", "issue_codes", "rationale"}
+            or type(item.get(ordinal_name)) is not int
+            or item[ordinal_name] != expected_ordinal
+        ):
+            raise PublicChallengeError(f"public gold audit {label} coverage is invalid")
+        disposition = _gold_audit_disposition(
+            {key: value for key, value in item.items() if key != ordinal_name},
+            label=label,
+        )
+        output.append({ordinal_name: expected_ordinal, **disposition})
+    return output
+
+
+def _gold_audit_response(
+    value: Mapping[str, Any],
+    *,
+    request: Mapping[str, Any],
+) -> dict[str, Any]:
+    cases = value.get("cases")
+    request_cases = request.get("cases")
+    if (
+        set(value) != _GOLD_AUDIT_RESPONSE_KEYS
+        or value.get("version") != GOLD_AUDIT_RESPONSE_VERSION
+        or not isinstance(cases, list)
+        or not isinstance(request_cases, list)
+        or len(cases) != len(request_cases)
+    ):
+        raise PublicChallengeError("public gold audit response is invalid")
+    output: list[dict[str, Any]] = []
+    for item, source in zip(cases, request_cases, strict=True):
+        if (
+            not isinstance(item, Mapping)
+            or not isinstance(source, Mapping)
+            or set(item) != _GOLD_AUDIT_RESPONSE_CASE_KEYS
+            or item.get("case_id") != source.get("case_id")
+        ):
+            raise PublicChallengeError("public gold audit response coverage is invalid")
+        proposed_gold = source.get("proposed_gold")
+        if not isinstance(proposed_gold, Mapping):
+            raise PublicChallengeError("public gold audit request is invalid")
+        case = _gold_audit_disposition(
+            {key: item[key] for key in _GOLD_AUDIT_DISPOSITION_KEYS},
+            label="case response",
+        )
+        members = _gold_audit_ordinal_dispositions(
+            item.get("members"),
+            expected_count=len(proposed_gold.get("members", [])),
+            ordinal_name="member_ordinal",
+            label="member response",
+        )
+        forbidden = _gold_audit_ordinal_dispositions(
+            item.get("forbidden_bindings"),
+            expected_count=len(proposed_gold.get("forbidden", [])),
+            ordinal_name="forbidden_ordinal",
+            label="forbidden response",
+        )
+        group_flag = _gold_audit_disposition(
+            item.get("group_flag"),
+            label="group response",
+        )
+        if case["disposition"] == "valid" and any(
+            row["disposition"] == "correction_needed"
+            for row in [*members, *forbidden, group_flag]
+        ):
+            raise PublicChallengeError("public gold audit case disposition conflicts")
+        output.append(
+            {
+                "case_id": str(item["case_id"]),
+                **case,
+                "members": members,
+                "forbidden_bindings": forbidden,
+                "group_flag": group_flag,
+            }
+        )
+    return {"version": GOLD_AUDIT_RESPONSE_VERSION, "cases": output}
+
+
+def _gold_audit_aggregates(cases: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    members = [member for case in cases for member in case["members"]]
+    forbidden = [item for case in cases for item in case["forbidden_bindings"]]
+    groups = [case["group_flag"] for case in cases]
+    return {
+        "case_count": len(cases),
+        "valid_case_count": sum(case["disposition"] == "valid" for case in cases),
+        "correction_case_count": sum(
+            case["disposition"] == "correction_needed" for case in cases
+        ),
+        "member_count": len(members),
+        "valid_member_count": sum(
+            member["disposition"] == "valid" for member in members
+        ),
+        "correction_member_count": sum(
+            member["disposition"] == "correction_needed" for member in members
+        ),
+        "forbidden_binding_count": len(forbidden),
+        "valid_forbidden_binding_count": sum(
+            item["disposition"] == "valid" for item in forbidden
+        ),
+        "correction_forbidden_binding_count": sum(
+            item["disposition"] == "correction_needed" for item in forbidden
+        ),
+        "valid_group_flag_count": sum(
+            item["disposition"] == "valid" for item in groups
+        ),
+        "correction_group_flag_count": sum(
+            item["disposition"] == "correction_needed" for item in groups
+        ),
+    }
+
+
+def _gold_audit_expected_request_case(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "case_id": str(row["case_id"]),
+        "source": {
+            "sender": str(row["sender"]),
+            "subject": str(row["subject"]),
+            "body": str(row["body"]),
+            "label_ids": list(row["label_ids"]),
+        },
+        "proposed_gold": {
+            "members": [dict(member) for member in row["members"]],
+            "forbidden": [dict(binding) for binding in row["forbidden"]],
+            "complete_group_required": bool(row["complete_group_required"]),
+        },
+    }
+
+
+def _gold_audit_fixture_gold(fixture: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "version": GOLD_VERSION,
+        "created_before_predictions": True,
+        "cases": [
+            {
+                "case_id": str(row["case_id"]),
+                "members": [dict(member) for member in row["members"]],
+                "forbidden": [dict(binding) for binding in row["forbidden"]],
+                "complete_group_required": bool(row["complete_group_required"]),
+            }
+            for row in fixture["cases"]
+        ],
+    }
+
+
+def _gold_audit_directory_names(path: Path) -> set[str]:
+    try:
+        return {item.name for item in path.iterdir()}
+    except OSError as exc:
+        raise PublicChallengeError("public gold audit evidence is unavailable") from exc
+
+
+def _load_gold_audit_evidence(
+    root: Path,
+    *,
+    key: bytes,
+    frontier_diagnostics: Mapping[str, Any],
+    challenge: Mapping[str, Any],
+    gold: Mapping[str, Any],
+    prediction_plan_created_at: datetime,
+) -> tuple[dict[str, Any], bytes]:
+    """Validate every artifact in one zero-correction restricted Sol audit."""
+
+    _private_directory(root)
+    if _gold_audit_directory_names(root) != {
+        "fixture.json",
+        "audit-plan.json",
+        "audit-detail.json",
+        "audit-summary.json",
+        "calls",
+    }:
+        raise PublicChallengeError("public gold audit root coverage is invalid")
+    fixture_raw = _private_file(root / "fixture.json")
+    fixture = _strict_json(fixture_raw, label="public gold audit fixture")
+    plan, plan_raw = _load_signed_artifact(
+        root / "audit-plan.json",
+        key=key,
+        domain=GOLD_AUDIT_PLAN_DOMAIN,
+        signature_field="plan_hmac_sha256",
+        label="public gold audit plan",
+    )
+    detail, detail_raw = _load_signed_artifact(
+        root / "audit-detail.json",
+        key=key,
+        domain=GOLD_AUDIT_DETAIL_DOMAIN,
+        signature_field="detail_hmac_sha256",
+        label="public gold audit detail",
+    )
+    summary, summary_raw = _load_signed_artifact(
+        root / "audit-summary.json",
+        key=key,
+        domain=GOLD_AUDIT_SUMMARY_DOMAIN,
+        signature_field="summary_hmac_sha256",
+        label="public gold audit summary",
+    )
+    plan_at = _aware_timestamp(plan.get("created_at"))
+    detail_at = _aware_timestamp(detail.get("created_at"))
+    summary_at = _aware_timestamp(summary.get("created_at"))
+    fixture_variant = plan.get("fixture_variant")
+    fixture_sha256 = _sha256(fixture_raw)
+    if (
+        set(fixture) != _GOLD_AUDIT_FIXTURE_KEYS
+        or fixture.get("version") != GOLD_AUDIT_FIXTURE_VERSION
+        or fixture.get("challenge_id") != challenge.get("challenge_id")
+        or fixture.get("created_at") != challenge.get("created_at")
+        or _aware_timestamp(fixture.get("created_at")) is None
+        or _aware_timestamp(fixture.get("message_internal_at")) is None
+        or _aware_timestamp(fixture.get("message_internal_at"))
+        > _aware_timestamp(fixture.get("created_at"))
+        or fixture.get("public_synthetic") is not True
+        or fixture.get("contains_private_gmail") is not False
+        or fixture.get("release_eligible") is not False
+        or not isinstance(fixture.get("account_email"), str)
+        or not str(fixture["account_email"]).casefold().endswith(".example.test")
+        or not isinstance(fixture.get("cases"), list)
+        or not fixture["cases"]
+        or isinstance(fixture_variant, bool)
+        or fixture_variant not in GOLD_AUDIT_APPROVED_FIXTURE_SHA256
+        or fixture_sha256
+        != GOLD_AUDIT_APPROVED_FIXTURE_SHA256.get(int(fixture_variant))
+        or fixture_sha256 != frontier_diagnostics.get("fixture_sha256")
+    ):
+        raise PublicChallengeError("public gold audit fixture authority is invalid")
+    fixture_cases = fixture["cases"]
+    if any(
+        not isinstance(row, Mapping) or set(row) != _GOLD_AUDIT_FIXTURE_CASE_KEYS
+        for row in fixture_cases
+    ):
+        raise PublicChallengeError("public gold audit fixture cases are invalid")
+    expected_case_ids = [str(row["case_id"]) for row in fixture_cases]
+    if (
+        len(expected_case_ids) != len(set(expected_case_ids))
+        or expected_case_ids
+        != [str(row["case_id"]) for row in challenge.get("cases", [])]
+        or _gold_audit_fixture_gold(fixture) != gold
+    ):
+        raise PublicChallengeError("public gold audit fixture coverage is invalid")
+
+    batch_count = _frontier_diagnostic_count(plan.get("batch_count"))
+    request_hashes = plan.get("request_sha256")
+    if (
+        set(plan) != _GOLD_AUDIT_PLAN_KEYS
+        or plan.get("version") != GOLD_AUDIT_PLAN_VERSION
+        or plan.get("scope") != GOLD_AUDIT_SCOPE
+        or plan_at is None
+        or plan.get("fixture_version") != GOLD_AUDIT_FIXTURE_VERSION
+        or plan.get("fixture_variant") != fixture_variant
+        or plan.get("fixture_sha256") != fixture_sha256
+        or plan.get("fixture_generator_version") != GOLD_AUDIT_FIXTURE_GENERATOR_VERSION
+        or plan.get("fixture_generator_sha256") != GOLD_AUDIT_FIXTURE_GENERATOR_SHA256
+        or plan.get("fixture_generator_exact_bytes_verified") is not True
+        or plan.get("case_count") != len(fixture_cases)
+        or batch_count == 0
+        or not isinstance(request_hashes, list)
+        or len(request_hashes) != batch_count
+        or len(request_hashes) != len(set(request_hashes))
+        or any(
+            not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None
+            for value in request_hashes
+        )
+        or plan.get("provider") != GOLD_AUDIT_PROVIDER
+        or plan.get("model") != GOLD_AUDIT_MODEL
+        or plan.get("reasoning_effort") != GOLD_AUDIT_REASONING_EFFORT
+        or plan.get("public_synthetic") is not True
+        or plan.get("contains_private_gmail") is not False
+        or plan.get("pipeline_predictions_present") is not False
+        or plan.get("prediction_artifacts_read") is not False
+        or plan.get("diagnostic_only") is not True
+        or plan.get("release_eligible") is not False
+    ):
+        raise PublicChallengeError("public gold audit plan authority is invalid")
+
+    calls_root = root / "calls"
+    _private_directory(calls_root)
+    expected_call_names = {f"{ordinal:03d}" for ordinal in range(1, batch_count + 1)}
+    if _gold_audit_directory_names(calls_root) != expected_call_names:
+        raise PublicChallengeError("public gold audit call coverage is invalid")
+    fixture_case_by_id = {str(row["case_id"]): row for row in fixture_cases}
+    completed_case_ids: list[str] = []
+    completed_cases: list[dict[str, Any]] = []
+    detail_calls: list[dict[str, Any]] = []
+    latest_completed_at = plan_at
+    for unit_ordinal in range(1, batch_count + 1):
+        call_root = calls_root / f"{unit_ordinal:03d}"
+        _private_directory(call_root)
+        if _gold_audit_directory_names(call_root) != {
+            "request.json",
+            "response.json",
+            "receipt.json",
+        }:
+            raise PublicChallengeError("public gold audit call evidence is incomplete")
+        request_raw = _private_file(call_root / "request.json")
+        response_raw = _private_file(call_root / "response.json")
+        request = _strict_json(request_raw, label="public gold audit request")
+        response_value = _strict_json(response_raw, label="public gold audit response")
+        receipt, receipt_raw = _load_signed_artifact(
+            call_root / "receipt.json",
+            key=key,
+            domain=GOLD_AUDIT_RECEIPT_DOMAIN,
+            signature_field="receipt_hmac_sha256",
+            label="public gold audit receipt",
+        )
+        request_cases = request.get("cases")
+        contract = request.get("contract")
+        if (
+            len(request_raw) > GOLD_AUDIT_MAX_REQUEST_BYTES
+            or set(request) != _GOLD_AUDIT_REQUEST_KEYS
+            or request.get("version") != GOLD_AUDIT_REQUEST_VERSION
+            or request.get("phase") != "prediction_blind_public_gold_audit"
+            or not isinstance(contract, str)
+            or _sha256(contract.encode("utf-8")) != GOLD_AUDIT_CONTRACT_SHA256
+            or request.get("challenge_id") != fixture["challenge_id"]
+            or request.get("fixture_created_at") != fixture["created_at"]
+            or request.get("message_internal_at") != fixture["message_internal_at"]
+            or request.get("account_email") != fixture["account_email"]
+            or request.get("public_synthetic") is not True
+            or request.get("contains_private_gmail") is not False
+            or request.get("pipeline_predictions_present") is not False
+            or not isinstance(request_cases, list)
+            or not 1 <= len(request_cases) <= GOLD_AUDIT_MAX_BATCH_CASES
+            or _sha256(request_raw) != request_hashes[unit_ordinal - 1]
+        ):
+            raise PublicChallengeError("public gold audit request authority is invalid")
+        for request_case in request_cases:
+            if (
+                not isinstance(request_case, Mapping)
+                or set(request_case) != _GOLD_AUDIT_REQUEST_CASE_KEYS
+                or not isinstance(request_case.get("source"), Mapping)
+                or set(request_case["source"]) != _GOLD_AUDIT_REQUEST_SOURCE_KEYS
+                or not isinstance(request_case.get("proposed_gold"), Mapping)
+                or set(request_case["proposed_gold"]) != _GOLD_AUDIT_REQUEST_GOLD_KEYS
+                or not isinstance(request_case.get("case_id"), str)
+                or request_case.get("case_id") not in fixture_case_by_id
+                or request_case
+                != _gold_audit_expected_request_case(
+                    fixture_case_by_id[str(request_case["case_id"])]
+                )
+            ):
+                raise PublicChallengeError(
+                    "public gold audit request case authority is invalid"
+                )
+            completed_case_ids.append(str(request_case["case_id"]))
+        if len(response_raw) > GOLD_AUDIT_MAX_RESPONSE_BYTES:
+            raise PublicChallengeError("public gold audit response is oversized")
+        response = _gold_audit_response(response_value, request=request)
+        started_at = _aware_timestamp(receipt.get("started_at"))
+        completed_at = _aware_timestamp(receipt.get("completed_at"))
+        if (
+            set(receipt) != _GOLD_AUDIT_RECEIPT_KEYS
+            or receipt.get("version") != GOLD_AUDIT_RECEIPT_VERSION
+            or receipt.get("unit_ordinal") != unit_ordinal
+            or started_at is None
+            or completed_at is None
+            or started_at < plan_at
+            or completed_at < started_at
+            or started_at < latest_completed_at
+            or receipt.get("provider") != GOLD_AUDIT_PROVIDER
+            or receipt.get("model") != GOLD_AUDIT_MODEL
+            or receipt.get("reasoning_effort") != GOLD_AUDIT_REASONING_EFFORT
+            or receipt.get("request_sha256") != _sha256(request_raw)
+            or receipt.get("response_sha256") != _sha256(response_raw)
+            or receipt.get("case_count") != len(request_cases)
+            or receipt.get("public_synthetic") is not True
+            or receipt.get("contains_private_gmail") is not False
+            or receipt.get("pipeline_predictions_present") is not False
+            or receipt.get("restricted_execution") is not True
+            or receipt.get("ephemeral_execution") is not True
+            or receipt.get("local_model_used") is not False
+            or receipt.get("test_invoker_used") is not False
+        ):
+            raise PublicChallengeError("public gold audit receipt authority is invalid")
+        latest_completed_at = completed_at
+        completed_cases.extend(response["cases"])
+        detail_calls.append(
+            {
+                "unit_ordinal": unit_ordinal,
+                "request_sha256": _sha256(request_raw),
+                "response_sha256": _sha256(response_raw),
+                "receipt_sha256": _sha256(receipt_raw),
+                "case_count": len(request_cases),
+            }
+        )
+    if completed_case_ids != expected_case_ids:
+        raise PublicChallengeError("public gold audit case coverage is incomplete")
+    aggregates = _gold_audit_aggregates(completed_cases)
+    common_invalid = bool(
+        detail.get("scope") != GOLD_AUDIT_SCOPE
+        or detail.get("fixture_sha256") != fixture_sha256
+        or detail.get("fixture_variant") != fixture_variant
+        or detail.get("fixture_generator_version")
+        != GOLD_AUDIT_FIXTURE_GENERATOR_VERSION
+        or detail.get("fixture_generator_sha256") != GOLD_AUDIT_FIXTURE_GENERATOR_SHA256
+        or detail.get("fixture_generator_exact_bytes_verified") is not True
+        or detail.get("provider") != GOLD_AUDIT_PROVIDER
+        or detail.get("model") != GOLD_AUDIT_MODEL
+        or detail.get("reasoning_effort") != GOLD_AUDIT_REASONING_EFFORT
+        or detail.get("public_synthetic") is not True
+        or detail.get("contains_private_gmail") is not False
+        or detail.get("pipeline_predictions_present") is not False
+        or detail.get("prediction_artifacts_read") is not False
+        or detail.get("diagnostic_only") is not True
+        or detail.get("release_eligible") is not False
+    )
+    if (
+        set(detail) != _GOLD_AUDIT_DETAIL_KEYS
+        or detail.get("version") != GOLD_AUDIT_DETAIL_VERSION
+        or detail.get("status") != "complete"
+        or detail_at is None
+        or detail_at < latest_completed_at
+        or detail.get("plan_sha256") != _sha256(plan_raw)
+        or detail.get("calls") != detail_calls
+        or detail.get("cases") != completed_cases
+        or detail.get("aggregates") != aggregates
+        or common_invalid
+    ):
+        raise PublicChallengeError("public gold audit detail authority is invalid")
+
+    count_names = {
+        *aggregates,
+        "batch_count",
+        "external_calls",
+    }
+    counts = {
+        name: _frontier_diagnostic_count(summary.get(name)) for name in count_names
+    }
+    if (
+        set(summary) != _GOLD_AUDIT_SUMMARY_KEYS
+        or summary.get("version") != GOLD_AUDIT_SUMMARY_VERSION
+        or summary.get("status") != "complete"
+        or summary.get("scope") != GOLD_AUDIT_SCOPE
+        or summary_at is None
+        or detail_at is None
+        or summary_at < detail_at
+        or summary_at > prediction_plan_created_at
+        or summary.get("fixture_sha256") != fixture_sha256
+        or summary.get("fixture_variant") != fixture_variant
+        or summary.get("fixture_generator_version")
+        != GOLD_AUDIT_FIXTURE_GENERATOR_VERSION
+        or summary.get("fixture_generator_sha256")
+        != GOLD_AUDIT_FIXTURE_GENERATOR_SHA256
+        or summary.get("fixture_generator_exact_bytes_verified") is not True
+        or summary.get("plan_sha256") != _sha256(plan_raw)
+        or summary.get("detail_sha256") != _sha256(detail_raw)
+        or counts["batch_count"] != batch_count
+        or counts["external_calls"] != batch_count
+        or summary.get("provider") != GOLD_AUDIT_PROVIDER
+        or summary.get("model") != GOLD_AUDIT_MODEL
+        or summary.get("reasoning_effort") != GOLD_AUDIT_REASONING_EFFORT
+        or summary.get("restricted_execution") is not True
+        or summary.get("ephemeral_execution") is not True
+        or summary.get("local_model_used") is not False
+        or summary.get("test_invoker_used") is not False
+        or summary.get("public_synthetic") is not True
+        or summary.get("contains_private_gmail") is not False
+        or summary.get("pipeline_predictions_present") is not False
+        or summary.get("prediction_artifacts_read") is not False
+        or summary.get("private_content_printed") is not False
+        or summary.get("diagnostic_only") is not True
+        or summary.get("release_eligible") is not False
+        or any(counts[name] != expected for name, expected in aggregates.items())
+    ):
+        raise PublicChallengeError("public gold audit summary authority is invalid")
+    if (
+        counts["valid_case_count"] != counts["case_count"]
+        or counts["correction_case_count"] != 0
+        or counts["valid_member_count"] != counts["member_count"]
+        or counts["correction_member_count"] != 0
+        or counts["valid_forbidden_binding_count"] != counts["forbidden_binding_count"]
+        or counts["correction_forbidden_binding_count"] != 0
+        or counts["valid_group_flag_count"] != counts["case_count"]
+        or counts["correction_group_flag_count"] != 0
+    ):
+        raise PublicChallengeError("public gold audit corrections are not zero")
+    return (
+        {
+            "version": GOLD_AUDIT_SUMMARY_VERSION,
+            "sha256": _sha256(summary_raw),
+            "summary_sha256": _sha256(summary_raw),
+            "detail_sha256": _sha256(detail_raw),
+            "plan_sha256": _sha256(plan_raw),
+            "fixture_sha256": fixture_sha256,
+            "fixture_variant": fixture_variant,
+            "fixture_generator_version": GOLD_AUDIT_FIXTURE_GENERATOR_VERSION,
+            "fixture_generator_sha256": GOLD_AUDIT_FIXTURE_GENERATOR_SHA256,
+            "fixture_generator_exact_bytes_verified": True,
+            "audited_at": summary["created_at"],
+            "provider": GOLD_AUDIT_PROVIDER,
+            "model": GOLD_AUDIT_MODEL,
+            "reasoning_effort": GOLD_AUDIT_REASONING_EFFORT,
+            "external_calls": counts["external_calls"],
+            "case_count": counts["case_count"],
+            "member_count": counts["member_count"],
+            "forbidden_binding_count": counts["forbidden_binding_count"],
+            "complete_evidence_chain": True,
+            "zero_corrections": True,
+        },
+        summary_raw,
+    )
+
+
 def score_public_challenge(
     challenge_path: Path,
     gold_path: Path,
@@ -3274,6 +4897,8 @@ def score_public_challenge(
     *,
     evaluation_mode: str,
     prediction_launcher_artifact: Path | None = None,
+    frontier_diagnostics_path: Path | None = None,
+    gold_audit_root: Path | None = None,
 ) -> dict[str, Any]:
     """Open gold only after a complete authenticated prediction result exists.
 
@@ -3405,6 +5030,79 @@ def score_public_challenge(
         raise PublicChallengeError("selected semantic gold denominators are vacuous")
     if set(result_rows) != set(selected_ids):
         raise PublicChallengeError("prediction result case coverage is invalid")
+    # Production preparations are bound to the authenticated plan and checked
+    # again against persisted execution receipts and results above.  Use their
+    # frontier count for the candidate-bearing negative denominator rather than
+    # inferring candidate availability from model output or verifier requests.
+    candidate_bearing_case_ids = {
+        case.case_id for case in cases if case.preparation.candidate_count > 0
+    }
+    frontier_diagnostics: dict[str, Any] | None = None
+    if frontier_diagnostics_path is not None:
+        frontier_diagnostics, _ = _load_frontier_diagnostics(
+            frontier_diagnostics_path,
+            key=key,
+            challenge=challenge,
+            challenge_raw=challenge_raw,
+            gold_rows=gold_rows,
+            gold_raw=gold_raw,
+            cases=cases,
+        )
+    gold_audit: dict[str, Any] | None = None
+    if gold_audit_root is not None:
+        if frontier_diagnostics is None:
+            raise PublicChallengeError(
+                "public gold audit requires authenticated frontier diagnostics"
+            )
+        assert plan_at is not None
+        gold_audit, _ = _load_gold_audit_evidence(
+            gold_audit_root,
+            key=key,
+            frontier_diagnostics=frontier_diagnostics,
+            challenge=challenge,
+            gold=gold,
+            prediction_plan_created_at=plan_at,
+        )
+
+    recomputed_frontier = _recompute_frontier_gold_coverage(
+        authorities=authorities,
+        gold_rows=gold_rows,
+        selected_ids=selected_ids,
+    )
+    if frontier_diagnostics is not None:
+        signed_cases = {
+            str(row["case_id"]): row for row in frontier_diagnostics["cases"]
+        }
+        if set(signed_cases) != set(selected_ids) or any(
+            signed_cases[row["case_id"]]["gold_members"] != row["gold_members"]
+            or signed_cases[row["case_id"]]["frontier_covered_gold_members"]
+            != row["frontier_covered_gold_members"]
+            or signed_cases[row["case_id"]]["frontier_missing_gold_members"]
+            != row["frontier_missing_gold_members"]
+            for row in recomputed_frontier["cases"]
+        ):
+            raise PublicChallengeError(
+                "public frontier diagnostics do not match production candidates"
+            )
+        aggregates = frontier_diagnostics["aggregates"]
+        if any(
+            aggregates[name] != recomputed_frontier[name]
+            for name in (
+                "gold_members",
+                "frontier_covered_gold_members",
+                "frontier_missing_gold_members",
+            )
+        ):
+            raise PublicChallengeError(
+                "public frontier aggregate does not match production candidates"
+            )
+
+    three_run_stability = _three_run_stability(
+        calls=calls,
+        authorities=authorities,
+        gold_rows=gold_rows,
+        selected_ids=selected_ids,
+    )
 
     gold_members = 0
     supported_gold_members = 0
@@ -3412,16 +5110,39 @@ def score_public_challenge(
     confirmed_members = 0
     canonical_subject_members = 0
     canonical_subject_members_recovered = 0
+    canonical_title_keys: set[tuple[str, str]] = set()
+    recovered_canonical_title_keys: set[tuple[str, str]] = set()
     total_artifacts = 0
     supported_artifacts = 0
     matched_artifact_ids: set[tuple[str, str]] = set()
     matched_artifact_expected_verdicts: dict[tuple[str, str], str] = {}
     cluster_reviews = 0
+    positive_cases = 0
+    positive_cases_fully_recovered = 0
     negative_cases = 0
     selected_negative_cases = 0
+    candidate_bearing_negative_cases = 0
+    selected_candidate_bearing_negative_cases = 0
     complete_group_components = 0
     complete_group_components_recovered = 0
+    semantic_units = 0
+    complete_units = 0
+    exact_units = 0
+    reschedule_units = 0
+    complete_reschedule_units = 0
     forbidden_hypotheses = 0
+    lifecycle_gold_members: Counter[str] = Counter()
+    lifecycle_matched_members: Counter[str] = Counter()
+    lifecycle_supported_gold_members: Counter[str] = Counter()
+    lifecycle_confirmed_members: Counter[str] = Counter()
+    relation_gold_members: Counter[str] = Counter()
+    relation_matched_members: Counter[str] = Counter()
+    relation_supported_gold_members: Counter[str] = Counter()
+    relation_confirmed_members: Counter[str] = Counter()
+    critical_category_gold_members: Counter[str] = Counter()
+    critical_category_matched_members: Counter[str] = Counter()
+    critical_temporal_gold_members = 0
+    critical_temporal_matched_members = 0
     per_case: list[dict[str, Any]] = []
     for case_id in selected_ids:
         gold_row = gold_rows[case_id]
@@ -3459,9 +5180,16 @@ def score_public_challenge(
             item.get("evidence_status") == "supported" for item in artifacts
         )
         cluster_reviews += len(reviews)
+        case_selected = bool(artifacts or reviews)
+        case_candidate_bearing = case_id in candidate_bearing_case_ids
+        positive_cases += int(bool(members))
         if not members:
             negative_cases += 1
-            selected_negative_cases += int(bool(artifacts or reviews))
+            selected_negative_cases += int(case_selected)
+            candidate_bearing_negative_cases += int(case_candidate_bearing)
+            selected_candidate_bearing_negative_cases += int(
+                case_candidate_bearing and case_selected
+            )
         forbidden_bindings = gold_row.get("forbidden", [])
         if not isinstance(forbidden_bindings, list):
             raise PublicChallengeError("semantic gold forbidden schema is invalid")
@@ -3491,27 +5219,73 @@ def score_public_challenge(
         case_confirmed = 0
         case_canonical_subject_members = 0
         case_canonical_subject_members_recovered = 0
+        case_canonical_titles: set[str] = set()
+        case_recovered_canonical_titles: set[str] = set()
         component_members: Counter[str] = Counter()
-        for member_ordinal, member in enumerate(members):
-            if isinstance(member, Mapping):
-                component_key = _structural_component_key(member, member_ordinal)
-                if component_key is not None:
-                    component_members[component_key] += 1
+        complete_group_required = gold_row.get("complete_group_required") is True
+        if complete_group_required:
+            for member_ordinal, member in enumerate(members):
+                if isinstance(member, Mapping):
+                    component_key = _structural_component_key(member, member_ordinal)
+                    if component_key is not None:
+                        component_members[component_key] += 1
         complete_group_components += len(component_members)
         matched_component_members: Counter[str] = Counter()
         component_group_ids: defaultdict[str, set[str]] = defaultdict(set)
+        member_outcomes: list[dict[str, Any]] = [
+            {
+                "matched": False,
+                "exact": False,
+                "structural_group_id": None,
+            }
+            for _ in members
+        ]
         for member_ordinal, member in enumerate(members):
             if not isinstance(member, Mapping):
                 raise PublicChallengeError("semantic gold member is invalid")
-            component_key = _structural_component_key(member, member_ordinal)
+            component_key = (
+                _structural_component_key(member, member_ordinal)
+                if complete_group_required
+                else None
+            )
             gold_members += 1
+            lifecycle = str(member.get("lifecycle"))
+            if lifecycle not in _LIFECYCLE_ROLES:
+                raise PublicChallengeError("semantic gold lifecycle is invalid")
+            relation = str(member.get("relation"))
+            if relation not in _TEMPORAL_RELATIONS:
+                raise PublicChallengeError("semantic gold relation is invalid")
+            critical_categories = _critical_temporal_categories_for_member(member)
+            critical_temporal = bool(critical_categories)
+            lifecycle_gold_members[lifecycle] += 1
+            relation_gold_members[relation] += 1
+            critical_temporal_gold_members += int(critical_temporal)
+            critical_category_gold_members.update(critical_categories)
             expected_verdict = member.get("expected_verdict", "supported")
             supported_gold_members += int(expected_verdict != "uncertain")
+            lifecycle_supported_gold_members[lifecycle] += int(
+                expected_verdict != "uncertain"
+            )
+            relation_supported_gold_members[relation] += int(
+                expected_verdict != "uncertain"
+            )
             canonical_subject_required = (
                 member.get("canonical_subject_required") is True
             )
             canonical_subject_members += int(canonical_subject_required)
             case_canonical_subject_members += int(canonical_subject_required)
+            canonical_title = (
+                _normalized_subject(member.get("subject"))
+                if canonical_subject_required
+                else None
+            )
+            if canonical_subject_required:
+                if canonical_title is None:
+                    raise PublicChallengeError(
+                        "canonical title gold identity is invalid"
+                    )
+                canonical_title_keys.add((case_id, canonical_title))
+                case_canonical_titles.add(canonical_title)
             matched_ids: tuple[str, ...] = ()
             structural_group_id: str | None = None
             used_case_artifact_ids = {
@@ -3573,28 +5347,58 @@ def score_public_challenge(
             )
             matched_members += 1
             case_matches += 1
+            lifecycle_matched_members[lifecycle] += 1
+            relation_matched_members[relation] += 1
+            critical_temporal_matched_members += int(critical_temporal)
+            critical_category_matched_members.update(critical_categories)
             if component_key is not None and structural_group_id is not None:
                 matched_component_members[component_key] += 1
                 component_group_ids[component_key].add(structural_group_id)
-            if _artifacts_confirm_supported_member(
+            confirmed = _artifacts_confirm_supported_member(
                 tuple(available[artifact_id] for artifact_id in matched_ids),
                 member,
-            ):
+            )
+            if confirmed:
                 confirmed_members += 1
                 case_confirmed += 1
-            if canonical_subject_required and _artifacts_recover_canonical_subject(
-                tuple(available[artifact_id] for artifact_id in matched_ids),
-                member,
-                subject_surfaces=subject_surfaces,
-            ):
+                lifecycle_confirmed_members[lifecycle] += 1
+                relation_confirmed_members[relation] += 1
+            canonical_recovered = bool(
+                canonical_subject_required
+                and _artifacts_recover_canonical_subject(
+                    tuple(available[artifact_id] for artifact_id in matched_ids),
+                    member,
+                    subject_surfaces=subject_surfaces,
+                )
+            )
+            if canonical_recovered:
                 canonical_subject_members_recovered += 1
                 case_canonical_subject_members_recovered += 1
+                assert canonical_title is not None
+                recovered_canonical_title_keys.add((case_id, canonical_title))
+                case_recovered_canonical_titles.add(canonical_title)
+            member_outcomes[member_ordinal] = {
+                "matched": True,
+                "exact": (not canonical_subject_required or canonical_recovered),
+                "structural_group_id": structural_group_id,
+            }
         case_complete_components = sum(
             matched_component_members[component_key] == expected_members
             and len(component_group_ids[component_key]) == 1
             for component_key, expected_members in component_members.items()
         )
         complete_group_components_recovered += case_complete_components
+        case_unit_metrics = _semantic_unit_metrics(members, member_outcomes)
+        semantic_units += case_unit_metrics["semantic_units"]
+        complete_units += case_unit_metrics["complete_units"]
+        exact_units += case_unit_metrics["exact_units"]
+        case_reschedule_metrics = _reschedule_unit_metrics(members, member_outcomes)
+        reschedule_units += case_reschedule_metrics["reschedule_units"]
+        complete_reschedule_units += case_reschedule_metrics[
+            "complete_reschedule_units"
+        ]
+        positive_case_fully_recovered = bool(members) and case_matches == len(members)
+        positive_cases_fully_recovered += int(positive_case_fully_recovered)
         per_case.append(
             {
                 "case_id": case_id,
@@ -3605,11 +5409,28 @@ def score_public_challenge(
                 "canonical_subject_members_recovered": (
                     case_canonical_subject_members_recovered
                 ),
+                "canonical_titles": len(case_canonical_titles),
+                "canonical_titles_recovered": len(case_recovered_canonical_titles),
                 "artifacts": len(artifacts),
                 "cluster_reviews": len(reviews),
+                "complete_group_required": complete_group_required,
                 "complete_group_components": len(component_members),
                 "complete_group_components_recovered": case_complete_components,
-                "negative_selected": bool(not members and (artifacts or reviews)),
+                "semantic_units": case_unit_metrics["semantic_units"],
+                "complete_units": case_unit_metrics["complete_units"],
+                "exact_units": case_unit_metrics["exact_units"],
+                "reschedule_units": case_reschedule_metrics["reschedule_units"],
+                "complete_reschedule_units": case_reschedule_metrics[
+                    "complete_reschedule_units"
+                ],
+                "candidate_bearing": case_candidate_bearing,
+                "positive_case_fully_recovered": (
+                    positive_case_fully_recovered if members else None
+                ),
+                "negative_selected": bool(not members and case_selected),
+                "candidate_bearing_negative_selected": bool(
+                    not members and case_candidate_bearing and case_selected
+                ),
                 "forbidden_hypotheses": case_forbidden,
             }
         )
@@ -3647,11 +5468,47 @@ def score_public_challenge(
         if canonical_subject_members
         else 1.0
     )
+    canonical_titles = len(canonical_title_keys)
+    canonical_titles_recovered = len(recovered_canonical_title_keys)
+    canonical_title_recall = (
+        canonical_titles_recovered / canonical_titles if canonical_titles else 1.0
+    )
     supported_precision = (
         matched_supported_artifacts / supported_artifacts
         if supported_artifacts
         else (1.0 if supported_gold_members == 0 else 0.0)
     )
+    supported_overclaim_count = supported_artifacts - matched_supported_artifacts
+    if supported_overclaim_count < 0:
+        raise PublicChallengeError("supported artifact calibration is invalid")
+    critical_artifact_overclaim_ids: set[tuple[str, str]] = set()
+    critical_supported_overclaim_ids: set[tuple[str, str]] = set()
+    for case_id in selected_ids:
+        projection = result_rows[case_id]["projection"]
+        if projection is None:
+            continue
+        for artifact in projection.get("artifacts", []):
+            if not isinstance(artifact, Mapping):
+                continue
+            artifact_id = artifact.get("artifact_id")
+            if not isinstance(artifact_id, str) or not artifact_id:
+                raise PublicChallengeError("critical artifact identity is invalid")
+            artifact_key = (case_id, artifact_id)
+            if (
+                artifact_key not in matched_artifact_ids
+                and _artifact_has_critical_temporal_hypothesis(artifact)
+            ):
+                critical_artifact_overclaim_ids.add(artifact_key)
+            if (
+                artifact.get("evidence_status") == "supported"
+                and _artifact_has_critical_temporal_hypothesis(artifact)
+                and matched_artifact_expected_verdicts.get(artifact_key) != "supported"
+            ):
+                critical_supported_overclaim_ids.add(artifact_key)
+    critical_artifact_overclaim_count = len(critical_artifact_overclaim_ids)
+    critical_supported_overclaim_count = len(critical_supported_overclaim_ids)
+    if critical_supported_overclaim_count > supported_overclaim_count:
+        raise PublicChallengeError("critical artifact calibration is invalid")
     # Cluster reviews are escalation records, not semantic artifacts.  Current
     # gold has no representation against which their correctness can be
     # judged, so report them as unscored workload instead of silently counting
@@ -3667,6 +5524,239 @@ def score_public_challenge(
         if complete_group_components
         else 1.0
     )
+    complete_unit_recall = complete_units / semantic_units if semantic_units else 1.0
+    exact_unit_recall = exact_units / semantic_units if semantic_units else 1.0
+    reschedule_unit_recall = (
+        complete_reschedule_units / reschedule_units if reschedule_units else None
+    )
+    positive_case_completeness_recall = positive_cases_fully_recovered / positive_cases
+    rejected_candidate_bearing_negative_cases = (
+        candidate_bearing_negative_cases - selected_candidate_bearing_negative_cases
+    )
+    candidate_bearing_negative_rejection_rate = (
+        rejected_candidate_bearing_negative_cases / candidate_bearing_negative_cases
+        if candidate_bearing_negative_cases
+        else None
+    )
+    frontier_member_recall: float | None = None
+    authenticated_positive_zero_work_cases: int | None = None
+    if frontier_diagnostics is not None:
+        frontier_aggregates = frontier_diagnostics["aggregates"]
+        frontier_gold_members = int(recomputed_frontier["gold_members"])
+        frontier_covered_gold_members = int(
+            recomputed_frontier["frontier_covered_gold_members"]
+        )
+        frontier_member_recall = (
+            frontier_covered_gold_members / frontier_gold_members
+            if frontier_gold_members
+            else 1.0
+        )
+        authenticated_positive_zero_work_cases = int(
+            frontier_aggregates["positive_zero_work_cases"]
+        )
+    lifecycle_metrics: dict[str, dict[str, Any]] = {}
+    for lifecycle in _LIFECYCLE_ROLES:
+        lifecycle_gold = lifecycle_gold_members[lifecycle]
+        lifecycle_matched = lifecycle_matched_members[lifecycle]
+        lifecycle_supported = lifecycle_supported_gold_members[lifecycle]
+        lifecycle_confirmed = lifecycle_confirmed_members[lifecycle]
+        lifecycle_metrics[lifecycle] = {
+            "gold_members": lifecycle_gold,
+            "matched_members": lifecycle_matched,
+            "effective_member_recall": (
+                lifecycle_matched / lifecycle_gold if lifecycle_gold else None
+            ),
+            "effective_member_recall_interval_95": _wilson_interval(
+                lifecycle_matched,
+                lifecycle_gold,
+            ),
+            "supported_gold_members": lifecycle_supported,
+            "confirmed_members": lifecycle_confirmed,
+            "confirmed_member_recall": (
+                lifecycle_confirmed / lifecycle_supported
+                if lifecycle_supported
+                else None
+            ),
+            "confirmed_member_recall_interval_95": _wilson_interval(
+                lifecycle_confirmed,
+                lifecycle_supported,
+            ),
+        }
+    relation_metrics: dict[str, dict[str, Any]] = {}
+    for relation in _TEMPORAL_RELATIONS:
+        relation_gold = relation_gold_members[relation]
+        relation_matched = relation_matched_members[relation]
+        relation_supported = relation_supported_gold_members[relation]
+        relation_confirmed = relation_confirmed_members[relation]
+        relation_metrics[relation] = {
+            "gold_members": relation_gold,
+            "matched_members": relation_matched,
+            "effective_member_recall": (
+                relation_matched / relation_gold if relation_gold else None
+            ),
+            "effective_member_recall_interval_95": _wilson_interval(
+                relation_matched,
+                relation_gold,
+            ),
+            "supported_gold_members": relation_supported,
+            "confirmed_members": relation_confirmed,
+            "confirmed_member_recall": (
+                relation_confirmed / relation_supported if relation_supported else None
+            ),
+            "confirmed_member_recall_interval_95": _wilson_interval(
+                relation_confirmed,
+                relation_supported,
+            ),
+        }
+    critical_temporal_category_metrics: dict[str, dict[str, Any]] = {}
+    for category in _CRITICAL_TEMPORAL_CATEGORIES:
+        category_gold = critical_category_gold_members[category]
+        category_matched = critical_category_matched_members[category]
+        critical_temporal_category_metrics[category] = {
+            "gold_members": category_gold,
+            "matched_members": category_matched,
+            "effective_member_recall": (
+                category_matched / category_gold if category_gold else None
+            ),
+            "effective_member_recall_interval_95": _wilson_interval(
+                category_matched,
+                category_gold,
+            ),
+        }
+    critical_temporal_effective_member_recall = (
+        critical_temporal_matched_members / critical_temporal_gold_members
+        if critical_temporal_gold_members
+        else None
+    )
+    critical_temporal_metrics = {
+        "basis": ("deadline_relation_or_scheduled_cancelled_reschedule_lifecycle"),
+        "gold_members": critical_temporal_gold_members,
+        "matched_members": critical_temporal_matched_members,
+        "effective_member_recall": critical_temporal_effective_member_recall,
+        "effective_member_recall_interval_95": _wilson_interval(
+            critical_temporal_matched_members,
+            critical_temporal_gold_members,
+        ),
+        "categories": critical_temporal_category_metrics,
+    }
+    critical_lifecycle_gold_members = sum(
+        lifecycle_gold_members[role] for role in _CRITICAL_LIFECYCLE_ROLES
+    )
+    critical_lifecycle_matched_members = sum(
+        lifecycle_matched_members[role] for role in _CRITICAL_LIFECYCLE_ROLES
+    )
+    critical_lifecycle_effective_member_recall = (
+        critical_lifecycle_matched_members / critical_lifecycle_gold_members
+        if critical_lifecycle_gold_members
+        else None
+    )
+    critical_lifecycle_metrics = {
+        "roles": list(_CRITICAL_LIFECYCLE_ROLES),
+        "gold_members": critical_lifecycle_gold_members,
+        "matched_members": critical_lifecycle_matched_members,
+        "effective_member_recall": critical_lifecycle_effective_member_recall,
+        "effective_member_recall_interval_95": _wilson_interval(
+            critical_lifecycle_matched_members,
+            critical_lifecycle_gold_members,
+        ),
+    }
+    lifecycle_reporting_complete = bool(
+        set(lifecycle_metrics) == set(_LIFECYCLE_ROLES)
+        and sum(row["gold_members"] for row in lifecycle_metrics.values())
+        == gold_members
+        and sum(row["matched_members"] for row in lifecycle_metrics.values())
+        == matched_members
+        and sum(row["supported_gold_members"] for row in lifecycle_metrics.values())
+        == supported_gold_members
+        and sum(row["confirmed_members"] for row in lifecycle_metrics.values())
+        == confirmed_members
+    )
+    relation_reporting_complete = bool(
+        set(relation_metrics) == set(_TEMPORAL_RELATIONS)
+        and sum(row["gold_members"] for row in relation_metrics.values())
+        == gold_members
+        and sum(row["matched_members"] for row in relation_metrics.values())
+        == matched_members
+        and sum(row["supported_gold_members"] for row in relation_metrics.values())
+        == supported_gold_members
+        and sum(row["confirmed_members"] for row in relation_metrics.values())
+        == confirmed_members
+    )
+    all_critical_temporal_categories_present = all(
+        critical_temporal_category_metrics[category]["gold_members"] > 0
+        for category in _CRITICAL_TEMPORAL_CATEGORIES
+    )
+    critical_temporal_category_minimum_recall = min(
+        (
+            float(row["effective_member_recall"])
+            for row in critical_temporal_category_metrics.values()
+            if row["effective_member_recall"] is not None
+        ),
+        default=None,
+    )
+    metric_intervals_95 = {
+        "effective_member_recall": _wilson_interval(
+            matched_members,
+            gold_members,
+        ),
+        "confirmed_member_recall": _wilson_interval(
+            confirmed_members,
+            supported_gold_members,
+        ),
+        "supported_artifact_precision": _wilson_interval(
+            matched_supported_artifacts,
+            supported_artifacts,
+        ),
+        "review_artifact_precision": _wilson_interval(
+            len(matched_artifact_ids),
+            total_artifacts,
+        ),
+        "canonical_title_recall": _wilson_interval(
+            canonical_titles_recovered,
+            canonical_titles,
+        ),
+        "canonical_subject_recall": _wilson_interval(
+            canonical_subject_members_recovered,
+            canonical_subject_members,
+        ),
+        "complete_group_recall": _wilson_interval(
+            complete_group_components_recovered,
+            complete_group_components,
+        ),
+        "complete_unit_recall": _wilson_interval(
+            complete_units,
+            semantic_units,
+        ),
+        "exact_unit_recall": _wilson_interval(
+            exact_units,
+            semantic_units,
+        ),
+        "critical_lifecycle_effective_member_recall": _wilson_interval(
+            critical_lifecycle_matched_members,
+            critical_lifecycle_gold_members,
+        ),
+        "deadline_effective_member_recall": _wilson_interval(
+            relation_matched_members["deadline"],
+            relation_gold_members["deadline"],
+        ),
+        "critical_temporal_effective_member_recall": _wilson_interval(
+            critical_temporal_matched_members,
+            critical_temporal_gold_members,
+        ),
+        "reschedule_unit_recall": _wilson_interval(
+            complete_reschedule_units,
+            reschedule_units,
+        ),
+        "positive_case_completeness_recall": _wilson_interval(
+            positive_cases_fully_recovered,
+            positive_cases,
+        ),
+    }
+    restricted_external_execution = bool(
+        claims.restricted_execution
+        and claims.external_call_started
+        and not claims.test_invoker_used
+    )
     gate = {
         "all_members_recovered": matched_members == gold_members,
         "all_supported_members_confirmed": (
@@ -3676,19 +5766,112 @@ def score_public_challenge(
             canonical_subject_members_recovered == canonical_subject_members
         ),
         "perfect_supported_precision": supported_precision == 1.0,
+        "zero_supported_overclaims": supported_overclaim_count == 0,
         "perfect_review_artifact_precision": review_artifact_precision == 1.0,
         "all_review_outputs_scored": all_review_outputs_scored,
         "complete_structural_groups": (
             complete_group_components_recovered == complete_group_components
         ),
         "no_selected_hard_negatives": selected_negative_cases == 0,
+        "no_selected_negative_cases": selected_negative_cases == 0,
         "no_forbidden_hypotheses": forbidden_hypotheses == 0,
-        "restricted_external_execution": (
-            claims.restricted_execution
-            and claims.external_call_started
-            and not claims.test_invoker_used
-        ),
+        "restricted_external_execution": restricted_external_execution,
     }
+    personal_target_gates = {
+        "authenticated_zero_correction_sol_gold_audit": gold_audit is not None,
+        "frontier_member_recall_at_least_0_95": bool(
+            frontier_member_recall is not None
+            and frontier_member_recall >= MIN_FRONTIER_MEMBER_RECALL
+        ),
+        "zero_authenticated_positive_zero_work_cases": (
+            authenticated_positive_zero_work_cases == 0
+        ),
+        "effective_member_recall_at_least_0_90": (
+            effective_recall >= MIN_EFFECTIVE_MEMBER_RECALL
+        ),
+        "confirmed_member_recall_at_least_0_90": (
+            confirmed_recall >= MIN_CONFIRMED_MEMBER_RECALL
+        ),
+        "complete_unit_recall_at_least_0_90": (
+            complete_unit_recall >= MIN_COMPLETE_UNIT_RECALL
+        ),
+        "exact_unit_recall_at_least_0_90": (exact_unit_recall >= MIN_EXACT_UNIT_RECALL),
+        "critical_lifecycle_effective_member_recall_at_least_0_95": bool(
+            critical_lifecycle_effective_member_recall is not None
+            and critical_lifecycle_effective_member_recall
+            >= MIN_CRITICAL_LIFECYCLE_EFFECTIVE_RECALL
+        ),
+        "critical_temporal_effective_member_recall_at_least_0_95": bool(
+            critical_temporal_effective_member_recall is not None
+            and critical_temporal_effective_member_recall
+            >= MIN_CRITICAL_TEMPORAL_EFFECTIVE_RECALL
+        ),
+        "all_critical_temporal_categories_present": (
+            all_critical_temporal_categories_present
+        ),
+        "each_critical_temporal_category_recall_at_least_0_95": bool(
+            all_critical_temporal_categories_present
+            and critical_temporal_category_minimum_recall is not None
+            and critical_temporal_category_minimum_recall
+            >= MIN_CRITICAL_TEMPORAL_CATEGORY_RECALL
+        ),
+        "deadline_relation_recall_at_least_0_95": bool(
+            relation_metrics["deadline"]["effective_member_recall"] is not None
+            and relation_metrics["deadline"]["effective_member_recall"]
+            >= MIN_CRITICAL_TEMPORAL_CATEGORY_RECALL
+        ),
+        "reschedule_unit_recall_at_least_0_95": bool(
+            reschedule_unit_recall is not None
+            and reschedule_unit_recall >= MIN_CRITICAL_TEMPORAL_CATEGORY_RECALL
+        ),
+        "canonical_title_recall_at_least_0_90": (
+            canonical_title_recall >= MIN_CANONICAL_TITLE_RECALL
+        ),
+        "canonical_subject_recall_at_least_0_90": (
+            canonical_subject_recall >= MIN_CANONICAL_SUBJECT_RECALL
+        ),
+        "supported_artifact_precision_at_least_0_95": (
+            supported_precision >= MIN_SUPPORTED_ARTIFACT_PRECISION
+        ),
+        "zero_supported_critical_overclaims": (critical_supported_overclaim_count == 0),
+        "zero_critical_artifact_overclaims": (critical_artifact_overclaim_count == 0),
+        "review_artifact_precision_at_least_0_90": (
+            review_artifact_precision >= MIN_REVIEW_ARTIFACT_PRECISION
+        ),
+        "accepted_parent_cluster_stability_at_least_0_95": bool(
+            three_run_stability["accepted_parent_clusters"]["gate_passed"]
+        ),
+        "accepted_gold_member_stability_at_least_0_95": bool(
+            three_run_stability["accepted_gold_members"]["gate_passed"]
+        ),
+        "critical_candidate_verdict_stability_at_least_0_95": bool(
+            three_run_stability["critical_candidate_verdict_agreement"]["gate_passed"]
+        ),
+        "critical_gold_member_verdict_stability_at_least_0_95": bool(
+            three_run_stability["critical_gold_member_verdict_agreement"]["gate_passed"]
+        ),
+        "candidate_bearing_negative_rejection_at_least_0_80": bool(
+            candidate_bearing_negative_rejection_rate is not None
+            and candidate_bearing_negative_rejection_rate
+            >= MIN_CANDIDATE_BEARING_NEGATIVE_REJECTION
+        ),
+        "no_forbidden_hypotheses": forbidden_hypotheses == 0,
+        "complete_lifecycle_reporting": lifecycle_reporting_complete,
+        "complete_relation_reporting": relation_reporting_complete,
+        "restricted_external_execution": restricted_external_execution,
+    }
+    personal_target_gate_available = gold_audit is not None
+    personal_target_gate_passed = bool(
+        personal_target_gate_available and all(personal_target_gates.values())
+    )
+    production_release_evidence_gates = {
+        "personal_quality_target_passed": personal_target_gate_passed,
+        "blind_first_use": evaluation_mode == "blind_first_use",
+        "cohort_release_eligible": challenge.get("release_eligible") is True,
+    }
+    production_release_evidence_gate_passed = all(
+        production_release_evidence_gates.values()
+    )
     score = _signed(
         {
             "version": SCORE_VERSION,
@@ -3704,6 +5887,8 @@ def score_public_challenge(
                 prediction_provenance.exact_artifact_verified
             ),
             "scorer_sha256": prediction_provenance.scorer_sha256,
+            "frontier_diagnostics": frontier_diagnostics,
+            "gold_audit": gold_audit,
             "gold_opened_after_this_prediction_seal": True,
             "operator_asserted_evaluation_mode": evaluation_mode,
             "first_use_blindness_claimed": evaluation_mode == "blind_first_use",
@@ -3715,30 +5900,89 @@ def score_public_challenge(
             "canonical_subject_members_recovered": (
                 canonical_subject_members_recovered
             ),
+            "canonical_titles": canonical_titles,
+            "canonical_titles_recovered": canonical_titles_recovered,
             "artifacts": total_artifacts,
             "supported_artifacts": supported_artifacts,
             "matched_supported_artifacts": matched_supported_artifacts,
             "overconfident_artifacts": overconfident_artifacts,
+            "supported_overclaim_count": supported_overclaim_count,
+            "critical_supported_overclaim_count": (critical_supported_overclaim_count),
+            "critical_artifact_overclaim_count": (critical_artifact_overclaim_count),
             "matched_artifacts": len(matched_artifact_ids),
             "cluster_reviews": cluster_reviews,
             "unscored_cluster_reviews": cluster_reviews,
+            "positive_cases": positive_cases,
+            "positive_cases_fully_recovered": positive_cases_fully_recovered,
+            "positive_case_completeness_recall": (positive_case_completeness_recall),
             "negative_cases": negative_cases,
             "selected_negative_cases": selected_negative_cases,
+            "candidate_bearing_negative_cases": (candidate_bearing_negative_cases),
+            "selected_candidate_bearing_negative_cases": (
+                selected_candidate_bearing_negative_cases
+            ),
+            "rejected_candidate_bearing_negative_cases": (
+                rejected_candidate_bearing_negative_cases
+            ),
+            "candidate_bearing_negative_rejection_rate": (
+                candidate_bearing_negative_rejection_rate
+            ),
+            "frontier_member_recall": frontier_member_recall,
+            "authenticated_positive_zero_work_cases": (
+                authenticated_positive_zero_work_cases
+            ),
+            "candidate_bearing_negative_case_basis": (
+                "authenticated_prediction_preparation_candidate_count"
+            ),
             "forbidden_hypotheses": forbidden_hypotheses,
             "complete_group_components": complete_group_components,
             "complete_group_components_recovered": (
                 complete_group_components_recovered
             ),
+            "semantic_units": semantic_units,
+            "complete_units": complete_units,
+            "exact_units": exact_units,
+            "reschedule_units": reschedule_units,
+            "complete_reschedule_units": complete_reschedule_units,
+            "reschedule_unit_recall": reschedule_unit_recall,
             "effective_member_recall": effective_recall,
             "confirmed_member_recall": confirmed_recall,
             "canonical_subject_recall": canonical_subject_recall,
+            "canonical_title_recall": canonical_title_recall,
             "supported_artifact_precision": supported_precision,
             "review_artifact_precision": review_artifact_precision,
             "review_output_precision": review_artifact_precision,
             "complete_group_recall": complete_group_recall,
+            "complete_unit_recall": complete_unit_recall,
+            "exact_unit_recall": exact_unit_recall,
+            "exact_unit_basis": (
+                "exact_semantic_binding_and_required_canonical_subject_recovery"
+            ),
+            "lifecycle_metrics": lifecycle_metrics,
+            "critical_lifecycle_metrics": critical_lifecycle_metrics,
+            "lifecycle_reporting_complete": lifecycle_reporting_complete,
+            "relation_metrics": relation_metrics,
+            "relation_reporting_complete": relation_reporting_complete,
+            "critical_temporal_metrics": critical_temporal_metrics,
+            "critical_temporal_category_minimum_recall": (
+                critical_temporal_category_minimum_recall
+            ),
+            "all_critical_temporal_categories_present": (
+                all_critical_temporal_categories_present
+            ),
+            "three_run_stability": three_run_stability,
+            "metric_intervals_95": metric_intervals_95,
+            "confidence_interval_method": "wilson_score_95_two_sided",
             "cases": per_case,
             "gates": gate,
             "smoke_gate_passed": all(gate.values()),
+            "personal_target_gates": personal_target_gates,
+            "personal_target_gate_available": personal_target_gate_available,
+            "personal_target_gate_passed": personal_target_gate_passed,
+            "production_release_evidence_gates": (production_release_evidence_gates),
+            "production_release_evidence_gate_passed": (
+                production_release_evidence_gate_passed
+            ),
             "public_synthetic": True,
             "gold_version": gold.get("version"),
             "release_eligible": False,
@@ -3758,27 +6002,86 @@ def score_public_challenge(
         "confirmed_members": confirmed_members,
         "canonical_subject_members": canonical_subject_members,
         "canonical_subject_members_recovered": canonical_subject_members_recovered,
+        "canonical_titles": canonical_titles,
+        "canonical_titles_recovered": canonical_titles_recovered,
         "artifacts": total_artifacts,
         "supported_artifacts": supported_artifacts,
         "matched_supported_artifacts": matched_supported_artifacts,
         "overconfident_artifacts": overconfident_artifacts,
+        "supported_overclaim_count": supported_overclaim_count,
+        "critical_supported_overclaim_count": critical_supported_overclaim_count,
+        "critical_artifact_overclaim_count": critical_artifact_overclaim_count,
         "cluster_reviews": cluster_reviews,
         "unscored_cluster_reviews": cluster_reviews,
+        "positive_cases": positive_cases,
+        "positive_cases_fully_recovered": positive_cases_fully_recovered,
+        "positive_case_completeness_recall": positive_case_completeness_recall,
         "negative_cases": negative_cases,
         "selected_negative_cases": selected_negative_cases,
+        "candidate_bearing_negative_cases": candidate_bearing_negative_cases,
+        "selected_candidate_bearing_negative_cases": (
+            selected_candidate_bearing_negative_cases
+        ),
+        "rejected_candidate_bearing_negative_cases": (
+            rejected_candidate_bearing_negative_cases
+        ),
+        "candidate_bearing_negative_rejection_rate": (
+            candidate_bearing_negative_rejection_rate
+        ),
+        "frontier_member_recall": frontier_member_recall,
+        "authenticated_positive_zero_work_cases": (
+            authenticated_positive_zero_work_cases
+        ),
+        "candidate_bearing_negative_case_basis": (
+            "authenticated_prediction_preparation_candidate_count"
+        ),
         "forbidden_hypotheses": forbidden_hypotheses,
         "effective_member_recall": effective_recall,
         "confirmed_member_recall": confirmed_recall,
         "canonical_subject_recall": canonical_subject_recall,
+        "canonical_title_recall": canonical_title_recall,
         "supported_artifact_precision": supported_precision,
         "review_artifact_precision": review_artifact_precision,
         "review_output_precision": review_artifact_precision,
         "complete_group_recall": complete_group_recall,
+        "semantic_units": semantic_units,
+        "complete_units": complete_units,
+        "exact_units": exact_units,
+        "reschedule_units": reschedule_units,
+        "complete_reschedule_units": complete_reschedule_units,
+        "reschedule_unit_recall": reschedule_unit_recall,
+        "complete_unit_recall": complete_unit_recall,
+        "exact_unit_recall": exact_unit_recall,
+        "exact_unit_basis": (
+            "exact_semantic_binding_and_required_canonical_subject_recovery"
+        ),
+        "lifecycle_metrics": lifecycle_metrics,
+        "critical_lifecycle_metrics": critical_lifecycle_metrics,
+        "lifecycle_reporting_complete": lifecycle_reporting_complete,
+        "relation_metrics": relation_metrics,
+        "relation_reporting_complete": relation_reporting_complete,
+        "critical_temporal_metrics": critical_temporal_metrics,
+        "critical_temporal_category_minimum_recall": (
+            critical_temporal_category_minimum_recall
+        ),
+        "all_critical_temporal_categories_present": (
+            all_critical_temporal_categories_present
+        ),
+        "three_run_stability": three_run_stability,
+        "metric_intervals_95": metric_intervals_95,
+        "confidence_interval_method": "wilson_score_95_two_sided",
         "complete_group_components": complete_group_components,
         "complete_group_components_recovered": complete_group_components_recovered,
         "cases": per_case,
         "gates": gate,
         "smoke_gate_passed": all(gate.values()),
+        "personal_target_gates": personal_target_gates,
+        "personal_target_gate_available": personal_target_gate_available,
+        "personal_target_gate_passed": personal_target_gate_passed,
+        "production_release_evidence_gates": production_release_evidence_gates,
+        "production_release_evidence_gate_passed": (
+            production_release_evidence_gate_passed
+        ),
         "gold_opened_after_this_prediction_seal": True,
         "operator_asserted_evaluation_mode": evaluation_mode,
         "first_use_blindness_claimed": evaluation_mode == "blind_first_use",
@@ -3790,6 +6093,8 @@ def score_public_challenge(
             prediction_provenance.exact_artifact_verified
         ),
         "scorer_sha256": prediction_provenance.scorer_sha256,
+        "frontier_diagnostics": frontier_diagnostics,
+        "gold_audit": gold_audit,
         "release_eligible": False,
         "test_invoker_used": claims.test_invoker_used,
         "private_content_printed": False,
@@ -3823,6 +6128,8 @@ def main() -> None:
     score.add_argument("--hmac-key", type=Path, required=True)
     score.add_argument("--output-root", type=Path, required=True)
     score.add_argument("--prediction-launcher-artifact", type=Path)
+    score.add_argument("--frontier-diagnostics", type=Path)
+    score.add_argument("--gold-audit-root", type=Path)
     score.add_argument(
         "--evaluation-mode",
         choices=("blind_first_use", "development_replay"),
@@ -3846,6 +6153,8 @@ def main() -> None:
                 args.output_root,
                 evaluation_mode=args.evaluation_mode,
                 prediction_launcher_artifact=args.prediction_launcher_artifact,
+                frontier_diagnostics_path=args.frontier_diagnostics,
+                gold_audit_root=args.gold_audit_root,
             )
     except (PublicChallengeError, OSError, ValueError):
         print(json.dumps(_safe_failure(str(args.phase)), sort_keys=True))

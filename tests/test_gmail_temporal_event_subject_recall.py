@@ -104,6 +104,119 @@ def test_source_bound_event_clause_recovers_full_review_only_identity(
     )
 
 
+@pytest.mark.parametrize(
+    ("event_head", "predicate"),
+    (
+        ("consultation", "is scheduled for"),
+        ("rehearsal", "begins"),
+        ("seminar", "starts on"),
+        ("briefing", "will begin at"),
+        ("kickoff", "is scheduled for"),
+    ),
+)
+def test_new_named_event_heads_recover_the_full_source_bound_title(
+    event_head: str,
+    predicate: str,
+) -> None:
+    text = f"The Juniper annual {event_head} {predicate} November 3, 2029."
+
+    analysis, titles = source_bound_titles(text)
+
+    assert len(titles) == 1
+    title = titles[0]
+    assert text[title.start : title.end] == f"Juniper annual {event_head}"
+    assert any(lead.mention_id == title.mention_id for lead in analysis.leads)
+
+
+@pytest.mark.parametrize("identifier", ("42", "2027", "123456", "12345678"))
+def test_bounded_numeric_identifiers_recover_the_full_source_bound_title(
+    identifier: str,
+) -> None:
+    text = f"The Project {identifier} kickoff starts on November 3, 2029."
+
+    analysis, titles = source_bound_titles(text)
+
+    assert len(titles) == 1
+    title = titles[0]
+    assert text[title.start : title.end] == f"Project {identifier} kickoff"
+    assert any(lead.mention_id == title.mention_id for lead in analysis.leads)
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    (
+        "Separately, the",
+        "In a separate item, the",
+        "On another line, the",
+        "Independently, the",
+    ),
+)
+def test_discourse_prefixed_second_clause_recovers_its_own_event_title(
+    prefix: str,
+) -> None:
+    text = (
+        "The Radian 002 Mica Valley interview is scheduled for September 16, 2027. "
+        f"{prefix} Radian 002 Nectar Bay workshop is scheduled for "
+        "September 17, 2027."
+    )
+
+    analysis, titles = source_bound_titles(text)
+    titles_by_surface = {text[item.start : item.end]: item for item in titles}
+
+    assert set(titles_by_surface) == {
+        "Radian 002 Mica Valley interview",
+        "Radian 002 Nectar Bay workshop",
+    }
+    second_title = titles_by_surface["Radian 002 Nectar Bay workshop"]
+    expressions = {text[item.start : item.end]: item for item in analysis.expressions}
+    assert {
+        lead.expression_id
+        for lead in analysis.leads
+        if lead.mention_id == second_title.mention_id
+    } == {expressions["September 17, 2027"].expression_id}
+
+    plan = plan_gmail_temporal_selector_batches(text=text, analysis=analysis)
+    assert any(
+        candidate.subject_mention_id == second_title.mention_id
+        and candidate.relation == "occurrence"
+        and candidate.lifecycle == "scheduled"
+        and candidate.normalized_value == "2027-09-17"
+        for batch in plan.batches
+        for candidate in build_gmail_temporal_candidate_frontier(
+            analysis=analysis,
+            batch=batch,
+        ).candidates
+    )
+
+
+@pytest.mark.parametrize(
+    "second_clause",
+    (
+        (
+            "We discussed this separately, the Nectar Bay workshop is scheduled "
+            "for September 17, 2027."
+        ),
+        ("Separately, the Nectar Bay\nworkshop is scheduled for September 17, 2027."),
+        (
+            "Separately, the Nectar Bay workshop report is scheduled for "
+            "September 17, 2027."
+        ),
+        ("As background, the Nectar Bay workshop is scheduled for September 17, 2027."),
+    ),
+)
+def test_discourse_prefixed_title_grammar_rejects_unbounded_lookalikes(
+    second_clause: str,
+) -> None:
+    text = (
+        "The Mica Valley interview is scheduled for September 16, 2027. "
+        f"{second_clause}"
+    )
+
+    _analysis, titles = source_bound_titles(text)
+
+    assert {text[item.start : item.end] for item in titles} == {"Mica Valley interview"}
+
+
 def test_alternative_dates_reach_frontier_but_confirmation_date_stays_an_action() -> (
     None
 ):
@@ -361,6 +474,9 @@ def test_clause_bound_identity_supersedes_weaker_subject_bridge(text: str) -> No
         "The Northstar design\nreview scheduled for October 6, 2027.",
         "The Acme parcel delivery is scheduled for September 18, 2027.",
         "The Northstar account review is scheduled for October 6, 2027.",
+        "The Project 123456789 kickoff is scheduled for October 6, 2027.",
+        "The Project 42 kickoff report is scheduled for October 6, 2027.",
+        "The Invoice 2027 review is scheduled for October 6, 2027.",
         "The cedar partner summit is scheduled for October 7, 2027.",
         "> The Northstar design review scheduled for October 6, 2027.\n",
         (

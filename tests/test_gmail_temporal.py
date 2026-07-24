@@ -260,6 +260,48 @@ def test_generic_or_non_temporal_meeting_phrase_is_never_promoted() -> None:
     )
 
 
+def test_artifact_owned_event_head_is_not_stabilized_as_a_timed_event() -> None:
+    samples = (
+        (
+            "The recording of the seminar is scheduled for deletion on "
+            "November 3, 2029.",
+            "The Juniper seminar is scheduled for November 3, 2029.",
+            "November 3, 2029",
+            "2029-11-03",
+            "seminar",
+        ),
+        (
+            "The transcript from the briefing is scheduled for publication on "
+            "November 4, 2029.",
+            "The Juniper briefing is scheduled for November 4, 2029.",
+            "November 4, 2029",
+            "2029-11-04",
+            "briefing",
+        ),
+    )
+
+    for artifact_text, genuine_text, expression, expected_start, event_head in samples:
+        raw_event_time = {
+            "kind": "planned",
+            "start_at": expected_start,
+            "precision": "day",
+            "expression": expression,
+        }
+        blocked = stabilize(artifact_text, raw_event_time)
+        genuine = stabilize(genuine_text, raw_event_time)
+
+        assert blocked.event_time is None
+        assert blocked.errors == (
+            "gmail event_time requires its expression and event in one cited sentence",
+        )
+        assert genuine.errors == ()
+        assert genuine.event_time and genuine.event_time["start_at"] == expected_start
+        primary = next(
+            mention for mention in genuine.entity_mentions if mention["is_primary"]
+        )
+        assert event_head in str(primary["surface"]).casefold()
+
+
 def test_nearest_event_predicate_owns_the_selected_expression() -> None:
     evidence = (
         "Orchid Interview is scheduled on May 1, 2026, and the Cedar "

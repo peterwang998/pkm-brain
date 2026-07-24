@@ -3,9 +3,11 @@
 
 The input is an owner-only canonical JSON fixture containing synthetic sources
 and semantic gold.  The freezer ingests those sources into a fresh isolated
-Brain home, verifies that every gold member is represented in the deterministic
-production frontier, and writes only hash-bound owner-only challenge artifacts.
-It never invokes a model and never prints fixture content.
+Brain home and writes only hash-bound owner-only challenge artifacts. Positive
+cases that the deterministic production frontier misses remain in the frozen
+challenge so the later score measures end-to-end recall; the freezer reports
+that frontier coverage only through a content-free authenticated sidecar. It
+never invokes a model and never prints fixture content.
 """
 
 from __future__ import annotations
@@ -40,10 +42,10 @@ from pkm_brain.service import BrainService
 from pkm_brain.util import slugify
 
 
-VERSION = "gmail_temporal_public_challenge_freezer_v1"
+VERSION = "gmail_temporal_public_challenge_freezer_v2"
 FIXTURE_VERSION = "gmail_temporal_public_challenge_fixture_v3"
 ACCOUNT_DOMAIN = "public.example.test"
-MAX_CASES = 32
+MAX_CASES = 128
 MAX_SUBJECT_CHARS = 500
 MAX_BODY_CHARS = 20_000
 
@@ -473,6 +475,7 @@ def freeze_public_challenge(
     """Materialize one fresh public-only challenge without opening a model path."""
 
     fixture = _load_fixture(fixture_path)
+    fixture_raw = _canonical_json(fixture) + b"\n"
     try:
         key = challenge._key(hmac_key_path)  # noqa: SLF001
     except challenge.PublicChallengeError as exc:
@@ -510,7 +513,11 @@ def freeze_public_challenge(
         ) from exc
     BrainService(paths).init_workspace()
     challenge_rows: list[dict[str, str]] = []
+    frontier_diagnostic_rows: list[dict[str, Any]] = []
     candidate_cases = 0
+    positive_zero_work_cases = 0
+    frontier_covered_gold_members = 0
+    frontier_missing_gold_members = 0
     total_candidates = 0
     import pkm_brain.gmail_temporal_runner as production_runner
 
@@ -532,18 +539,29 @@ def freeze_public_challenge(
             gmail_message_id=message_id,
         )
         members = row["members"]
-        if members and not preparation.requests:
-            raise PublicChallengeFreezerError(
-                "positive public case has no verifier authority"
-            )
-        if any(
-            not _member_has_frontier_authority(member, authority) for member in members
-        ):
-            raise PublicChallengeFreezerError(
-                "public gold member is absent from the production frontier"
-            )
+        member_frontier_coverage = tuple(
+            _member_has_frontier_authority(member, authority) for member in members
+        )
+        covered_members = sum(member_frontier_coverage)
+        frontier_covered_gold_members += covered_members
+        frontier_missing_gold_members += len(members) - covered_members
+        positive_zero_work_cases += int(bool(members) and not preparation.requests)
         candidate_cases += int(bool(preparation.requests))
         total_candidates += preparation.candidate_count
+        frontier_diagnostic_rows.append(
+            {
+                "case_id": str(row["case_id"]),
+                "gold_members": len(members),
+                "frontier_covered_gold_members": covered_members,
+                "frontier_missing_gold_members": len(members) - covered_members,
+                "positive": bool(members),
+                "candidate_count": preparation.candidate_count,
+                "candidate_bearing": preparation.candidate_count > 0,
+                "verifier_request_count": len(preparation.requests),
+                "zero_work": not preparation.requests,
+                "positive_zero_work": bool(members) and not preparation.requests,
+            }
+        )
         challenge_rows.append(
             {
                 "case_id": str(row["case_id"]),
@@ -568,6 +586,43 @@ def freeze_public_challenge(
         "cases": challenge_rows,
     }
     manifest_raw = _canonical_json(manifest) + b"\n"
+    frontier_diagnostic_aggregates = {
+        "cases": len(frontier_diagnostic_rows),
+        "positive_cases": sum(
+            bool(row["positive"]) for row in frontier_diagnostic_rows
+        ),
+        "negative_cases": sum(not row["positive"] for row in frontier_diagnostic_rows),
+        "gold_members": sum(row["gold_members"] for row in frontier_diagnostic_rows),
+        "frontier_covered_gold_members": frontier_covered_gold_members,
+        "frontier_missing_gold_members": frontier_missing_gold_members,
+        "positive_zero_work_cases": positive_zero_work_cases,
+        "candidate_bearing_positive_cases": sum(
+            bool(row["positive"] and row["candidate_bearing"])
+            for row in frontier_diagnostic_rows
+        ),
+        "candidate_bearing_negative_cases": sum(
+            bool(not row["positive"] and row["candidate_bearing"])
+            for row in frontier_diagnostic_rows
+        ),
+    }
+    frontier_diagnostics = challenge._signed(  # noqa: SLF001
+        {
+            "version": challenge.FRONTIER_DIAGNOSTICS_VERSION,
+            "challenge_id": fixture["challenge_id"],
+            "challenge_manifest_sha256": _sha256(manifest_raw),
+            "gold_sha256": _sha256(gold_raw),
+            "fixture_sha256": _sha256(fixture_raw),
+            "aggregates": frontier_diagnostic_aggregates,
+            "cases": frontier_diagnostic_rows,
+            "public_synthetic": True,
+            "contains_private_gmail": False,
+            "release_eligible": False,
+        },
+        key=key,
+        domain=challenge.FRONTIER_DIAGNOSTICS_DOMAIN,
+        signature_field="frontier_diagnostics_hmac_sha256",
+    )
+    frontier_diagnostics_raw = _canonical_json(frontier_diagnostics) + b"\n"
     marker = challenge._signed(  # noqa: SLF001
         {
             "version": challenge.PUBLIC_ROOT_AUTHORITY_VERSION,
@@ -597,6 +652,10 @@ def freeze_public_challenge(
         challenge._write_private_new(  # noqa: SLF001
             resolved_output / "challenge.json", manifest_raw
         )
+        challenge._write_private_new(  # noqa: SLF001
+            resolved_output / challenge.FRONTIER_DIAGNOSTICS_FILENAME,
+            frontier_diagnostics_raw,
+        )
     except challenge.PublicChallengeError as exc:
         raise PublicChallengeFreezerError(
             "public challenge artifacts could not be frozen"
@@ -624,9 +683,19 @@ def freeze_public_challenge(
         ),
         "candidate_cases": candidate_cases,
         "zero_work_cases": len(challenge_rows) - candidate_cases,
+        "positive_zero_work_cases": positive_zero_work_cases,
+        "frontier_covered_gold_members": frontier_covered_gold_members,
+        "frontier_missing_gold_members": frontier_missing_gold_members,
+        "candidate_bearing_positive_cases": frontier_diagnostic_aggregates[
+            "candidate_bearing_positive_cases"
+        ],
+        "candidate_bearing_negative_cases": frontier_diagnostic_aggregates[
+            "candidate_bearing_negative_cases"
+        ],
         "candidates": total_candidates,
         "challenge_sha256": _sha256(manifest_raw),
         "gold_sha256": _sha256(gold_raw),
+        "frontier_diagnostics_sha256": _sha256(frontier_diagnostics_raw),
         "external_calls": 0,
         "public_synthetic": True,
         "contains_private_gmail": False,

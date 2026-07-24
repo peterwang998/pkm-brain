@@ -305,7 +305,7 @@ def test_default_mention_cap_covers_dense_citable_segment() -> None:
     expected = {
         item.mention_id for item in value.mentions if item.mention_type in citable_types
     }
-    assert len(expected) == 20
+    assert len(expected) == 21
 
     plan = plan_gmail_temporal_selector_batches(text=text, analysis=value)
 

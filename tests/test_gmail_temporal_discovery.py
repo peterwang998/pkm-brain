@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import asdict
 
+import pytest
+
 from pkm_brain.gmail_temporal_discovery import (
     GmailTemporalCandidate,
     discover_gmail_temporal_candidates,
@@ -241,6 +243,154 @@ def test_direct_occurrence_and_start_cues_remain_supported() -> None:
     for text in samples:
         (candidate,) = discover(text)
         assert candidate.start_at == "2027-05-14"
+
+
+@pytest.mark.parametrize(
+    "event_head",
+    ("consultation", "rehearsal", "seminar", "briefing", "kickoff"),
+)
+def test_named_event_heads_reach_deterministic_occurrence_discovery(
+    event_head: str,
+) -> None:
+    text = f"The Juniper {event_head} is scheduled for November 3, 2029."
+
+    (candidate,) = discover(text)
+
+    assert (candidate.relation, candidate.kind, candidate.start_at) == (
+        "occurrence",
+        "planned",
+        "2029-11-03",
+    )
+
+
+@pytest.mark.parametrize(
+    ("artifact_text", "genuine_text", "expected_start"),
+    (
+        (
+            "The recording of the seminar is scheduled for deletion on "
+            "November 3, 2029.",
+            "The Juniper seminar is scheduled for November 3, 2029.",
+            "2029-11-03",
+        ),
+        (
+            "The transcript from the briefing is scheduled for publication on "
+            "November 4, 2029.",
+            "The Juniper briefing is scheduled for November 4, 2029.",
+            "2029-11-04",
+        ),
+    ),
+)
+def test_artifact_owned_event_head_is_not_an_occurrence_cue(
+    artifact_text: str,
+    genuine_text: str,
+    expected_start: str,
+) -> None:
+    assert discover(artifact_text) == ()
+
+    (genuine,) = discover(genuine_text)
+    assert (genuine.relation, genuine.kind, genuine.start_at) == (
+        "occurrence",
+        "planned",
+        expected_start,
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "cue"),
+    (
+        ("Registration opens November 3, 2029.", "opens"),
+        ("Applications open November 3, 2029.", "open"),
+        ("The application window opens November 3, 2029.", "opens"),
+        (
+            "Marigold Residency registration opens November 3, 2029.",
+            "opens",
+        ),
+        (
+            "Foxglove Fellows applications open November 3, 2029.",
+            "open",
+        ),
+        (
+            "The Marigold Residency application window opens November 3, 2029.",
+            "opens",
+        ),
+        (
+            "Registration for Marigold Residency opens November 3, 2029.",
+            "opens",
+        ),
+        (
+            "Applications for Foxglove Fellows open November 3, 2029.",
+            "open",
+        ),
+    ),
+)
+def test_bounded_third_person_intake_opening_is_an_occurrence_start(
+    text: str,
+    cue: str,
+) -> None:
+    (candidate,) = discover(text)
+
+    assert (candidate.relation, candidate.kind, candidate.start_at) == (
+        "occurrence",
+        "planned",
+        "2029-11-03",
+    )
+    assert text[candidate.cue_span.start : candidate.cue_span.end] == cue
+
+
+@pytest.mark.parametrize(
+    ("subject", "cue"),
+    (
+        ("Registration", "opens"),
+        ("Applications", "open"),
+        ("Marigold Residency registration", "opens"),
+        ("Foxglove Fellows applications", "open"),
+        ("Registration for Marigold Residency", "opens"),
+    ),
+)
+def test_bounded_third_person_opening_can_precede_an_exact_closing_endpoint(
+    subject: str,
+    cue: str,
+) -> None:
+    text = f"{subject} {cue} November 3, 2029 and closes November 12, 2029."
+
+    candidates = discover(text)
+
+    openings = tuple(item for item in candidates if item.relation == "occurrence")
+    assert len(openings) == 1
+    opening = openings[0]
+    assert (opening.kind, opening.start_at, opening.end_at) == (
+        "planned",
+        "2029-11-03",
+        None,
+    )
+    assert text[opening.cue_span.start : opening.cue_span.end] == cue
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "The registration report opens November 3, 2029.",
+        "Marigold registration report opens November 3, 2029.",
+        "The clerk opens registration on November 3, 2029.",
+        "Keep Marigold Residency applications open November 3, 2029.",
+        "We reviewed Marigold Residency applications open on November 3, 2029.",
+        "Applications for QA open November 3, 2029.",
+        "Registration for the report opens November 3, 2029.",
+        "Registration opens November 3, 2029 according to the memo.",
+        (
+            "Marigold Residency applications open November 3, 2029 "
+            "according to the memo."
+        ),
+        (
+            "Registration opens November 3, 2029 and closes "
+            "November 12, 2029 according to the memo."
+        ),
+    ),
+)
+def test_third_person_opening_does_not_admit_transitive_or_unbounded_occurrences(
+    text: str,
+) -> None:
+    assert not any(candidate.relation == "occurrence" for candidate in discover(text))
 
 
 def test_named_boundary_requires_a_separate_unambiguous_event_noun() -> None:
