@@ -23,6 +23,7 @@ import os
 import re
 import stat
 import sys
+import time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -49,6 +50,7 @@ MAX_REQUEST_BYTES = 48_000
 MAX_RESPONSE_BYTES = 32_768
 DEFAULT_TIMEOUT_SECONDS = 900
 MAX_TIMEOUT_SECONDS = 1800
+MIN_EXTERNAL_CALL_START_INTERVAL_SECONDS = 31.0
 
 PLAN_DOMAIN = b"gmail_temporal_public_gold_audit_plan_v1\0"
 RECEIPT_DOMAIN = b"gmail_temporal_public_gold_audit_receipt_v1\0"
@@ -140,6 +142,21 @@ def _sha256(value: bytes) -> str:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _external_call_delay(
+    previous_started_monotonic: float | None,
+    current_monotonic: float,
+) -> float:
+    """Return the delay needed to stay within the restricted provider rate."""
+
+    if previous_started_monotonic is None:
+        return 0.0
+    return max(
+        0.0,
+        MIN_EXTERNAL_CALL_START_INTERVAL_SECONDS
+        - (current_monotonic - previous_started_monotonic),
+    )
 
 
 def _signed(
@@ -651,6 +668,7 @@ def audit_public_gold(
     completed_cases: list[dict[str, Any]] = []
     call_receipts: list[dict[str, Any]] = []
     response_schema = _response_schema()
+    previous_external_call_started_monotonic: float | None = None
     for unit_ordinal, request in enumerate(requests, start=1):
         call_root = output_root / "calls" / f"{unit_ordinal:03d}"
         try:
@@ -660,6 +678,15 @@ def audit_public_gold(
                 "owner-only audit call directory failed"
             ) from exc
         request_raw = _write_private_new(call_root / "request.json", request)
+        if not test_invoker_used:
+            current_monotonic = time.monotonic()
+            delay = _external_call_delay(
+                previous_external_call_started_monotonic,
+                current_monotonic,
+            )
+            if delay:
+                time.sleep(delay)
+            previous_external_call_started_monotonic = time.monotonic()
         started_at = _now()
         try:
             raw_response = active_invoke(

@@ -135,6 +135,15 @@ def test_response_schema_uses_provider_supported_array_constraints() -> None:
         )
 
 
+def test_external_call_pacing_enforces_minimum_start_interval() -> None:
+    interval = audit.MIN_EXTERNAL_CALL_START_INTERVAL_SECONDS
+    assert audit._external_call_delay(None, 100.0) == 0.0  # noqa: SLF001
+    assert audit._external_call_delay(100.0, 100.0 + interval) == 0.0  # noqa: SLF001
+    assert audit._external_call_delay(100.0, 105.0) == pytest.approx(  # noqa: SLF001
+        interval - 5.0
+    )
+
+
 def test_real_100_case_audit_is_blind_bounded_pinned_and_hmac_sealed(
     tmp_path: Path,
 ) -> None:
