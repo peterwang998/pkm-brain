@@ -80,10 +80,10 @@ The successful bounded capture canary left:
 The legacy facts, entities, fact links, and Operations counts are unchanged.
 Index doctor reports zero missing and zero stale vectors.
 
-After the first normally scheduled Gmail Knowledge batch, the final observed
-totals were 1,461 documents, 1,358 active documents, 8,088 chunks, and 7,974
-active chunks. Active FTS and LanceDB both contained the same 7,974 chunk IDs,
-with zero missing and zero stale vectors.
+After the first normally scheduled Gmail Knowledge batch, the checkpoint totals
+were 1,461 documents, 1,358 active documents, 8,088 chunks, and 7,974 active
+chunks. Active FTS and LanceDB both contained the same 7,974 chunk IDs, with
+zero missing and zero stale vectors.
 
 Private Gmail remains fail-closed for external extraction:
 
@@ -139,7 +139,10 @@ deleted 10, and stopped normally at its bounded partial-coverage checkpoint.
 The first normally scheduled Gmail Knowledge tick then captured and ingested
 500 revisions, wrote 1,136 embeddings, and reconciled to 897 active, 100
 deleted, and 3 superseded Gmail documents with zero errors and zero held
-documents.
+documents. The following automatic `capture_tick` also completed successfully:
+16 documents and 411 embeddings were written with zero errors. Its post-run
+index doctor found 8,385 active SQLite chunks and 8,385 Lance vectors, with
+zero missing and zero stale vectors.
 
 ## Continuing Work
 
