@@ -19,7 +19,12 @@ from pkm_brain.automation import (
     run_nightly_maintenance,
     validate_nightly_launch_agent_plist,
 )
-from pkm_brain.capture import AgentLogCapture, redact_text, render_hyprnote_transcript
+from pkm_brain.capture import (
+    MAX_RENDERED_AGENT_MARKDOWN_CHARS,
+    AgentLogCapture,
+    redact_text,
+    render_hyprnote_transcript,
+)
 from pkm_brain.db import connection
 from pkm_brain.google_cache import GoogleEvidenceCache
 from pkm_brain.llm import (
@@ -332,7 +337,149 @@ def test_capture_agents_writes_markdown_and_skips_unchanged(tmp_path: Path) -> N
     assert second.captured == 0
 
 
-def test_capture_skips_pkm_brain_codex_provider_sessions(tmp_path: Path) -> None:
+def test_unchanged_codex_capture_skips_rollout_materialization(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    svc = make_service(tmp_path)
+    capture = AgentLogCapture(
+        svc.paths,
+        codex_state=make_codex_fixture(tmp_path),
+        claude_projects=tmp_path / "missing-claude",
+        opencode_db=tmp_path / "missing-opencode.sqlite",
+    )
+    first = capture.capture(agent="codex")
+    assert first.captured == 1
+
+    def fail_materialization(_path: Path):
+        raise AssertionError("unchanged rollout should not be opened")
+
+    monkeypatch.setattr(
+        "pkm_brain.capture.read_codex_capture_events",
+        fail_materialization,
+    )
+    second = capture.capture(agent="codex")
+
+    assert second.skipped == 1
+    assert second.captured == 0
+
+
+def test_codex_capture_rematerializes_deleted_output(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    svc = make_service(tmp_path)
+    capture = AgentLogCapture(
+        svc.paths,
+        codex_state=make_codex_fixture(tmp_path),
+        claude_projects=tmp_path / "missing-claude",
+        opencode_db=tmp_path / "missing-opencode.sqlite",
+    )
+    first = capture.capture(agent="codex")
+    output = Path(first.artifacts[0])
+    output.unlink()
+    calls = 0
+    from pkm_brain import capture as capture_module
+
+    original = capture_module.read_codex_capture_events
+
+    def track_materialization(path: Path):
+        nonlocal calls
+        calls += 1
+        return original(path)
+
+    monkeypatch.setattr(
+        "pkm_brain.capture.read_codex_capture_events",
+        track_materialization,
+    )
+    second = capture.capture(agent="codex")
+
+    assert calls == 1
+    assert second.captured == 1
+    assert output.is_file()
+
+
+def test_codex_capture_keeps_conversation_and_bounds_runtime_noise(
+    tmp_path: Path,
+) -> None:
+    svc = make_service(tmp_path)
+    state = make_codex_fixture(tmp_path)
+    rollout = tmp_path / "rollout.jsonl"
+    events = [
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "bounded-request"}],
+            },
+        },
+        *[
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": f"assistant-update-{index}",
+                        }
+                    ],
+                },
+            }
+            for index in range(250)
+        ],
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "inspect_repository",
+                "arguments": '{"path":"src"}',
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "output": "forbidden-large-tool-output",
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "private_runtime_telemetry": "forbidden-token-telemetry",
+            },
+        },
+    ]
+    rollout.write_text(
+        "\n".join(json.dumps(event) for event in events) + "\n",
+        encoding="utf-8",
+    )
+    result = AgentLogCapture(
+        svc.paths,
+        codex_state=state,
+        claude_projects=tmp_path / "missing-claude",
+        opencode_db=tmp_path / "missing-opencode.sqlite",
+    ).capture(agent="codex")
+    text = Path(result.artifacts[0]).read_text(encoding="utf-8")
+
+    assert "bounded-request" in text
+    assert "assistant-update-0" in text
+    assert "assistant-update-50" not in text
+    assert "assistant-update-249" in text
+    assert "omitted 58 earlier session item(s)" in text
+    assert "inspect_repository" in text
+    assert "forbidden-large-tool-output" not in text
+    assert "forbidden-token-telemetry" not in text
+    assert len(text) <= MAX_RENDERED_AGENT_MARKDOWN_CHARS + 40
+
+
+def test_capture_skips_pkm_brain_codex_provider_sessions(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
     svc = make_service(tmp_path)
     capture = AgentLogCapture(
         svc.paths,
@@ -342,6 +489,13 @@ def test_capture_skips_pkm_brain_codex_provider_sessions(tmp_path: Path) -> None
         hyprnote_root=tmp_path / "missing-hyprnote",
     )
 
+    def fail_materialization(_path: Path):
+        raise AssertionError("provider rollout should be filtered from metadata")
+
+    monkeypatch.setattr(
+        "pkm_brain.capture.read_codex_capture_events",
+        fail_materialization,
+    )
     result = capture.capture(agent="codex")
 
     assert result.discovered == 0

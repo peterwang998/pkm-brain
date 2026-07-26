@@ -112,11 +112,9 @@ class ConnectorContext:
 class Connector(Protocol):
     manifest: ConnectorManifest
 
-    def preflight(self, ctx: ConnectorContext) -> PreflightReport:
-        ...
+    def preflight(self, ctx: ConnectorContext) -> PreflightReport: ...
 
-    def discover(self, ctx: ConnectorContext) -> list[Any]:
-        ...
+    def discover(self, ctx: ConnectorContext) -> list[Any]: ...
 
     def capture(
         self,
@@ -125,8 +123,7 @@ class Connector(Protocol):
         *,
         dry_run: bool = False,
         export_outbox: bool = False,
-    ) -> CaptureResult:
-        ...
+    ) -> CaptureResult: ...
 
 
 @dataclass(frozen=True)
@@ -199,9 +196,7 @@ class ConnectorBatchResult:
         self.artifacts.extend(run.artifacts)
         self.outbox_artifacts.extend(run.outbox_artifacts)
         if run.status == "failed":
-            self.errors.extend(
-                f"{run.connector_id}: {error}" for error in run.errors
-            )
+            self.errors.extend(f"{run.connector_id}: {error}" for error in run.errors)
             self.warnings.append(f"{run.connector_id}: failed; see connector_results")
         self.connector_results.append(run.as_dict())
 
@@ -262,7 +257,9 @@ class FilesConnector:
     def preflight(self, ctx: ConnectorContext) -> PreflightReport:
         return PreflightReport(
             ok=True,
-            warnings=[] if (ctx.paths.inbox / "documents").exists() else ["inbox/documents does not exist yet"],
+            warnings=[]
+            if (ctx.paths.inbox / "documents").exists()
+            else ["inbox/documents does not exist yet"],
         )
 
     def discover(self, ctx: ConnectorContext) -> list[AgentSessionCapture]:
@@ -299,7 +296,10 @@ def codex_connector() -> Connector:
             ],
             permissions_note="Reads ~/.codex/state_5.sqlite and rollout JSONL paths referenced by it.",
         ),
-        lambda ctx: CodexAdapter(ctx.path_setting("state_db", "~/.codex/state_5.sqlite")),
+        lambda ctx: CodexAdapter(
+            ctx.path_setting("state_db", "~/.codex/state_5.sqlite"),
+            capture_paths=ctx.paths,
+        ),
         preflight_path_key="state_db",
     )
 
@@ -324,7 +324,9 @@ def claude_connector() -> Connector:
             ],
             permissions_note="Reads JSONL files under ~/.claude/projects.",
         ),
-        lambda ctx: ClaudeAdapter(ctx.path_setting("projects_dir", "~/.claude/projects")),
+        lambda ctx: ClaudeAdapter(
+            ctx.path_setting("projects_dir", "~/.claude/projects")
+        ),
         preflight_path_key="projects_dir",
     )
 
@@ -349,7 +351,9 @@ def opencode_connector() -> Connector:
             ],
             permissions_note="Reads ~/.local/share/opencode/opencode.db.",
         ),
-        lambda ctx: OpenCodeAdapter(ctx.path_setting("db_path", "~/.local/share/opencode/opencode.db")),
+        lambda ctx: OpenCodeAdapter(
+            ctx.path_setting("db_path", "~/.local/share/opencode/opencode.db")
+        ),
         preflight_path_key="db_path",
     )
 
@@ -375,7 +379,9 @@ def hyprnote_connector() -> Connector:
             permissions_note="Reads meeting session folders under Hyprnote application support.",
             activation_note="Opt-in because it scans private meeting data outside the Brain home.",
         ),
-        lambda ctx: HyprnoteAdapter(ctx.path_setting("root", "~/Library/Application Support/hyprnote")),
+        lambda ctx: HyprnoteAdapter(
+            ctx.path_setting("root", "~/Library/Application Support/hyprnote")
+        ),
         preflight_path_key="root",
     )
 
@@ -466,7 +472,9 @@ class GmailKnowledgeConnector:
 
     def preflight(self, ctx: ConnectorContext) -> PreflightReport:
         try:
-            source_paths, account_key, _operator_email, _batch_size = self._settings(ctx)
+            source_paths, account_key, _operator_email, _batch_size = self._settings(
+                ctx
+            )
             policy = load_operations_policy(source_paths)
             gmail = policy.sources.gmail
             if not (
@@ -477,7 +485,9 @@ class GmailKnowledgeConnector:
             ):
                 return PreflightReport(
                     ok=False,
-                    errors=["The source Gmail archive is not approved for local agent access."],
+                    errors=[
+                        "The source Gmail archive is not approved for local agent access."
+                    ],
                 )
             store = GmailArchiveStore.for_paths(source_paths)
             status = store.status(account_key)
@@ -497,7 +507,9 @@ class GmailKnowledgeConnector:
 
     def discover(self, ctx: ConnectorContext) -> list[Any]:
         source_paths, account_key, _operator_email, _batch_size = self._settings(ctx)
-        return GmailArchiveStore.for_paths(source_paths).list_thread_snapshots(account_key)
+        return GmailArchiveStore.for_paths(source_paths).list_thread_snapshots(
+            account_key
+        )
 
     def capture(
         self,
@@ -530,15 +542,19 @@ class GmailKnowledgeConnector:
         source_paths = BrainPaths.from_value(source_home or ctx.paths.home)
         policy = load_operations_policy(source_paths)
         approved_account_key = str(policy.sources.gmail.account_key).strip()
-        account_key = str(ctx.settings.get("account_key") or approved_account_key).strip()
+        account_key = str(
+            ctx.settings.get("account_key") or approved_account_key
+        ).strip()
         if not account_key or account_key != approved_account_key:
             raise ValueError(
                 "Gmail Knowledge account_key must match the approved source policy account"
             )
         approved_operator_email = str(policy.operator.gmail.email).strip().casefold()
-        operator_email = str(
-            ctx.settings.get("operator_email") or approved_operator_email
-        ).strip().casefold()
+        operator_email = (
+            str(ctx.settings.get("operator_email") or approved_operator_email)
+            .strip()
+            .casefold()
+        )
         if not operator_email or operator_email != approved_operator_email:
             raise ValueError(
                 "Gmail Knowledge operator_email must match the approved source policy identity"
@@ -615,7 +631,9 @@ def connector_config_path(paths: BrainPaths) -> Path:
 
 
 def connector_registry() -> dict[str, Connector]:
-    return {connector_id: factory() for connector_id, factory in BUILTIN_CONNECTORS.items()}
+    return {
+        connector_id: factory() for connector_id, factory in BUILTIN_CONNECTORS.items()
+    }
 
 
 def load_connector_config(paths: BrainPaths) -> dict[str, Any]:
@@ -692,7 +710,9 @@ def get_connector(paths: BrainPaths, connector_id: str) -> dict[str, Any]:
     return connector_payload(paths, connector, config["connectors"][connector_id])
 
 
-def set_connector_enabled(paths: BrainPaths, connector_id: str, enabled: bool) -> dict[str, Any]:
+def set_connector_enabled(
+    paths: BrainPaths, connector_id: str, enabled: bool
+) -> dict[str, Any]:
     config = load_connector_config(paths)
     registry = connector_registry()
     connector = require_connector(registry, connector_id)
@@ -703,7 +723,9 @@ def set_connector_enabled(paths: BrainPaths, connector_id: str, enabled: bool) -
     return connector_payload(paths, connector, config["connectors"][connector_id])
 
 
-def update_connector_settings(paths: BrainPaths, connector_id: str, settings: dict[str, Any]) -> dict[str, Any]:
+def update_connector_settings(
+    paths: BrainPaths, connector_id: str, settings: dict[str, Any]
+) -> dict[str, Any]:
     config = load_connector_config(paths)
     registry = connector_registry()
     connector = require_connector(registry, connector_id)
@@ -723,7 +745,9 @@ def connector_payload(
         "manifest": connector.manifest.as_dict(),
         "state": {
             "enabled": bool(state.get("enabled", connector.manifest.default_enabled)),
-            "cadence_s": int(state.get("cadence_s", connector.manifest.default_cadence_s)),
+            "cadence_s": int(
+                state.get("cadence_s", connector.manifest.default_cadence_s)
+            ),
             "settings": dict(state.get("settings") or {}),
             "auth": connector_auth_status(paths, connector.manifest.id),
         },
@@ -738,7 +762,9 @@ def require_connector(registry: dict[str, Connector], connector_id: str) -> Conn
     return connector
 
 
-def validate_settings(manifest: ConnectorManifest, settings: dict[str, Any]) -> dict[str, Any]:
+def validate_settings(
+    manifest: ConnectorManifest, settings: dict[str, Any]
+) -> dict[str, Any]:
     fields = {field.key: field for field in manifest.settings_schema}
     unknown = sorted(set(settings) - set(fields))
     if unknown:
@@ -802,7 +828,9 @@ def run_connector_capture(
     config = load_connector_config(paths)
     registry = connector_registry()
     selected_ids = connector_ids or sorted(registry)
-    selected_ids = [connector_id for connector_id in selected_ids if connector_id in registry]
+    selected_ids = [
+        connector_id for connector_id in selected_ids if connector_id in registry
+    ]
     batch = ConnectorBatchResult()
     for connector_id in selected_ids:
         connector = registry[connector_id]
@@ -810,7 +838,9 @@ def run_connector_capture(
         if not connector.manifest.capture_available:
             batch.add_run(skipped_run(connector_id, "capture not implemented"))
             continue
-        if respect_enabled and not bool(state.get("enabled", connector.manifest.default_enabled)):
+        if respect_enabled and not bool(
+            state.get("enabled", connector.manifest.default_enabled)
+        ):
             run = skipped_run(connector_id, "disabled")
             batch.add_run(run)
             continue
@@ -867,7 +897,9 @@ def run_one_connector(
         )
     try:
         candidates = connector.discover(ctx)
-        result = connector.capture(ctx, candidates, dry_run=dry_run, export_outbox=export_outbox)
+        result = connector.capture(
+            ctx, candidates, dry_run=dry_run, export_outbox=export_outbox
+        )
     except Exception as exc:
         return ConnectorRun(
             connector_id=connector.manifest.id,
@@ -927,7 +959,9 @@ def update_health(state: dict[str, Any], run: ConnectorRun) -> None:
         "exported": run.exported,
     }
     if run.status == "failed":
-        health["consecutive_failures"] = int(health.get("consecutive_failures") or 0) + 1
+        health["consecutive_failures"] = (
+            int(health.get("consecutive_failures") or 0) + 1
+        )
         health["status"] = f"failing({health['consecutive_failures']})"
         health["last_error"] = "; ".join(run.errors[:3]) or "connector failed"
     else:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -19,9 +20,15 @@ from .util import file_sha256, now_iso, slugify, text_sha256
 
 MAX_ITEM_CHARS = 4000
 MAX_RAW_JSON_CHARS = 1200
+MAX_USER_MESSAGE_ITEMS = 96
+MAX_ASSISTANT_MESSAGE_ITEMS = 192
+MAX_TOOL_ACTIVITY_ITEMS = 32
+MAX_RAW_EVENT_ITEMS = 8
+MAX_RENDERED_AGENT_MARKDOWN_CHARS = 1_500_000
 SKIPPED_TEXT_KEYS = {"data"}
 SKIPPED_CONTAINER_KEYS = {"snapshot", "pastedContents"}
 CAPTURE_FORMAT_VERSION = "agent-md-v5"
+CODEX_CAPTURE_FORMAT_VERSION = "codex-semantic-v1"
 HYPRNOTE_TRANSCRIPT_RENDER_VERSION = "chronological-speaker-turns-v2"
 HYPRNOTE_MAX_TURN_WORDS = 240
 HYPRNOTE_TURN_GAP_MS = 2500
@@ -109,8 +116,7 @@ class CaptureResult:
 class AgentLogAdapter(Protocol):
     agent: str
 
-    def capture_sessions(self) -> list[AgentSessionCapture]:
-        ...
+    def capture_sessions(self) -> list[AgentSessionCapture]: ...
 
 
 class AgentLogCapture:
@@ -125,9 +131,15 @@ class AgentLogCapture:
     ) -> None:
         self.paths = paths
         self.codex_state = codex_state or Path("~/.codex/state_5.sqlite").expanduser()
-        self.claude_projects = claude_projects or Path("~/.claude/projects").expanduser()
-        self.opencode_db = opencode_db or Path("~/.local/share/opencode/opencode.db").expanduser()
-        self.hyprnote_root = hyprnote_root or Path("~/Library/Application Support/hyprnote").expanduser()
+        self.claude_projects = (
+            claude_projects or Path("~/.claude/projects").expanduser()
+        )
+        self.opencode_db = (
+            opencode_db or Path("~/.local/share/opencode/opencode.db").expanduser()
+        )
+        self.hyprnote_root = (
+            hyprnote_root or Path("~/Library/Application Support/hyprnote").expanduser()
+        )
         self.include_hyprnote = include_hyprnote
 
     def adapters(self, agent: str = "all") -> list[AgentLogAdapter]:
@@ -136,7 +148,7 @@ class AgentLogCapture:
             selected.add("hyprnote")
         adapters: list[AgentLogAdapter] = []
         if "codex" in selected:
-            adapters.append(CodexAdapter(self.codex_state))
+            adapters.append(CodexAdapter(self.codex_state, capture_paths=self.paths))
         if "claude" in selected:
             adapters.append(ClaudeAdapter(self.claude_projects))
         if "opencode" in selected:
@@ -145,7 +157,9 @@ class AgentLogCapture:
             adapters.append(HyprnoteAdapter(self.hyprnote_root))
         return adapters
 
-    def capture(self, agent: str = "all", dry_run: bool = False, export_outbox: bool = False) -> CaptureResult:
+    def capture(
+        self, agent: str = "all", dry_run: bool = False, export_outbox: bool = False
+    ) -> CaptureResult:
         self.paths.inbox.mkdir(parents=True, exist_ok=True)
         result = CaptureResult()
         for adapter in self.adapters(agent):
@@ -174,7 +188,12 @@ class AgentLogCapture:
         result = CaptureResult(discovered=len(sessions))
         for session in sessions:
             result.warnings.extend(session.warnings)
-            output = self.paths.inbox / session.output_group / session.agent / f"{slugify(session.session_id)}.md"
+            output = (
+                self.paths.inbox
+                / session.output_group
+                / session.agent
+                / f"{slugify(session.session_id)}.md"
+            )
             if self._is_unchanged(session):
                 result.skipped += 1
                 if export_outbox and not dry_run and output.exists():
@@ -184,7 +203,9 @@ class AgentLogCapture:
                             result.exported += 1
                         result.outbox_artifacts.append(str(export.path))
                     except Exception as exc:
-                        result.errors.append(f"{session.agent}:{session.session_id}: outbox export failed: {exc}")
+                        result.errors.append(
+                            f"{session.agent}:{session.session_id}: outbox export failed: {exc}"
+                        )
                 continue
             if dry_run:
                 result.captured += 1
@@ -203,7 +224,9 @@ class AgentLogCapture:
                         result.exported += 1
                     result.outbox_artifacts.append(str(export.path))
                 except Exception as exc:
-                    result.errors.append(f"{session.agent}:{session.session_id}: outbox export failed: {exc}")
+                    result.errors.append(
+                        f"{session.agent}:{session.session_id}: outbox export failed: {exc}"
+                    )
         return result
 
     def _is_unchanged(self, session: AgentSessionCapture) -> bool:
@@ -271,8 +294,14 @@ class AgentLogCapture:
 class CodexAdapter:
     agent = "codex"
 
-    def __init__(self, state_db: Path) -> None:
+    def __init__(
+        self,
+        state_db: Path,
+        *,
+        capture_paths: BrainPaths | None = None,
+    ) -> None:
         self.state_db = state_db.expanduser()
+        self.capture_paths = capture_paths
 
     def capture_sessions(self) -> list[AgentSessionCapture]:
         if not self.state_db.exists():
@@ -280,9 +309,20 @@ class CodexAdapter:
         conn = sqlite3.connect(self.state_db)
         conn.row_factory = sqlite3.Row
         try:
+            thread_columns = {
+                str(column["name"])
+                for column in conn.execute("PRAGMA table_info(threads)")
+            }
+            first_user_message = (
+                "first_user_message"
+                if "first_user_message" in thread_columns
+                else "''"
+            )
             rows = conn.execute(
-                """
-                SELECT id, rollout_path, cwd, title, model, reasoning_effort, created_at_ms, updated_at_ms
+                f"""
+                SELECT id, rollout_path, cwd, title, model, reasoning_effort,
+                       created_at_ms, updated_at_ms,
+                       {first_user_message} AS first_user_message
                 FROM threads
                 WHERE rollout_path IS NOT NULL AND rollout_path != ''
                 ORDER BY updated_at_ms DESC
@@ -292,12 +332,39 @@ class CodexAdapter:
             conn.close()
         captures: list[AgentSessionCapture] = []
         for row in rows:
+            title = row["title"] or f"Codex session {row['id']}"
+            first_user_message = str(row["first_user_message"] or "")
+            if is_self_generated_codex_provider_session(
+                "codex",
+                title,
+                [first_user_message] if first_user_message else [],
+            ):
+                continue
             rollout = Path(row["rollout_path"]).expanduser()
             if not rollout.exists():
                 continue
-            events = read_jsonl(rollout)
             stat = rollout.stat()
-            title = row["title"] or f"Codex session {row['id']}"
+            cached_source_hash = cached_codex_source_hash(
+                self.capture_paths,
+                session_id=str(row["id"]),
+                source_path=rollout,
+                source_stat=stat,
+            )
+            if cached_source_hash is not None:
+                captures.append(
+                    AgentSessionCapture(
+                        agent="codex",
+                        session_id=row["id"],
+                        title=title,
+                        source_path=rollout,
+                        source_hash=cached_source_hash,
+                        source_mtime=stat.st_mtime,
+                        source_size=stat.st_size,
+                        markdown="",
+                    )
+                )
+                continue
+            source_hash, source_event_count, events = read_codex_capture_events(rollout)
             user_messages = extracted_role_messages(events, "user")
             if is_self_generated_codex_provider_session("codex", title, user_messages):
                 continue
@@ -312,6 +379,9 @@ class CodexAdapter:
                 "title": title,
                 "model": row["model"] or "Unknown",
                 "reasoning_effort": row["reasoning_effort"] or "Unknown",
+                "source_event_count": source_event_count,
+                "knowledge_event_count": len(events),
+                "capture_format": CODEX_CAPTURE_FORMAT_VERSION,
             }
             captures.append(
                 AgentSessionCapture(
@@ -319,7 +389,7 @@ class CodexAdapter:
                     session_id=row["id"],
                     title=title,
                     source_path=rollout,
-                    source_hash=file_sha256(rollout),
+                    source_hash=(f"{CODEX_CAPTURE_FORMAT_VERSION}:{source_hash}"),
                     source_mtime=stat.st_mtime,
                     source_size=stat.st_size,
                     markdown=render_markdown(metadata, events),
@@ -351,8 +421,15 @@ class ClaudeAdapter:
             session_events = [event for _, event in path_events]
             stats = [path.stat() for path in set(paths)]
             source_path = paths[0]
-            title = find_first_value(session_events, "aiTitle") or f"Claude session {session_id}"
-            cwd = find_first_value(session_events, "cwd") or find_first_value(session_events, "project") or "Unknown"
+            title = (
+                find_first_value(session_events, "aiTitle")
+                or f"Claude session {session_id}"
+            )
+            cwd = (
+                find_first_value(session_events, "cwd")
+                or find_first_value(session_events, "project")
+                or "Unknown"
+            )
             metadata = {
                 "source_type": "agent_session_log",
                 "agent": "claude",
@@ -371,7 +448,12 @@ class ClaudeAdapter:
                     session_id=session_id,
                     title=title,
                     source_path=source_path,
-                    source_hash=text_sha256("\n".join(json.dumps(event, sort_keys=True) for event in session_events)),
+                    source_hash=text_sha256(
+                        "\n".join(
+                            json.dumps(event, sort_keys=True)
+                            for event in session_events
+                        )
+                    ),
                     source_mtime=max(stat.st_mtime for stat in stats),
                     source_size=sum(stat.st_size for stat in stats),
                     markdown=render_markdown(metadata, session_events),
@@ -440,7 +522,9 @@ class OpenCodeAdapter:
                             session_id=session["id"],
                             title=title,
                             source_path=self.db_path,
-                            source_hash=text_sha256(json.dumps(session_payload, sort_keys=True)),
+                            source_hash=text_sha256(
+                                json.dumps(session_payload, sort_keys=True)
+                            ),
                             source_mtime=self.db_path.stat().st_mtime,
                             source_size=self.db_path.stat().st_size,
                             markdown=render_markdown(metadata, events),
@@ -462,7 +546,11 @@ class HyprnoteAdapter:
         if not sessions_dir.exists():
             return []
         captures: list[AgentSessionCapture] = []
-        for session_dir in sorted((path for path in sessions_dir.iterdir() if path.is_dir()), key=session_modified_at, reverse=True):
+        for session_dir in sorted(
+            (path for path in sessions_dir.iterdir() if path.is_dir()),
+            key=session_modified_at,
+            reverse=True,
+        ):
             capture = self.capture_session(session_dir)
             if capture:
                 captures.append(capture)
@@ -481,8 +569,12 @@ class HyprnoteAdapter:
         meta = read_json_object(session_dir / "_meta.json")
         session_id = str(meta.get("id") or session_dir.name)
         event = meta.get("event") if isinstance(meta.get("event"), dict) else {}
-        title = str(meta.get("title") or event.get("title") or f"Hyprnote session {session_id}")
-        participant_names, participant_paths = hyprnote_participant_names(self.root, meta)
+        title = str(
+            meta.get("title") or event.get("title") or f"Hyprnote session {session_id}"
+        )
+        participant_names, participant_paths = hyprnote_participant_names(
+            self.root, meta
+        )
         summary = read_text_if_exists(session_dir / "_summary.md")
         memo = read_text_if_exists(session_dir / "_memo.md")
         transcript = render_hyprnote_transcript(session_dir / "transcript.json")
@@ -520,7 +612,9 @@ class HyprnoteAdapter:
             source_hash=source_hash,
             source_mtime=max(stat.st_mtime for stat in stats),
             source_size=sum(stat.st_size for stat in stats),
-            markdown=render_hyprnote_markdown(metadata, summary=summary, memo=memo, transcript=transcript),
+            markdown=render_hyprnote_markdown(
+                metadata, summary=summary, memo=memo, transcript=transcript
+            ),
             source_kind="hyprnote_meeting",
             output_group="documents",
         )
@@ -537,9 +631,13 @@ class OutboxExport:
     manifest_changed: bool
 
 
-def export_capture_to_outbox(paths: BrainPaths, session: AgentSessionCapture, captured_path: Path) -> OutboxExport:
+def export_capture_to_outbox(
+    paths: BrainPaths, session: AgentSessionCapture, captured_path: Path
+) -> OutboxExport:
     node_id, outbox_root = outbox_destination(paths)
-    relative_path = Path(session.output_group) / session.agent / f"{slugify(session.session_id)}.md"
+    relative_path = (
+        Path(session.output_group) / session.agent / f"{slugify(session.session_id)}.md"
+    )
     target = outbox_root / relative_path
     content_hash = file_sha256(captured_path)
     exported = link_or_copy_if_changed(captured_path, target, content_hash)
@@ -579,7 +677,9 @@ def outbox_destination(paths: BrainPaths) -> tuple[str, Path]:
     return config.node_id, paths.outbox / config.node_id
 
 
-def link_or_copy_if_changed(source: Path, target: Path, content_hash: str | None = None) -> bool:
+def link_or_copy_if_changed(
+    source: Path, target: Path, content_hash: str | None = None
+) -> bool:
     content_hash = content_hash or file_sha256(source)
     if target.exists() and file_sha256(target) == content_hash:
         return False
@@ -619,7 +719,9 @@ def update_outbox_manifest(manifest_path: Path, row: dict[str, Any]) -> bool:
         json.dumps(rows_by_path[key], sort_keys=True, separators=(",", ":")) + "\n"
         for key in sorted(rows_by_path)
     )
-    current = manifest_path.read_text(encoding="utf-8") if manifest_path.exists() else ""
+    current = (
+        manifest_path.read_text(encoding="utf-8") if manifest_path.exists() else ""
+    )
     if current == serialized:
         return False
     tmp = manifest_path.with_suffix(".jsonl.tmp")
@@ -657,6 +759,158 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return events
 
 
+def cached_codex_source_hash(
+    paths: BrainPaths | None,
+    *,
+    session_id: str,
+    source_path: Path,
+    source_stat: os.stat_result,
+) -> str | None:
+    """Return a reusable source hash without opening an unchanged rollout."""
+
+    if paths is None or not paths.sqlite_path.exists():
+        return None
+    capture_id = f"codex:{session_id}"
+    with connection(paths.sqlite_path) as conn:
+        row = conn.execute(
+            """
+            SELECT source_path, source_hash, source_mtime, source_size,
+                   captured_path, status
+            FROM capture_sources
+            WHERE id = ?
+            """,
+            (capture_id,),
+        ).fetchone()
+    if row is None or row["status"] != "captured":
+        return None
+    captured_path = Path(str(row["captured_path"] or ""))
+    if not captured_path.is_file():
+        return None
+    if Path(str(row["source_path"] or "")).expanduser() != source_path:
+        return None
+    if row["source_size"] is None or int(row["source_size"]) != source_stat.st_size:
+        return None
+    if (
+        row["source_mtime"] is None
+        or abs(float(row["source_mtime"]) - source_stat.st_mtime) > 1e-6
+    ):
+        return None
+    prefix = f"{CAPTURE_FORMAT_VERSION}:"
+    stored_hash = str(row["source_hash"] or "")
+    if not stored_hash.startswith(prefix):
+        return None
+    reusable_hash = stored_hash[len(prefix) :]
+    if re.fullmatch(r"[0-9a-f]{64}", reusable_hash):
+        # Legacy v5 captures remain valid until their append-only rollout grows.
+        return reusable_hash
+    semantic_prefix = f"{CODEX_CAPTURE_FORMAT_VERSION}:"
+    if reusable_hash.startswith(semantic_prefix) and re.fullmatch(
+        r"[0-9a-f]{64}", reusable_hash[len(semantic_prefix) :]
+    ):
+        return reusable_hash
+    return None
+
+
+def read_codex_capture_events(
+    path: Path,
+) -> tuple[str, int, list[dict[str, Any]]]:
+    """Stream one Codex rollout into bounded, knowledge-bearing events."""
+
+    digest = hashlib.sha256()
+    source_event_count = 0
+    events: list[dict[str, Any]] = []
+    with path.open("rb") as handle:
+        for raw_line in handle:
+            digest.update(raw_line)
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            source_event_count += 1
+            try:
+                parsed = json.loads(stripped)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                events.append(
+                    {
+                        "type": "unparsed",
+                        "text": truncate_text(
+                            stripped.decode("utf-8", errors="replace"),
+                            MAX_RAW_JSON_CHARS,
+                        ),
+                    }
+                )
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            normalized = normalize_codex_event(parsed)
+            if normalized is not None:
+                events.append(normalized)
+    return digest.hexdigest(), source_event_count, events
+
+
+def normalize_codex_event(event: dict[str, Any]) -> dict[str, Any] | None:
+    """Keep conversational evidence and concise calls; drop runtime telemetry."""
+
+    root_type = str(event.get("type") or "").lower()
+    if root_type in {"user", "assistant"}:
+        text = extract_text(event)
+        return (
+            {"type": root_type, "text": truncate_text(text, MAX_ITEM_CHARS)}
+            if text
+            else None
+        )
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    payload_type = str(payload.get("type") or "").lower()
+    role = str(payload.get("role") or "").lower()
+    normalized_role: str | None = None
+    if root_type == "response_item":
+        if payload_type == "message" and role in {"user", "assistant"}:
+            normalized_role = role
+        elif payload_type == "agent_message":
+            normalized_role = "assistant"
+        elif payload_type in {
+            "custom_tool_call",
+            "function_call",
+            "tool_search_call",
+        }:
+            normalized_role = "tool"
+    elif root_type == "event_msg":
+        if payload_type == "user_message":
+            normalized_role = "user"
+        elif payload_type == "agent_message":
+            normalized_role = "assistant"
+    if normalized_role is None:
+        return None
+    text = codex_payload_text(payload, tool_call=normalized_role == "tool")
+    if not text:
+        return None
+    return {
+        "type": normalized_role,
+        "text": truncate_text(text, MAX_ITEM_CHARS),
+    }
+
+
+def codex_payload_text(
+    payload: dict[str, Any],
+    *,
+    tool_call: bool = False,
+) -> str:
+    text = extract_text(payload)
+    if text:
+        return text
+    message = payload.get("message")
+    if isinstance(message, str):
+        return redact_text(message)
+    if not tool_call:
+        return ""
+    parts = [
+        str(payload.get(key) or "").strip()
+        for key in ("name", "tool", "arguments", "input")
+    ]
+    return redact_text("\n".join(part for part in parts if part))
+
+
 def render_markdown(metadata: dict[str, Any], events: list[dict[str, Any]]) -> str:
     user_messages: list[str] = []
     assistant_messages: list[str] = []
@@ -664,10 +918,17 @@ def render_markdown(metadata: dict[str, Any], events: list[dict[str, Any]]) -> s
     raw_notes: list[str] = []
 
     for event in events:
-        role = str(event.get("role") or event.get("type") or event.get("kind") or "").lower()
+        role = str(
+            event.get("role") or event.get("type") or event.get("kind") or ""
+        ).lower()
         text = extract_text(event)
         if not text:
-            text = truncate_text(json.dumps(redact_large_values(event), ensure_ascii=False, sort_keys=True), MAX_RAW_JSON_CHARS)
+            text = truncate_text(
+                json.dumps(
+                    redact_large_values(event), ensure_ascii=False, sort_keys=True
+                ),
+                MAX_RAW_JSON_CHARS,
+            )
         if role == "user":
             user_messages.append(text)
         elif role == "assistant":
@@ -692,22 +953,44 @@ def render_markdown(metadata: dict[str, Any], events: list[dict[str, Any]]) -> s
         "## Metadata",
         "",
     ]
-    for key in ["agent", "session_id", "source_path", "cwd", "model", "provider", "reasoning_effort", "captured_at"]:
+    for key in [
+        "agent",
+        "session_id",
+        "source_path",
+        "cwd",
+        "model",
+        "provider",
+        "reasoning_effort",
+        "captured_at",
+    ]:
         if key in metadata:
             lines.append(f"- {key}: {metadata.get(key) or 'Unknown'}")
     lines.extend(["", "## User Requests", ""])
-    lines.extend(markdown_items(user_messages))
+    lines.extend(markdown_items(user_messages, max_items=MAX_USER_MESSAGE_ITEMS))
     lines.extend(["", "## Assistant Responses", ""])
-    lines.extend(markdown_items(assistant_messages))
+    lines.extend(
+        markdown_items(
+            assistant_messages,
+            max_items=MAX_ASSISTANT_MESSAGE_ITEMS,
+        )
+    )
     lines.extend(["", "## Tool / Command Activity", ""])
-    lines.extend(markdown_items(tool_notes))
+    lines.extend(markdown_items(tool_notes, max_items=MAX_TOOL_ACTIVITY_ITEMS))
     lines.extend(["", "## Raw Event Notes", ""])
-    lines.extend(markdown_items(raw_notes))
+    lines.extend(markdown_items(raw_notes, max_items=MAX_RAW_EVENT_ITEMS))
     lines.append("")
-    return "\n".join(lines)
+    rendered = "\n".join(lines)
+    if len(rendered) <= MAX_RENDERED_AGENT_MARKDOWN_CHARS:
+        return rendered
+    return (
+        rendered[:MAX_RENDERED_AGENT_MARKDOWN_CHARS]
+        + "\n\n[omitted oversized session tail]\n"
+    )
 
 
-def render_hyprnote_markdown(metadata: dict[str, Any], summary: str, memo: str, transcript: str) -> str:
+def render_hyprnote_markdown(
+    metadata: dict[str, Any], summary: str, memo: str, transcript: str
+) -> str:
     title = metadata.get("title") or "Hyprnote meeting"
     participants = [
         value.strip()
@@ -998,24 +1281,49 @@ def read_text_if_exists(path: Path) -> str:
 
 def session_modified_at(path: Path) -> float:
     try:
-        return max((child.stat().st_mtime for child in path.iterdir() if child.is_file()), default=path.stat().st_mtime)
+        return max(
+            (child.stat().st_mtime for child in path.iterdir() if child.is_file()),
+            default=path.stat().st_mtime,
+        )
     except OSError:
         return 0.0
 
 
-def markdown_items(items: list[str]) -> list[str]:
+def markdown_items(
+    items: list[str],
+    *,
+    max_items: int | None = None,
+) -> list[str]:
     if not items:
         return ["- Unknown"]
+    items = dedupe_preserve_order(items)
+    omitted = 0
+    if max_items is not None and len(items) > max_items:
+        head_count = max(1, max_items // 4)
+        tail_count = max_items - head_count
+        omitted = len(items) - max_items
+        items = items[:head_count] + items[-tail_count:]
     rendered: list[str] = []
-    for item in items:
-        rendered.append("- " + truncate_text(item, MAX_ITEM_CHARS).replace("\n", "\n  "))
+    for index, item in enumerate(items):
+        if omitted and index == head_count:
+            rendered.append(
+                f"- [omitted {omitted} earlier session item(s); "
+                "retained the beginning and most recent activity]"
+            )
+        rendered.append(
+            "- " + truncate_text(item, MAX_ITEM_CHARS).replace("\n", "\n  ")
+        )
     return rendered
 
 
-def extracted_role_messages(events: list[dict[str, Any]], expected_role: str) -> list[str]:
+def extracted_role_messages(
+    events: list[dict[str, Any]], expected_role: str
+) -> list[str]:
     messages: list[str] = []
     for event in events:
-        role = str(event.get("role") or event.get("type") or event.get("kind") or "").lower()
+        role = str(
+            event.get("role") or event.get("type") or event.get("kind") or ""
+        ).lower()
         if role == expected_role:
             text = extract_text(event)
             if text:
@@ -1086,7 +1394,9 @@ def truncate_text(text: str, max_chars: int) -> str:
 def looks_like_base64(text: str) -> bool:
     if len(text) < 800:
         return False
-    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r")
+    allowed = set(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r"
+    )
     if any(ch not in allowed for ch in text):
         return False
     return len(set(text.replace("\n", "").replace("\r", ""))) > 20
@@ -1124,10 +1434,14 @@ def copy_sqlite_family(source: Path, target: Path) -> None:
             shutil.copy2(sidecar, target.with_name(target.name + suffix))
 
 
-def open_code_events(messages: list[sqlite3.Row], parts: list[sqlite3.Row]) -> list[dict[str, Any]]:
+def open_code_events(
+    messages: list[sqlite3.Row], parts: list[sqlite3.Row]
+) -> list[dict[str, Any]]:
     by_message: dict[str, list[dict[str, Any]]] = {}
     for part in parts:
-        by_message.setdefault(part["message_id"], []).append(parse_json_text(part["data"]))
+        by_message.setdefault(part["message_id"], []).append(
+            parse_json_text(part["data"])
+        )
     events: list[dict[str, Any]] = []
     for message in messages:
         data = parse_json_text(message["data"])
@@ -1138,14 +1452,21 @@ def open_code_events(messages: list[sqlite3.Row], parts: list[sqlite3.Row]) -> l
             "message_id": message["id"],
             "time_created": message["time_created"],
             "model": data.get("modelID") or (data.get("model") or {}).get("modelID"),
-            "provider": data.get("providerID") or (data.get("model") or {}).get("providerID"),
+            "provider": data.get("providerID")
+            or (data.get("model") or {}).get("providerID"),
             "parts": by_message.get(message["id"], []),
         }
-        text_parts = [part.get("text", "") for part in event["parts"] if part.get("type") == "text"]
+        text_parts = [
+            part.get("text", "")
+            for part in event["parts"]
+            if part.get("type") == "text"
+        ]
         if text_parts:
             event["text"] = "\n".join(text_parts)
         else:
-            event["text"] = json.dumps(event["parts"], ensure_ascii=False, sort_keys=True)[:2000]
+            event["text"] = json.dumps(
+                event["parts"], ensure_ascii=False, sort_keys=True
+            )[:2000]
         events.append(event)
     return events
 

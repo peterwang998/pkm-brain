@@ -238,7 +238,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
     try:
-        return supervise_scheduled_process(
+        return_code = supervise_scheduled_process(
             int(args.parent_pid),
             _executor_command(
                 str(args.job),
@@ -246,6 +246,23 @@ def main(argv: list[str] | None = None) -> int:
                 str(args.status_file),
             ),
         )
+        if return_code < 0:
+            signal_number = -return_code
+            try:
+                signal_name = signal.Signals(signal_number).name
+            except ValueError:
+                signal_name = "UNKNOWN"
+            write_scheduler_status(
+                Path(args.status_file),
+                {
+                    "status": "failed",
+                    "error": "scheduled executor terminated by signal",
+                    "signal_number": signal_number,
+                    "signal_name": signal_name,
+                },
+            )
+            return 128 + signal_number
+        return return_code
     except BaseException as exc:
         write_scheduler_status(
             Path(args.status_file),

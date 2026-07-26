@@ -1099,6 +1099,73 @@ def test_duplicate_ingest_skips_unchanged_content_without_rehashing(
     assert document["source_size"] == note.stat().st_size
 
 
+def test_bounded_ingest_drains_changed_documents_without_duplicates(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    for index in range(5):
+        (svc.paths.inbox / f"note-{index}.md").write_text(
+            f"# Note {index}\n\nunique-bounded-token-{index}\n",
+            encoding="utf-8",
+        )
+
+    first = svc.ingest(
+        max_changed_documents=2,
+        max_changed_source_bytes=1024 * 1024,
+    )
+    second = svc.ingest(
+        max_changed_documents=2,
+        max_changed_source_bytes=1024 * 1024,
+    )
+    third = svc.ingest(
+        max_changed_documents=2,
+        max_changed_source_bytes=1024 * 1024,
+    )
+    final = svc.ingest(
+        max_changed_documents=2,
+        max_changed_source_bytes=1024 * 1024,
+    )
+
+    assert (first.changed, first.deferred) == (2, 3)
+    assert (second.changed, second.deferred) == (2, 1)
+    assert (third.changed, third.deferred) == (1, 0)
+    assert (final.changed, final.deferred, final.skipped) == (0, 0, 5)
+    with connection(svc.paths.sqlite_path) as conn:
+        document_count = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+        chunk_count = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        chunk_fts_count = conn.execute("SELECT COUNT(*) FROM chunk_fts").fetchone()[0]
+        retrieval_fts_count = conn.execute(
+            "SELECT COUNT(*) FROM retrieval_fts"
+        ).fetchone()[0]
+    assert document_count == 5
+    assert chunk_count == chunk_fts_count == retrieval_fts_count
+
+
+def test_bounded_ingest_defers_next_source_that_exceeds_byte_budget(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    notes = []
+    for index in range(3):
+        note = svc.paths.inbox / f"byte-note-{index}.md"
+        note.write_text(
+            f"# Byte Note {index}\n\n" + ("x" * 200) + f"-{index}\n",
+            encoding="utf-8",
+        )
+        notes.append(note)
+    byte_budget = notes[0].stat().st_size + 1
+
+    first = svc.ingest(max_changed_source_bytes=byte_budget)
+    second = svc.ingest(max_changed_source_bytes=byte_budget)
+    third = svc.ingest(max_changed_source_bytes=byte_budget)
+
+    assert (first.changed, first.deferred) == (1, 2)
+    assert (second.changed, second.deferred) == (1, 1)
+    assert (third.changed, third.deferred) == (1, 0)
+
+
 def test_agent_session_log_reingest_replaces_previous_snapshot(tmp_path: Path) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()
@@ -2765,12 +2832,8 @@ def test_knowledge_time_context_omits_later_source_chunks(tmp_path: Path) -> Non
 
     assert current["supporting_chunks"]
     assert known["supporting_chunks"] == []
-    assert all(
-        snapshot["type"] != "chunk" for snapshot in known["citation_snapshots"]
-    )
-    assert "supporting_chunks" in known["temporal"][
-        "omitted_current_state_layers"
-    ]
+    assert all(snapshot["type"] != "chunk" for snapshot in known["citation_snapshots"])
+    assert "supporting_chunks" in known["temporal"]["omitted_current_state_layers"]
     assert known["retrieval_debug"]["fanout"]["candidate_ids"] == []
     assert known["retrieval_debug"]["reranked_candidates"] == []
 
@@ -2822,9 +2885,7 @@ def test_fact_search_applies_knowledge_and_bitemporal_requests(
             )
         rebuild_fact_retrieval_index(conn)
 
-    known = TemporalRetrievalRequest.resolve(
-        "ignored", known_as_of="2026-02-01"
-    )
+    known = TemporalRetrievalRequest.resolve("ignored", known_as_of="2026-02-01")
     bitemporal = TemporalRetrievalRequest.resolve(
         "ignored",
         valid_as_of="2026-03-01",
@@ -2833,9 +2894,7 @@ def test_fact_search_applies_knowledge_and_bitemporal_requests(
 
     assert [
         fact["id"]
-        for fact in svc.search_facts(
-            "Revision clock marker", temporal_request=known
-        )
+        for fact in svc.search_facts("Revision clock marker", temporal_request=known)
     ] == ["fact_revision_1"]
     assert [
         fact["id"]
@@ -2843,9 +2902,9 @@ def test_fact_search_applies_knowledge_and_bitemporal_requests(
             "Revision clock marker", temporal_request=bitemporal
         )
     ] == ["fact_revision_1"]
-    assert [
-        fact["id"] for fact in svc.search_facts("Revision clock marker")
-    ] == ["fact_revision_2"]
+    assert [fact["id"] for fact in svc.search_facts("Revision clock marker")] == [
+        "fact_revision_2"
+    ]
 
 
 def test_valid_and_timeline_views_do_not_resurrect_corrected_revision(
@@ -2890,24 +2949,18 @@ def test_valid_and_timeline_views_do_not_resurrect_corrected_revision(
             )
         rebuild_fact_retrieval_index(conn)
 
-    valid = TemporalRetrievalRequest.resolve(
-        "ignored", valid_as_of="2026-02-01"
-    )
+    valid = TemporalRetrievalRequest.resolve("ignored", valid_as_of="2026-02-01")
     bitemporal_before_correction = TemporalRetrievalRequest.resolve(
         "ignored",
         valid_as_of="2026-02-01",
         known_as_of="2026-02-01",
     )
-    timeline = TemporalRetrievalRequest.resolve(
-        "ignored", temporal_mode="timeline"
-    )
+    timeline = TemporalRetrievalRequest.resolve("ignored", temporal_mode="timeline")
 
-    assert svc.search_facts(
-        "Corrected chronology marker", temporal_request=valid
-    ) == []
-    assert svc.search_facts(
-        "Corrected chronology marker", temporal_request=timeline
-    ) == []
+    assert svc.search_facts("Corrected chronology marker", temporal_request=valid) == []
+    assert (
+        svc.search_facts("Corrected chronology marker", temporal_request=timeline) == []
+    )
     assert [
         fact["id"]
         for fact in svc.search_facts(

@@ -6,7 +6,7 @@ import os
 import re
 import shutil
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -48,6 +48,7 @@ from .indexes import (
     upsert_vectors,
     vector_chunk_ids,
 )
+from .ingest_batch import IngestBudget, IngestResult
 from .paths import BrainPaths, local_node_id
 from .retrospective_retrieval import (
     RETROSPECTIVE_RETRIEVAL_VERSION as RETROSPECTIVE_RETRIEVAL_VERSION,
@@ -58,23 +59,6 @@ from .retrospective_retrieval import (
 from .temporal import TemporalRetrievalRequest
 from .title_utils import bounded_document_title
 from .util import file_sha256, new_id, now_iso, slugify, token_count as estimate_tokens
-
-
-@dataclass
-class IngestResult:
-    run_id: str
-    discovered: int
-    changed: int
-    skipped: int
-    chunks_created: int
-    embeddings_created: int
-    errors: list[str]
-    documents_replaced: int = 0
-    vector_writes: dict[str, Any] = field(default_factory=dict)
-
-    def as_dict(self) -> dict[str, Any]:
-        return dict(self.__dict__)
-
 
 def chunk_row_id(row: Any) -> str:
     keys = row.keys()
@@ -305,7 +289,6 @@ RECENCY_INTENT_TERMS = {
     "week",
     "yesterday",
 }
-
 @dataclass(frozen=True)
 class RetrievalPolicy:
     mode: str
@@ -1217,6 +1200,8 @@ class BrainService(RetrospectiveRetrievalMixin):
         dry_run: bool = False,
         origin_node_id: str | None = None,
         retry_quarantine: bool = False,
+        max_changed_documents: int | None = None,
+        max_changed_source_bytes: int | None = None,
     ) -> IngestResult:
         self.init_workspace()
         if retry_quarantine and not dry_run:
@@ -1241,6 +1226,8 @@ class BrainService(RetrospectiveRetrievalMixin):
         documents_replaced = 0
         vector_source_rows: list[dict[str, Any]] = []
         stale_vector_chunk_ids: list[str] = []
+        deferred = 0
+        budget = IngestBudget(max_changed_documents, max_changed_source_bytes)
 
         if dry_run:
             return IngestResult(run_id, len(candidates), 0, 0, 0, 0, [])
@@ -1250,7 +1237,7 @@ class BrainService(RetrospectiveRetrievalMixin):
                 "INSERT INTO ingestion_runs(id, started_at, status, documents_discovered) VALUES (?, ?, ?, ?)",
                 (run_id, started, "running", len(candidates)),
             )
-            for path in candidates:
+            for candidate_index, path in enumerate(candidates):
                 try:
                     source_type = detect_source_type(path)
                     if not source_type:
@@ -1299,6 +1286,9 @@ class BrainService(RetrospectiveRetrievalMixin):
                         )
                         skipped += 1
                         continue
+                    if not budget.accept(source_size):
+                        deferred = len(candidates) - candidate_index
+                        break
                     content_hash = file_sha256(path)
                     text = path.read_text(encoding="utf-8", errors="replace")
                     title = document_title_for_text(text, path)
@@ -1489,6 +1479,7 @@ class BrainService(RetrospectiveRetrievalMixin):
             errors,
             documents_replaced,
             vector_writes,
+            deferred,
         )
 
     def rebuild_mirror_index(self) -> dict[str, Any]:

@@ -31,12 +31,21 @@ from pkm_brain.automation import run_nightly_maintenance
 from pkm_brain.connectors import load_connector_config, save_connector_config
 from pkm_brain.db import connection
 from pkm_brain.paths import BrainPaths
-from pkm_brain.operational_service import OperationalService, OperationalWriteRefusedError
+from pkm_brain.operational_service import (
+    OperationalService,
+    OperationalWriteRefusedError,
+)
 from pkm_brain.scheduler_protocol import (
     SCHEDULER_STATUS_MAX_BYTES,
+    read_scheduler_status,
     sanitize_scheduler_payload,
 )
-from pkm_brain.sync_config import PeerConfig, PrimaryConfig, SyncConfig, write_sync_config
+from pkm_brain.sync_config import (
+    PeerConfig,
+    PrimaryConfig,
+    SyncConfig,
+    write_sync_config,
+)
 from pkm_brain.sync_setup import init_secondary
 
 
@@ -394,7 +403,7 @@ def test_scheduler_runs_isolated_job_in_child_instead_of_handler(
         source = (
             "from pathlib import Path; "
             f"Path({str(status_path)!r}).write_text("
-            "'{\"status\":\"success\",\"processed\":3}', encoding='utf-8')"
+            '\'{"status":"success","processed":3}\', encoding=\'utf-8\')'
         )
         return [sys.executable, "-c", source]
 
@@ -438,6 +447,40 @@ def test_scheduler_guardian_command_is_bound_to_daemon_pid(tmp_path: Path) -> No
 
     parent_index = command.index("--parent-pid")
     assert command[parent_index + 1] == str(os.getpid())
+
+
+def test_scheduler_guardian_reports_executor_signal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status_path = tmp_path / "status.json"
+    monkeypatch.setattr(
+        scheduler_worker,
+        "supervise_scheduled_process",
+        lambda *_args, **_kwargs: -signal.SIGBUS,
+    )
+
+    exit_code = scheduler_worker.main(
+        [
+            "--job",
+            "capture_tick",
+            "--home",
+            str(tmp_path / "brain"),
+            "--status-file",
+            str(status_path),
+            "--parent-pid",
+            str(os.getpid()),
+        ]
+    )
+    status = read_scheduler_status(status_path)
+
+    assert exit_code == 128 + signal.SIGBUS
+    assert status == {
+        "status": "failed",
+        "error": "scheduled executor terminated by signal",
+        "signal_number": signal.SIGBUS,
+        "signal_name": "SIGBUS",
+    }
 
 
 def test_scheduler_stop_terminates_active_isolated_child(
@@ -743,13 +786,17 @@ def test_scheduler_does_not_overlap_repeated_run_for_same_job(tmp_path: Path) ->
 
 def test_scheduler_pause_persists(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
-    scheduler = SerialJobScheduler(paths, jobs=[SchedulerJob("job", 60, lambda: {"status": "success"})])
+    scheduler = SerialJobScheduler(
+        paths, jobs=[SchedulerJob("job", 60, lambda: {"status": "success"})]
+    )
 
     state = scheduler.pause(120)
     assert state["paused_until"]
     assert scheduler_config_path(paths).exists()
 
-    reloaded = SerialJobScheduler(paths, jobs=[SchedulerJob("job", 60, lambda: {"status": "success"})])
+    reloaded = SerialJobScheduler(
+        paths, jobs=[SchedulerJob("job", 60, lambda: {"status": "success"})]
+    )
     assert reloaded.as_dict()["paused_until"] == state["paused_until"]
 
     resumed = reloaded.resume()
@@ -786,7 +833,10 @@ def test_scheduler_preserves_skipped_reason(tmp_path: Path) -> None:
     job = scheduler.as_dict()["jobs"][0]
     assert job["last_status"] == "skipped"
     assert job["last_error"] == "last successful nightly run is less than 20 hours old"
-    assert job["last_result"]["reason"] == "last successful nightly run is less than 20 hours old"
+    assert (
+        job["last_result"]["reason"]
+        == "last successful nightly run is less than 20 hours old"
+    )
 
 
 def test_scheduler_run_now_bypasses_pause(tmp_path: Path) -> None:
@@ -794,7 +844,11 @@ def test_scheduler_run_now_bypasses_pause(tmp_path: Path) -> None:
     completed: list[str] = []
     scheduler = SerialJobScheduler(
         paths,
-        jobs=[SchedulerJob("job", 60, lambda: completed.append("job") or {"status": "success"})],
+        jobs=[
+            SchedulerJob(
+                "job", 60, lambda: completed.append("job") or {"status": "success"}
+            )
+        ],
     )
     scheduler.pause(3600)
     scheduler.start()
@@ -953,9 +1007,7 @@ def test_gmail_jobs_are_primary_lane_startup_work(tmp_path: Path) -> None:
             "nightly",
             "gmail_knowledge_ingest",
         }
-        assert {job.lane for job in mutation_jobs.values()} == {
-            "knowledge_mutation"
-        }
+        assert {job.lane for job in mutation_jobs.values()} == {"knowledge_mutation"}
         assert all(job.isolated_job == job.id for job in mutation_jobs.values())
 
     secondary = BrainPaths.from_value(tmp_path / "secondary-with-ops")
@@ -982,7 +1034,9 @@ def test_daemon_nightly_summary_matches_automation_shape(tmp_path: Path) -> None
         scheduler.run_now("nightly")
         deadline = time.time() + 8
         while time.time() < deadline:
-            nightly = next(job for job in scheduler.as_dict()["jobs"] if job["id"] == "nightly")
+            nightly = next(
+                job for job in scheduler.as_dict()["jobs"] if job["id"] == "nightly"
+            )
             if nightly["last_status"]:
                 break
             time.sleep(0.05)
@@ -1001,7 +1055,9 @@ def test_daemon_nightly_summary_matches_automation_shape(tmp_path: Path) -> None
     assert summary_shape(daemon_summary) == summary_shape(direct_result.summary)
 
 
-def test_parent_process_missing_checks_ppid_and_liveness(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_parent_process_missing_checks_ppid_and_liveness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr("pkm_brain.daemon.os.getppid", lambda: 123)
     monkeypatch.setattr("pkm_brain.daemon.process_alive", lambda pid: True)
     assert parent_process_missing(123) is False

@@ -56,6 +56,8 @@ MAX_STORED_SUMMARY_LIST_ITEMS = 50
 MAX_STORED_SUMMARY_DICT_ITEMS = 100
 MAX_STORED_SUMMARY_DEPTH = 10
 MAX_STORED_SUMMARY_BYTES = 256_000
+AGENT_LOG_INGEST_MAX_CHANGED_DOCUMENTS = 16
+AGENT_LOG_INGEST_MAX_CHANGED_SOURCE_BYTES = 64 * 1024 * 1024
 ERROR_FIELD_NAMES = {"error", "errors", "stderr", "traceback"}
 COS_SECONDARY_SKIP_REASON = (
     "secondary role skips CoS mutation-capable stages by default"
@@ -126,6 +128,13 @@ class SecondaryTickResult:
     reason: str | None = None
 
 
+def run_bounded_scheduled_ingest(service: BrainService):
+    return service.ingest(
+        max_changed_documents=AGENT_LOG_INGEST_MAX_CHANGED_DOCUMENTS,
+        max_changed_source_bytes=AGENT_LOG_INGEST_MAX_CHANGED_SOURCE_BYTES,
+    )
+
+
 def run_agent_log_ingest(
     paths: BrainPaths,
     agent: str = "all",
@@ -166,7 +175,7 @@ def run_agent_log_ingest(
                 hyprnote_root=hyprnote_root,
             ),
         )
-        ingest_result = service.ingest()
+        ingest_result = run_bounded_scheduled_ingest(service)
         return AutomationResult(
             started_at=now_iso(),
             capture=capture_result.as_dict(),
@@ -338,7 +347,7 @@ def run_secondary_tick(
                 hyprnote_root=hyprnote_root,
             ),
         )
-        ingest_result = service.ingest()
+        ingest_result = run_bounded_scheduled_ingest(service)
         status = index_status(paths, service)
         return SecondaryTickResult(
             started_at=now_iso(),
@@ -419,8 +428,8 @@ def run_nightly_maintenance(
         status = "success"
         error: str | None = None
         try:
-            summary["google_evidence_retention"] = (
-                run_google_evidence_cache_retention(paths)
+            summary["google_evidence_retention"] = run_google_evidence_cache_retention(
+                paths
             )
             cos_role = cos_role_status(paths)
             connector_ids = connector_ids_for_agent(
@@ -441,7 +450,7 @@ def run_nightly_maintenance(
             )
             summary["capture"] = capture_result.as_dict()
 
-            ingest_result = service.ingest()
+            ingest_result = run_bounded_scheduled_ingest(service)
             summary["ingest"] = ingest_result.__dict__
 
             summary["cos_role"] = cos_role
@@ -451,9 +460,7 @@ def run_nightly_maintenance(
             )
             summary["cos_extraction_shadow"] = summary["cos_extraction"]
 
-            summary["cos_gardener"] = run_cos_gardener(
-                paths, cos_role, run_id=run_id
-            )
+            summary["cos_gardener"] = run_cos_gardener(paths, cos_role, run_id=run_id)
             summary["cos_gardener_shadow"] = summary["cos_gardener"]
 
             summary["cos_synthesis"] = run_cos_synthesis(
@@ -500,9 +507,7 @@ def run_nightly_maintenance(
         except Exception as exc:
             status = "failed"
             error = str(exc)
-        summary["llm_usage"] = llm_usage_summary(
-            paths, cycle_id=run_id, limit=1
-        )
+        summary["llm_usage"] = llm_usage_summary(paths, cycle_id=run_id, limit=1)
         finished_at = now_iso()
         record_automation_finish(paths, run_id, status, finished_at, summary, error)
         return NightlyMaintenanceResult(
