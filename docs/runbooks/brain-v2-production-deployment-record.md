@@ -67,7 +67,7 @@ quick check passes.
 
 The successful bounded capture canary left:
 
-| Aggregate | Live value |
+| Aggregate | Post-capture canary value |
 |---|---:|
 | Documents / active documents | 961 / 891 |
 | Chunks / active chunks | 6,952 / 6,882 |
@@ -80,6 +80,11 @@ The successful bounded capture canary left:
 The legacy facts, entities, fact links, and Operations counts are unchanged.
 Index doctor reports zero missing and zero stale vectors.
 
+After the first normally scheduled Gmail Knowledge batch, the final observed
+totals were 1,461 documents, 1,358 active documents, 8,088 chunks, and 7,974
+active chunks. Active FTS and LanceDB both contained the same 7,974 chunk IDs,
+with zero missing and zero stale vectors.
+
 Private Gmail remains fail-closed for external extraction:
 
 - `source_types.gmail_thread.extract` is `false`.
@@ -87,11 +92,11 @@ Private Gmail remains fail-closed for external extraction:
 - All five Gmail temporal-review ledger tables are empty.
 - No Gmail fact extraction or temporal-review job is scheduled.
 
-The first Gmail Knowledge batch retained 430 active and 70 deleted document
-revisions. Its active routing distribution was 4 action, 312 informational, 99
-promotional, and 15 time-sensitive documents. Generic retrieval suppression
-applied to 393 of 430 active documents. These are local classification and
-retrieval controls, not external model extraction.
+The initial pre-resume Gmail Knowledge batch retained 430 active and 70 deleted
+document revisions. Its active routing distribution was 4 action, 312
+informational, 99 promotional, and 15 time-sensitive documents. Generic
+retrieval suppression applied to 393 of 430 active documents. These are local
+classification and retrieval controls, not external model extraction.
 
 ## Capture Failure, Root Cause, And Corrective Canary
 
@@ -131,6 +136,10 @@ The scheduler is resumed with seven jobs:
 The first resumed Gmail mirror tick completed one incremental update with no
 error. The first archive tick fetched 129 messages, inserted 119, updated 10,
 deleted 10, and stopped normally at its bounded partial-coverage checkpoint.
+The first normally scheduled Gmail Knowledge tick then captured and ingested
+500 revisions, wrote 1,136 embeddings, and reconciled to 897 active, 100
+deleted, and 3 superseded Gmail documents with zero errors and zero held
+documents.
 
 ## Continuing Work
 
