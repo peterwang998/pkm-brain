@@ -12,6 +12,7 @@ from .embeddings import EmbeddingProvider, HASH_MODEL, HASH_PROVIDER
 
 TABLE_NAME = "chunks"
 STAMP_FILE = "embedding_provider.json"
+DELETE_PREDICATE_BATCH_SIZE = 1024
 
 
 class VectorIndexUnavailable(RuntimeError):
@@ -37,7 +38,11 @@ def upsert_table_vectors(
     if table_name in table_names(db):
         table = db.open_table(table_name)
         try:
-            table.delete(" OR ".join(f"{id_column} = '{row[id_column]}'" for row in rows))
+            _delete_table_rows(
+                table,
+                id_column,
+                [str(row[id_column]) for row in rows],
+            )
         except Exception:
             pass
         table.add(rows)
@@ -65,8 +70,27 @@ def delete_table_vectors(
     if table_name not in table_names(db):
         return 0
     table = db.open_table(table_name)
-    table.delete(" OR ".join(f"{id_column} = '{target_id}'" for target_id in target_ids))
+    _delete_table_rows(table, id_column, target_ids)
     return len(target_ids)
+
+
+def _delete_table_rows(
+    table: Any,
+    id_column: str,
+    target_ids: list[str],
+) -> None:
+    """Bound deletes without building LanceDB's recursively parsed OR tree."""
+
+    for offset in range(0, len(target_ids), DELETE_PREDICATE_BATCH_SIZE):
+        batch = target_ids[offset : offset + DELETE_PREDICATE_BATCH_SIZE]
+        values = ", ".join(
+            f"'{_escape_predicate_string(target_id)}'" for target_id in batch
+        )
+        table.delete(f"{id_column} IN ({values})")
+
+
+def _escape_predicate_string(value: str) -> str:
+    return value.replace("'", "''")
 
 
 def search_vectors(db_path: Path, provider: EmbeddingProvider, query: str, limit: int) -> list[dict[str, Any]]:
