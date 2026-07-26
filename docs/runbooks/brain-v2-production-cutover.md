@@ -1,7 +1,10 @@
 # Brain V2 Production Cutover
 
-**Status:** operator-ready in-place migration; rehearsal passed, live cutover record pending
-**Last verified:** 2026-07-26 against the uncommitted `0.2.0` release candidate based on commit `2442edc`
+**Status:** deployed in place; scheduler resumed; bounded backfills active
+**Last verified:** 2026-07-26 against Brain `0.2.2` build 8 at commit `c952419`
+
+The live evidence and remaining follow-ups are recorded in
+[`brain-v2-production-deployment-record.md`](brain-v2-production-deployment-record.md).
 
 ## Decision And Boundary
 
@@ -77,7 +80,7 @@ scripts/m2-clean-machine-acceptance.sh "$(mktemp -d "${TMPDIR:-/tmp}/pkm-brain-m
 ```
 
 The gate is green only when all commands pass and the clean build produces a
-validly signed `dist/PKM Brain.app` with app and Python package version `0.2.0`.
+validly signed `dist/PKM Brain.app` with app and Python package version `0.2.2`.
 
 ## Exact Cutover Procedure
 
@@ -181,7 +184,7 @@ Gmail. Run the installer once: it retains the previous app at
 
 Do not run any scheduled job until every item below passes:
 
-1. `/api/health` reports `ok=true`, version `0.2.0`, schema 26, the expected
+1. `/api/health` reports `ok=true`, version `0.2.2`, schema 26, the expected
    runtime ID, and home `/Users/Peter/brain`.
 2. The migration ledger is the exact contiguous prefix 1-26; Knowledge and
    Operations integrity checks pass with no foreign-key rows; the archive
@@ -191,7 +194,7 @@ Do not run any scheduled job until every item below passes:
 4. `brain doctor --home /Users/Peter/brain` passes the database, vector, and
    embedding checks. The same four lexical probes retain their fingerprints.
 5. Both the installed and previous app bundles pass `codesign --verify --deep --strict`.
-6. The app-managed shim reports `brain 0.2.0`; align
+6. The app-managed shim reports `brain 0.2.2`; align
    `/Users/Peter/.local/bin/brain` (and `pkm-brain`, if present) to that shim
    only after preserving their old targets in the migration backup.
 7. An MCP read round trip succeeds through the app-managed runtime.
