@@ -51,6 +51,7 @@ public struct SchedulerJobState: Codable, Equatable, Identifiable, Sendable {
         case "meeting_preparation": "Prepare meeting briefs"
         case "gmail_mirror_sync": "Check Gmail for updates"
         case "gmail_archive_sync": "Copy Gmail history securely"
+        case "gmail_knowledge_ingest": "Index important Gmail knowledge"
         default:
             id.replacingOccurrences(of: "_", with: " ")
         }

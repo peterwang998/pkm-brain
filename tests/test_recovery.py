@@ -7,8 +7,10 @@ import stat
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
 import pkm_brain.recovery as recovery_module
+from pkm_brain.cli import app
 from pkm_brain.daemon import BrainDaemon
 from pkm_brain.db import connection, init_db
 from pkm_brain.operational_db import init_operational_db, operational_connection
@@ -32,6 +34,9 @@ from pkm_brain.recovery import (
 )
 from pkm_brain.sync_setup import init_secondary
 from pkm_brain.sync_status import canonical_manifest_hash
+
+
+runner = CliRunner()
 
 
 def service(paths: BrainPaths) -> OperationalService:
@@ -123,6 +128,9 @@ def test_coordinated_recovery_captures_wal_pair_and_private_manifest(
     manifest = verification["manifest"]
     assert manifest["artifact_kind"] == "database_pair"
     assert manifest["consistency"] == "sqlite_write_barrier"
+    assert manifest["databases"]["knowledge"]["schema_compatibility"] == "current"
+    assert manifest["scope"]["complete_brain_home"] is False
+    assert result["scope"] == manifest["scope"]
     assert manifest["databases"]["knowledge"]["generation"] == result["generation"]
     assert manifest["databases"]["operations"]["generation"] == result["generation"]
     assert manifest["watermarks"]["source_manifest_sha256"] == canonical_manifest_hash(
@@ -133,13 +141,217 @@ def test_coordinated_recovery_captures_wal_pair_and_private_manifest(
     for name in ("brain.sqlite", "ops.sqlite", MANIFEST_FILENAME, COMMITTED_FILENAME):
         assert stat.S_IMODE((recovery_dir / name).stat().st_mode) == 0o600
     with sqlite3.connect(recovery_dir / "brain.sqlite") as conn:
-        assert conn.execute(
-            "SELECT content FROM memories WHERE id = 'memory-reviewed'"
-        ).fetchone()[0] == "Committed knowledge WAL state"
+        assert (
+            conn.execute(
+                "SELECT content FROM memories WHERE id = 'memory-reviewed'"
+            ).fetchone()[0]
+            == "Committed knowledge WAL state"
+        )
     with sqlite3.connect(recovery_dir / "ops.sqlite") as conn:
-        assert conn.execute(
-            "SELECT title FROM ops_items WHERE id = ?", (item_id,)
-        ).fetchone()[0] == "Committed operations WAL state"
+        assert (
+            conn.execute(
+                "SELECT title FROM ops_items WHERE id = ?", (item_id,)
+            ).fetchone()[0]
+            == "Committed operations WAL state"
+        )
+
+
+def test_recovery_accepts_known_older_schema_prefix_without_migrating(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, _operational, _item_id = prepared_home(tmp_path)
+    with sqlite3.connect(paths.sqlite_path) as conn:
+        conn.execute("DELETE FROM schema_migrations WHERE version > 23")
+    with sqlite3.connect(paths.ops_sqlite_path) as conn:
+        conn.execute("DELETE FROM ops_schema_migrations WHERE version > 8")
+
+    def reject_workspace_initialization(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("recovery CLI must not initialize or migrate a workspace")
+
+    monkeypatch.setattr(
+        "pkm_brain.service.BrainService.init_workspace",
+        reject_workspace_initialization,
+    )
+    recovery_dir = tmp_path / "pre-migration-recovery"
+    create_result = runner.invoke(
+        app,
+        [
+            "recovery",
+            "create",
+            "--home",
+            str(paths.home),
+            "--output",
+            str(recovery_dir),
+        ],
+    )
+    assert create_result.exit_code == 0, create_result.output
+    created = json.loads(create_result.stdout)
+    knowledge = created["databases"]["knowledge"]
+    assert knowledge["schema_version"] == 23
+    assert knowledge["runtime_schema_version"] > 23
+    assert knowledge["schema_compatibility"] == "known_migration_prefix"
+    operations = created["databases"]["operations"]
+    assert operations["schema_version"] == 8
+    assert operations["schema_compatibility"] == "known_migration_prefix"
+    assert created["scope"]["complete_brain_home"] is False
+    with sqlite3.connect(paths.sqlite_path) as conn:
+        assert [
+            int(row[0])
+            for row in conn.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )
+        ] == list(range(1, 24))
+
+    verify_result = runner.invoke(
+        app,
+        ["recovery", "verify", str(recovery_dir)],
+    )
+    assert verify_result.exit_code == 0, verify_result.output
+    verified = json.loads(verify_result.stdout)
+    assert verified["validation"]["knowledge"]["schema_version"] == 23
+
+    restored_home = tmp_path / "pre-migration-restore"
+    restore_result = runner.invoke(
+        app,
+        [
+            "recovery",
+            "restore-isolated",
+            str(recovery_dir),
+            str(restored_home),
+        ],
+    )
+    assert restore_result.exit_code == 0, restore_result.output
+    restored = json.loads(restore_result.stdout)
+    assert restored["daemon_started"] is False
+    assert restored["scope"]["complete_brain_home"] is False
+    with sqlite3.connect(BrainPaths.from_value(restored_home).sqlite_path) as conn:
+        assert [
+            int(row[0])
+            for row in conn.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )
+        ] == list(range(1, 24))
+    with sqlite3.connect(BrainPaths.from_value(restored_home).ops_sqlite_path) as conn:
+        assert [
+            int(row[0])
+            for row in conn.execute(
+                "SELECT version FROM ops_schema_migrations ORDER BY version"
+            )
+        ] == list(range(1, 9))
+
+
+def test_recovery_verifies_legacy_manifest_without_schema_summary(
+    tmp_path: Path,
+) -> None:
+    paths, operational, _item_id = prepared_home(tmp_path)
+    result = create_coordinated_recovery_set(
+        paths,
+        operational,
+        output_dir=tmp_path / "recovery-set",
+    )
+    recovery_dir = Path(result["path"])
+    manifest_path = recovery_dir / MANIFEST_FILENAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("schema_metadata_version")
+    manifest.pop("scope")
+    for entry in manifest["databases"].values():
+        entry.pop("schema_version")
+        entry.pop("runtime_schema_version")
+        entry.pop("schema_compatibility")
+    manifest_bytes = (
+        json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
+    manifest_path.write_bytes(manifest_bytes)
+    (recovery_dir / COMMITTED_FILENAME).write_text(
+        hashlib.sha256(manifest_bytes).hexdigest() + "\n",
+        encoding="ascii",
+    )
+
+    verification = verify_recovery_set(recovery_dir)
+    assert verification["status"] == "ok"
+    assert verification["validation"]["knowledge"]["schema_compatibility"] == (
+        "current"
+    )
+    assert verification["scope"]["complete_brain_home"] is False
+
+
+def test_recovery_schema_summary_survives_a_newer_verifier_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, operational, _item_id = prepared_home(tmp_path)
+    result = create_coordinated_recovery_set(
+        paths,
+        operational,
+        output_dir=tmp_path / "recovery-set",
+    )
+    recovery_dir = Path(result["path"])
+    recorded_runtime_version = result["databases"]["knowledge"][
+        "runtime_schema_version"
+    ]
+    monkeypatch.setattr(
+        recovery_module,
+        "MIGRATIONS",
+        [
+            *recovery_module.MIGRATIONS,
+            (recorded_runtime_version + 1, "future_migration", lambda _conn: None),
+        ],
+    )
+
+    verification = verify_recovery_set(recovery_dir)
+    assert (
+        verification["manifest"]["databases"]["knowledge"]["schema_compatibility"]
+        == "current"
+    )
+    assert verification["validation"]["knowledge"]["schema_compatibility"] == (
+        "known_migration_prefix"
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "DELETE FROM schema_migrations WHERE version = 22",
+        "INSERT INTO schema_migrations(version, applied_at) "
+        "VALUES (999, '2026-07-26T00:00:00+00:00')",
+    ),
+)
+def test_recovery_rejects_gapped_or_unknown_knowledge_migrations(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    paths, operational, _item_id = prepared_home(tmp_path)
+    with sqlite3.connect(paths.sqlite_path) as conn:
+        conn.execute(mutation)
+
+    with pytest.raises(RecoverySetError, match="complete prefix"):
+        create_coordinated_recovery_set(
+            paths,
+            operational,
+            output_dir=tmp_path / "unsafe-recovery",
+        )
+    assert not paths.brain_identity_file.exists()
+    assert not (tmp_path / "unsafe-recovery").exists()
+
+
+def test_recovery_rejects_unknown_operational_migration_identity(
+    tmp_path: Path,
+) -> None:
+    paths, operational, _item_id = prepared_home(tmp_path)
+    with sqlite3.connect(paths.ops_sqlite_path) as conn:
+        conn.execute(
+            "UPDATE ops_schema_migrations SET name = 'unknown_name' WHERE version = 9"
+        )
+
+    with pytest.raises(RecoverySetError, match="complete prefix"):
+        create_coordinated_recovery_set(
+            paths,
+            operational,
+            output_dir=tmp_path / "unsafe-recovery",
+        )
+    assert not paths.brain_identity_file.exists()
+    assert not (tmp_path / "unsafe-recovery").exists()
 
 
 def test_recovery_verification_rejects_tampering_and_incomplete_publication(
@@ -192,9 +404,12 @@ def test_isolated_restore_preserves_reviewed_and_operational_state(
 
     assert restored["daemon_started"] is False
     with connection(restored_paths.sqlite_path) as conn:
-        assert conn.execute(
-            "SELECT content FROM memories WHERE id = 'memory-reviewed'"
-        ).fetchone()[0] == "Preserve this review"
+        assert (
+            conn.execute(
+                "SELECT content FROM memories WHERE id = 'memory-reviewed'"
+            ).fetchone()[0]
+            == "Preserve this review"
+        )
     item = get_item(restored_paths.ops_sqlite_path, item_id)
     assert item is not None
     assert item["state"] == "active"
@@ -209,7 +424,10 @@ def test_isolated_restore_preserves_reviewed_and_operational_state(
     assert cursor["cursor"] == "private-provider-cursor"
     with operational_connection(restored_paths.ops_sqlite_path):
         pass
-    assert restored_paths.brain_identity_file.read_text(encoding="utf-8").strip() == restored["brain_id"]
+    assert (
+        restored_paths.brain_identity_file.read_text(encoding="utf-8").strip()
+        == restored["brain_id"]
+    )
     assert restored_paths.restore_quarantine_file.exists()
     with pytest.raises(
         OperationalWriteRefusedError,

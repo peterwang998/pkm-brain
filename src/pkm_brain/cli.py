@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
-from typing import Optional
+from typing import NoReturn, Optional
 
 import typer
 from rich.console import Console
@@ -69,12 +69,23 @@ from .memory_proposals import (
 )
 from .mcp_server import create_mcp
 from .paths import BrainPaths
+from .operational_service import (
+    OperationalService,
+    OperationalWriteRefusedError,
+    OperationalWriterBusyError,
+)
 from .policy_reconciliation import reconcile_policy_escalations
 from .queue_summary import review_queue_summary
 from .regeneration import (
     backup_runtime_brain,
     export_human_state,
     rebuild_facts_from_sources,
+)
+from .recovery import (
+    RecoverySetError,
+    create_coordinated_recovery_set,
+    restore_recovery_set_isolated,
+    verify_recovery_set,
 )
 from .service import BrainService
 from .setup_wizard import run_setup_plan
@@ -124,6 +135,12 @@ sync_app = typer.Typer(help="Primary/Secondary sync commands.")
 scheduler_app = typer.Typer(help="Logical scheduler commands.")
 maintenance_app = typer.Typer(help="Runtime maintenance commands.")
 app_migration_app = typer.Typer(help="macOS app migration commands.")
+recovery_app = typer.Typer(
+    help=(
+        "Create and test coordinated brain.sqlite + ops.sqlite recovery sets. "
+        "These exclude Gmail archives and are not full Brain-home backups."
+    )
+)
 app.add_typer(inspect_app, name="inspect")
 app.add_typer(index_app, name="index")
 app.add_typer(db_app, name="db")
@@ -143,6 +160,7 @@ app.add_typer(sync_app, name="sync")
 app.add_typer(scheduler_app, name="scheduler")
 app.add_typer(maintenance_app, name="maintenance")
 app.add_typer(app_migration_app, name="app-migration")
+app.add_typer(recovery_app, name="recovery")
 console = Console()
 
 
@@ -840,9 +858,7 @@ def embeddings_status(
 def embeddings_configure(
     provider: str = typer.Option(..., "--provider"),
     model: Optional[str] = typer.Option(None, "--model"),
-    query_instruction: Optional[str] = typer.Option(
-        None, "--query-instruction"
-    ),
+    query_instruction: Optional[str] = typer.Option(None, "--query-instruction"),
     home: Optional[Path] = typer.Option(None),
 ) -> None:
     paths = BrainPaths.from_value(home)
@@ -2212,6 +2228,87 @@ def app_migration_retire_launch_agents(
         launch_agents_dir=launch_agents_dir,
         dry_run=not commit,
     )
+    console.print_json(json.dumps(result))
+
+
+def _recovery_cli_error(exc: Exception) -> NoReturn:
+    Console(stderr=True).print(str(exc))
+    raise typer.Exit(1)
+
+
+@recovery_app.command("create")
+def recovery_create(
+    home: Optional[Path] = typer.Option(None, help="Existing Brain home directory."),
+    output_dir: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        help=(
+            "New recovery-set directory. Defaults under the Brain home; its parent "
+            "must already exist when an explicit path is supplied."
+        ),
+    ),
+) -> None:
+    """Back up only brain.sqlite and ops.sqlite; do not initialize or migrate them.
+
+    The owner-only, checksummed pair excludes the Gmail archive and mirror, source
+    files, wiki, indexes, configuration, logs, and all other Brain-home content.
+    """
+
+    paths = BrainPaths.from_value(home)
+    operator = OperationalService(paths, writer_guard=lambda: None)
+    try:
+        result = create_coordinated_recovery_set(
+            paths,
+            operator,
+            output_dir=output_dir,
+        )
+    except (
+        RecoverySetError,
+        OperationalWriteRefusedError,
+        OperationalWriterBusyError,
+    ) as exc:
+        _recovery_cli_error(exc)
+    console.print_json(json.dumps(result))
+
+
+@recovery_app.command("verify")
+def recovery_verify(
+    recovery_dir: Path = typer.Argument(
+        ...,
+        help="Recovery-set directory containing the coordinated database pair.",
+    ),
+) -> None:
+    """Verify pair hashes, known schema prefixes, and SQLite/FK integrity.
+
+    Success covers only brain.sqlite and ops.sqlite. It does not verify the Gmail
+    archive, mailbox mirror, or a complete Brain home.
+    """
+
+    try:
+        result = verify_recovery_set(recovery_dir)
+    except RecoverySetError as exc:
+        _recovery_cli_error(exc)
+    console.print_json(json.dumps(result))
+
+
+@recovery_app.command("restore-isolated")
+def recovery_restore_isolated(
+    recovery_dir: Path = typer.Argument(..., help="Verified recovery-set directory."),
+    target_home: Path = typer.Argument(
+        ...,
+        help="New, nonexistent Brain home for the quarantined database-pair restore.",
+    ),
+) -> None:
+    """Restore the database pair to a new quarantined home without migrating it.
+
+    This does not restore Gmail archives/mirrors, source files, wiki, indexes,
+    configuration, logs, or any other content required for a full-home restore.
+    """
+
+    try:
+        result = restore_recovery_set_isolated(recovery_dir, target_home)
+    except RecoverySetError as exc:
+        _recovery_cli_error(exc)
     console.print_json(json.dumps(result))
 
 

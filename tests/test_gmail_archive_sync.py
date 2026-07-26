@@ -19,6 +19,7 @@ from pkm_brain.gmail_archive_sync import (
     GmailArchiveSynchronizer,
     _query_from_window_start,
     _require_archive_policy,
+    run_scheduled_gmail_archive_sync,
 )
 from pkm_brain.operational_service import OperationalService
 from pkm_brain.operations_policy import OperationsPolicy
@@ -337,3 +338,45 @@ def test_archive_policy_gate_is_explicit() -> None:
     )
     with pytest.raises(ValueError):
         _require_archive_policy(disabled)
+
+
+def test_scheduled_failure_reports_only_a_safe_error_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class SensitiveProviderFailure(Exception):
+        pass
+
+    class FailingSynchronizer:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+
+        def sync(self, *, policy: OperationsPolicy) -> Any:
+            del policy
+            raise SensitiveProviderFailure(
+                "private Gmail subject and message body must not escape"
+    )
+
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    operational_service = OperationalService(paths)
+    monkeypatch.setattr(operational_service, "initialize", lambda: None)
+    monkeypatch.setattr(
+        "pkm_brain.gmail_archive_sync.load_operations_policy", lambda paths: _policy()
+    )
+    monkeypatch.setattr(
+        "pkm_brain.gmail_archive_sync.connector_auth_status",
+        lambda paths, connector: {"status": "connected"},
+    )
+    monkeypatch.setattr(
+        "pkm_brain.gmail_archive_sync.GmailArchiveSynchronizer",
+        FailingSynchronizer,
+    )
+
+    payload = run_scheduled_gmail_archive_sync(paths, operational_service)
+
+    assert payload == {
+        "status": "failed",
+        "message": "Secure Gmail history copy stopped safely; retry from the Brain app.",
+        "error_code": "gmail_archive_SensitiveProviderFailure",
+    }
+    assert "subject" not in repr(payload)
+    assert "message body" not in repr(payload)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from .gmail_fact_quality import gmail_fact_quality_prompt_rule
@@ -18,7 +19,15 @@ from .source_dates import (
 
 DEFAULT_EXTRACTION_MAX_WORKERS = 1
 MAX_EXTRACTION_MAX_WORKERS = 16
-DEFAULT_SKIPPED_SOURCE_TYPES = {"agent_session_log"}
+# Agent traces and private Gmail projections remain searchable locally, but they
+# are not sent through the external fact extractor unless an operator makes an
+# explicit source-type opt-in.
+DEFAULT_SKIPPED_SOURCE_TYPES = {"agent_session_log", "gmail_thread"}
+MAX_COMPATIBLE_TERMINAL_PROMPT_VERSIONS = 32
+MAX_EXTRACTION_PROMPT_VERSION_CHARS = 128
+EXTRACTION_PROMPT_VERSION_PATTERN = re.compile(
+    r"^extractor-evidence-units-v(?P<revision>[1-9][0-9]*)(?:-[a-z0-9]+)*$"
+)
 
 
 def extraction_policy_for_source_type(
@@ -34,9 +43,16 @@ def extraction_policy_for_source_type(
         "full_coverage": True,
         "require_fact_eligible": source_type == "gmail_thread",
     }
-    for configured in (source_types.get("default"), source_types.get(source_type)):
+    source_policy = source_types.get(source_type)
+    for configured in (source_types.get("default"), source_policy):
         if isinstance(configured, dict):
             policy.update(normalize_extraction_policy(configured))
+    if source_type in DEFAULT_SKIPPED_SOURCE_TYPES and not (
+        isinstance(source_policy, dict) and source_policy.get("extract") is True
+    ):
+        # A broad default cannot opt private or internal-only sources into the
+        # external extractor.  Opt-in must name the protected source exactly.
+        policy["extract"] = False
     return policy
 
 
@@ -54,6 +70,37 @@ def normalize_extraction_max_workers(value: Any) -> int:
     except (TypeError, ValueError):
         parsed = DEFAULT_EXTRACTION_MAX_WORKERS
     return min(MAX_EXTRACTION_MAX_WORKERS, max(1, parsed))
+
+
+def normalize_compatible_terminal_prompt_versions(
+    value: Any,
+    *,
+    current_prompt_version: str,
+) -> tuple[str, ...]:
+    """Return exact, bounded older extractor prompt identities from local config."""
+
+    current_match = EXTRACTION_PROMPT_VERSION_PATTERN.fullmatch(current_prompt_version)
+    if not isinstance(value, list) or current_match is None:
+        return ()
+    current_revision = int(current_match.group("revision"))
+    compatible: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        candidate = item.strip()
+        if len(candidate) > MAX_EXTRACTION_PROMPT_VERSION_CHARS:
+            continue
+        match = EXTRACTION_PROMPT_VERSION_PATTERN.fullmatch(candidate)
+        if (
+            match is None
+            or int(match.group("revision")) >= current_revision
+            or candidate in compatible
+        ):
+            continue
+        compatible.append(candidate)
+        if len(compatible) >= MAX_COMPATIBLE_TERMINAL_PROMPT_VERSIONS:
+            break
+    return tuple(compatible)
 
 
 def source_extraction_admission(

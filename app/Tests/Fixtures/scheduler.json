@@ -49,6 +49,23 @@
       "running": false
     },
     {
+      "cadence_s": 600,
+      "enabled": true,
+      "id": "gmail_knowledge_ingest",
+      "isolated": true,
+      "lane": "knowledge_mutation",
+      "last_error": null,
+      "last_result": {
+        "captured": 412,
+        "status": "complete"
+      },
+      "last_run_at": "2026-07-08T08:03:00+00:00",
+      "last_status": "complete",
+      "next_due_at": "2026-07-08T08:13:00+00:00",
+      "queued": false,
+      "running": false
+    },
+    {
       "cadence_s": 3600,
       "enabled": true,
       "id": "nightly",

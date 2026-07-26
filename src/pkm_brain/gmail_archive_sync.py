@@ -425,10 +425,14 @@ def run_scheduled_gmail_archive_sync(
             "message": "Secure Gmail history copy paused at today's Gmail limit.",
             "stopped_reason": "daily_budget_headroom",
         }
-    except Exception:
+    except Exception as exc:
         return {
             "status": "failed",
             "message": "Secure Gmail history copy stopped safely; retry from the Brain app.",
+            # Exception text may contain provider or message context.  The class
+            # name is enough to diagnose the failing boundary without exposing
+            # private Gmail evidence through the scheduler API.
+            "error_code": f"gmail_archive_{type(exc).__name__}",
         }
 
 

@@ -5,8 +5,13 @@ import json
 import os
 import queue
 import secrets
+import signal
 import stat
+import subprocess
+import sys
+import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from importlib import metadata
@@ -15,13 +20,6 @@ from typing import Any, Callable
 
 import yaml
 
-from .automation import (
-    as_jsonable,
-    run_agent_log_ingest,
-    run_gmail_knowledge_ingest,
-    run_nightly_maintenance,
-    run_secondary_tick,
-)
 from .gmail_archive_sync import run_scheduled_gmail_archive_sync
 from .gmail_sync import run_scheduled_gmail_mirror_sync
 from .migrations import MIGRATIONS
@@ -29,10 +27,13 @@ from .operational_meeting_packets import run_scheduled_meeting_preparation
 from .operational_service import OperationalService, OperationalWriteRefusedError
 from .operational_today import OperationalTodayPresentationService
 from .paths import BrainPaths
+from .scheduler_protocol import (
+    read_scheduler_status,
+    sanitize_scheduler_payload,
+)
 from .shadow_controller import ShadowTrialController
 from .service import BrainService
 from .sync_config import load_sync_config
-from .sync_transfer import sync_run
 from .ui_server import BrainUIServer, create_ui_server
 from .util import now_iso
 
@@ -107,7 +108,7 @@ def process_alive(pid: int) -> bool:
 class SchedulerJob:
     id: str
     cadence_s: int
-    handler: Callable[[], Any]
+    handler: Callable[[], Any] | None = None
     enabled: bool = True
     last_run_at: str | None = None
     last_status: str | None = None
@@ -117,6 +118,7 @@ class SchedulerJob:
     running: bool = False
     lane: str = "serial"
     run_on_start: bool = False
+    isolated_job: str | None = None
 
 
 @dataclass
@@ -143,6 +145,9 @@ class SerialJobScheduler:
         self._stop = threading.Event()
         self._worker_threads: dict[str, threading.Thread] = {}
         self._ticker_thread: threading.Thread | None = None
+        self._children_lock = threading.RLock()
+        self._active_children: dict[str, subprocess.Popen[bytes]] = {}
+        self._accept_children = False
         self._config = self._load_config()
         self.jobs: dict[str, SchedulerJob] = {
             job.id: self._apply_config(job)
@@ -197,6 +202,8 @@ class SerialJobScheduler:
             if self._ticker_thread and self._ticker_thread.is_alive():
                 return
             self._stop.clear()
+            with self._children_lock:
+                self._accept_children = True
             self._worker_threads = {
                 lane: threading.Thread(
                     target=self._worker_loop,
@@ -216,6 +223,10 @@ class SerialJobScheduler:
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
+        with self._children_lock:
+            self._accept_children = False
+            active_children = list(self._active_children.values())
+        self._terminate_children(active_children, timeout=max(0.1, timeout / 2))
         for lane_queue in self._queues.values():
             lane_queue.put(None)
         if self._ticker_thread:
@@ -248,16 +259,24 @@ class SerialJobScheduler:
                 job.running = True
             started = self._now()
             try:
-                raw_result = job.handler()
-                result = json.loads(json.dumps(raw_result, default=str))
+                raw_result = (
+                    self._run_isolated_job(job.isolated_job)
+                    if job.isolated_job
+                    else self._run_local_job(job)
+                )
+                result = sanitize_scheduler_payload(raw_result)
                 status = str(result.get("status") or ("skipped" if result.get("skipped") else "success"))
                 error = result.get("error")
                 if not error and status == "skipped":
                     error = result.get("reason")
             except Exception as exc:
-                result = {}
+                result = {
+                    "status": "failed",
+                    "error": "scheduled job failed",
+                    "error_type": type(exc).__name__,
+                }
                 status = "failed"
-                error = str(exc)
+                error = str(result["error"])
             finished = self._now()
             with self._lock:
                 job.running = False
@@ -323,6 +342,7 @@ class SerialJobScheduler:
                         "cadence_s": job.cadence_s,
                         "lane": job.lane,
                         "run_on_start": job.run_on_start,
+                        "isolated": bool(job.isolated_job),
                         "last_run_at": job.last_run_at,
                         "last_status": job.last_status,
                         "last_result": job.last_result,
@@ -361,6 +381,147 @@ class SerialJobScheduler:
             return False
         return True
 
+    def _run_isolated_job(self, isolated_job: str) -> dict[str, Any]:
+        self.paths.logs.mkdir(parents=True, exist_ok=True)
+        descriptor, raw_status_path = tempfile.mkstemp(
+            prefix=".scheduler-child-",
+            suffix=".json",
+            dir=self.paths.logs,
+        )
+        os.close(descriptor)
+        status_path = Path(raw_status_path)
+        os.chmod(status_path, 0o600)
+        process: subprocess.Popen[bytes] | None = None
+        try:
+            with self._children_lock:
+                if not self._accept_children or self._stop.is_set():
+                    return {
+                        "status": "failed",
+                        "error": "scheduled child cancelled during daemon shutdown",
+                    }
+                process = subprocess.Popen(
+                    self._isolated_command(isolated_job, status_path),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    close_fds=True,
+                    start_new_session=True,
+                )
+                self._active_children[isolated_job] = process
+            return_code = process.wait()
+            # A crashed guardian may leave its heavy executor alive in the
+            # guardian's process group. Clean the group even after its leader
+            # has exited before reading or returning scheduler state.
+            self._terminate_children([process], timeout=0.5)
+            result = read_scheduler_status(status_path)
+            if return_code != 0:
+                if result.get("status") != "failed":
+                    result = {
+                        "status": "failed",
+                        "error": "scheduled child exited unexpectedly",
+                    }
+                result["exit_code"] = return_code
+            return result
+        finally:
+            if process is not None:
+                # Also cover failures raised while waiting for or decoding the
+                # guardian, before it can be removed from the active registry.
+                self._terminate_children([process], timeout=0.5)
+            with self._children_lock:
+                if (
+                    process is not None
+                    and self._active_children.get(isolated_job) is process
+                ):
+                    self._active_children.pop(isolated_job, None)
+            status_path.unlink(missing_ok=True)
+
+    def _run_local_job(self, job: SchedulerJob) -> Any:
+        if job.handler is None:
+            raise RuntimeError(f"scheduler job has no handler: {job.id}")
+        return job.handler()
+
+    def _isolated_command(self, isolated_job: str, status_path: Path) -> list[str]:
+        return [
+            sys.executable,
+            "-m",
+            "pkm_brain.scheduler_worker",
+            "--job",
+            isolated_job,
+            "--home",
+            str(self.paths.home),
+            "--status-file",
+            str(status_path),
+            "--parent-pid",
+            str(os.getpid()),
+        ]
+
+    def _terminate_children(
+        self,
+        children: list[subprocess.Popen[bytes]],
+        *,
+        timeout: float,
+    ) -> None:
+        processes_by_group = {process.pid: process for process in children}
+        for process in children:
+            process.poll()
+        remaining_groups = {
+            group_id
+            for group_id in processes_by_group
+            if self._process_group_alive(group_id)
+        }
+        for group_id in remaining_groups:
+            try:
+                os.killpg(group_id, signal.SIGTERM)
+            except ProcessLookupError:
+                continue
+            except OSError:
+                process = processes_by_group[group_id]
+                if process.poll() is None:
+                    process.terminate()
+        deadline = time.monotonic() + timeout
+        while remaining_groups and time.monotonic() < deadline:
+            for process in children:
+                process.poll()
+            remaining_groups = {
+                group_id
+                for group_id in remaining_groups
+                if self._process_group_alive(group_id)
+            }
+            if remaining_groups:
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        for group_id in remaining_groups:
+            try:
+                os.killpg(group_id, signal.SIGKILL)
+            except ProcessLookupError:
+                continue
+            except OSError:
+                process = processes_by_group.get(group_id)
+                if process is not None and process.poll() is None:
+                    process.kill()
+        for process in children:
+            if process.poll() is not None:
+                continue
+            try:
+                process.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:  # pragma: no cover - OS-level failure
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    process.kill()
+
+    def _process_group_alive(self, group_id: int) -> bool:
+        try:
+            os.killpg(group_id, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return True
+        return True
+
     def _iso(self, value: datetime) -> str:
         return value.astimezone(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -388,7 +549,8 @@ def build_role_jobs(
             SchedulerJob(
                 id="capture_tick",
                 cadence_s=DEFAULT_CAPTURE_CADENCE_SECONDS,
-                handler=lambda: as_jsonable(run_agent_log_ingest(paths)),
+                lane="knowledge_mutation",
+                isolated_job="capture_tick",
             )
         )
     if role == "secondary":
@@ -396,16 +558,16 @@ def build_role_jobs(
             SchedulerJob(
                 id="secondary_tick",
                 cadence_s=DEFAULT_CAPTURE_CADENCE_SECONDS,
-                handler=lambda: as_jsonable(run_secondary_tick(paths)),
+                lane="knowledge_mutation",
+                isolated_job="secondary_tick",
             )
         )
     jobs.append(
         SchedulerJob(
             id="nightly",
             cadence_s=DEFAULT_NIGHTLY_CHECK_CADENCE_SECONDS,
-            handler=lambda: as_jsonable(
-                run_nightly_maintenance(paths, if_due=True, due_after_hours=20)
-            ),
+            lane="knowledge_mutation",
+            isolated_job="nightly",
         )
     )
     if role in {"single", "primary"} and operational_service is not None:
@@ -437,8 +599,8 @@ def build_role_jobs(
             SchedulerJob(
                 id="gmail_knowledge_ingest",
                 cadence_s=DEFAULT_GMAIL_KNOWLEDGE_INGEST_CADENCE_SECONDS,
-                handler=lambda: run_gmail_knowledge_ingest(paths),
-                lane="knowledge_ingest",
+                lane="knowledge_mutation",
+                isolated_job="gmail_knowledge_ingest",
             )
         )
         jobs.append(
@@ -457,9 +619,8 @@ def build_role_jobs(
                 SchedulerJob(
                     id=f"sync:{peer.node_id}",
                     cadence_s=peer.cadence_s or DEFAULT_SYNC_CADENCE_SECONDS,
-                    handler=lambda peer_id=peer.node_id: json.loads(
-                        json.dumps(sync_run(paths, peer_id, if_reachable=True).__dict__, default=str)
-                    ),
+                    lane="knowledge_mutation",
+                    isolated_job=f"sync:{peer.node_id}",
                 )
             )
     return jobs

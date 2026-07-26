@@ -31,11 +31,7 @@ from .event_routing import (
     enrich_event_route_targets, mint_stabilized_gmail_event_time,
     guard_event_candidate_route, guard_event_candidate_routes,
 )
-from .extraction_contract import (
-    COMPATIBLE_EXTRACTION_PROMPT_VERSIONS,
-    EXTRACTION_PROMPT_VERSION,
-    EXTRACTION_SCHEMA,
-)
+from .extraction_contract import EXTRACTION_PROMPT_VERSION, EXTRACTION_SCHEMA
 from .extraction_evidence import (
     MAX_EVIDENCE_UNITS_PER_FACT,
     empty_resolved_evidence as empty_resolved_evidence,
@@ -53,6 +49,7 @@ from .extraction_source_policy import (
     DEFAULT_EXTRACTION_MAX_WORKERS,
     extraction_policy_for_source_type,
     filter_source_extraction_chunks,
+    normalize_compatible_terminal_prompt_versions,
     normalize_extraction_max_workers,
     source_extraction_admission,
     source_prompt_safety_rule,
@@ -307,12 +304,8 @@ def extract_recent_documents(
         max_workers=critic_max_workers,
         timeout_seconds=critic_timeout_seconds,
     )
-    source_type_filter = {
-        str(item).strip() for item in source_types or [] if str(item).strip()
-    }
-    document_id_filter = {
-        str(item).strip() for item in document_ids or [] if str(item).strip()
-    }
+    source_type_filter = {str(item).strip() for item in source_types or [] if str(item).strip()}
+    document_id_filter = {str(item).strip() for item in document_ids or [] if str(item).strip()}
     selection_limit = (
         max(1, limit)
         if offset <= 0 and not source_type_filter and not document_id_filter
@@ -803,6 +796,7 @@ def recent_source_cards(
                 content_hash=normalized_content_hash,
                 extractor_model=extractor_model,
                 prompt_version=prompt_version,
+                compatible_prompt_versions=tuple(config.get("compatible_terminal_prompt_versions") or ()),
             ):
                 continue
             windows: list[dict[str, Any]] = []
@@ -858,12 +852,10 @@ def extraction_terminal_watermark_exists(
     content_hash: str,
     extractor_model: str | None,
     prompt_version: str,
+    compatible_prompt_versions: tuple[str, ...] = (),
 ) -> bool:
     if prompt_version == EXTRACTION_PROMPT_VERSION:
-        accepted_versions = (
-            prompt_version,
-            *COMPATIBLE_EXTRACTION_PROMPT_VERSIONS,
-        )
+        accepted_versions = (prompt_version, *compatible_prompt_versions)
         accepted_placeholders = ",".join("?" for _ in accepted_versions)
         watermark_rows = conn.execute(
             f"""
@@ -883,17 +875,21 @@ def extraction_terminal_watermark_exists(
                 *accepted_versions,
             ),
         ).fetchall()
-        for watermark in watermark_rows:
-            status = str(watermark["status"] or "")
-            watermark_prompt = str(watermark["prompt_version"] or "")
-            if watermark_prompt == prompt_version:
-                if status in TERMINAL_EXTRACTION_WATERMARK_STATUSES:
-                    return True
-                if partial_extraction_watermark_is_terminal(watermark):
-                    return True
-            elif status in {"ok", "ok_with_rejections"}:
-                return True
-        return False
+        current_watermarks = [
+            watermark
+            for watermark in watermark_rows
+            if str(watermark["prompt_version"] or "") == prompt_version
+        ]
+        if current_watermarks:
+            return any(
+                str(watermark["status"] or "") in TERMINAL_EXTRACTION_WATERMARK_STATUSES
+                or partial_extraction_watermark_is_terminal(watermark)
+                for watermark in current_watermarks
+            )
+        return any(
+            str(watermark["status"] or "") in {"ok", "ok_with_rejections"}
+            for watermark in watermark_rows
+        )
     terminal_placeholders = ",".join(
         "?" for _ in TERMINAL_EXTRACTION_WATERMARK_STATUSES
     )
@@ -943,6 +939,10 @@ def load_extraction_config(paths: BrainPaths) -> dict[str, Any]:
         overlap_chunks = max(0, max_chunks - 1)
     return {
         "source_types": source_types,
+        "compatible_terminal_prompt_versions": normalize_compatible_terminal_prompt_versions(
+            raw.get("compatible_terminal_prompt_versions"),
+            current_prompt_version=EXTRACTION_PROMPT_VERSION,
+        ),
         "window_max_chunks": max_chunks,
         "window_overlap_chunks": overlap_chunks,
         "routing_hints_limit": max(

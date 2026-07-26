@@ -43,6 +43,24 @@ REQUIRED_OPERATIONAL_TABLES = {
     "ops_item_events",
     "ops_source_cursors",
 }
+SCHEMA_METADATA_VERSION = 1
+
+
+def recovery_scope() -> dict[str, Any]:
+    """Describe the intentionally narrow contents of a recovery set."""
+
+    return {
+        "included": [
+            "db/brain.sqlite",
+            "db/ops.sqlite",
+        ],
+        "excluded": [
+            "Gmail encrypted archive and mailbox mirror",
+            "raw source files and inbox captures",
+            "wiki files, indexes, configuration, logs, and runtime files",
+        ],
+        "complete_brain_home": False,
+    }
 
 
 class RecoverySetError(RuntimeError):
@@ -142,9 +160,7 @@ def _readonly_connection(path: Path, *, immutable: bool) -> sqlite3.Connection:
 def _database_tables(conn: sqlite3.Connection) -> set[str]:
     return {
         str(row[0])
-        for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'"
-        )
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
     }
 
 
@@ -160,6 +176,72 @@ def _database_health(conn: sqlite3.Connection) -> tuple[str, int]:
             f"database foreign-key check found {foreign_key_errors} errors"
         )
     return "ok", foreign_key_errors
+
+
+def _require_known_migration_prefix(
+    actual: tuple[Any, ...],
+    expected: tuple[Any, ...],
+    *,
+    database_name: str,
+) -> None:
+    """Accept an older schema only when it is an exact known migration prefix."""
+
+    if not actual or len(actual) > len(expected) or actual != expected[: len(actual)]:
+        raise RecoverySetError(
+            f"{database_name} schema versions {actual} are not a complete prefix "
+            f"of known migrations {expected}"
+        )
+
+
+def _schema_summary(
+    actual: tuple[Any, ...],
+    expected: tuple[Any, ...],
+) -> dict[str, Any]:
+    actual_version = int(actual[-1][0] if isinstance(actual[-1], tuple) else actual[-1])
+    runtime_version = int(
+        expected[-1][0] if isinstance(expected[-1], tuple) else expected[-1]
+    )
+    return {
+        "schema_version": actual_version,
+        "runtime_schema_version": runtime_version,
+        "schema_compatibility": (
+            "current" if actual == expected else "known_migration_prefix"
+        ),
+    }
+
+
+def _validate_recorded_schema_summary(
+    entry: dict[str, Any],
+    actual: dict[str, Any],
+    *,
+    database_name: str,
+) -> None:
+    if entry.get("schema_version") != actual["schema_version"]:
+        raise RecoverySetError(
+            "recovery database validation metadata mismatch: "
+            f"{database_name}.schema_version"
+        )
+    recorded_runtime_version = entry.get("runtime_schema_version")
+    if (
+        isinstance(recorded_runtime_version, bool)
+        or not isinstance(recorded_runtime_version, int)
+        or recorded_runtime_version < actual["schema_version"]
+        or recorded_runtime_version > actual["runtime_schema_version"]
+    ):
+        raise RecoverySetError(
+            "recovery database validation metadata mismatch: "
+            f"{database_name}.runtime_schema_version"
+        )
+    recorded_compatibility = (
+        "current"
+        if recorded_runtime_version == actual["schema_version"]
+        else "known_migration_prefix"
+    )
+    if entry.get("schema_compatibility") != recorded_compatibility:
+        raise RecoverySetError(
+            "recovery database validation metadata mismatch: "
+            f"{database_name}.schema_compatibility"
+        )
 
 
 def _validate_knowledge_database(path: Path, *, immutable: bool) -> dict[str, Any]:
@@ -179,15 +261,19 @@ def _validate_knowledge_database(path: Path, *, immutable: bool) -> dict[str, An
                 )
             )
             expected = tuple(version for version, _name, _migration in MIGRATIONS)
-            if versions != expected:
-                raise RecoverySetError(
-                    f"knowledge schema versions {versions} do not match {expected}"
-                )
+            _require_known_migration_prefix(
+                versions,
+                expected,
+                database_name="knowledge",
+            )
             integrity, foreign_key_errors = _database_health(conn)
     except sqlite3.DatabaseError as exc:
-        raise RecoverySetError(f"knowledge database cannot be validated: {path}") from exc
+        raise RecoverySetError(
+            f"knowledge database cannot be validated: {path}"
+        ) from exc
     return {
         "schema_versions": list(versions),
+        **_schema_summary(versions, expected),
         "integrity_check": integrity,
         "foreign_key_errors": foreign_key_errors,
     }
@@ -210,13 +296,13 @@ def _validate_operational_database(path: Path, *, immutable: bool) -> dict[str, 
                 )
             )
             expected = tuple(
-                (version, name)
-                for version, name, _migration in OPERATIONAL_MIGRATIONS
+                (version, name) for version, name, _migration in OPERATIONAL_MIGRATIONS
             )
-            if versions != expected:
-                raise RecoverySetError(
-                    f"operational schema versions {versions} do not match {expected}"
-                )
+            _require_known_migration_prefix(
+                versions,
+                expected,
+                database_name="operational",
+            )
             integrity, foreign_key_errors = _database_health(conn)
     except sqlite3.DatabaseError as exc:
         raise RecoverySetError(
@@ -226,6 +312,7 @@ def _validate_operational_database(path: Path, *, immutable: bool) -> dict[str, 
         "schema_versions": [
             {"version": version, "name": name} for version, name in versions
         ],
+        **_schema_summary(versions, expected),
         "integrity_check": integrity,
         "foreign_key_errors": foreign_key_errors,
     }
@@ -274,7 +361,9 @@ def _coordinated_database_barrier(
 
 def _online_backup(source_path: Path, target_path: Path) -> None:
     if target_path.exists() or target_path.is_symlink():
-        raise RecoverySetError(f"recovery database target already exists: {target_path}")
+        raise RecoverySetError(
+            f"recovery database target already exists: {target_path}"
+        )
     with _readonly_connection(source_path, immutable=False) as source:
         with sqlite3.connect(target_path) as target:
             source.backup(target)
@@ -353,7 +442,9 @@ def _safe_recovery_target(paths: BrainPaths, target: Path) -> Path:
         or resolved.is_relative_to(db_dir)
         or db_dir.is_relative_to(resolved)
     ):
-        raise RecoverySetError("recovery output must not overlap the live database home")
+        raise RecoverySetError(
+            "recovery output must not overlap the live database home"
+        )
     if resolved.exists() or resolved.is_symlink():
         raise RecoverySetError(f"recovery output already exists: {resolved}")
     return resolved
@@ -369,13 +460,15 @@ def create_coordinated_recovery_set(
 
     if operational_service.paths.home != paths.home:
         raise RecoverySetError("operational service belongs to a different Brain home")
+    # Validate the existing stores read-only before creating identity or generation
+    # metadata. In particular, do not initialize or migrate either database here.
+    _validate_knowledge_database(paths.sqlite_path, immutable=False)
+    _validate_operational_database(paths.ops_sqlite_path, immutable=False)
     # Refuse an unauthorized or lease-less caller and establish the shared Brain
     # identity before hashing canonical source state. Authority is checked again
     # for the actual snapshot.
     with operational_service.mutation_lease():
         brain_id = ensure_brain_identity(paths)
-    _validate_knowledge_database(paths.sqlite_path, immutable=False)
-    _validate_operational_database(paths.ops_sqlite_path, immutable=False)
     backup_set_id = new_id("recovery")
     target = _safe_recovery_target(
         paths,
@@ -441,6 +534,8 @@ def create_coordinated_recovery_set(
         "primary_epoch": primary_epoch,
         "runtime_version": _package_version(),
         "sqlite_version": sqlite3.sqlite_version,
+        "schema_metadata_version": SCHEMA_METADATA_VERSION,
+        "scope": recovery_scope(),
         "watermarks": watermarks,
         "protection": {
             "at_rest": "owner_only_filesystem_permissions",
@@ -486,6 +581,7 @@ def create_coordinated_recovery_set(
         "generation": generation,
         "manifest_sha256": verification["manifest_sha256"],
         "databases": verification["manifest"]["databases"],
+        "scope": recovery_scope(),
     }
 
 
@@ -504,7 +600,9 @@ def _read_recovery_manifest(recovery_dir: Path) -> tuple[dict[str, Any], str]:
         if path.is_symlink() or not path.is_file():
             raise RecoverySetError(f"recovery set member is missing or unsafe: {path}")
         if stat.S_IMODE(path.stat().st_mode) & 0o077:
-            raise RecoverySetError(f"recovery set member is not owner-only: {path.name}")
+            raise RecoverySetError(
+                f"recovery set member is not owner-only: {path.name}"
+            )
     manifest_bytes = manifest_path.read_bytes()
     manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
     if committed_path.read_text(encoding="ascii").strip() != manifest_sha256:
@@ -529,14 +627,22 @@ def verify_recovery_set(recovery_dir: Path) -> dict[str, Any]:
         raise RecoverySetError("recovery artifact is not a database pair")
     if manifest.get("status") != "complete":
         raise RecoverySetError("recovery manifest is incomplete")
-    if not BACKUP_SET_ID_PATTERN.fullmatch(
-        str(manifest.get("backup_set_id") or "")
-    ):
+    schema_metadata_version = manifest.get("schema_metadata_version")
+    if schema_metadata_version not in {None, SCHEMA_METADATA_VERSION}:
+        raise RecoverySetError("unsupported recovery schema metadata version")
+    manifest_scope = manifest.get("scope")
+    if manifest_scope is not None and manifest_scope != recovery_scope():
+        raise RecoverySetError("recovery manifest has an invalid scope declaration")
+    if not BACKUP_SET_ID_PATTERN.fullmatch(str(manifest.get("backup_set_id") or "")):
         raise RecoverySetError("recovery manifest has an invalid backup-set identity")
     if not BRAIN_ID_PATTERN.fullmatch(str(manifest.get("brain_id") or "")):
         raise RecoverySetError("recovery manifest has an invalid Brain identity")
     generation = manifest.get("generation")
-    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+    if (
+        isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation < 1
+    ):
         raise RecoverySetError("recovery generation is invalid")
     databases = manifest.get("databases")
     if not isinstance(databases, dict) or set(databases) != {
@@ -568,11 +674,22 @@ def verify_recovery_set(recovery_dir: Path) -> dict[str, Any]:
             if name == "knowledge"
             else _validate_operational_database(path, immutable=True)
         )
-        for key in ("schema_versions", "integrity_check", "foreign_key_errors"):
+        validation_keys = [
+            "schema_versions",
+            "integrity_check",
+            "foreign_key_errors",
+        ]
+        for key in validation_keys:
             if entry.get(key) != actual[key]:
                 raise RecoverySetError(
                     f"recovery database validation metadata mismatch: {name}.{key}"
                 )
+        if schema_metadata_version == SCHEMA_METADATA_VERSION:
+            _validate_recorded_schema_summary(
+                entry,
+                actual,
+                database_name=name,
+            )
         validation[name] = actual
     return {
         "status": "ok",
@@ -580,6 +697,7 @@ def verify_recovery_set(recovery_dir: Path) -> dict[str, Any]:
         "manifest_sha256": manifest_sha256,
         "manifest": manifest,
         "validation": validation,
+        "scope": recovery_scope(),
     }
 
 
@@ -630,7 +748,11 @@ def restore_recovery_set_isolated(
     source = recovery_dir.expanduser().resolve()
     if target.exists() or target.is_symlink():
         raise RecoverySetError("isolated restore target must not already exist")
-    if target == source or target.is_relative_to(source) or source.is_relative_to(target):
+    if (
+        target == source
+        or target.is_relative_to(source)
+        or source.is_relative_to(target)
+    ):
         raise RecoverySetError("restore target must not overlap the recovery set")
     staging = target.with_name(
         f".{target.name}.restore-partial-{manifest['backup_set_id']}"
@@ -678,9 +800,7 @@ def restore_recovery_set_isolated(
     }
     _write_private_file(
         staged_paths.restore_quarantine_file,
-        (json.dumps(restored_from, indent=2, sort_keys=True) + "\n").encode(
-            "utf-8"
-        ),
+        (json.dumps(restored_from, indent=2, sort_keys=True) + "\n").encode("utf-8"),
     )
     for directory in (
         staged_paths.db_dir,
@@ -705,4 +825,5 @@ def restore_recovery_set_isolated(
         "generation": manifest["generation"],
         "brain_id": manifest["brain_id"],
         "daemon_started": False,
+        "scope": recovery_scope(),
     }

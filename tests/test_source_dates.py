@@ -436,6 +436,10 @@ def test_ingested_gmail_card_preserves_offsets_for_provider_time(
     paths = BrainPaths.from_value(tmp_path / "brain")
     service = BrainService(paths)
     service.init_workspace()
+    (paths.config_local / "cos_llm.yaml").write_text(
+        "extraction:\n  source_types:\n    gmail_thread:\n      extract: true\n",
+        encoding="utf-8",
+    )
     ingested = service.ingest(source=source_path)
 
     documents = recent_source_cards(paths, limit=10)

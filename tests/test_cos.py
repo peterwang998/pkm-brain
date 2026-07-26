@@ -45,8 +45,10 @@ from pkm_brain.extraction import (
     evidence_units_for_text,
     extraction_prompt,
     extract_recent_documents,
+    load_extraction_config,
     normalized_extraction_content,
     recent_source_cards,
+    record_extraction_watermarks,
     record_critic_block_rate_anomalies,
     reclaim_unrouted_facts,
     reconcile_fact_conflict_reviews,
@@ -119,7 +121,9 @@ def test_gmail_extraction_prompt_treats_email_as_untrusted_data() -> None:
     assert "never infer that an attachment was read" in prompt
 
 
-def test_gmail_extraction_requires_fact_eligible_frontmatter(tmp_path: Path) -> None:
+def test_gmail_extraction_is_opt_in_and_requires_fact_eligible_frontmatter(
+    tmp_path: Path,
+) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()
     root = svc.paths.inbox / "documents" / "gmail"
@@ -189,11 +193,28 @@ deleted: false
         )
     svc.ingest(source=root)
 
+    (svc.paths.config_local / "cos_llm.yaml").write_text(
+        "extraction:\n  source_types:\n    default:\n      extract: true\n",
+        encoding="utf-8",
+    )
+    assert recent_source_cards(svc.paths, limit=10) == []
+
+    (svc.paths.config_local / "cos_llm.yaml").write_text(
+        "extraction:\n  source_types:\n    gmail_thread:\n      extract: true\n",
+        encoding="utf-8",
+    )
     documents = recent_source_cards(svc.paths, limit=10)
 
     assert [document["title"] for document in documents] == ["eligible"]
     assert documents[0]["source_type"] == "gmail_thread"
     assert documents[0]["source_trust"] == "untrusted_external"
+
+    (svc.paths.config_local / "cos_llm.yaml").write_text(
+        "extraction:\n  source_types:\n    gmail_thread:\n      extract: false\n",
+        encoding="utf-8",
+    )
+
+    assert recent_source_cards(svc.paths, limit=10) == []
 
 
 def test_evidence_units_propagate_speaker_identity_across_sentences() -> None:
@@ -1602,6 +1623,74 @@ def test_extraction_v12_revisits_previous_success_watermark(
     assert provider.calls == 2
 
 
+@pytest.mark.parametrize("status", ("ok", "ok_with_rejections"))
+def test_extraction_configured_older_success_watermark_is_terminal(
+    tmp_path: Path, status: str
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "source.md"
+    note.write_text("# Source\n\nWatermarked extraction marker.", encoding="utf-8")
+    svc.ingest()
+    provider = FakeExtractorProvider()
+    first = extract_recent_documents(svc.paths, shadow=True, llm_provider=provider)
+    with connection(svc.paths.sqlite_path) as conn:
+        conn.execute(
+            "UPDATE cos_stage_watermarks SET prompt_version = ?, status = ?",
+            ("extractor-evidence-units-v12-parity-recovery", status),
+        )
+    (svc.paths.config_local / "cos_llm.yaml").write_text(
+        "extraction:\n"
+        "  compatible_terminal_prompt_versions:\n"
+        "    - extractor-evidence-units-v12-parity-recovery\n",
+        encoding="utf-8",
+    )
+
+    second = extract_recent_documents(svc.paths, shadow=True, llm_provider=provider)
+
+    assert len(first["documents"]) == 1
+    assert second["documents"] == []
+    assert provider.calls == 1
+
+    record_extraction_watermarks(
+        svc.paths,
+        first["documents"],
+        extractor_model="fake-extractor-model",
+        run_id=None,
+        candidate_count=0,
+        status="invalid",
+    )
+    third = extract_recent_documents(svc.paths, shadow=True, llm_provider=provider)
+
+    assert len(third["documents"]) == 1
+    assert provider.calls == 2
+
+
+def test_extraction_compatible_prompt_config_is_exact_older_and_fail_closed(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    (svc.paths.config_local / "cos_llm.yaml").write_text(
+        "extraction:\n"
+        "  compatible_terminal_prompt_versions:\n"
+        "    - extractor-evidence-units-v12-parity-recovery\n"
+        "    - extractor-evidence-units-v12-parity-recovery\n"
+        "    - extractor-evidence-units-v15-gmail-event-time\n"
+        "    - extractor-evidence-units-v99-future\n"
+        "    - resolver-evidence-units-v12-parity-recovery\n"
+        "    - extractor-evidence-units-v12-parity-recovery;unsafe\n"
+        "    - 12\n",
+        encoding="utf-8",
+    )
+
+    config = load_extraction_config(svc.paths)
+
+    assert config["compatible_terminal_prompt_versions"] == (
+        "extractor-evidence-units-v12-parity-recovery",
+    )
+
+
 def test_extraction_revisits_compatible_prompt_empty_watermark(
     tmp_path: Path,
 ) -> None:
@@ -1619,6 +1708,12 @@ def test_extraction_revisits_compatible_prompt_empty_watermark(
             "UPDATE cos_stage_watermarks SET prompt_version = ?",
             ("extractor-evidence-units-v9-comprehensive-temporal",),
         )
+    (svc.paths.config_local / "cos_llm.yaml").write_text(
+        "extraction:\n"
+        "  compatible_terminal_prompt_versions:\n"
+        "    - extractor-evidence-units-v9-comprehensive-temporal\n",
+        encoding="utf-8",
+    )
 
     provider = FakeExtractorProvider()
     second = extract_recent_documents(svc.paths, shadow=True, llm_provider=provider)

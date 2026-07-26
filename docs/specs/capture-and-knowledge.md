@@ -74,6 +74,19 @@ An explicit document-ID filter is available for bounded repair/reprocessing runs
 
 The source policy lives in `config/local/cos_llm.yaml`. The verified local extractor deployment on 2026-07-10 is Codex `gpt-5.6-luna` at low effort with four workers. Provider configuration remains user-overridable.
 
+An in-place prompt migration may explicitly fence already-processed documents while leaving Gmail Knowledge extraction disabled:
+
+```yaml
+extraction:
+  compatible_terminal_prompt_versions:
+    - extractor-evidence-units-v12-parity-recovery
+  source_types:
+    gmail_thread:
+      extract: false
+```
+
+The compatibility list is empty by default. It accepts only exact, older extractor prompt identities and treats only their successful `ok` or `ok_with_rejections` watermarks as terminal under the current v15 selector. Empty, invalid, current, future, malformed, and unlisted prompt watermarks are still revisited. Operators should add an older prompt only after deciding that preserving its successful extraction is safer than replaying it during that migration. Source policy is independent: `source_types.gmail_thread.extract: false` prevents eligible Gmail Knowledge documents from entering fact extraction at all.
+
 This selector answers whether a source should enter the durable fact pipeline. It is not an operational-relevance classifier. A thread can be ineligible for facts and still contain an important reservation, renewal, delivery, deadline, cancellation, or payment signal.
 
 ## Extractor Payload

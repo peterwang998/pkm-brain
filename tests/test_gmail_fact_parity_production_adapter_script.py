@@ -236,6 +236,10 @@ def test_v2_projection_passes_real_timestamp_and_policy_authority(
     paths = BrainPaths.from_value(tmp_path / "brain")
     service = BrainService(paths)
     service.init_workspace()
+    (paths.config_local / "cos_llm.yaml").write_text(
+        "extraction:\n  source_types:\n    gmail_thread:\n      extract: true\n",
+        encoding="utf-8",
+    )
 
     source = adapter.write_v2_source(paths.home, body, ranges, packet)
     result = service.ingest(source=source)

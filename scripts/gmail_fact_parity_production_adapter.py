@@ -950,6 +950,20 @@ def execute_request(
             paths = BrainPaths.from_value(home)
             service = BrainService(paths)
             service.init_workspace()
+            if request["arm"] == "v2":
+                # Production Gmail extraction is intentionally fail-closed.
+                # This sealed parity harness is the explicit, private opt-in
+                # that authorizes its synthetic Gmail packet for evaluation.
+                extraction_config = paths.config_local / "cos_llm.yaml"
+                _write_private_text(
+                    extraction_config,
+                    (
+                        "extraction:\n"
+                        "  source_types:\n"
+                        "    gmail_thread:\n"
+                        "      extract: true\n"
+                    ),
+                )
             source = (
                 write_original_source(home, body, packet)
                 if request["arm"] == "original"
