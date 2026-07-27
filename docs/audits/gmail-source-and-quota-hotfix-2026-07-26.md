@@ -60,7 +60,7 @@ problems, not a failed bulk import.
 - Focused Gmail, MCP, source-route, and quota suite: 72 passed.
 - Ruff lint, formatting, and Git whitespace checks passed.
 - Brain 0.2.3 build 9 is live as runtime
-  `0.2.3-12a45456-e039567c`. All 43 unique local Gmail evidence links on the
+  `0.2.3-12a45456-fabf4497`. All 43 unique local Gmail evidence links on the
   current Today surface resolved offline: 42 from the exact mirror revision and
   one from its exact retained cache, with no errors.
 - On startup, the archive and mirror each completed an incremental history check
