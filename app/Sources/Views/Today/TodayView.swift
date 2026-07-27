@@ -892,16 +892,16 @@ private struct TodayItemCard: View {
                                 Label(localEvidenceActionTitle(evidence), systemImage: "brain.head.profile")
                             }
                             .buttonStyle(.link)
-                            .accessibilityLabel("Open local evidence for \(item.title)")
-                            .help("Open local evidence · \(evidence.reference)")
+                            .accessibilityLabel("\(localEvidenceActionTitle(evidence)) for \(item.title)")
+                            .help("\(localEvidenceActionTitle(evidence)) · \(evidence.reference)")
                         }
                         if let url = safeProviderURL(evidence.provider_url) {
                             Link(destination: url) {
                                 Label(providerEvidenceActionTitle(evidence), systemImage: "arrow.up.right.square")
                             }
                             .buttonStyle(.link)
-                            .accessibilityLabel("Open source for \(item.title)")
-                            .help("Open provider source · \(evidence.reference)")
+                            .accessibilityLabel("\(providerEvidenceActionTitle(evidence)) for \(item.title)")
+                            .help("\(providerEvidenceActionTitle(evidence)) · \(evidence.reference)")
                         }
                     }
                 }

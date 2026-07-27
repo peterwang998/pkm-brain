@@ -11,12 +11,13 @@ problems, not a failed bulk import.
 
 ## Evidence
 
-- Encrypted archive: live phase, complete coverage, 8,522 stored message rows.
+- Encrypted archive: live phase, complete coverage, 8,568 stored message rows
+  after the deployment restart.
 - Operational mirror: complete coverage and an active Gmail history cursor.
 - Gmail Knowledge: local archive-to-file-to-index processing; zero Gmail API
   calls in this stage.
-- Brain safety budget: 750 of 20,000 Gmail requests used on the day of the
-  investigation. No retained day reached the configured 20,000-request limit.
+- Brain safety budget: 2,150 of 20,000 Gmail requests used after a full day of
+  normal operation. No retained day reached the configured 20,000-request limit.
 - The Gmail archive health probe succeeded locally. Knowledge search was
   temporarily blocked while the large historical local-index backlog was being
   processed; that is independent of Gmail API quota.
@@ -53,6 +54,13 @@ problems, not a failed bulk import.
 - Swift suite: 28 passed.
 - Focused Gmail, MCP, source-route, and quota suite: 72 passed.
 - Ruff lint, formatting, and Git whitespace checks passed.
+- Brain 0.2.3 build 9 is live as runtime
+  `0.2.3-12a45456-e039567c`. All 43 unique local Gmail evidence links on the
+  current Today surface resolved offline: 42 from the exact mirror revision and
+  one from its exact retained cache, with no errors.
+- On startup, the archive and mirror each completed an incremental history check
+  using one request and two Gmail quota units. Local archive and Knowledge health
+  probes both passed.
 
 ## Remaining architectural tradeoff
 
