@@ -2667,5 +2667,8 @@ def print_search_result(result: dict) -> None:
         )
     console.print(table)
     console.print(f"retrieval_event_id: {result['event_id']}")
+    telemetry = result.get("retrieval_telemetry") or {}
+    if telemetry.get("message"):
+        console.print(f"warning: {telemetry['message']}")
     if result.get("debug"):
         console.print_json(json.dumps(result["debug"]))

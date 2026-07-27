@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 
-GMAIL_SENSITIVE_DATA_VERSION = 1
+GMAIL_SENSITIVE_DATA_VERSION = 2
 GMAIL_SENSITIVE_MASK = "█"
 _NON_SECRET_LABEL_VALUES = {
     "above",
@@ -64,6 +64,13 @@ _LABELED_SECRET_RE = re.compile(
     (?P<value>[^\s<>{}\[\](),;|\"']{4,256})
     """,
     re.IGNORECASE | re.VERBOSE,
+)
+_TEMPORARY_PASSWORD_LINE_RE = re.compile(
+    r"\btemporary(?:\s+(?:security|access|sign[\s-]?in|login|authentication))?\s+"
+    r"(?:password|passcode)\b"
+    r"(?:\s*(?::|=)\s*|\s+(?:is|was)(?:\s*:\s*|\s+)|[ \t]*\n+[ \t]*)"
+    r"(?P<value>[^\r\n]{4,256})",
+    re.IGNORECASE,
 )
 _NUMERIC_LABELED_SECRET_RE = re.compile(
     r"\b(?:one[\s-]?time|verification|security|access|sign[\s-]?in|login|authentication|temporary(?:\s+(?:security|access|sign[\s-]?in|login|authentication))?)\s+"
@@ -168,7 +175,8 @@ _AUTH_HEADER_RE = re.compile(
 )
 _SENSITIVE_KEY_VALUE_RE = re.compile(
     r"\b(?:access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|"
-    r"api[_-]?key|client[_-]?secret|session[_-]?(?:id|token)|private[_-]?key)\b"
+    r"api[_-]?key|client[_-]?secret|aws[_-]?secret[_-]?access[_-]?key|"
+    r"secret[_-]?access[_-]?key|session[_-]?(?:id|token)|private[_-]?key)\b"
     r"[\"']?\s*(?::|=)\s*[\"']?(?P<value>[A-Za-z0-9._~+/=-]{8,512})",
     re.IGNORECASE,
 )
@@ -254,8 +262,11 @@ _STANDALONE_TOKEN_RES = (
     (
         "provider_token",
         re.compile(
-            r"(?P<value>AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|"
-            r"sk-[A-Za-z0-9_-]{20,})"
+            r"(?P<value>(?:AKIA|ASIA)[0-9A-Z]{16}|"
+            r"gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
+            r"xox[baprs]-[A-Za-z0-9-]{10,}|"
+            r"(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}|"
+            r"AIza[0-9A-Za-z_-]{20,}|sk-[A-Za-z0-9_-]{20,})"
         ),
     ),
 )
@@ -298,9 +309,7 @@ def sanitize_gmail_evidence_quotes(
     redaction_kinds: set[str] = set()
     redaction_count = 0
     for quote in quotes:
-        sanitized = sanitize_gmail_sensitive_text(
-            quote, source_values=combined_values
-        )
+        sanitized = sanitize_gmail_sensitive_text(quote, source_values=combined_values)
         sanitized_quotes.append(sanitized.text)
         redaction_count += len(sanitized.redactions)
         redaction_kinds.update(item.kind for item in sanitized.redactions)
@@ -339,6 +348,7 @@ def gmail_sensitive_redactions(value: str) -> tuple[GmailSensitiveRedaction, ...
     candidates: list[GmailSensitiveRedaction] = []
     for kind, pattern in (
         ("labeled_secret", _LABELED_SECRET_RE),
+        ("labeled_secret", _TEMPORARY_PASSWORD_LINE_RE),
         ("labeled_numeric_secret", _NUMERIC_LABELED_SECRET_RE),
         ("labeled_numeric_secret", _NUMERIC_PASSCODE_RE),
         ("labeled_numeric_secret", _YOUR_NUMERIC_CODE_RE),
@@ -361,10 +371,7 @@ def gmail_sensitive_redactions(value: str) -> tuple[GmailSensitiveRedaction, ...
         ("opaque_url_token", _OPAQUE_QUERY_RE),
         ("travel_access_locator", _AIRBNB_RESERVATION_PATH_RE),
         ("private_key", _PRIVATE_KEY_BLOCK_RE),
-        *(
-            ("meeting_access_locator", pattern)
-            for pattern in _MEETING_ACCESS_PATH_RES
-        ),
+        *(("meeting_access_locator", pattern) for pattern in _MEETING_ACCESS_PATH_RES),
         *_STANDALONE_TOKEN_RES,
     ):
         for match in pattern.finditer(value):
@@ -433,15 +440,16 @@ def gmail_payload_contains_sensitive_value(
     if gmail_sensitive_redactions(serialized):
         return True
     return any(
-        _source_value_is_distinctive(value)
-        and _source_value_occurs(value, serialized)
+        _source_value_is_distinctive(value) and _source_value_occurs(value, serialized)
         for value in source_values
     )
 
 
 def gmail_payload_contains_sensitive_mask(payload: Any) -> bool:
     """Return whether model-authored payload contains a redaction placeholder."""
-    return GMAIL_SENSITIVE_MASK in json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return GMAIL_SENSITIVE_MASK in json.dumps(
+        payload, ensure_ascii=False, sort_keys=True
+    )
 
 
 def _payload_sensitive_values(value: Any) -> tuple[str, ...]:
@@ -528,15 +536,15 @@ def _merge_redactions(
         previous_contains_item = (
             previous.start <= item.start and previous.end >= item.end
         )
-        item_contains_previous = item.start <= previous.start and item.end >= previous.end
+        item_contains_previous = (
+            item.start <= previous.start and item.end >= previous.end
+        )
         merged[-1] = GmailSensitiveRedaction(
             kind=(
                 previous.kind
                 if previous.kind == item.kind
                 or (previous.start == item.start and previous.end == item.end)
-                or (
-                    item.kind == "source_sensitive_value" and previous_contains_item
-                )
+                or (item.kind == "source_sensitive_value" and previous_contains_item)
                 else item.kind
                 if previous.kind == "source_sensitive_value" and item_contains_previous
                 else "multiple_sensitive_values"

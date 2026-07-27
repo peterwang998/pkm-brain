@@ -14,6 +14,7 @@ from typing import Any
 import yaml
 
 from .audit import valid_memory_scope
+from .agent_sessions import persist_agent_session
 from .chunking import (
     DEFAULT_OVERLAP_TOKENS,
     DEFAULT_TARGET_TOKENS,
@@ -21,7 +22,13 @@ from .chunking import (
     prepare_text_for_indexing,
     sanitize_agent_session_log,
 )
-from .db import connection, dumps, init_db, loads, rows
+from .db import (
+    connection,
+    dumps,
+    init_db,
+    loads,
+    rows,
+)
 from .embeddings import (
     EmbeddingProviderUnavailable,
     HASH_PROVIDER,
@@ -48,7 +55,12 @@ from .indexes import (
     upsert_vectors,
     vector_chunk_ids,
 )
-from .ingest_batch import IngestBudget, IngestResult
+from .ingest_batch import (
+    IngestBudget,
+    IngestResult,
+    existing_document_metadata_matches_source,
+    existing_document_matches_source_stats,
+)
 from .paths import BrainPaths, local_node_id
 from .retrospective_retrieval import (
     RETROSPECTIVE_RETRIEVAL_VERSION as RETROSPECTIVE_RETRIEVAL_VERSION,
@@ -56,9 +68,11 @@ from .retrospective_retrieval import (
     RetrospectiveEvidenceSource as RetrospectiveEvidenceSource,
     RetrospectiveRetrievalMixin,
 )
+from .retrieval_telemetry import record_retrieval_telemetry
 from .temporal import TemporalRetrievalRequest
 from .title_utils import bounded_document_title
 from .util import file_sha256, new_id, now_iso, slugify, token_count as estimate_tokens
+
 
 def chunk_row_id(row: Any) -> str:
     keys = row.keys()
@@ -289,6 +303,8 @@ RECENCY_INTENT_TERMS = {
     "week",
     "yesterday",
 }
+
+
 @dataclass(frozen=True)
 class RetrievalPolicy:
     mode: str
@@ -1228,6 +1244,7 @@ class BrainService(RetrospectiveRetrievalMixin):
         stale_vector_chunk_ids: list[str] = []
         deferred = 0
         budget = IngestBudget(max_changed_documents, max_changed_source_bytes)
+        sqlite_commit_interval = 100
 
         if dry_run:
             return IngestResult(run_id, len(candidates), 0, 0, 0, 0, [])
@@ -1251,7 +1268,8 @@ class BrainService(RetrospectiveRetrievalMixin):
                     )
                     existing = conn.execute(
                         """
-                        SELECT id, source_type, title, content_hash, raw_path, source_mtime_ns, source_size
+                        SELECT id, source_type, title, source_path, content_hash, raw_path,
+                               origin_node_id, logical_source_key, source_mtime_ns, source_size
                         FROM documents
                         WHERE logical_source_key = ? AND (origin_node_id = ? OR (? = 'gmail_thread' AND ? = 'gmail-knowledge'))
                         ORDER BY CASE WHEN origin_node_id = ? THEN 0 ELSE 1 END, ingested_at DESC
@@ -1273,17 +1291,24 @@ class BrainService(RetrospectiveRetrievalMixin):
                             )
                             stale_vector_chunk_ids.extend(replaced.chunk_ids)
                             documents_replaced += replaced.documents
-                        refresh_existing_document_metadata(
-                            conn,
-                            existing["id"],
-                            source_type,
-                            str(existing["title"]),
-                            path,
-                            origin,
-                            logical_source_key,
-                            source_mtime_ns=source_mtime_ns,
-                            source_size=source_size,
-                        )
+                        if not existing_document_metadata_matches_source(
+                            existing,
+                            source_type=source_type,
+                            path=path,
+                            origin_node_id=origin,
+                            logical_source_key=logical_source_key,
+                        ):
+                            refresh_existing_document_metadata(
+                                conn,
+                                existing["id"],
+                                source_type,
+                                str(existing["title"]),
+                                path,
+                                origin,
+                                logical_source_key,
+                                source_mtime_ns=source_mtime_ns,
+                                source_size=source_size,
+                            )
                         skipped += 1
                         continue
                     if not budget.accept(source_size):
@@ -1427,29 +1452,37 @@ class BrainService(RetrospectiveRetrievalMixin):
                         )
                     else:
                         errors.append(f"{path}: {exc}")
-            delete_vectors(self.paths.lancedb_path, stale_vector_chunk_ids)
-            embeddings_created = 0
+                if (candidate_index + 1) % sqlite_commit_interval == 0:
+                    conn.commit()
+
+        # Embedding can take minutes for a large incremental import. Keep it
+        # outside the SQLite write transaction so retrieval telemetry, agent
+        # session capture, and other scheduled jobs remain writable throughout.
+        delete_vectors(self.paths.lancedb_path, stale_vector_chunk_ids)
+        embeddings_created = 0
+        vector_writes = {
+            "status": "ok",
+            "reason": None,
+            "attempted": len(vector_source_rows),
+        }
+        try:
+            for offset in range(0, len(vector_source_rows), 128):
+                batch = vector_source_rows[offset : offset + 128]
+                embeddings_created += upsert_vectors(
+                    self.paths.lancedb_path,
+                    self._vector_rows_for_chunks(batch),
+                    self.embedding_provider,
+                )
+            vector_writes["written"] = embeddings_created
+        except (EmbeddingProviderUnavailable, VectorIndexUnavailable) as exc:
             vector_writes = {
-                "status": "ok",
-                "reason": None,
+                "status": "skipped",
+                "reason": str(exc),
                 "attempted": len(vector_source_rows),
+                "written": 0,
             }
-            try:
-                for offset in range(0, len(vector_source_rows), 128):
-                    batch = vector_source_rows[offset : offset + 128]
-                    embeddings_created += upsert_vectors(
-                        self.paths.lancedb_path,
-                        self._vector_rows_for_chunks(batch),
-                        self.embedding_provider,
-                    )
-                vector_writes["written"] = embeddings_created
-            except (EmbeddingProviderUnavailable, VectorIndexUnavailable) as exc:
-                vector_writes = {
-                    "status": "skipped",
-                    "reason": str(exc),
-                    "attempted": len(vector_source_rows),
-                    "written": 0,
-                }
+
+        with connection(self.paths.sqlite_path) as conn:
             conn.execute(
                 """
                 UPDATE ingestion_runs
@@ -1654,14 +1687,23 @@ class BrainService(RetrospectiveRetrievalMixin):
         shutil.copy2(source, target)
         return target
 
-    def _origin_identity_for_path(self, path: Path, origin_node_id: str | None = None, source_type: str | None = None) -> tuple[str, str]:
+    def _origin_identity_for_path(
+        self,
+        path: Path,
+        origin_node_id: str | None = None,
+        source_type: str | None = None,
+    ) -> tuple[str, str]:
         try:
             external_relative = path.resolve().relative_to(
                 (self.paths.inbox / "external").resolve()
             )
         except ValueError:
             external_relative = None
-        origin = origin_node_id or ("gmail-knowledge" if source_type == "gmail_thread" else local_node_id(self.paths))
+        origin = origin_node_id or (
+            "gmail-knowledge"
+            if source_type == "gmail_thread"
+            else local_node_id(self.paths)
+        )
         if external_relative and external_relative.parts:
             origin = origin_node_id or external_relative.parts[0]
             if len(external_relative.parts) > 1:
@@ -1766,33 +1808,22 @@ class BrainService(RetrospectiveRetrievalMixin):
                 f"vector_search unavailable: {fanout_debug['vector_unavailable_reason']}"
             )
         event_id = None
+        telemetry_warning = None
         if not self.read_only and record_telemetry:
-            event_id = new_id("retrieval")
-            with connection(self.paths.sqlite_path) as conn:
-                conn.execute(
-                    """
-                    INSERT INTO retrieval_events(
-                      id, query, timestamp, caller, returned_chunk_ids, selected_chunk_ids, citation_snapshots, debug
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        event_id,
-                        truncate_for_packet(query, RETRIEVAL_EVENT_QUERY_MAX_CHARS),
-                        now_iso(),
-                        caller,
-                        dumps(
-                            list(fanout_debug["candidate_ids"])[
-                                :RETRIEVAL_EVENT_ID_LIMIT
-                            ]
-                        ),
-                        dumps(selected_ids[:RETRIEVAL_EVENT_ID_LIMIT]),
-                        dumps(
-                            stored_citation_snapshots(citation_snapshots, debug=debug)
-                        ),
-                        stored_retrieval_debug(search_debug) if debug else "{}",
-                    ),
-                )
-        return {
+            event_id, telemetry_warning = record_retrieval_telemetry(
+                self.paths.sqlite_path,
+                query=truncate_for_packet(query, RETRIEVAL_EVENT_QUERY_MAX_CHARS),
+                caller=caller,
+                returned_chunk_ids=list(fanout_debug["candidate_ids"])[
+                    :RETRIEVAL_EVENT_ID_LIMIT
+                ],
+                selected_chunk_ids=selected_ids[:RETRIEVAL_EVENT_ID_LIMIT],
+                citation_snapshots=stored_citation_snapshots(
+                    citation_snapshots, debug=debug
+                ),
+                debug_json=stored_retrieval_debug(search_debug) if debug else "{}",
+            )
+        result = {
             "event_id": event_id,
             "query": query,
             "retrieval_verdict": assessment["verdict"],
@@ -1803,6 +1834,9 @@ class BrainService(RetrospectiveRetrievalMixin):
             "citation_snapshots": citation_snapshots,
             "debug": search_debug if debug else None,
         }
+        if telemetry_warning:
+            result["retrieval_telemetry"] = telemetry_warning
+        return result
 
     def retrieve_context(
         self,
@@ -1916,41 +1950,34 @@ class BrainService(RetrospectiveRetrievalMixin):
             assessment["reasons"].append(
                 f"vector_search unavailable: {fanout_debug['vector_unavailable_reason']}"
             )
+        telemetry_warning = None
         if not self.read_only and record_telemetry:
-            event_id = new_id("retrieval")
-            with connection(self.paths.sqlite_path) as conn:
-                conn.execute(
-                    """
-                    INSERT INTO retrieval_events(
-                      id, query, timestamp, caller, returned_chunk_ids, selected_chunk_ids, citation_snapshots, debug
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        event_id,
-                        truncate_for_packet(query, RETRIEVAL_EVENT_QUERY_MAX_CHARS),
-                        now_iso(),
-                        "retrieve_context",
-                        dumps(list(fanout_debug["fused"])[:RETRIEVAL_EVENT_ID_LIMIT]),
-                        dumps(
-                            [row["chunk_id"] for row in supporting_chunks][
-                                :RETRIEVAL_EVENT_ID_LIMIT
-                            ]
-                        ),
-                        dumps(
-                            stored_citation_snapshots(citation_snapshots, debug=debug)
-                        ),
-                        stored_retrieval_debug(retrieval_debug) if debug else "{}",
-                    ),
-                )
-                self._record_retrieval_exposures(
-                    conn,
-                    retrieval_event_id=event_id,
-                    query=query,
-                    supporting_chunks=supporting_chunks,
-                    relevant_facts=relevant_facts,
-                    wiki_pages=wiki_pages,
-                    active_memories=memories,
-                )
+            event_id, telemetry_warning = record_retrieval_telemetry(
+                self.paths.sqlite_path,
+                query=truncate_for_packet(query, RETRIEVAL_EVENT_QUERY_MAX_CHARS),
+                caller="retrieve_context",
+                returned_chunk_ids=list(fanout_debug["fused"])[
+                    :RETRIEVAL_EVENT_ID_LIMIT
+                ],
+                selected_chunk_ids=[row["chunk_id"] for row in supporting_chunks][
+                    :RETRIEVAL_EVENT_ID_LIMIT
+                ],
+                citation_snapshots=stored_citation_snapshots(
+                    citation_snapshots, debug=debug
+                ),
+                debug_json=stored_retrieval_debug(retrieval_debug) if debug else "{}",
+                exposure_recorder=lambda conn, retrieval_event_id: (
+                    self._record_retrieval_exposures(
+                        conn,
+                        retrieval_event_id=retrieval_event_id,
+                        query=query,
+                        supporting_chunks=supporting_chunks,
+                        relevant_facts=relevant_facts,
+                        wiki_pages=wiki_pages,
+                        active_memories=memories,
+                    )
+                ),
+            )
         result = {
             "task": task,
             "project": project,
@@ -1979,6 +2006,8 @@ class BrainService(RetrospectiveRetrievalMixin):
             ],
             "retrieval_event_id": event_id,
         }
+        if telemetry_warning:
+            result["retrieval_telemetry"] = telemetry_warning
         if debug:
             result["retrieval_policy"] = {
                 "total_budget": policy.total_budget,
@@ -2290,7 +2319,9 @@ class BrainService(RetrospectiveRetrievalMixin):
                 created_at=created_at,
             )
 
-    def _fanout_chunk_candidates(self, query: str, limit: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    def _fanout_chunk_candidates(
+        self, query: str, limit: int
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         raw_limit = min(1000, max(240, limit * 16))
         lexical = self._search_fts(query, raw_limit)
         vector_unavailable_reason = None
@@ -2315,7 +2346,9 @@ class BrainService(RetrospectiveRetrievalMixin):
         fused_ids = reciprocal_rank_fusion(lexical_ids, vector_ids)
         candidate_ids = dedupe_preserve_order(fused_ids + lexical_ids + vector_ids)
         candidates = self._chunks_by_ids(candidate_ids)
-        candidates = [row for row in candidates if not gmail_retrieval_noise_reasons(row, query)][:limit]
+        candidates = [
+            row for row in candidates if not gmail_retrieval_noise_reasons(row, query)
+        ][:limit]
         candidate_ids = [row["chunk_id"] for row in candidates]
         return candidates, {
             "lexical": lexical,
@@ -2777,24 +2810,14 @@ class BrainService(RetrospectiveRetrievalMixin):
     ) -> str:
         self._ensure_writable()
         self.init_workspace()
-        session_id = new_id("session")
-        with connection(self.paths.sqlite_path) as conn:
-            conn.execute(
-                """
-                INSERT INTO agent_sessions(id, summary, files_touched, commands_run, outcome, unresolved_issues, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    session_id,
-                    summary,
-                    dumps(files_touched),
-                    dumps(commands_run),
-                    outcome,
-                    dumps(unresolved_issues),
-                    now_iso(),
-                ),
-            )
-        return session_id
+        return persist_agent_session(
+            self.paths,
+            summary=summary,
+            files_touched=files_touched,
+            commands_run=commands_run,
+            outcome=outcome,
+            unresolved_issues=unresolved_issues,
+        )
 
     def _search_fts(self, query: str, limit: int) -> list[dict[str, Any]]:
         fts_query = build_fts_query(query)
@@ -4699,20 +4722,6 @@ def refresh_existing_document_metadata(
         ),
     )
     update_chunk_retrieval_title(conn, document_id, title)
-
-
-def existing_document_matches_source_stats(
-    document: Any,
-    *,
-    source_mtime_ns: int,
-    source_size: int,
-) -> bool:
-    return (
-        document["source_mtime_ns"] is not None
-        and document["source_size"] is not None
-        and int(document["source_mtime_ns"]) == source_mtime_ns
-        and int(document["source_size"]) == source_size
-    )
 
 
 def reciprocal_rank_fusion(*rankings: list[str], k: int = 60) -> list[str]:

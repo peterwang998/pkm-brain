@@ -142,7 +142,40 @@ def test_gmail_sensitive_sanitizer_handles_auth_codes_and_opaque_auth_urls() -> 
     }
 
 
-def test_gmail_sensitive_sanitizer_handles_account_codes_and_auth_link_variants() -> None:
+def test_gmail_sensitive_sanitizer_handles_common_provider_tokens_and_full_temporary_passwords() -> (
+    None
+):
+    secrets = (
+        "".join(("xoxb", "-1234567890-", "abcdefghijklmnop")),
+        "".join(("github", "_pat_1234567890", "abcdefghijklmnop")),
+        "".join(("sk", "_live_1234567890", "abcdefghijklmnop")),
+        "".join(("AI", "za1234567890", "abcdefghijklmnopqrst")),
+        "".join(("AS", "IA1234567890ABCDEF")),
+        "aws-secret-value-1234567890",
+        "Blue Meadow 42!",
+    )
+    source = (
+        f"Slack token: {secrets[0]}\n"
+        f"GitHub token: {secrets[1]}\n"
+        f"Stripe credential: {secrets[2]}\n"
+        f"Google API credential: {secrets[3]}\n"
+        f"AWS session key: {secrets[4]}\n"
+        f"AWS_SECRET_ACCESS_KEY={secrets[5]}\n"
+        f"Temporary password: {secrets[6]}\n"
+        "Temporary password is unavailable\n"
+    )
+
+    sanitized = sanitize_gmail_sensitive_text(source)
+
+    assert len(sanitized.text) == len(source)
+    for secret in secrets:
+        assert secret not in sanitized.text
+    assert "Temporary password is unavailable" in sanitized.text
+
+
+def test_gmail_sensitive_sanitizer_handles_account_codes_and_auth_link_variants() -> (
+    None
+):
     source = (
         "345678 is your Microsoft account security code.\n"
         "Your Apple ID Code is: 456789\n"
@@ -170,8 +203,7 @@ def test_gmail_sensitive_sanitizer_handles_account_codes_and_auth_link_variants(
     assert sanitized.text.count("345678") == 1
     assert "https://docs.example.test/article?key=OpaqueE5F6G7H8" in sanitized.text
     assert (
-        "https://accounts.example.test/login-help?key=OpaqueF6G7H8I9"
-        in sanitized.text
+        "https://accounts.example.test/login-help?key=OpaqueF6G7H8I9" in sanitized.text
     )
     assert "https://accounts.example.test/login?key=help-center" in sanitized.text
     assert {item.kind for item in sanitized.redactions} >= {
@@ -249,8 +281,7 @@ def test_recursive_gmail_payload_sanitizes_auth_artifacts_in_all_text_fields() -
         "attachments": [
             {
                 "filename": (
-                    "https://accounts.example.test/verify-email/"
-                    "VerifyOpaqueA1B2C3D4"
+                    "https://accounts.example.test/verify-email/VerifyOpaqueA1B2C3D4"
                 ),
                 "description": (
                     "https://accounts.example.test/reset-password"
@@ -567,9 +598,7 @@ def test_gmail_prompt_masks_secrets_before_external_model_payload() -> None:
                     }
                 ]
             },
-            "routing_hints": [
-                {"page_hint": f"events/interview-{secret}.md"}
-            ],
+            "routing_hints": [{"page_hint": f"events/interview-{secret}.md"}],
         }
     )
 
@@ -586,9 +615,7 @@ def test_gmail_validation_retry_omits_rejected_secret_fact() -> None:
             "chunks": [
                 {
                     "chunk_id": "chunk_gmail",
-                    "units": [
-                        {"unit_id": "u0", "text": f"Password is {secret}"}
-                    ],
+                    "units": [{"unit_id": "u0", "text": f"Password is {secret}"}],
                 }
             ]
         },
@@ -640,8 +667,7 @@ def test_gmail_evidence_quote_masks_access_locator_but_keeps_exact_span(
             "facts": [
                 {
                     "statement": (
-                        "Cathay Pacific flight CX 331 departs at 16:40 on "
-                        "22 Jun 2026."
+                        "Cathay Pacific flight CX 331 departs at 16:40 on 22 Jun 2026."
                     ),
                     "chunk_id": chunk["id"],
                     "evidence_unit_ids": unit_ids,

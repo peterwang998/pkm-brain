@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import io
 import os
 import threading
+import urllib.error
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
+
+import pytest
 
 from pkm_brain.daemon import atomic_write_private_json, daemon_handshake_path
 from pkm_brain.db import connection
@@ -69,11 +73,15 @@ def test_mcp_proxy_uses_daemon_passthrough_for_writes(tmp_path: Path) -> None:
 
     assert result["status"] == "proposed"
     with connection(paths.sqlite_path) as conn:
-        row = conn.execute("SELECT content FROM memories WHERE id = ?", (result["memory_id"],)).fetchone()
+        row = conn.execute(
+            "SELECT content FROM memories WHERE id = ?", (result["memory_id"],)
+        ).fetchone()
     assert row["content"] == "Daemon MCP passthrough writes through the service layer."
 
 
-def test_mcp_proxy_read_only_fallback_does_not_record_retrieval_events(tmp_path: Path) -> None:
+def test_mcp_proxy_read_only_fallback_does_not_record_retrieval_events(
+    tmp_path: Path,
+) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
     BrainService(paths).init_workspace()
 
@@ -112,9 +120,7 @@ def test_mcp_proxy_propagates_knowledge_time_request(tmp_path: Path) -> None:
     )
 
     assert result["temporal"]["mode"] == "known"
-    assert result["temporal"]["known_as_of"].startswith(
-        "2026-05-01T23:59:59"
-    )
+    assert result["temporal"]["known_as_of"].startswith("2026-05-01T23:59:59")
     assert result["supporting_chunks"] == []
 
 
@@ -259,3 +265,33 @@ def test_daemon_mcp_endpoint_requires_known_tool(tmp_path: Path) -> None:
         )
 
     assert result == []
+
+
+def test_daemon_mcp_validation_error_preserves_actionable_detail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    proxy = BrainMCPProxy(str(paths.home), auto_launch=False)
+    endpoint = DaemonEndpoint("http://127.0.0.1:4567", "test-token")
+
+    def reject_request(*_args, **_kwargs):
+        raise urllib.error.HTTPError(
+            f"{endpoint.base_url}/api/mcp/retrieve_context",
+            400,
+            "Bad Request",
+            None,
+            io.BytesIO(b'{"error":"event_kind requires event_as_of"}'),
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", reject_request)
+    with pytest.raises(
+        ValueError,
+        match="retrieve_context request rejected: event_kind requires event_as_of",
+    ) as error:
+        proxy.post_tool(
+            endpoint,
+            "retrieve_context",
+            {"task": "find an actual event", "event_kind": "actual"},
+        )
+
+    assert "HTTP Error 400" not in str(error.value)

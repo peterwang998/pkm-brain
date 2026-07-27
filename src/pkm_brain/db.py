@@ -10,6 +10,8 @@ from typing import Any, Callable, Iterable, Iterator, TypeVar
 
 SQLITE_BUSY_TIMEOUT_SECONDS = 1.0
 SQLITE_BUSY_TIMEOUT_MS = int(SQLITE_BUSY_TIMEOUT_SECONDS * 1000)
+BEST_EFFORT_WRITE_TIMEOUT_SECONDS = 0.05
+BEST_EFFORT_WRITE_TIMEOUT_MS = int(BEST_EFFORT_WRITE_TIMEOUT_SECONDS * 1000)
 SQLITE_LOCK_RETRY_DELAYS_SECONDS = (0.5, 1.0, 2.0, 4.0, 8.0)
 T = TypeVar("T")
 
@@ -371,6 +373,26 @@ def connect(db_path: Path) -> sqlite3.Connection:
 def connection(db_path: Path) -> Iterator[sqlite3.Connection]:
     conn = connect(db_path)
     try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@contextmanager
+def best_effort_write_connection(db_path: Path) -> Iterator[sqlite3.Connection]:
+    """Open a short-wait connection for non-critical, fail-open writes.
+
+    Unlike :func:`connection`, this connection deliberately does not use the
+    multi-second lock retry policy. Callers must catch lock errors and continue
+    without the ancillary write.
+    """
+
+    conn = sqlite3.connect(db_path, timeout=BEST_EFFORT_WRITE_TIMEOUT_SECONDS)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout={BEST_EFFORT_WRITE_TIMEOUT_MS}")
+        conn.execute("PRAGMA foreign_keys=ON")
         yield conn
         conn.commit()
     finally:

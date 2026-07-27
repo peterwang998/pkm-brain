@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+import time
 from pathlib import Path
 
 import pytest
@@ -114,6 +116,49 @@ def test_retrieval_telemetry_payloads_are_bounded_at_write() -> None:
     assert len(stored_debug.encode("utf-8")) <= RETRIEVAL_EVENT_DEBUG_MAX_BYTES
     assert debug_payload["truncated"] is True
     assert debug_payload["candidate_count"] == 500
+
+
+def test_retrieval_succeeds_when_telemetry_writer_is_locked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "telemetry-lock.md"
+    note.write_text(
+        "# Telemetry Lock\n\nEvidence retrieval must survive ancillary telemetry contention.\n",
+        encoding="utf-8",
+    )
+    svc.ingest()
+
+    # The workspace is already initialized. Bypass repeat schema setup so this
+    # test isolates the lock held precisely when retrieval records telemetry.
+    monkeypatch.setattr(svc, "_ensure_workspace", lambda: None)
+    blocker = sqlite3.connect(svc.paths.sqlite_path)
+    blocker.execute("PRAGMA journal_mode=WAL")
+    blocker.execute("BEGIN IMMEDIATE")
+    try:
+        started_at = time.monotonic()
+        search = svc.search("ancillary telemetry contention", limit=3)
+        context = svc.retrieve_context("ancillary telemetry contention")
+        elapsed = time.monotonic() - started_at
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+    assert search["results"]
+    assert context["supporting_chunks"]
+    assert search["event_id"] is None
+    assert context["retrieval_event_id"] is None
+    assert search["retrieval_telemetry"] == context["retrieval_telemetry"]
+    assert search["retrieval_telemetry"]["reason"] == "database_locked"
+    assert search["retrieval_telemetry"]["impact"] == "evidence_unaffected"
+    assert elapsed < 2.0
+    with connection(svc.paths.sqlite_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM retrieval_events").fetchone()[0] == 0
+        assert (
+            conn.execute("SELECT COUNT(*) FROM context_lineage_events").fetchone()[0]
+            == 0
+        )
 
 
 def test_retrieve_context_returns_query_relevant_open_questions(tmp_path: Path) -> None:
@@ -516,6 +561,37 @@ def test_ingest_embeds_new_chunks_in_bounded_batches(
 
     assert result.embeddings_created == 300
     assert batch_sizes == [128, 128, 44]
+
+
+def test_ingest_releases_sqlite_writer_before_embedding(
+    tmp_path: Path, monkeypatch
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    note = svc.paths.inbox / "nonblocking-ingest.md"
+    note.write_text(
+        "# Nonblocking ingest\n\nEmbedding must not hold SQLite's writer lock.\n",
+        encoding="utf-8",
+    )
+    acquired_writer_lock = False
+
+    def fake_upsert(_path, rows, _provider) -> int:
+        nonlocal acquired_writer_lock
+        writer = sqlite3.connect(svc.paths.sqlite_path, timeout=0.0)
+        try:
+            writer.execute("BEGIN IMMEDIATE")
+            acquired_writer_lock = True
+            writer.rollback()
+        finally:
+            writer.close()
+        return len(rows)
+
+    monkeypatch.setattr("pkm_brain.service.upsert_vectors", fake_upsert)
+
+    result = svc.ingest(source=note)
+
+    assert result.changed == 1
+    assert acquired_writer_lock is True
 
 
 def test_configured_model_provider_skips_vector_writes_without_hash_fallback(
@@ -1084,7 +1160,13 @@ def test_duplicate_ingest_skips_unchanged_content_without_rehashing(
     def fail_hash(_path: Path) -> str:
         raise AssertionError("unchanged source should skip hashing")
 
+    def fail_refresh(*_args, **_kwargs) -> None:
+        raise AssertionError("unchanged source should skip metadata writes")
+
     monkeypatch.setattr("pkm_brain.service.file_sha256", fail_hash)
+    monkeypatch.setattr(
+        "pkm_brain.service.refresh_existing_document_metadata", fail_refresh
+    )
     second = svc.ingest()
 
     assert first.changed == 1
@@ -3064,3 +3146,41 @@ def test_agent_session_write(tmp_path: Path) -> None:
 
     assert row is not None
     assert row["outcome"] == "success"
+
+
+def test_agent_session_write_sanitizes_credentials_before_persistence(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    secrets = {
+        "summary": "Blue Meadow 42!",
+        "command": "".join(("xoxb", "-1234567890-", "abcdefghijklmnop")),
+        "outcome": "".join(("github", "_pat_1234567890", "abcdefghijklmnop")),
+        "issue": "aws-secret-value-1234567890",
+    }
+    session_id = svc.write_agent_session(
+        f"Okta temporary password: {secrets['summary']}",
+        ["src/pkm_brain/service.py"],
+        [f"tool --token {secrets['command']}"],
+        f"success with token {secrets['outcome']}",
+        [f"AWS_SECRET_ACCESS_KEY={secrets['issue']}"],
+    )
+
+    with connection(svc.paths.sqlite_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM agent_sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+
+    assert row is not None
+    persisted = " ".join(
+        [
+            row["summary"],
+            row["files_touched"],
+            row["commands_run"],
+            row["outcome"],
+            row["unresolved_issues"],
+        ]
+    )
+    for secret in secrets.values():
+        assert secret not in persisted
+    assert "████" in persisted

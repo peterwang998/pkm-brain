@@ -19,7 +19,9 @@ from .service import BrainService
 from .shadow_setup import ShadowSetupError, validate_operations_policy_auth_binding
 
 
-READ_ONLY_WRITE_ERROR = "PKM Brain app is not available; write declined. Launch the app and retry."
+READ_ONLY_WRITE_ERROR = (
+    "PKM Brain app is not available; write declined. Launch the app and retry."
+)
 DAEMON_REQUIRED_ERROR = (
     "PKM Brain app is not available; encrypted Gmail history requires the local "
     "daemon. Launch the app and retry."
@@ -66,7 +68,9 @@ WRITE_TOOL_NAMES = {
 DAEMON_ONLY_TOOL_NAMES = {"search_mail", "get_mail_thread"}
 
 
-def call_mcp_tool(service: BrainService, tool_name: str, payload: dict[str, Any]) -> Any:
+def call_mcp_tool(
+    service: BrainService, tool_name: str, payload: dict[str, Any]
+) -> Any:
     if tool_name == "search_knowledge":
         return _knowledge_response(
             service,
@@ -74,7 +78,7 @@ def call_mcp_tool(service: BrainService, tool_name: str, payload: dict[str, Any]
                 str(payload.get("query") or ""),
                 limit=int(payload.get("limit") or 10),
                 caller="mcp",
-            )
+            ),
         )
     if tool_name == "retrieve_context":
         return _knowledge_response(
@@ -87,7 +91,7 @@ def call_mcp_tool(service: BrainService, tool_name: str, payload: dict[str, Any]
                 event_as_of=payload.get("event_as_of"),
                 event_kind=payload.get("event_kind"),
                 temporal_mode=payload.get("temporal_mode"),
-            )
+            ),
         )
     if tool_name == "record_context_feedback":
         return service.record_context_feedback(
@@ -126,7 +130,7 @@ def call_mcp_tool(service: BrainService, tool_name: str, payload: dict[str, Any]
             service,
             service.retrieve_context(
                 task=f"project context for {project}", project=project
-            )
+            ),
         )
     if tool_name == "search_mail":
         return _search_mail(service, payload)
@@ -194,9 +198,7 @@ def _referenced_content_includes_gmail(service: BrainService, value: Any) -> boo
     references = _knowledge_source_references(value)
     if references["gmail"]:
         return True
-    if not any(
-        references[key] for key in ("documents", "chunks", "facts", "unknown")
-    ):
+    if not any(references[key] for key in ("documents", "chunks", "facts", "unknown")):
         return False
     paths = getattr(service, "paths", None)
     raw_db_path = getattr(paths, "sqlite_path", None)
@@ -256,9 +258,7 @@ def _knowledge_source_references(value: Any) -> dict[str, Any]:
         if isinstance(item, Mapping):
             for key, nested in item.items():
                 normalized_key = str(key).casefold()
-                if normalized_key == "source_ids" and isinstance(
-                    nested, (list, tuple)
-                ):
+                if normalized_key == "source_ids" and isinstance(nested, (list, tuple)):
                     for source_id in nested:
                         add(source_id)
                 elif normalized_key == "document_id":
@@ -293,7 +293,9 @@ def _references_resolve_to_gmail(
         if not fact_ids:
             return False
         resolved_fact_ids.update(fact_ids)
-        rows = _rows_for_ids(conn, "SELECT id, source_ids FROM facts WHERE id IN", fact_ids)
+        rows = _rows_for_ids(
+            conn, "SELECT id, source_ids FROM facts WHERE id IN", fact_ids
+        )
         if not rows:
             return False
         before = len(documents) + len(chunks) + len(facts) + len(unknown)
@@ -390,15 +392,18 @@ def _search_mail(service: BrainService, payload: Mapping[str, Any]) -> dict[str,
         raise
     except Exception:
         return _archive_unavailable("search_mail")
-    return _gmail_response({
-        "content_trust": MAIL_CONTENT_TRUST,
-        "warning": MAIL_CONTENT_WARNING,
-        "spam_trash_included": include_spam_trash,
-        "result_count": len(results),
-        "results": [
-            _search_card(item, policy.operator.gmail.email) for item in results
-        ],
-    })
+    return _gmail_response(
+        {
+            "content_trust": MAIL_CONTENT_TRUST,
+            "warning": MAIL_CONTENT_WARNING,
+            "source_scope": _mail_source_scope(policy),
+            "spam_trash_included": include_spam_trash,
+            "result_count": len(results),
+            "results": [
+                _search_card(item, policy.operator.gmail.email) for item in results
+            ],
+        }
+    )
 
 
 def _get_mail_thread(
@@ -428,17 +433,20 @@ def _get_mail_thread(
     except Exception:
         return _archive_unavailable("get_mail_thread")
     messages = list(_value(thread, "messages", ()))[:max_messages]
-    return _gmail_response({
-        "content_trust": MAIL_CONTENT_TRUST,
-        "warning": MAIL_CONTENT_WARNING,
-        "thread_id": thread_id,
-        "gmail_url": gmail_thread_route(policy.operator.gmail.email, thread_id),
-        "spam_trash_included": include_spam_trash,
-        "total_messages": int(_value(thread, "total_messages", len(messages))),
-        "returned_messages": len(messages),
-        "messages": [_message_card(item) for item in messages],
-        "response_truncated": bool(_value(thread, "truncated", False)),
-    })
+    return _gmail_response(
+        {
+            "content_trust": MAIL_CONTENT_TRUST,
+            "warning": MAIL_CONTENT_WARNING,
+            "source_scope": _mail_source_scope(policy),
+            "thread_id": thread_id,
+            "gmail_url": gmail_thread_route(policy.operator.gmail.email, thread_id),
+            "spam_trash_included": include_spam_trash,
+            "total_messages": int(_value(thread, "total_messages", len(messages))),
+            "returned_messages": len(messages),
+            "messages": [_message_card(item) for item in messages],
+            "response_truncated": bool(_value(thread, "truncated", False)),
+        }
+    )
 
 
 def _approved_mail_policy(service: BrainService, tool_name: str) -> Any:
@@ -506,6 +514,14 @@ def _archive_unavailable(tool_name: str) -> dict[str, Any]:
     }
 
 
+def _mail_source_scope(policy: Any) -> dict[str, str]:
+    return {
+        "kind": "local_gmail_archive",
+        "account_key": _safe_gmail_text(policy.sources.gmail.account_key, 160),
+        "account": _safe_gmail_text(policy.operator.gmail.email, 320),
+    }
+
+
 def _search_card(item: Any, provider_account: str) -> dict[str, Any]:
     thread_id = _required_identifier(_value(item, "thread_id"), "archive thread_id")
     return {
@@ -538,9 +554,7 @@ def _message_card(item: Any) -> dict[str, Any]:
         "from": _safe_addresses(_value(item, "from_addresses", ())),
         "to": _safe_addresses(_value(item, "to_addresses", ())),
         "cc": _safe_addresses(_value(item, "cc_addresses", ())),
-        "plain_text": _safe_gmail_text(
-            _value(item, "body_text"), 12_000, lines=True
-        ),
+        "plain_text": _safe_gmail_text(_value(item, "body_text"), 12_000, lines=True),
         "attachments": [
             {
                 "filename": _safe_gmail_text(_value(value, "filename"), 160),
@@ -564,11 +578,7 @@ def _value(value: Any, name: str, default: Any = None) -> Any:
 
 def _safe_addresses(value: Any) -> list[str]:
     values: Sequence[Any] = (value,) if isinstance(value, str) else value or ()
-    return [
-        text
-        for item in list(values)[:3]
-        if (text := _safe_gmail_text(item, 200))
-    ]
+    return [text for item in list(values)[:3] if (text := _safe_gmail_text(item, 200))]
 
 
 def _safe_text(value: Any, maximum: int, *, lines: bool = False) -> str:
