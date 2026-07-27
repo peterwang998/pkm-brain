@@ -1075,6 +1075,11 @@ def _coverage_from_run(
             {"status": "unavailable", "reason": "missing_coverage"},
         )
         if run_policy_version != policy_version:
+            # Diagnostics on the retained entry describe the superseded run.
+            # Do not let them masquerade as a current provider failure after
+            # policy compatibility has become the authoritative limitation.
+            entry.pop("error", None)
+            entry.pop("sync_error", None)
             entry.update(
                 {
                     "status": "partial",
@@ -1085,6 +1090,8 @@ def _coverage_from_run(
             )
             continue
         if source == "gmail" and run_detector_version != gmail_detector_version:
+            entry.pop("error", None)
+            entry.pop("sync_error", None)
             entry.update(
                 {
                     "status": "partial",

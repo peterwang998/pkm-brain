@@ -38,6 +38,10 @@ TODAY_FEEDBACK_ACTIONS = (
     "restore",
     "report_missing",
 )
+SUPERSEDING_COVERAGE_REASONS = {
+    "policy_version_mismatch",
+    "detector_version_mismatch",
+}
 
 
 class OperationalTodayPresentationService:
@@ -401,7 +405,18 @@ def _today_coverage(source: str, value: Mapping[str, Any]) -> TodayCoverage:
     state = str(value.get("status") or "unavailable")
     if state not in {"complete", "partial", "unavailable"}:
         state = "unavailable"
-    detail = value.get("error") or value.get("sync_error")
+    reason = str(value.get("reason") or "")
+    current_sync_error = (
+        value.get("sync_error")
+        if isinstance(value.get("scheduled_sync"), Mapping)
+        else None
+    )
+    detail = (
+        current_sync_error
+        or _coverage_reason_detail(reason, source=source)
+        if reason in SUPERSEDING_COVERAGE_REASONS
+        else value.get("error") or value.get("sync_error")
+    )
     if not detail and source == "gmail" and value.get("mailbox_status"):
         mailbox = str(value.get("mailbox_status") or "unavailable").replace("_", " ")
         backlog = max(0, int(value.get("triage_pending_count") or 0))
@@ -420,8 +435,8 @@ def _today_coverage(source: str, value: Mapping[str, Any]) -> TodayCoverage:
             detail += " · awaiting first sync"
         else:
             detail += " · analysis current"
-    if not detail and value.get("reason"):
-        detail = _coverage_reason_detail(str(value["reason"]), source=source)
+    if not detail and reason:
+        detail = _coverage_reason_detail(reason, source=source)
     if not detail and source == "gmail" and value.get("thread_count") is not None:
         thread_count = max(0, int(value.get("thread_count") or 0))
         deferred = max(0, int(value.get("deferred_count") or 0))

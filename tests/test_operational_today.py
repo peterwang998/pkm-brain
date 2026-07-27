@@ -199,6 +199,35 @@ def test_coverage_reason_codes_are_presented_as_plain_language() -> None:
     assert "_" not in briefing.coverage[1].detail
 
 
+@pytest.mark.parametrize(
+    ("reason", "detail"),
+    (
+        (
+            "policy_version_mismatch",
+            "The latest result used an older operations policy.",
+        ),
+        (
+            "detector_version_mismatch",
+            "Gmail needs a fresh detector review.",
+        ),
+    ),
+)
+def test_superseding_coverage_reason_hides_diagnostic_from_old_run(
+    reason: str,
+    detail: str,
+) -> None:
+    value = projection(status="partial")
+    value["coverage"]["gmail"] = {
+        "status": "partial",
+        "reason": reason,
+        "error": "DailyBudgetExceeded: superseded run detail",
+    }
+
+    briefing = today_briefing_from_operational(value, now=NOW)
+
+    assert briefing.coverage[1].detail == detail
+
+
 def test_gmail_coverage_distinguishes_synced_mailbox_from_analysis_backlog() -> None:
     value = projection(status="partial")
     value["coverage"]["gmail"].update(
@@ -383,6 +412,41 @@ def test_current_gmail_sync_problem_blocks_today_all_clear(
     assert value["coverage"]["gmail"]["status"] == expected_state
     briefing = today_briefing_from_operational(value, now=NOW)
     assert briefing.coverage[1].detail == expected_detail
+
+
+def test_current_gmail_sync_failure_outranks_superseded_run_error(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    _complete_gmail_mirror(paths)
+    value = projection(status="partial")
+    value["coverage"]["gmail"].update(
+        {
+            "status": "partial",
+            "reason": "policy_version_mismatch",
+            "error": "DailyBudgetExceeded: superseded run detail",
+        }
+    )
+
+    _overlay_gmail_mirror_coverage(
+        value,
+        paths=paths,
+        account_key="gmail.primary",
+        enabled=True,
+        scheduled_sync={
+            "available": True,
+            "enabled": True,
+            "paused": False,
+            "last_status": "failed",
+            "last_error": "current scheduler failure",
+        },
+    )
+
+    briefing = today_briefing_from_operational(value, now=NOW)
+    assert (
+        briefing.coverage[1].detail
+        == "Automatic Gmail sync failed: current scheduler failure"
+    )
 
 
 def test_later_success_supersedes_an_old_gmail_sync_error(tmp_path: Path) -> None:

@@ -35,6 +35,9 @@ problems, not a failed bulk import.
    their back-to-back combined burst could exceed the per-user quota window.
 4. Status text did not distinguish Brain's conservative daily safety budget
    from an actual Google 403/429 quota response.
+5. A superseded July 14 shadow run retained its old `DailyBudgetExceeded`
+   diagnostic. The Today presentation correctly marked the run as an older
+   policy, but still rendered that historical diagnostic as if it were current.
 
 ## Changes
 
@@ -47,6 +50,8 @@ problems, not a failed bulk import.
   request pacing is aligned with the mirror at two requests per second.
 - Scheduler results separately identify Brain safety-budget pauses and Google
   rate limiting, with bounded retry behavior and no private provider details.
+- Superseded policy or detector runs no longer surface their historical error
+  diagnostics as current source failures.
 
 ## Verification
 
@@ -61,6 +66,8 @@ problems, not a failed bulk import.
 - On startup, the archive and mirror each completed an incremental history check
   using one request and two Gmail quota units. Local archive and Knowledge health
   probes both passed.
+- An additional 155 operational, Gmail sync, quota, and Today-presentation tests
+  passed after removing the stale API-budget banner.
 
 ## Remaining architectural tradeoff
 
