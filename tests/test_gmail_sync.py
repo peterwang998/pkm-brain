@@ -485,7 +485,9 @@ def test_scheduled_sync_initializes_local_ops_after_policy_and_auth_approval(
         paths.ops_sqlite_path.touch()
 
     service.initialize = initialize
-    monkeypatch.setattr(gmail_sync_module, "load_operations_policy", lambda _paths: _policy())
+    monkeypatch.setattr(
+        gmail_sync_module, "load_operations_policy", lambda _paths: _policy()
+    )
     monkeypatch.setattr(
         gmail_sync_module,
         "connector_auth_status",
@@ -507,6 +509,65 @@ def test_scheduled_sync_initializes_local_ops_after_policy_and_auth_approval(
 
     assert result == {"status": "complete"}
     assert service.initialize_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (
+            DailyBudgetExceeded("local detail"),
+            {
+                "status": "partial",
+                "message": "Gmail updates paused at Brain's daily Gmail safety budget.",
+                "stopped_reason": "daily_budget_exhausted",
+            },
+        ),
+        (
+            GoogleAPIError(
+                429,
+                "provider detail",
+                reason="userRateLimitExceeded",
+                retryable=True,
+            ),
+            {
+                "status": "partial",
+                "message": "Google asked Brain to slow down; updates will retry.",
+                "stopped_reason": "provider_rate_limited",
+            },
+        ),
+    ],
+)
+def test_scheduled_sync_distinguishes_local_budget_from_provider_limit(
+    tmp_path: Path,
+    monkeypatch,
+    failure: Exception,
+    expected: dict[str, str],
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    paths.ops_sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+    paths.ops_sqlite_path.touch()
+    service = SimpleNamespace()
+    monkeypatch.setattr(
+        gmail_sync_module, "load_operations_policy", lambda _paths: _policy()
+    )
+    monkeypatch.setattr(
+        gmail_sync_module,
+        "connector_auth_status",
+        lambda _paths, _source: {"status": "connected"},
+    )
+
+    class FailingSynchronizer:
+        def __init__(self, _paths, _service) -> None:
+            pass
+
+        def sync(self, *, policy):
+            raise failure
+
+    monkeypatch.setattr(
+        gmail_sync_module, "GmailMirrorSynchronizer", FailingSynchronizer
+    )
+
+    assert run_scheduled_gmail_mirror_sync(paths, service) == expected
 
 
 def _policy() -> OperationsPolicy:

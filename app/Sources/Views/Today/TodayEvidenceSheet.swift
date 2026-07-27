@@ -58,6 +58,18 @@ struct TodayEvidenceSheet: View {
     @ViewBuilder
     private func evidence(_ document: TodayRetainedEvidence) -> some View {
         VStack(alignment: .leading, spacing: 20) {
+            if document.isCurrentRevisionFallback {
+                Label(
+                    "The exact cited email version is no longer retained. This is the newest local copy; verify any changes before relying on it.",
+                    systemImage: "clock.arrow.trianglehead.counterclockwise.rotate.90"
+                )
+                .font(.callout)
+                .foregroundStyle(.orange)
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.orange.opacity(0.10))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
             sourceMetadata(document)
             if document.source_type == "gmail" {
                 gmailEvidence(document)
@@ -85,8 +97,19 @@ struct TodayEvidenceSheet: View {
                         .font(.caption.monospaced())
                         .multilineTextAlignment(.trailing)
                 }
+                if document.isCurrentRevisionFallback,
+                   let requested = document.requested_source_revision,
+                   !requested.isEmpty {
+                    LabeledContent("Cited version") {
+                        Text(requested)
+                            .font(.caption.monospaced())
+                            .multilineTextAlignment(.trailing)
+                    }
+                }
                 if let revision = document.source_revision, !revision.isEmpty {
-                    LabeledContent("Version") {
+                    LabeledContent(
+                        document.isCurrentRevisionFallback ? "Displayed version" : "Version"
+                    ) {
                         Text(revision)
                             .font(.caption.monospaced())
                             .multilineTextAlignment(.trailing)

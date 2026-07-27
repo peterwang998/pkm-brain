@@ -889,7 +889,7 @@ private struct TodayItemCard: View {
                             Button {
                                 onBrainRoute(route)
                             } label: {
-                                Label(evidence.label, systemImage: "brain.head.profile")
+                                Label(localEvidenceActionTitle(evidence), systemImage: "brain.head.profile")
                             }
                             .buttonStyle(.link)
                             .accessibilityLabel("Open local evidence for \(item.title)")
@@ -897,7 +897,7 @@ private struct TodayItemCard: View {
                         }
                         if let url = safeProviderURL(evidence.provider_url) {
                             Link(destination: url) {
-                                Label("Source", systemImage: "arrow.up.right.square")
+                                Label(providerEvidenceActionTitle(evidence), systemImage: "arrow.up.right.square")
                             }
                             .buttonStyle(.link)
                             .accessibilityLabel("Open source for \(item.title)")
@@ -975,6 +975,22 @@ private struct TodayItemCard: View {
         case "being_handled": return "person.2.circle"
         case "fulfilled": return "checkmark.circle.fill"
         default: return "questionmark.circle"
+        }
+    }
+
+    private func localEvidenceActionTitle(_ evidence: TodayEvidenceLink) -> String {
+        switch evidence.source_type {
+        case "gmail": return "View local copy"
+        case "calendar": return "View local details"
+        default: return evidence.label
+        }
+    }
+
+    private func providerEvidenceActionTitle(_ evidence: TodayEvidenceLink) -> String {
+        switch evidence.source_type {
+        case "gmail": return "Open in Gmail"
+        case "calendar": return "Open in Calendar"
+        default: return "Open provider source"
         }
     }
 

@@ -52,8 +52,7 @@ HTTPRequester = Callable[[urllib.request.Request, float], GoogleHTTPResponse]
 
 
 class AccessTokenProvider(Protocol):
-    def access_token(self, *, force_refresh: bool = False) -> str:
-        ...
+    def access_token(self, *, force_refresh: bool = False) -> str: ...
 
 
 class GoogleAPIError(RuntimeError):
@@ -73,6 +72,56 @@ class GoogleAPIError(RuntimeError):
 
 class GoogleQuotaError(RuntimeError):
     pass
+
+
+@dataclass
+class _GoogleQuotaWindow:
+    units_per_minute: int
+    request_interval: float
+    events: deque[tuple[float, int]]
+    next_request_at: float
+    lock: threading.Lock
+
+
+_SHARED_QUOTA_WINDOWS_LOCK = threading.Lock()
+_SHARED_QUOTA_WINDOWS: dict[str, _GoogleQuotaWindow] = {}
+
+
+def _quota_window(
+    *,
+    shared_key: str | None,
+    units_per_minute: int,
+    request_interval: float,
+) -> _GoogleQuotaWindow:
+    if shared_key is None:
+        return _GoogleQuotaWindow(
+            units_per_minute,
+            request_interval,
+            deque(),
+            0.0,
+            threading.Lock(),
+        )
+    normalized_key = shared_key.strip()
+    if not normalized_key:
+        raise ValueError("shared quota key must be non-empty")
+    with _SHARED_QUOTA_WINDOWS_LOCK:
+        existing = _SHARED_QUOTA_WINDOWS.get(normalized_key)
+        if existing is not None:
+            if (
+                existing.units_per_minute != units_per_minute
+                or existing.request_interval != request_interval
+            ):
+                raise ValueError("shared quota key is configured inconsistently")
+            return existing
+        created = _GoogleQuotaWindow(
+            units_per_minute,
+            request_interval,
+            deque(),
+            0.0,
+            threading.Lock(),
+        )
+        _SHARED_QUOTA_WINDOWS[normalized_key] = created
+        return created
 
 
 def perform_http_request(
@@ -95,7 +144,12 @@ def perform_http_request(
 
 
 class GoogleQuotaBudget:
-    """Serialize requests behind explicit request-rate and quota-unit ceilings."""
+    """Serialize requests behind explicit request-rate and quota-unit ceilings.
+
+    ``shared_key`` lets independent readers for the same provider account share
+    one rolling minute window. Without it, two individually compliant clients
+    can exceed Google's per-user quota when they run back to back.
+    """
 
     def __init__(
         self,
@@ -105,6 +159,7 @@ class GoogleQuotaBudget:
         monotonic: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
         on_acquire: Callable[[int], None] | None = None,
+        shared_key: str | None = None,
     ) -> None:
         if units_per_minute <= 0:
             raise ValueError("units_per_minute must be positive")
@@ -115,9 +170,11 @@ class GoogleQuotaBudget:
         self._monotonic = monotonic
         self._sleep = sleeper
         self._on_acquire = on_acquire
-        self._events: deque[tuple[float, int]] = deque()
-        self._next_request_at = 0.0
-        self._lock = threading.Lock()
+        self._window = _quota_window(
+            shared_key=shared_key,
+            units_per_minute=units_per_minute,
+            request_interval=self.request_interval,
+        )
 
     def acquire(self, units: int) -> None:
         if units <= 0:
@@ -127,15 +184,18 @@ class GoogleQuotaBudget:
                 f"one request requires {units} quota units; budget is "
                 f"{self.units_per_minute}/minute"
             )
-        with self._lock:
+        with self._window.lock:
             while True:
                 now = self._monotonic()
                 self._discard_expired(now)
-                used = sum(event_units for _, event_units in self._events)
+                used = sum(event_units for _, event_units in self._window.events)
                 quota_wait = 0.0
-                if used + units > self.units_per_minute and self._events:
-                    quota_wait = max(0.0, 60.0 - (now - self._events[0][0]))
-                rate_wait = max(0.0, self._next_request_at - now)
+                if used + units > self.units_per_minute and self._window.events:
+                    quota_wait = max(
+                        0.0,
+                        60.0 - (now - self._window.events[0][0]),
+                    )
+                rate_wait = max(0.0, self._window.next_request_at - now)
                 wait_for = max(quota_wait, rate_wait)
                 if wait_for <= 0:
                     # Reserve durable daily capacity immediately before the HTTP
@@ -145,14 +205,14 @@ class GoogleQuotaBudget:
                     if self._on_acquire is not None:
                         self._on_acquire(units)
                     timestamp = self._monotonic()
-                    self._events.append((timestamp, units))
-                    self._next_request_at = timestamp + self.request_interval
+                    self._window.events.append((timestamp, units))
+                    self._window.next_request_at = timestamp + self.request_interval
                     return
                 self._sleep(wait_for)
 
     def _discard_expired(self, now: float) -> None:
-        while self._events and now - self._events[0][0] >= 60.0:
-            self._events.popleft()
+        while self._window.events and now - self._window.events[0][0] >= 60.0:
+            self._window.events.popleft()
 
 
 class GoogleTokenManager:
@@ -276,9 +336,7 @@ class GoogleTokenManager:
         payload = _json_object(response.body)
         if response.status < 200 or response.status >= 300:
             _, message = _google_error_fields(payload, response.status)
-            raise RuntimeError(
-                f"{self.connector_id} token refresh failed: {message}"
-            )
+            raise RuntimeError(f"{self.connector_id} token refresh failed: {message}")
         token = str(payload.get("access_token") or "").strip()
         if not token:
             raise RuntimeError(
@@ -341,7 +399,10 @@ class GoogleTokenManager:
             raise RuntimeError(
                 f"{self.connector_id} OAuth grant is bound to a different account"
             )
-        if self.expected_subject is not None and actual_subject != self.expected_subject:
+        if (
+            self.expected_subject is not None
+            and actual_subject != self.expected_subject
+        ):
             raise RuntimeError(
                 f"{self.connector_id} OAuth grant subject does not match policy"
             )

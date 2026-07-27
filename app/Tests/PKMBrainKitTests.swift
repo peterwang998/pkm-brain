@@ -228,7 +228,7 @@ struct PKMBrainKitTests {
                 )
             )
             let payload = Data(
-                #"{"schema_version":1,"source_type":"gmail","account_key":"gmail.personal","source_ref":"gmail.personal:thread-1","source_revision":"history-42","retention_days":30,"evidence":{"thread_id":"thread-1","subject":"Send the board deck","messages":[{"body":"Can you send it today?"}]}}"#.utf8
+                #"{"schema_version":1,"source_type":"gmail","account_key":"gmail.personal","source_ref":"gmail.personal:thread-1","source_revision":"history-43","requested_source_revision":"history-42","revision_matches":false,"evidence_origin":"gmail_mirror_current_fallback","retention_days":30,"evidence":{"thread_id":"thread-1","subject":"Send the board deck","messages":[{"body":"Can you send it today?"}]}}"#.utf8
             )
             return (response, payload)
         }
@@ -243,7 +243,9 @@ struct PKMBrainKitTests {
 
         #expect(evidence.sourceLabel == "Gmail")
         #expect(evidence.displayTitle == "Send the board deck")
-        #expect(evidence.source_revision == "history-42")
+        #expect(evidence.source_revision == "history-43")
+        #expect(evidence.requested_source_revision == "history-42")
+        #expect(evidence.isCurrentRevisionFallback)
         #expect(evidence.evidence.objectValue?["messages"]?.arrayValue?.count == 1)
         #expect(BrainAPIClient.canLoadTodayEvidence(at: route))
     }

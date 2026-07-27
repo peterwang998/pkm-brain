@@ -117,8 +117,7 @@ class GmailMirrorSyncOutcome:
             + (retry_mirror.current_updates if retry_mirror else 0),
             "tombstones": self.mirror.tombstones
             + (retry_mirror.tombstones if retry_mirror else 0),
-            "queued": self.mirror.queued
-            + (retry_mirror.queued if retry_mirror else 0),
+            "queued": self.mirror.queued + (retry_mirror.queued if retry_mirror else 0),
             "superseded": self.mirror.superseded
             + (retry_mirror.superseded if retry_mirror else 0),
             "quarantined_thread_count": self.quarantine_backlog_count,
@@ -187,9 +186,7 @@ class GmailMirrorSynchronizer:
                 GMAIL_MIRROR_STREAM,
             )
             resume_full = bool(
-                previous
-                and not previous.coverage_complete
-                and previous.mode == "full"
+                previous and not previous.coverage_complete and previous.mode == "full"
             )
             reader = self._reader_for(
                 active_policy,
@@ -206,9 +203,7 @@ class GmailMirrorSynchronizer:
                     else None
                 ),
                 continuation_page_token=(
-                    previous.continuation_page_token
-                    if previous is not None
-                    else None
+                    previous.continuation_page_token if previous is not None else None
                 ),
                 baseline_history_id=(
                     previous.baseline_history_id if resume_full else None
@@ -248,7 +243,10 @@ class GmailMirrorSynchronizer:
                     "unresolved_count"
                 ],
             )
-            if not mirror.checkpoint.coverage_complete or not mirror.checkpoint.history_id:
+            if (
+                not mirror.checkpoint.coverage_complete
+                or not mirror.checkpoint.history_id
+            ):
                 return outcome
             retry_limit = min(
                 GMAIL_MIRROR_MAX_QUARANTINE_RETRIES_PER_SYNC,
@@ -350,6 +348,7 @@ class GmailMirrorSynchronizer:
                     run_id=run_id,
                     started=started,
                 ),
+                shared_key=f"gmail:{policy.operator.gmail.provider_subject}",
             ),
             attempts=GMAIL_MIRROR_API_ATTEMPTS,
         )
@@ -438,9 +437,42 @@ def run_scheduled_gmail_mirror_sync(
         # approved, the scheduled source lane may create its local control store
         # without requiring a first manual Shadow click.
         operational_service.initialize()
-    return GmailMirrorSynchronizer(paths, operational_service).sync(
-        policy=policy,
-    ).as_dict()
+    try:
+        return (
+            GmailMirrorSynchronizer(paths, operational_service)
+            .sync(
+                policy=policy,
+            )
+            .as_dict()
+        )
+    except DailyBudgetExceeded:
+        return {
+            "status": "partial",
+            "message": "Gmail updates paused at Brain's daily Gmail safety budget.",
+            "stopped_reason": "daily_budget_exhausted",
+        }
+    except GoogleAPIError as exc:
+        if (
+            exc.reason
+            in {
+                "dailyLimitExceeded",
+                "quotaExceeded",
+                "rateLimitExceeded",
+                "userRateLimitExceeded",
+                "RESOURCE_EXHAUSTED",
+            }
+            or exc.status == 429
+        ):
+            return {
+                "status": "partial",
+                "message": "Google asked Brain to slow down; updates will retry.",
+                "stopped_reason": "provider_rate_limited",
+            }
+        return {
+            "status": "failed",
+            "message": "Gmail update check stopped safely and will retry.",
+            "error_code": "gmail_mirror_GoogleAPIError",
+        }
 
 
 def _sync_thread_cap(

@@ -25,7 +25,9 @@ from pkm_brain.paths import BrainPaths
 from pkm_brain.service import BrainService
 
 
-def response(status: int, payload: dict[str, object], **headers: str) -> GoogleHTTPResponse:
+def response(
+    status: int, payload: dict[str, object], **headers: str
+) -> GoogleHTTPResponse:
     return GoogleHTTPResponse(
         status=status,
         headers=headers,
@@ -112,7 +114,9 @@ def test_token_manager_refreshes_and_persists_home_scoped_grant(tmp_path: Path) 
     }
 
 
-def test_token_manager_refuses_identity_only_or_stale_scope_state(tmp_path: Path) -> None:
+def test_token_manager_refuses_identity_only_or_stale_scope_state(
+    tmp_path: Path,
+) -> None:
     paths, store = configured_google_grant(tmp_path, "gmail")
     store.save("gmail", {"access_token": "secret", "refresh_token": "refresh"})
     config = load_auth_config(paths)
@@ -300,18 +304,23 @@ def test_get_client_retries_quota_error_and_uses_get_only() -> None:
         jitter=lambda: 0,
     )
 
-    assert client.get_json("threads/abc", params={"format": "full"}, quota_units=40) == {
-        "ok": True
-    }
+    assert client.get_json(
+        "threads/abc", params={"format": "full"}, quota_units=40
+    ) == {"ok": True}
     assert sleeps == [3.0]
     assert [request.get_method() for request in requests] == ["GET", "GET"]
-    assert all(request.headers["Authorization"] == "Bearer initial" for request in requests)
+    assert all(
+        request.headers["Authorization"] == "Bearer initial" for request in requests
+    )
     assert requests[-1].full_url.endswith("/threads/abc?format=full")
 
 
 def test_get_client_refreshes_once_after_401() -> None:
     tokens = Tokens()
-    replies = [response(401, {"error": {"message": "expired"}}), response(200, {"ok": 1})]
+    replies = [
+        response(401, {"error": {"message": "expired"}}),
+        response(200, {"ok": 1}),
+    ]
 
     client = GoogleAPIClient(
         "calendar",
@@ -409,6 +418,46 @@ def test_quota_budget_reserves_each_http_attempt_before_transport() -> None:
     assert client.get_json("threads/abc", quota_units=40) == {"ok": True}
     assert reservations == [40, 40]
     assert len(attempts) == 2
+
+
+def test_quota_budget_shared_key_combines_independent_client_windows() -> None:
+    now = [0.0]
+    sleeps: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    common = {
+        "units_per_minute": 60,
+        "requests_per_second": 1_000,
+        "monotonic": lambda: now[0],
+        "sleeper": sleep,
+        "shared_key": "test:gmail-shared-window",
+    }
+    mirror = GoogleQuotaBudget(**common)
+    archive = GoogleQuotaBudget(**common)
+
+    mirror.acquire(40)
+    archive.acquire(21)
+
+    assert sleeps == [60.0]
+    assert now[0] == 60.0
+
+
+def test_quota_budget_shared_key_rejects_inconsistent_limits() -> None:
+    GoogleQuotaBudget(
+        units_per_minute=60,
+        requests_per_second=2,
+        shared_key="test:gmail-consistent-configuration",
+    )
+
+    with pytest.raises(ValueError, match="configured inconsistently"):
+        GoogleQuotaBudget(
+            units_per_minute=60,
+            requests_per_second=4,
+            shared_key="test:gmail-consistent-configuration",
+        )
 
 
 def test_quota_budget_reservation_failure_prevents_http_attempt() -> None:

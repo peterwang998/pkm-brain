@@ -16,7 +16,12 @@ from .gmail_archive_source import (
     GmailHistoryExpired,
     GmailPageTokenExpired,
 )
-from .google_api import GoogleAPIClient, GoogleQuotaBudget, GoogleTokenManager
+from .google_api import (
+    GoogleAPIClient,
+    GoogleAPIError,
+    GoogleQuotaBudget,
+    GoogleTokenManager,
+)
 from .operational_budget import DailyBudgetExceeded, daily_budget_usage
 from .operational_service import OperationalService
 from .operations_policy import OperationsPolicy, load_operations_policy
@@ -25,7 +30,7 @@ from .paths import BrainPaths
 
 GMAIL_ARCHIVE_PAGE_SIZE = 250
 GMAIL_ARCHIVE_API_ATTEMPTS = 2
-GMAIL_ARCHIVE_REQUESTS_PER_SECOND = 4.0
+GMAIL_ARCHIVE_REQUESTS_PER_SECOND = 2.0
 GMAIL_ARCHIVE_OPERATIONAL_HEADROOM = 250
 GMAIL_ARCHIVE_MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024
 
@@ -75,7 +80,7 @@ class GmailArchiveSyncOutcome:
         paused_messages = {
             "low_disk_space": "Secure Gmail history copy needs more free disk space.",
             "daily_budget_headroom": (
-                "Secure Gmail history copy paused at today's Gmail limit."
+                "Secure Gmail history copy paused at Brain's daily Gmail safety budget."
             ),
             "malformed_message": (
                 "Secure Gmail history copy paused because one Gmail message "
@@ -172,7 +177,9 @@ class GmailArchiveSynchronizer:
             state is not None
             and getattr(state, "identity_fingerprint", None) != identity_fingerprint
         ):
-            raise ValueError("Gmail archive identity does not match the approved account")
+            raise ValueError(
+                "Gmail archive identity does not match the approved account"
+            )
         if not self._disk_ready():
             return self._outcome(state, stopped_reason="low_disk_space")
         if not self._budget_ready(active_policy, started):
@@ -320,6 +327,7 @@ class GmailArchiveSynchronizer:
             quota=GoogleQuotaBudget(
                 requests_per_second=GMAIL_ARCHIVE_REQUESTS_PER_SECOND,
                 on_acquire=self._budget_reserver(policy, run_id, started),
+                shared_key=f"gmail:{policy.operator.gmail.provider_subject}",
             ),
             attempts=GMAIL_ARCHIVE_API_ATTEMPTS,
         )
@@ -331,9 +339,9 @@ class GmailArchiveSynchronizer:
         run_id: str | None,
         started: datetime,
     ) -> Callable[[int], None]:
-        local_day = started.astimezone(
-            ZoneInfo(policy.operator.timezone)
-        ).date().isoformat()
+        local_day = (
+            started.astimezone(ZoneInfo(policy.operator.timezone)).date().isoformat()
+        )
 
         def reserve(quota_units: int) -> None:
             self.operational_service.reserve_daily_budgets(
@@ -351,9 +359,9 @@ class GmailArchiveSynchronizer:
         return reserve
 
     def _budget_ready(self, policy: OperationsPolicy, started: datetime) -> bool:
-        local_day = started.astimezone(
-            ZoneInfo(policy.operator.timezone)
-        ).date().isoformat()
+        local_day = (
+            started.astimezone(ZoneInfo(policy.operator.timezone)).date().isoformat()
+        )
         used = int(
             self.usage_reader(self.paths.ops_sqlite_path, local_day=local_day)
             .get("gmail", {})
@@ -416,14 +424,40 @@ def run_scheduled_gmail_archive_sync(
     if not paths.ops_sqlite_path.is_file():
         operational_service.initialize()
     try:
-        return GmailArchiveSynchronizer(paths, operational_service).sync(
-            policy=policy
-        ).as_dict()
+        return (
+            GmailArchiveSynchronizer(paths, operational_service)
+            .sync(policy=policy)
+            .as_dict()
+        )
     except DailyBudgetExceeded:
         return {
             "status": "partial",
-            "message": "Secure Gmail history copy paused at today's Gmail limit.",
+            "message": (
+                "Secure Gmail history copy paused at Brain's daily Gmail safety budget."
+            ),
             "stopped_reason": "daily_budget_headroom",
+        }
+    except GoogleAPIError as exc:
+        if (
+            exc.reason
+            in {
+                "dailyLimitExceeded",
+                "quotaExceeded",
+                "rateLimitExceeded",
+                "userRateLimitExceeded",
+                "RESOURCE_EXHAUSTED",
+            }
+            or exc.status == 429
+        ):
+            return {
+                "status": "partial",
+                "message": "Google asked Brain to slow down; the copy will retry.",
+                "stopped_reason": "provider_rate_limited",
+            }
+        return {
+            "status": "failed",
+            "message": "Secure Gmail history copy stopped safely; retry from the Brain app.",
+            "error_code": "gmail_archive_GoogleAPIError",
         }
     except Exception as exc:
         return {
@@ -461,10 +495,7 @@ def _initial_state(
     return ArchiveState(
         account_key=account_key,
         phase="backfill",
-        query=(
-            f"after:{int(start.timestamp()) - 1} "
-            f"before:{int(end.timestamp()) + 1}"
-        ),
+        query=(f"after:{int(start.timestamp()) - 1} before:{int(end.timestamp()) + 1}"),
         window_start=start.isoformat(),
         window_end=end.isoformat(),
         updated_at=end.isoformat(),
@@ -498,9 +529,7 @@ def _after_history(state: Any, batch: GmailArchiveSourceBatch, now: datetime) ->
         page_token=batch.next_page_token,
         history_id=batch.next_history_id or state.history_id,
         pending_message_ids=batch.pending_ids,
-        continuation_history_id=(
-            None if complete else batch.continuation_history_id
-        ),
+        continuation_history_id=(None if complete else batch.continuation_history_id),
         processed=state.processed + _attempted(batch),
         coverage_complete=complete,
         reset_required=False,
@@ -535,7 +564,13 @@ def _query_from_window_start(value: str) -> str:
 
 
 def _safe_status(value: Any) -> dict[str, Any]:
-    data = asdict(value) if is_dataclass(value) else dict(value) if isinstance(value, dict) else {}
+    data = (
+        asdict(value)
+        if is_dataclass(value)
+        else dict(value)
+        if isinstance(value, dict)
+        else {}
+    )
     state = data.pop("state", None)
     if isinstance(state, dict):
         for key in (

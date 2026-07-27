@@ -1064,8 +1064,15 @@ public struct TodayRetainedEvidence: Codable, Equatable, Sendable {
     public let account_key: String
     public let source_ref: String
     public let source_revision: String?
+    public let requested_source_revision: String?
+    public let revision_matches: Bool?
+    public let evidence_origin: String?
     public let retention_days: Int
     public let evidence: JSONValue
+
+    public var isCurrentRevisionFallback: Bool {
+        revision_matches == false && evidence_origin == "gmail_mirror_current_fallback"
+    }
 
     public var sourceLabel: String {
         switch source_type {

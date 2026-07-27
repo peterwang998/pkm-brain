@@ -21,6 +21,7 @@ from pkm_brain.gmail_archive_sync import (
     _require_archive_policy,
     run_scheduled_gmail_archive_sync,
 )
+from pkm_brain.google_api import GoogleAPIError
 from pkm_brain.operational_service import OperationalService
 from pkm_brain.operations_policy import OperationsPolicy
 from pkm_brain.paths import BrainPaths
@@ -153,7 +154,9 @@ def _sync(
     )
 
 
-def test_initial_pass_captures_h0_then_resumes_one_fixed_backfill(tmp_path: Path) -> None:
+def test_initial_pass_captures_h0_then_resumes_one_fixed_backfill(
+    tmp_path: Path,
+) -> None:
     store = FakeStore()
     reader = FakeReader(
         GmailArchiveSourceBatch(
@@ -296,9 +299,9 @@ def test_resource_gates_stop_before_any_provider_fetch(
     store = FakeStore()
     reader = FakeReader()
 
-    outcome = _sync(
-        tmp_path, store, reader, free_bytes=free_bytes, used=used
-    ).sync(policy=_policy())
+    outcome = _sync(tmp_path, store, reader, free_bytes=free_bytes, used=used).sync(
+        policy=_policy()
+    )
 
     assert outcome.stopped_reason == reason
     assert reader.calls == []
@@ -354,7 +357,7 @@ def test_scheduled_failure_reports_only_a_safe_error_code(
             del policy
             raise SensitiveProviderFailure(
                 "private Gmail subject and message body must not escape"
-    )
+            )
 
     paths = BrainPaths.from_value(tmp_path / "brain")
     operational_service = OperationalService(paths)
@@ -380,3 +383,41 @@ def test_scheduled_failure_reports_only_a_safe_error_code(
     }
     assert "subject" not in repr(payload)
     assert "message body" not in repr(payload)
+
+
+def test_scheduled_provider_rate_limit_is_distinct_from_brain_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class RateLimitedSynchronizer:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+
+        def sync(self, *, policy: OperationsPolicy) -> Any:
+            del policy
+            raise GoogleAPIError(
+                429,
+                "provider detail must stay private",
+                reason="userRateLimitExceeded",
+                retryable=True,
+            )
+
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    service = OperationalService(paths)
+    monkeypatch.setattr(service, "initialize", lambda: None)
+    monkeypatch.setattr(
+        "pkm_brain.gmail_archive_sync.load_operations_policy", lambda paths: _policy()
+    )
+    monkeypatch.setattr(
+        "pkm_brain.gmail_archive_sync.connector_auth_status",
+        lambda paths, connector: {"status": "connected"},
+    )
+    monkeypatch.setattr(
+        "pkm_brain.gmail_archive_sync.GmailArchiveSynchronizer",
+        RateLimitedSynchronizer,
+    )
+
+    assert run_scheduled_gmail_archive_sync(paths, service) == {
+        "status": "partial",
+        "message": "Google asked Brain to slow down; the copy will retry.",
+        "stopped_reason": "provider_rate_limited",
+    }

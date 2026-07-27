@@ -129,6 +129,62 @@ def test_operations_evidence_endpoint_prefers_durable_gmail_mirror(
     assert payload["source_revision"] == "revision-1"
 
 
+def test_operations_evidence_endpoint_labels_current_local_gmail_fallback(
+    tmp_path: Path,
+) -> None:
+    paths = _configured_paths(tmp_path)
+    store = GmailMirrorStore(paths.gmail_mirror_sqlite_path)
+    store.initialize()
+    current = _gmail_thread("thread-1", "Current local subject")
+    current = NormalizedGmailThread(
+        thread_id=current.thread_id,
+        history_id="history-2",
+        source_revision="revision-2",
+        subject=current.subject,
+        created_at=current.created_at,
+        updated_at=current.updated_at,
+        message_class=current.message_class,
+        messages=current.messages,
+        body_chars=current.body_chars,
+        attachment_count=current.attachment_count,
+        quoted_chars_removed=current.quoted_chars_removed,
+        truncated=current.truncated,
+    )
+    store.apply_sync_unit(
+        GmailMirrorCheckpointUpdate(
+            account_key="gmail.primary",
+            history_id="history-2",
+            mode="incremental",
+            coverage_complete=True,
+            reset_required=False,
+            continuation_page_token=None,
+            baseline_history_id=None,
+            pending_thread_ids=(),
+            continuation_history_id=None,
+            expected_generation=None,
+            last_success_at="2026-07-14T17:00:00+00:00",
+            updated_at="2026-07-14T17:00:00+00:00",
+        ),
+        (GmailMirrorThreadInput(thread=current, raw_payload={"id": "thread-1"}),),
+    )
+
+    payload = operations_evidence_payload(
+        paths,
+        {
+            "source_type": ["gmail"],
+            "account_key": ["gmail.primary"],
+            "source_ref": ["gmail.primary:thread-1"],
+            "source_revision": ["revision-1"],
+        },
+    )
+
+    assert payload["evidence"]["subject"] == "Current local subject"
+    assert payload["evidence_origin"] == "gmail_mirror_current_fallback"
+    assert payload["requested_source_revision"] == "revision-1"
+    assert payload["source_revision"] == "revision-2"
+    assert payload["revision_matches"] is False
+
+
 def test_shadow_setup_reports_mailbox_and_triage_health_separately(
     tmp_path: Path,
 ) -> None:

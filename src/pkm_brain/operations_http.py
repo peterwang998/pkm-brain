@@ -100,8 +100,7 @@ def operations_evidence_payload(
     duplicated = sorted(key for key, values in query.items() if len(values) != 1)
     if duplicated:
         raise OperationsHTTPBadRequest(
-            "evidence query fields must appear exactly once: "
-            + ", ".join(duplicated)
+            "evidence query fields must appear exactly once: " + ", ".join(duplicated)
         )
     source_type = _first(query, "source_type").casefold()
     account_key = _first(query, "account_key")
@@ -115,7 +114,9 @@ def operations_evidence_payload(
         or not source_ref
         or len(source_ref) > 4_000
     ):
-        raise OperationsHTTPBadRequest("account_key and bounded source_ref are required")
+        raise OperationsHTTPBadRequest(
+            "account_key and bounded source_ref are required"
+        )
     if source_revision is not None and len(source_revision) > 1_024:
         raise OperationsHTTPBadRequest("source_revision is too long")
     policy = load_operations_policy(paths)
@@ -136,15 +137,24 @@ def operations_evidence_payload(
     evidence = None
     evidence_origin = "retained_cache"
     resolved_revision = source_revision
+    gmail_current_fallback = None
     if source_type == "gmail" and paths.gmail_mirror_sqlite_path.is_file():
         thread_id = source_ref.removeprefix(prefix)
         store = GmailMirrorStore(paths.gmail_mirror_sqlite_path)
-        revision = (
-            store.get_revision(account_key, thread_id, source_revision)
-            if source_revision is not None
-            else store.get_current_revision(account_key, thread_id)
-        )
-        if revision is not None and not revision.tombstoned and revision.thread is not None:
+        if source_revision is not None:
+            revision = store.get_revision(account_key, thread_id, source_revision)
+            if revision is None:
+                gmail_current_fallback = store.get_current_revision(
+                    account_key,
+                    thread_id,
+                )
+        else:
+            revision = store.get_current_revision(account_key, thread_id)
+        if (
+            revision is not None
+            and not revision.tombstoned
+            and revision.thread is not None
+        ):
             evidence = revision.thread.as_dict()
             evidence_origin = "gmail_mirror"
             resolved_revision = revision.source_revision
@@ -154,14 +164,26 @@ def operations_evidence_payload(
             source_ref,
             source_revision=source_revision,
         )
+    if (
+        evidence is None
+        and gmail_current_fallback is not None
+        and not gmail_current_fallback.tombstoned
+        and gmail_current_fallback.thread is not None
+    ):
+        evidence = gmail_current_fallback.thread.as_dict()
+        evidence_origin = "gmail_mirror_current_fallback"
+        resolved_revision = gmail_current_fallback.source_revision
     if evidence is None:
         raise OperationsHTTPNotFound("retained local evidence is unavailable")
+    revision_matches = source_revision is None or source_revision == resolved_revision
     return {
         "schema_version": 1,
         "source_type": source_type,
         "account_key": account_key,
         "source_ref": source_ref,
         "source_revision": resolved_revision,
+        "requested_source_revision": source_revision,
+        "revision_matches": revision_matches,
         "retention_days": policy.privacy.normalized_evidence_days,
         "evidence_origin": evidence_origin,
         "evidence": evidence,
