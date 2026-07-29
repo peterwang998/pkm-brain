@@ -83,7 +83,11 @@ final class PKMBrainUITests: XCTestCase {
             app.staticTexts["Connector Authentication"].waitForExistence(timeout: 10),
             "Missing Calendar authentication sheet"
         )
-        XCTAssertTrue(app.staticTexts["Operational read-only access"].exists)
+        XCTAssertTrue(
+            app.staticTexts["Read events on your owned primary calendar only"]
+                .waitForExistence(timeout: 10),
+            "Missing Calendar read-only access summary"
+        )
         XCTAssertTrue(app.staticTexts["http://127.0.0.1:53682/oauth/callback/calendar"].exists)
         app.buttons["Done"].click()
 
@@ -94,7 +98,11 @@ final class PKMBrainUITests: XCTestCase {
             app.staticTexts["Connector Authentication"].waitForExistence(timeout: 10),
             "Missing Gmail authentication sheet"
         )
-        XCTAssertTrue(app.staticTexts["Operational read-only access"].exists)
+        XCTAssertTrue(
+            app.staticTexts["Read Gmail messages and threads only"]
+                .waitForExistence(timeout: 10),
+            "Missing Gmail read-only access summary"
+        )
         XCTAssertTrue(app.staticTexts["http://127.0.0.1:53682/oauth/callback/gmail"].exists)
 
         let authAttachment = XCTAttachment(screenshot: app.screenshot())
