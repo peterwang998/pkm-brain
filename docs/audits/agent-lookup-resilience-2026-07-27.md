@@ -97,3 +97,22 @@ The focused suite exercises:
 - expanded provider-token and temporary-password masking.
 
 The release is version `0.2.4`, app build `10`.
+
+## Live verification
+
+The installed app is running Brain `0.2.4` build `10` with runtime ID
+`0.2.4-12a45456-2b523a3a`.
+
+- The original Sierra lookup returned `found`, with eight relevant facts, two
+  supporting chunks, and a recorded retrieval event.
+- The Sierra mail search returned three results from the configured local Gmail
+  archive for `peterwang998@gmail.com`, with the external-content warning
+  intact.
+- Invalid mail limits and event kinds now return the exact accepted range or
+  enum, including through an already-running older MCP proxy.
+- A full no-change capture scanned 9,691 sources, skipped all 9,691, performed
+  no chunking or embedding, and completed in roughly eight seconds. The
+  corresponding pre-fix worker had remained active for more than an hour.
+- A second capture completed in roughly four seconds. While it was queued and
+  running, both `retrieve_context` and `write_agent_session` completed
+  successfully; retrieval telemetry was also recorded rather than skipped.
