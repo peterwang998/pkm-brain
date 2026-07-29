@@ -55,6 +55,10 @@ final class PKMBrainUITests: XCTestCase {
 
     @MainActor
     private func captureConnectorAuthentication(in app: XCUIApplication) throws {
+        XCTAssertTrue(
+            app.staticTexts["Running"].waitForExistence(timeout: 180),
+            "Daemon did not become ready for connector acceptance"
+        )
         let picker = app.radioGroups["ops-section-picker"]
         XCTAssertTrue(picker.waitForExistence(timeout: 10), "Missing Ops section picker")
         let connectorsSegment = picker.radioButtons["Connectors"]
@@ -62,7 +66,7 @@ final class PKMBrainUITests: XCTestCase {
         connectorsSegment.click()
 
         XCTAssertTrue(
-            app.staticTexts["Google Calendar"].waitForExistence(timeout: 10),
+            app.staticTexts["Google Calendar"].waitForExistence(timeout: 20),
             "Missing Google Calendar connector"
         )
         XCTAssertTrue(app.staticTexts["Gmail"].waitForExistence(timeout: 10), "Missing Gmail connector")

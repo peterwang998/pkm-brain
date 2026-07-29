@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -23,6 +24,7 @@ from pkm_brain.gmail_archive import (
     MacOSKeychainGmailArchiveKeyProvider,
     StaticGmailArchiveKeyProvider,
     _run_security_password_prompt,
+    _script_pty_argv,
 )
 
 
@@ -205,6 +207,27 @@ def test_security_prompt_runner_answers_both_pty_prompts() -> None:
     )
 
     assert result == 0
+
+
+def test_security_prompt_runner_uses_util_linux_script_syntax() -> None:
+    command = ["/usr/bin/python3", "-c", "print('hello world')"]
+
+    result = _script_pty_argv(command, "linux")
+
+    assert result[:4] == ["/usr/bin/script", "-q", "-e", "-c"]
+    assert shlex.split(result[4]) == command
+    assert result[5] == "/dev/null"
+
+
+def test_security_prompt_runner_keeps_bsd_script_syntax() -> None:
+    command = ["/usr/bin/python3", "-c", "print('hello world')"]
+
+    assert _script_pty_argv(command, "darwin") == [
+        "/usr/bin/script",
+        "-q",
+        "/dev/null",
+        *command,
+    ]
 
 
 def test_security_prompt_runner_fails_if_second_prompt_never_arrives() -> None:

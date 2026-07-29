@@ -4,6 +4,8 @@ import Foundation
 public enum DaemonSupervisorError: Error, Equatable {
     case versionMismatch(expected: String, actual: String)
     case runtimeMismatch(expected: String, actual: String?)
+    case launchExited(Int32)
+    case handshakeTimedOut
 }
 
 @MainActor
@@ -15,6 +17,8 @@ public final class DaemonSupervisor: ObservableObject {
     public private(set) var apiClient: BrainAPIClient?
     private let provisioner: RuntimeProvisioner
     private let expectedDaemonVersion: String?
+    private let initialHandshakeTimeoutSeconds: TimeInterval
+    private let restartHandshakeTimeoutSeconds: TimeInterval
     private var expectedRuntimeID: String?
     private var process: Process?
     private var healthTask: Task<Void, Never>?
@@ -24,11 +28,15 @@ public final class DaemonSupervisor: ObservableObject {
     public init(
         provisioner: RuntimeProvisioner,
         expectedDaemonVersion: String? = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
-        expectedRuntimeID: String? = nil
+        expectedRuntimeID: String? = nil,
+        initialHandshakeTimeoutSeconds: TimeInterval = 180,
+        restartHandshakeTimeoutSeconds: TimeInterval = 60
     ) {
         self.provisioner = provisioner
         self.expectedDaemonVersion = expectedDaemonVersion
         self.expectedRuntimeID = expectedRuntimeID
+        self.initialHandshakeTimeoutSeconds = initialHandshakeTimeoutSeconds
+        self.restartHandshakeTimeoutSeconds = restartHandshakeTimeoutSeconds
     }
 
     public func start(homeURL: URL, serveWeb: Bool = false) async {
@@ -52,9 +60,13 @@ public final class DaemonSupervisor: ObservableObject {
                 runtimeID: expectedRuntimeID
             )
             try launchDaemon(brain: brain, homeURL: homeURL, serveWeb: serveWeb, runtimeID: expectedRuntimeID)
-            let handshake = try await waitForHandshake(homeURL: homeURL, timeoutSeconds: 10)
+            let handshake = try await waitForHandshake(
+                homeURL: homeURL,
+                timeoutSeconds: initialHandshakeTimeoutSeconds
+            )
             try await adopt(handshake: handshake)
         } catch {
+            await terminateTrackedProcess()
             status = .failed(String(describing: error))
         }
     }
@@ -253,7 +265,10 @@ public final class DaemonSupervisor: ObservableObject {
                     serveWeb: launchConfiguration.serveWeb,
                     runtimeID: launchConfiguration.runtimeID
                 )
-                let handshake = try await waitForHandshake(homeURL: launchConfiguration.homeURL, timeoutSeconds: 10)
+                let handshake = try await waitForHandshake(
+                    homeURL: launchConfiguration.homeURL,
+                    timeoutSeconds: restartHandshakeTimeoutSeconds
+                )
                 try await adopt(handshake: handshake)
                 return
             } catch {
@@ -307,9 +322,12 @@ public final class DaemonSupervisor: ObservableObject {
             if let handshake = try? readHandshake(homeURL: homeURL) {
                 return handshake
             }
+            if let process, !process.isRunning {
+                throw DaemonSupervisorError.launchExited(process.terminationStatus)
+            }
             try await Task.sleep(nanoseconds: 200_000_000)
         }
-        throw CocoaError(.fileReadNoSuchFile)
+        throw DaemonSupervisorError.handshakeTimedOut
     }
 
     private func readHandshake(homeURL: URL) throws -> DaemonHandshake {

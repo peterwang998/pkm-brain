@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import select
+import shlex
 import sqlite3
 import stat
 import subprocess
@@ -76,6 +77,21 @@ _KEYCHAIN_PASSWORD_PROMPTS = (
 )
 
 
+def _script_pty_argv(command: Sequence[str], platform: str) -> list[str]:
+    if platform.startswith("linux"):
+        # util-linux script accepts the child command only through -c. -e
+        # preserves the child's exit status, matching BSD script semantics.
+        return [
+            "/usr/bin/script",
+            "-q",
+            "-e",
+            "-c",
+            shlex.join(command),
+            "/dev/null",
+        ]
+    return ["/usr/bin/script", "-q", "/dev/null", *command]
+
+
 def _run_security_password_prompt(
     argv: Sequence[str],
     password: str,
@@ -101,7 +117,7 @@ def _run_security_password_prompt(
         # macOS script owns the controlling PTY, avoiding forkpty inside the
         # daemon's multithreaded process. /dev/null prevents transcript storage.
         process = subprocess.Popen(
-            ["/usr/bin/script", "-q", "/dev/null", *command],
+            _script_pty_argv(command, sys.platform),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
