@@ -327,7 +327,20 @@ Provisioning checks bundle, local cache, then network. It smoke-tests `brain --v
 
 `scripts/build-app.sh` builds the exact project-version wheel, replaces stale runtime resources, resolves pinned Swift packages through absolute app-local cache paths, generates/builds the Xcode project, ad-hoc signs nested binaries and the app, and writes `dist/PKM Brain.app`. `scripts/install-app.sh` stages and verifies the bundle in `/Applications`, keeps one previous app rollback, refreshes the login item, and optionally activates the installed build.
 
-The 2026-07-14 local release gate completed with Ruff and diff checks green, 873 Python tests and 28 Swift tests passing, and a signed `dist/PKM Brain.app` bundle built, installed, launched, and serving healthy runtime `0.1.6-12a45456-7adaae5c`. Installed startup completed both Gmail provider jobs. The archive completed a fixed 90-day copy and five-change history catch-up with 7,746 active messages across 6,857 threads; integrity, owner-only permissions, Keychain round trip, identity binding, encrypted-at-rest scan, and bounded installed daemon tools passed. Native UI automation remains blocked before test execution by the host's XCTest automation-mode timeout; owner visual/content review and promotion remain separate gates.
+The current `0.2.4` source release gate requires Ruff, all 2,808 Python tests,
+all 28 Swift tests, a clean app build, strict deep signature verification, and
+the GitHub native-UI workflow to pass before promotion to `main`. The resulting
+source-built app is an Apple Silicon (`arm64`) bundle with an ad-hoc signature;
+a Developer ID-signed, notarized, universal download remains a separate
+distribution milestone.
+
+The 2026-07-14 installed-data gate remains useful operational evidence:
+startup completed both Gmail provider jobs, and the archive completed a fixed
+90-day copy plus history catch-up with 7,746 active messages across 6,857
+threads. Integrity, owner-only permissions, Keychain round trip, identity
+binding, encrypted-at-rest scanning, and bounded installed-daemon reads passed.
+Owner source/UX review and empirical trust promotion remain independent of the
+software release.
 
 Runtime versions are immutable deployment artifacts. Successful activation starts process-aware retention: current, one rollback, and every runtime referenced by a live process remain; inactive older versions are removed. Process inventory failure is fail-closed, and process output is drained before waiting for exit so large inventories cannot deadlock the retention task.
 
@@ -404,4 +417,7 @@ scripts/m3-migration-acceptance.sh
 scripts/build-app.sh
 ```
 
-The latest local result is Ruff and diff checks green, 873 Python tests passing, 28 Swift tests passing, and a signed app bundle installed and serving healthy runtime `0.1.6-12a45456-7adaae5c`. Both installed Gmail jobs report complete. Native UI automation remains blocked before test execution by the host's XCTest automation-mode timeout; owner source/UX review and empirical promotion remain independent pending evaluation steps.
+The current release result is recorded by the `0.2.4` GitHub workflow and the
+clean-checkout validation described above. Installed Gmail transport and
+private-source quality are environment-specific checks; software promotion
+does not imply owner trust in generated briefings or model judgments.

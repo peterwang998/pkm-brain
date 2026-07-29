@@ -1,7 +1,7 @@
 # Product Foundation
 
-**Status:** canonical living feature spec; the read-only Chief-of-Staff trial, Gmail mirror, and encrypted 90-day local mail archive are locally release-verified and testing-ready, while owner review and promotion remain pending
-**Last verified:** 2026-07-15 against the unpromoted temporal-cognition working tree based on `d5405b9`; the parity-first Brain v2 target reaches migration 24 while the 2026-07-14 installed release remains the live baseline
+**Status:** canonical living feature spec; Brain v2 temporal cognition, the read-only Chief-of-Staff trial, Gmail mirror, encrypted local mail archive, and bounded Gmail Knowledge projection are release-verified, while Gmail external extraction/temporal review and owner trust promotion remain separately gated
+**Last verified:** 2026-07-29 against Brain `0.2.4` release-line commit `2085ec3` and Knowledge schema 26
 **Owns:** product boundaries, authority hierarchy, persistence model, privacy rules, and cross-feature invariants
 
 ## Purpose
@@ -86,7 +86,7 @@ These are two evidence flows over shared source identity. The operational flow m
 
 ## Persistent Model
 
-`brain.sqlite` remains the Knowledge Curation control plane. The installed baseline applies migrations 1 through 21 idempotently; the unpromoted temporal-cognition working tree adds migrations 22-24. Introducing `ops.sqlite` is additive and must not change the meaning, migration history, or behavior of existing knowledge tables.
+`brain.sqlite` remains the Knowledge Curation control plane. The current release applies migrations 1 through 26 idempotently. Introducing `ops.sqlite` is additive and does not change the meaning, migration history, or behavior of existing knowledge tables.
 
 | Migration | Durable capability |
 |---:|---|
@@ -109,9 +109,11 @@ These are two evidence flows over shared source identity. The operational flow m
 | 19 | entity mention kind |
 | 20 | document source size/mtime statistics |
 | 21 | review admission metadata and state |
-| 22 | additive temporal fact fields and valid/knowledge-time indexes; working tree only, not live-migrated |
-| 23 | fact assertion lineage and copy-before-write revision constraints; working tree only, not live-migrated |
-| 24 | nullable flattened `event_time` fields (`kind`, start, end, precision, expression) on facts; working tree only, not live-migrated |
+| 22 | additive temporal fact fields and valid/knowledge-time indexes |
+| 23 | fact assertion lineage and copy-before-write revision constraints |
+| 24 | nullable flattened `event_time` fields (`kind`, start, end, precision, expression) on facts |
+| 25 | immutable Gmail temporal-review ledger and current head |
+| 26 | durable temporal runner executions/components, including zero-work outcomes |
 
 Major persistent responsibilities:
 
@@ -203,11 +205,22 @@ Allowed network activity is limited to explicitly configured LLM, connector, and
 
 ## Current Status
 
-The core local Knowledge Curation pipeline, fact/entity ledger, action policy, managed pages, retrieval, MCP, native daemon/app, and Primary/Secondary sync are implemented. The installed schema version is 21; the unpromoted temporal-cognition working tree targets 24 only in isolated homes. Existing `cos_*` code and tables implement Knowledge Curation despite their historical names.
+The core local Knowledge Curation pipeline, temporal fact/entity/event ledger, action policy, managed pages, retrieval, MCP, native daemon/app, and Primary/Secondary sync are implemented. Knowledge schema 26 is the current release contract. Existing `cos_*` code and tables implement Knowledge Curation despite their historical names.
 
-The Operational Chief-of-Staff context now has an isolated, independently migrated `ops.sqlite` kernel, a daemon-owned fail-closed mutation service, coordinated database-pair recovery, read-only Calendar/Gmail source integration, deterministic reconciliation, a coverage-aware Today briefing, local feedback, and offline replay evaluation. The full Shadow evaluation remains manual: the owner authorizes two exact-scope Google grants and selects **Today > Run Shadow** for Calendar refresh plus local Gmail analysis. Gmail transport is separate; once a valid private operations policy and exact grant exist, the primary/single daemon may initialize `ops.sqlite` and runs the fetch-only local mirror at startup and about every 600 seconds. Operational writes remain local to `ops.sqlite`; Calendar/Gmail knowledge ingestion and all external-action authority remain disabled. Restores publish only into a new quarantined home and cannot become a writer until a future explicit topology activation workflow.
+The Operational Chief-of-Staff context now has an isolated, independently migrated `ops.sqlite` kernel, a daemon-owned fail-closed mutation service, coordinated database-pair recovery, read-only Calendar/Gmail source integration, deterministic reconciliation, a coverage-aware Today briefing, local feedback, and offline replay evaluation. The full Shadow evaluation remains manual: the owner authorizes two exact-scope Google grants and selects **Today > Run Shadow** for Calendar refresh plus local Gmail analysis. Gmail transport is separate; once a valid private operations policy and exact grant exist, the primary/single daemon may initialize `ops.sqlite` and runs the fetch-only local mirror at startup and about every 600 seconds. Operational writes remain local to `ops.sqlite`. Bounded Gmail Knowledge projection and retrieval run locally from the encrypted archive when enabled, while Calendar Knowledge ingestion, private Gmail external extraction/temporal review, and all external-action authority remain disabled by default. Restores publish only into a new quarantined home and cannot become a writer until a future explicit topology activation workflow.
 
-The 2026-07-14 local release gate is complete: Ruff and diff checks are green, 873 Python tests and 28 Swift tests pass, and the signed local app bundle builds, installs, launches, and serves healthy runtime `0.1.6-12a45456-7adaae5c`. Installed startup completed both Gmail jobs. The operational mirror holds a complete incremental checkpoint, while the encrypted archive completed its fixed 90-day copy plus history catch-up and is current with 7,746 active messages across 6,857 threads. Archive integrity, owner-only permissions, Keychain round trip, account binding, encrypted-at-rest scan, and bounded installed agent reads passed. Two isolated UI-acceptance attempts executed no app test bodies because macOS timed out enabling XCTest automation mode, so observed native UI acceptance remains a host-level final gate. Private-source quality review, daily briefing trust, owner visual/content review, and every empirical promotion gate remain pending.
+The current `0.2.4` software release gate requires clean Ruff and diff checks,
+all 2,808 Python tests, all 28 Swift tests, a clean Apple Silicon app build,
+strict deep signature verification, and a passing GitHub native-UI workflow
+before promotion to `main`. Source-built bundles are ad-hoc signed; Developer
+ID signing, notarization, a universal binary, and a downloadable release remain
+a separate distribution milestone. The prior installed-data gate remains valid
+operational evidence: both Gmail jobs completed, the encrypted archive reached
+an incremental checkpoint after its 90-day copy and history catch-up, and its
+integrity, owner-only permissions, Keychain round trip, account binding,
+encrypted-at-rest scan, and bounded reads passed. Private-source quality,
+briefing trust, and owner content/UX review remain empirical gates rather than
+claims implied by shipping the software.
 
 The item lifecycle, source-specific detection, reconciliation, briefing, evaluation, and execution protocol are specified in [Chief-of-Staff Operations](chief-of-staff-operations.md). This foundation owns the boundary between that context and existing Knowledge Curation.
 

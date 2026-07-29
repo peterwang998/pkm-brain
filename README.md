@@ -79,8 +79,12 @@ Key layers:
 
 - `documents` and `chunks` store source-derived text with provenance.
 - SQLite FTS5 provides BM25 lexical search; LanceDB stores chunk vectors.
-- `facts` stores atomic source-backed claims with quotes, spans, routes, status, and confidence fields.
-- `entities` and `fact_entities` link facts to named people, companies, products, projects, and other named referents.
+- `facts` stores atomic source-backed claims with quotes, spans, routes, status,
+  confidence, knowledge/source clocks, optional predicate validity, and optional
+  event occurrence time.
+- `entities` and `fact_entities` link facts to named people, companies,
+  products, projects, and other named referents. Events are typed entities;
+  their occurrence anchors remain source-backed facts.
 - `cos_actions` is the legacy-named reversible Knowledge Curation ledger for fact, page, entity, and topology changes.
 - `cos_policy` decides knowledge-mutation autonomy; clean low/medium-risk actions can apply, while conflicts and ambiguous topology become residue.
 - `open_questions` is the human review queue for conflicts, unrouted facts, anomalies, policy escalations, and other residue.
@@ -96,7 +100,7 @@ Chief of Staff is the product mission, not another app. It uses Brain's evidence
 
 The existing autonomous subsystem is Knowledge Curation: it extracts facts from eligible source windows, validates quotes/spans, routes facts to canonical pages, resolves safe duplicates, flags conflicts, applies reversible actions, samples audits, and lets the gardener propose topology cleanup. Its current `cos_*` names remain compatibility identifiers until an atomic rename; they must not be used for operational items or external side effects.
 
-The initial operational rollout is read-only and manual. After the owner separately authorizes the owned-primary Calendar grant and Gmail read-only grant, **Today > Run Shadow** performs one bounded pass, shows source coverage, surfaces operational candidates, explains ignored/suppressed material, opens retained local evidence, and accepts local corrections or missing-item reports. There is no schedule and no provider write capability. Gmail knowledge capture, retrieval indexing, and durable-fact ingestion remain disabled.
+The initial operational rollout is read-only and manual. After the owner separately authorizes the owned-primary Calendar grant and Gmail read-only grant, **Today > Run Shadow** performs one bounded pass, shows source coverage, surfaces operational candidates, explains ignored/suppressed material, opens retained local evidence, and accepts local corrections or missing-item reports. There is no provider write capability. The encrypted Gmail mirror and local Knowledge projection update incrementally in separate bounded jobs when explicitly enabled; mailbox writes remain impossible, and external-LLM extraction from private Gmail is disabled by default behind a separate source-type gate.
 
 The implementation has passed local code, unit, integration, security-boundary, and signed-build verification and is ready for the first owner-started private trial. It has not yet been promoted as trusted daily guidance. See [Chief-of-Staff Operations](docs/specs/chief-of-staff-operations.md) and the [Live Shadow Trial Runbook](docs/runbooks/chief-of-staff-shadow-trial.md).
 
@@ -119,14 +123,25 @@ the Python daemon, schedules capture/nightly/sync jobs, exposes Today, Queue,
 Wiki, Entities, Ask, Ops, and Settings, and keeps the CLI/MCP service available
 through app-managed shims.
 
-For a development build:
+Install the full app from source on macOS:
 
 ```bash
+brew install uv xcodegen
+uv sync --dev
 scripts/build-app.sh
-open "dist/PKM Brain.app"
+scripts/install-app.sh --activate
 ```
 
-The app adopts `~/brain` in place; private data does not move into the bundle.
+The installed app lives at `/Applications/PKM Brain.app`. It adopts `~/brain`
+in place; private data does not move into the bundle. Re-running the build and
+installer upgrades in place while retaining one previous app bundle for local
+rollback.
+
+Public source builds are currently Apple Silicon (`arm64`) only and are ad-hoc
+signed on the machine that builds them. A Developer ID-signed, notarized, and
+universal downloadable release is a separate distribution step; cloning and
+building from source is the supported public installation path for this
+release.
 
 ## Browser Fallback
 

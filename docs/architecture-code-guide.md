@@ -1,7 +1,7 @@
 # PKM Brain Architecture Code Guide
 
 **Status:** current code-navigation guide
-**Last verified:** 2026-07-21 against the unpromoted temporal-cognition branch based on rollback commit `d5405b9`; the Brain v2 target reaches schema 24 while the installed release remains on schema 21
+**Last verified:** 2026-07-29 against the promoted Brain `0.2.4` temporal-cognition release line at commit `2085ec3`; Knowledge schema 26 is the current release contract
 
 This guide answers where behavior lives. Feature requirements and open work belong in [the specs index](README.md), not here.
 
@@ -67,7 +67,7 @@ sync_* modules move source files, never live DB/index state.
 
 - `paths.py`: all home-relative paths, node identity, lock/token/handshake paths.
 - `db.py`: base schema, connection helpers, FTS setup, row helpers.
-- `migrations.py`: ordered idempotent migrations 1-26 in the unpromoted Brain v2 target; migration 25 adds the immutable Gmail temporal review ledger/head and migration 26 adds durable runner executions/components, including zero-work outcomes.
+- `migrations.py`: ordered idempotent migrations 1-26; migration 25 adds the immutable Gmail temporal review ledger/head and migration 26 adds durable runner executions/components, including zero-work outcomes.
 - `operational_db.py` and `operational_migrations.py`: the independently versioned `db/ops.sqlite` control plane and bounded lock handling.
 - `gmail_mirror.py`: the independent owner-only, rebuildable Gmail operational evidence store, atomic local-analysis queue, and content-free poison-thread quarantine at `cache/gmail-mirror/gmail-mirror.sqlite`.
 - `gmail_archive.py`, `gmail_archive_source.py`, and `gmail_archive_sync.py`: the separate encrypted raw-message store, Gmail reader, and scheduled 90-day-plus-incremental sync.
