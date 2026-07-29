@@ -4,6 +4,7 @@ import io
 import os
 import threading
 import urllib.error
+import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -265,6 +266,29 @@ def test_daemon_mcp_endpoint_requires_known_tool(tmp_path: Path) -> None:
         )
 
     assert result == []
+
+
+def test_daemon_mcp_validation_error_sets_actionable_http_reason(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+
+    with running_ui_with_handshake(paths) as (host, port, token):
+        request = urllib.request.Request(
+            f"http://{host}:{port}/api/mcp/retrieve_context",
+            data=b'{"task":"find an event","event_kind":"actual"}',
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request, timeout=2)
+
+    assert error.value.code == 400
+    assert error.value.reason == "event_kind requires event_as_of"
 
 
 def test_daemon_mcp_validation_error_preserves_actionable_detail(

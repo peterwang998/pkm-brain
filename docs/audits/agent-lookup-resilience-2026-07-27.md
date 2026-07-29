@@ -69,6 +69,8 @@ failed for the same reason.
   HTTP request.
 - Cross-field temporal errors preserve the daemon's actionable message instead
   of surfacing a generic HTTP 400.
+- The daemon also places validation detail in the HTTP reason phrase so
+  already-running older MCP proxies remain actionable until they reconnect.
 
 ### Gmail scope and credentials
 

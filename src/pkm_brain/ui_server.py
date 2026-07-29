@@ -427,7 +427,7 @@ class BrainUIHandler(BaseHTTPRequestHandler):
         except NotFoundError as exc:
             self.write_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
         except ValueError as exc:
-            self.write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            self.write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST, reason=" ".join(str(exc).split())[:200] or "Bad Request")
         except Exception as exc:
             self.write_json(
                 {"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR
@@ -544,10 +544,10 @@ class BrainUIHandler(BaseHTTPRequestHandler):
         self.wfile.write(encoded)
 
     def write_json(
-        self, payload: dict[str, Any] | list[Any], status: HTTPStatus = HTTPStatus.OK
+        self, payload: dict[str, Any] | list[Any], status: HTTPStatus = HTTPStatus.OK, *, reason: str | None = None
     ) -> None:
         encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
-        self.send_response(status.value)
+        self.send_response(status.value, message=reason)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
