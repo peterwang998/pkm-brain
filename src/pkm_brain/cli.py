@@ -11,6 +11,7 @@ from rich.table import Table
 
 from .audit import audit_memories, provenance_check
 from .automation import (
+    WEEKLY_HISTORICAL_AUDIT_LIMIT,
     as_jsonable,
     install_launch_agent,
     install_nightly_launch_agent,
@@ -26,6 +27,7 @@ from .automation import (
     run_gmail_knowledge_ingest,
     run_nightly_maintenance,
     run_secondary_tick,
+    run_weekly_historical_audit,
 )
 from .app_migration import (
     build_migration_plan,
@@ -1217,7 +1219,7 @@ def cos_audit_actions(
         auto_revert_bad=auto_revert_bad,
         provider=provider,
         action_run_id=action_run_id,
-        action_ids=action_id or [],
+        action_ids=action_id,
     )
     console.print_json(json.dumps(result))
 
@@ -2459,6 +2461,49 @@ def automation_nightly(
         include_hyprnote=include_hyprnote,
         with_llm_memory_proposals=with_llm_memory_proposals,
         llm_wiki=llm_wiki,
+        provider=provider,
+    )
+    console.print_json(json.dumps(as_jsonable(result)))
+    if result.status == "failed":
+        raise typer.Exit(1)
+
+
+@automation_app.command("weekly-historical-audit")
+def automation_weekly_historical_audit(
+    if_due: bool = typer.Option(
+        False,
+        "--if-due",
+        help="Skip when the last successful historical audit is less than a week old.",
+    ),
+    due_after_hours: int = typer.Option(
+        168,
+        "--due-after-hours",
+        min=1,
+        help="Minimum hours between successful runs when --if-due is set.",
+    ),
+    limit: int = typer.Option(
+        5,
+        "--limit",
+        min=1,
+        max=WEEKLY_HISTORICAL_AUDIT_LIMIT,
+        help="Maximum older actions to audit in this run.",
+    ),
+    active_limit: int = typer.Option(
+        5,
+        "--active-limit",
+        min=1,
+        max=100,
+        help="Maximum unresolved historical findings allowed at once.",
+    ),
+    provider: Optional[str] = typer.Option(None),
+    home: Optional[Path] = typer.Option(None),
+) -> None:
+    result = run_weekly_historical_audit(
+        BrainPaths.from_value(home),
+        if_due=if_due,
+        due_after_hours=due_after_hours,
+        limit=limit,
+        active_limit=active_limit,
         provider=provider,
     )
     console.print_json(json.dumps(as_jsonable(result)))

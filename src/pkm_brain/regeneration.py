@@ -25,6 +25,7 @@ from .llm import (
     cos_rebuild_allows_critic_proposer_model_overlap,
 )
 from .paths import BrainPaths
+from .review_resolution import confirmed_fact_review_state_matches
 from .service import BrainService
 from .util import now_iso
 from .wiki import parse_frontmatter
@@ -41,7 +42,9 @@ HUMAN_OPEN_QUESTION_STATUSES = {"answered", "dismissed"}
 REFERENCE_PAGE_PREFIXES = ("references/", "agent_session_log/")
 
 
-def export_human_state(paths: BrainPaths, output_dir: Path | None = None) -> dict[str, Any]:
+def export_human_state(
+    paths: BrainPaths, output_dir: Path | None = None
+) -> dict[str, Any]:
     BrainService(paths).init_workspace()
     generated_at = now_iso()
     target_dir = output_dir or default_regeneration_artifact_dir(paths, generated_at)
@@ -60,7 +63,9 @@ def export_human_state(paths: BrainPaths, output_dir: Path | None = None) -> dic
     }
 
 
-def backup_runtime_brain(paths: BrainPaths, output_dir: Path | None = None) -> dict[str, Any]:
+def backup_runtime_brain(
+    paths: BrainPaths, output_dir: Path | None = None
+) -> dict[str, Any]:
     BrainService(paths).init_workspace()
     generated_at = now_iso()
     target_dir = output_dir or default_regeneration_artifact_dir(paths, generated_at)
@@ -111,7 +116,9 @@ def rebuild_facts_from_sources(
     extraction_config = load_extraction_config(paths)
     selected_cards = recent_source_cards(
         paths,
-        limit=10_000_000 if source_type_filter or offset > 0 else max(1, limit or 10_000_000),
+        limit=10_000_000
+        if source_type_filter or offset > 0
+        else max(1, limit or 10_000_000),
         changed_only=False,
         prompt_version=EXTRACTION_PROMPT_VERSION,
         extraction_config=extraction_config,
@@ -162,14 +169,20 @@ def rebuild_facts_from_sources(
         "limit": limit,
         "offset": offset,
         "provider_ready": rebuild_provider_ready_summary(paths, providers),
-        "embedding": BrainService(paths).embedding_provider.status(check_available=False),
+        "embedding": BrainService(paths).embedding_provider.status(
+            check_available=False
+        ),
         "extraction_eval_gate": eval_gate,
         "scope": {
             **inventory,
             "selected_document_count": len(selected_cards),
             "selected_source_types": count_by_key(selected_cards, "source_type"),
-            "selected_window_count": sum(len(card.get("windows") or []) for card in selected_cards),
-            "selected_chunk_count": sum(len(card.get("chunks") or []) for card in selected_cards),
+            "selected_window_count": sum(
+                len(card.get("windows") or []) for card in selected_cards
+            ),
+            "selected_chunk_count": sum(
+                len(card.get("chunks") or []) for card in selected_cards
+            ),
             "selected_documents": [
                 {
                     "document_id": str(card.get("document_id") or ""),
@@ -212,13 +225,13 @@ def apply_rebuild_facts_from_sources(
     provider_ready = rebuild_provider_ready_summary(paths, providers)
     if not provider_ready["all_ready"]:
         missing = ", ".join(provider_ready["missing_or_unready_roles"])
-        raise ValueError(f"rebuild-facts apply blocked: provider roles not ready: {missing}")
+        raise ValueError(
+            f"rebuild-facts apply blocked: provider roles not ready: {missing}"
+        )
     if provider_ready["blocking_warnings"]:
         raise ValueError(
             "rebuild-facts apply blocked: provider separation warnings: "
-            + "; ".join(
-                str(warning) for warning in provider_ready["blocking_warnings"]
-            )
+            + "; ".join(str(warning) for warning in provider_ready["blocking_warnings"])
         )
     run_id = f"regen_{generated_at.replace(':', '').replace('-', '').replace('+', '')}"
     artifact_dir = default_regeneration_artifact_dir(paths, generated_at)
@@ -227,8 +240,14 @@ def apply_rebuild_facts_from_sources(
     human_export = export_human_state(paths, output_dir=artifact_dir)
     human_payload = json.loads(Path(human_export["path"]).read_text(encoding="utf-8"))
 
-    seeded_contracts = seed_route_contracts(paths) if reset else skipped_step("not_reset")
-    reset_result = reset_rebuild_derived_state(paths, run_id=run_id) if reset else skipped_step("not_reset")
+    seeded_contracts = (
+        seed_route_contracts(paths) if reset else skipped_step("not_reset")
+    )
+    reset_result = (
+        reset_rebuild_derived_state(paths, run_id=run_id)
+        if reset
+        else skipped_step("not_reset")
+    )
 
     extraction = extract_recent_documents(
         paths,
@@ -241,7 +260,11 @@ def apply_rebuild_facts_from_sources(
         source_types=sorted(source_type_filter),
     )
     entity_keys = active_fact_entity_keys(paths)
-    resolver = resolve_fact_groups(paths, entity_keys) if entity_keys else skipped_step("no_active_fact_entity_keys")
+    resolver = (
+        resolve_fact_groups(paths, entity_keys)
+        if entity_keys
+        else skipped_step("no_active_fact_entity_keys")
+    )
     confirmations = reapply_confirmed_facts(paths, human_payload, run_id=run_id)
     first_curation = curate_all_managed_fact_pages(paths, overwrite_existing=True)
     route = canonicalize_fact_routes(paths)
@@ -292,7 +315,9 @@ def apply_rebuild_facts_from_sources(
         "post_counts": regeneration_post_counts(paths),
         "notes": [
             "raw sources were not modified",
-            "legacy facts were archived, not deleted" if reset else "continuation tranche did not reset derived state",
+            "legacy facts were archived, not deleted"
+            if reset
+            else "continuation tranche did not reset derived state",
             "page contracts were seeded/preserved before extraction to avoid a cold empty route pool",
         ],
     }
@@ -447,7 +472,9 @@ def remove_managed_wiki_files(paths: BrainPaths) -> list[str]:
 def prune_empty_dirs(root: Path) -> None:
     if not root.exists():
         return
-    for path in sorted((item for item in root.rglob("*") if item.is_dir()), reverse=True):
+    for path in sorted(
+        (item for item in root.rglob("*") if item.is_dir()), reverse=True
+    ):
         try:
             path.rmdir()
         except OSError:
@@ -480,7 +507,12 @@ def reapply_confirmed_facts(
         if isinstance(fact, dict)
     ]
     if not confirmed:
-        return {"matched_count": 0, "unmatched_count": 0, "matched_fact_ids": [], "unmatched": []}
+        return {
+            "matched_count": 0,
+            "unmatched_count": 0,
+            "matched_fact_ids": [],
+            "unmatched": [],
+        }
     with connection(paths.sqlite_path) as conn:
         active_facts = rows(
             conn,
@@ -493,7 +525,9 @@ def reapply_confirmed_facts(
         )
         by_statement: dict[str, list[Any]] = {}
         for fact in active_facts:
-            by_statement.setdefault(statement_key(str(fact["statement"] or "")), []).append(fact)
+            by_statement.setdefault(
+                statement_key(str(fact["statement"] or "")), []
+            ).append(fact)
         matched_ids: list[str] = []
         unmatched: list[dict[str, Any]] = []
         for old_fact in confirmed:
@@ -533,20 +567,15 @@ def reapply_confirmed_facts(
     }
 
 
-def best_confirmation_match(old_fact: dict[str, Any], candidates: list[Any]) -> Any | None:
+def best_confirmation_match(
+    old_fact: dict[str, Any], candidates: list[Any]
+) -> Any | None:
     if not candidates:
         return None
-    old_page_hint = str(old_fact.get("page_hint") or "")
-    old_sources = set(str(item) for item in json_list(old_fact.get("source_ids")))
-    same_page = [fact for fact in candidates if str(fact["page_hint"] or "") == old_page_hint]
-    if same_page:
-        return same_page[0]
-    if old_sources:
-        for fact in candidates:
-            new_sources = set(str(item) for item in json_list(fact["source_ids"]))
-            if old_sources & new_sources:
-                return fact
-    return candidates[0]
+    for candidate in candidates:
+        if confirmed_fact_review_state_matches(old_fact, row_to_fact(candidate)):
+            return candidate
+    return None
 
 
 def statement_key(value: str) -> str:
@@ -588,7 +617,9 @@ def curation_summary(result: dict[str, Any]) -> dict[str, Any]:
     return {
         "page_count": result.get("page_count"),
         "written_count": len([page for page in pages if page.get("written")]),
-        "projection_error_count": sum(len(page.get("projection_errors") or []) for page in pages),
+        "projection_error_count": sum(
+            len(page.get("projection_errors") or []) for page in pages
+        ),
         "archived_orphan_count": len(result.get("archived_orphans") or []),
         "lint_error_count": len((result.get("lint") or {}).get("errors") or []),
     }
@@ -598,11 +629,21 @@ def regeneration_post_counts(paths: BrainPaths) -> dict[str, int]:
     return {
         "active_facts": table_count_where(paths, "facts", "status = 'active'"),
         "archived_facts": table_count_where(paths, "facts", "status = 'archived'"),
-        "rejected_actions": table_count_where(paths, "cos_actions", "status = 'rejected'"),
-        "needs_human_actions": table_count_where(paths, "cos_actions", "status = 'needs_human'"),
-        "open_questions": table_count_where(paths, "open_questions", "status IN ('open', 'needs_human')"),
-        "active_entities": table_count_where(paths, "entities", "COALESCE(status, 'active') = 'active'"),
-        "active_contracts": table_count_where(paths, "page_contracts", "status = 'active'"),
+        "rejected_actions": table_count_where(
+            paths, "cos_actions", "status = 'rejected'"
+        ),
+        "needs_human_actions": table_count_where(
+            paths, "cos_actions", "status = 'needs_human'"
+        ),
+        "open_questions": table_count_where(
+            paths, "open_questions", "status IN ('open', 'needs_human')"
+        ),
+        "active_entities": table_count_where(
+            paths, "entities", "COALESCE(status, 'active') = 'active'"
+        ),
+        "active_contracts": table_count_where(
+            paths, "page_contracts", "status = 'active'"
+        ),
     }
 
 
@@ -614,7 +655,11 @@ def table_count_where(paths: BrainPaths, table: str, where_sql: str) -> int:
         ).fetchone()
         if not exists:
             return 0
-        return int(conn.execute(f"SELECT COUNT(*) FROM {table} WHERE {where_sql}").fetchone()[0])
+        return int(
+            conn.execute(f"SELECT COUNT(*) FROM {table} WHERE {where_sql}").fetchone()[
+                0
+            ]
+        )
 
 
 def write_regeneration_summary(artifact_dir: Path, summary: dict[str, Any]) -> None:
@@ -738,7 +783,9 @@ def regeneration_inventory(
         doc
         for doc in docs
         if (not source_type_filter or str(doc["source_type"]) in source_type_filter)
-        and extraction_policy_for_source_type(extraction_config, str(doc["source_type"]))["extract"]
+        and extraction_policy_for_source_type(
+            extraction_config, str(doc["source_type"])
+        )["extract"]
     ]
     managed_pages = managed_wiki_page_count(paths)
     return {
@@ -903,4 +950,8 @@ def public_row(row: Any) -> dict[str, Any]:
 
 def default_regeneration_artifact_dir(paths: BrainPaths, generated_at: str) -> Path:
     stamp = generated_at.replace(":", "").replace("-", "")
-    return paths.home.parent / f"{paths.home.name}-runtime-backups" / f"regeneration-{stamp}"
+    return (
+        paths.home.parent
+        / f"{paths.home.name}-runtime-backups"
+        / f"regeneration-{stamp}"
+    )

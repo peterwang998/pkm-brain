@@ -41,6 +41,7 @@ from .util import now_iso
 DEFAULT_SCHEDULER_TICK_SECONDS = 30.0
 DEFAULT_CAPTURE_CADENCE_SECONDS = 600
 DEFAULT_NIGHTLY_CHECK_CADENCE_SECONDS = 3600
+DEFAULT_WEEKLY_HISTORICAL_AUDIT_CHECK_CADENCE_SECONDS = 3600
 DEFAULT_SYNC_CADENCE_SECONDS = 1800
 DEFAULT_MEETING_PREPARATION_CADENCE_SECONDS = 900
 DEFAULT_GMAIL_MIRROR_SYNC_CADENCE_SECONDS = 600
@@ -570,6 +571,15 @@ def build_role_jobs(
             isolated_job="nightly",
         )
     )
+    if role in {"single", "primary"}:
+        jobs.append(
+            SchedulerJob(
+                id="weekly_historical_audit",
+                cadence_s=DEFAULT_WEEKLY_HISTORICAL_AUDIT_CHECK_CADENCE_SECONDS,
+                lane="knowledge_mutation",
+                isolated_job="weekly_historical_audit",
+            )
+        )
     if role in {"single", "primary"} and operational_service is not None:
         jobs.append(
             SchedulerJob(

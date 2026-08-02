@@ -285,11 +285,17 @@ def write_versioned_fact(
     entity_links: list[dict[str, Any]],
     *,
     record_revision: bool = True,
+    human_confirmed: bool = False,
 ) -> tuple[list[str], dict[str, Any]]:
     """Write a fact through the single copy-before-write lifecycle."""
 
     if existing and record_revision:
         old_fact = row_to_fact(existing)
+        fact = bind_confirmation_to_semantic_state(
+            old_fact,
+            fact,
+            human_confirmed=human_confirmed,
+        )
         timestamp = next_revision_timestamp(old_fact.get("created_at"))
         if old_fact.get("knowledge_to") or old_fact.get("status") == "revision_closed":
             raise ValueError(f"stale fact revision: {fact_id}")
@@ -341,6 +347,55 @@ def write_versioned_fact(
     write_fact_row(conn, fact, fact_id, existing)
     replace_fact_entity_links(conn, fact_id=fact_id, links=entity_links)
     return touched_ids, inverse
+
+
+def bind_confirmation_to_semantic_state(
+    existing: dict[str, Any],
+    update: dict[str, Any],
+    *,
+    human_confirmed: bool,
+) -> dict[str, Any]:
+    """Do not carry a human confirmation onto materially different fact state."""
+
+    if not existing.get("confirmed_by_user"):
+        return update
+    from .review_resolution import fact_review_identity
+
+    effective = effective_fact_state(existing, update)
+    state_changed = (
+        fact_review_identity(existing)["state_fingerprint"]
+        != fact_review_identity(effective)["state_fingerprint"]
+    )
+    explicitly_confirmed = human_confirmed and bool(update.get("confirmed_by_user"))
+    if not state_changed or explicitly_confirmed:
+        return update
+    return {**update, "confirmed_by_user": False}
+
+
+def effective_fact_state(
+    existing: dict[str, Any], update: dict[str, Any]
+) -> dict[str, Any]:
+    """Mirror fact persistence closely enough to compare review-relevant state."""
+
+    effective = {**existing, **update}
+    for key, default in (
+        ("temporal_kind", "unknown"),
+        ("valid_time_precision", "unknown"),
+    ):
+        effective[key] = update.get(key) or existing.get(key) or default
+
+    if "event_time" in update:
+        nested = update.get("event_time")
+        nested = nested if isinstance(nested, dict) else {}
+        for flat_key, nested_key in (
+            ("event_time_kind", "kind"),
+            ("event_start_at", "start_at"),
+            ("event_end_at", "end_at"),
+            ("event_time_precision", "precision"),
+            ("event_time_expression", "expression"),
+        ):
+            effective[flat_key] = nested.get(nested_key)
+    return effective
 
 
 def revise_stored_fact(

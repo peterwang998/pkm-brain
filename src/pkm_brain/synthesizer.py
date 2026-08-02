@@ -34,6 +34,7 @@ def generate_page_syntheses(
     *,
     shadow: bool = True,
     max_pages: int = 10,
+    run_id: str | None = None,
     llm_provider: LLMProvider | None = None,
     provider: str | None = None,
 ) -> dict[str, Any]:
@@ -83,6 +84,7 @@ def generate_page_syntheses(
                 propose_action(
                     paths,
                     "synthesize_page",
+                    run_id=run_id,
                     action_payload={"synthesis": candidate},
                     action_features={
                         "candidate_signal": "page_synthesis",

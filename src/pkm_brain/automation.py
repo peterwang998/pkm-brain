@@ -19,8 +19,14 @@ from .connectors import (
     run_connector_capture,
     runtime_settings,
 )
-from .cos_audit import run_sampled_audit
-from .db import connection, dumps
+from .cos_actions import reviewable_bad_audit_actions
+from .cos_audit import (
+    HISTORICAL_AUDIT_CANDIDATE_SCAN_CAP,
+    load_audit_sample,
+    run_sampled_audit,
+    select_historical_audit_cohort,
+)
+from .db import connection, dumps, loads
 from .extraction import extract_recent_documents
 from .gardener import generate_gardener_candidates
 from .gmail_knowledge import reconcile_gmail_document_revisions
@@ -49,6 +55,10 @@ from .wiki import lint_wiki
 LAUNCH_AGENT_LABEL = "com.pkm-brain.agent-log-ingest"
 NIGHTLY_LAUNCH_AGENT_LABEL = "com.pkm-brain.nightly-maintenance"
 NIGHTLY_JOB_NAME = "nightly-maintenance"
+WEEKLY_HISTORICAL_AUDIT_JOB_NAME = "weekly-historical-audit"
+WEEKLY_HISTORICAL_AUDIT_DUE_AFTER_HOURS = 168
+WEEKLY_HISTORICAL_AUDIT_LIMIT = 5
+WEEKLY_HISTORICAL_AUDIT_ACTIVE_LIMIT = 5
 MAX_STORED_ERROR_CHARS = 4000
 MAX_STORED_ERROR_LIST_ITEMS = 20
 MAX_STORED_SUMMARY_CHARS = 4000
@@ -56,6 +66,7 @@ MAX_STORED_SUMMARY_LIST_ITEMS = 50
 MAX_STORED_SUMMARY_DICT_ITEMS = 100
 MAX_STORED_SUMMARY_DEPTH = 10
 MAX_STORED_SUMMARY_BYTES = 256_000
+MAX_PENDING_WEEKLY_HISTORICAL_RUN_SCAN = 100
 AGENT_LOG_INGEST_MAX_CHANGED_DOCUMENTS = 16
 AGENT_LOG_INGEST_MAX_CHANGED_SOURCE_BYTES = 64 * 1024 * 1024
 ERROR_FIELD_NAMES = {"error", "errors", "stderr", "traceback"}
@@ -107,6 +118,19 @@ class AutomationResult:
 
 @dataclass(frozen=True)
 class NightlyMaintenanceResult:
+    run_id: str | None
+    started_at: str
+    finished_at: str | None
+    status: str
+    due: bool
+    skipped: bool
+    reason: str | None
+    summary: dict[str, Any]
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class WeeklyHistoricalAuditResult:
     run_id: str | None
     started_at: str
     finished_at: str | None
@@ -464,9 +488,14 @@ def run_nightly_maintenance(
             summary["cos_gardener_shadow"] = summary["cos_gardener"]
 
             summary["cos_synthesis"] = run_cos_synthesis(
-                paths, cos_role, enabled=llm_wiki
+                paths, cos_role, enabled=llm_wiki, run_id=run_id
             )
             summary["cos_synthesis_shadow"] = summary["cos_synthesis"]
+            summary["cos_current_action_ids"] = current_cycle_action_ids(
+                summary["cos_extraction"],
+                summary["cos_gardener"],
+                summary["cos_synthesis"],
+            )
 
             summary["index_status"] = index_status(paths, service)
             summary["telemetry_retention"] = service.compact_retrieval_events(
@@ -474,7 +503,12 @@ def run_nightly_maintenance(
             )
             summary["index_maintenance"] = run_index_maintenance(paths)
             summary["cos_timeout_sweep"] = run_cos_timeout_sweep(paths)
-            summary["cos_audit"] = run_cos_audit(paths, cos_role, run_id=run_id)
+            summary["cos_audit"] = run_cos_audit(
+                paths,
+                cos_role,
+                run_id=run_id,
+                action_ids=summary["cos_current_action_ids"],
+            )
             summary["queue_summary"] = review_queue_summary(paths)
             summary["provenance_check"] = provenance_check(paths)
             summary["wiki_lint"] = lint_wiki(paths)
@@ -511,6 +545,205 @@ def run_nightly_maintenance(
         finished_at = now_iso()
         record_automation_finish(paths, run_id, status, finished_at, summary, error)
         return NightlyMaintenanceResult(
+            run_id=run_id,
+            started_at=started_at,
+            finished_at=finished_at,
+            status=status,
+            due=True,
+            skipped=False,
+            reason=None,
+            summary=summary,
+            error=error,
+        )
+
+
+def run_weekly_historical_audit(
+    paths: BrainPaths,
+    *,
+    if_due: bool = False,
+    due_after_hours: int = WEEKLY_HISTORICAL_AUDIT_DUE_AFTER_HOURS,
+    limit: int = WEEKLY_HISTORICAL_AUDIT_LIMIT,
+    active_limit: int = WEEKLY_HISTORICAL_AUDIT_ACTIVE_LIMIT,
+    provider: str | None = None,
+) -> WeeklyHistoricalAuditResult:
+    """Audit a small, durable-cadence sample of older applied actions."""
+
+    service = BrainService(paths)
+    service.init_workspace()
+    lock_path = paths.logs / "weekly-historical-audit.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    started_at = now_iso()
+
+    with lock_path.open("w") as lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return WeeklyHistoricalAuditResult(
+                run_id=None,
+                started_at=started_at,
+                finished_at=now_iso(),
+                status="skipped",
+                due=False,
+                skipped=True,
+                reason="another weekly historical audit is already active",
+                summary={},
+            )
+
+        role_status = cos_role_status(paths)
+        if not role_status.get("can_run_mutation_capable_stages"):
+            return WeeklyHistoricalAuditResult(
+                run_id=None,
+                started_at=started_at,
+                finished_at=now_iso(),
+                status="skipped",
+                due=False,
+                skipped=True,
+                reason=str(role_status.get("reason") or COS_SECONDARY_SKIP_REASON),
+                summary={"cos_role": role_status},
+            )
+
+        if if_due and not automation_due(
+            paths,
+            WEEKLY_HISTORICAL_AUDIT_JOB_NAME,
+            due_after_hours,
+        ):
+            return WeeklyHistoricalAuditResult(
+                run_id=None,
+                started_at=started_at,
+                finished_at=now_iso(),
+                status="skipped",
+                due=False,
+                skipped=True,
+                reason=(
+                    "last successful weekly historical audit is less than "
+                    f"{due_after_hours} hours old"
+                ),
+                summary={"due_after_hours": due_after_hours, "cos_role": role_status},
+            )
+
+        retry_state = pending_weekly_historical_audit_state(paths)
+        retry_run_id = retry_state.get("run_id")
+        retry_cohort = list(retry_state.get("action_ids") or [])
+        run_id = new_id("automation")
+        record_automation_start(
+            paths,
+            run_id,
+            WEEKLY_HISTORICAL_AUDIT_JOB_NAME,
+            started_at,
+        )
+        requested_limit = max(0, limit)
+        cohort_limit = min(requested_limit, WEEKLY_HISTORICAL_AUDIT_LIMIT)
+        summary: dict[str, Any] = {
+            "cos_role": role_status,
+            "due_after_hours": due_after_hours,
+            "requested_limit": requested_limit,
+            "cohort_limit": cohort_limit,
+            "active_limit": max(0, active_limit),
+            "cohort_retry_of_run_id": retry_run_id,
+        }
+        status = "success"
+        error: str | None = None
+        try:
+            active_before = active_historical_audit_findings(paths)
+            available_capacity = max(0, max(0, active_limit) - active_before)
+            requested_sample_limit = min(cohort_limit, available_capacity)
+            cohort_action_ids = list(retry_cohort)
+            historical_scan = dict(retry_state.get("historical_scan") or {})
+            if not cohort_action_ids and requested_sample_limit > 0:
+                cohort_selection = select_weekly_historical_audit_cohort(
+                    paths,
+                    requested_sample_limit,
+                )
+                cohort_action_ids, historical_scan = (
+                    normalize_weekly_historical_cohort_selection(
+                        paths,
+                        cohort_selection,
+                    )
+                )
+            elif not historical_scan:
+                historical_scan = unadvanced_weekly_historical_scan(paths)
+            remaining_action_ids = eligible_weekly_historical_action_ids(
+                paths,
+                cohort_action_ids,
+            )
+            sample_limit = min(len(remaining_action_ids), available_capacity)
+            summary.update(
+                {
+                    "active_findings_before": active_before,
+                    "available_capacity": available_capacity,
+                    "sample_limit": sample_limit,
+                    "cohort_action_ids": cohort_action_ids,
+                    "cohort_size": len(cohort_action_ids),
+                    "remaining_cohort_action_ids": remaining_action_ids,
+                    "remaining_cohort_size": len(remaining_action_ids),
+                    "historical_scan": historical_scan,
+                }
+            )
+            # Store the cohort before invoking the auditor because each judgment is
+            # committed independently. A crashed or incomplete attempt can then
+            # retry this exact cohort instead of widening one weekly pass on every
+            # hourly due check.
+            record_automation_progress(paths, run_id, summary)
+            if sample_limit == 0:
+                summary["audit"] = {
+                    "status": "skipped",
+                    "reason": (
+                        "active historical audit finding capacity is full"
+                        if remaining_action_ids and available_capacity == 0
+                        else "no eligible historical actions"
+                    ),
+                    "sampled": 0,
+                    "audited": [],
+                }
+                if remaining_action_ids:
+                    status = "failed"
+                    error = (
+                        "weekly historical audit retry is waiting for active "
+                        "historical finding capacity"
+                        if available_capacity == 0
+                        else "weekly historical audit cohort remains incomplete"
+                    )
+            else:
+                audit = run_sampled_audit(
+                    paths,
+                    limit=sample_limit,
+                    provider=provider,
+                    run_id=run_id,
+                    action_ids=remaining_action_ids,
+                    audit_origin="weekly_historical",
+                    historical=True,
+                )
+                summary["audit"] = audit
+                if audit.get("mode") != "configured":
+                    status = "failed"
+                    error = "weekly historical audit has no configured auditor"
+                else:
+                    remaining_action_ids = eligible_weekly_historical_action_ids(
+                        paths,
+                        cohort_action_ids,
+                    )
+                    summary["remaining_cohort_action_ids"] = remaining_action_ids
+                    summary["remaining_cohort_size"] = len(remaining_action_ids)
+                if audit.get("mode") == "configured" and audit.get("status") != "ok":
+                    status = "failed"
+                    error = (
+                        "weekly historical audit did not complete all sampled actions"
+                    )
+                elif audit.get("mode") == "configured" and remaining_action_ids:
+                    status = "failed"
+                    error = (
+                        "weekly historical audit cohort remains incomplete; "
+                        f"{len(remaining_action_ids)} eligible action(s) are pending"
+                    )
+            summary["active_findings_after"] = active_historical_audit_findings(paths)
+            summary["queue_summary"] = review_queue_summary(paths)
+        except Exception as exc:
+            status = "failed"
+            error = str(exc)
+        summary["llm_usage"] = llm_usage_summary(paths, cycle_id=run_id, limit=1)
+        finished_at = now_iso()
+        record_automation_finish(paths, run_id, status, finished_at, summary, error)
+        return WeeklyHistoricalAuditResult(
             run_id=run_id,
             started_at=started_at,
             finished_at=finished_at,
@@ -637,7 +870,11 @@ def run_cos_gardener(
 
 
 def run_cos_synthesis(
-    paths: BrainPaths, role_status: dict[str, Any], *, enabled: bool
+    paths: BrainPaths,
+    role_status: dict[str, Any],
+    *,
+    enabled: bool,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     if not enabled:
         return {
@@ -649,7 +886,7 @@ def run_cos_synthesis(
         }
     if not role_status.get("can_run_mutation_capable_stages"):
         return cos_stage_skipped("cos_synthesis", role_status, mode="policy")
-    result = generate_page_syntheses(paths, shadow=False)
+    result = generate_page_syntheses(paths, shadow=False, run_id=run_id)
     status = "skipped" if result.get("status") == "skipped" else "policy"
     return {
         **result,
@@ -671,10 +908,22 @@ def run_cos_once(paths: BrainPaths, *, llm_wiki: bool = True) -> dict[str, Any]:
         "cos_role": role_status,
         "cos_extraction": run_cos_extraction(paths, role_status, run_id=run_id),
         "cos_gardener": run_cos_gardener(paths, role_status, run_id=run_id),
-        "cos_synthesis": run_cos_synthesis(paths, role_status, enabled=llm_wiki),
+        "cos_synthesis": run_cos_synthesis(
+            paths, role_status, enabled=llm_wiki, run_id=run_id
+        ),
         "cos_timeout_sweep": run_cos_timeout_sweep(paths),
-        "cos_audit": run_cos_audit(paths, role_status, run_id=run_id),
     }
+    result["cos_current_action_ids"] = current_cycle_action_ids(
+        result["cos_extraction"],
+        result["cos_gardener"],
+        result["cos_synthesis"],
+    )
+    result["cos_audit"] = run_cos_audit(
+        paths,
+        role_status,
+        run_id=run_id,
+        action_ids=result["cos_current_action_ids"],
+    )
     result["llm_usage"] = llm_usage_summary(paths, cycle_id=run_id, limit=1)
     return result
 
@@ -780,15 +1029,43 @@ def run_cos_audit(
     role_status: dict[str, Any],
     *,
     run_id: str | None = None,
+    action_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     if not role_status.get("can_run_mutation_capable_stages"):
         return cos_stage_skipped("cos_audit", role_status, mode="stub")
-    result = run_sampled_audit(paths, run_id=run_id)
+    scope = (
+        {"action_ids": action_ids}
+        if action_ids is not None
+        else {"action_run_id": run_id}
+    )
+    result = run_sampled_audit(
+        paths, run_id=run_id, audit_origin="current_run", **scope
+    )
     return {
         **result,
         "stage": "cos_audit",
         "role": role_status.get("role"),
     }
+
+
+def current_cycle_action_ids(*stage_results: dict[str, Any]) -> list[str]:
+    """Return the exact actions touched by the current extraction/gardening cycle."""
+
+    action_ids: list[str] = []
+    seen: set[str] = set()
+    for result in stage_results:
+        actions = result.get("actions") if isinstance(result, dict) else None
+        if not isinstance(actions, list):
+            continue
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            action_id = str(action.get("id") or "").strip()
+            if not action_id or action_id in seen:
+                continue
+            seen.add(action_id)
+            action_ids.append(action_id)
+    return action_ids
 
 
 def index_status(
@@ -845,13 +1122,43 @@ def run_index_maintenance(paths: BrainPaths) -> dict[str, Any]:
 
 
 def nightly_due(paths: BrainPaths, due_after_hours: int) -> bool:
-    last_success = last_successful_automation_run(paths, NIGHTLY_JOB_NAME)
+    return automation_due(paths, NIGHTLY_JOB_NAME, due_after_hours)
+
+
+def automation_due(paths: BrainPaths, job_name: str, due_after_hours: int) -> bool:
+    last_success = last_successful_automation_run(paths, job_name)
     if not last_success:
         return True
     finished_at = parse_iso_datetime(last_success)
     return datetime.now(finished_at.tzinfo) - finished_at >= timedelta(
         hours=due_after_hours
     )
+
+
+def active_historical_audit_findings(paths: BrainPaths) -> int:
+    """Count unresolved semantic findings created by historical audit passes."""
+
+    with connection(paths.sqlite_path) as conn:
+        actions = reviewable_bad_audit_actions(conn)
+    return sum(
+        1
+        for action in actions
+        if action_audit_origin(action) not in {"manual", "current_run"}
+    )
+
+
+def action_audit_origin(action: dict[str, Any]) -> str:
+    evidence = action.get("evidence_json") or {}
+    audits = evidence.get("audits") if isinstance(evidence, dict) else None
+    if not isinstance(audits, list):
+        return "legacy_historical"
+    for audit in reversed(audits):
+        if not isinstance(audit, dict):
+            continue
+        metadata = audit.get("metadata")
+        if isinstance(metadata, dict) and metadata.get("audit_origin"):
+            return str(metadata["audit_origin"])
+    return "legacy_historical"
 
 
 def last_successful_automation_run(paths: BrainPaths, job_name: str) -> str | None:
@@ -869,6 +1176,305 @@ def last_successful_automation_run(paths: BrainPaths, job_name: str) -> str | No
     return str(row["finished_at"]) if row else None
 
 
+def pending_weekly_historical_audit_cohort(
+    paths: BrainPaths,
+) -> tuple[str | None, list[str]]:
+    """Return the newest unfinished cohort since the last successful weekly run."""
+
+    state = pending_weekly_historical_audit_state(paths)
+    return state.get("run_id"), list(state.get("action_ids") or [])
+
+
+def pending_weekly_historical_audit_state(paths: BrainPaths) -> dict[str, Any]:
+    """Return the exact unfinished cohort and its unchanged scan window."""
+
+    with connection(paths.sqlite_path) as conn:
+        rows = conn.execute(
+            """
+            WITH latest_success AS (
+              SELECT rowid AS boundary_rowid, finished_at
+              FROM automation_runs
+              WHERE job_name = ?
+                AND status = 'success'
+                AND finished_at IS NOT NULL
+              ORDER BY rowid DESC
+              LIMIT 1
+            )
+            SELECT pending.id, pending.summary
+            FROM automation_runs AS pending
+            LEFT JOIN latest_success AS success ON 1 = 1
+            WHERE pending.job_name = ?
+              AND pending.status IN ('failed', 'running')
+              AND (
+                success.boundary_rowid IS NULL
+                OR pending.rowid > success.boundary_rowid
+              )
+            ORDER BY pending.rowid DESC
+            LIMIT ?
+            """,
+            (
+                WEEKLY_HISTORICAL_AUDIT_JOB_NAME,
+                WEEKLY_HISTORICAL_AUDIT_JOB_NAME,
+                MAX_PENDING_WEEKLY_HISTORICAL_RUN_SCAN,
+            ),
+        ).fetchall()
+    for row in rows:
+        summary = loads(row["summary"], {})
+        if not isinstance(summary, dict):
+            continue
+        raw_action_ids = summary.get("cohort_action_ids")
+        if not isinstance(raw_action_ids, list):
+            audit = summary.get("audit")
+            raw_action_ids = (
+                audit.get("sampled_action_ids") if isinstance(audit, dict) else None
+            )
+        if not isinstance(raw_action_ids, list):
+            continue
+        action_ids = normalized_action_ids(
+            raw_action_ids,
+            max_items=WEEKLY_HISTORICAL_AUDIT_LIMIT,
+        )
+        if action_ids:
+            historical_scan = summary.get("historical_scan")
+            remaining_action_ids = normalized_action_ids(
+                summary.get("remaining_cohort_action_ids", action_ids),
+                max_items=WEEKLY_HISTORICAL_AUDIT_LIMIT,
+            )
+            cohort = set(action_ids)
+            return {
+                "run_id": str(row["id"]),
+                "action_ids": action_ids,
+                "remaining_action_ids": [
+                    action_id
+                    for action_id in remaining_action_ids
+                    if action_id in cohort
+                ],
+                "historical_scan": (
+                    dict(historical_scan) if isinstance(historical_scan, dict) else {}
+                ),
+            }
+    return {
+        "run_id": None,
+        "action_ids": [],
+        "remaining_action_ids": [],
+        "historical_scan": {},
+    }
+
+
+def select_weekly_historical_audit_cohort(
+    paths: BrainPaths,
+    limit: int,
+) -> dict[str, Any]:
+    """Select one semantic cohort without skipping its bounded scan window."""
+
+    scan_state = last_successful_weekly_historical_scan_state(paths)
+    scan_after = scan_state["scan_after"]
+    retained_window_action_ids = list(scan_state["window_action_ids"])
+    with connection(paths.sqlite_path) as conn:
+        selection = select_historical_audit_cohort(
+            conn,
+            limit,
+            scan_after=scan_after,
+            window_action_ids=retained_window_action_ids,
+        )
+    action_ids = [str(action["id"]) for action in selection["actions"]]
+    if retained_window_action_ids:
+        window_action_ids = retained_window_action_ids
+        window_end = scan_state["window_end"]
+        reached_end = bool(scan_state["window_reached_end"])
+    else:
+        window_action_ids = normalized_historical_window_action_ids(
+            selection.get("window_action_ids")
+        )
+        window_end = selection.get("window_end")
+        reached_end = bool(selection.get("reached_end"))
+    # A non-empty cohort pins the window. It may contain only five of many
+    # eligible rows, so advancing to the window tail here would skip the rest.
+    if action_ids:
+        next_after = scan_after
+        next_window_action_ids = window_action_ids
+    elif reached_end:
+        next_after = None
+        next_window_action_ids = []
+    else:
+        next_after = window_end
+        next_window_action_ids = []
+    return {
+        "action_ids": action_ids,
+        "historical_scan": {
+            "cursor_version": 2,
+            "start_after": historical_scan_cursor_value(scan_after),
+            "window_end": historical_scan_cursor_value(window_end),
+            "window_action_ids": next_window_action_ids,
+            "window_reached_end": reached_end,
+            "next_after": historical_scan_cursor_value(next_after),
+            "scanned_action_count": int(selection.get("scanned_action_count") or 0),
+            "selected_action_count": len(action_ids),
+            "reached_end": reached_end,
+            "advanced": not action_ids and next_after != scan_after,
+            "wrapped": not action_ids and reached_end and scan_after is not None,
+        },
+    }
+
+
+def normalize_weekly_historical_cohort_selection(
+    paths: BrainPaths,
+    selection: Any,
+) -> tuple[list[str], dict[str, Any]]:
+    """Accept current structured selection and legacy/test list-shaped results."""
+
+    if isinstance(selection, dict):
+        raw_action_ids = selection.get("action_ids")
+        raw_scan = selection.get("historical_scan")
+        action_ids = normalized_action_ids(
+            raw_action_ids,
+            max_items=WEEKLY_HISTORICAL_AUDIT_LIMIT,
+        )
+        if isinstance(raw_scan, dict):
+            return action_ids, dict(raw_scan)
+    else:
+        action_ids = normalized_action_ids(
+            selection,
+            max_items=WEEKLY_HISTORICAL_AUDIT_LIMIT,
+        )
+    scan = unadvanced_weekly_historical_scan(paths)
+    scan["selected_action_count"] = len(action_ids)
+    return action_ids, scan
+
+
+def normalized_action_ids(
+    value: Any,
+    *,
+    max_items: int | None = None,
+) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    action_ids = list(
+        dict.fromkeys(
+            action_id.strip()
+            for action_id in value
+            if isinstance(action_id, str) and action_id.strip()
+        )
+    )
+    if max_items is None:
+        return action_ids
+    return action_ids[: max(0, max_items)]
+
+
+def normalized_historical_window_action_ids(value: Any) -> list[str]:
+    return normalized_action_ids(
+        value,
+        max_items=HISTORICAL_AUDIT_CANDIDATE_SCAN_CAP,
+    )
+
+
+def eligible_weekly_historical_action_ids(
+    paths: BrainPaths,
+    action_ids: list[str],
+) -> list[str]:
+    """Return cohort IDs that remain unresolved and eligible for an audit."""
+
+    normalized = normalized_action_ids(action_ids)
+    if not normalized:
+        return []
+    with connection(paths.sqlite_path) as conn:
+        actions = load_audit_sample(
+            conn,
+            len(normalized),
+            action_ids=normalized,
+            historical=True,
+        )
+    eligible = {str(action["id"]) for action in actions}
+    return [action_id for action_id in normalized if action_id in eligible]
+
+
+def last_successful_weekly_historical_scan_cursor(
+    paths: BrainPaths,
+) -> tuple[str, str] | None:
+    return last_successful_weekly_historical_scan_state(paths)["scan_after"]
+
+
+def last_successful_weekly_historical_scan_state(
+    paths: BrainPaths,
+) -> dict[str, Any]:
+    """Return the next cursor and any exact frozen window from the last success."""
+
+    with connection(paths.sqlite_path) as conn:
+        row = conn.execute(
+            """
+            SELECT summary
+            FROM automation_runs
+            WHERE job_name = ?
+              AND status = 'success'
+              AND finished_at IS NOT NULL
+            ORDER BY rowid DESC
+            LIMIT 1
+            """,
+            (WEEKLY_HISTORICAL_AUDIT_JOB_NAME,),
+        ).fetchone()
+    summary = loads(row["summary"], {}) if row else {}
+    scan = summary.get("historical_scan") if isinstance(summary, dict) else None
+    if not isinstance(scan, dict):
+        scan = {}
+    window_action_ids = normalized_historical_window_action_ids(
+        scan.get("window_action_ids")
+    )
+    return {
+        "scan_after": historical_scan_cursor(scan.get("next_after")),
+        "window_action_ids": window_action_ids,
+        "window_end": (
+            historical_scan_cursor(scan.get("window_end"))
+            if window_action_ids
+            else None
+        ),
+        "window_reached_end": (
+            bool(scan.get("window_reached_end")) if window_action_ids else False
+        ),
+    }
+
+
+def unadvanced_weekly_historical_scan(paths: BrainPaths) -> dict[str, Any]:
+    scan_state = last_successful_weekly_historical_scan_state(paths)
+    scan_after = scan_state["scan_after"]
+    cursor = historical_scan_cursor_value(scan_after)
+    return {
+        "cursor_version": 2,
+        "start_after": cursor,
+        "window_end": historical_scan_cursor_value(scan_state["window_end"]),
+        "window_action_ids": list(scan_state["window_action_ids"]),
+        "window_reached_end": bool(scan_state["window_reached_end"]),
+        "next_after": cursor,
+        "scanned_action_count": 0,
+        "reached_end": False,
+        "advanced": False,
+        "wrapped": False,
+    }
+
+
+def historical_scan_cursor(value: Any) -> tuple[str, str] | None:
+    if not isinstance(value, dict):
+        return None
+    raw_sort_at = value.get("sort_at")
+    raw_action_id = value.get("action_id")
+    if raw_sort_at is None or raw_action_id is None:
+        return None
+    sort_at = str(raw_sort_at)
+    action_id = str(raw_action_id)
+    # The keyset expression uses SQL COALESCE semantics, where an empty
+    # applied_at is a real sort value rather than a missing timestamp.
+    if not action_id:
+        return None
+    return sort_at, action_id
+
+
+def historical_scan_cursor_value(
+    cursor: tuple[str, str] | None,
+) -> dict[str, str] | None:
+    if cursor is None:
+        return None
+    return {"sort_at": cursor[0], "action_id": cursor[1]}
+
+
 def parse_iso_datetime(value: str) -> datetime:
     return datetime.fromisoformat(value)
 
@@ -883,6 +1489,23 @@ def record_automation_start(
             VALUES (?, ?, ?, ?)
             """,
             (run_id, job_name, started_at, "running"),
+        )
+
+
+def record_automation_progress(
+    paths: BrainPaths, run_id: str, summary: dict[str, Any]
+) -> None:
+    """Persist resumable automation state without marking the run complete."""
+
+    compacted_summary = bounded_automation_summary(summary)
+    with connection(paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            UPDATE automation_runs
+            SET summary = ?
+            WHERE id = ?
+            """,
+            (dumps(compacted_summary), run_id),
         )
 
 
@@ -922,7 +1545,9 @@ def compact_automation_errors(value: Any) -> Any:
 
 
 def bounded_automation_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    control_state = durable_automation_control_state(summary)
     compacted = compact_automation_summary(compact_automation_errors(summary))
+    compacted.update(control_state)
     serialized = dumps(compacted)
     byte_count = len(serialized.encode("utf-8"))
     if byte_count <= MAX_STORED_SUMMARY_BYTES:
@@ -935,7 +1560,56 @@ def bounded_automation_summary(summary: dict[str, Any]) -> dict[str, Any]:
     for key in ("status", "reason", "queue_summary", "telemetry_retention", "errors"):
         if key in compacted:
             fallback[key] = compacted[key]
+    fallback.update(control_state)
     return fallback
+
+
+def durable_automation_control_state(summary: dict[str, Any]) -> dict[str, Any]:
+    """Keep small retry/cursor state intact when diagnostics are pruned."""
+
+    output: dict[str, Any] = {}
+    for key in ("cohort_action_ids", "remaining_cohort_action_ids"):
+        if key in summary:
+            output[key] = normalized_action_ids(
+                summary.get(key),
+                max_items=WEEKLY_HISTORICAL_AUDIT_LIMIT,
+            )
+    if "cohort_retry_of_run_id" in summary:
+        retry_run_id = summary.get("cohort_retry_of_run_id")
+        output["cohort_retry_of_run_id"] = (
+            compact_error_text(retry_run_id, max_chars=MAX_STORED_SUMMARY_CHARS)
+            if isinstance(retry_run_id, str)
+            else None
+        )
+    if "historical_scan" in summary:
+        output["historical_scan"] = durable_historical_scan_state(
+            summary.get("historical_scan")
+        )
+    return output
+
+
+def durable_historical_scan_state(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    output: dict[str, Any] = {}
+    if isinstance(value.get("cursor_version"), int):
+        output["cursor_version"] = max(0, int(value["cursor_version"]))
+    for key in ("start_after", "window_end", "next_after"):
+        if key not in value:
+            continue
+        cursor = historical_scan_cursor(value.get(key))
+        output[key] = historical_scan_cursor_value(cursor)
+    if "window_action_ids" in value:
+        output["window_action_ids"] = normalized_historical_window_action_ids(
+            value.get("window_action_ids")
+        )
+    for key in ("scanned_action_count", "selected_action_count"):
+        if isinstance(value.get(key), int):
+            output[key] = max(0, int(value[key]))
+    for key in ("window_reached_end", "reached_end", "advanced", "wrapped"):
+        if isinstance(value.get(key), bool):
+            output[key] = value[key]
+    return output
 
 
 def compact_automation_summary(value: Any, *, depth: int = 0) -> Any:
@@ -1316,6 +1990,11 @@ def find_nightly_command_index(tokens: list[str]) -> int | None:
 
 
 def as_jsonable(
-    result: AutomationResult | NightlyMaintenanceResult | SecondaryTickResult,
+    result: (
+        AutomationResult
+        | NightlyMaintenanceResult
+        | SecondaryTickResult
+        | WeeklyHistoricalAuditResult
+    ),
 ) -> dict[str, Any]:
     return json.loads(json.dumps(result.__dict__))

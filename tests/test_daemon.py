@@ -1000,11 +1000,18 @@ def test_gmail_jobs_are_primary_lane_startup_work(tmp_path: Path) -> None:
         mutation_jobs = {
             job.id: job
             for job in jobs.values()
-            if job.id in {"capture_tick", "nightly", "gmail_knowledge_ingest"}
+            if job.id
+            in {
+                "capture_tick",
+                "nightly",
+                "weekly_historical_audit",
+                "gmail_knowledge_ingest",
+            }
         }
         assert set(mutation_jobs) == {
             "capture_tick",
             "nightly",
+            "weekly_historical_audit",
             "gmail_knowledge_ingest",
         }
         assert {job.lane for job in mutation_jobs.values()} == {"knowledge_mutation"}

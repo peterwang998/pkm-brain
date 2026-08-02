@@ -272,6 +272,7 @@ Entity identity and page routing are separate.
 - `entities` stores canonical name, aliases, closed type, status, and merge lineage.
 - `fact_entities` is the source of truth for fact-to-entity links.
 - `facts.entity_id` is a denormalized cache of the primary link.
+- Normalized mention attribution and explicit-versus-derived primary-ID provenance are retained in a fact metadata receipt. Omitting attribution preserves the prior links; an explicit attribution input that normalizes to no mentions clears both the primary-ID cache and all links unless the same update supplies a valid authored `entity_id`.
 - entity types are `person|organization|product|project|concept|place|event|other`.
 - mention kind defaults to under-creation: only admitted named mentions create entities unless local policy admits concepts.
 - exact normalized name/alias matches require no LLM.

@@ -17,6 +17,17 @@ from urllib.parse import parse_qs, urlparse
 import yaml
 
 from .audit import audit_memories
+from .audit_review import (
+    AuditReviewDecisionError,
+    audit_is_historical,
+    audit_risk_tier,
+    decide_audit_queue_item,
+    decide_direct_action_queue_item,
+    latest_action_audit,
+    record_fact_confirmation_resolution,
+    record_question_review_resolution,
+    revoke_queue_review_resolution,
+)
 from .automation import index_status
 from .contracts import active_page_contracts, generate_initial_contracts
 from .connector_api import dispatch_connector_post, dispatch_connector_put
@@ -30,9 +41,7 @@ from .cos_actions import (
     load_action,
     propose_action,
     recent_actions,
-    record_action_audit,
     reviewable_bad_audit_actions,
-    retire_open_candidate_siblings,
     revert_action,
     row_to_action,
     split_destination_page_hint,
@@ -59,6 +68,20 @@ from .operations_http import (
     shadow_setup_payload,
 )
 from .paths import BrainPaths
+from .question_resolution import (
+    QuestionResolutionError,
+    action_ids_from_result,
+    ensure_applied_question_action as require_applied_question_action,
+    finalize_question_review,
+    question_replacement_guard,
+    safely_revert_question_action as revert_question_action,
+    supported_existing_fact,
+    temporal_update_fact,
+)
+from .queue_undo_transaction import (
+    QueueUndoTransactionError,
+    undo_queue_database,
+)
 from .routing_coherence import (
     coherence_bonus,
     fact_document_id,
@@ -68,12 +91,30 @@ from .review_admission import (
     load_review_admission_states,
     reconcile_review_admissions,
 )
+from .review_undo import (
+    ReviewUndoError,
+    capture_action_state as action_undo_state,
+    restore_action_state as restore_review_action_state,
+    seal_undo_handle,
+)
 from .scheduler.launchd import LaunchdScheduler
 from .service import BrainService, row_to_memory
 from .setup_wizard import build_setup_plan
 from .source_dates import derive_fact_source_date, document_source_date_metadata
 from . import today_presentation as today_api
 from .shadow_controller import ShadowTrialController, shadow_run_start_payload
+from .ui_errors import BadRequestError, NotFoundError
+from .ui_review_questions import (
+    annotate_answered_question_decision,
+    answer_wiki_question,
+    apply_cos_question_action,
+    dismiss_cos_question,
+    get_review_question,
+    legacy_question_decision_response,
+    mark_review_question_decided,
+    reject_linked_review_action,
+    ui_create_wiki_fact_correction,
+)
 from .util import new_id, now_iso
 from .wiki import (
     ALLOWED_PAGE_TYPES,
@@ -85,12 +126,13 @@ from .wiki import (
     parse_frontmatter,
 )
 from .wiki_facts import (
-    answer_open_question,
     apply_fact_status_action,
-    create_confirmed_page_fact,
+    curate_managed_pages,
     managed_fact_page_review,
+    preflight_wiki_page_projection_restore,
     reconcile_open_fact_questions,
     regenerate_managed_fact_page,
+    restore_wiki_page_projection_from_snapshot,
     revert_wiki_page_snapshot,
     row_to_fact,
     row_to_question,
@@ -99,14 +141,6 @@ from .wiki_facts import (
 
 
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
-
-
-class BadRequestError(ValueError):
-    pass
-
-
-class NotFoundError(ValueError):
-    pass
 
 
 class BrainUIServer(ThreadingHTTPServer):
@@ -207,7 +241,9 @@ class BrainUIHandler(BaseHTTPRequestHandler):
             elif path == "/api/digest":
                 self.write_json(ui_digest(self.server.paths, query))
             elif path == "/api/v1/today":
-                self.write_json(today_api.today_briefing_payload(self.server.daemon_today_service))
+                self.write_json(
+                    today_api.today_briefing_payload(self.server.daemon_today_service)
+                )
             elif path == "/api/v1/today/run":
                 controller = self.server.daemon_shadow_controller
                 if controller is None:
@@ -215,7 +251,14 @@ class BrainUIHandler(BaseHTTPRequestHandler):
                 self.write_json(controller.status())
             elif path == "/api/v1/today/setup":
                 scheduler = self.server.daemon_scheduler
-                self.write_json(shadow_setup_payload(self.server.paths, scheduler_state=scheduler.as_dict() if scheduler is not None else None))
+                self.write_json(
+                    shadow_setup_payload(
+                        self.server.paths,
+                        scheduler_state=scheduler.as_dict()
+                        if scheduler is not None
+                        else None,
+                    )
+                )
             elif path == "/api/queue":
                 self.write_json(ui_queue(self.server.paths, query))
             elif path == "/api/search":
@@ -251,10 +294,14 @@ class BrainUIHandler(BaseHTTPRequestHandler):
                 self.write_json(operations_storage_payload(self.server.paths))
             elif path == "/api/ops/evidence":
                 self.write_json(operations_evidence_payload(self.server.paths, query))
-            elif path.startswith("/api/ops/items/") and path.endswith("/meeting-packet"):
-                item_id = path.removeprefix("/api/ops/items/").removesuffix(
-                    "/meeting-packet"
-                ).strip("/")
+            elif path.startswith("/api/ops/items/") and path.endswith(
+                "/meeting-packet"
+            ):
+                item_id = (
+                    path.removeprefix("/api/ops/items/")
+                    .removesuffix("/meeting-packet")
+                    .strip("/")
+                )
                 self.write_json(
                     operations_meeting_packet_payload(self.server.paths, item_id)
                 )
@@ -344,12 +391,16 @@ class BrainUIHandler(BaseHTTPRequestHandler):
                         self.server.daemon_today_service, self.read_json_body()
                     )
                 )
-            elif len(parts) == 5 and parts[:3] == [
-                "v1", "today", "calendar-series"
-            ] and parts[4] == "restore":
-                self.write_json(today_api.today_calendar_series_restore_payload(
-                    self.server.daemon_today_service, parts[3]
-                ))
+            elif (
+                len(parts) == 5
+                and parts[:3] == ["v1", "today", "calendar-series"]
+                and parts[4] == "restore"
+            ):
+                self.write_json(
+                    today_api.today_calendar_series_restore_payload(
+                        self.server.daemon_today_service, parts[3]
+                    )
+                )
             elif parts == ["v1", "today", "run"]:
                 controller = self.server.daemon_shadow_controller
                 if controller is None:
@@ -427,7 +478,11 @@ class BrainUIHandler(BaseHTTPRequestHandler):
         except NotFoundError as exc:
             self.write_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
         except ValueError as exc:
-            self.write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST, reason=" ".join(str(exc).split())[:200] or "Bad Request")
+            self.write_json(
+                {"error": str(exc)},
+                status=HTTPStatus.BAD_REQUEST,
+                reason=" ".join(str(exc).split())[:200] or "Bad Request",
+            )
         except Exception as exc:
             self.write_json(
                 {"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR
@@ -544,7 +599,11 @@ class BrainUIHandler(BaseHTTPRequestHandler):
         self.wfile.write(encoded)
 
     def write_json(
-        self, payload: dict[str, Any] | list[Any], status: HTTPStatus = HTTPStatus.OK, *, reason: str | None = None
+        self,
+        payload: dict[str, Any] | list[Any],
+        status: HTTPStatus = HTTPStatus.OK,
+        *,
+        reason: str | None = None,
     ) -> None:
         encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
         self.send_response(status.value, message=reason)
@@ -1970,6 +2029,9 @@ def queue_items(
                 "source_type": "audit",
                 "item": action,
                 "sort": queue_item_sort_key(queue_audit_stub(action)),
+                "dedupe_key": (
+                    f"audit:{action.get('audit_issue_key') or action['id']}"
+                ),
             }
             for action in queue_audit_rows(conn, limit=descriptor_limit)
         )
@@ -2014,10 +2076,7 @@ def queue_items(
     admission_states = (
         load_review_admission_states(
             conn,
-            {
-                str(descriptor["item"].get("id") or "")
-                for descriptor in descriptors
-            },
+            {str(descriptor["item"].get("id") or "") for descriptor in descriptors},
         )
         if apply_admission
         else {}
@@ -2502,11 +2561,14 @@ def queue_action_stub(action: dict[str, Any]) -> dict[str, Any]:
 
 
 def queue_audit_stub(action: dict[str, Any]) -> dict[str, Any]:
+    audit = latest_action_audit(action)
+    historical = audit_is_historical(audit)
     return {
         "kind": "audit_flagged",
         "group": "audit",
         "created_at": action.get("applied_at") or action.get("created_at"),
-        "risk_tier": action.get("risk_tier"),
+        "risk_tier": audit_risk_tier(action, audit),
+        "maintenance_kind": "historical_audit" if historical else None,
     }
 
 
@@ -3076,6 +3138,11 @@ def queue_item_for_audit_action(
         if current_fact or raw_fact
         else None
     )
+    historical = audit_is_historical(audit)
+    direct_contradiction = bool(audit.get("direct_contradiction")) or str(
+        (candidate or {}).get("status") or ""
+    ) in {"contested", "conflicted"}
+    audit["direct_contradiction"] = direct_contradiction
     action_type = str(action.get("action_type") or "action")
     statement = str((candidate or {}).get("statement") or "").strip()
     title = (
@@ -3092,7 +3159,11 @@ def queue_item_for_audit_action(
         "summary": compact_text(audit.get("rationale"), 500),
         "created_at": action.get("applied_at") or action.get("created_at"),
         "status": action.get("status"),
-        "risk_tier": action.get("risk_tier"),
+        "risk_tier": audit_risk_tier(
+            action, audit, direct_contradiction=direct_contradiction
+        ),
+        "maintenance_kind": "historical_audit" if historical else None,
+        "direct_contradiction": direct_contradiction,
         "candidate": candidate,
         "audit": audit,
         "topology": topology,
@@ -3102,9 +3173,7 @@ def queue_item_for_audit_action(
     }
 
 
-def audit_action_title(
-    action_type: str, topology: dict[str, Any] | None
-) -> str:
+def audit_action_title(action_type: str, topology: dict[str, Any] | None) -> str:
     if action_type in {"entity_merge", "page_merge"} and topology:
         destination = str(topology.get("merge_destination_label") or "").strip()
         sources = [
@@ -3161,6 +3230,11 @@ def audit_action_detail(
     ]
     return {
         **audit,
+        "issue_key": action.get("audit_issue_key") or audit.get("issue_key"),
+        "group_key": action.get("audit_group_key") or audit.get("group_key"),
+        "related_action_ids": action.get("related_audit_action_ids")
+        or [str(action.get("id") or "")],
+        "related_action_count": int(action.get("related_audit_action_count") or 1),
         "affected_fact_count": len(fact_ids),
         "affected_page_count": len(action.get("target_page_paths") or []),
         "affected_contract_count": len(action.get("target_contract_ids") or []),
@@ -3168,34 +3242,6 @@ def audit_action_detail(
         "revertible": bool(reviewability["revertible"]),
         "revert_mode": reviewability.get("revert_mode"),
         "reviewability_reason": reviewability["reason"],
-    }
-
-
-def latest_action_audit(action: dict[str, Any]) -> dict[str, Any]:
-    raw_evidence = action.get("evidence_json") or {}
-    evidence = raw_evidence if isinstance(raw_evidence, dict) else {}
-    records = evidence.get("audits")
-    valid = [record for record in records or [] if isinstance(record, dict)]
-    record = valid[-1] if valid else {}
-    metadata = (
-        record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-    )
-    legacy = evidence.get("audit") if isinstance(evidence.get("audit"), dict) else {}
-    rationale = first_nonempty(
-        metadata.get("rationale"),
-        metadata.get("reason"),
-        legacy.get("rationale"),
-        evidence.get("reason"),
-        action.get("audit_status"),
-    )
-    return {
-        "status": record.get("status") or action.get("audit_status"),
-        "rationale": rationale,
-        "provider": metadata.get("provider"),
-        "model": metadata.get("model"),
-        "audited_at": record.get("at"),
-        "action_type": action.get("action_type"),
-        "action_status": action.get("status"),
     }
 
 
@@ -3321,9 +3367,7 @@ def page_merge_direction(
         if len(current_pages) == 1:
             destination = next(iter(current_pages))
     if not destination:
-        page_statuses = action_page_contract_statuses(
-            context, action, page_hints
-        )
+        page_statuses = action_page_contract_statuses(context, action, page_hints)
         active_pages = [
             page for page in page_hints if page_statuses.get(page) == "active"
         ]
@@ -3375,9 +3419,7 @@ def action_page_contract_statuses(
         return first_page_contract_statuses(conn.execute(query, params), page_hints)
 
 
-def first_page_contract_statuses(
-    rows: Any, page_hints: list[str]
-) -> dict[str, str]:
+def first_page_contract_statuses(rows: Any, page_hints: list[str]) -> dict[str, str]:
     allowed = set(page_hints)
     statuses: dict[str, str] = {}
     for row in rows:
@@ -3836,7 +3878,15 @@ def ui_queue_decision(
         raise BadRequestError("decision is required")
     existing = find_queue_target(paths, item_id)
     normalized_decision = decision.replace("-", "_")
-    if normalized_decision not in {"skip", "unsure", "skip_later", "escalate"}:
+    legacy_manual_answer = existing["source_type"] == "question" and (
+        normalized_decision in {"manual_answer", "manual_selection"}
+    )
+    if not legacy_manual_answer and normalized_decision not in {
+        "skip",
+        "unsure",
+        "skip_later",
+        "escalate",
+    }:
         card = queue_card_for_target(paths, existing)
         if card.get("approvable") is not True:
             reason = str(
@@ -3845,7 +3895,10 @@ def ui_queue_decision(
             raise BadRequestError(f"Review item is not approvable: {reason}")
     source_type = existing["source_type"]
     if source_type == "question":
-        result = decide_queue_question(paths, existing["item"], decision, payload)
+        try:
+            result = decide_queue_question(paths, existing["item"], decision, payload)
+        except QuestionResolutionError as exc:
+            raise BadRequestError(str(exc)) from exc
     elif source_type == "memory":
         result = decide_queue_memory(paths, existing["item"], decision, payload)
     elif source_type == "action":
@@ -3854,7 +3907,52 @@ def ui_queue_decision(
         result = decide_queue_audit(paths, existing["item"], decision, payload)
     else:
         raise NotFoundError(f"queue item not found: {item_id}")
+    if source_type == "question" and result.get("status") == "decided":
+        try:
+            finalize_question_review(
+                paths,
+                result["undo_handle"],
+                lambda: record_question_review_resolution(
+                    paths, existing["item"], normalized_decision, result["undo_handle"]
+                ),
+                restore_action_state,
+                restore_question_state,
+                revoke_queue_review_resolution,
+            )
+        except QuestionResolutionError as exc:
+            page_hint = str(existing["item"].get("page_hint") or "").strip()
+            snapshot_ids = [
+                str(snapshot_id)
+                for snapshot_id in result["undo_handle"].get("page_snapshot_ids") or []
+            ]
+            if snapshot_ids:
+                try:
+                    for snapshot_id in reversed(snapshot_ids):
+                        restored = restore_wiki_page_projection_from_snapshot(
+                            paths, snapshot_id
+                        )
+                        if not restored.get("restored"):
+                            raise ValueError(str(restored.get("reason") or ""))
+                except Exception as projection_exc:
+                    raise BadRequestError(
+                        "review resolution failed; fact state was rolled back but "
+                        "the managed page projection could not be restored"
+                    ) from projection_exc
+            elif page_hint:
+                try:
+                    curate_managed_pages(
+                        paths,
+                        page_hints=[page_hint],
+                        overwrite_existing=False,
+                    )
+                except Exception as projection_exc:
+                    raise BadRequestError(
+                        "review resolution failed; fact state was rolled back but "
+                        "the managed page projection could not be refreshed"
+                    ) from projection_exc
+            raise BadRequestError(str(exc)) from exc
     result["queue_summary"] = current_queue_summary(paths)
+    seal_undo_handle(paths, result.get("undo_handle"))
     return result
 
 
@@ -3894,9 +3992,13 @@ def find_queue_target(paths: BrainPaths, item_id: str) -> dict[str, Any]:
             if row:
                 action = row_to_action(row)
                 if action.get("audit_status") == "sampled_bad":
-                    if not audit_action_reviewability(conn, action)["reviewable"]:
-                        raise NotFoundError(f"queue item not found: {item_id}")
-                    return {"source_type": "audit", "item": action}
+                    for representative in reviewable_bad_audit_actions(conn):
+                        related_ids = representative.get(
+                            "related_audit_action_ids"
+                        ) or [representative["id"]]
+                        if item_id in {str(value) for value in related_ids}:
+                            return {"source_type": "audit", "item": representative}
+                    raise NotFoundError(f"queue item not found: {item_id}")
                 return {"source_type": "action", "item": action}
     raise NotFoundError(f"queue item not found: {item_id}")
 
@@ -3912,6 +4014,28 @@ def decide_queue_question(
         return decide_unrouted_inbox_batch(paths, question, normalized, payload)
     if question.get("kind") == "document_extraction_anomaly":
         return decide_extraction_anomaly(paths, question, normalized, payload)
+    if normalized in {"manual_answer", "manual_selection"}:
+        previous = question_undo_state(question)
+        action_states = linked_question_action_states(paths, question)
+        result = answer_wiki_question(paths, question["id"], payload)
+        annotate_answered_question_decision(
+            paths,
+            result,
+            original_question=question,
+            decision=normalized,
+        )
+        return {
+            "status": "decided",
+            "item_id": question["id"],
+            "result": result,
+            "undo_handle": {
+                "kind": "legacy_question_answer",
+                "question": previous,
+                "action_ids": list(reversed(action_ids_from_result(result))),
+                "actions": action_states,
+                **question_projection_undo_metadata(question, result),
+            },
+        }
     alternative_comparison = is_alternative_fact_comparison(question)
     if alternative_comparison and normalized not in {
         "skip",
@@ -3976,8 +4100,20 @@ def decide_queue_question(
                     "selected_fact_ids must contain at least one fact"
                 )
         action_states = linked_question_action_states(paths, question)
-        result = ui_answer_wiki_question(
-            paths, question["id"], {"selected_fact_ids": selected_fact_ids}
+        result = answer_wiki_question(
+            paths,
+            question["id"],
+            {
+                "selected_fact_ids": selected_fact_ids,
+                "answer": payload.get("answer"),
+                "overwrite_existing": payload.get("overwrite_existing", False),
+            },
+        )
+        annotate_answered_question_decision(
+            paths,
+            result,
+            original_question=question,
+            decision=normalized,
         )
         return {
             "status": "decided",
@@ -3988,6 +4124,7 @@ def decide_queue_question(
                 "question": previous,
                 "action_ids": action_ids_from_result(result),
                 "actions": action_states,
+                **question_projection_undo_metadata(question, result),
             },
         }
     if normalized in {"both_true", "contested"}:
@@ -4009,9 +4146,11 @@ def decide_queue_question(
                 "question": previous,
                 "action_ids": action_ids,
                 "actions": action_states,
+                **question_projection_undo_metadata(question, result),
             },
         }
     if normalized in {"reject", "reject_candidate", "keep_existing", "dismiss"}:
+        previous_action = action_undo_state(paths, str(question.get("action_id") or ""))
         result = reject_question_candidate(paths, question, payload)
         return {
             "status": "decided",
@@ -4020,9 +4159,7 @@ def decide_queue_question(
             "undo_handle": {
                 "kind": "question_reject",
                 "question": previous,
-                "action": action_undo_state(
-                    paths, str(question.get("action_id") or "")
-                ),
+                "action": previous_action,
             },
         }
     raise BadRequestError(f"unsupported queue decision: {decision}")
@@ -4122,15 +4259,15 @@ def apply_question_candidate(
 ) -> dict[str, Any]:
     action_id = str(question.get("action_id") or "").strip()
     if action_id:
-        return ui_apply_cos_question_action(paths, question["id"], payload)
+        return apply_cos_question_action(paths, question["id"], payload, ui_cos_review)
     selected_fact_id = str(payload.get("selected_fact_id") or "").strip()
     if selected_fact_id:
-        return ui_answer_wiki_question(
+        return answer_wiki_question(
             paths, question["id"], {"selected_fact_id": selected_fact_id}
         )
     candidate = question_candidate_fact(paths, question)
     if candidate and candidate.get("id"):
-        return ui_answer_wiki_question(
+        return answer_wiki_question(
             paths, question["id"], {"selected_fact_id": str(candidate["id"])}
         )
     raise BadRequestError(f"review question has no applicable action: {question['id']}")
@@ -4141,14 +4278,15 @@ def reject_question_candidate(
 ) -> dict[str, Any]:
     action_id = str(question.get("action_id") or "").strip()
     if action_id:
-        return ui_dismiss_cos_question(
+        return dismiss_cos_question(
             paths,
             question["id"],
             {"reason": payload.get("reason") or "human rejected queue item"},
+            ui_cos_review,
         )
     counterpart = first_counterpart_fact_id(paths, question)
     if counterpart:
-        return ui_answer_wiki_question(
+        return answer_wiki_question(
             paths, question["id"], {"selected_fact_id": counterpart}
         )
     mark_review_question_decided(
@@ -4175,49 +4313,63 @@ def support_existing_question_candidate(
         raise BadRequestError(f"existing fact not found: {counterpart_id}")
     action_states = linked_question_action_states(paths, question)
     merged = supported_existing_fact(existing, candidate, question["id"])
-    action = apply_action(
+    with question_replacement_guard(
         paths,
-        propose_action(
+        previous_question=previous,
+        previous_actions=action_states,
+        restore_action=restore_action_state,
+        restore_question=restore_question_state,
+    ) as applied_action_ids:
+        action = apply_action(
             paths,
-            "fact_upsert",
-            action_payload={"fact": merged},
-            action_features={
-                "human_confirmed": True,
-                "truth_mutation": False,
-                "reversible": True,
-                "affected_fact_count": 1,
-                "relation": "supports",
-            },
-            target_fact_ids=[counterpart_id],
-            target_page_paths=[str(merged.get("page_hint") or "")]
-            if merged.get("page_hint")
-            else [],
-            proposed_by="ui_queue_supports_existing",
-            confidence=float(merged.get("confidence") or 1.0),
-            risk_tier="low",
-        )["id"],
-    )
-    old_action_id = str(question.get("action_id") or "").strip()
-    if old_action_id:
-        reject_linked_review_action(
-            paths, old_action_id, "replaced by supports-existing queue decision"
+            propose_action(
+                paths,
+                "fact_upsert",
+                action_payload={"fact": merged},
+                action_features={
+                    "human_confirmed": True,
+                    "truth_mutation": False,
+                    "reversible": True,
+                    "affected_fact_count": 1,
+                    "relation": "supports",
+                },
+                target_fact_ids=[counterpart_id],
+                target_page_paths=[str(merged.get("page_hint") or "")]
+                if merged.get("page_hint")
+                else [],
+                proposed_by="ui_queue_supports_existing",
+                confidence=float(merged.get("confidence") or 1.0),
+                risk_tier="low",
+                override_semantic_rejection=True,
+            )["id"],
+            override_semantic_rejection=True,
         )
-    mark_review_question_decided(
-        paths,
-        question["id"],
-        status="answered",
-        answer={
-            "decision": "supports_existing",
-            "existing_fact_id": counterpart_id,
-            "support_action_id": action["id"],
-        },
-        action_id=action["id"],
-    )
+        if action.get("status") in {"applied", "auto_applied"}:
+            applied_action_ids.append(str(action["id"]))
+        require_applied_question_action(action, "supports-existing")
+        old_action_id = str(question.get("action_id") or "").strip()
+        if old_action_id:
+            reject_linked_review_action(
+                paths, old_action_id, "replaced by supports-existing queue decision"
+            )
+        mark_review_question_decided(
+            paths,
+            question["id"],
+            status="answered",
+            answer={
+                "decision": "supports_existing",
+                "existing_fact_id": counterpart_id,
+                "support_action_id": action["id"],
+                "old_action_id": old_action_id,
+            },
+            action_id=action["id"],
+        )
+        decided_question = get_review_question(paths, question["id"])
     return {
         "status": "decided",
         "item_id": question["id"],
         "result": {
-            "question": get_review_question(paths, question["id"]),
+            "question": decided_question,
             "action": action,
         },
         "undo_handle": {
@@ -4246,66 +4398,85 @@ def temporal_update_question_candidate(
     temporal_candidate = temporal_update_fact(
         candidate, counterpart_ids, question["id"]
     )
-    candidate_action = apply_action(
+    with question_replacement_guard(
         paths,
-        propose_action(
+        previous_question=previous,
+        previous_actions=action_states,
+        restore_action=restore_action_state,
+        restore_question=restore_question_state,
+    ) as applied_action_ids:
+        candidate_action = apply_action(
             paths,
-            "fact_upsert",
-            action_payload={"fact": temporal_candidate},
-            action_features={
-                "human_confirmed": True,
-                "truth_mutation": True,
-                "reversible": True,
-                "affected_fact_count": 1 + len(counterpart_ids),
-                "relation": "updates",
-            },
-            target_fact_ids=[str(temporal_candidate["id"])],
-            target_page_paths=[str(temporal_candidate.get("page_hint") or "")]
-            if temporal_candidate.get("page_hint")
-            else [],
-            proposed_by="ui_queue_temporal_update",
-            confidence=float(temporal_candidate.get("confidence") or 1.0),
-            risk_tier="medium",
-        )["id"],
-    )
-    supersede_action = apply_fact_status_action(
-        paths,
-        "fact_supersede",
-        [
-            {"fact_id": fact_id, "status": "superseded", "conflict_group_id": None}
-            for fact_id in counterpart_ids
-        ],
-        proposed_by="ui_queue_temporal_update",
-        risk_tier="medium",
-    )
-    old_action_id = str(question.get("action_id") or "").strip()
-    if old_action_id:
-        reject_linked_review_action(
-            paths, old_action_id, "replaced by temporal-update queue decision"
+            propose_action(
+                paths,
+                "fact_upsert",
+                action_payload={"fact": temporal_candidate},
+                action_features={
+                    "human_confirmed": True,
+                    "truth_mutation": True,
+                    "reversible": True,
+                    "affected_fact_count": 1 + len(counterpart_ids),
+                    "relation": "updates",
+                },
+                target_fact_ids=[str(temporal_candidate["id"])],
+                target_page_paths=[str(temporal_candidate.get("page_hint") or "")]
+                if temporal_candidate.get("page_hint")
+                else [],
+                proposed_by="ui_queue_temporal_update",
+                confidence=float(temporal_candidate.get("confidence") or 1.0),
+                risk_tier="medium",
+                override_semantic_rejection=True,
+            )["id"],
+            override_semantic_rejection=True,
         )
-    action_ids = [candidate_action["id"]]
-    actions = [candidate_action]
-    if supersede_action.get("id"):
-        action_ids.insert(0, str(supersede_action["id"]))
-        actions.append(supersede_action)
-    mark_review_question_decided(
-        paths,
-        question["id"],
-        status="answered",
-        answer={
-            "decision": "temporal_update",
-            "candidate_fact_id": str(temporal_candidate["id"]),
-            "superseded_fact_ids": counterpart_ids,
-            "candidate_action_id": candidate_action["id"],
-            "supersede_action_id": supersede_action.get("id"),
-        },
-        action_id=candidate_action["id"],
-    )
+        if candidate_action.get("status") in {"applied", "auto_applied"}:
+            applied_action_ids.append(str(candidate_action["id"]))
+        require_applied_question_action(candidate_action, "temporal candidate")
+        supersede_action = apply_fact_status_action(
+            paths,
+            "fact_supersede",
+            [
+                {
+                    "fact_id": fact_id,
+                    "status": "superseded",
+                    "conflict_group_id": None,
+                }
+                for fact_id in counterpart_ids
+            ],
+            proposed_by="ui_queue_temporal_update",
+            risk_tier="medium",
+            override_semantic_rejection=True,
+        )
+        if supersede_action.get("status") in {"applied", "auto_applied"}:
+            applied_action_ids.append(str(supersede_action["id"]))
+        require_applied_question_action(supersede_action, "temporal supersede")
+        old_action_id = str(question.get("action_id") or "").strip()
+        if old_action_id:
+            reject_linked_review_action(
+                paths, old_action_id, "replaced by temporal-update queue decision"
+            )
+        mark_review_question_decided(
+            paths,
+            question["id"],
+            status="answered",
+            answer={
+                "decision": "temporal_update",
+                "candidate_fact_id": str(temporal_candidate["id"]),
+                "superseded_fact_ids": counterpart_ids,
+                "candidate_action_id": candidate_action["id"],
+                "supersede_action_id": supersede_action.get("id"),
+                "old_action_id": old_action_id,
+            },
+            action_id=candidate_action["id"],
+        )
+        decided_question = get_review_question(paths, question["id"])
+    action_ids = list(reversed(applied_action_ids))
+    actions = [candidate_action, supersede_action]
     return {
         "status": "decided",
         "item_id": question["id"],
         "result": {
-            "question": get_review_question(paths, question["id"]),
+            "question": decided_question,
             "actions": actions,
         },
         "undo_handle": {
@@ -4314,68 +4485,6 @@ def temporal_update_question_candidate(
             "action_ids": action_ids,
             "actions": action_states,
         },
-    }
-
-
-def supported_existing_fact(
-    existing: dict[str, Any], candidate: dict[str, Any], question_id: str
-) -> dict[str, Any]:
-    timestamp = now_iso()
-    metadata = (
-        existing.get("metadata") if isinstance(existing.get("metadata"), dict) else {}
-    )
-    support_records = metadata.get("supporting_candidates")
-    if not isinstance(support_records, list):
-        support_records = []
-    support_records.append(
-        {
-            "question_id": question_id,
-            "statement": candidate.get("statement"),
-            "evidence_quote": candidate.get("evidence_quote") or candidate.get("quote"),
-            "source_ids": candidate.get("source_ids") or [],
-            "observed_at": candidate.get("observed_at"),
-            "attached_at": timestamp,
-        }
-    )
-    source_spans = [
-        *(existing.get("source_spans") or []),
-        *(candidate.get("source_spans") or []),
-    ]
-    return {
-        **existing,
-        "source_ids": stable_unique_strings(
-            [*(existing.get("source_ids") or []), *(candidate.get("source_ids") or [])]
-        ),
-        "source_spans": source_spans,
-        "metadata": {**metadata, "supporting_candidates": support_records[-25:]},
-        "last_seen_at": candidate.get("observed_at") or timestamp,
-    }
-
-
-def temporal_update_fact(
-    candidate: dict[str, Any], counterpart_ids: list[str], question_id: str
-) -> dict[str, Any]:
-    timestamp = now_iso()
-    metadata = (
-        candidate.get("metadata") if isinstance(candidate.get("metadata"), dict) else {}
-    )
-    fact_id = str(candidate.get("id") or new_id("fact"))
-    return {
-        **candidate,
-        "id": fact_id,
-        "status": "active",
-        "supersedes_id": counterpart_ids[0],
-        "metadata": {
-            **metadata,
-            "temporal_update": {
-                "question_id": question_id,
-                "superseded_fact_ids": counterpart_ids,
-                "decided_at": timestamp,
-            },
-        },
-        "last_seen_at": candidate.get("last_seen_at")
-        or candidate.get("observed_at")
-        or timestamp,
     }
 
 
@@ -4408,42 +4517,56 @@ def route_unrouted_question(
             "decided_at": now_iso(),
         },
     }
-    action = apply_action(
+    previous_actions = [old_action] if old_action else []
+    with question_replacement_guard(
         paths,
-        propose_action(
+        previous_question=previous,
+        previous_actions=previous_actions,
+        restore_action=restore_action_state,
+        restore_question=restore_question_state,
+    ) as applied_action_ids:
+        action = apply_action(
             paths,
-            "fact_upsert",
-            action_payload={"fact": routed},
-            action_features={
-                "human_confirmed": True,
-                "truth_mutation": True,
-                "reversible": True,
-                "affected_fact_count": 1,
-            },
-            target_fact_ids=[str(routed.get("id") or "")],
-            target_page_paths=[page_hint],
-            proposed_by="ui_queue_route",
-            confidence=float(routed.get("confidence") or 1.0),
-            risk_tier="medium",
-        )["id"],
-    )
-    if old_action_id:
-        reject_linked_review_action(
-            paths, old_action_id, "replaced by explicit UI route decision"
+            propose_action(
+                paths,
+                "fact_upsert",
+                action_payload={"fact": routed},
+                action_features={
+                    "human_confirmed": True,
+                    "truth_mutation": True,
+                    "reversible": True,
+                    "affected_fact_count": 1,
+                },
+                target_fact_ids=[str(routed.get("id") or "")],
+                target_page_paths=[page_hint],
+                proposed_by="ui_queue_route",
+                confidence=float(routed.get("confidence") or 1.0),
+                risk_tier="medium",
+                override_semantic_rejection=True,
+            )["id"],
+            override_semantic_rejection=True,
         )
-    mark_review_question_decided(
-        paths,
-        question["id"],
-        status="answered",
-        answer={
-            "decision": "route",
-            "page_hint": page_hint,
-            "new_action_id": action["id"],
-            "old_action_id": old_action_id,
-        },
-        action_id=action["id"],
-    )
-    result = {"question": get_review_question(paths, question["id"]), "action": action}
+        if action.get("status") in {"applied", "auto_applied"}:
+            applied_action_ids.append(str(action["id"]))
+        require_applied_question_action(action, "route")
+        if old_action_id:
+            reject_linked_review_action(
+                paths, old_action_id, "replaced by explicit UI route decision"
+            )
+        mark_review_question_decided(
+            paths,
+            question["id"],
+            status="answered",
+            answer={
+                "decision": "route",
+                "page_hint": page_hint,
+                "new_action_id": action["id"],
+                "old_action_id": old_action_id,
+            },
+            action_id=action["id"],
+        )
+        decided_question = get_review_question(paths, question["id"])
+    result = {"question": decided_question, "action": action}
     return {
         "status": "decided",
         "item_id": question["id"],
@@ -4451,8 +4574,8 @@ def route_unrouted_question(
         "undo_handle": {
             "kind": "question_route",
             "question": previous,
-            "new_action_id": action["id"],
-            "old_action": old_action,
+            "action_ids": list(reversed(applied_action_ids)),
+            "actions": previous_actions,
         },
     }
 
@@ -4465,7 +4588,12 @@ def contest_question_candidate(
     applied_ids: list[str] = []
     candidate_fact_ids: list[str] = []
     if action_id:
-        applied = apply_action(paths, action_id)
+        applied = apply_action(
+            paths,
+            action_id,
+            override_semantic_rejection=True,
+        )
+        require_applied_question_action(applied, "both-true candidate")
         applied_ids.append(applied["id"])
         candidate_fact_ids.extend(
             str(item) for item in applied.get("target_fact_ids") or []
@@ -4480,28 +4608,45 @@ def contest_question_candidate(
     ]
     fact_ids = stable_unique_strings([*candidate_fact_ids, *counterpart_ids])
     if len(fact_ids) < 2:
+        for applied_id in reversed(applied_ids):
+            revert_question_action(paths, applied_id)
+        for state in action_states:
+            restore_action_state(paths, state)
         raise BadRequestError("both_true requires at least two fact ids")
-    contested = apply_action(
-        paths,
-        propose_action(
+    try:
+        contested = apply_action(
             paths,
-            "display_contested",
-            action_payload={"fact_ids": fact_ids, "question_id": question["id"]},
-            action_features={
-                "human_confirmed": True,
-                "truth_mutation": True,
-                "reversible": True,
-                "affected_fact_count": len(fact_ids),
-            },
-            target_fact_ids=fact_ids,
-            target_page_paths=[str(question.get("page_hint"))]
-            if question.get("page_hint")
-            else [],
-            proposed_by="ui_queue_contested",
-            confidence=1.0,
-            risk_tier="medium",
-        )["id"],
-    )
+            propose_action(
+                paths,
+                "display_contested",
+                action_payload={
+                    "fact_ids": fact_ids,
+                    "question_id": question["id"],
+                },
+                action_features={
+                    "human_confirmed": True,
+                    "truth_mutation": True,
+                    "reversible": True,
+                    "affected_fact_count": len(fact_ids),
+                },
+                target_fact_ids=fact_ids,
+                target_page_paths=[str(question.get("page_hint"))]
+                if question.get("page_hint")
+                else [],
+                proposed_by="ui_queue_contested",
+                confidence=1.0,
+                risk_tier="medium",
+                override_semantic_rejection=True,
+            )["id"],
+            override_semantic_rejection=True,
+        )
+        require_applied_question_action(contested, "both-true display")
+    except Exception:
+        for applied_id in reversed(applied_ids):
+            revert_question_action(paths, applied_id)
+        for state in action_states:
+            restore_action_state(paths, state)
+        raise
     applied_ids.append(contested["id"])
     mark_review_question_decided(
         paths,
@@ -4580,26 +4725,10 @@ def decide_queue_action(
     decision: str,
     payload: dict[str, Any],
 ) -> dict[str, Any]:
-    normalized = decision.replace("-", "_")
-    previous = action_undo_state(paths, action["id"])
-    if normalized in {"approve", "apply", "accept"}:
-        result = apply_action(paths, action["id"])
-        undo = {"kind": "action_apply", "action_id": action["id"]}
-    elif normalized in {"reject", "dismiss"}:
-        result = reject_linked_review_action(
-            paths,
-            action["id"],
-            str(payload.get("reason") or "human rejected queue action"),
-        )
-        undo = {"kind": "action_status", "action": previous}
-    else:
-        raise BadRequestError(f"unsupported action decision: {decision}")
-    return {
-        "status": "decided",
-        "item_id": action["id"],
-        "result": {"action": result},
-        "undo_handle": undo,
-    }
+    try:
+        return decide_direct_action_queue_item(paths, action, decision, payload)
+    except AuditReviewDecisionError as exc:
+        raise BadRequestError(str(exc)) from exc
 
 
 def decide_queue_audit(
@@ -4608,69 +4737,16 @@ def decide_queue_audit(
     decision: str,
     payload: dict[str, Any],
 ) -> dict[str, Any]:
-    normalized = decision.replace("-", "_")
-    previous = action_undo_state(paths, action["id"])
-    if normalized in {"revert", "v"}:
-        with connection(paths.sqlite_path) as conn:
-            reviewability = audit_action_reviewability(conn, action)
-        if not reviewability["revertible"]:
-            raise BadRequestError(
-                "audited action no longer has a safe direct revert; review the current fact or topology state"
-            )
-        if reviewability.get("revert_mode") == "reject_current_fact":
-            fact_id = str(reviewability.get("fact_id") or "")
-            correction = apply_fact_status_action(
-                paths,
-                "fact_supersede",
-                [
-                    {
-                        "fact_id": fact_id,
-                        "status": "rejected",
-                        "conflict_group_id": None,
-                    }
-                ],
-                proposed_by="ui_audit_reject_current_fact",
-                risk_tier="medium",
-            )
-            if not correction.get("id"):
-                raise BadRequestError("audited fact is no longer active")
-            result = record_action_audit(
-                paths,
-                action["id"],
-                "remediated",
-                metadata={
-                    "ui_rejected_current_fact": True,
-                    "fact_id": fact_id,
-                    "correction_action_id": correction["id"],
-                },
-            )
-            result_payload = {"action": result, "correction_action": correction}
-            undo = {
-                "kind": "audit_fact_remediation",
-                "action": previous,
-                "correction_action_id": correction["id"],
-            }
-        else:
-            result = revert_action(paths, action["id"])
-            result_payload = {"action": result}
-            undo = {"kind": "action_revert", "action": previous}
-    elif normalized in {"ok", "mark_ok", "mark_good"}:
-        result = record_action_audit(
+    try:
+        return decide_audit_queue_item(
             paths,
-            action["id"],
-            "sampled_ok",
-            metadata={"ui_marked_ok": True, "note": payload.get("note") or ""},
+            action,
+            decision,
+            payload,
+            previous_action_state=action_undo_state(paths, action["id"]),
         )
-        result_payload = {"action": result}
-        undo = {"kind": "action_status", "action": previous}
-    else:
-        raise BadRequestError(f"unsupported audit decision: {decision}")
-    return {
-        "status": "decided",
-        "item_id": action["id"],
-        "result": result_payload,
-        "undo_handle": undo,
-    }
+    except AuditReviewDecisionError as exc:
+        raise BadRequestError(str(exc)) from exc
 
 
 def ui_queue_undo(paths: BrainPaths, payload: dict[str, Any]) -> dict[str, Any]:
@@ -4678,49 +4754,102 @@ def ui_queue_undo(paths: BrainPaths, payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(handle, dict):
         raise BadRequestError("undo_handle is required")
     kind = str(handle.get("kind") or "").strip()
-    if kind == "question_actions":
-        action_states = {
-            str(state.get("id")): state
-            for state in handle.get("actions") or []
-            if isinstance(state, dict) and str(state.get("id") or "").strip()
-        }
-        for action_id in handle.get("action_ids") or []:
-            action_id = str(action_id)
-            revert_action(paths, action_id)
-            restore_action_state(paths, action_states.get(action_id))
-        restore_question_state(paths, handle.get("question") or {})
-    elif kind == "question_reject":
-        restore_action_state(paths, handle.get("action") or {})
-        restore_question_state(paths, handle.get("question") or {})
-    elif kind == "question_route":
-        if handle.get("new_action_id"):
-            revert_action(paths, str(handle["new_action_id"]))
-        restore_action_state(paths, handle.get("old_action") or {})
-        restore_question_state(paths, handle.get("question") or {})
-    elif kind == "memory_status":
-        restore_memory_state(paths, handle.get("memory") or {})
-    elif kind == "action_apply":
-        revert_action(paths, str(handle.get("action_id") or ""))
-    elif kind == "action_revert":
-        action_state = handle.get("action") or {}
-        action_id = str(action_state.get("id") or "").strip()
-        if action_id:
-            apply_action(paths, action_id)
-        restore_action_state(paths, action_state)
-    elif kind == "audit_fact_remediation":
-        correction_action_id = str(handle.get("correction_action_id") or "")
-        if correction_action_id:
-            revert_action(paths, correction_action_id)
-        restore_action_state(paths, handle.get("action") or {})
-    elif kind == "action_status":
-        restore_action_state(paths, handle.get("action") or {})
-    else:
-        raise BadRequestError(f"unsupported undo handle: {kind}")
-    return {
+    snapshot_ids = stable_unique_strings(handle.get("page_snapshot_ids") or [])
+    if kind in {"question_actions", "legacy_question_answer", "fact_correction"}:
+        require_restorable_page_snapshots(paths, snapshot_ids)
+
+    try:
+        undo_queue_database(paths, handle)
+    except QueueUndoTransactionError as exc:
+        raise BadRequestError(str(exc)) from exc
+
+    projection_errors = restore_queue_undo_projections(
+        paths,
+        kind=kind,
+        handle=handle,
+        snapshot_ids=snapshot_ids,
+    )
+    response = {
         "status": "undone",
         "undo_handle": handle,
         "queue_summary": current_queue_summary(paths),
     }
+    if projection_errors:
+        response["projection_status"] = "needs_repair"
+        response["projection_errors"] = projection_errors
+    return response
+
+
+def restore_queue_undo_projections(
+    paths: BrainPaths,
+    *,
+    kind: str,
+    handle: dict[str, Any],
+    snapshot_ids: list[str],
+) -> list[str]:
+    """Restore derived files after the database undo has committed.
+
+    A projection failure must not make a successfully committed DB undo look
+    rolled back. Return an explicit repair warning while preserving a drifted
+    user-authored page.
+    """
+
+    errors: list[str] = []
+    if kind == "memory_status":
+        try:
+            service(paths).export_all_memories()
+        except Exception as exc:  # pragma: no cover - defensive filesystem boundary
+            errors.append(f"memory export needs repair: {exc}")
+
+    if kind not in {"question_actions", "legacy_question_answer", "fact_correction"}:
+        return errors
+    if snapshot_ids:
+        for snapshot_id in reversed(snapshot_ids):
+            try:
+                restored = restore_wiki_page_projection_from_snapshot(
+                    paths, snapshot_id
+                )
+            except Exception as exc:  # pragma: no cover - defensive filesystem boundary
+                errors.append(
+                    f"managed page snapshot {snapshot_id} needs repair: {exc}"
+                )
+                continue
+            if not restored.get("restored"):
+                errors.append(
+                    f"managed page snapshot {snapshot_id} needs repair: "
+                    f"{restored.get('reason') or 'restore failed'}"
+                )
+        return errors
+
+    # Unlike legacy answers and direct corrections, question-actions decisions
+    # have no safe route-based fallback. Only restore the exact projection
+    # snapshots captured by answer_wiki_question.
+    if kind == "question_actions":
+        return errors
+
+    try:
+        curated = curate_managed_pages(
+            paths,
+            page_hints=stable_unique_strings(handle.get("page_hints") or []),
+            overwrite_existing=False,
+        )
+        if curated.get("lint_errors"):
+            errors.append("managed page projection needs repair: wiki lint failed")
+    except Exception as exc:  # pragma: no cover - defensive filesystem boundary
+        errors.append(f"managed page projection needs repair: {exc}")
+    return errors
+
+
+def require_restorable_page_snapshots(
+    paths: BrainPaths, snapshot_ids: list[str]
+) -> None:
+    for snapshot_id in snapshot_ids:
+        try:
+            preflight = preflight_wiki_page_projection_restore(paths, snapshot_id)
+        except ValueError as exc:
+            raise BadRequestError(str(exc)) from exc
+        if not preflight.get("restorable"):
+            raise BadRequestError(str(preflight.get("reason") or ""))
 
 
 def question_undo_state(question: dict[str, Any]) -> dict[str, Any]:
@@ -4734,26 +4863,26 @@ def question_undo_state(question: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def action_undo_state(paths: BrainPaths, action_id: str) -> dict[str, Any] | None:
-    if not action_id:
-        return None
-    try:
-        action = get_action_for_queue(paths, action_id)
-    except ValueError:
-        return None
+def question_projection_undo_metadata(
+    question: dict[str, Any], result: dict[str, Any]
+) -> dict[str, list[str]]:
+    curation = result.get("curation")
+    pages = curation.get("pages") if isinstance(curation, dict) else []
+    page_results = pages if isinstance(pages, list) else []
     return {
-        "id": action["id"],
-        "status": action.get("status"),
-        "audit_status": action.get("audit_status"),
-        "target_fact_ids": action.get("target_fact_ids"),
-        "target_page_paths": action.get("target_page_paths"),
-        "target_contract_ids": action.get("target_contract_ids"),
-        "evidence_json": action.get("evidence_json"),
-        "policy_decision": action.get("policy_decision"),
-        "autonomy_level": action.get("autonomy_level"),
-        "inverse_action_json": action.get("inverse_action_json"),
-        "applied_state_hash": action.get("applied_state_hash"),
-        "applied_at": action.get("applied_at"),
+        "page_hints": stable_unique_strings(
+            [
+                question.get("page_hint"),
+                *[
+                    page.get("page_hint") or page.get("relative_path")
+                    for page in page_results
+                    if isinstance(page, dict)
+                ],
+            ]
+        ),
+        "page_snapshot_ids": stable_unique_strings(
+            [page.get("snapshot_id") for page in page_results if isinstance(page, dict)]
+        ),
     }
 
 
@@ -4765,22 +4894,12 @@ def linked_question_action_states(
     return [state] if state else []
 
 
-def action_ids_from_result(result: dict[str, Any]) -> list[str]:
-    action_ids: list[str] = []
-    if isinstance(result.get("action"), dict) and result["action"].get("id"):
-        action_ids.append(str(result["action"]["id"]))
-    for action in result.get("actions") or []:
-        if isinstance(action, dict) and action.get("id"):
-            action_ids.append(str(action["id"]))
-    return action_ids
-
-
 def restore_question_state(paths: BrainPaths, state: dict[str, Any]) -> None:
     question_id = str(state.get("id") or "").strip()
     if not question_id:
         return
     with connection(paths.sqlite_path) as conn:
-        conn.execute(
+        restored = conn.execute(
             """
             UPDATE open_questions
             SET status = ?, answer = ?, answered_at = ?, action_id = ?, decided_by = ?
@@ -4795,41 +4914,17 @@ def restore_question_state(paths: BrainPaths, state: dict[str, Any]) -> None:
                 question_id,
             ),
         )
+        if restored.rowcount != 1:
+            raise BadRequestError(
+                f"question undo target no longer exists: {question_id}"
+            )
 
 
 def restore_action_state(paths: BrainPaths, state: dict[str, Any] | None) -> None:
-    if not state:
-        return
-    action_id = str(state.get("id") or "").strip()
-    if not action_id:
-        return
-    with connection(paths.sqlite_path) as conn:
-        conn.execute(
-            """
-            UPDATE cos_actions
-            SET status = ?, audit_status = ?, target_fact_ids = ?,
-                target_page_paths = ?, target_contract_ids = ?, evidence_json = ?,
-                policy_decision = ?, autonomy_level = ?, inverse_action_json = ?,
-                applied_state_hash = ?, applied_at = ?
-            WHERE id = ?
-            """,
-            (
-                state.get("status"),
-                state.get("audit_status"),
-                dumps(state.get("target_fact_ids") or []),
-                dumps(state.get("target_page_paths") or []),
-                dumps(state.get("target_contract_ids") or []),
-                dumps(state.get("evidence_json") or {}),
-                state.get("policy_decision"),
-                state.get("autonomy_level"),
-                dumps(state.get("inverse_action_json"))
-                if state.get("inverse_action_json") is not None
-                else None,
-                state.get("applied_state_hash"),
-                state.get("applied_at"),
-                action_id,
-            ),
-        )
+    try:
+        restore_review_action_state(paths, state)
+    except ReviewUndoError as exc:
+        raise BadRequestError(str(exc)) from exc
 
 
 def restore_memory_state(paths: BrainPaths, state: dict[str, Any]) -> None:
@@ -5072,34 +5167,59 @@ def ui_save_wiki_page(paths: BrainPaths, payload: dict[str, Any]) -> dict[str, A
     return ui_wiki_page(paths, {"path": [relative_path]})
 
 
-def ui_confirm_fact(paths: BrainPaths, fact_id: str) -> dict[str, Any]:
+def ui_confirm_fact(
+    paths: BrainPaths, fact_id: str, *, record_resolution: bool = True
+) -> dict[str, Any]:
     service(paths).init_workspace()
     facts = facts_by_id(paths, [fact_id])
     fact = facts.get(fact_id)
     if not fact:
         raise NotFoundError(f"fact not found: {fact_id}")
     confirmed = {**fact, "confirmed_by_user": True}
-    action = apply_action(
+    proposal = propose_action(
         paths,
-        propose_action(
-            paths,
-            "fact_upsert",
-            action_payload={"fact": confirmed},
-            action_features={
-                "human_confirmed": True,
-                "truth_mutation": True,
-                "reversible": True,
-                "affected_fact_count": 1,
-            },
-            target_fact_ids=[fact_id],
-            target_page_paths=[str(fact.get("page_hint"))]
-            if fact.get("page_hint")
-            else [],
-            proposed_by="ui_fact_confirm",
-            confidence=1.0,
-            risk_tier="low",
-        )["id"],
+        "fact_upsert",
+        action_payload={"fact": confirmed},
+        action_features={
+            "human_confirmed": True,
+            "truth_mutation": True,
+            "reversible": True,
+            "affected_fact_count": 1,
+        },
+        target_fact_ids=[fact_id],
+        target_page_paths=[str(fact.get("page_hint"))] if fact.get("page_hint") else [],
+        proposed_by="ui_fact_confirm",
+        confidence=1.0,
+        risk_tier="low",
+        override_semantic_rejection=True,
     )
+
+    def record_confirmation(conn: Any, reviewed_action: dict[str, Any]) -> None:
+        record_fact_confirmation_resolution(
+            paths,
+            reviewed_action,
+            fact_id,
+            conn=conn,
+        )
+
+    try:
+        action = apply_action(
+            paths,
+            str(proposal["id"]),
+            override_semantic_rejection=True,
+            transaction_hook=record_confirmation if record_resolution else None,
+        )
+    except Exception:
+        with connection(paths.sqlite_path) as conn:
+            conn.execute(
+                """
+                UPDATE cos_actions
+                SET status = 'failed'
+                WHERE id = ? AND status IN ('proposed', 'needs_human')
+                """,
+                (proposal["id"],),
+            )
+        raise
     return {"fact": facts_by_id(paths, [fact_id]).get(fact_id), "action": action}
 
 
@@ -5702,163 +5822,46 @@ def ui_wiki_fact_page_review(
 def ui_answer_wiki_question(
     paths: BrainPaths, question_id: str, payload: dict[str, Any]
 ) -> dict[str, Any]:
-    service(paths).init_workspace()
     raw_selected_fact_ids = payload.get("selected_fact_ids")
     if raw_selected_fact_ids is not None and not isinstance(
         raw_selected_fact_ids, list
     ):
         raise BadRequestError("selected_fact_ids must be an array")
-    try:
-        return answer_open_question(
-            paths,
-            question_id,
-            selected_fact_id=optional_str(payload.get("selected_fact_id")),
-            selected_fact_ids=[
-                str(fact_id).strip()
-                for fact_id in raw_selected_fact_ids or []
-                if str(fact_id or "").strip()
-            ]
-            if raw_selected_fact_ids is not None
-            else None,
-            answer=optional_str(payload.get("answer")),
-            overwrite_existing=bool(payload.get("overwrite_existing", False)),
-        )
-    except ValueError as exc:
-        raise BadRequestError(str(exc)) from exc
+    selected_fact_ids = stable_unique_strings(
+        [payload.get("selected_fact_id"), *(raw_selected_fact_ids or [])]
+    )
+    if selected_fact_ids:
+        decision_payload = {
+            **payload,
+            "decision": "manual_selection",
+            "selected_fact_ids": selected_fact_ids,
+        }
+    else:
+        decision_payload = {**payload, "decision": "manual_answer"}
+    decision = ui_queue_decision(paths, question_id, decision_payload)
+    return legacy_question_decision_response(decision)
 
 
 def ui_apply_cos_question_action(
     paths: BrainPaths, question_id: str, payload: dict[str, Any]
 ) -> dict[str, Any]:
-    service(paths).init_workspace()
-    question = review_question_for_decision(paths, question_id)
-    action_id = str(question.get("action_id") or "").strip()
-    if not action_id:
-        raise BadRequestError(f"review question has no linked action: {question_id}")
-    action = apply_action(paths, action_id)
-    answer_payload = {
-        "decision": "apply_action",
-        "action_id": action_id,
-        "note": optional_str(payload.get("note")) or "",
-    }
-    mark_review_question_decided(
+    decision = ui_queue_decision(
         paths,
         question_id,
-        status="answered",
-        answer=answer_payload,
-        action_id=action_id,
+        {**payload, "decision": "apply"},
     )
-    return {
-        "question": get_review_question(paths, question_id),
-        "action": action,
-        "review": ui_cos_review(paths, review_query_for_question(question)),
-        "dashboard": wiki_fact_dashboard(paths),
-    }
+    return legacy_question_decision_response(decision)
 
 
 def ui_dismiss_cos_question(
     paths: BrainPaths, question_id: str, payload: dict[str, Any]
 ) -> dict[str, Any]:
-    service(paths).init_workspace()
-    question = review_question_for_decision(paths, question_id)
-    action_id = str(question.get("action_id") or "").strip()
-    reason = optional_str(payload.get("reason")) or "human rejected review item"
-    action: dict[str, Any] | None = None
-    if action_id:
-        action = reject_linked_review_action(paths, action_id, reason)
-    answer_payload = {
-        "decision": "dismiss",
-        "action_id": action_id,
-        "reason": reason,
-    }
-    mark_review_question_decided(
+    decision = ui_queue_decision(
         paths,
         question_id,
-        status="dismissed",
-        answer=answer_payload,
-        action_id=action_id or None,
+        {**payload, "decision": "dismiss"},
     )
-    return {
-        "question": get_review_question(paths, question_id),
-        "action": action,
-        "review": ui_cos_review(paths, review_query_for_question(question)),
-        "dashboard": wiki_fact_dashboard(paths),
-    }
-
-
-def review_question_for_decision(paths: BrainPaths, question_id: str) -> dict[str, Any]:
-    question = get_review_question(paths, question_id)
-    if question["status"] not in {"open", "needs_human"}:
-        raise BadRequestError(f"review question is already closed: {question_id}")
-    return question
-
-
-def review_query_for_question(question: dict[str, Any]) -> dict[str, list[str]]:
-    kind = str(question.get("kind") or "").strip()
-    return {"kind": [kind]} if kind else {}
-
-
-def get_review_question(paths: BrainPaths, question_id: str) -> dict[str, Any]:
-    with connection(paths.sqlite_path) as conn:
-        row = conn.execute(
-            "SELECT * FROM open_questions WHERE id = ?", (question_id,)
-        ).fetchone()
-    if not row:
-        raise NotFoundError(f"review question not found: {question_id}")
-    return row_to_question(row)
-
-
-def mark_review_question_decided(
-    paths: BrainPaths,
-    question_id: str,
-    *,
-    status: str,
-    answer: dict[str, Any],
-    action_id: str | None,
-) -> None:
-    with connection(paths.sqlite_path) as conn:
-        conn.execute(
-            """
-            UPDATE open_questions
-            SET status = ?, answer = ?, answered_at = ?, action_id = COALESCE(?, action_id),
-                decided_by = 'human'
-            WHERE id = ?
-            """,
-            (status, dumps(answer), now_iso(), action_id, question_id),
-        )
-
-
-def reject_linked_review_action(
-    paths: BrainPaths, action_id: str, reason: str
-) -> dict[str, Any]:
-    timestamp = now_iso()
-    with connection(paths.sqlite_path) as conn:
-        action = load_action(conn, action_id)
-        if action["status"] in {"applied", "auto_applied", "reverted"}:
-            raise BadRequestError(
-                f"linked action is already {action['status']}: {action_id}"
-            )
-        evidence = dict(action.get("evidence_json") or {})
-        evidence["human_review"] = {
-            "decision": "reject",
-            "reason": reason,
-            "decided_at": timestamp,
-        }
-        conn.execute(
-            """
-            UPDATE cos_actions
-            SET status = 'rejected', evidence_json = ?
-            WHERE id = ?
-            """,
-            (dumps(evidence), action_id),
-        )
-        retire_open_candidate_siblings(
-            conn,
-            action,
-            reason="candidate rejected by human review",
-        )
-    with connection(paths.sqlite_path) as conn:
-        return load_action(conn, action_id)
+    return legacy_question_decision_response(decision)
 
 
 def ui_reconcile_wiki_facts(
@@ -5901,27 +5904,6 @@ def ui_revert_wiki_fact_page(
         raise BadRequestError("snapshot_id is required")
     try:
         return revert_wiki_page_snapshot(paths, snapshot_id)
-    except ValueError as exc:
-        raise BadRequestError(str(exc)) from exc
-
-
-def ui_create_wiki_fact_correction(
-    paths: BrainPaths, payload: dict[str, Any]
-) -> dict[str, Any]:
-    service(paths).init_workspace()
-    page_hint = str(payload.get("page_hint") or payload.get("path") or "").strip()
-    if not page_hint:
-        raise BadRequestError("page_hint is required")
-    try:
-        return create_confirmed_page_fact(
-            paths,
-            page_hint,
-            str(payload.get("statement") or ""),
-            section_hint=str(payload.get("section_hint") or "Summary"),
-            supersede_fact_ids=string_list(payload.get("supersede_fact_ids")),
-            source_ids=string_list(payload.get("source_ids")),
-            overwrite_existing=bool(payload.get("overwrite_existing", False)),
-        )
     except ValueError as exc:
         raise BadRequestError(str(exc)) from exc
 

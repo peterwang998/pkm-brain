@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -722,10 +723,12 @@ def test_compact_retrieval_events_strips_old_payloads_and_preserves_lineage(
 ) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()
-    backup = svc.paths.db_dir / "brain-2026-05-01.bak.gz"
+    now = datetime.now(timezone.utc)
+    old_at = now - timedelta(days=180)
+    backup = svc.paths.db_dir / f"brain-{old_at.date().isoformat()}.bak.gz"
     backup.write_bytes(b"old backup")
-    old_timestamp = "2026-01-01T00:00:00+00:00"
-    recent_timestamp = "2026-07-01T00:00:00+00:00"
+    old_timestamp = old_at.isoformat()
+    recent_timestamp = (now - timedelta(days=1)).isoformat()
     old_snapshots = json.dumps(
         [{"type": "chunk", "chunk_id": "chunk_old", "text": "heavy copied text"}]
     )

@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from pkm_brain.automation import run_cos_timeout_sweep
+from pkm_brain.candidate_retirement import CANDIDATE_SIBLING_RETIREMENTS_KEY
 from pkm_brain.cos_actions import (
     ACTION_TYPE_SPECS,
     apply_action,
@@ -26,7 +27,11 @@ from pkm_brain.cos_actions import (
     repair_refused_fact_audit_revert,
     revert_action,
 )
-from pkm_brain.cos_audit import AUDITOR_MAX_BATCH_CHARS, run_sampled_audit
+from pkm_brain.cos_audit import (
+    AUDITOR_MAX_BATCH_CHARS,
+    run_sampled_audit,
+    stable_sample_fraction,
+)
 from pkm_brain.cos_policy import (
     NEAR_DUPLICATE_PAGE_MERGE_SIGNAL,
     PolicyDecision,
@@ -67,6 +72,7 @@ from pkm_brain.gmail_projection import (
 )
 from pkm_brain.numeric_faithfulness import extract_numeric_mentions
 from pkm_brain.paths import BrainPaths
+from pkm_brain.review_resolution import record_review_resolution
 from pkm_brain.service import BrainService
 from pkm_brain.temporal import TemporalRetrievalRequest
 
@@ -81,6 +87,75 @@ def evidence_unit_ids_containing(text: str, needle: str) -> list[str]:
         for unit in evidence_units_for_text(text)
         if needle in unit["text"]
     ]
+
+
+@pytest.mark.parametrize("disposition", ["keep", "reject"])
+def test_exact_reviewed_llm_fact_cannot_resurface_as_residue(
+    tmp_path: Path, disposition: str
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    fact = {
+        "id": "fact_reviewed_llm",
+        "statement": "The review workflow keeps resolved facts out of the inbox.",
+        "entity_key": "concept:review-workflow",
+        "page_hint": "concepts/review-workflow.md",
+        "section_hint": "Summary",
+        "source_ids": ["document:review-workflow"],
+        "source_spans": [
+            {
+                "source_id": "document:review-workflow",
+                "chunk_id": "chunk:review-workflow",
+                "start": 0,
+                "end": 48,
+            }
+        ],
+        "evidence_quote": "Resolved facts stay out of the inbox.",
+        "extraction_method": "llm",
+        "confidence": 0.9,
+        "status": "active",
+    }
+    original = propose_action(
+        svc.paths,
+        "fact_upsert",
+        action_payload={"fact": fact},
+        target_fact_ids=[fact["id"]],
+        proposed_by="extractor",
+    )
+    with connection(svc.paths.sqlite_path) as conn:
+        record_review_resolution(
+            conn,
+            original,
+            disposition=disposition,
+            source_item_kind="question",
+            source_item_id=f"question_{disposition}",
+        )
+    duplicate_fact = {**fact, "id": "fact_reviewed_llm_regenerated"}
+    duplicate = propose_action(
+        svc.paths,
+        "fact_upsert",
+        action_payload={"fact": duplicate_fact},
+        target_fact_ids=[duplicate_fact["id"]],
+        proposed_by="extractor",
+    )
+
+    resolved = mark_action_residue(
+        svc.paths,
+        duplicate["id"],
+        kind="unrouted_fact",
+        reason="No confident route was available.",
+    )
+
+    assert resolved["status"] == "rejected"
+    assert (
+        resolved["evidence_json"]["semantic_resolution"]["disposition"] == disposition
+    )
+    with connection(svc.paths.sqlite_path) as conn:
+        questions = conn.execute(
+            "SELECT COUNT(*) FROM open_questions WHERE action_id = ?",
+            (duplicate["id"],),
+        ).fetchone()[0]
+    assert questions == 0
 
 
 def test_extraction_prompt_requires_direct_entailment_for_clean_facts() -> None:
@@ -948,6 +1023,148 @@ def test_candidate_key_reuses_open_action_and_retires_legacy_sibling(
     )
     assert question["status"] == "dismissed"
     assert question["decided_by"] == "candidate_deduplication"
+
+
+def test_proposed_action_cannot_forge_candidate_retirement_snapshot(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+
+    action = propose_action(
+        svc.paths,
+        "canonicalize_page",
+        action_payload={"page_hint": "concepts/forged-retirement.md"},
+        action_features={"reversible": True},
+        evidence={
+            CANDIDATE_SIBLING_RETIREMENTS_KEY: {
+                "version": 1,
+                "actions": [
+                    {
+                        "id": "victim_action",
+                        "before": {"status": "proposed", "evidence_json": "{}"},
+                        "after_fingerprint": "forged",
+                    }
+                ],
+            }
+        },
+    )
+
+    assert CANDIDATE_SIBLING_RETIREMENTS_KEY not in action["evidence_json"]
+
+
+def test_reverting_candidate_action_restores_retired_sibling_and_question(
+    tmp_path: Path,
+) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    candidate_key = "canonicalize_page:concepts/reversible-review.md"
+    selected = propose_action(
+        svc.paths,
+        "canonicalize_page",
+        action_payload={"page_hint": "concepts/reversible-review.md"},
+        action_features={"candidate_key": candidate_key, "reversible": True},
+        target_page_paths=["concepts/reversible-review.md"],
+    )
+    sibling = propose_action(
+        svc.paths,
+        "canonicalize_page",
+        action_payload={"page_hint": "concepts/reversible-review.md"},
+        action_features={"reversible": True},
+        target_page_paths=["concepts/reversible-review.md"],
+    )
+    previous_answer = {"draft": "preserve candidate review state"}
+    with connection(svc.paths.sqlite_path) as conn:
+        features = json.loads(
+            conn.execute(
+                "SELECT action_features FROM cos_actions WHERE id = ?",
+                (sibling["id"],),
+            ).fetchone()[0]
+        )
+        features["candidate_key"] = candidate_key
+        conn.execute(
+            "UPDATE cos_actions SET action_features = ? WHERE id = ?",
+            (json.dumps(features), sibling["id"]),
+        )
+        conn.execute(
+            "UPDATE cos_actions SET status = 'needs_human' WHERE id = ?",
+            (sibling["id"],),
+        )
+        conn.execute(
+            """
+            INSERT INTO open_questions(
+              id, kind, fact_ids, question, options, status, answer, context,
+              action_id, recommended_action, risk_tier, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "question_reversible_candidate_sibling",
+                "policy_escalation",
+                "[]",
+                "Review duplicate candidate.",
+                "[]",
+                "needs_human",
+                json.dumps(previous_answer),
+                "{}",
+                sibling["id"],
+                "{}",
+                "low",
+                "2026-07-09T12:00:00+00:00",
+            ),
+        )
+
+    applied = apply_action(svc.paths, selected["id"])
+    reverted = revert_action(svc.paths, selected["id"])
+
+    assert applied["status"] == "applied"
+    assert reverted["status"] == "reverted"
+    with connection(svc.paths.sqlite_path) as conn:
+        sibling_row = conn.execute(
+            "SELECT status, evidence_json FROM cos_actions WHERE id = ?",
+            (sibling["id"],),
+        ).fetchone()
+        question = conn.execute(
+            """
+            SELECT status, answer, answered_at, decided_by
+            FROM open_questions WHERE id = ?
+            """,
+            ("question_reversible_candidate_sibling",),
+        ).fetchone()
+    assert sibling_row["status"] == "needs_human"
+    assert "candidate_superseded" not in json.loads(sibling_row["evidence_json"])
+    assert question["status"] == "needs_human"
+    assert json.loads(question["answer"]) == previous_answer
+    assert question["answered_at"] is None
+    assert question["decided_by"] is None
+
+    reapplied = apply_action(svc.paths, selected["id"])
+    assert reapplied["status"] == "applied"
+    with connection(svc.paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            UPDATE open_questions
+            SET status = 'answered', answer = '{"decision":"newer_review"}',
+                answered_at = '2026-07-09T13:00:00+00:00', decided_by = 'human'
+            WHERE id = ?
+            """,
+            ("question_reversible_candidate_sibling",),
+        )
+
+    refused = revert_action(svc.paths, selected["id"])
+
+    assert refused["status"] == "failed"
+    with connection(svc.paths.sqlite_path) as conn:
+        sibling_after_drift = conn.execute(
+            "SELECT status FROM cos_actions WHERE id = ?", (sibling["id"],)
+        ).fetchone()
+        question_after_drift = conn.execute(
+            "SELECT status, answer, decided_by FROM open_questions WHERE id = ?",
+            ("question_reversible_candidate_sibling",),
+        ).fetchone()
+    assert sibling_after_drift["status"] == "dismissed"
+    assert question_after_drift["status"] == "answered"
+    assert json.loads(question_after_drift["answer"]) == {"decision": "newer_review"}
+    assert question_after_drift["decided_by"] == "human"
 
 
 def test_fact_upsert_revert_round_trip_and_drift_refusal(tmp_path: Path) -> None:
@@ -4153,7 +4370,9 @@ def test_sampled_audit_isolates_failed_batch(tmp_path: Path) -> None:
     assert get_action(svc.paths, action["id"])["audit_status"] == "unaudited"
 
 
-def test_sampled_audit_respects_zero_policy_sample_rate(tmp_path: Path) -> None:
+def test_sampled_audit_explicit_ids_respect_zero_policy_sample_rate(
+    tmp_path: Path,
+) -> None:
     svc = service_for(tmp_path)
     svc.init_workspace()
     with connection(svc.paths.sqlite_path) as conn:
@@ -4186,19 +4405,80 @@ def test_sampled_audit_respects_zero_policy_sample_rate(tmp_path: Path) -> None:
     action = propose_action(
         svc.paths,
         "canonicalize_page",
+        run_id="run_zero_policy_sample",
         action_payload={"page_hint": "concepts/test.md"},
         action_features={"skip_audit_sample": True},
         target_page_paths=["concepts/test.md"],
     )
     decided = decide_action(svc.paths, action["id"])
 
-    result = run_sampled_audit(svc.paths, llm_provider=FailingAuditorProvider())
+    result = run_sampled_audit(
+        svc.paths,
+        action_ids=[decided["id"]],
+        llm_provider=FailingAuditorProvider(),
+    )
 
     assert decided["status"] == "applied"
     assert decided["policy_id"] == "policy_test_zero_audit"
     assert result["mode"] == "configured"
     assert result["sampled"] == 0
     assert result["audited"] == []
+    assert result["scope"]["explicit_action_count"] == 1
+    assert get_action(svc.paths, decided["id"])["audit_status"] == "unaudited"
+
+
+def test_sampled_audit_explicit_cohort_samples_before_limit(tmp_path: Path) -> None:
+    svc = service_for(tmp_path)
+    svc.init_workspace()
+    insert_audit_policy(
+        svc.paths,
+        "policy_explicit_fractional_audit",
+        {"explicit_fractional_audit": True},
+        demotion_threshold=0.5,
+        audit_sample_rate=0.5,
+    )
+    actions = [
+        decide_action(
+            svc.paths,
+            propose_action(
+                svc.paths,
+                "canonicalize_page",
+                action_payload={"page_hint": f"concepts/fractional-{index}.md"},
+                action_features={"explicit_fractional_audit": True},
+                target_page_paths=[f"concepts/fractional-{index}.md"],
+            )["id"],
+        )
+        for index in range(2)
+    ]
+    ordered = sorted(actions, key=lambda action: stable_sample_fraction(action["id"]))
+    included, excluded = ordered
+    sample_rate = (
+        stable_sample_fraction(included["id"]) + stable_sample_fraction(excluded["id"])
+    ) / 2.0
+    with connection(svc.paths.sqlite_path) as conn:
+        conn.execute(
+            "UPDATE cos_policy SET audit_sample_rate = ? WHERE id = ? AND version = ?",
+            (sample_rate, "policy_explicit_fractional_audit", 99),
+        )
+        conn.execute(
+            "UPDATE cos_actions SET applied_at = ? WHERE id = ?",
+            ("2026-06-25T00:00:02+00:00", excluded["id"]),
+        )
+        conn.execute(
+            "UPDATE cos_actions SET applied_at = ? WHERE id = ?",
+            ("2026-06-25T00:00:01+00:00", included["id"]),
+        )
+
+    result = run_sampled_audit(
+        svc.paths,
+        limit=1,
+        action_ids=[excluded["id"], included["id"]],
+        llm_provider=FakeAuditorProvider({included["id"]: "ok"}),
+    )
+
+    assert result["sampled_action_ids"] == [included["id"]]
+    assert [action["id"] for action in result["audited"]] == [included["id"]]
+    assert get_action(svc.paths, excluded["id"])["audit_status"] == "unaudited"
 
 
 def test_sampled_audit_unscoped_bad_reverts_without_demoting_policy(
@@ -5979,6 +6259,7 @@ def insert_audit_policy(
     match: dict[str, object],
     *,
     demotion_threshold: float,
+    audit_sample_rate: float = 1.0,
 ) -> None:
     with connection(paths.sqlite_path) as conn:
         conn.execute(
@@ -6000,7 +6281,7 @@ def insert_audit_policy(
                 0,
                 0,
                 None,
-                1.0,
+                audit_sample_rate,
                 demotion_threshold,
                 "[]",
                 1,

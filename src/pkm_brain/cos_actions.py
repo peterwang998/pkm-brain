@@ -2,10 +2,22 @@ from __future__ import annotations
 
 import hashlib
 import re
+from contextlib import nullcontext
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+from .action_review_enforcement import (
+    enforce_action_review_resolution,
+    resolve_action_from_semantic_resolution,
+)
+from .candidate_retirement import (
+    CANDIDATE_SIBLING_RETIREMENTS_KEY,
+    action_candidate_key,
+    restore_retired_candidate_siblings,
+    retire_open_candidate_siblings,
+)
 from .cos_action_prechecks import apply_event_fact_action_precheck
+from .event_routing import extraction_event_candidate
 from .critic_context import (
     CRITIC_CONTEXT_RADIUS as CRITIC_CONTEXT_RADIUS,
     MAX_CRITIC_REPAIR_EVIDENCE_UNITS,
@@ -26,9 +38,22 @@ from .entities import (
     normalize_admit_kinds,
     normalize_entity_name,
     normalize_entity_type,
-    normalize_mention_kind,
     replace_fact_entity_links,
     resolve_entity,
+)
+from .fact_entity_attribution import (
+    FACT_ENTITY_ATTRIBUTION_SNAPSHOT_KEY as FACT_ENTITY_ATTRIBUTION_SNAPSHOT_KEY,
+    FACT_ENTITY_ATTRIBUTION_SNAPSHOT_VERSION as FACT_ENTITY_ATTRIBUTION_SNAPSHOT_VERSION,
+    fact_clears_entity_attribution as fact_clears_entity_attribution,
+    fact_entity_attribution_input_present as fact_entity_attribution_input_present,
+    fact_entity_attribution_snapshot_mentions as fact_entity_attribution_snapshot_mentions,
+    fact_entity_id_is_explicit as fact_entity_id_is_explicit,
+    fact_entity_mentions as fact_entity_mentions,
+    fact_with_entity_attribution_snapshot as fact_with_entity_attribution_snapshot,
+    fact_with_resolved_entity_id_receipt as fact_with_resolved_entity_id_receipt,
+    first_primary_entity_mention as first_primary_entity_mention,
+    normalize_fact_entity_mentions as normalize_fact_entity_mentions,
+    primary_entity_mention as primary_entity_mention,
 )
 from .fact_event_integrity import (
     event_time_for_resolved_primary_event,
@@ -56,6 +81,10 @@ from .llm import (
     load_cos_llm_config,
 )
 from .paths import BrainPaths
+from .review_resolution import (
+    action_is_manually_resolved,
+    action_review_identity,
+)
 from .source_evidence import resolve_evidence_unit_ids
 from .util import new_id, now_iso
 
@@ -201,10 +230,56 @@ def propose_action(
     risk_tier: str | None = None,
     evidence: dict[str, Any] | None = None,
     decide: bool = False,
+    override_semantic_rejection: bool = False,
 ) -> dict[str, Any]:
+    with connection(paths.sqlite_path) as conn:
+        selected_action = propose_action_in_connection(
+            conn,
+            action_type,
+            action_payload=action_payload,
+            action_features=action_features,
+            run_id=run_id,
+            target_fact_ids=target_fact_ids,
+            target_page_paths=target_page_paths,
+            target_contract_ids=target_contract_ids,
+            proposed_by=proposed_by,
+            confidence=confidence,
+            risk_tier=risk_tier,
+            evidence=evidence,
+        )
+    selected_action_id = str(selected_action["id"])
+    if not override_semantic_rejection and not action_is_event_fact_candidate(
+        selected_action
+    ):
+        selected_action = resolve_action_from_semantic_resolution(
+            paths, selected_action
+        )
+    if decide and selected_action["status"] == "proposed":
+        return decide_action(paths, selected_action_id)
+    return selected_action
+
+
+def propose_action_in_connection(
+    conn: Any,
+    action_type: str,
+    *,
+    action_payload: dict[str, Any] | None = None,
+    action_features: dict[str, Any] | None = None,
+    run_id: str | None = None,
+    target_fact_ids: list[str] | None = None,
+    target_page_paths: list[str] | None = None,
+    target_contract_ids: list[str] | None = None,
+    proposed_by: str = "system",
+    confidence: float | None = None,
+    risk_tier: str | None = None,
+    evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Insert or reuse a proposal on the caller's transaction."""
+
     validate_action_type(action_type)
     action_id = new_id("cosact")
     evidence_json = dict(evidence or {})
+    evidence_json.pop(CANDIDATE_SIBLING_RETIREMENTS_KEY, None)
     if action_payload is not None:
         evidence_json["payload"] = action_payload
     features = dict(action_features or {})
@@ -220,63 +295,62 @@ def propose_action(
     created_at = now_iso()
     candidate_key = str(features.get("candidate_key") or "").strip()
     existing_action_id: str | None = None
-    with connection(paths.sqlite_path) as conn:
-        existing = (
-            open_action_for_candidate_key(conn, action_type, candidate_key)
-            if candidate_key
-            else None
+    existing = (
+        open_action_for_candidate_key(conn, action_type, candidate_key)
+        if candidate_key
+        else None
+    )
+    if existing is not None:
+        existing_action_id = str(existing["id"])
+    elif run_id:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO wiki_curation_runs(
+              id, source_packet_id, group_by, status, summary, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                None,
+                "cos_action",
+                "running",
+                dumps({"created_by": "propose_action"}),
+                created_at,
+            ),
         )
-        if existing is not None:
-            existing_action_id = str(existing["id"])
-        elif run_id:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO wiki_curation_runs(
-                  id, source_packet_id, group_by, status, summary, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    run_id,
-                    None,
-                    "cos_action",
-                    "running",
-                    dumps({"created_by": "propose_action"}),
-                    created_at,
-                ),
-            )
-        if existing_action_id is None:
-            conn.execute(
-                """
-                INSERT INTO cos_actions(
-                  id, run_id, action_type, status, target_fact_ids, target_page_paths,
-                  target_contract_ids, action_features, proposed_by, confidence,
-                  risk_tier, evidence_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    action_id,
-                    run_id,
-                    action_type,
-                    "proposed",
-                    dumps(target_fact_ids or []),
-                    dumps(target_page_paths or []),
-                    dumps(target_contract_ids or []),
-                    dumps(features),
-                    proposed_by,
-                    confidence,
-                    resolved_risk_tier,
-                    dumps(evidence_json),
-                    created_at,
-                ),
-            )
-    if existing_action_id is not None:
-        existing_action = get_action(paths, existing_action_id)
-        if decide and existing_action["status"] == "proposed":
-            return decide_action(paths, existing_action_id)
-        return existing_action
-    if decide:
-        return decide_action(paths, action_id)
-    return get_action(paths, action_id)
+    if existing_action_id is None:
+        conn.execute(
+            """
+            INSERT INTO cos_actions(
+              id, run_id, action_type, status, target_fact_ids, target_page_paths,
+              target_contract_ids, action_features, proposed_by, confidence,
+              risk_tier, evidence_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                action_id,
+                run_id,
+                action_type,
+                "proposed",
+                dumps(target_fact_ids or []),
+                dumps(target_page_paths or []),
+                dumps(target_contract_ids or []),
+                dumps(features),
+                proposed_by,
+                confidence,
+                resolved_risk_tier,
+                dumps(evidence_json),
+                created_at,
+            ),
+        )
+    return load_action(conn, existing_action_id or action_id)
+
+
+def action_is_event_fact_candidate(action: dict[str, Any]) -> bool:
+    if action.get("action_type") != "fact_upsert":
+        return False
+    fact = action_payload(action).get("fact")
+    return isinstance(fact, dict) and extraction_event_candidate(fact)
 
 
 def open_action_for_candidate_key(
@@ -299,78 +373,6 @@ def open_action_for_candidate_key(
         if action_candidate_key(action) == candidate_key:
             return action
     return None
-
-
-def action_candidate_key(action: dict[str, Any]) -> str:
-    features = action.get("action_features")
-    if isinstance(features, dict):
-        key = str(features.get("candidate_key") or "").strip()
-        if key:
-            return key
-    payload = action_payload(action)
-    if isinstance(payload, dict):
-        candidate = payload.get("candidate")
-        if isinstance(candidate, dict):
-            return str(candidate.get("candidate_key") or "").strip()
-        return str(payload.get("candidate_key") or "").strip()
-    return ""
-
-
-def retire_open_candidate_siblings(
-    conn: Any, action: dict[str, Any], *, reason: str
-) -> list[str]:
-    candidate_key = action_candidate_key(action)
-    if not candidate_key:
-        return []
-    sibling_ids: list[str] = []
-    rows = conn.execute(
-        """
-        SELECT *
-        FROM cos_actions
-        WHERE action_type = ?
-          AND status IN ('proposed', 'needs_human')
-          AND id != ?
-        ORDER BY created_at, id
-        """,
-        (action["action_type"], action["id"]),
-    )
-    for row in rows:
-        sibling = row_to_action(row)
-        if action_candidate_key(sibling) != candidate_key:
-            continue
-        sibling_ids.append(str(sibling["id"]))
-        evidence = dict(sibling.get("evidence_json") or {})
-        evidence["candidate_superseded"] = {
-            "by_action_id": action["id"],
-            "candidate_key": candidate_key,
-            "reason": reason,
-            "at": now_iso(),
-        }
-        conn.execute(
-            "UPDATE cos_actions SET status = 'dismissed', evidence_json = ? WHERE id = ?",
-            (dumps(evidence), sibling["id"]),
-        )
-    if sibling_ids:
-        placeholders = ",".join("?" for _ in sibling_ids)
-        answer = dumps(
-            {
-                "decision": "obsolete",
-                "reason": reason,
-                "superseded_by_action_id": action["id"],
-                "candidate_key": candidate_key,
-            }
-        )
-        conn.execute(
-            f"""
-            UPDATE open_questions
-            SET status = 'dismissed', answer = ?, answered_at = ?,
-                decided_by = 'candidate_deduplication'
-            WHERE action_id IN ({placeholders})
-              AND status IN ('open', 'needs_human')
-            """,
-            [answer, now_iso(), *sibling_ids],
-        )
-    return sibling_ids
 
 
 def precheck_event_fact_action(conn: Any, action: dict[str, Any]) -> dict[str, Any]:
@@ -399,7 +401,12 @@ def decide_action(
         )
     with connection(paths.sqlite_path) as conn:
         action = load_action(conn, action_id)
+        if action.get("status") == "rejected":
+            return action
         action = precheck_event_fact_action(conn, action)
+        action = enforce_action_review_resolution(conn, action)
+        if action.get("status") == "rejected":
+            return action
         decision = evaluate_policy(
             conn, action["action_type"], action.get("action_features") or {}
         )
@@ -485,6 +492,11 @@ def decide_action(
                 action_id,
             ),
         )
+    action = resolve_action_from_semantic_resolution(
+        paths, get_action(paths, action_id)
+    )
+    if action.get("status") == "rejected":
+        return action
     if decision.autonomy_level == "L0":
         return apply_decided_action(
             paths, action_id, applied_status="auto_applied", action=action
@@ -841,9 +853,7 @@ def rebuild_fact_action_evidence(
     evidence_sanitization: dict[str, Any] | None = None
     if str(row["source_type"] or "") == "gmail_thread":
         source_values = gmail_sensitive_values(str(row["text"] or ""))
-        if gmail_payload_contains_sensitive_value(
-            fact, source_values=source_values
-        ):
+        if gmail_payload_contains_sensitive_value(fact, source_values=source_values):
             return {
                 "status": "not_repaired",
                 "reason": "Gmail credential facts may not be repaired or persisted",
@@ -933,25 +943,62 @@ def apply_action(
     *,
     applied_status: str = "applied",
     allow_llm_entity_resolution: bool = True,
+    override_semantic_rejection: bool = False,
+    transaction_hook: Callable[[Any, dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     with connection(paths.sqlite_path) as conn:
+        return apply_action_in_connection(
+            paths,
+            conn,
+            action_id,
+            applied_status=applied_status,
+            allow_llm_entity_resolution=allow_llm_entity_resolution,
+            override_semantic_rejection=override_semantic_rejection,
+            transaction_hook=transaction_hook,
+            persist_failure=True,
+        )
+
+
+def apply_action_in_connection(
+    paths: BrainPaths,
+    conn: Any,
+    action_id: str,
+    *,
+    applied_status: str = "applied",
+    allow_llm_entity_resolution: bool = True,
+    override_semantic_rejection: bool = False,
+    transaction_hook: Callable[[Any, dict[str, Any]], None] | None = None,
+    persist_failure: bool = False,
+) -> dict[str, Any]:
+    """Apply an action without crossing the caller's transaction boundary."""
+
+    with nullcontext(conn) as conn:
         action = load_action(conn, action_id)
         if action["status"] in APPLIED_STATUSES:
             return action
+        if action["status"] == "rejected" and not override_semantic_rejection:
+            return action
+        action = precheck_event_fact_action(conn, action)
+        if not override_semantic_rejection:
+            action = enforce_action_review_resolution(conn, action)
+            if action["status"] == "rejected":
+                return action
         spec = ACTION_TYPE_SPECS.get(str(action["action_type"]))
         if spec is None:
             conn.execute(
                 "UPDATE cos_actions SET status = ? WHERE id = ?",
                 ("failed", action_id),
             )
-            conn.commit()
+            if persist_failure:
+                conn.commit()
             raise ValueError(f"unknown cos action type: {action['action_type']}")
         if not spec.get("implemented"):
             conn.execute(
                 "UPDATE cos_actions SET status = ? WHERE id = ?",
                 ("failed", action_id),
             )
-            conn.commit()
+            if persist_failure:
+                conn.commit()
             reason = spec.get("reason") or "not implemented"
             raise ValueError(
                 f"action type {action['action_type']} is declared but not implemented: {reason}"
@@ -968,6 +1015,9 @@ def apply_action(
                 payload,
                 paths=paths,
                 allow_llm_entity_resolution=allow_llm_entity_resolution,
+                human_confirmed=bool(
+                    (action.get("action_features") or {}).get("human_confirmed")
+                ),
             )
             target_fact_ids = stable_unique([*target_fact_ids, *fact_ids])
         elif action["action_type"] in {"fact_supersede", "resolve_conflict"}:
@@ -1026,7 +1076,8 @@ def apply_action(
                 "UPDATE cos_actions SET status = ? WHERE id = ?",
                 ("failed", action_id),
             )
-            conn.commit()
+            if persist_failure:
+                conn.commit()
             raise ValueError(
                 f"unsupported implemented action type: {action['action_type']}"
             )
@@ -1042,7 +1093,7 @@ def apply_action(
             UPDATE cos_actions
             SET status = ?, target_fact_ids = ?, target_contract_ids = ?,
                 target_page_paths = ?, inverse_action_json = ?,
-                applied_state_hash = ?, applied_at = ?
+                applied_state_hash = ?, applied_at = ?, reverted_at = NULL
             WHERE id = ?
             """,
             (
@@ -1061,11 +1112,26 @@ def apply_action(
             action,
             reason=f"candidate resolved by {applied_status} action",
         )
-    return get_action(paths, action_id)
+        if transaction_hook is not None:
+            transaction_hook(conn, action)
+    return load_action(conn, action_id)
 
 
 def revert_action(paths: BrainPaths, action_id: str) -> dict[str, Any]:
     with connection(paths.sqlite_path) as conn:
+        # The sibling snapshot preflight and every inverse mutation must observe
+        # one write-locked state. Otherwise another reviewer could change a
+        # retired sibling between validation and restoration.
+        conn.execute("BEGIN IMMEDIATE")
+        return revert_action_in_connection(paths, conn, action_id)
+
+
+def revert_action_in_connection(
+    paths: BrainPaths, conn: Any, action_id: str
+) -> dict[str, Any]:
+    """Revert an action inside an existing write transaction."""
+
+    with nullcontext(conn) as conn:
         action = load_action(conn, action_id)
         if action["status"] == "reverted":
             return action
@@ -1088,16 +1154,32 @@ def revert_action(paths: BrainPaths, action_id: str) -> dict[str, Any]:
                 ("failed", action_id),
             )
             return load_action(conn, action_id)
+        try:
+            restore_retired_candidate_siblings(conn, action)
+        except ValueError:
+            create_action_residue(
+                conn,
+                action,
+                "revert_drift",
+                "Guarded revert refused because a retired candidate sibling drifted.",
+            )
+            conn.execute(
+                "UPDATE cos_actions SET status = ? WHERE id = ?",
+                ("failed", action_id),
+            )
+            return load_action(conn, action_id)
         apply_inverse(conn, action.get("inverse_action_json") or {})
+        evidence = dict(action.get("evidence_json") or {})
+        evidence.pop(CANDIDATE_SIBLING_RETIREMENTS_KEY, None)
         conn.execute(
             """
             UPDATE cos_actions
-            SET status = 'reverted', reverted_at = ?
+            SET status = 'reverted', evidence_json = ?, reverted_at = ?
             WHERE id = ?
             """,
-            (now_iso(), action_id),
+            (dumps(evidence), now_iso(), action_id),
         )
-    return get_action(paths, action_id)
+    return load_action(conn, action_id)
 
 
 def audit_action_reviewability(conn: Any, action: dict[str, Any]) -> dict[str, Any]:
@@ -1114,6 +1196,13 @@ def audit_action_reviewability(conn: Any, action: dict[str, Any]) -> dict[str, A
             "revertible": False,
             "revert_mode": None,
             "reason": "action_no_longer_applied",
+        }
+    if action_is_manually_resolved(conn, action):
+        return {
+            "reviewable": False,
+            "revertible": False,
+            "revert_mode": None,
+            "reason": "manually_resolved_state",
         }
     inverse = action.get("inverse_action_json")
     meaningful_inverse = isinstance(inverse, dict) and any(
@@ -1192,15 +1281,32 @@ def reviewable_bad_audit_actions(conn: Any) -> list[dict[str, Any]]:
             SELECT *
             FROM cos_actions
             WHERE audit_status = 'sampled_bad'
-            ORDER BY COALESCE(applied_at, created_at) DESC, id DESC
+            ORDER BY COALESCE(applied_at, created_at) DESC, rowid DESC
             """
         )
     ]
-    return [
-        action
-        for action in actions
-        if audit_action_reviewability(conn, action)["reviewable"]
-    ]
+    representatives: list[dict[str, Any]] = []
+    by_issue: dict[str, dict[str, Any]] = {}
+    for action in actions:
+        if not audit_action_reviewability(conn, action)["reviewable"]:
+            continue
+        identity = action_review_identity(action)
+        issue_key = f"{identity['family_key']}:{identity['state_fingerprint']}"
+        representative = by_issue.get(issue_key)
+        if representative is None:
+            representative = dict(action)
+            representative["audit_issue_key"] = issue_key
+            representative["audit_group_key"] = identity["group_key"]
+            representative["related_audit_action_ids"] = [str(action["id"])]
+            representative["related_audit_action_count"] = 1
+            by_issue[issue_key] = representative
+            representatives.append(representative)
+            continue
+        representative["related_audit_action_ids"].append(str(action["id"]))
+        representative["related_audit_action_count"] = len(
+            representative["related_audit_action_ids"]
+        )
+    return representatives
 
 
 def repair_refused_fact_audit_revert(
@@ -1328,6 +1434,10 @@ def mark_action_residue(
 ) -> dict[str, Any]:
     with connection(paths.sqlite_path) as conn:
         action = load_action(conn, action_id)
+        action = precheck_event_fact_action(conn, action)
+        action = enforce_action_review_resolution(conn, action)
+        if action.get("status") not in OPEN_ACTION_STATUSES:
+            return action
         create_action_residue(conn, action, kind, reason)
         conn.execute(
             """
@@ -1386,6 +1496,7 @@ def apply_fact_upsert(
     paths: BrainPaths | None = None,
     allow_llm_entity_resolution: bool = True,
     record_revision: bool = True,
+    human_confirmed: bool = False,
 ) -> tuple[list[str], dict[str, Any]]:
     from .wiki_facts import rebuild_fact_retrieval_index
 
@@ -1409,6 +1520,7 @@ def apply_fact_upsert(
         existing,
         entity_links,
         record_revision=record_revision,
+        human_confirmed=human_confirmed,
     )
     rebuild_fact_retrieval_index(conn)
     return touched_ids, inverse
@@ -1424,12 +1536,32 @@ def fact_with_entity_links(
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     existing_get = existing_value_getter(existing)
     mentions = fact_entity_mentions(fact)
+    fact = fact_with_entity_attribution_snapshot(fact, mentions, existing_get)
+    # A metadata-only update may have recovered the prior receipt.  Feed that
+    # receipt through the same normalizer so persisted links are rebuilt from
+    # their original attribution rather than a blank primary mention.
+    mentions = fact_entity_mentions(fact)
     primary_mention = first_primary_entity_mention(mentions)
     admit_kinds = entity_admit_kinds(paths)
+    clears_attribution = fact_clears_entity_attribution(fact)
     entity_id = str(
-        fact.get("entity_id") or existing_get("entity_id", "") or ""
+        fact.get("entity_id")
+        or ("" if clears_attribution else existing_get("entity_id", ""))
+        or ""
     ).strip()
     links: list[dict[str, Any]] = []
+    if clears_attribution:
+        # An explicit empty structured input shadows every legacy fallback,
+        # including a stale model_entity_key carried in the same metadata.
+        return fact_with_resolved_entity_id_receipt(fact, None), links
+    if (
+        entity_id
+        and not entity_exists(conn, entity_id)
+        and fact_entity_id_is_explicit(fact)
+    ):
+        raise ValueError(
+            f"fact_upsert references unknown explicit entity_id: {entity_id}"
+        )
     if entity_id and entity_exists(conn, entity_id):
         links.append(
             entity_link_from_existing(
@@ -1450,7 +1582,7 @@ def fact_with_entity_links(
             else primary_entity_mention(fact)
         )
         if not mention_text:
-            return fact, []
+            return fact_with_resolved_entity_id_receipt(fact, entity_id), []
         primary_resolution = resolve_entity(
             conn,
             mention_text,
@@ -1499,89 +1631,9 @@ def fact_with_entity_links(
         links[0]["is_primary"] = True
         entity_id = str(links[0]["entity_id"])
     if not entity_id:
-        return fact, links
-    return {**fact, "entity_id": entity_id}, links
-
-
-def fact_entity_mentions(fact: dict[str, Any]) -> list[dict[str, Any]]:
-    raw_mentions = fact.get("entity_mentions")
-    if raw_mentions is None:
-        metadata = fact.get("metadata")
-        if isinstance(metadata, str):
-            metadata = loads(metadata, {})
-        if isinstance(metadata, dict):
-            raw_mentions = metadata.get("model_entity_mentions")
-    mentions = normalize_fact_entity_mentions(raw_mentions)
-    if mentions:
-        return mentions
-    primary = primary_entity_mention(fact)
-    if not primary:
-        return []
-    return [
-        {
-            "surface": primary,
-            "entity_type": normalize_entity_type(fact.get("entity_type")),
-            "is_primary": True,
-            "mention_span": None,
-            "mention_kind": "named",
-            "confidence": optional_float(
-                fact.get("truth_confidence") or fact.get("confidence")
-            ),
-        }
-    ]
-
-
-def normalize_fact_entity_mentions(raw_mentions: Any) -> list[dict[str, Any]]:
-    if not isinstance(raw_mentions, list):
-        return []
-    mentions: list[dict[str, Any]] = []
-    primary_seen = False
-    for raw in raw_mentions:
-        if not isinstance(raw, dict):
-            continue
-        surface = str(
-            raw.get("surface")
-            or raw.get("mention")
-            or raw.get("name")
-            or raw.get("entity_key")
-            or ""
-        ).strip()
-        if not surface:
-            continue
-        entity_type = normalize_entity_type(raw.get("entity_type") or raw.get("type"))
-        mention_kind = normalize_mention_kind(
-            raw.get("mention_kind") or raw.get("kind")
-        )
-        is_primary = bool(raw.get("is_primary")) and not primary_seen
-        if is_primary:
-            primary_seen = True
-        mentions.append(
-            {
-                "surface": surface,
-                "entity_identity": str(raw.get("entity_identity") or "").strip()
-                or None,
-                "entity_type": entity_type,
-                "is_primary": is_primary,
-                "mention_span": raw.get("mention_span")
-                if isinstance(raw.get("mention_span"), dict)
-                else None,
-                "mention_kind": mention_kind,
-                "confidence": optional_float(raw.get("confidence")),
-            }
-        )
-    if mentions and not any(mention["is_primary"] for mention in mentions):
-        mentions[0]["is_primary"] = True
-    return mentions
-
-
-def first_primary_entity_mention(
-    mentions: list[dict[str, Any]],
-) -> dict[str, Any] | None:
-    if not mentions:
-        return None
-    return next(
-        (mention for mention in mentions if mention.get("is_primary")), mentions[0]
-    )
+        return fact_with_resolved_entity_id_receipt(fact, None), links
+    fact = {**fact, "entity_id": entity_id}
+    return fact_with_resolved_entity_id_receipt(fact, entity_id), links
 
 
 def entity_link_from_existing(
@@ -1641,21 +1693,6 @@ def entity_resolution_context(fact: dict[str, Any]) -> dict[str, Any]:
         "section_hint": fact.get("section_hint"),
         "evidence_quote": fact.get("evidence_quote"),
     }
-
-
-def primary_entity_mention(fact: dict[str, Any]) -> str | None:
-    metadata = fact.get("metadata")
-    if isinstance(metadata, str):
-        metadata = loads(metadata, {})
-    if isinstance(metadata, dict):
-        model_entity_key = str(metadata.get("model_entity_key") or "").strip()
-        if model_entity_key:
-            return model_entity_key
-    for key in ("entity_mention", "entity_name"):
-        value = str(fact.get(key) or "").strip()
-        if value:
-            return value
-    return None
 
 
 def source_ids_from_fact(fact: dict[str, Any]) -> list[str]:

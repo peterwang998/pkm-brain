@@ -1,7 +1,7 @@
 # App And Operations
 
 **Status:** canonical living feature spec; native app is primary, with live-validated scheduled Gmail mirroring and an encrypted local history archive
-**Last verified:** 2026-07-14 against the completed archive, installed scheduler/tools, and full release suites
+**Last verified:** 2026-07-31 against the temporal-cognition scheduler and durable semantic review design
 **Owns:** daemon, scheduler, connector operations, native/browser UI, settings, provisioning, packaging, migration, and operational retention
 
 ## Product Shape
@@ -48,7 +48,9 @@ The daemon:
 - exposes skipped/no-op reasons, not only status labels;
 - keeps jobs role-gated.
 
-Current job classes include capture tick, nightly maintenance, secondary tick, one `sync:<peer>` job per configured child on a primary, meeting preparation, `gmail_mirror_sync`, and `gmail_archive_sync`. The registry derives cadence and due state from config. Pausing does not erase due state; run-now behavior is explicit.
+Current job classes include capture tick, nightly maintenance, weekly historical audit, secondary tick, one `sync:<peer>` job per configured child on a primary, meeting preparation, `gmail_mirror_sync`, and `gmail_archive_sync`. The registry derives cadence and due state from config. Pausing does not erase due state; run-now behavior is explicit.
+
+Nightly maintenance passes the exact action IDs returned by its extraction, gardener, and synthesis stages into sampled audit, so it reviews only work touched by that cycle even when a stage reuses an older open action. The action keeps its original provenance `run_id`; an explicit empty action-ID list is a zero-action audit and never causes an implicit global-backlog scan. `weekly_historical_audit` is registered only for `single` or active `primary`, runs in the serialized knowledge-mutation lane, and uses an hourly due check backed by the durable successful `weekly-historical-audit` automation record. A daemon restart therefore cannot reset the 168-hour interval. Each due run is bounded to five historical actions and the available active historical-review capacity. Cohort selection examines at most 512 unaudited applied actions through 64-row keyset batches ordered by `(COALESCE(applied_at, created_at), id)` and ranks semantic priority only within that bounded window. Its start-after cursor and exact bounded window membership are durable across successful weekly runs: a nonempty cohort pins those action IDs so newer or backdated inserts cannot displace unselected eligible rows, an empty window advances to its original tail, and reaching the historical tail wraps the next successful scan to the newest row. Consequently a newest window made entirely of manual resolutions or policy-unsampled rows cannot permanently starve older work. Fact priority enrichment is capped at 4,096 target IDs in 400-bind chunks. The selected action IDs and scan state are persisted before the first auditor call, so an incomplete or interrupted hourly retry stays inside the same weekly cohort instead of widening the pass. Failed and unconfigured runs do not advance the durable success watermark. A retry with only one to four available finding slots remains failed after auditing that subset and keeps the exact cohort until every still-eligible member is terminal; a full-capacity block likewise stays pending until an hourly check can resume it. The same operation remains explicitly invocable for diagnosis without changing the nightly scope.
 
 Operational work has two lanes. On `single` or active `primary`, `gmail_mirror_sync` runs on startup and about every 600 seconds on the separate `provider_sync` lane; it performs provider reads and atomic mirror/checkpoint/queue commits without Luna or `ops_items` mutation. The full Calendar refresh plus Gmail queue analysis/reconciliation still starts only from the owner's **Today > Run Shadow** action, with one evaluation pass active at a time. A provider or analysis failure records its own incomplete state and leaves the last valid mailbox mirror and item projection intact; it does not block capture, knowledge curation, or daemon health.
 
@@ -303,7 +305,7 @@ Key UI endpoints:
 | `GET /api/ops/items/<id>/meeting-packet` | derive a bounded meeting-preparation projection |
 | `GET /api/queue?kind=&sort=&limit=&cursor=` | deduplicated complete review cards |
 | `POST /api/queue/<id>/decision` | dispatch to owning primitive |
-| `POST /api/queue/undo` | guarded revert/reopen |
+| `POST /api/queue/undo` | write-locked atomic database revert/reopen plus explicit post-commit projection repair status |
 | `GET /api/wiki/pages` and page detail | Wiki browsing/provenance |
 | `GET /api/entities` and entity detail | entity/fact browsing and popularity |
 | `POST /api/entities/merge` | policy-gated merge proposal |
@@ -327,7 +329,7 @@ Provisioning checks bundle, local cache, then network. It smoke-tests `brain --v
 
 `scripts/build-app.sh` builds the exact project-version wheel, replaces stale runtime resources, resolves pinned Swift packages through absolute app-local cache paths, generates/builds the Xcode project, ad-hoc signs nested binaries and the app, and writes `dist/PKM Brain.app`. `scripts/install-app.sh` stages and verifies the bundle in `/Applications`, keeps one previous app rollback, refreshes the login item, and optionally activates the installed build.
 
-The current `0.2.4` source release gate requires Ruff, all 2,808 Python tests,
+The current `0.2.5` source release gate requires Ruff, all 2,969 Python tests,
 all 28 Swift tests, a clean app build, strict deep signature verification, and
 the GitHub native-UI workflow to pass before promotion to `main`. The resulting
 source-built app is an Apple Silicon (`arm64`) bundle with an ad-hoc signature;
@@ -417,7 +419,7 @@ scripts/m3-migration-acceptance.sh
 scripts/build-app.sh
 ```
 
-The current release result is recorded by the `0.2.4` GitHub workflow and the
+The current release result is recorded by the `0.2.5` GitHub workflow and the
 clean-checkout validation described above. Installed Gmail transport and
 private-source quality are environment-specific checks; software promotion
 does not imply owner trust in generated briefings or model judgments.

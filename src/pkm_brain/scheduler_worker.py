@@ -135,6 +135,7 @@ def run_scheduled_child(job_id: str, paths: BrainPaths) -> dict[str, Any]:
         run_gmail_knowledge_ingest,
         run_nightly_maintenance,
         run_secondary_tick,
+        run_weekly_historical_audit,
     )
 
     handlers: dict[str, Callable[[], dict[str, Any]]] = {
@@ -142,6 +143,9 @@ def run_scheduled_child(job_id: str, paths: BrainPaths) -> dict[str, Any]:
         "secondary_tick": lambda: as_jsonable(run_secondary_tick(paths)),
         "nightly": lambda: as_jsonable(
             run_nightly_maintenance(paths, if_due=True, due_after_hours=20)
+        ),
+        "weekly_historical_audit": lambda: as_jsonable(
+            run_weekly_historical_audit(paths, if_due=True, due_after_hours=168)
         ),
         "gmail_knowledge_ingest": lambda: run_gmail_knowledge_ingest(paths),
     }

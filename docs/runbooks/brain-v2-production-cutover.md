@@ -6,6 +6,25 @@
 The live evidence and remaining follow-ups are recorded in
 [`brain-v2-production-deployment-record.md`](brain-v2-production-deployment-record.md).
 
+## Schema 29 Follow-on (0.2.5)
+
+The review-stability follow-on is additive. Migration 27 creates the semantic
+`review_resolutions` ledger and backfills explicit human confirmations and
+decisions; migration 28 idempotently repairs incomplete legacy question
+resolutions and expands alternative reviews into per-fact decisions; migration
+29 replays that backfill under entity-aware fact identity and rekeys direct
+Queue decisions while retaining the schema-28 rows as revoked history. It also
+adds a normalized attribution snapshot to legacy fact metadata when exact
+mention text and type remain recoverable from `fact_entities`; it never
+fabricates an unrecoverable entity identity. These migrations do not rewrite
+fact claims/statuses, actions, audit evidence, or source data.
+Nightly audit is scoped to that maintenance run's action IDs. Older unaudited
+actions move to the due-gated `weekly_historical_audit` job, bounded to five
+samples and five active historical findings. A primary/single scheduler now has
+eight expected jobs, adding `weekly_historical_audit` as an isolated hourly due
+check on the `knowledge_mutation` lane; its successful automation watermark
+enforces the 168-hour cadence across daemon restarts.
+
 ## Decision And Boundary
 
 Upgrade `/Users/Peter/brain` in place. Do **not** replace it with
@@ -80,7 +99,7 @@ scripts/m2-clean-machine-acceptance.sh "$(mktemp -d "${TMPDIR:-/tmp}/pkm-brain-m
 ```
 
 The gate is green only when all commands pass and the clean build produces a
-validly signed `dist/PKM Brain.app` with app and Python package version `0.2.2`.
+validly signed `dist/PKM Brain.app` with app and Python package version `0.2.5`.
 
 ## Exact Cutover Procedure
 
@@ -184,9 +203,9 @@ Gmail. Run the installer once: it retains the previous app at
 
 Do not run any scheduled job until every item below passes:
 
-1. `/api/health` reports `ok=true`, version `0.2.2`, schema 26, the expected
+1. `/api/health` reports `ok=true`, version `0.2.5`, schema 29, the expected
    runtime ID, and home `/Users/Peter/brain`.
-2. The migration ledger is the exact contiguous prefix 1-26; Knowledge and
+2. The migration ledger is the exact contiguous prefix 1-29; Knowledge and
    Operations integrity checks pass with no foreign-key rows; the archive
    quick check passes.
 3. Every legacy count in the rehearsal table still matches. The five temporal
@@ -194,15 +213,15 @@ Do not run any scheduled job until every item below passes:
 4. `brain doctor --home /Users/Peter/brain` passes the database, vector, and
    embedding checks. The same four lexical probes retain their fingerprints.
 5. Both the installed and previous app bundles pass `codesign --verify --deep --strict`.
-6. The app-managed shim reports `brain 0.2.2`; align
+6. The app-managed shim reports `brain 0.2.5`; align
    `/Users/Peter/.local/bin/brain` (and `pkm-brain`, if present) to that shim
    only after preserving their old targets in the migration backup.
 7. An MCP read round trip succeeds through the app-managed runtime.
 8. No legacy Brain LaunchAgent is loaded.
-9. `/api/scheduler` remains paused and shows the expected seven jobs for this
-   primary: `capture_tick`, `nightly`, `gmail_mirror_sync`,
-   `gmail_archive_sync`, `gmail_knowledge_ingest`, `meeting_preparation`, and
-   `sync:Peters-Mac-mini`.
+9. `/api/scheduler` remains paused and shows the expected eight jobs for this
+   primary: `capture_tick`, `nightly`, `weekly_historical_audit`,
+   `gmail_mirror_sync`, `gmail_archive_sync`, `gmail_knowledge_ingest`,
+   `meeting_preparation`, and `sync:Peters-Mac-mini`.
 10. `capture_tick`, `nightly`, `gmail_knowledge_ingest`, and the sync job report
     `isolated=true` and lane `knowledge_mutation`. Gmail mirror and archive
     remain serialized on lane `provider_sync`. No private child exception text

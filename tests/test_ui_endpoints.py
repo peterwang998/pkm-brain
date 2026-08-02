@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import sqlite3
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -9,17 +10,30 @@ from typing import Iterator
 
 import pytest
 
-from pkm_brain import ui_server
+from pkm_brain import (
+    question_resolution,
+    queue_undo_transaction,
+    ui_server,
+    wiki_facts,
+)
 from pkm_brain.contracts import insert_contract_direct
 from pkm_brain.cos_actions import (
     apply_action,
     decide_action,
+    load_action,
     propose_action,
     record_action_audit,
+    target_state_hash,
 )
 from pkm_brain.cos_policy import evaluate_policy
 from pkm_brain.db import connection, dumps
 from pkm_brain.paths import BrainPaths
+from pkm_brain.review_resolution import (
+    ReviewResolutionConflict,
+    active_resolution_for_action,
+    record_review_resolution,
+)
+from pkm_brain.review_undo import ReviewUndoError, seal_undo_handle
 from pkm_brain.service import BrainService, memory_export_path
 from pkm_brain.title_utils import CODEX_PROVIDER_PROMPT_PREFIX
 from pkm_brain.ui_server import create_ui_server, ensure_ui_token
@@ -368,6 +382,63 @@ def insert_unrouted_question(
         )
 
 
+def insert_legacy_answer_question(
+    paths: BrainPaths, *, question_id: str
+) -> tuple[dict[str, object], dict[str, object]]:
+    left = existing_review_fact_payload(f"fact_{question_id}_left")
+    right = review_fact_payload(f"fact_{question_id}_right")
+    right["statement"] = "The current review workflow shows complete evidence."
+    right["evidence_quote"] = right["statement"]
+    for fact in (left, right):
+        apply_action(
+            paths,
+            propose_action(
+                paths,
+                "fact_upsert",
+                action_payload={"fact": fact},
+                action_features={"truth_mutation": True, "reversible": True},
+                target_fact_ids=[str(fact["id"])],
+                target_page_paths=[str(fact["page_hint"])],
+                proposed_by="test_legacy_answer",
+                risk_tier="low",
+            )["id"],
+        )
+    fact_ids = [str(left["id"]), str(right["id"])]
+    with connection(paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            UPDATE facts
+            SET status = 'conflicted', conflict_group_id = ?
+            WHERE id IN (?, ?)
+            """,
+            (f"conflict_{question_id}", *fact_ids),
+        )
+        conn.execute(
+            """
+            INSERT INTO open_questions(
+              id, kind, entity_key, page_hint, fact_ids, question, options,
+              status, context, risk_tier, created_at
+            ) VALUES (?, 'conflict', ?, ?, ?, ?, ?, 'open', ?, 'medium', ?)
+            """,
+            (
+                question_id,
+                right["entity_key"],
+                right["page_hint"],
+                dumps(fact_ids),
+                "Which review-workflow fact should be retained?",
+                dumps(
+                    [
+                        {"fact_id": fact["id"], "statement": fact["statement"]}
+                        for fact in (left, right)
+                    ]
+                ),
+                dumps({"conflict_group_id": f"conflict_{question_id}"}),
+                "2026-07-06T10:01:00+00:00",
+            ),
+        )
+    return left, right
+
+
 def test_status_endpoint_returns_service_layer_json(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
 
@@ -500,9 +571,7 @@ def test_v2_queue_defers_future_work_beyond_daily_admission_budget(
     BrainService(paths).init_workspace()
 
     with running_ui(paths) as (host, port, token):
-        initial_status, initial = request_json(
-            host, port, token, "GET", "/api/queue"
-        )
+        initial_status, initial = request_json(host, port, token, "GET", "/api/queue")
         assert initial_status == 200
         assert initial["queue_summary"]["active_total"] == 0
 
@@ -526,9 +595,7 @@ def test_v2_queue_defers_future_work_beyond_daily_admission_budget(
                 ],
             )
 
-        active_status, active = request_json(
-            host, port, token, "GET", "/api/queue"
-        )
+        active_status, active = request_json(host, port, token, "GET", "/api/queue")
         deferred_status, deferred = request_json(
             host, port, token, "GET", "/api/queue?state=deferred"
         )
@@ -902,6 +969,20 @@ def test_v2_queue_audit_card_surfaces_finding_and_applied_fact(tmp_path: Path) -
             f"/api/queue/{action['id']}/decision",
             {"decision": "mark_ok"},
         )
+        after_status, after = request_json(
+            host, port, token, "GET", "/api/queue?kind=audit"
+        )
+        undo_status, _undo = request_json(
+            host,
+            port,
+            token,
+            "POST",
+            "/api/queue/undo",
+            {"undo_handle": decision["undo_handle"]},
+        )
+        reopened_status, reopened = request_json(
+            host, port, token, "GET", "/api/queue?kind=audit"
+        )
 
     assert queue_status == 200
     item = queue["items"][0]
@@ -916,6 +997,1533 @@ def test_v2_queue_audit_card_surfaces_finding_and_applied_fact(tmp_path: Path) -
     assert item["approvable"] is True
     assert decision_status == 200
     assert decision["result"]["action"]["audit_status"] == "sampled_ok"
+    assert decision["result"]["confirmation"]["fact"]["confirmed_by_user"] is True
+    assert after_status == 200
+    assert after["total"] == 0
+    assert undo_status == 200
+    assert reopened_status == 200
+    assert reopened["total"] == 1
+    with connection(paths.sqlite_path) as conn:
+        fact_row = conn.execute(
+            "SELECT confirmed_by_user FROM facts WHERE id = ?", (fact["id"],)
+        ).fetchone()
+        resolution = conn.execute(
+            """
+            SELECT disposition, revoked_at
+            FROM review_resolutions
+            WHERE source_item_kind = 'audit' AND source_item_id = ?
+            """,
+            (action["id"],),
+        ).fetchone()
+    assert bool(fact_row["confirmed_by_user"]) is False
+    assert resolution["disposition"] == "keep"
+    assert resolution["revoked_at"] is not None
+
+
+def test_v2_queue_reverts_exact_audit_siblings_as_one_undoable_issue(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    fact = review_fact_payload("fact_duplicate_audit")
+    actions = []
+    for _ in range(2):
+        action = apply_action(
+            paths,
+            propose_action(
+                paths,
+                "fact_upsert",
+                action_payload={"fact": fact},
+                action_features={"truth_mutation": False, "reversible": True},
+                target_fact_ids=[fact["id"]],
+                target_page_paths=[fact["page_hint"]],
+                proposed_by="test",
+                risk_tier="low",
+            )["id"],
+        )
+        record_action_audit(
+            paths,
+            action["id"],
+            "sampled_bad",
+            metadata={"rationale": "The same semantic issue was found twice."},
+        )
+        actions.append(action)
+
+    with running_ui(paths) as (host, port, token):
+        queue_status, queue = request_json(
+            host, port, token, "GET", "/api/queue?kind=audit"
+        )
+        representative_id = str(queue["items"][0]["id"])
+        decision_status, decision = request_json(
+            host,
+            port,
+            token,
+            "POST",
+            f"/api/queue/{representative_id}/decision",
+            {"decision": "revert"},
+        )
+        after_status, after = request_json(
+            host, port, token, "GET", "/api/queue?kind=audit"
+        )
+        undo_status, _undo = request_json(
+            host,
+            port,
+            token,
+            "POST",
+            "/api/queue/undo",
+            {"undo_handle": decision["undo_handle"]},
+        )
+        reopened_status, reopened = request_json(
+            host, port, token, "GET", "/api/queue?kind=audit"
+        )
+
+    assert queue_status == 200
+    assert queue["total"] == 1
+    assert queue["items"][0]["audit"]["related_action_count"] == 2
+    assert decision_status == 200
+    assert decision["undo_handle"]["kind"] == "audit_batch_remediation"
+    assert len(decision["result"]["related_results"]) == 2
+    assert after_status == 200
+    assert after["total"] == 0
+    assert undo_status == 200
+    assert reopened_status == 200
+    assert reopened["total"] == 1
+    with connection(paths.sqlite_path) as conn:
+        action_rows = list(
+            conn.execute(
+                "SELECT status, audit_status FROM cos_actions WHERE id IN (?, ?)",
+                [action["id"] for action in actions],
+            )
+        )
+        fact_row = conn.execute(
+            "SELECT status FROM facts WHERE id = ?", (fact["id"],)
+        ).fetchone()
+    assert [(row["status"], row["audit_status"]) for row in action_rows] == [
+        ("applied", "sampled_bad"),
+        ("applied", "sampled_bad"),
+    ]
+    assert fact_row["status"] == "active"
+
+
+def test_direct_fact_confirmation_supersedes_exact_rejection(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    fact = review_fact_payload("fact_confirm_after_reject")
+    action = apply_action(
+        paths,
+        propose_action(
+            paths,
+            "fact_upsert",
+            action_payload={"fact": fact},
+            action_features={"truth_mutation": False, "reversible": True},
+            target_fact_ids=[fact["id"]],
+            target_page_paths=[fact["page_hint"]],
+            proposed_by="test",
+            risk_tier="low",
+        )["id"],
+    )
+    with connection(paths.sqlite_path) as conn:
+        rejected, created = record_review_resolution(
+            conn,
+            action,
+            disposition="reject",
+            source_item_kind="audit",
+            source_item_id=action["id"],
+        )
+    assert created is True
+
+    with running_ui(paths) as (host, port, token):
+        confirm_status, confirmed = request_json(
+            host,
+            port,
+            token,
+            "POST",
+            f"/api/wiki/facts/{fact['id']}/confirm",
+        )
+
+    assert confirm_status == 200
+    assert confirmed["fact"]["confirmed_by_user"] is True
+    assert confirmed["action"]["status"] == "applied"
+    with connection(paths.sqlite_path) as conn:
+        rows = list(
+            conn.execute(
+                """
+                SELECT id, disposition, revoked_at
+                FROM review_resolutions
+                WHERE family_key = ?
+                ORDER BY resolved_at, id
+                """,
+                (rejected["family_key"],),
+            )
+        )
+    assert {row["disposition"]: row["revoked_at"] is None for row in rows} == {
+        "reject": False,
+        "keep": True,
+    }
+
+
+def test_direct_fact_confirmation_rolls_back_with_resolution_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    fact = review_fact_payload("fact_confirm_resolution_failure")
+    apply_action(
+        paths,
+        propose_action(
+            paths,
+            "fact_upsert",
+            action_payload={"fact": fact},
+            action_features={"truth_mutation": False, "reversible": True},
+            target_fact_ids=[fact["id"]],
+            target_page_paths=[fact["page_hint"]],
+            proposed_by="test",
+            risk_tier="low",
+        )["id"],
+    )
+    write_resolution = ui_server.record_fact_confirmation_resolution
+
+    def fail_after_resolution(*args: object, **kwargs: object) -> None:
+        write_resolution(*args, **kwargs)
+        raise RuntimeError("injected confirmation resolution failure")
+
+    monkeypatch.setattr(
+        ui_server, "record_fact_confirmation_resolution", fail_after_resolution
+    )
+    with pytest.raises(RuntimeError, match="confirmation resolution failure"):
+        ui_server.ui_confirm_fact(paths, fact["id"])
+
+    with connection(paths.sqlite_path) as conn:
+        restored_fact = conn.execute(
+            "SELECT confirmed_by_user FROM facts WHERE id = ?", (fact["id"],)
+        ).fetchone()
+        confirmation_action = conn.execute(
+            """
+            SELECT status FROM cos_actions
+            WHERE proposed_by = 'ui_fact_confirm'
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        resolution_count = conn.execute(
+            "SELECT COUNT(*) FROM review_resolutions"
+        ).fetchone()[0]
+    assert restored_fact["confirmed_by_user"] == 0
+    assert confirmation_action["status"] == "failed"
+    assert resolution_count == 0
+
+
+def test_legacy_wiki_answer_selection_records_exact_resolutions_and_undo(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    left, right = insert_legacy_answer_question(
+        paths, question_id="question_legacy_selection"
+    )
+
+    with running_ui(paths) as (host, port, token):
+        status, body = request_json(
+            host,
+            port,
+            token,
+            "POST",
+            "/api/wiki/questions/question_legacy_selection/answer",
+            {"selected_fact_id": right["id"], "answer": "Keep the current fact."},
+        )
+
+    assert status == 200
+    assert body["question"]["status"] == "answered"
+    assert body["question"]["decided_by"] == "human"
+    assert body["question"]["answer"]["decision"] == "manual_selection"
+    assert body["undo_handle"]["kind"] == "legacy_question_answer"
+    assert body["undo_handle"]["undo_guard"]["fingerprint"]
+    with connection(paths.sqlite_path) as conn:
+        fact_states = {
+            row["id"]: (row["status"], row["confirmed_by_user"])
+            for row in conn.execute(
+                "SELECT id, status, confirmed_by_user FROM facts WHERE id IN (?, ?)",
+                (left["id"], right["id"]),
+            )
+        }
+        resolutions = list(
+            conn.execute(
+                """
+                SELECT disposition, revoked_at
+                FROM review_resolutions
+                WHERE source_item_kind = 'question' AND source_item_id = ?
+                ORDER BY disposition
+                """,
+                ("question_legacy_selection",),
+            )
+        )
+    assert fact_states == {
+        left["id"]: ("retracted", 0),
+        right["id"]: ("active", 1),
+    }
+    assert [(row["disposition"], row["revoked_at"]) for row in resolutions] == [
+        ("keep", None),
+        ("reject", None),
+    ]
+
+    undone = ui_server.ui_queue_undo(paths, {"undo_handle": body["undo_handle"]})
+    assert undone["status"] == "undone"
+    with connection(paths.sqlite_path) as conn:
+        restored = {
+            row["id"]: row["status"]
+            for row in conn.execute(
+                "SELECT id, status FROM facts WHERE id IN (?, ?)",
+                (left["id"], right["id"]),
+            )
+        }
+        active_resolution_count = conn.execute(
+            """
+            SELECT COUNT(*) FROM review_resolutions
+            WHERE source_item_id = ? AND revoked_at IS NULL
+            """,
+            ("question_legacy_selection",),
+        ).fetchone()[0]
+    assert restored == {left["id"]: "conflicted", right["id"]: "conflicted"}
+    assert active_resolution_count == 0
+
+
+def test_question_actions_undo_restores_exact_answer_page_snapshot(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    left, right = insert_legacy_answer_question(
+        paths, question_id="question_actions_page_restore"
+    )
+    page = paths.wiki / str(right["page_hint"])
+    assert not page.exists()
+
+    decision = ui_server.ui_queue_decision(
+        paths,
+        "question_actions_page_restore",
+        {"decision": "select_fact", "selected_fact_id": right["id"]},
+    )
+
+    handle = decision["undo_handle"]
+    assert handle["kind"] == "question_actions"
+    assert handle["page_hints"] == [right["page_hint"]]
+    assert handle["page_snapshot_ids"]
+    assert page.exists()
+
+    undone = ui_server.ui_queue_undo(paths, {"undo_handle": handle})
+
+    assert undone["status"] == "undone"
+    assert "projection_status" not in undone
+    assert not page.exists()
+    with connection(paths.sqlite_path) as conn:
+        restored = {
+            row["id"]: row["status"]
+            for row in conn.execute(
+                "SELECT id, status FROM facts WHERE id IN (?, ?)",
+                (left["id"], right["id"]),
+            )
+        }
+    assert restored == {left["id"]: "conflicted", right["id"]: "conflicted"}
+
+
+@pytest.mark.parametrize(
+    "before_markdown",
+    [None, "Exact page content from before the review.\nSecond line.\n"],
+    ids=["previously_absent", "previously_present"],
+)
+def test_question_actions_undo_restores_page_written_before_projection_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    before_markdown: str | None,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    left, right = insert_legacy_answer_question(
+        paths, question_id="question_projection_exception_restore"
+    )
+    page_hint = str(right["page_hint"])
+    page = paths.wiki / page_hint
+    if before_markdown is not None:
+        page.parent.mkdir(parents=True, exist_ok=True)
+        page.write_text(before_markdown, encoding="utf-8")
+    partial_projection = "Partial managed projection written before failure.\n"
+
+    def write_then_fail(
+        actual_paths: BrainPaths,
+        *,
+        page_hints: list[str],
+        overwrite_existing: bool = False,
+    ) -> dict[str, object]:
+        del overwrite_existing
+        target = actual_paths.wiki / page_hints[0]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(partial_projection, encoding="utf-8")
+        raise RuntimeError("injected failure after managed page write")
+
+    monkeypatch.setattr(wiki_facts, "curate_managed_pages", write_then_fail)
+
+    decision = ui_server.ui_queue_decision(
+        paths,
+        "question_projection_exception_restore",
+        {"decision": "select_fact", "selected_fact_id": right["id"]},
+    )
+
+    result = decision["result"]
+    handle = decision["undo_handle"]
+    page_result = result["curation"]["pages"][0]
+    assert result["status"] == "committed_with_projection_warning"
+    assert result["curation"]["projection_status"] == "failed"
+    assert "injected failure after managed page write" in result["warnings"][0]
+    assert page_result["recovery_status"] == "snapshot_recorded"
+    assert handle["page_snapshot_ids"] == [page_result["snapshot_id"]]
+    assert page.read_text(encoding="utf-8") == partial_projection
+
+    undone = ui_server.ui_queue_undo(paths, {"undo_handle": handle})
+
+    assert undone["status"] == "undone"
+    assert "projection_status" not in undone
+    assert page.exists() is (before_markdown is not None)
+    if before_markdown is not None:
+        assert page.read_text(encoding="utf-8") == before_markdown
+    with connection(paths.sqlite_path) as conn:
+        restored = {
+            row["id"]: row["status"]
+            for row in conn.execute(
+                "SELECT id, status FROM facts WHERE id IN (?, ?)",
+                (left["id"], right["id"]),
+            )
+        }
+    assert restored == {left["id"]: "conflicted", right["id"]: "conflicted"}
+
+
+@pytest.mark.parametrize(
+    "before_markdown",
+    [None, "Exact page content before compensated projection.\n"],
+    ids=["previously_absent", "previously_present"],
+)
+def test_managed_curator_compensates_downstream_exception_before_queue_undo(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    before_markdown: str | None,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    left, right = insert_legacy_answer_question(
+        paths, question_id="question_downstream_projection_exception"
+    )
+    page_hint = str(right["page_hint"])
+    page = paths.wiki / page_hint
+    if before_markdown is not None:
+        page.parent.mkdir(parents=True, exist_ok=True)
+        page.write_text(before_markdown, encoding="utf-8")
+    with connection(paths.sqlite_path) as conn:
+        if before_markdown is not None:
+            conn.execute(
+                """
+                INSERT INTO wiki_pages(
+                  id, title, page_type, status, path, source_ids, related, tags,
+                  created_at, updated_at, managed, fact_ids
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    wiki_facts.stable_page_id(
+                        page_hint, wiki_facts.human_title_for_path(page_hint)
+                    ),
+                    "Exact pre-projection index title",
+                    "reference",
+                    "archived",
+                    str(page),
+                    dumps(["document:pre-projection-index"]),
+                    dumps(["concepts/pre-projection-related.md"]),
+                    dumps(["pre-projection-index"]),
+                    "2025-01-02",
+                    "2025-03-04",
+                    0,
+                    dumps([left["id"]]),
+                ),
+            )
+        index_before = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM wiki_pages WHERE path = ? ORDER BY id", (str(page),)
+            )
+        ]
+    observed_written_page: list[str] = []
+
+    def fail_after_page_write(
+        _paths: BrainPaths, pages: list[dict[str, object]]
+    ) -> None:
+        assert pages[0]["written"] is True
+        observed_written_page.append(page.read_text(encoding="utf-8"))
+        raise RuntimeError("injected downstream index failure")
+
+    monkeypatch.setattr(wiki_facts, "sync_managed_page_index", fail_after_page_write)
+
+    decision = ui_server.ui_queue_decision(
+        paths,
+        "question_downstream_projection_exception",
+        {
+            "decision": "select_fact",
+            "selected_fact_id": right["id"],
+            "overwrite_existing": True,
+        },
+    )
+
+    result = decision["result"]
+    handle = decision["undo_handle"]
+    assert observed_written_page
+    assert result["status"] == "committed_with_projection_warning"
+    assert result["curation"]["projection_status"] == "failed"
+    assert "injected downstream index failure" in result["warnings"][0]
+    assert result["curation"]["pages"][0]["recovery_status"] == (
+        "unchanged_or_compensated"
+    )
+    assert handle["page_snapshot_ids"] == []
+    assert page.exists() is (before_markdown is not None)
+    if before_markdown is not None:
+        assert page.read_text(encoding="utf-8") == before_markdown
+    with connection(paths.sqlite_path) as conn:
+        index_after_failure = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM wiki_pages WHERE path = ? ORDER BY id", (str(page),)
+            )
+        ]
+    assert index_after_failure == index_before
+
+    undone = ui_server.ui_queue_undo(paths, {"undo_handle": handle})
+
+    assert undone["status"] == "undone"
+    assert "projection_status" not in undone
+    assert page.exists() is (before_markdown is not None)
+    if before_markdown is not None:
+        assert page.read_text(encoding="utf-8") == before_markdown
+    with connection(paths.sqlite_path) as conn:
+        restored = {
+            row["id"]: row["status"]
+            for row in conn.execute(
+                "SELECT id, status FROM facts WHERE id IN (?, ?)",
+                (left["id"], right["id"]),
+            )
+        }
+        index_after_undo = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM wiki_pages WHERE path = ? ORDER BY id", (str(page),)
+            )
+        ]
+    assert restored == {left["id"]: "conflicted", right["id"]: "conflicted"}
+    assert index_after_undo == index_before
+
+
+@pytest.mark.parametrize("answer_kind", ["manual_selection", "manual_answer"])
+def test_legacy_wiki_answer_accepts_incomplete_open_question_only_for_manual_answer(
+    tmp_path: Path, answer_kind: str
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    left, right = insert_legacy_answer_question(
+        paths, question_id=f"question_incomplete_{answer_kind}"
+    )
+    with connection(paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            UPDATE facts
+            SET source_ids = '[]', source_spans = '[]', evidence_quote = NULL,
+                observed_at = NULL, metadata = '{}'
+            WHERE id IN (?, ?)
+            """,
+            (left["id"], right["id"]),
+        )
+
+    target = ui_server.find_queue_target(paths, f"question_incomplete_{answer_kind}")
+    card = ui_server.queue_card_for_target(paths, target)
+    assert card["approvable"] is False
+    assert card["blocking_code"] == "missing_evidence"
+    assert all(fact["source_date"] is None for fact in card["alternatives"])
+
+    payload = (
+        {"selected_fact_id": right["id"]}
+        if answer_kind == "manual_selection"
+        else {"answer": "The human supplied the missing authoritative context."}
+    )
+    with running_ui(paths) as (host, port, token):
+        blocked_status, _blocked = request_json(
+            host,
+            port,
+            token,
+            "POST",
+            f"/api/queue/question_incomplete_{answer_kind}/decision",
+            {"decision": "both_true"},
+        )
+        if answer_kind == "manual_selection":
+            invalid_status, _invalid = request_json(
+                host,
+                port,
+                token,
+                "POST",
+                f"/api/wiki/questions/question_incomplete_{answer_kind}/answer",
+                {"selected_fact_id": "fact_outside_question"},
+            )
+            assert invalid_status == 400
+        status, body = request_json(
+            host,
+            port,
+            token,
+            "POST",
+            f"/api/wiki/questions/question_incomplete_{answer_kind}/answer",
+            payload,
+        )
+        closed_status, _closed = request_json(
+            host,
+            port,
+            token,
+            "POST",
+            f"/api/wiki/questions/question_incomplete_{answer_kind}/answer",
+            payload,
+        )
+
+    assert blocked_status == 400
+    assert status == 200
+    assert body["question"]["status"] == "answered"
+    assert body["question"]["answer"]["decision"] == answer_kind
+    assert closed_status == 400
+
+
+def test_legacy_wiki_answer_undo_page_drift_leaves_review_state_unchanged(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    left, right = insert_legacy_answer_question(
+        paths, question_id="question_legacy_stale_page"
+    )
+    answer = ui_server.ui_answer_wiki_question(
+        paths,
+        "question_legacy_stale_page",
+        {"selected_fact_id": right["id"]},
+    )
+    snapshot_ids = answer["undo_handle"]["page_snapshot_ids"]
+    assert snapshot_ids
+    page = paths.wiki / str(right["page_hint"])
+    drifted_markdown = page.read_text(encoding="utf-8") + "\nHuman edit after review.\n"
+    page.write_text(drifted_markdown, encoding="utf-8")
+
+    def review_state() -> dict[str, object]:
+        with connection(paths.sqlite_path) as conn:
+            return {
+                "facts": [
+                    tuple(row)
+                    for row in conn.execute(
+                        "SELECT * FROM facts WHERE id IN (?, ?) ORDER BY id",
+                        (left["id"], right["id"]),
+                    )
+                ],
+                "question": tuple(
+                    conn.execute(
+                        "SELECT * FROM open_questions WHERE id = ?",
+                        ("question_legacy_stale_page",),
+                    ).fetchone()
+                ),
+                "resolutions": [
+                    tuple(row)
+                    for row in conn.execute(
+                        "SELECT * FROM review_resolutions ORDER BY id"
+                    )
+                ],
+                "actions": [
+                    tuple(row)
+                    for row in conn.execute("SELECT * FROM cos_actions ORDER BY id")
+                ],
+            }
+
+    before = review_state()
+    with pytest.raises(ui_server.BadRequestError, match="managed page changed"):
+        ui_server.ui_queue_undo(paths, {"undo_handle": answer["undo_handle"]})
+
+    assert review_state() == before
+    assert page.read_text(encoding="utf-8") == drifted_markdown
+
+
+def test_legacy_wiki_free_text_answer_rolls_back_if_resolution_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    left, right = insert_legacy_answer_question(
+        paths, question_id="question_legacy_manual_failure"
+    )
+    write_resolution = ui_server.record_question_review_resolution
+
+    def fail_after_resolution(*args: object, **kwargs: object) -> None:
+        write_resolution(*args, **kwargs)
+        raise RuntimeError("injected legacy answer resolution failure")
+
+    monkeypatch.setattr(
+        ui_server, "record_question_review_resolution", fail_after_resolution
+    )
+    with pytest.raises(ui_server.BadRequestError, match="decision was rolled back"):
+        ui_server.ui_answer_wiki_question(
+            paths,
+            "question_legacy_manual_failure",
+            {"answer": "The human supplied a corrected replacement fact."},
+        )
+
+    with connection(paths.sqlite_path) as conn:
+        fact_states = {
+            row["id"]: row["status"]
+            for row in conn.execute(
+                "SELECT id, status FROM facts WHERE id IN (?, ?)",
+                (left["id"], right["id"]),
+            )
+        }
+        manual_count = conn.execute(
+            """
+            SELECT COUNT(*) FROM facts
+            WHERE source_ids LIKE '%manual:question:question_legacy_manual_failure%'
+            """
+        ).fetchone()[0]
+        question = conn.execute(
+            "SELECT status, decided_by FROM open_questions WHERE id = ?",
+            ("question_legacy_manual_failure",),
+        ).fetchone()
+        active_resolution_count = conn.execute(
+            "SELECT COUNT(*) FROM review_resolutions WHERE revoked_at IS NULL"
+        ).fetchone()[0]
+    page = paths.wiki / "concepts" / "review-workflow.md"
+    assert fact_states == {left["id"]: "conflicted", right["id"]: "conflicted"}
+    assert manual_count == 0
+    assert question["status"] == "open"
+    assert question["decided_by"] is None
+    assert active_resolution_count == 0
+    assert not page.exists()
+
+
+def test_direct_queue_action_approve_undo_reopens_original_issue(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    action = propose_action(
+        paths,
+        "edit_contract",
+        action_payload={
+            "contract": {
+                "id": "contract_undo_review",
+                "page_hint": "concepts/undo-review.md",
+                "canonical_entity": "concept:undo-review",
+                "page_scope": "review",
+                "retrieval_purpose": "Verify queue undo.",
+                "what_belongs_here": "Undo evidence.",
+                "what_does_not_belong_here": "Unrelated evidence.",
+                "freshness_policy": "manual",
+                "related_pages": [],
+                "version": 1,
+                "status": "active",
+            }
+        },
+        action_features={"reversible": True, "affected_fact_count": 0},
+        target_page_paths=["concepts/undo-review.md"],
+        proposed_by="test",
+        risk_tier="low",
+    )
+
+    with running_ui(paths) as (host, port, token):
+        decision_status, decision = request_json(
+            host,
+            port,
+            token,
+            "POST",
+            f"/api/queue/{action['id']}/decision",
+            {"decision": "approve"},
+        )
+        undo_status, _undo = request_json(
+            host,
+            port,
+            token,
+            "POST",
+            "/api/queue/undo",
+            {"undo_handle": decision["undo_handle"]},
+        )
+        queue_status, queue = request_json(
+            host, port, token, "GET", "/api/queue?kind=topology"
+        )
+
+    assert decision_status == 200
+    assert decision["result"]["action"]["status"] == "applied"
+    assert undo_status == 200
+    assert queue_status == 200
+    assert [item["id"] for item in queue["items"]] == [action["id"]]
+    with connection(paths.sqlite_path) as conn:
+        current = conn.execute(
+            "SELECT status FROM cos_actions WHERE id = ?", (action["id"],)
+        ).fetchone()
+        resolutions = conn.execute(
+            """
+            SELECT disposition, revoked_at
+            FROM review_resolutions
+            WHERE source_item_kind = 'action' AND source_item_id = ?
+            """,
+            (action["id"],),
+        ).fetchall()
+    assert current["status"] == "proposed"
+    assert [
+        (row["disposition"], row["revoked_at"] is not None) for row in resolutions
+    ] == [("keep", True)]
+
+
+@pytest.mark.parametrize(
+    ("decision_name", "drift_candidate_sibling"),
+    [
+        ("approve", False),
+        ("reject", False),
+        ("approve", True),
+        ("reject", True),
+    ],
+)
+def test_direct_queue_decision_undo_restores_candidate_sibling_issue(
+    tmp_path: Path, decision_name: str, drift_candidate_sibling: bool
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    candidate_key = "edit_contract:concepts/candidate-undo.md"
+    contract = {
+        "id": "contract_candidate_reject_undo",
+        "page_hint": "concepts/candidate-undo.md",
+        "canonical_entity": "concept:candidate-undo",
+        "page_scope": "review",
+        "retrieval_purpose": "Verify candidate rejection undo.",
+        "what_belongs_here": "Candidate review evidence.",
+        "what_does_not_belong_here": "Unrelated evidence.",
+        "freshness_policy": "manual",
+        "related_pages": [],
+        "version": 1,
+        "status": "active",
+    }
+    selected = propose_action(
+        paths,
+        "edit_contract",
+        action_payload={"contract": contract},
+        action_features={"candidate_key": candidate_key, "reversible": True},
+        target_page_paths=["concepts/candidate-undo.md"],
+        proposed_by="test",
+        risk_tier="low",
+    )
+    sibling = propose_action(
+        paths,
+        "edit_contract",
+        action_payload={"contract": contract},
+        action_features={"reversible": True},
+        target_page_paths=["concepts/candidate-undo.md"],
+        proposed_by="legacy_test",
+        risk_tier="low",
+    )
+    previous_answer = {"draft": "keep this review note"}
+    with connection(paths.sqlite_path) as conn:
+        features = json.loads(
+            conn.execute(
+                "SELECT action_features FROM cos_actions WHERE id = ?",
+                (sibling["id"],),
+            ).fetchone()[0]
+        )
+        features["candidate_key"] = candidate_key
+        conn.execute(
+            "UPDATE cos_actions SET action_features = ?, status = 'needs_human' WHERE id = ?",
+            (dumps(features), sibling["id"]),
+        )
+        conn.execute(
+            """
+            INSERT INTO open_questions(
+              id, kind, fact_ids, question, options, status, answer, context,
+              action_id, recommended_action, risk_tier, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "question_candidate_reject_undo_sibling",
+                "policy_escalation",
+                "[]",
+                "Review duplicate candidate.",
+                "[]",
+                "needs_human",
+                dumps(previous_answer),
+                "{}",
+                sibling["id"],
+                "{}",
+                "low",
+                "2026-07-31T12:00:00+00:00",
+            ),
+        )
+
+    with running_ui(paths) as (host, port, token):
+        decision_status, decision = request_json(
+            host,
+            port,
+            token,
+            "POST",
+            f"/api/queue/{selected['id']}/decision",
+            {"decision": decision_name, "reason": "Not the right candidate."},
+        )
+        if drift_candidate_sibling:
+            with connection(paths.sqlite_path) as conn:
+                conn.execute(
+                    """
+                    UPDATE open_questions
+                    SET status = 'answered', answer = '{"decision":"newer_review"}',
+                        answered_at = '2026-07-31T12:05:00+00:00',
+                        decided_by = 'human'
+                    WHERE id = 'question_candidate_reject_undo_sibling'
+                    """
+                )
+        undo_status, undo = request_json(
+            host,
+            port,
+            token,
+            "POST",
+            "/api/queue/undo",
+            {"undo_handle": decision["undo_handle"]},
+        )
+
+    assert decision_status == 200
+    assert undo_status == (400 if drift_candidate_sibling else 200)
+    if drift_candidate_sibling:
+        assert "stale" in str(undo.get("error") or "")
+    else:
+        assert undo["status"] == "undone"
+    with connection(paths.sqlite_path) as conn:
+        selected_row = conn.execute(
+            "SELECT status FROM cos_actions WHERE id = ?", (selected["id"],)
+        ).fetchone()
+        sibling_row = conn.execute(
+            "SELECT status, evidence_json FROM cos_actions WHERE id = ?",
+            (sibling["id"],),
+        ).fetchone()
+        question = conn.execute(
+            """
+            SELECT status, answer, answered_at, decided_by
+            FROM open_questions WHERE id = ?
+            """,
+            ("question_candidate_reject_undo_sibling",),
+        ).fetchone()
+    if drift_candidate_sibling:
+        assert selected_row["status"] == (
+            "applied" if decision_name == "approve" else "rejected"
+        )
+        assert sibling_row["status"] == "dismissed"
+        assert "candidate_superseded" in json.loads(sibling_row["evidence_json"])
+        assert question["status"] == "answered"
+        assert json.loads(question["answer"]) == {"decision": "newer_review"}
+        assert question["decided_by"] == "human"
+    else:
+        assert selected_row["status"] == "proposed"
+        assert sibling_row["status"] == "needs_human"
+        assert "candidate_superseded" not in json.loads(sibling_row["evidence_json"])
+        assert question["status"] == "needs_human"
+        assert json.loads(question["answer"]) == previous_answer
+        assert question["answered_at"] is None
+        assert question["decided_by"] is None
+
+
+def test_queue_undo_rejects_tampered_embedded_action_state(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    action = propose_action(
+        paths,
+        "edit_contract",
+        action_payload={
+            "contract": {
+                "id": "contract_tampered_undo",
+                "page_hint": "concepts/tampered-undo.md",
+                "canonical_entity": "concept:tampered-undo",
+                "page_scope": "review",
+                "retrieval_purpose": "Reject a forged undo snapshot.",
+                "what_belongs_here": "Undo integrity evidence.",
+                "what_does_not_belong_here": "Unrelated evidence.",
+                "freshness_policy": "manual",
+                "related_pages": [],
+                "version": 1,
+                "status": "active",
+            }
+        },
+        action_features={"reversible": True, "affected_fact_count": 0},
+        target_page_paths=["concepts/tampered-undo.md"],
+        proposed_by="test",
+        risk_tier="low",
+    )
+    decision = ui_server.ui_queue_decision(
+        paths,
+        action["id"],
+        {"decision": "reject"},
+    )
+    tampered = json.loads(json.dumps(decision["undo_handle"]))
+    tampered["action"]["status"] = "applied"
+
+    with pytest.raises(ui_server.BadRequestError, match="handle is stale"):
+        ui_server.ui_queue_undo(paths, {"undo_handle": tampered})
+
+    with connection(paths.sqlite_path) as conn:
+        current_action = conn.execute(
+            "SELECT status FROM cos_actions WHERE id = ?", (action["id"],)
+        ).fetchone()
+        contract_count = conn.execute(
+            "SELECT COUNT(*) FROM page_contracts WHERE id = 'contract_tampered_undo'"
+        ).fetchone()[0]
+        active_resolution = conn.execute(
+            """
+            SELECT disposition FROM review_resolutions
+            WHERE revoked_at IS NULL AND source_item_kind = 'action'
+              AND source_item_id = ?
+            """,
+            (action["id"],),
+        ).fetchone()
+    assert current_action["status"] == "rejected"
+    assert contract_count == 0
+    assert active_resolution["disposition"] == "reject"
+
+
+def test_failed_direct_action_undo_leaves_no_revert_residue(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    action = propose_action(
+        paths,
+        "edit_contract",
+        action_payload={
+            "contract": {
+                "id": "contract_direct_undo_drift",
+                "page_hint": "concepts/direct-undo-drift.md",
+                "canonical_entity": "concept:direct-undo-drift",
+                "page_scope": "review",
+                "retrieval_purpose": "Exercise guarded direct undo.",
+                "what_belongs_here": "Undo evidence.",
+                "what_does_not_belong_here": "Unrelated evidence.",
+                "freshness_policy": "manual",
+                "related_pages": [],
+                "version": 1,
+                "status": "active",
+            }
+        },
+        action_features={"reversible": True, "affected_fact_count": 0},
+        target_page_paths=["concepts/direct-undo-drift.md"],
+        proposed_by="test",
+        risk_tier="low",
+    )
+    decision = ui_server.ui_queue_decision(paths, action["id"], {"decision": "approve"})
+    with connection(paths.sqlite_path) as conn:
+        conn.execute(
+            """
+            UPDATE page_contracts SET retrieval_purpose = ? WHERE id = ?
+            """,
+            ("A newer decision changed this contract.", "contract_direct_undo_drift"),
+        )
+
+    with pytest.raises(ui_server.BadRequestError, match="handle is stale"):
+        ui_server.ui_queue_undo(paths, {"undo_handle": decision["undo_handle"]})
+
+    with connection(paths.sqlite_path) as conn:
+        current_action = conn.execute(
+            "SELECT status FROM cos_actions WHERE id = ?", (action["id"],)
+        ).fetchone()
+        contract = conn.execute(
+            "SELECT retrieval_purpose FROM page_contracts WHERE id = ?",
+            ("contract_direct_undo_drift",),
+        ).fetchone()
+        residue_count = conn.execute(
+            """
+            SELECT COUNT(*) FROM open_questions
+            WHERE action_id = ? AND kind = 'revert_drift'
+            """,
+            (action["id"],),
+        ).fetchone()[0]
+        active_resolution = conn.execute(
+            """
+            SELECT disposition FROM review_resolutions
+            WHERE revoked_at IS NULL AND source_item_kind = 'action'
+              AND source_item_id = ?
+            """,
+            (action["id"],),
+        ).fetchone()
+    assert current_action["status"] == "applied"
+    assert contract["retrieval_purpose"] == "A newer decision changed this contract."
+    assert residue_count == 0
+    assert active_resolution["disposition"] == "keep"
+
+
+def test_queue_undo_rolls_back_inverse_when_resolution_revoke_conflicts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    action = propose_action(
+        paths,
+        "edit_contract",
+        action_payload={
+            "contract": {
+                "id": "contract_atomic_undo_ledger",
+                "page_hint": "concepts/atomic-undo-ledger.md",
+                "canonical_entity": "concept:atomic-undo-ledger",
+                "page_scope": "review",
+                "retrieval_purpose": "Keep queue undo atomic with its ledger.",
+                "what_belongs_here": "Atomic undo evidence.",
+                "what_does_not_belong_here": "Unrelated evidence.",
+                "freshness_policy": "manual",
+                "related_pages": [],
+                "version": 1,
+                "status": "active",
+            }
+        },
+        action_features={"reversible": True, "affected_fact_count": 0},
+        target_page_paths=["concepts/atomic-undo-ledger.md"],
+        proposed_by="test",
+        risk_tier="low",
+    )
+    decision = ui_server.ui_queue_decision(paths, action["id"], {"decision": "approve"})
+
+    def fail_revoke(*_args: object, **_kwargs: object) -> None:
+        raise ReviewResolutionConflict(
+            "review resolution changed; undo was not applied"
+        )
+
+    monkeypatch.setattr(
+        queue_undo_transaction,
+        "revoke_review_resolution",
+        fail_revoke,
+    )
+    with pytest.raises(ui_server.BadRequestError, match="resolution changed"):
+        ui_server.ui_queue_undo(paths, {"undo_handle": decision["undo_handle"]})
+
+    resolution_id = decision["undo_handle"]["review_resolution_ids"][0]
+    with connection(paths.sqlite_path) as conn:
+        current_action = conn.execute(
+            "SELECT status FROM cos_actions WHERE id = ?", (action["id"],)
+        ).fetchone()
+        contract_count = conn.execute(
+            "SELECT COUNT(*) FROM page_contracts WHERE id = ?",
+            ("contract_atomic_undo_ledger",),
+        ).fetchone()[0]
+        resolution = conn.execute(
+            "SELECT revoked_at FROM review_resolutions WHERE id = ?",
+            (resolution_id,),
+        ).fetchone()
+    assert current_action["status"] == "applied"
+    assert contract_count == 1
+    assert resolution["revoked_at"] is None
+
+
+def test_queue_undo_rolls_back_earlier_inverse_when_later_inverse_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    actions: list[dict[str, object]] = []
+    for suffix in ("first", "second"):
+        action = propose_action(
+            paths,
+            "edit_contract",
+            action_payload={
+                "contract": {
+                    "id": f"contract_atomic_batch_{suffix}",
+                    "page_hint": f"concepts/atomic-batch-{suffix}.md",
+                    "canonical_entity": f"concept:atomic-batch-{suffix}",
+                    "page_scope": "review",
+                    "retrieval_purpose": "Exercise atomic batch undo.",
+                    "what_belongs_here": "Atomic undo evidence.",
+                    "what_does_not_belong_here": "Unrelated evidence.",
+                    "freshness_policy": "manual",
+                    "related_pages": [],
+                    "version": 1,
+                    "status": "active",
+                }
+            },
+            action_features={"reversible": True, "affected_fact_count": 0},
+            target_page_paths=[f"concepts/atomic-batch-{suffix}.md"],
+            proposed_by="test",
+            risk_tier="low",
+        )
+        actions.append(apply_action(paths, action["id"]))
+
+    handle = {
+        "kind": "fact_correction",
+        "action_ids": [action["id"] for action in actions],
+        "page_hints": [],
+        "page_snapshot_ids": [],
+    }
+    seal_undo_handle(paths, handle)
+    original_revert = queue_undo_transaction.safely_revert_action_in_connection
+    calls = 0
+
+    def fail_second_revert(
+        passed_paths: BrainPaths, conn: object, action_id: str
+    ) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise ReviewUndoError("injected later inverse drift")
+        return original_revert(passed_paths, conn, action_id)
+
+    monkeypatch.setattr(
+        queue_undo_transaction,
+        "safely_revert_action_in_connection",
+        fail_second_revert,
+    )
+    with pytest.raises(ui_server.BadRequestError, match="later inverse drift"):
+        ui_server.ui_queue_undo(paths, {"undo_handle": handle})
+
+    with connection(paths.sqlite_path) as conn:
+        statuses = [
+            conn.execute(
+                "SELECT status FROM cos_actions WHERE id = ?", (action["id"],)
+            ).fetchone()[0]
+            for action in actions
+        ]
+        contract_count = conn.execute(
+            """
+            SELECT COUNT(*) FROM page_contracts
+            WHERE id IN ('contract_atomic_batch_first',
+                         'contract_atomic_batch_second')
+            """
+        ).fetchone()[0]
+    assert statuses == ["applied", "applied"]
+    assert contract_count == 2
+
+
+def test_queue_undo_holds_write_lock_between_inverse_and_ledger_revoke(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    action = propose_action(
+        paths,
+        "edit_contract",
+        action_payload={
+            "contract": {
+                "id": "contract_atomic_undo_lock",
+                "page_hint": "concepts/atomic-undo-lock.md",
+                "canonical_entity": "concept:atomic-undo-lock",
+                "page_scope": "review",
+                "retrieval_purpose": "Prove queue undo write serialization.",
+                "what_belongs_here": "Atomic undo evidence.",
+                "what_does_not_belong_here": "Unrelated evidence.",
+                "freshness_policy": "manual",
+                "related_pages": [],
+                "version": 1,
+                "status": "active",
+            }
+        },
+        action_features={"reversible": True, "affected_fact_count": 0},
+        target_page_paths=["concepts/atomic-undo-lock.md"],
+        proposed_by="test",
+        risk_tier="low",
+    )
+    decision = ui_server.ui_queue_decision(paths, action["id"], {"decision": "reject"})
+    entered_gap = threading.Event()
+    release_gap = threading.Event()
+    original_undo = queue_undo_transaction.undo_queue_database_in_connection
+
+    def pause_after_inverse(
+        passed_paths: BrainPaths,
+        conn: object,
+        handle: dict[str, object],
+    ) -> None:
+        original_undo(passed_paths, conn, handle)
+        entered_gap.set()
+        if not release_gap.wait(timeout=5):
+            raise AssertionError("test did not release the queue undo transaction")
+
+    monkeypatch.setattr(
+        queue_undo_transaction,
+        "undo_queue_database_in_connection",
+        pause_after_inverse,
+    )
+    results: list[dict[str, object]] = []
+    failures: list[BaseException] = []
+
+    def run_undo() -> None:
+        try:
+            results.append(
+                ui_server.ui_queue_undo(paths, {"undo_handle": decision["undo_handle"]})
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    worker = threading.Thread(target=run_undo)
+    worker.start()
+    assert entered_gap.wait(timeout=5)
+
+    contender = sqlite3.connect(paths.sqlite_path, timeout=0)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            contender.execute("BEGIN IMMEDIATE")
+    finally:
+        contender.close()
+        release_gap.set()
+        worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert failures == []
+    assert results[0]["status"] == "undone"
+    resolution_id = decision["undo_handle"]["review_resolution_ids"][0]
+    with connection(paths.sqlite_path) as conn:
+        current_action = conn.execute(
+            "SELECT status FROM cos_actions WHERE id = ?", (action["id"],)
+        ).fetchone()
+        resolution = conn.execute(
+            "SELECT revoked_at FROM review_resolutions WHERE id = ?",
+            (resolution_id,),
+        ).fetchone()
+    assert current_action["status"] == "proposed"
+    assert resolution["revoked_at"] is not None
+
+
+def test_stale_undo_replay_cannot_overwrite_a_newer_decision(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    action = propose_action(
+        paths,
+        "edit_contract",
+        action_payload={
+            "contract": {
+                "id": "contract_stale_undo",
+                "page_hint": "concepts/stale-undo.md",
+                "canonical_entity": "concept:stale-undo",
+                "page_scope": "review",
+                "retrieval_purpose": "Exercise stale undo replay.",
+                "what_belongs_here": "Undo evidence.",
+                "what_does_not_belong_here": "Unrelated evidence.",
+                "freshness_policy": "manual",
+                "related_pages": [],
+                "version": 1,
+                "status": "active",
+            }
+        },
+        action_features={"reversible": True, "affected_fact_count": 0},
+        target_page_paths=["concepts/stale-undo.md"],
+        proposed_by="test",
+        risk_tier="low",
+    )
+    approved = ui_server.ui_queue_decision(paths, action["id"], {"decision": "approve"})
+    stale_handle = json.loads(json.dumps(approved["undo_handle"]))
+    ui_server.ui_queue_undo(paths, {"undo_handle": approved["undo_handle"]})
+    rejected = ui_server.ui_queue_decision(paths, action["id"], {"decision": "reject"})
+
+    with pytest.raises(ui_server.BadRequestError, match="handle is stale"):
+        ui_server.ui_queue_undo(paths, {"undo_handle": stale_handle})
+
+    with connection(paths.sqlite_path) as conn:
+        current_action = conn.execute(
+            "SELECT status FROM cos_actions WHERE id = ?", (action["id"],)
+        ).fetchone()
+        contract_count = conn.execute(
+            "SELECT COUNT(*) FROM page_contracts WHERE id = 'contract_stale_undo'"
+        ).fetchone()[0]
+        active_resolution = conn.execute(
+            """
+            SELECT disposition FROM review_resolutions
+            WHERE revoked_at IS NULL AND source_item_kind = 'action'
+              AND source_item_id = ?
+            """,
+            (action["id"],),
+        ).fetchone()
+    assert rejected["result"]["action"]["status"] == "rejected"
+    assert current_action["status"] == "rejected"
+    assert contract_count == 0
+    assert active_resolution["disposition"] == "reject"
+
+
+def test_audit_revert_undo_refuses_to_overwrite_newer_fact_state(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    fact = review_fact_payload("fact_audit_undo_drift")
+    action = apply_action(
+        paths,
+        propose_action(
+            paths,
+            "fact_upsert",
+            action_payload={"fact": fact},
+            action_features={"truth_mutation": False, "reversible": True},
+            target_fact_ids=[fact["id"]],
+            target_page_paths=[fact["page_hint"]],
+            proposed_by="test",
+            risk_tier="low",
+        )["id"],
+    )
+    record_action_audit(
+        paths,
+        action["id"],
+        "sampled_bad",
+        metadata={"rationale": "The original state is wrong."},
+    )
+
+    with running_ui(paths) as (host, port, token):
+        decision_status, decision = request_json(
+            host,
+            port,
+            token,
+            "POST",
+            f"/api/queue/{action['id']}/decision",
+            {"decision": "revert"},
+        )
+        replacement = dict(fact)
+        replacement.update(
+            {
+                "statement": "A newer source established a materially different fact.",
+                "evidence_quote": "A newer source established a materially different fact.",
+                "source_ids": ["manual:newer"],
+            }
+        )
+        replacement_action = apply_action(
+            paths,
+            propose_action(
+                paths,
+                "fact_upsert",
+                action_payload={"fact": replacement},
+                action_features={"truth_mutation": False, "reversible": True},
+                target_fact_ids=[fact["id"]],
+                target_page_paths=[fact["page_hint"]],
+                proposed_by="test",
+                risk_tier="low",
+            )["id"],
+        )
+        undo_status, _undo = request_json(
+            host,
+            port,
+            token,
+            "POST",
+            "/api/queue/undo",
+            {"undo_handle": decision["undo_handle"]},
+        )
+
+    assert decision_status == 200
+    assert replacement_action["status"] == "applied"
+    assert undo_status == 400
+    with connection(paths.sqlite_path) as conn:
+        current_fact = conn.execute(
+            "SELECT statement FROM facts WHERE id = ?", (fact["id"],)
+        ).fetchone()
+        current_action = conn.execute(
+            "SELECT status FROM cos_actions WHERE id = ?", (action["id"],)
+        ).fetchone()
+        active_resolution = conn.execute(
+            """
+            SELECT disposition FROM review_resolutions
+            WHERE revoked_at IS NULL AND source_item_kind = 'audit'
+              AND source_item_id = ?
+            """,
+            (action["id"],),
+        ).fetchone()
+        residue_count = conn.execute(
+            """
+            SELECT COUNT(*) FROM open_questions
+            WHERE action_id = ? AND kind = 'revert_drift'
+            """,
+            (action["id"],),
+        ).fetchone()[0]
+    assert current_fact["statement"] == replacement["statement"]
+    assert current_action["status"] == "reverted"
+    assert active_resolution["disposition"] == "reject"
+    assert residue_count == 0
+
+
+def test_audit_mark_ok_undo_refuses_after_confirmed_fact_drift(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    fact = review_fact_payload("fact_audit_mark_ok_drift")
+    action = apply_action(
+        paths,
+        propose_action(
+            paths,
+            "fact_upsert",
+            action_payload={"fact": fact},
+            action_features={"truth_mutation": False, "reversible": True},
+            target_fact_ids=[fact["id"]],
+            target_page_paths=[fact["page_hint"]],
+            proposed_by="test",
+            risk_tier="low",
+        )["id"],
+    )
+    record_action_audit(
+        paths,
+        action["id"],
+        "sampled_bad",
+        metadata={"rationale": "Confirm or reject this state."},
+    )
+
+    with running_ui(paths) as (host, port, token):
+        decision_status, decision = request_json(
+            host,
+            port,
+            token,
+            "POST",
+            f"/api/queue/{action['id']}/decision",
+            {"decision": "mark_ok"},
+        )
+        replacement = dict(fact)
+        replacement.update(
+            {
+                "statement": "New evidence changed the confirmed fact.",
+                "evidence_quote": "New evidence changed the confirmed fact.",
+                "source_ids": ["manual:changed-after-confirmation"],
+            }
+        )
+        apply_action(
+            paths,
+            propose_action(
+                paths,
+                "fact_upsert",
+                action_payload={"fact": replacement},
+                action_features={"truth_mutation": False, "reversible": True},
+                target_fact_ids=[fact["id"]],
+                target_page_paths=[fact["page_hint"]],
+                proposed_by="test",
+                risk_tier="low",
+            )["id"],
+        )
+        undo_status, _undo = request_json(
+            host,
+            port,
+            token,
+            "POST",
+            "/api/queue/undo",
+            {"undo_handle": decision["undo_handle"]},
+        )
+
+    assert decision_status == 200
+    assert undo_status == 400
+    confirmation_action_id = decision["undo_handle"]["confirmation_action_id"]
+    with connection(paths.sqlite_path) as conn:
+        current_fact = conn.execute(
+            "SELECT statement, confirmed_by_user FROM facts WHERE id = ?",
+            (fact["id"],),
+        ).fetchone()
+        current_audit = conn.execute(
+            "SELECT audit_status FROM cos_actions WHERE id = ?", (action["id"],)
+        ).fetchone()
+        active_resolution = conn.execute(
+            """
+            SELECT disposition FROM review_resolutions
+            WHERE revoked_at IS NULL AND source_item_kind = 'audit'
+              AND source_item_id = ?
+            """,
+            (action["id"],),
+        ).fetchone()
+        confirmation_action = conn.execute(
+            "SELECT status FROM cos_actions WHERE id = ?", (confirmation_action_id,)
+        ).fetchone()
+        residue_count = conn.execute(
+            """
+            SELECT COUNT(*) FROM open_questions
+            WHERE action_id = ? AND kind = 'revert_drift'
+            """,
+            (confirmation_action_id,),
+        ).fetchone()[0]
+    assert current_fact["statement"] == replacement["statement"]
+    assert bool(current_fact["confirmed_by_user"]) is False
+    assert current_audit["audit_status"] == "sampled_ok"
+    assert active_resolution["disposition"] == "keep"
+    assert confirmation_action["status"] == "applied"
+    assert residue_count == 0
 
 
 def test_v2_queue_keeps_active_audited_fact_after_related_state_drift(
@@ -2171,6 +3779,19 @@ def test_v2_queue_supports_existing_merges_provenance_only(tmp_path: Path) -> No
 
     assert status == 200
     assert body["result"]["question"]["answer"]["decision"] == "supports_existing"
+    regenerated = propose_action(
+        paths,
+        "fact_upsert",
+        action_payload={"fact": fact},
+        target_fact_ids=[str(fact["id"])],
+        target_page_paths=[str(fact["page_hint"])],
+        proposed_by="regenerated-test",
+        risk_tier="medium",
+    )
+    assert regenerated["status"] == "rejected"
+    assert regenerated["evidence_json"]["semantic_resolution"]["disposition"] == (
+        "reject"
+    )
     with connection(paths.sqlite_path) as conn:
         existing = conn.execute(
             "SELECT statement, source_ids, evidence_quote, metadata FROM facts WHERE id = 'fact_existing'"
@@ -2191,6 +3812,391 @@ def test_v2_queue_supports_existing_merges_provenance_only(tmp_path: Path) -> No
         == "question_supports_existing"
     )
     assert old_action["status"] == "rejected"
+
+    undo = ui_server.ui_queue_undo(paths, {"undo_handle": body["undo_handle"]})
+
+    assert undo["status"] == "undone"
+    with connection(paths.sqlite_path) as conn:
+        restored_existing = conn.execute(
+            "SELECT status, source_ids, metadata FROM facts WHERE id = 'fact_existing'"
+        ).fetchone()
+        restored_action = conn.execute(
+            "SELECT status FROM cos_actions WHERE id = ?", (action["id"],)
+        ).fetchone()
+        restored_question = conn.execute(
+            "SELECT status, decided_by FROM open_questions WHERE id = ?",
+            ("question_supports_existing",),
+        ).fetchone()
+        active_resolutions = conn.execute(
+            "SELECT COUNT(*) FROM review_resolutions WHERE revoked_at IS NULL"
+        ).fetchone()[0]
+    assert json.loads(restored_existing["source_ids"]) == ["manual:existing"]
+    assert "supporting_candidates" not in json.loads(restored_existing["metadata"])
+    assert restored_action["status"] == "proposed"
+    assert restored_question["status"] == "needs_human"
+    assert restored_question["decided_by"] is None
+    assert active_resolutions == 0
+
+
+def test_v2_route_human_replacement_overrides_prior_semantic_reject(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    fact = review_fact_payload("fact_routed_override")
+    original = propose_action(
+        paths,
+        "fact_upsert",
+        action_payload={"fact": fact},
+        target_fact_ids=[str(fact["id"])],
+        proposed_by="test",
+        risk_tier="medium",
+    )
+    with connection(paths.sqlite_path) as conn:
+        record_review_resolution(
+            conn,
+            original,
+            disposition="reject",
+            source_item_kind="question",
+            source_item_id="prior_route_question",
+        )
+    insert_unrouted_question(
+        paths,
+        question_id="question_route_override",
+        fact_id=str(fact["id"]),
+    )
+    with connection(paths.sqlite_path) as conn:
+        conn.execute(
+            "UPDATE open_questions SET action_id = ? WHERE id = ?",
+            (original["id"], "question_route_override"),
+        )
+
+    result = ui_server.ui_queue_decision(
+        paths,
+        "question_route_override",
+        {"decision": "new_page", "page_hint": "concepts/routed-override.md"},
+    )
+
+    assert result["result"]["action"]["status"] == "applied"
+    assert result["result"]["question"]["status"] == "answered"
+    with connection(paths.sqlite_path) as conn:
+        original_row = conn.execute(
+            "SELECT status FROM cos_actions WHERE id = ?", (original["id"],)
+        ).fetchone()
+    assert original_row["status"] == "rejected"
+
+
+@pytest.mark.parametrize("decision", ["route", "new_page"])
+def test_v2_route_records_keep_blocks_regeneration_and_undo_restores_review(
+    tmp_path: Path,
+    decision: str,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    question_id = f"question_{decision}_semantic_keep"
+    fact_id = f"fact_{decision}_semantic_keep"
+    approved_page = f"concepts/{decision}-semantic-keep.md"
+    insert_unrouted_question(paths, question_id=question_id, fact_id=fact_id)
+
+    result = ui_server.ui_queue_decision(
+        paths,
+        question_id,
+        {"decision": decision, "page_hint": approved_page},
+    )
+
+    route_action = result["result"]["action"]
+    routed_fact = dict(route_action["evidence_json"]["payload"]["fact"])
+    assert route_action["status"] == "applied"
+    assert routed_fact["page_hint"] == approved_page
+    assert len(result["undo_handle"]["review_resolution_ids"]) == 1
+    with connection(paths.sqlite_path) as conn:
+        resolution = active_resolution_for_action(conn, route_action)
+        persisted = conn.execute(
+            "SELECT page_hint, status FROM facts WHERE id = ?", (fact_id,)
+        ).fetchone()
+    assert resolution is not None
+    assert resolution["disposition"] == "keep"
+    assert persisted["page_hint"] == approved_page
+    assert persisted["status"] == "active"
+
+    regenerated = propose_action(
+        paths,
+        "fact_upsert",
+        action_payload={"fact": {**routed_fact, "id": f"{fact_id}_regenerated"}},
+        target_fact_ids=[f"{fact_id}_regenerated"],
+        target_page_paths=[approved_page],
+        proposed_by="regenerated-after-approved-route",
+        risk_tier="medium",
+    )
+
+    assert regenerated["status"] == "rejected"
+    assert regenerated["evidence_json"]["semantic_resolution"]["disposition"] == (
+        "keep"
+    )
+    assert (
+        regenerated["evidence_json"]["semantic_resolution"]["outcome"]
+        == "exact_semantic_state_already_kept"
+    )
+
+    undone = ui_server.ui_queue_undo(paths, {"undo_handle": result["undo_handle"]})
+
+    assert undone["status"] == "undone"
+    with connection(paths.sqlite_path) as conn:
+        restored_question = conn.execute(
+            "SELECT status, action_id, decided_by FROM open_questions WHERE id = ?",
+            (question_id,),
+        ).fetchone()
+        replacement_status = conn.execute(
+            "SELECT status FROM cos_actions WHERE id = ?", (route_action["id"],)
+        ).fetchone()["status"]
+        regenerated_status = conn.execute(
+            "SELECT status FROM cos_actions WHERE id = ?", (regenerated["id"],)
+        ).fetchone()["status"]
+        fact_count = conn.execute(
+            "SELECT COUNT(*) FROM facts WHERE id = ?", (fact_id,)
+        ).fetchone()[0]
+        revoked_at = conn.execute(
+            "SELECT revoked_at FROM review_resolutions WHERE id = ?",
+            (resolution["id"],),
+        ).fetchone()["revoked_at"]
+    assert restored_question["status"] == "needs_human"
+    assert restored_question["action_id"] is None
+    assert restored_question["decided_by"] is None
+    assert replacement_status == "reverted"
+    assert regenerated_status == "proposed"
+    assert fact_count == 0
+    assert revoked_at is not None
+
+
+def test_v2_question_replacement_failure_keeps_original_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    apply_existing_review_fact(paths)
+    fact = review_fact_payload("fact_support_failure")
+    original = propose_action(
+        paths,
+        "fact_upsert",
+        action_payload={"fact": fact},
+        target_fact_ids=[str(fact["id"])],
+        proposed_by="test",
+        risk_tier="medium",
+    )
+    insert_review_question_for_action(
+        paths,
+        question_id="question_support_failure",
+        action_id=original["id"],
+        fact=fact,
+    )
+
+    def rejected_replacement(
+        paths: BrainPaths, action_id: str, **_kwargs: object
+    ) -> dict[str, object]:
+        return {
+            **ui_server.get_action_for_queue(paths, action_id),
+            "status": "rejected",
+        }
+
+    monkeypatch.setattr(ui_server, "apply_action", rejected_replacement)
+    with pytest.raises(ui_server.BadRequestError, match="replacement did not apply"):
+        ui_server.ui_queue_decision(
+            paths,
+            "question_support_failure",
+            {"decision": "merge_evidence"},
+        )
+
+    with connection(paths.sqlite_path) as conn:
+        original_row = conn.execute(
+            "SELECT status FROM cos_actions WHERE id = ?", (original["id"],)
+        ).fetchone()
+        question = conn.execute(
+            "SELECT status, decided_by FROM open_questions WHERE id = ?",
+            ("question_support_failure",),
+        ).fetchone()
+        resolution_count = conn.execute(
+            "SELECT COUNT(*) FROM review_resolutions"
+        ).fetchone()[0]
+    assert original_row["status"] == "proposed"
+    assert question["status"] == "needs_human"
+    assert question["decided_by"] is None
+    assert resolution_count == 0
+
+
+def test_support_replacement_rolls_back_when_resolution_write_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    apply_existing_review_fact(paths)
+    fact = review_fact_payload("fact_support_resolution_failure")
+    original = propose_action(
+        paths,
+        "fact_upsert",
+        action_payload={"fact": fact},
+        target_fact_ids=[str(fact["id"])],
+        proposed_by="test",
+        risk_tier="medium",
+    )
+    insert_review_question_for_action(
+        paths,
+        question_id="question_support_resolution_failure",
+        action_id=original["id"],
+        fact=fact,
+    )
+    write_resolution = ui_server.record_question_review_resolution
+
+    def fail_after_resolution(*args: object, **kwargs: object) -> None:
+        write_resolution(*args, **kwargs)
+        raise RuntimeError("injected resolution persistence failure")
+
+    monkeypatch.setattr(
+        ui_server, "record_question_review_resolution", fail_after_resolution
+    )
+    with pytest.raises(ui_server.BadRequestError, match="decision was rolled back"):
+        ui_server.ui_queue_decision(
+            paths,
+            "question_support_resolution_failure",
+            {"decision": "supports"},
+        )
+
+    with connection(paths.sqlite_path) as conn:
+        existing = conn.execute(
+            "SELECT source_ids, metadata FROM facts WHERE id = 'fact_existing'"
+        ).fetchone()
+        original_row = conn.execute(
+            "SELECT status FROM cos_actions WHERE id = ?", (original["id"],)
+        ).fetchone()
+        replacement = conn.execute(
+            """
+            SELECT status FROM cos_actions
+            WHERE proposed_by = 'ui_queue_supports_existing'
+            ORDER BY created_at DESC LIMIT 1
+            """
+        ).fetchone()
+        question = conn.execute(
+            "SELECT status, action_id, decided_by FROM open_questions WHERE id = ?",
+            ("question_support_resolution_failure",),
+        ).fetchone()
+        active_resolutions = conn.execute(
+            "SELECT COUNT(*) FROM review_resolutions WHERE revoked_at IS NULL"
+        ).fetchone()[0]
+    assert json.loads(existing["source_ids"]) == ["manual:existing"]
+    assert "supporting_candidates" not in json.loads(existing["metadata"])
+    assert original_row["status"] == "proposed"
+    assert replacement["status"] == "reverted"
+    assert question["status"] == "needs_human"
+    assert question["action_id"] == original["id"]
+    assert question["decided_by"] is None
+    assert active_resolutions == 0
+
+
+def test_reject_candidate_rolls_back_when_resolution_write_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    apply_existing_review_fact(paths)
+    fact = review_fact_payload("fact_reject_resolution_failure")
+    original = propose_action(
+        paths,
+        "fact_upsert",
+        action_payload={"fact": fact},
+        target_fact_ids=[str(fact["id"])],
+        proposed_by="test",
+        risk_tier="medium",
+    )
+    insert_review_question_for_action(
+        paths,
+        question_id="question_reject_resolution_failure",
+        action_id=original["id"],
+        fact=fact,
+    )
+    write_resolution = ui_server.record_question_review_resolution
+
+    def fail_after_resolution(*args: object, **kwargs: object) -> None:
+        write_resolution(*args, **kwargs)
+        raise RuntimeError("injected resolution persistence failure")
+
+    monkeypatch.setattr(
+        ui_server, "record_question_review_resolution", fail_after_resolution
+    )
+    with pytest.raises(ui_server.BadRequestError, match="decision was rolled back"):
+        ui_server.ui_queue_decision(
+            paths,
+            "question_reject_resolution_failure",
+            {"decision": "reject_candidate"},
+        )
+
+    with connection(paths.sqlite_path) as conn:
+        original_row = conn.execute(
+            "SELECT status FROM cos_actions WHERE id = ?", (original["id"],)
+        ).fetchone()
+        question = conn.execute(
+            "SELECT status, action_id, decided_by FROM open_questions WHERE id = ?",
+            ("question_reject_resolution_failure",),
+        ).fetchone()
+        active_resolutions = conn.execute(
+            "SELECT COUNT(*) FROM review_resolutions WHERE revoked_at IS NULL"
+        ).fetchone()[0]
+    assert original_row["status"] == "proposed"
+    assert question["status"] == "needs_human"
+    assert question["action_id"] == original["id"]
+    assert question["decided_by"] is None
+    assert active_resolutions == 0
+
+
+def test_route_replacement_rolls_back_when_resolution_write_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    fact_id = "fact_route_resolution_failure"
+    insert_unrouted_question(
+        paths,
+        question_id="question_route_resolution_failure",
+        fact_id=fact_id,
+    )
+    write_resolution = ui_server.record_question_review_resolution
+
+    def fail_after_resolution(*args: object, **kwargs: object) -> None:
+        write_resolution(*args, **kwargs)
+        raise RuntimeError("injected resolution persistence failure")
+
+    monkeypatch.setattr(
+        ui_server, "record_question_review_resolution", fail_after_resolution
+    )
+    with pytest.raises(ui_server.BadRequestError, match="decision was rolled back"):
+        ui_server.ui_queue_decision(
+            paths,
+            "question_route_resolution_failure",
+            {"decision": "route", "page_hint": "concepts/resolution-failure.md"},
+        )
+
+    with connection(paths.sqlite_path) as conn:
+        fact_count = conn.execute(
+            "SELECT COUNT(*) FROM facts WHERE id = ?", (fact_id,)
+        ).fetchone()[0]
+        replacement = conn.execute(
+            """
+            SELECT status FROM cos_actions
+            WHERE proposed_by = 'ui_queue_route'
+            ORDER BY created_at DESC LIMIT 1
+            """
+        ).fetchone()
+        question = conn.execute(
+            "SELECT status, action_id, decided_by FROM open_questions WHERE id = ?",
+            ("question_route_resolution_failure",),
+        ).fetchone()
+        active_resolutions = conn.execute(
+            "SELECT COUNT(*) FROM review_resolutions WHERE revoked_at IS NULL"
+        ).fetchone()[0]
+    assert fact_count == 0
+    assert replacement["status"] == "reverted"
+    assert question["status"] == "needs_human"
+    assert question["action_id"] is None
+    assert question["decided_by"] is None
+    assert active_resolutions == 0
 
 
 def test_v2_queue_temporal_update_supersedes_existing_fact(tmp_path: Path) -> None:
@@ -2243,6 +4249,286 @@ def test_v2_queue_temporal_update_supersedes_existing_fact(tmp_path: Path) -> No
         "superseded_fact_ids"
     ] == ["fact_existing"]
     assert existing["status"] == "superseded"
+
+    regenerated = propose_action(
+        paths,
+        "fact_upsert",
+        action_payload={"fact": fact},
+        target_fact_ids=[str(fact["id"])],
+        target_page_paths=[str(fact["page_hint"])],
+        proposed_by="regenerated-test",
+        risk_tier="medium",
+    )
+    assert regenerated["status"] == "rejected"
+    undo = ui_server.ui_queue_undo(paths, {"undo_handle": body["undo_handle"]})
+    assert undo["status"] == "undone"
+    with connection(paths.sqlite_path) as conn:
+        current_count = conn.execute(
+            "SELECT COUNT(*) FROM facts WHERE id = 'fact_temporal_current'"
+        ).fetchone()[0]
+        restored_existing = conn.execute(
+            "SELECT status FROM facts WHERE id = 'fact_existing'"
+        ).fetchone()
+        restored_action = conn.execute(
+            "SELECT status FROM cos_actions WHERE id = ?", (action["id"],)
+        ).fetchone()
+        restored_question = conn.execute(
+            "SELECT status, decided_by FROM open_questions WHERE id = ?",
+            ("question_temporal_update",),
+        ).fetchone()
+        active_resolutions = conn.execute(
+            "SELECT COUNT(*) FROM review_resolutions WHERE revoked_at IS NULL"
+        ).fetchone()[0]
+    assert current_count == 0
+    assert restored_existing["status"] == "active"
+    assert restored_action["status"] == "proposed"
+    assert restored_question["status"] == "needs_human"
+    assert restored_question["decided_by"] is None
+    assert active_resolutions == 0
+
+
+def test_v2_temporal_replacement_failure_rolls_back_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    apply_existing_review_fact(paths)
+    fact = review_fact_payload("fact_temporal_failure")
+    original = propose_action(
+        paths,
+        "fact_upsert",
+        action_payload={"fact": fact},
+        target_fact_ids=[str(fact["id"])],
+        proposed_by="test",
+        risk_tier="medium",
+    )
+    insert_review_question_for_action(
+        paths,
+        question_id="question_temporal_failure",
+        action_id=original["id"],
+        fact=fact,
+    )
+    monkeypatch.setattr(
+        ui_server,
+        "apply_fact_status_action",
+        lambda *_args, **_kwargs: {"id": None, "status": "skipped"},
+    )
+
+    with pytest.raises(ui_server.BadRequestError, match="replacement did not apply"):
+        ui_server.ui_queue_decision(
+            paths,
+            "question_temporal_failure",
+            {"decision": "current_state"},
+        )
+
+    with connection(paths.sqlite_path) as conn:
+        candidate_count = conn.execute(
+            "SELECT COUNT(*) FROM facts WHERE id = ?", (fact["id"],)
+        ).fetchone()[0]
+        original_row = conn.execute(
+            "SELECT status FROM cos_actions WHERE id = ?", (original["id"],)
+        ).fetchone()
+        question = conn.execute(
+            "SELECT status, decided_by FROM open_questions WHERE id = ?",
+            ("question_temporal_failure",),
+        ).fetchone()
+    assert candidate_count == 0
+    assert original_row["status"] == "proposed"
+    assert question["status"] == "needs_human"
+    assert question["decided_by"] is None
+
+
+def test_temporal_replacement_rolls_back_both_actions_after_apply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    apply_existing_review_fact(paths)
+    fact = review_fact_payload("fact_temporal_post_apply_failure")
+    original = propose_action(
+        paths,
+        "fact_upsert",
+        action_payload={"fact": fact},
+        target_fact_ids=[str(fact["id"])],
+        proposed_by="test",
+        risk_tier="medium",
+    )
+    insert_review_question_for_action(
+        paths,
+        question_id="question_temporal_post_apply_failure",
+        action_id=original["id"],
+        fact=fact,
+    )
+
+    def fail_after_replacements(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("injected post-apply failure")
+
+    monkeypatch.setattr(
+        ui_server, "reject_linked_review_action", fail_after_replacements
+    )
+    with pytest.raises(RuntimeError, match="post-apply failure"):
+        ui_server.ui_queue_decision(
+            paths,
+            "question_temporal_post_apply_failure",
+            {"decision": "temporal_update"},
+        )
+
+    with connection(paths.sqlite_path) as conn:
+        candidate_count = conn.execute(
+            "SELECT COUNT(*) FROM facts WHERE id = ?", (fact["id"],)
+        ).fetchone()[0]
+        existing = conn.execute(
+            "SELECT status FROM facts WHERE id = 'fact_existing'"
+        ).fetchone()
+        original_row = conn.execute(
+            "SELECT status FROM cos_actions WHERE id = ?", (original["id"],)
+        ).fetchone()
+        replacement_rows = conn.execute(
+            """
+            SELECT action_type, status FROM cos_actions
+            WHERE proposed_by = 'ui_queue_temporal_update'
+            ORDER BY created_at, id
+            """
+        ).fetchall()
+        question = conn.execute(
+            "SELECT status, action_id, decided_by FROM open_questions WHERE id = ?",
+            ("question_temporal_post_apply_failure",),
+        ).fetchone()
+        resolution_count = conn.execute(
+            "SELECT COUNT(*) FROM review_resolutions"
+        ).fetchone()[0]
+    assert candidate_count == 0
+    assert existing["status"] == "active"
+    assert original_row["status"] == "proposed"
+    assert {(row["action_type"], row["status"]) for row in replacement_rows} == {
+        ("fact_upsert", "reverted"),
+        ("fact_supersede", "reverted"),
+    }
+    assert question["status"] == "needs_human"
+    assert question["action_id"] == original["id"]
+    assert question["decided_by"] is None
+    assert resolution_count == 0
+
+
+def test_multi_action_undo_rollback_retains_fresh_inverse_and_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    facts = [
+        review_fact_payload("fact_multi_undo_first"),
+        review_fact_payload("fact_multi_undo_second"),
+    ]
+    actions = [
+        apply_action(
+            paths,
+            propose_action(
+                paths,
+                "fact_upsert",
+                action_payload={"fact": fact},
+                action_features={"truth_mutation": False, "reversible": True},
+                target_fact_ids=[str(fact["id"])],
+                target_page_paths=[str(fact["page_hint"])],
+                proposed_by="test",
+                risk_tier="low",
+            )["id"],
+        )
+        for fact in facts
+    ]
+    revert_question_action = question_resolution.safely_revert_question_action
+
+    def fail_second_revert(paths_arg: BrainPaths, action_id: str) -> None:
+        if action_id == actions[1]["id"]:
+            raise question_resolution.QuestionResolutionError(
+                "injected second revert failure"
+            )
+        revert_question_action(paths_arg, action_id)
+
+    monkeypatch.setattr(
+        question_resolution,
+        "safely_revert_question_action",
+        fail_second_revert,
+    )
+    with pytest.raises(
+        question_resolution.QuestionResolutionError, match="second revert failure"
+    ):
+        question_resolution.undo_question_actions(
+            paths, [str(action["id"]) for action in actions]
+        )
+
+    with connection(paths.sqlite_path) as conn:
+        first = load_action(conn, str(actions[0]["id"]))
+        second = load_action(conn, str(actions[1]["id"]))
+        current_hash = target_state_hash(
+            conn,
+            target_fact_ids=first.get("target_fact_ids") or [],
+            target_contract_ids=first.get("target_contract_ids") or [],
+            target_page_paths=first.get("target_page_paths") or [],
+        )
+        fact_count = conn.execute(
+            """
+            SELECT COUNT(*) FROM facts
+            WHERE id IN ('fact_multi_undo_first', 'fact_multi_undo_second')
+            """
+        ).fetchone()[0]
+    assert first["status"] == "applied"
+    assert first["inverse_action_json"]["delete_fact_ids"] == ["fact_multi_undo_first"]
+    assert first["applied_state_hash"] == current_hash
+    assert first["reverted_at"] is None
+    assert second["status"] == "applied"
+    assert fact_count == 2
+
+
+def test_v2_question_undo_drift_preserves_resolution_and_closed_state(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    apply_existing_review_fact(paths)
+    fact = review_fact_payload("fact_support_drift")
+    original = propose_action(
+        paths,
+        "fact_upsert",
+        action_payload={"fact": fact},
+        target_fact_ids=[str(fact["id"])],
+        proposed_by="test",
+        risk_tier="medium",
+    )
+    insert_review_question_for_action(
+        paths,
+        question_id="question_support_drift",
+        action_id=original["id"],
+        fact=fact,
+    )
+    result = ui_server.ui_queue_decision(
+        paths,
+        "question_support_drift",
+        {"decision": "supports"},
+    )
+    with connection(paths.sqlite_path) as conn:
+        conn.execute(
+            "UPDATE facts SET statement = ? WHERE id = 'fact_existing'",
+            ("The fact changed after the replacement was applied.",),
+        )
+
+    with pytest.raises(ui_server.BadRequestError, match="safely reverted"):
+        ui_server.ui_queue_undo(paths, {"undo_handle": result["undo_handle"]})
+
+    with connection(paths.sqlite_path) as conn:
+        original_row = conn.execute(
+            "SELECT status FROM cos_actions WHERE id = ?", (original["id"],)
+        ).fetchone()
+        question = conn.execute(
+            "SELECT status, decided_by FROM open_questions WHERE id = ?",
+            ("question_support_drift",),
+        ).fetchone()
+        active_resolutions = conn.execute(
+            "SELECT COUNT(*) FROM review_resolutions WHERE revoked_at IS NULL"
+        ).fetchone()[0]
+    assert original_row["status"] == "rejected"
+    assert question["status"] == "answered"
+    assert question["decided_by"] == "human"
+    assert active_resolutions == 1
 
 
 def test_m4_queue_acceptance_mixed_decisions_land_and_undo(tmp_path: Path) -> None:
@@ -2942,6 +5228,8 @@ def test_cos_review_apply_action_endpoint_applies_linked_action(
     assert body["question"]["status"] == "answered"
     assert body["question"]["answer"]["decision"] == "apply_action"
     assert body["action"]["status"] == "applied"
+    assert body["undo_handle"]["review_resolution_ids"]
+    assert body["undo_handle"]["undo_guard"]["fingerprint"]
     with connection(paths.sqlite_path) as conn:
         fact_row = conn.execute(
             "SELECT statement, status FROM facts WHERE id = ?", (fact["id"],)
@@ -2950,10 +5238,44 @@ def test_cos_review_apply_action_endpoint_applies_linked_action(
             "SELECT status, decided_by FROM open_questions WHERE id = ?",
             ("question_review_apply",),
         ).fetchone()
+        resolution_row = conn.execute(
+            """
+            SELECT id, disposition, revoked_at
+            FROM review_resolutions
+            WHERE source_item_kind = 'question' AND source_item_id = ?
+            """,
+            ("question_review_apply",),
+        ).fetchone()
     assert fact_row["statement"] == fact["statement"]
     assert fact_row["status"] == "active"
     assert question_row["status"] == "answered"
     assert question_row["decided_by"] == "human"
+    assert resolution_row["id"] in body["undo_handle"]["review_resolution_ids"]
+    assert resolution_row["disposition"] == "keep"
+    assert resolution_row["revoked_at"] is None
+
+    undone = ui_server.ui_queue_undo(paths, {"undo_handle": body["undo_handle"]})
+    assert undone["status"] == "undone"
+    with connection(paths.sqlite_path) as conn:
+        restored_action = conn.execute(
+            "SELECT status FROM cos_actions WHERE id = ?", (action["id"],)
+        ).fetchone()
+        restored_question = conn.execute(
+            "SELECT status, decided_by FROM open_questions WHERE id = ?",
+            ("question_review_apply",),
+        ).fetchone()
+        fact_count = conn.execute(
+            "SELECT COUNT(*) FROM facts WHERE id = ?", (fact["id"],)
+        ).fetchone()[0]
+        revoked_at = conn.execute(
+            "SELECT revoked_at FROM review_resolutions WHERE id = ?",
+            (resolution_row["id"],),
+        ).fetchone()[0]
+    assert restored_action["status"] == "needs_human"
+    assert restored_question["status"] == "needs_human"
+    assert restored_question["decided_by"] is None
+    assert fact_count == 0
+    assert revoked_at is not None
 
 
 def test_cos_review_dismiss_endpoint_rejects_linked_action(
@@ -2962,20 +5284,53 @@ def test_cos_review_dismiss_endpoint_rejects_linked_action(
     paths = BrainPaths.from_value(tmp_path / "brain")
     BrainService(paths).init_workspace()
     fact = review_fact_payload("fact_rejected")
+    candidate_key = "fact_upsert:fact_rejected"
     action = propose_action(
+        paths,
+        "fact_upsert",
+        action_payload={"fact": fact},
+        action_features={
+            "candidate_key": candidate_key,
+            "truth_mutation": True,
+            "reversible": True,
+        },
+        target_fact_ids=[str(fact["id"])],
+        target_page_paths=[str(fact["page_hint"])],
+        proposed_by="test",
+        risk_tier="medium",
+    )
+    sibling = propose_action(
         paths,
         "fact_upsert",
         action_payload={"fact": fact},
         action_features={"truth_mutation": True, "reversible": True},
         target_fact_ids=[str(fact["id"])],
         target_page_paths=[str(fact["page_hint"])],
-        proposed_by="test",
+        proposed_by="legacy_test",
         risk_tier="medium",
     )
+    with connection(paths.sqlite_path) as conn:
+        features = json.loads(
+            conn.execute(
+                "SELECT action_features FROM cos_actions WHERE id = ?",
+                (sibling["id"],),
+            ).fetchone()[0]
+        )
+        features["candidate_key"] = candidate_key
+        conn.execute(
+            "UPDATE cos_actions SET action_features = ?, status = 'needs_human' WHERE id = ?",
+            (dumps(features), sibling["id"]),
+        )
     insert_review_question_for_action(
         paths,
         question_id="question_review_reject",
         action_id=action["id"],
+        fact=fact,
+    )
+    insert_review_question_for_action(
+        paths,
+        question_id="question_review_reject_sibling",
+        action_id=sibling["id"],
         fact=fact,
     )
 
@@ -2993,6 +5348,8 @@ def test_cos_review_dismiss_endpoint_rejects_linked_action(
     assert body["question"]["status"] == "dismissed"
     assert body["question"]["answer"]["decision"] == "dismiss"
     assert body["action"]["status"] == "rejected"
+    assert body["undo_handle"]["review_resolution_ids"]
+    assert body["undo_handle"]["undo_guard"]["fingerprint"]
     assert (
         body["action"]["evidence_json"]["human_review"]["reason"]
         == "not supported by quote"
@@ -3005,9 +5362,184 @@ def test_cos_review_dismiss_endpoint_rejects_linked_action(
             "SELECT status, decided_by FROM open_questions WHERE id = ?",
             ("question_review_reject",),
         ).fetchone()
+        retired_sibling = conn.execute(
+            "SELECT status FROM cos_actions WHERE id = ?", (sibling["id"],)
+        ).fetchone()
+        retired_sibling_question = conn.execute(
+            "SELECT status, decided_by FROM open_questions WHERE id = ?",
+            ("question_review_reject_sibling",),
+        ).fetchone()
+        resolution_row = conn.execute(
+            """
+            SELECT id, disposition, revoked_at
+            FROM review_resolutions
+            WHERE source_item_kind = 'question' AND source_item_id = ?
+            """,
+            ("question_review_reject",),
+        ).fetchone()
     assert fact_count == 0
     assert question_row["status"] == "dismissed"
     assert question_row["decided_by"] == "human"
+    assert retired_sibling["status"] == "dismissed"
+    assert retired_sibling_question["status"] == "dismissed"
+    assert retired_sibling_question["decided_by"] == "candidate_deduplication"
+    assert resolution_row["id"] in body["undo_handle"]["review_resolution_ids"]
+    assert resolution_row["disposition"] == "reject"
+    assert resolution_row["revoked_at"] is None
+
+    undone = ui_server.ui_queue_undo(paths, {"undo_handle": body["undo_handle"]})
+    assert undone["status"] == "undone"
+    with connection(paths.sqlite_path) as conn:
+        restored_action = conn.execute(
+            "SELECT status FROM cos_actions WHERE id = ?", (action["id"],)
+        ).fetchone()
+        restored_question = conn.execute(
+            "SELECT status, decided_by FROM open_questions WHERE id = ?",
+            ("question_review_reject",),
+        ).fetchone()
+        restored_sibling = conn.execute(
+            "SELECT status FROM cos_actions WHERE id = ?", (sibling["id"],)
+        ).fetchone()
+        restored_sibling_question = conn.execute(
+            "SELECT status, decided_by FROM open_questions WHERE id = ?",
+            ("question_review_reject_sibling",),
+        ).fetchone()
+        revoked_at = conn.execute(
+            "SELECT revoked_at FROM review_resolutions WHERE id = ?",
+            (resolution_row["id"],),
+        ).fetchone()[0]
+    assert restored_action["status"] == "proposed"
+    assert restored_question["status"] == "needs_human"
+    assert restored_question["decided_by"] is None
+    assert restored_sibling["status"] == "needs_human"
+    assert restored_sibling_question["status"] == "needs_human"
+    assert restored_sibling_question["decided_by"] is None
+    assert revoked_at is not None
+
+
+def test_cos_review_apply_rolls_back_if_semantic_resolution_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    fact = review_fact_payload("fact_legacy_apply_resolution_failure")
+    action = propose_action(
+        paths,
+        "fact_upsert",
+        action_payload={"fact": fact},
+        action_features={"truth_mutation": True, "reversible": True},
+        target_fact_ids=[str(fact["id"])],
+        target_page_paths=[str(fact["page_hint"])],
+        proposed_by="test",
+        risk_tier="medium",
+    )
+    with connection(paths.sqlite_path) as conn:
+        conn.execute(
+            "UPDATE cos_actions SET status = 'needs_human' WHERE id = ?",
+            (action["id"],),
+        )
+    insert_review_question_for_action(
+        paths,
+        question_id="question_legacy_apply_resolution_failure",
+        action_id=action["id"],
+        fact=fact,
+    )
+    write_resolution = ui_server.record_question_review_resolution
+
+    def fail_after_resolution(*args: object, **kwargs: object) -> None:
+        write_resolution(*args, **kwargs)
+        raise RuntimeError("injected semantic resolution failure")
+
+    monkeypatch.setattr(
+        ui_server, "record_question_review_resolution", fail_after_resolution
+    )
+    with pytest.raises(ui_server.BadRequestError, match="decision was rolled back"):
+        ui_server.ui_apply_cos_question_action(
+            paths,
+            "question_legacy_apply_resolution_failure",
+            {"note": "looks supported"},
+        )
+
+    with connection(paths.sqlite_path) as conn:
+        action_row = conn.execute(
+            "SELECT status FROM cos_actions WHERE id = ?", (action["id"],)
+        ).fetchone()
+        question_row = conn.execute(
+            "SELECT status, decided_by FROM open_questions WHERE id = ?",
+            ("question_legacy_apply_resolution_failure",),
+        ).fetchone()
+        fact_count = conn.execute(
+            "SELECT COUNT(*) FROM facts WHERE id = ?", (fact["id"],)
+        ).fetchone()[0]
+        resolution_rows = conn.execute(
+            "SELECT disposition, revoked_at FROM review_resolutions"
+        ).fetchall()
+    assert action_row["status"] == "needs_human"
+    assert question_row["status"] == "needs_human"
+    assert question_row["decided_by"] is None
+    assert fact_count == 0
+    assert [
+        (row["disposition"], row["revoked_at"] is not None) for row in resolution_rows
+    ] == [("keep", True)]
+
+
+def test_cos_review_dismiss_rolls_back_if_semantic_resolution_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    fact = review_fact_payload("fact_legacy_dismiss_resolution_failure")
+    action = propose_action(
+        paths,
+        "fact_upsert",
+        action_payload={"fact": fact},
+        action_features={"truth_mutation": True, "reversible": True},
+        target_fact_ids=[str(fact["id"])],
+        target_page_paths=[str(fact["page_hint"])],
+        proposed_by="test",
+        risk_tier="medium",
+    )
+    insert_review_question_for_action(
+        paths,
+        question_id="question_legacy_dismiss_resolution_failure",
+        action_id=action["id"],
+        fact=fact,
+    )
+    write_resolution = ui_server.record_question_review_resolution
+
+    def fail_after_resolution(*args: object, **kwargs: object) -> None:
+        write_resolution(*args, **kwargs)
+        raise RuntimeError("injected semantic resolution failure")
+
+    monkeypatch.setattr(
+        ui_server, "record_question_review_resolution", fail_after_resolution
+    )
+    with pytest.raises(ui_server.BadRequestError, match="decision was rolled back"):
+        ui_server.ui_dismiss_cos_question(
+            paths,
+            "question_legacy_dismiss_resolution_failure",
+            {"reason": "not supported by quote"},
+        )
+
+    with connection(paths.sqlite_path) as conn:
+        action_row = conn.execute(
+            "SELECT status, evidence_json FROM cos_actions WHERE id = ?",
+            (action["id"],),
+        ).fetchone()
+        question_row = conn.execute(
+            "SELECT status, decided_by FROM open_questions WHERE id = ?",
+            ("question_legacy_dismiss_resolution_failure",),
+        ).fetchone()
+        resolution_rows = conn.execute(
+            "SELECT disposition, revoked_at FROM review_resolutions"
+        ).fetchall()
+    assert action_row["status"] == "proposed"
+    assert "human_review" not in json.loads(action_row["evidence_json"])
+    assert question_row["status"] == "needs_human"
+    assert question_row["decided_by"] is None
+    assert [
+        (row["disposition"], row["revoked_at"] is not None) for row in resolution_rows
+    ] == [("reject", True)]
 
 
 def test_legacy_wiki_proposal_endpoints_are_retired(tmp_path: Path) -> None:
@@ -3410,6 +5942,279 @@ def test_chief_of_staff_page_review_correction_and_revert_endpoint(
     assert "corrected fact" in correction["review"]["current_markdown"]
     assert revert_status == 200
     assert "original fact" in reverted["review"]["current_markdown"]
+
+
+def test_wiki_fact_correction_records_exact_resolutions_and_guarded_undo(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    original = existing_review_fact_payload("fact_correction_original")
+    apply_action(
+        paths,
+        propose_action(
+            paths,
+            "fact_upsert",
+            action_payload={"fact": original},
+            target_fact_ids=[str(original["id"])],
+            target_page_paths=[str(original["page_hint"])],
+            proposed_by="test_correction",
+            risk_tier="low",
+        )["id"],
+    )
+    wiki_facts.curate_managed_pages(paths, page_hints=[str(original["page_hint"])])
+
+    correction = ui_server.ui_create_wiki_fact_correction(
+        paths,
+        {
+            "page_hint": original["page_hint"],
+            "statement": "The corrected workflow now presents complete evidence.",
+            "supersede_fact_ids": [original["id"]],
+        },
+    )
+
+    assert correction["undo_handle"]["kind"] == "fact_correction"
+    assert len(correction["undo_handle"]["action_ids"]) == 2
+    assert len(correction["undo_handle"]["review_resolution_ids"]) == 2
+    assert correction["undo_handle"]["undo_guard"]["fingerprint"]
+    with connection(paths.sqlite_path) as conn:
+        original_status = conn.execute(
+            "SELECT status FROM facts WHERE id = ?", (original["id"],)
+        ).fetchone()[0]
+        rows = list(
+            conn.execute(
+                """
+                SELECT disposition, decision_payload, revoked_at
+                FROM review_resolutions
+                WHERE source_item_kind = 'wiki_correction'
+                ORDER BY disposition
+                """
+            )
+        )
+    assert original_status == "retracted"
+    assert [(row["disposition"], row["revoked_at"]) for row in rows] == [
+        ("keep", None),
+        ("reject", None),
+    ]
+    reject_payload = json.loads(
+        next(row["decision_payload"] for row in rows if row["disposition"] == "reject")
+    )
+    assert reject_payload["corrected_away_fact_id"] == original["id"]
+
+    undone = ui_server.ui_queue_undo(paths, {"undo_handle": correction["undo_handle"]})
+
+    assert undone["status"] == "undone"
+    with connection(paths.sqlite_path) as conn:
+        restored_original = conn.execute(
+            "SELECT status FROM facts WHERE id = ?", (original["id"],)
+        ).fetchone()[0]
+        replacement_count = conn.execute(
+            "SELECT COUNT(*) FROM facts WHERE id = ?",
+            (correction["fact"]["id"],),
+        ).fetchone()[0]
+        action_statuses = [
+            row["status"]
+            for row in conn.execute(
+                """
+                SELECT status FROM cos_actions
+                WHERE id IN (?, ?)
+                ORDER BY action_type
+                """,
+                correction["undo_handle"]["action_ids"],
+            )
+        ]
+        active_resolution_count = conn.execute(
+            """
+            SELECT COUNT(*) FROM review_resolutions
+            WHERE source_item_kind = 'wiki_correction' AND revoked_at IS NULL
+            """
+        ).fetchone()[0]
+    markdown = (paths.wiki / str(original["page_hint"])).read_text(encoding="utf-8")
+    assert restored_original == "active"
+    assert replacement_count == 0
+    assert action_statuses == ["reverted", "reverted"]
+    assert active_resolution_count == 0
+    assert str(original["statement"]) in markdown
+    assert "corrected workflow" not in markdown
+
+
+def test_wiki_fact_correction_undo_page_drift_is_non_mutating(tmp_path: Path) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    original = existing_review_fact_payload("fact_correction_page_drift")
+    apply_action(
+        paths,
+        propose_action(
+            paths,
+            "fact_upsert",
+            action_payload={"fact": original},
+            target_fact_ids=[str(original["id"])],
+            target_page_paths=[str(original["page_hint"])],
+            proposed_by="test_correction_page_drift",
+            risk_tier="low",
+        )["id"],
+    )
+    correction = ui_server.ui_create_wiki_fact_correction(
+        paths,
+        {
+            "page_hint": original["page_hint"],
+            "statement": "The corrected workflow is now complete.",
+            "supersede_fact_ids": [original["id"]],
+        },
+    )
+    assert correction["undo_handle"]["page_snapshot_ids"]
+    page = paths.wiki / str(original["page_hint"])
+    drifted_markdown = page.read_text(encoding="utf-8") + "\nHuman page edit.\n"
+    page.write_text(drifted_markdown, encoding="utf-8")
+
+    def correction_state() -> dict[str, object]:
+        with connection(paths.sqlite_path) as conn:
+            return {
+                "facts": [
+                    tuple(row)
+                    for row in conn.execute("SELECT * FROM facts ORDER BY id")
+                ],
+                "actions": [
+                    tuple(row)
+                    for row in conn.execute("SELECT * FROM cos_actions ORDER BY id")
+                ],
+                "resolutions": [
+                    tuple(row)
+                    for row in conn.execute(
+                        "SELECT * FROM review_resolutions ORDER BY id"
+                    )
+                ],
+                "snapshots": [
+                    tuple(row)
+                    for row in conn.execute(
+                        "SELECT * FROM wiki_page_snapshots ORDER BY id"
+                    )
+                ],
+            }
+
+    before = correction_state()
+    with pytest.raises(ui_server.BadRequestError, match="managed page changed"):
+        ui_server.ui_queue_undo(paths, {"undo_handle": correction["undo_handle"]})
+
+    assert correction_state() == before
+    assert page.read_text(encoding="utf-8") == drifted_markdown
+
+
+def test_wiki_fact_correction_undo_uses_canonical_career_page_snapshot(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    original = existing_review_fact_payload("fact_correction_career")
+    original.update(
+        {
+            "entity_key": "career:acme:summary",
+            "page_hint": "career/acme.md",
+            "statement": "The Acme opportunity uses the original process.",
+        }
+    )
+    apply_action(
+        paths,
+        propose_action(
+            paths,
+            "fact_upsert",
+            action_payload={"fact": original},
+            target_fact_ids=[str(original["id"])],
+            target_page_paths=[str(original["page_hint"])],
+            proposed_by="test_correction_canonical_career",
+            risk_tier="low",
+        )["id"],
+    )
+    wiki_facts.curate_managed_pages(paths, page_hints=["career/acme.md"])
+
+    correction = ui_server.ui_create_wiki_fact_correction(
+        paths,
+        {
+            "page_hint": "career/opportunities/acme-senior-pm.md",
+            "statement": "The Acme opportunity now uses the corrected process.",
+            "supersede_fact_ids": [original["id"]],
+        },
+    )
+
+    snapshot_ids = [
+        page["snapshot_id"]
+        for page in correction["curation"]["pages"]
+        if page.get("snapshot_id")
+    ]
+    assert correction["fact"]["page_hint"] == "career/acme.md"
+    assert correction["undo_handle"]["page_hints"] == ["career/acme.md"]
+    assert correction["undo_handle"]["page_snapshot_ids"] == snapshot_ids
+
+    ui_server.ui_queue_undo(paths, {"undo_handle": correction["undo_handle"]})
+
+    canonical_page = paths.wiki / "career" / "acme.md"
+    assert str(original["statement"]) in canonical_page.read_text(encoding="utf-8")
+    assert "corrected process" not in canonical_page.read_text(encoding="utf-8")
+    assert not (paths.wiki / "career" / "opportunities" / "acme-senior-pm.md").exists()
+
+
+def test_wiki_fact_correction_compensates_if_resolution_write_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    original = existing_review_fact_payload("fact_correction_failure_original")
+    apply_action(
+        paths,
+        propose_action(
+            paths,
+            "fact_upsert",
+            action_payload={"fact": original},
+            target_fact_ids=[str(original["id"])],
+            target_page_paths=[str(original["page_hint"])],
+            proposed_by="test_correction_failure",
+            risk_tier="low",
+        )["id"],
+    )
+    write_resolution = wiki_facts.record_review_resolution
+
+    def fail_after_resolution(*args: object, **kwargs: object) -> tuple[object, bool]:
+        write_resolution(*args, **kwargs)
+        raise RuntimeError("injected correction resolution failure")
+
+    monkeypatch.setattr(wiki_facts, "record_review_resolution", fail_after_resolution)
+    with pytest.raises(RuntimeError, match="correction resolution failure"):
+        ui_server.ui_create_wiki_fact_correction(
+            paths,
+            {
+                "page_hint": original["page_hint"],
+                "statement": "A correction whose ledger write must fail.",
+                "supersede_fact_ids": [original["id"]],
+            },
+        )
+
+    with connection(paths.sqlite_path) as conn:
+        original_status = conn.execute(
+            "SELECT status FROM facts WHERE id = ?", (original["id"],)
+        ).fetchone()[0]
+        replacement_count = conn.execute(
+            """
+            SELECT COUNT(*) FROM facts
+            WHERE source_ids LIKE '%manual:chief-of-staff:%'
+            """
+        ).fetchone()[0]
+        correction_action_statuses = [
+            row["status"]
+            for row in conn.execute(
+                """
+                SELECT status FROM cos_actions
+                WHERE proposed_by = 'chief_of_staff_correction'
+                ORDER BY created_at, id
+                """
+            )
+        ]
+        active_resolution_count = conn.execute(
+            "SELECT COUNT(*) FROM review_resolutions WHERE revoked_at IS NULL"
+        ).fetchone()[0]
+    assert original_status == "active"
+    assert replacement_count == 0
+    assert sorted(correction_action_statuses) == ["failed", "reverted"]
+    assert active_resolution_count == 0
 
 
 def test_cos_control_plane_endpoints_require_auth_and_return_state(

@@ -1,7 +1,7 @@
 # PKM Brain Documentation
 
 **Status:** authoritative docs index
-**Last verified:** 2026-07-29 against the promoted Brain `0.2.4` temporal-cognition release line at commit `2085ec3`; Knowledge migrations 1-26 are live-compatible, Gmail Knowledge projection is local and bounded, and private Gmail external extraction plus temporal review remain separately gated
+**Last verified:** 2026-08-02 against Brain `0.2.5`; Knowledge migrations 1-29 are live-compatible, current-run audit is isolated from bounded weekly historical review, Gmail Knowledge projection is local and bounded, and private Gmail external extraction plus temporal review remain separately gated
 
 Current requirements are organized by product feature, not implementation stream. Start with Product Foundation, then read the owning feature spec for the behavior being changed.
 

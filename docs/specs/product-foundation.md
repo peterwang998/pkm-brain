@@ -1,7 +1,7 @@
 # Product Foundation
 
 **Status:** canonical living feature spec; Brain v2 temporal cognition, the read-only Chief-of-Staff trial, Gmail mirror, encrypted local mail archive, and bounded Gmail Knowledge projection are release-verified, while Gmail external extraction/temporal review and owner trust promotion remain separately gated
-**Last verified:** 2026-07-29 against Brain `0.2.4` release-line commit `2085ec3` and Knowledge schema 26
+**Last verified:** 2026-08-02 against Brain `0.2.5` and Knowledge schema 29
 **Owns:** product boundaries, authority hierarchy, persistence model, privacy rules, and cross-feature invariants
 
 ## Purpose
@@ -205,12 +205,12 @@ Allowed network activity is limited to explicitly configured LLM, connector, and
 
 ## Current Status
 
-The core local Knowledge Curation pipeline, temporal fact/entity/event ledger, action policy, managed pages, retrieval, MCP, native daemon/app, and Primary/Secondary sync are implemented. Knowledge schema 26 is the current release contract. Existing `cos_*` code and tables implement Knowledge Curation despite their historical names.
+The core local Knowledge Curation pipeline, temporal fact/entity/event ledger, action policy, managed pages, retrieval, MCP, native daemon/app, and Primary/Secondary sync are implemented. Knowledge schema 29 is the current release contract; schema 27 adds durable semantic review resolutions without rewriting fact or action history, schema 28 idempotently repairs and completes the historical question backfill, and schema 29 preserves those active decisions while rekeying reconstructable facts and actions under entity-aware semantic identity. It also records recoverable legacy attribution without inventing missing entity identity. Existing `cos_*` code and tables implement Knowledge Curation despite their historical names.
 
 The Operational Chief-of-Staff context now has an isolated, independently migrated `ops.sqlite` kernel, a daemon-owned fail-closed mutation service, coordinated database-pair recovery, read-only Calendar/Gmail source integration, deterministic reconciliation, a coverage-aware Today briefing, local feedback, and offline replay evaluation. The full Shadow evaluation remains manual: the owner authorizes two exact-scope Google grants and selects **Today > Run Shadow** for Calendar refresh plus local Gmail analysis. Gmail transport is separate; once a valid private operations policy and exact grant exist, the primary/single daemon may initialize `ops.sqlite` and runs the fetch-only local mirror at startup and about every 600 seconds. Operational writes remain local to `ops.sqlite`. Bounded Gmail Knowledge projection and retrieval run locally from the encrypted archive when enabled, while Calendar Knowledge ingestion, private Gmail external extraction/temporal review, and all external-action authority remain disabled by default. Restores publish only into a new quarantined home and cannot become a writer until a future explicit topology activation workflow.
 
-The current `0.2.4` software release gate requires clean Ruff and diff checks,
-all 2,808 Python tests, all 28 Swift tests, a clean Apple Silicon app build,
+The current `0.2.5` software release gate requires clean Ruff and diff checks,
+all 2,969 Python tests, all 28 Swift tests, a clean Apple Silicon app build,
 strict deep signature verification, and a passing GitHub native-UI workflow
 before promotion to `main`. Source-built bundles are ad-hoc signed; Developer
 ID signing, notarization, a universal binary, and a downloadable release remain

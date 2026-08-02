@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 from collections.abc import Callable, Iterable
 
@@ -1152,6 +1154,717 @@ def _migration_026_gmail_temporal_runner_evidence(
         )
 
 
+def _migration_027_review_resolution_ledger(conn: sqlite3.Connection) -> None:
+    """Persist semantic human review decisions across regenerated action IDs."""
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS review_resolutions (
+          id TEXT PRIMARY KEY,
+          family_key TEXT NOT NULL,
+          portable_key TEXT NOT NULL,
+          state_fingerprint TEXT NOT NULL,
+          group_key TEXT NOT NULL,
+          disposition TEXT NOT NULL CHECK(disposition IN ('keep', 'reject')),
+          source_item_kind TEXT NOT NULL,
+          source_item_id TEXT NOT NULL,
+          decision_payload TEXT NOT NULL DEFAULT '{}',
+          decided_by TEXT NOT NULL,
+          resolved_at TEXT NOT NULL,
+          revoked_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_review_resolutions_active_state
+        ON review_resolutions(family_key, state_fingerprint)
+        WHERE revoked_at IS NULL
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_review_resolutions_portable
+        ON review_resolutions(portable_key, resolved_at)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_review_resolutions_group
+        ON review_resolutions(group_key, resolved_at)
+        """
+    )
+    from .review_resolution import backfill_review_resolutions
+
+    backfill_review_resolutions(conn)
+
+
+def _migration_028_finalize_review_resolution_backfill(
+    conn: sqlite3.Connection,
+) -> None:
+    """Repair the pre-release v27 question backfill and fill legacy fact decisions."""
+
+    from .review_resolution import backfill_review_resolutions
+
+    backfill_review_resolutions(conn)
+
+
+def _migration_029_rekey_entity_review_resolutions(
+    conn: sqlite3.Connection,
+) -> None:
+    """Move schema-28 decisions onto the entity-aware fact identity.
+
+    Schema 29 makes fact entity attribution material to semantic review identity.
+    The ordinary backfill reconstructs confirmed facts, questions, and audit
+    decisions under that identity.  Direct Queue decisions have no other durable
+    provenance, so the remaining active ledger rows are rekeyed from their source
+    action.  The legacy row is retained as revoked history and a deterministic
+    successor carries the same human decision under the current identity.
+    """
+
+    if not _table_exists(conn, "review_resolutions"):
+        return
+
+    from .review_resolution import (
+        action_by_id,
+        action_review_identity,
+        backfill_review_resolutions,
+        decoded_fact_row,
+        original_question_action,
+        synthetic_fact_action,
+    )
+
+    _backfill_fact_entity_attribution_snapshots(conn)
+
+    # Reconstruct every source that already has first-class historical
+    # provenance before handling direct action decisions.  Besides preserving
+    # the richer question plans, this also ensures legacy free-text answers are
+    # expanded into their reject-original/keep-manual pair by the current
+    # backfill contract.
+    backfill_review_resolutions(conn, restore_superseded_on_revoke=False)
+
+    migrated_at = now_iso()
+    active_rows = list(
+        conn.execute(
+            """
+            SELECT *
+            FROM review_resolutions
+            WHERE revoked_at IS NULL
+            ORDER BY resolved_at, id
+            """
+        )
+    )
+    active_question_counts = {
+        str(row["source_item_id"]): int(row["resolution_count"])
+        for row in conn.execute(
+            """
+            SELECT source_item_id, COUNT(*) AS resolution_count
+            FROM review_resolutions
+            WHERE revoked_at IS NULL AND source_item_kind = 'question'
+            GROUP BY source_item_id
+            """
+        )
+    }
+    for row in active_rows:
+        action = None
+        source_kind = str(row["source_item_kind"] or "")
+        source_id = str(row["source_item_id"] or "")
+        if source_kind in {"action", "audit"}:
+            action = action_by_id(conn, source_id)
+        elif source_kind == "fact_confirmation" and _table_exists(conn, "facts"):
+            fact_row = conn.execute(
+                "SELECT * FROM facts WHERE id = ?", (source_id,)
+            ).fetchone()
+            if fact_row is not None:
+                action = synthetic_fact_action(decoded_fact_row(fact_row))
+        elif (
+            source_kind == "question"
+            and active_question_counts.get(source_id) == 1
+            and _table_exists(conn, "open_questions")
+        ):
+            # Multi-resolution alternative questions are deliberately left to
+            # backfill_review_resolutions above.  A single residual row can be
+            # mapped safely to the reviewed candidate even if old provenance is
+            # too sparse for the generic backfill to recreate it.
+            question_row = conn.execute(
+                "SELECT * FROM open_questions WHERE id = ?", (source_id,)
+            ).fetchone()
+            if question_row is not None:
+                from .review_resolution import decoded_question_row
+
+                action = original_question_action(
+                    conn, decoded_question_row(question_row)
+                )
+        if action is None:
+            continue
+        identity = action_review_identity(action)
+        _rekey_active_review_resolution(
+            conn,
+            row,
+            identity=identity,
+            migrated_at=migrated_at,
+        )
+
+
+def _rekey_active_review_resolution(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    identity: dict[str, str],
+    migrated_at: str,
+) -> None:
+    """Rekey one active resolution without violating the partial unique index."""
+
+    old_id = str(row["id"])
+    identity_columns = (
+        "family_key",
+        "portable_key",
+        "state_fingerprint",
+        "group_key",
+    )
+    if all(str(row[column]) == identity[column] for column in identity_columns):
+        return
+
+    existing = conn.execute(
+        """
+        SELECT *
+        FROM review_resolutions
+        WHERE family_key = ? AND state_fingerprint = ?
+          AND revoked_at IS NULL
+        LIMIT 1
+        """,
+        (identity["family_key"], identity["state_fingerprint"]),
+    ).fetchone()
+    if existing is not None and str(existing["id"]) == old_id:
+        conn.execute(
+            """
+            UPDATE review_resolutions
+            SET portable_key = ?, group_key = ?
+            WHERE id = ? AND revoked_at IS NULL
+            """,
+            (identity["portable_key"], identity["group_key"], old_id),
+        )
+        return
+
+    # A current-identity row can already exist when the standard backfill
+    # reconstructed this source.  Keep a strictly newer decision.  On equal
+    # timestamps, preserve the released ledger row being migrated; its explicit
+    # disposition is stronger evidence than a newly derived backfill row.
+    if existing is not None and str(existing["resolved_at"] or "") > str(
+        row["resolved_at"] or ""
+    ):
+        conn.execute(
+            """
+            UPDATE review_resolutions SET revoked_at = ?
+            WHERE id = ? AND revoked_at IS NULL
+            """,
+            (migrated_at, old_id),
+        )
+        return
+
+    if existing is not None:
+        conn.execute(
+            """
+            UPDATE review_resolutions SET revoked_at = ?
+            WHERE id = ? AND revoked_at IS NULL
+            """,
+            (migrated_at, str(existing["id"])),
+        )
+    conn.execute(
+        """
+        UPDATE review_resolutions SET revoked_at = ?
+        WHERE id = ? AND revoked_at IS NULL
+        """,
+        (migrated_at, old_id),
+    )
+
+    successor_id = _schema29_resolution_id(old_id, identity)
+    decision_payload = _schema29_resolution_payload(
+        conn,
+        row,
+        identity=identity,
+        migrated_at=migrated_at,
+        seen={old_id},
+    )
+    successor = conn.execute(
+        "SELECT id FROM review_resolutions WHERE id = ?", (successor_id,)
+    ).fetchone()
+    values = (
+        identity["family_key"],
+        identity["portable_key"],
+        identity["state_fingerprint"],
+        identity["group_key"],
+        str(row["disposition"]),
+        str(row["source_item_kind"]),
+        str(row["source_item_id"]),
+        json.dumps(decision_payload, sort_keys=True),
+        str(row["decided_by"]),
+        str(row["resolved_at"]),
+    )
+    if successor is None:
+        conn.execute(
+            """
+            INSERT INTO review_resolutions(
+              id, family_key, portable_key, state_fingerprint, group_key,
+              disposition, source_item_kind, source_item_id, decision_payload,
+              decided_by, resolved_at, revoked_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            """,
+            (successor_id, *values),
+        )
+    else:
+        conn.execute(
+            """
+            UPDATE review_resolutions
+            SET family_key = ?, portable_key = ?, state_fingerprint = ?,
+                group_key = ?, disposition = ?, source_item_kind = ?,
+                source_item_id = ?, decision_payload = ?, decided_by = ?,
+                resolved_at = ?, revoked_at = NULL
+            WHERE id = ?
+            """,
+            (*values, successor_id),
+        )
+
+
+def _backfill_fact_entity_attribution_snapshots(conn: sqlite3.Connection) -> None:
+    """Persist recoverable schema-28 attribution and entity-ID provenance."""
+
+    if not all(
+        _table_exists(conn, table) for table in ("facts", "fact_entities", "entities")
+    ):
+        return
+    from .fact_entity_attribution import (
+        FACT_ENTITY_ATTRIBUTION_SNAPSHOT_KEY,
+        FACT_ENTITY_ATTRIBUTION_SNAPSHOT_VERSION,
+        fact_entity_attribution_snapshot,
+        fact_entity_mentions,
+    )
+
+    action_inputs = _schema29_fact_upsert_inputs(conn)
+    fact_entity_id_sql = (
+        "f.entity_id" if "entity_id" in _table_columns(conn, "facts") else "NULL"
+    )
+    rows = conn.execute(
+        f"""
+        SELECT f.id AS fact_id, {fact_entity_id_sql} AS fact_entity_id, f.metadata,
+               fe.id AS association_id, fe.is_primary, fe.mention_text,
+               fe.mention_kind, e.name AS entity_name, e.entity_type
+        FROM facts f
+        LEFT JOIN fact_entities fe ON fe.fact_id = f.id
+        LEFT JOIN entities e ON e.id = fe.entity_id
+        ORDER BY f.id, fe.is_primary DESC, fe.id
+        """
+    )
+    grouped: dict[str, dict[str, object]] = {}
+    for row in rows:
+        fact_id = str(row["fact_id"])
+        item = grouped.setdefault(
+            fact_id,
+            {
+                "entity_id": row["fact_entity_id"],
+                "metadata": row["metadata"],
+                "mentions": {},
+            },
+        )
+        surface = str(row["mention_text"] or "").strip()
+        if not surface:
+            continue
+        is_primary = bool(row["is_primary"])
+        mention: dict[str, object] = {
+            "surface": surface,
+            "is_primary": is_primary,
+        }
+        entity_name = str(row["entity_name"] or "").strip()
+        if is_primary and entity_name and entity_name.casefold() != surface.casefold():
+            mention["entity_identity"] = entity_name
+        entity_type = str(row["entity_type"] or "").strip()
+        mention_kind = str(row["mention_kind"] or "").strip()
+        if entity_type:
+            mention["entity_type"] = entity_type
+        if mention_kind:
+            mention["mention_kind"] = mention_kind
+        key = json.dumps(
+            mention, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+        )
+        mentions = item["mentions"]
+        if isinstance(mentions, dict):
+            mentions.setdefault(key, mention)
+
+    for fact_id, item in grouped.items():
+        metadata = _decoded_json_object(item["metadata"])
+        if metadata is None:
+            continue
+        current_input = action_inputs.get(fact_id)
+        current_fact = (
+            current_input.get("fact") if isinstance(current_input, dict) else None
+        )
+        existing_snapshot = fact_entity_attribution_snapshot(metadata)
+        existing_origin = str((existing_snapshot or {}).get("entity_id_origin") or "")
+        if isinstance(current_fact, dict):
+            source_mentions = fact_entity_mentions(current_fact)
+            recovered_origin = str(current_input.get("entity_id_origin") or "derived")
+            recovered_authoritative = bool(
+                current_input.get("entity_id_origin_authoritative")
+            )
+            entity_id_origin = (
+                recovered_origin
+                if recovered_authoritative
+                or existing_origin not in {"derived", "explicit", "unknown"}
+                else existing_origin
+            )
+        else:
+            source_mentions = fact_entity_mentions({"metadata": metadata})
+            entity_id_origin = (
+                existing_origin
+                if existing_origin in {"derived", "explicit", "unknown"}
+                else "unknown"
+            )
+        if source_mentions:
+            mentions = _schema29_snapshot_mentions(source_mentions)
+        elif existing_snapshot is not None:
+            mentions = list(existing_snapshot.get("mentions") or [])
+        else:
+            mention_map = item["mentions"]
+            mentions = (
+                sorted(
+                    mention_map.values(),
+                    key=lambda mention: (
+                        not bool(mention.get("is_primary")),
+                        json.dumps(
+                            mention,
+                            ensure_ascii=True,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ),
+                    ),
+                )
+                if isinstance(mention_map, dict)
+                else []
+            )
+        if (
+            not mentions
+            and existing_snapshot is None
+            and not isinstance(current_fact, dict)
+        ):
+            continue
+        entity_id = str(item.get("entity_id") or "").strip()
+        metadata[FACT_ENTITY_ATTRIBUTION_SNAPSHOT_KEY] = {
+            "version": FACT_ENTITY_ATTRIBUTION_SNAPSHOT_VERSION,
+            "mentions": mentions,
+            "entity_id_origin": entity_id_origin,
+            **({"entity_id": entity_id} if entity_id else {}),
+        }
+        conn.execute(
+            "UPDATE facts SET metadata = ? WHERE id = ?",
+            (json.dumps(metadata, sort_keys=True), fact_id),
+        )
+
+
+def _schema29_fact_upsert_inputs(
+    conn: sqlite3.Connection,
+) -> dict[str, dict[str, object]]:
+    """Recover each head's latest attribution input and ID provenance.
+
+    Target lists can contain superseded history IDs, so only the payload fact's
+    own ID is authoritative. Attribution-free updates are skipped, while older
+    explicit-ID input remains available to a later mention-only update.
+    """
+
+    if not _table_exists(conn, "cos_actions"):
+        return {}
+    from .fact_entity_attribution import (
+        FACT_ENTITY_ID_ORIGINS,
+        fact_entity_attribution_input_present,
+        fact_entity_attribution_snapshot,
+        fact_entity_id_is_explicit,
+    )
+
+    result: dict[str, dict[str, object]] = {}
+    for row in conn.execute(
+        """
+        SELECT proposed_by, evidence_json
+        FROM cos_actions
+        WHERE action_type = 'fact_upsert'
+          AND status IN ('applied', 'auto_applied')
+        ORDER BY COALESCE(applied_at, created_at) DESC, id DESC
+        """
+    ):
+        if str(row["proposed_by"] or "") == "ui_fact_confirm":
+            continue
+        evidence = _json_object(row["evidence_json"])
+        payload = evidence.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        raw_fact = (
+            payload.get("fact") if isinstance(payload.get("fact"), dict) else payload
+        )
+        if not isinstance(raw_fact, dict):
+            continue
+        fact = dict(raw_fact)
+        payload_id = str(fact.get("id") or "").strip()
+        if not payload_id or not fact_entity_attribution_input_present(fact):
+            continue
+        item = result.setdefault(
+            payload_id,
+            {
+                "fact": fact,
+                "entity_id_origin": "derived",
+                "entity_id_origin_authoritative": False,
+            },
+        )
+        if bool(item.get("entity_id_origin_authoritative")):
+            continue
+        snapshot = fact_entity_attribution_snapshot(fact.get("metadata"))
+        snapshot_origin = str((snapshot or {}).get("entity_id_origin") or "")
+        snapshot_id = str((snapshot or {}).get("entity_id") or "").strip()
+        supplied_id = str(fact.get("entity_id") or "").strip()
+        if supplied_id:
+            item["entity_id_origin"] = (
+                "explicit" if fact_entity_id_is_explicit(fact) else "derived"
+            )
+            item["entity_id_origin_authoritative"] = True
+        elif snapshot_origin in FACT_ENTITY_ID_ORIGINS and snapshot_id:
+            item["entity_id_origin"] = snapshot_origin
+            item["entity_id_origin_authoritative"] = True
+    return result
+
+
+def _schema29_snapshot_mentions(
+    mentions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    by_key: dict[str, dict[str, object]] = {}
+    for mention in mentions:
+        is_primary = bool(mention.get("is_primary"))
+        snapshot_mention = {
+            key: value
+            for key, value in {
+                "surface": str(mention.get("surface") or "").strip(),
+                "entity_identity": (
+                    str(mention.get("entity_identity") or "").strip()
+                    if is_primary
+                    else ""
+                ),
+                "entity_type": mention.get("entity_type"),
+                "mention_kind": mention.get("mention_kind"),
+                "is_primary": is_primary,
+            }.items()
+            if value not in (None, "")
+        }
+        key = json.dumps(
+            snapshot_mention,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        by_key.setdefault(key, snapshot_mention)
+    return sorted(
+        by_key.values(),
+        key=lambda mention: (
+            not bool(mention.get("is_primary")),
+            json.dumps(
+                mention,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+        ),
+    )
+
+
+def _schema29_resolution_payload(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    identity: dict[str, str],
+    migrated_at: str,
+    seen: set[str],
+) -> dict[str, object]:
+    old_id = str(row["id"])
+    decision_payload = _json_object(row["decision_payload"])
+    migration_provenance: dict[str, object] = {
+        "from_resolution_id": old_id,
+        "schema_version": 29,
+    }
+    superseded_id = str(decision_payload.get("superseded_resolution_id") or "")
+    if superseded_id:
+        predecessor = conn.execute(
+            "SELECT * FROM review_resolutions WHERE id = ?", (superseded_id,)
+        ).fetchone()
+        predecessor_identity = (
+            _schema29_resolution_identity(conn, predecessor)
+            if predecessor is not None
+            else None
+        )
+        same_identity = predecessor_identity is not None and all(
+            predecessor_identity[key] == identity[key]
+            for key in ("family_key", "state_fingerprint")
+        )
+        migrated_superseded_id = None
+        if same_identity:
+            migrated_superseded_id = _clone_schema29_resolution_history(
+                conn,
+                superseded_id,
+                identity=predecessor_identity,
+                migrated_at=migrated_at,
+                seen=seen,
+                active=False,
+            )
+            if migrated_superseded_id:
+                decision_payload["superseded_resolution_id"] = migrated_superseded_id
+        elif predecessor_identity is not None:
+            migrated_superseded_id = _clone_schema29_resolution_history(
+                conn,
+                superseded_id,
+                identity=predecessor_identity,
+                migrated_at=migrated_at,
+                seen=seen,
+                active=True,
+            )
+            decision_payload.pop("superseded_resolution_id", None)
+            migration_provenance["separated_superseded_resolution_id"] = (
+                migrated_superseded_id or superseded_id
+            )
+            migration_provenance["legacy_superseded_resolution_id"] = superseded_id
+        else:
+            # Never let Undo reactivate an unreachable schema-28 state.
+            decision_payload.pop("superseded_resolution_id", None)
+            migration_provenance["legacy_superseded_resolution_id"] = superseded_id
+    decision_payload["identity_migration"] = migration_provenance
+    return decision_payload
+
+
+def _clone_schema29_resolution_history(
+    conn: sqlite3.Connection,
+    legacy_id: str,
+    *,
+    identity: dict[str, str],
+    migrated_at: str,
+    seen: set[str],
+    active: bool,
+) -> str | None:
+    if not legacy_id or legacy_id in seen:
+        return None
+    row = conn.execute(
+        "SELECT * FROM review_resolutions WHERE id = ?", (legacy_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    successor_id = _schema29_resolution_id(legacy_id, identity)
+    decision_payload = _schema29_resolution_payload(
+        conn,
+        row,
+        identity=identity,
+        migrated_at=migrated_at,
+        seen={*seen, legacy_id},
+    )
+    revoked_at: str | None = None if active else str(row["revoked_at"] or migrated_at)
+    if active:
+        active_existing = conn.execute(
+            """
+            SELECT id FROM review_resolutions
+            WHERE family_key = ? AND state_fingerprint = ?
+              AND revoked_at IS NULL
+            LIMIT 1
+            """,
+            (identity["family_key"], identity["state_fingerprint"]),
+        ).fetchone()
+        if active_existing is not None and str(active_existing["id"]) != successor_id:
+            return str(active_existing["id"])
+    values = (
+        identity["family_key"],
+        identity["portable_key"],
+        identity["state_fingerprint"],
+        identity["group_key"],
+        str(row["disposition"]),
+        str(row["source_item_kind"]),
+        str(row["source_item_id"]),
+        json.dumps(decision_payload, sort_keys=True),
+        str(row["decided_by"]),
+        str(row["resolved_at"]),
+        revoked_at,
+    )
+    existing = conn.execute(
+        "SELECT id FROM review_resolutions WHERE id = ?", (successor_id,)
+    ).fetchone()
+    if existing is None:
+        conn.execute(
+            """
+            INSERT INTO review_resolutions(
+              id, family_key, portable_key, state_fingerprint, group_key,
+              disposition, source_item_kind, source_item_id, decision_payload,
+              decided_by, resolved_at, revoked_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (successor_id, *values),
+        )
+    else:
+        conn.execute(
+            """
+            UPDATE review_resolutions
+            SET family_key = ?, portable_key = ?, state_fingerprint = ?,
+                group_key = ?, disposition = ?, source_item_kind = ?,
+                source_item_id = ?, decision_payload = ?, decided_by = ?,
+                resolved_at = ?, revoked_at = ?
+            WHERE id = ?
+            """,
+            (*values, successor_id),
+        )
+    return successor_id
+
+
+def _schema29_resolution_identity(
+    conn: sqlite3.Connection, row: sqlite3.Row
+) -> dict[str, str] | None:
+    """Reconstruct a resolution's own identity from durable source state."""
+
+    from .review_resolution import (
+        action_by_id,
+        action_review_identity,
+        decoded_fact_row,
+        synthetic_fact_action,
+    )
+
+    source_kind = str(row["source_item_kind"] or "")
+    source_id = str(row["source_item_id"] or "")
+    action = None
+    if source_kind in {"action", "audit"}:
+        action = action_by_id(conn, source_id)
+    elif source_kind == "fact_confirmation" and _table_exists(conn, "facts"):
+        fact_row = conn.execute(
+            "SELECT * FROM facts WHERE id = ?", (source_id,)
+        ).fetchone()
+        if fact_row is not None:
+            action = synthetic_fact_action(decoded_fact_row(fact_row))
+    return action_review_identity(action) if action is not None else None
+
+
+def _schema29_resolution_id(old_id: str, identity: dict[str, str]) -> str:
+    return (
+        "resolution_schema29_"
+        + hashlib.sha256(
+            (
+                old_id
+                + "\0"
+                + identity["family_key"]
+                + "\0"
+                + identity["state_fingerprint"]
+            ).encode("utf-8")
+        ).hexdigest()[:24]
+    )
+
+
+def _json_object(value: object) -> dict[str, object]:
+    return _decoded_json_object(value) or {}
+
+
+def _decoded_json_object(value: object) -> dict[str, object] | None:
+    try:
+        decoded = json.loads(str(value or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return dict(decoded) if isinstance(decoded, dict) else None
+
+
 MIGRATIONS: list[Migration] = [
     (1, "add_origin_identity", _migration_001_add_origin_identity),
     (2, "create_sync_runs", _migration_002_create_sync_runs),
@@ -1190,6 +1903,17 @@ MIGRATIONS: list[Migration] = [
         26,
         "gmail_temporal_runner_evidence",
         _migration_026_gmail_temporal_runner_evidence,
+    ),
+    (27, "review_resolution_ledger", _migration_027_review_resolution_ledger),
+    (
+        28,
+        "finalize_review_resolution_backfill",
+        _migration_028_finalize_review_resolution_backfill,
+    ),
+    (
+        29,
+        "rekey_entity_review_resolutions",
+        _migration_029_rekey_entity_review_resolutions,
     ),
 ]
 

@@ -106,12 +106,14 @@ def test_page_synthesizer_proposes_reversible_action(tmp_path: Path) -> None:
     result = generate_page_syntheses(
         svc.paths,
         shadow=False,
+        run_id="automation_synthesis_test",
         llm_provider=FakeSynthesizerProvider(),
     )
 
     assert result["candidate_count"] == 1
     action = result["actions"][0]
     assert action["action_type"] == "synthesize_page"
+    assert action["run_id"] == "automation_synthesis_test"
     assert action["status"] == "applied"
     assert action["autonomy_level"] == "L2"
     assert action["critic_by"] is None

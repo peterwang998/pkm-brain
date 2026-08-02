@@ -21,6 +21,11 @@ from .llm import (
     get_cos_role_provider,
 )
 from .paths import BrainPaths
+from .review_resolution import (
+    action_is_manually_resolved,
+    action_review_identity,
+    table_exists,
+)
 
 
 COS_AUDIT_STUB_NOTE = "Sampled audit is not executed; no independent critic/auditor provider is configured."
@@ -53,6 +58,11 @@ AUDITOR_MAX_ACTIONS_PER_BATCH = 8
 AUDITOR_MAX_BATCH_CHARS = 180_000
 AUDITOR_MAX_CARD_CHARS = 48_000
 AUDITOR_MAX_PAYLOAD_CHARS = 16_000
+HISTORICAL_AUDIT_CANDIDATE_SCAN_CAP = 512
+HISTORICAL_AUDIT_CANDIDATE_BATCH_SIZE = 64
+HISTORICAL_PRIORITY_FACT_ID_SCAN_CAP = 4096
+HISTORICAL_PRIORITY_FACT_IDS_PER_ACTION = 64
+SQLITE_SAFE_BIND_BATCH_SIZE = 400
 
 
 def run_sampled_audit(
@@ -65,6 +75,8 @@ def run_sampled_audit(
     run_id: str | None = None,
     action_run_id: str | None = None,
     action_ids: list[str] | None = None,
+    audit_origin: str = "manual",
+    historical: bool = False,
 ) -> dict[str, Any]:
     with connection(paths.sqlite_path) as conn:
         actions = load_audit_sample(
@@ -72,13 +84,21 @@ def run_sampled_audit(
             limit,
             action_run_id=action_run_id,
             action_ids=action_ids,
+            historical=historical,
         )
+    scope = audit_scope(
+        action_run_id=action_run_id,
+        action_ids=action_ids,
+        audit_origin=audit_origin,
+        historical=historical,
+    )
     if not auditor_configured(paths, llm_provider=llm_provider, provider=provider):
         return {
             "status": "ok",
             "mode": "stub",
             "note": COS_AUDIT_STUB_NOTE,
             "sampled": len(actions),
+            "sampled_action_ids": [str(action["id"]) for action in actions],
             "audited": [],
             "bad_action_ids": [],
             "unscoped_bad_action_ids": [],
@@ -87,7 +107,7 @@ def run_sampled_audit(
             "audit_errors": [],
             "demoted_policy_version": None,
             "reverted": [],
-            "scope": audit_scope(action_run_id=action_run_id, action_ids=action_ids),
+            "scope": scope,
         }
 
     audited: list[dict[str, Any]] = []
@@ -136,6 +156,7 @@ def run_sampled_audit(
             missing_action_ids.append(action["id"])
             continue
         audit_status = str(judgment["audit_status"])
+        identity = action_review_identity(action)
         audited.append(
             record_action_audit(
                 paths,
@@ -152,6 +173,13 @@ def run_sampled_audit(
                         paths, llm_provider=audit_provider, provider=provider
                     ),
                     "model": getattr(audit_provider, "model", None),
+                    "audit_origin": audit_origin,
+                    "audit_run_id": run_id,
+                    "issue_key": (
+                        f"{identity['family_key']}:{identity['state_fingerprint']}"
+                    ),
+                    "group_key": identity["group_key"],
+                    "historical_priority": action.get("historical_priority") or {},
                 },
             )
         )
@@ -167,7 +195,9 @@ def run_sampled_audit(
                 for action in load_actions_for_audit_ids(conn, bad_action_ids)
                 if not action.get("policy_id") or action.get("policy_version") is None
             ]
-            demotion_evidence = demotion_threshold_breaches(conn, bad_action_ids)
+            demotion_evidence = (
+                [] if historical else demotion_threshold_breaches(conn, bad_action_ids)
+            )
             if demotion_evidence:
                 demoted_version = demote_policy_version(
                     conn,
@@ -186,6 +216,7 @@ def run_sampled_audit(
         "mode": "configured",
         "note": COS_AUDIT_CONFIGURED_NOTE,
         "sampled": len(actions),
+        "sampled_action_ids": [str(action["id"]) for action in actions],
         "audited": audited,
         "bad_action_ids": bad_action_ids,
         "unscoped_bad_action_ids": unscoped_bad_action_ids,
@@ -195,7 +226,7 @@ def run_sampled_audit(
         "demotion_evidence": demotion_evidence,
         "demoted_policy_version": demoted_version,
         "reverted": reverted,
-        "scope": audit_scope(action_run_id=action_run_id, action_ids=action_ids),
+        "scope": scope,
     }
 
 
@@ -205,10 +236,14 @@ def load_audit_sample(
     *,
     action_run_id: str | None = None,
     action_ids: list[str] | None = None,
+    historical: bool = False,
 ) -> list[dict[str, Any]]:
     if limit <= 0:
         return []
+    explicit_action_scope = action_ids is not None
     explicit_ids = [str(item).strip() for item in action_ids or [] if str(item).strip()]
+    if explicit_action_scope and not explicit_ids:
+        return []
     clauses = ["status IN ('applied', 'auto_applied')", "audit_status = 'unaudited'"]
     params: list[Any] = []
     if action_run_id:
@@ -218,7 +253,16 @@ def load_audit_sample(
         placeholders = ",".join("?" for _ in explicit_ids)
         clauses.append(f"id IN ({placeholders})")
         params.extend(explicit_ids)
-    candidate_limit = limit if explicit_ids or action_run_id else max(limit * 10, limit)
+    if historical:
+        return load_historical_audit_sample(conn, limit, clauses, params)
+    # Explicit IDs define the eligible cohort; they do not opt those actions out
+    # of policy sampling. Load the whole cohort before applying the sample limit
+    # so an unsampled member cannot crowd out a later sampled member.
+    candidate_limit = (
+        max(len(explicit_ids), limit)
+        if explicit_action_scope
+        else max(limit * 10, limit)
+    )
     params.append(candidate_limit)
     candidates = [
         row_to_action(row)
@@ -226,7 +270,7 @@ def load_audit_sample(
             f"""
             SELECT *
             FROM cos_actions
-            WHERE {' AND '.join(clauses)}
+            WHERE {" AND ".join(clauses)}
             ORDER BY
               CASE COALESCE(risk_tier, '')
                 WHEN 'high' THEN 0
@@ -239,29 +283,459 @@ def load_audit_sample(
             params,
         )
     ]
-    if explicit_ids:
+    if explicit_action_scope:
         by_id = {str(action["id"]): action for action in candidates}
-        return [by_id[action_id] for action_id in explicit_ids if action_id in by_id][
-            :limit
-        ]
+        ordered = [by_id[action_id] for action_id in explicit_ids if action_id in by_id]
+        return sampled_unresolved_unique_actions(conn, ordered, limit=limit)
     if action_run_id:
-        return candidates[:limit]
+        return sampled_unresolved_unique_actions(conn, candidates, limit=limit)
     selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for action in candidates:
-        if action_in_audit_sample(conn, action):
+        issue_key = action_issue_key(action)
+        if (
+            action_in_audit_sample(conn, action)
+            and not action_is_manually_resolved(conn, action)
+            and issue_key not in seen
+        ):
             selected.append(action)
+            seen.add(issue_key)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def sampled_unresolved_unique_actions(
+    conn: Any, actions: list[dict[str, Any]], *, limit: int
+) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for action in actions:
+        issue_key = action_issue_key(action)
+        if (
+            not action_in_audit_sample(conn, action)
+            or action_is_manually_resolved(conn, action)
+            or issue_key in seen
+        ):
+            continue
+        selected.append(action)
+        seen.add(issue_key)
         if len(selected) >= limit:
             break
     return selected
 
 
 def audit_scope(
-    *, action_run_id: str | None, action_ids: list[str] | None
+    *,
+    action_run_id: str | None,
+    action_ids: list[str] | None,
+    audit_origin: str,
+    historical: bool,
 ) -> dict[str, Any]:
     return {
         "action_run_id": action_run_id,
         "explicit_action_count": len(action_ids or []),
+        "kind": "historical" if historical else "current_or_explicit",
+        "audit_origin": audit_origin,
     }
+
+
+def unresolved_unique_actions(
+    conn: Any, actions: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for action in actions:
+        issue_key = action_issue_key(action)
+        if issue_key in seen or action_is_manually_resolved(conn, action):
+            continue
+        seen.add(issue_key)
+        selected.append(action)
+    return selected
+
+
+def load_historical_audit_sample(
+    conn: Any,
+    limit: int,
+    clauses: list[str] | None = None,
+    params: list[Any] | None = None,
+) -> list[dict[str, Any]]:
+    selection = select_historical_audit_cohort(
+        conn,
+        limit,
+        clauses=clauses,
+        params=params,
+    )
+    return list(selection["actions"])
+
+
+def select_historical_audit_cohort(
+    conn: Any,
+    limit: int,
+    *,
+    clauses: list[str] | None = None,
+    params: list[Any] | None = None,
+    scan_after: tuple[str, str] | None = None,
+    window_action_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Select one cohort and expose bounded-window cursor metadata.
+
+    The caller owns cursor advancement. Weekly automation persists the initial
+    bounded membership and reloads only those IDs until no eligible cohort remains,
+    so neither newer nor backdated inserts can displace unfinished members.
+    """
+
+    if limit <= 0:
+        return {
+            "actions": [],
+            "scan_after": scan_after,
+            "window_end": scan_after,
+            "window_action_ids": [],
+            "scanned_action_count": 0,
+            "reached_end": False,
+        }
+    where = list(
+        clauses
+        or [
+            "status IN ('applied', 'auto_applied')",
+            "audit_status = 'unaudited'",
+        ]
+    )
+    frozen_window_action_ids = normalized_historical_window_action_ids(
+        window_action_ids
+    )
+    if frozen_window_action_ids:
+        candidates = load_frozen_historical_candidates(
+            conn,
+            where,
+            list(params or []),
+            frozen_window_action_ids,
+        )
+        window_end = scan_after
+        reached_end = False
+    else:
+        candidates, window_end, reached_end = load_bounded_historical_candidates(
+            conn,
+            where,
+            list(params or []),
+            scan_after=scan_after,
+        )
+        frozen_window_action_ids = [str(action["id"]) for action in candidates]
+    scanned_action_count = len(candidates)
+    candidates = [
+        action
+        for action in candidates
+        if action_in_audit_sample(conn, action)
+        and not action_is_manually_resolved(conn, action)
+    ]
+    priorities = historical_priority_index(conn, candidates)
+    candidates.sort(
+        key=lambda action: (
+            priorities[str(action["id"])]["direct_contradiction"],
+            priorities[str(action["id"])]["current_target"],
+            priorities[str(action["id"])]["retrieval_count"],
+            priorities[str(action["id"])]["last_retrieved_at"],
+            risk_rank(action.get("risk_tier")),
+            historical_candidate_effective_at(action),
+            str(action.get("id") or ""),
+        ),
+        reverse=True,
+    )
+    selected: list[dict[str, Any]] = []
+    seen_issues: set[str] = set()
+    seen_groups: set[str] = set()
+    for action in candidates:
+        identity = action_review_identity(action)
+        issue_key = action_issue_key(action)
+        group_key = identity["group_key"]
+        if issue_key in seen_issues or group_key in seen_groups:
+            continue
+        action["historical_priority"] = priorities[str(action["id"])]
+        selected.append(action)
+        seen_issues.add(issue_key)
+        seen_groups.add(group_key)
+        if len(selected) >= limit:
+            break
+    return {
+        "actions": selected,
+        "scan_after": scan_after,
+        "window_end": window_end,
+        "window_action_ids": frozen_window_action_ids,
+        "scanned_action_count": scanned_action_count,
+        "reached_end": reached_end,
+    }
+
+
+def normalized_historical_window_action_ids(value: Any) -> list[str]:
+    """Return at most one bounded keyset window of unique action IDs."""
+
+    if not isinstance(value, (list, tuple)):
+        return []
+    selected: list[str] = []
+    seen: set[str] = set()
+    for raw_action_id in value:
+        if not isinstance(raw_action_id, str):
+            continue
+        action_id = raw_action_id.strip()
+        if not action_id or action_id in seen:
+            continue
+        selected.append(action_id)
+        seen.add(action_id)
+        if len(selected) >= HISTORICAL_AUDIT_CANDIDATE_SCAN_CAP:
+            break
+    return selected
+
+
+def load_frozen_historical_candidates(
+    conn: Any,
+    where: list[str],
+    params: list[Any],
+    window_action_ids: list[str],
+) -> list[dict[str, Any]]:
+    """Reload one exact historical window without admitting later inserts."""
+
+    normalized = normalized_historical_window_action_ids(window_action_ids)
+    by_id: dict[str, dict[str, Any]] = {}
+    for action_id_batch in chunked(normalized, SQLITE_SAFE_BIND_BATCH_SIZE):
+        placeholders = ",".join("?" for _ in action_id_batch)
+        for row in conn.execute(
+            f"""
+            SELECT *
+            FROM cos_actions
+            WHERE {" AND ".join(where)}
+              AND id IN ({placeholders})
+            """,
+            [*params, *action_id_batch],
+        ):
+            action = row_to_action(row)
+            by_id[str(action["id"])] = action
+    return [by_id[action_id] for action_id in normalized if action_id in by_id]
+
+
+def load_bounded_historical_candidates(
+    conn: Any,
+    where: list[str],
+    params: list[Any],
+    *,
+    scan_after: tuple[str, str] | None = None,
+) -> tuple[list[dict[str, Any]], tuple[str, str] | None, bool]:
+    """Load a deterministic, hard-bounded newest-first historical window.
+
+    Keyset batches keep application memory and row decoding bounded. The weekly
+    caller decides when to advance this window so eligible, unselected rows cannot
+    be skipped.
+    """
+
+    candidates: list[dict[str, Any]] = []
+    cursor = scan_after
+    reached_end = False
+    while len(candidates) < HISTORICAL_AUDIT_CANDIDATE_SCAN_CAP:
+        batch_limit = min(
+            HISTORICAL_AUDIT_CANDIDATE_BATCH_SIZE,
+            HISTORICAL_AUDIT_CANDIDATE_SCAN_CAP - len(candidates),
+        )
+        cursor_clause, cursor_params = historical_candidate_cursor_clause(cursor)
+        rows = list(
+            conn.execute(
+                f"""
+                SELECT *
+                FROM cos_actions
+                WHERE {" AND ".join([*where, cursor_clause])}
+                ORDER BY COALESCE(applied_at, created_at) DESC, id DESC
+                LIMIT ?
+                """,
+                [*params, *cursor_params, batch_limit],
+            )
+        )
+        if not rows:
+            reached_end = True
+            break
+        candidates.extend(row_to_action(row) for row in rows)
+        last = rows[-1]
+        cursor = historical_candidate_row_cursor(last)
+        if len(rows) < batch_limit:
+            reached_end = True
+            break
+    if candidates and not reached_end:
+        reached_end = not historical_candidates_exist_after(
+            conn,
+            where,
+            params,
+            cursor,
+        )
+    return candidates, cursor, reached_end
+
+
+def historical_candidate_cursor_clause(
+    cursor: tuple[str, str] | None,
+) -> tuple[str, list[Any]]:
+    if cursor is None:
+        return "1 = 1", []
+    sort_at, action_id = cursor
+    return (
+        """
+        (
+          COALESCE(applied_at, created_at) < ?
+          OR (COALESCE(applied_at, created_at) = ? AND id < ?)
+        )
+        """,
+        [sort_at, sort_at, action_id],
+    )
+
+
+def historical_candidate_row_cursor(row: Any) -> tuple[str, str]:
+    return (
+        historical_candidate_effective_at(row),
+        str(row["id"] or ""),
+    )
+
+
+def historical_candidate_effective_at(row: Any) -> str:
+    """Mirror SQL ``COALESCE(applied_at, created_at)`` exactly for keysets.
+
+    An empty ``applied_at`` is schema-valid and is not NULL, so SQL sorts it as
+    the empty string. Python truthiness would incorrectly substitute
+    ``created_at`` and make the next keyset batch repeat the same rows.
+    ``created_at`` is NOT NULL in the table contract.
+    """
+
+    applied_at = row["applied_at"]
+    return str(applied_at if applied_at is not None else row["created_at"])
+
+
+def historical_candidates_exist_after(
+    conn: Any,
+    where: list[str],
+    params: list[Any],
+    cursor: tuple[str, str] | None,
+) -> bool:
+    cursor_clause, cursor_params = historical_candidate_cursor_clause(cursor)
+    return bool(
+        conn.execute(
+            f"""
+            SELECT 1
+            FROM cos_actions
+            WHERE {" AND ".join([*where, cursor_clause])}
+            LIMIT 1
+            """,
+            [*params, *cursor_params],
+        ).fetchone()
+    )
+
+
+def historical_priority_index(
+    conn: Any, actions: list[dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    fact_ids = bounded_historical_priority_fact_ids(actions)
+    priority_fact_ids = set(fact_ids)
+    fact_status: dict[str, str] = {}
+    retrieval: dict[str, tuple[int, str]] = {}
+    if fact_ids and table_exists(conn, "facts"):
+        for fact_id_batch in chunked(fact_ids, SQLITE_SAFE_BIND_BATCH_SIZE):
+            placeholders = ",".join("?" for _ in fact_id_batch)
+            fact_status.update(
+                {
+                    str(row["id"]): str(row["status"] or "")
+                    for row in conn.execute(
+                        f"SELECT id, status FROM facts WHERE id IN ({placeholders})",
+                        fact_id_batch,
+                    )
+                }
+            )
+    if fact_ids and table_exists(conn, "context_lineage_events"):
+        for fact_id_batch in chunked(fact_ids, SQLITE_SAFE_BIND_BATCH_SIZE):
+            placeholders = ",".join("?" for _ in fact_id_batch)
+            retrieval.update(
+                {
+                    str(row["target_id"]): (
+                        int(row["retrieval_count"] or 0),
+                        str(row["last_retrieved_at"] or ""),
+                    )
+                    for row in conn.execute(
+                        f"""
+                        SELECT target_id,
+                               COUNT(DISTINCT retrieval_event_id) AS retrieval_count,
+                               MAX(created_at) AS last_retrieved_at
+                        FROM context_lineage_events
+                        WHERE target_type = 'fact'
+                          AND retrieval_event_id IS NOT NULL
+                          AND target_id IN ({placeholders})
+                        GROUP BY target_id
+                        """,
+                        fact_id_batch,
+                    )
+                }
+            )
+    result: dict[str, dict[str, Any]] = {}
+    for action in actions:
+        bounded_targets = bounded_action_target_fact_ids(action)
+        targets = [value for value in bounded_targets if value in priority_fact_ids]
+        statuses = {fact_status.get(fact_id, "") for fact_id in targets}
+        events = [retrieval.get(fact_id, (0, "")) for fact_id in targets]
+        result[str(action["id"])] = {
+            "direct_contradiction": int(bool(statuses & {"contested", "conflicted"})),
+            "current_target": int(
+                not bounded_targets
+                or bool(
+                    statuses
+                    & {"active", "contested", "conflicted", "needs_confirmation"}
+                )
+            ),
+            "retrieval_count": sum(count for count, _at in events),
+            "last_retrieved_at": max((at for _count, at in events), default=""),
+        }
+    return result
+
+
+def bounded_historical_priority_fact_ids(
+    actions: list[dict[str, Any]],
+) -> list[str]:
+    """Fairly bound fact-priority work across the candidate window."""
+
+    targets_by_action = [bounded_action_target_fact_ids(action) for action in actions]
+    selected: list[str] = []
+    seen: set[str] = set()
+    for target_index in range(HISTORICAL_PRIORITY_FACT_IDS_PER_ACTION):
+        for targets in targets_by_action:
+            if target_index >= len(targets):
+                continue
+            fact_id = targets[target_index]
+            if fact_id in seen:
+                continue
+            selected.append(fact_id)
+            seen.add(fact_id)
+            if len(selected) >= HISTORICAL_PRIORITY_FACT_ID_SCAN_CAP:
+                return selected
+    return selected
+
+
+def bounded_action_target_fact_ids(action: dict[str, Any]) -> list[str]:
+    """Read at most the first 64 unique non-empty targets from one action."""
+
+    selected: list[str] = []
+    seen: set[str] = set()
+    for value in action.get("target_fact_ids") or []:
+        fact_id = str(value or "").strip()
+        if not fact_id or fact_id in seen:
+            continue
+        selected.append(fact_id)
+        seen.add(fact_id)
+        if len(selected) >= HISTORICAL_PRIORITY_FACT_IDS_PER_ACTION:
+            break
+    return selected
+
+
+def chunked(values: list[str], size: int) -> list[list[str]]:
+    return [values[index : index + size] for index in range(0, len(values), size)]
+
+
+def action_issue_key(action: dict[str, Any]) -> str:
+    identity = action_review_identity(action)
+    return f"{identity['family_key']}:{identity['state_fingerprint']}"
+
+
+def risk_rank(value: Any) -> int:
+    return {"high": 3, "medium": 2, "low": 1}.get(str(value or "").lower(), 0)
 
 
 def action_in_audit_sample(conn: Any, action: dict[str, Any]) -> bool:

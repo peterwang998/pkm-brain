@@ -13,6 +13,7 @@ from pkm_brain.extraction import load_extraction_route_targets
 from pkm_brain.paths import BrainPaths
 from pkm_brain.regeneration import (
     backup_runtime_brain,
+    best_confirmation_match,
     export_human_state,
     rebuild_facts_from_sources,
     rebuild_provider_ready_summary,
@@ -134,6 +135,80 @@ def test_backup_runtime_brain_includes_committed_wal_pages(tmp_path: Path) -> No
     assert value == "committed-in-wal"
 
 
+def test_regeneration_reapplies_confirmation_only_to_exact_semantic_state(
+    tmp_path: Path,
+) -> None:
+    paths = BrainPaths.from_value(tmp_path / "brain")
+    BrainService(paths).init_workspace()
+    old_fact = {
+        "statement": "The review is scheduled.",
+        "entity_key": "event:review",
+        "source_ids": json.dumps(["source-old"]),
+        "source_spans": json.dumps(
+            [{"source_id": "source-old", "start": 10, "end": 30}]
+        ),
+        "evidence_quote": "Review is August 3.",
+        "event_time_kind": "occurrence",
+        "event_start_at": "2026-08-03T09:00:00-07:00",
+        "event_time_precision": "minute",
+    }
+    with connection(paths.sqlite_path) as conn:
+        for fact_id, source_id, quote, start_at in (
+            (
+                "fact_changed",
+                "source-new",
+                "Review is August 4.",
+                "2026-08-04T09:00:00-07:00",
+            ),
+            (
+                "fact_exact",
+                "source-old",
+                "Review is August 3.",
+                "2026-08-03T09:00:00-07:00",
+            ),
+        ):
+            conn.execute(
+                """
+                INSERT INTO facts(
+                  id, statement, entity_key, page_hint, source_ids, source_spans,
+                  evidence_quote, confidence, status, confirmed_by_user, metadata,
+                  created_at, event_time_kind, event_start_at, event_time_precision
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    fact_id,
+                    old_fact["statement"],
+                    "event:review",
+                    "events/review.md",
+                    json.dumps([source_id]),
+                    json.dumps([{"source_id": source_id, "start": 10, "end": 30}]),
+                    quote,
+                    0.8,
+                    "active",
+                    0,
+                    "{}",
+                    "2026-07-31T00:00:00+00:00",
+                    "occurrence",
+                    start_at,
+                    "minute",
+                ),
+            )
+        candidates = list(
+            conn.execute(
+                "SELECT * FROM facts ORDER BY CASE id WHEN 'fact_changed' THEN 0 ELSE 1 END"
+            )
+        )
+
+    match = best_confirmation_match(old_fact, candidates)
+
+    assert match is not None
+    assert match["id"] == "fact_exact"
+    assert best_confirmation_match(old_fact, [candidates[0]]) is None
+    changed_key_candidate = dict(candidates[1])
+    changed_key_candidate["entity_key"] = "event:other-review"
+    assert best_confirmation_match(old_fact, [changed_key_candidate]) is None
+
+
 def test_reset_dismisses_only_open_extractor_actions(tmp_path: Path) -> None:
     paths = BrainPaths.from_value(tmp_path / "brain")
     BrainService(paths).init_workspace()
@@ -165,9 +240,7 @@ def test_reset_dismisses_only_open_extractor_actions(tmp_path: Path) -> None:
     with connection(paths.sqlite_path) as conn:
         actions = {
             str(row["id"]): row
-            for row in conn.execute(
-                "SELECT id, status, evidence_json FROM cos_actions"
-            )
+            for row in conn.execute("SELECT id, status, evidence_json FROM cos_actions")
         }
 
     assert result["dismissed_open_extractor_action_count"] == 2
@@ -389,7 +462,15 @@ def test_rebuild_facts_apply_resets_with_contract_seed_and_reapplies_confirmatio
             INSERT INTO entities(id, name, entity_type, aliases, status, source_ids, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            ("entity_legacy", "Legacy", "concept", "[]", "active", "[]", "2026-07-05T00:00:00+00:00"),
+            (
+                "entity_legacy",
+                "Legacy",
+                "concept",
+                "[]",
+                "active",
+                "[]",
+                "2026-07-05T00:00:00+00:00",
+            ),
         )
         conn.execute(
             """
@@ -397,7 +478,15 @@ def test_rebuild_facts_apply_resets_with_contract_seed_and_reapplies_confirmatio
               id, fact_id, entity_id, is_primary, mention_text, mention_kind, created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            ("fe_legacy", "fact_legacy", "entity_legacy", 1, "Legacy", "named", "2026-07-05T00:00:00+00:00"),
+            (
+                "fe_legacy",
+                "fact_legacy",
+                "entity_legacy",
+                1,
+                "Legacy",
+                "named",
+                "2026-07-05T00:00:00+00:00",
+            ),
         )
         conn.execute(
             """
@@ -439,13 +528,23 @@ def test_rebuild_facts_apply_resets_with_contract_seed_and_reapplies_confirmatio
             "status": "ok",
             "documents": [{"document_id": "doc_note"}],
             "candidates": [{"id": "candidate_rebuilt"}],
-            "actions": [{"id": "cosact_rebuilt", "status": "applied", "critic_decision": "agree"}],
+            "actions": [
+                {
+                    "id": "cosact_rebuilt",
+                    "status": "applied",
+                    "critic_decision": "agree",
+                }
+            ],
             "timing": {"total_duration_ms": 1},
             "validation": {},
         }
 
-    monkeypatch.setattr("pkm_brain.regeneration.cos_provider_status", ready_provider_status)
-    monkeypatch.setattr("pkm_brain.regeneration.extract_recent_documents", fake_extract_recent_documents)
+    monkeypatch.setattr(
+        "pkm_brain.regeneration.cos_provider_status", ready_provider_status
+    )
+    monkeypatch.setattr(
+        "pkm_brain.regeneration.extract_recent_documents", fake_extract_recent_documents
+    )
 
     result = rebuild_facts_from_sources(
         paths,
@@ -463,14 +562,24 @@ def test_rebuild_facts_apply_resets_with_contract_seed_and_reapplies_confirmatio
     assert (paths.wiki / "concepts" / "hand.md").exists()
     assert (paths.wiki / "concepts" / "legacy.md").exists()
     with connection(paths.sqlite_path) as conn:
-        legacy = conn.execute("SELECT status FROM facts WHERE id = 'fact_legacy'").fetchone()
+        legacy = conn.execute(
+            "SELECT status FROM facts WHERE id = 'fact_legacy'"
+        ).fetchone()
         rebuilt = conn.execute(
             "SELECT status, confirmed_by_user FROM facts WHERE id = 'fact_rebuilt'"
         ).fetchone()
-        legacy_entity = conn.execute("SELECT status FROM entities WHERE id = 'entity_legacy'").fetchone()
-        fact_entity_count = conn.execute("SELECT COUNT(*) FROM fact_entities WHERE id = 'fe_legacy'").fetchone()[0]
-        legacy_question = conn.execute("SELECT status FROM open_questions WHERE id = 'question_legacy'").fetchone()
-        contract_count = conn.execute("SELECT COUNT(*) FROM page_contracts WHERE status = 'active'").fetchone()[0]
+        legacy_entity = conn.execute(
+            "SELECT status FROM entities WHERE id = 'entity_legacy'"
+        ).fetchone()
+        fact_entity_count = conn.execute(
+            "SELECT COUNT(*) FROM fact_entities WHERE id = 'fe_legacy'"
+        ).fetchone()[0]
+        legacy_question = conn.execute(
+            "SELECT status FROM open_questions WHERE id = 'question_legacy'"
+        ).fetchone()
+        contract_count = conn.execute(
+            "SELECT COUNT(*) FROM page_contracts WHERE status = 'active'"
+        ).fetchone()[0]
         legacy_revisions = conn.execute(
             """
             SELECT status, revision_status, revision_number, created_at, knowledge_to
@@ -512,14 +621,18 @@ def test_rebuild_facts_apply_continuation_does_not_reset_existing_rebuilt_state(
     write_labeled_extraction_eval(paths)
     insert_document_with_chunk(paths, "doc_one", "markdown_note")
     insert_document_with_chunk(paths, "doc_two", "markdown_note")
-    insert_active_fact(paths, "fact_existing_rebuilt", "Existing rebuilt fact.", "concepts/existing.md")
+    insert_active_fact(
+        paths, "fact_existing_rebuilt", "Existing rebuilt fact.", "concepts/existing.md"
+    )
 
     def fake_extract_recent_documents(
         paths_arg: BrainPaths,
         **kwargs: object,
     ) -> dict[str, object]:
         assert kwargs["offset"] == 1
-        insert_active_fact(paths_arg, "fact_continued", "Continuation fact.", "concepts/continued.md")
+        insert_active_fact(
+            paths_arg, "fact_continued", "Continuation fact.", "concepts/continued.md"
+        )
         return {
             "status": "ok",
             "documents": [{"document_id": "doc_two"}],
@@ -529,8 +642,12 @@ def test_rebuild_facts_apply_continuation_does_not_reset_existing_rebuilt_state(
             "validation": {},
         }
 
-    monkeypatch.setattr("pkm_brain.regeneration.cos_provider_status", ready_provider_status)
-    monkeypatch.setattr("pkm_brain.regeneration.extract_recent_documents", fake_extract_recent_documents)
+    monkeypatch.setattr(
+        "pkm_brain.regeneration.cos_provider_status", ready_provider_status
+    )
+    monkeypatch.setattr(
+        "pkm_brain.regeneration.extract_recent_documents", fake_extract_recent_documents
+    )
 
     result = rebuild_facts_from_sources(
         paths,
@@ -565,7 +682,9 @@ def test_propose_action_creates_missing_curation_run_for_run_id(tmp_path: Path) 
     )
 
     with connection(paths.sqlite_path) as conn:
-        run = conn.execute("SELECT * FROM wiki_curation_runs WHERE id = ?", ("cosrun_test",)).fetchone()
+        run = conn.execute(
+            "SELECT * FROM wiki_curation_runs WHERE id = ?", ("cosrun_test",)
+        ).fetchone()
     assert action["run_id"] == "cosrun_test"
     assert run is not None
     assert run["group_by"] == "cos_action"
@@ -622,7 +741,14 @@ def ready_provider_status(paths: BrainPaths) -> dict[str, object]:
     assert paths.home
     roles = [
         {"role": role, "configured": True, "missing": []}
-        for role in ("extractor", "resolver", "gardener", "synthesizer", "critic", "auditor")
+        for role in (
+            "extractor",
+            "resolver",
+            "gardener",
+            "synthesizer",
+            "critic",
+            "auditor",
+        )
     ]
     return {"roles": roles, "warnings": []}
 

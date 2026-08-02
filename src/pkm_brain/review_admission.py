@@ -6,6 +6,11 @@ from typing import Any
 
 DEFAULT_ACTIVE_LIMIT = 100
 DEFAULT_DAILY_ADMISSION_LIMIT = 25
+DEFAULT_ACTIVE_HISTORICAL_AUDIT_LIMIT = 5
+
+HISTORICAL_AUDIT_ORIGINS = frozenset(
+    {"weekly_historical", "legacy_historical"}
+)
 
 
 def reconcile_review_admissions(
@@ -14,6 +19,7 @@ def reconcile_review_admissions(
     *,
     active_limit: int = DEFAULT_ACTIVE_LIMIT,
     daily_limit: int = DEFAULT_DAILY_ADMISSION_LIMIT,
+    historical_active_limit: int = DEFAULT_ACTIVE_HISTORICAL_AUDIT_LIMIT,
     now: str | None = None,
 ) -> dict[str, Any]:
     """Keep ordinary human review bounded while preserving hard safety gates."""
@@ -50,8 +56,28 @@ def reconcile_review_admissions(
         if key in rows:
             update_admission_metadata(conn, key, item, timestamp)
 
+    # Historical audits are maintenance work, not unbounded safety gates. Older
+    # versions grandfathered every item in the first observed queue and let a
+    # high-risk source action bypass capacity forever. Correct that state on
+    # every reconciliation so an existing installation converges immediately.
+    historical_active_limit = max(0, int(historical_active_limit))
+    demote_excess_historical_admissions(
+        conn,
+        candidates,
+        rows,
+        active_limit=historical_active_limit,
+        timestamp=timestamp,
+    )
+    rows = admission_rows(conn, candidates)
+
     active_keys = {
         key for key, row in rows.items() if str(row["state"]) == "admitted"
+    }
+    historical_active_keys = {
+        key
+        for key in active_keys
+        if is_historical_audit(candidates[key])
+        and not is_direct_contradiction(candidates[key])
     }
     budget_used = int(
         conn.execute(
@@ -71,6 +97,12 @@ def reconcile_review_admissions(
         if is_hard_boundary(item):
             state = "admitted"
             reason = "hard_boundary"
+        elif (
+            is_historical_audit(item)
+            and len(historical_active_keys) >= historical_active_limit
+        ):
+            state = "deferred"
+            reason = "historical_capacity"
         elif len(active_keys) < active_limit and budget_used < daily_limit:
             state = "admitted"
             reason = "daily_budget"
@@ -88,6 +120,8 @@ def reconcile_review_admissions(
         )
         if state == "admitted":
             active_keys.add(key)
+            if is_historical_audit(item) and not is_direct_contradiction(item):
+                historical_active_keys.add(key)
 
     rows = admission_rows(conn, candidates)
     deferred = [
@@ -95,10 +129,44 @@ def reconcile_review_admissions(
         for key, row in rows.items()
         if key in candidates and str(row["state"]) == "deferred"
     ]
+
+    # A finding may become an explicit direct contradiction after it was first
+    # deferred. Promote that hard boundary immediately; it is the sole kind of
+    # historical audit allowed to bypass the ordinary and historical caps.
     for item in sorted(deferred, key=admission_sort_key):
+        if not is_hard_boundary(item):
+            continue
+        key = str(item["id"])
+        conn.execute(
+            """
+            UPDATE review_admissions
+            SET state = 'admitted', admission_reason = 'hard_boundary',
+                admitted_at = ?, updated_at = ?
+            WHERE item_key = ? AND state = 'deferred'
+            """,
+            (timestamp, timestamp, key),
+        )
+        active_keys.add(key)
+
+    for item in sorted(deferred, key=admission_sort_key):
+        key = str(item["id"])
+        if key in active_keys:
+            continue
         if len(active_keys) >= active_limit or budget_used >= daily_limit:
             break
-        key = str(item["id"])
+        if (
+            is_historical_audit(item)
+            and len(historical_active_keys) >= historical_active_limit
+        ):
+            conn.execute(
+                """
+                UPDATE review_admissions
+                SET admission_reason = 'historical_capacity', updated_at = ?
+                WHERE item_key = ? AND state = 'deferred'
+                """,
+                (timestamp, key),
+            )
+            continue
         conn.execute(
             """
             UPDATE review_admissions
@@ -109,6 +177,8 @@ def reconcile_review_admissions(
             (timestamp, timestamp, key),
         )
         active_keys.add(key)
+        if is_historical_audit(item):
+            historical_active_keys.add(key)
         budget_used += 1
 
     states = {
@@ -119,8 +189,39 @@ def reconcile_review_admissions(
         "states": states,
         "active_limit": active_limit,
         "daily_limit": daily_limit,
+        "historical_active_limit": historical_active_limit,
+        "historical_admitted": len(historical_active_keys),
         "admitted_today": budget_used,
     }
+
+
+def demote_excess_historical_admissions(
+    conn: Any,
+    candidates: dict[str, dict[str, Any]],
+    rows: dict[str, Any],
+    *,
+    active_limit: int,
+    timestamp: str,
+) -> None:
+    admitted = [
+        candidates[key]
+        for key, row in rows.items()
+        if key in candidates
+        and str(row["state"]) == "admitted"
+        and is_historical_audit(candidates[key])
+        and not is_direct_contradiction(candidates[key])
+    ]
+    excess = sorted(admitted, key=admission_sort_key)[active_limit:]
+    for item in excess:
+        conn.execute(
+            """
+            UPDATE review_admissions
+            SET state = 'deferred', admission_reason = 'historical_capacity',
+                admitted_at = NULL, updated_at = ?
+            WHERE item_key = ? AND state = 'admitted'
+            """,
+            (timestamp, str(item["id"])),
+        )
 
 
 def load_review_admission_states(
@@ -207,9 +308,26 @@ def update_admission_metadata(
 
 
 def is_hard_boundary(item: dict[str, Any]) -> bool:
+    if is_historical_audit(item):
+        return is_direct_contradiction(item)
     return str(item.get("group") or "") == "conflicts" or str(
         item.get("risk_tier") or ""
     ).lower() == "high"
+
+
+def is_historical_audit(item: dict[str, Any]) -> bool:
+    if str(item.get("maintenance_kind") or "").strip().lower() == "historical_audit":
+        return True
+    audit = item.get("audit") if isinstance(item.get("audit"), dict) else {}
+    origin = str(audit.get("origin") or item.get("audit_origin") or "").strip().lower()
+    return origin in HISTORICAL_AUDIT_ORIGINS
+
+
+def is_direct_contradiction(item: dict[str, Any]) -> bool:
+    if item.get("direct_contradiction") is True:
+        return True
+    audit = item.get("audit") if isinstance(item.get("audit"), dict) else {}
+    return audit.get("direct_contradiction") is True
 
 
 def admission_priority(item: dict[str, Any]) -> int:

@@ -1,7 +1,7 @@
 # PKM Brain Architecture Code Guide
 
 **Status:** current code-navigation guide
-**Last verified:** 2026-07-29 against the promoted Brain `0.2.4` temporal-cognition release line at commit `2085ec3`; Knowledge schema 26 is the current release contract
+**Last verified:** 2026-08-02 against Brain `0.2.5`; Knowledge schema 29 is the current release contract
 
 This guide answers where behavior lives. Feature requirements and open work belong in [the specs index](README.md), not here.
 
@@ -13,7 +13,9 @@ capture.py / connectors.py / connector_auth.py
   -> db.py + migrations.py
   -> chunking.py + indexes.py + embeddings.py
   -> extraction.py
-  -> cos_actions.py + cos_policy.py
+  -> cos_actions.py + cos_policy.py + cos_audit.py
+  -> review_resolution.py + action_review_enforcement.py + audit_review.py
+  -> review_undo.py + queue_undo_transaction.py + question_resolution.py + review_admission.py
   -> wiki_facts.py + entities.py + gardener.py
   -> service.py retrieval
   -> mcp_server.py / ui_server.py / cli.py
@@ -34,7 +36,8 @@ encrypted Gmail archive
   -> AES-256-GCM with a Keychain key
   -> daemon-only search_mail/get_mail_thread
 
-daemon.py + automation.py schedule lane-isolated primitives.
+daemon.py + automation.py schedule lane-isolated primitives, including
+current-run nightly audit and due-gated weekly historical audit.
 SwiftUI and browser assets call ui_server.py JSON endpoints.
 sync_* modules move source files, never live DB/index state.
 ```
@@ -67,7 +70,11 @@ sync_* modules move source files, never live DB/index state.
 
 - `paths.py`: all home-relative paths, node identity, lock/token/handshake paths.
 - `db.py`: base schema, connection helpers, FTS setup, row helpers.
-- `migrations.py`: ordered idempotent migrations 1-26; migration 25 adds the immutable Gmail temporal review ledger/head and migration 26 adds durable runner executions/components, including zero-work outcomes.
+- `migrations.py`: ordered idempotent migrations 1-29; migration 25 adds the immutable Gmail temporal review ledger/head, migration 26 adds durable runner executions/components including zero-work outcomes, migration 27 adds semantic review resolutions, migration 28 repairs the legacy question-resolution backfill, and migration 29 preserves active decisions while moving them onto entity-aware fact identity and best-effort receipts for recoverable historical attribution.
+- `fact_entity_attribution.py`: canonical entity-mention inputs plus explicit-versus-derived entity-ID receipts used by fact mutation and semantic review identity.
+- `candidate_retirement.py`: transactional candidate-key sibling retirement snapshots, stale guards, and exact action/question restoration for review Undo.
+- `queue_undo_transaction.py`: one write-locked transaction for queue Undo guard validation, action/question/memory inverses, and review-resolution revocation; filesystem projections are repaired after commit and reported separately.
+- `wiki_manual_review.py`, `ui_review_questions.py`, and `ui_errors.py`: compensated manual-answer/correction workflows, pre-projection state capture, durable partial-write snapshots, projection-safe undo helpers, and the focused HTTP review boundary extracted from the large compatibility modules.
 - `operational_db.py` and `operational_migrations.py`: the independently versioned `db/ops.sqlite` control plane and bounded lock handling.
 - `gmail_mirror.py`: the independent owner-only, rebuildable Gmail operational evidence store, atomic local-analysis queue, and content-free poison-thread quarantine at `cache/gmail-mirror/gmail-mirror.sqlite`.
 - `gmail_archive.py`, `gmail_archive_source.py`, and `gmail_archive_sync.py`: the separate encrypted raw-message store, Gmail reader, and scheduled 90-day-plus-incremental sync.
